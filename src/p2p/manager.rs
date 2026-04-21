@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use super::connection;
-use super::{P2pCommand, P2pEvent, PeerId};
+use super::{PeerCommand, PeerEvent, PeerId};
 use crate::wire::WireMessage;
 
 /// Internal messages that flow into the manager (from listener + connection tasks).
@@ -16,8 +16,8 @@ pub enum ManagerMsg {
 }
 
 pub async fn run(
-    mut cmd_rx: mpsc::Receiver<P2pCommand>,
-    event_tx: mpsc::Sender<P2pEvent>,
+    mut cmd_rx: mpsc::Receiver<PeerCommand>,
+    event_tx: mpsc::Sender<PeerEvent>,
     mut internal_rx: mpsc::Receiver<ManagerMsg>,
     internal_tx: mpsc::Sender<ManagerMsg>,
 ) {
@@ -41,24 +41,24 @@ pub async fn run(
 
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(P2pCommand::Broadcast { msg }) => {
+                    Some(PeerCommand::Broadcast { msg }) => {
                         broadcast(&peers, msg);
                     }
-                    Some(P2pCommand::SendTo { peer_id, msg }) => {
+                    Some(PeerCommand::SendTo { peer_id, msg }) => {
                         if let Some(tx) = peers.get(&peer_id) {
                             let _ = tx.try_send(msg);
                         } else {
                             warn!("SendTo unknown peer {peer_id}");
                         }
                     }
-                    Some(P2pCommand::Disconnect { peer_id }) => {
+                    Some(PeerCommand::Disconnect { peer_id }) => {
                         if peers.remove(&peer_id).is_none() {
                             warn!("Disconnect unknown peer {peer_id}");
                         }
                         // Dropping the sender closes the write channel, which
                         // causes the connection task to exit and emit PeerDisconnected.
                     }
-                    Some(P2pCommand::ListPeers { reply }) => {
+                    Some(PeerCommand::ListPeers { reply }) => {
                         let list: Vec<PeerId> = peers.keys().copied().collect();
                         let _ = reply.send(list);
                     }
@@ -73,7 +73,7 @@ fn register_connection(
     addr: SocketAddr,
     stream: TcpStream,
     peers: &mut HashMap<PeerId, mpsc::Sender<WireMessage>>,
-    event_tx: mpsc::Sender<P2pEvent>,
+    event_tx: mpsc::Sender<PeerEvent>,
     internal_tx: mpsc::Sender<ManagerMsg>,
 ) {
     let (write_tx, write_rx) = mpsc::channel::<WireMessage>(64);

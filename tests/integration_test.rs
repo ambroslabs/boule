@@ -1,19 +1,11 @@
 use std::io::Write;
+use std::net::TcpListener as StdTcpListener;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tempfile::NamedTempFile;
-
-// Ports used by the three-node cluster in tests.
-// Using high port numbers to avoid conflicts with common services.
-const P2P_PORT_1: u16 = 19001;
-const P2P_PORT_2: u16 = 19002;
-const P2P_PORT_3: u16 = 19003;
-const API_PORT_1: u16 = 19101;
-const API_PORT_2: u16 = 19102;
-const API_PORT_3: u16 = 19103;
 
 struct NodeGuard {
     child: Child,
@@ -34,6 +26,17 @@ impl Drop for NodeGuard {
     }
 }
 
+/// Ask the OS for a free port by binding to :0, recording the assigned port,
+/// then releasing the socket. There is a small TOCTOU window before the node
+/// process binds the port, but it is negligible in a local test environment.
+fn free_port() -> u16 {
+    StdTcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 fn spawn_node(p2p_port: u16, api_port: u16, peers: &[u16]) -> NodeGuard {
     let peer_lines: String = peers
         .iter()
@@ -51,7 +54,7 @@ fn spawn_node(p2p_port: u16, api_port: u16, peers: &[u16]) -> NodeGuard {
     let bin = env!("CARGO_BIN_EXE_ambros-p2p");
     let child = Command::new(bin)
         .args(["--config", config_file.path().to_str().unwrap()])
-        .env("RUST_LOG", "warn") // keep test output quiet
+        .env("RUST_LOG", "warn")
         .spawn()
         .expect("failed to spawn node binary");
 
@@ -128,18 +131,21 @@ async fn poll_for_message(node: &NodeGuard, content: &str, timeout: Duration) {
     }
 }
 
-/// Start a three-node fully-connected cluster and return the nodes.
+/// Start a three-node fully-connected cluster on dynamically allocated ports.
 async fn start_cluster() -> (NodeGuard, NodeGuard, NodeGuard) {
-    let node1 = spawn_node(P2P_PORT_1, API_PORT_1, &[P2P_PORT_2, P2P_PORT_3]);
-    let node2 = spawn_node(P2P_PORT_2, API_PORT_2, &[P2P_PORT_1, P2P_PORT_3]);
-    let node3 = spawn_node(P2P_PORT_3, API_PORT_3, &[P2P_PORT_1, P2P_PORT_2]);
+    let (p2p_1, api_1) = (free_port(), free_port());
+    let (p2p_2, api_2) = (free_port(), free_port());
+    let (p2p_3, api_3) = (free_port(), free_port());
+
+    let node1 = spawn_node(p2p_1, api_1, &[p2p_2, p2p_3]);
+    let node2 = spawn_node(p2p_2, api_2, &[p2p_1, p2p_3]);
+    let node3 = spawn_node(p2p_3, api_3, &[p2p_1, p2p_2]);
 
     let ready_timeout = Duration::from_secs(10);
     wait_until_ready(&node1, ready_timeout).await;
     wait_until_ready(&node2, ready_timeout).await;
     wait_until_ready(&node3, ready_timeout).await;
 
-    // Wait for at least 2 peers on each node (fully connected mesh).
     let mesh_timeout = Duration::from_secs(10);
     wait_for_peer_count(&node1, 2, mesh_timeout).await;
     wait_for_peer_count(&node2, 2, mesh_timeout).await;

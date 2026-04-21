@@ -28,8 +28,8 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(gossip::store::GossipStore::new());
 
-    let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::P2pCommand>(256);
-    let (p2p_event_tx, p2p_event_rx) = mpsc::channel::<p2p::P2pEvent>(256);
+    let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
+    let (p2p_event_tx, p2p_event_rx) = mpsc::channel::<p2p::PeerEvent>(256);
     let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 

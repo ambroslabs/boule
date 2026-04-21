@@ -10,11 +10,11 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::gossip::store::GossipStore;
 use crate::gossip::{GossipMessage, InsertResult};
-use crate::p2p::{P2pCommand, PeerId};
+use crate::p2p::{PeerCommand, PeerId};
 use crate::wire::WireMessage;
 
 use types::{MessageItem, PostMessageRequest, PostMessageResponse};
@@ -22,12 +22,12 @@ use types::{MessageItem, PostMessageRequest, PostMessageResponse};
 #[derive(Clone)]
 struct AppState {
     store: Arc<GossipStore>,
-    cmd_tx: mpsc::Sender<P2pCommand>,
+    cmd_tx: mpsc::Sender<PeerCommand>,
 }
 
 pub async fn serve(
     store: Arc<GossipStore>,
-    cmd_tx: mpsc::Sender<P2pCommand>,
+    cmd_tx: mpsc::Sender<PeerCommand>,
     listen_addr: SocketAddr,
 ) {
     let state = AppState { store, cmd_tx };
@@ -59,12 +59,16 @@ async fn post_message(
 
     match state.store.try_insert(msg.clone()) {
         InsertResult::Inserted => {
-            let _ = state
+            if state
                 .cmd_tx
-                .send(P2pCommand::Broadcast {
+                .send(PeerCommand::Broadcast {
                     msg: WireMessage::Gossip(msg),
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                warn!("PeerManager channel closed; message stored locally but not broadcast");
+            }
         }
         InsertResult::AlreadySeen => {
             // Idempotent — return the hash as if it were new.
@@ -91,7 +95,9 @@ async fn list_messages(State(state): State<AppState>) -> Json<Vec<MessageItem>> 
 
 async fn list_peers(State(state): State<AppState>) -> Json<Vec<PeerId>> {
     let (tx, rx) = oneshot::channel();
-    let _ = state.cmd_tx.send(P2pCommand::ListPeers { reply: tx }).await;
+    let _ = state.cmd_tx.send(PeerCommand::ListPeers { reply: tx }).await;
+    // If PeerManager has exited, the oneshot sender is dropped and rx.await returns
+    // RecvError; unwrap_or_default() maps that to an empty Vec, which is correct.
     let peers = rx.await.unwrap_or_default();
     Json(peers)
 }

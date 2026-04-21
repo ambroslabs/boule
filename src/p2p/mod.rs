@@ -12,7 +12,7 @@ pub type PeerId = SocketAddr;
 
 #[derive(Debug)]
 #[allow(dead_code)]
-pub enum P2pCommand {
+pub enum PeerCommand {
     Broadcast { msg: WireMessage },
     SendTo { peer_id: PeerId, msg: WireMessage },
     Disconnect { peer_id: PeerId },
@@ -20,7 +20,7 @@ pub enum P2pCommand {
 }
 
 #[derive(Debug)]
-pub enum P2pEvent {
+pub enum PeerEvent {
     PeerConnected { peer_id: PeerId },
     PeerDisconnected { peer_id: PeerId },
     MessageReceived { peer_id: PeerId, msg: WireMessage },
