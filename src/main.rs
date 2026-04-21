@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config_path = parse_config_arg();
+    let config_path = parse_config_arg()?;
     let config = config::load(&config_path)?;
     info!("loaded config from {}", config_path.display());
 
@@ -52,19 +52,33 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(gossip::cleanup::run(store, interval, srx))
     };
 
+    // Bind the API listener here so we know the actual port before writing addr_file.
+    let api_listener = TcpListener::bind(config.api.listen_addr).await?;
+    let api_actual_addr = api_listener.local_addr()?;
     let api_handle = {
         let store = Arc::clone(&store);
         let cmd_tx = p2p_cmd_tx.clone();
-        let addr = config.api.listen_addr;
-        tokio::spawn(api::serve(store, cmd_tx, addr))
+        tokio::spawn(api::serve(store, cmd_tx, api_listener))
     };
 
+    // Bind the P2P listener before spawning the accept loop for the same reason.
     let listener = TcpListener::bind(config.node.listen_addr).await?;
-    info!("P2P listening on {}", config.node.listen_addr);
+    let p2p_actual_addr = listener.local_addr()?;
+    info!("P2P listening on {p2p_actual_addr}");
     let listener_handle = {
         let itx = internal_tx.clone();
         tokio::spawn(p2p::listener::run(listener, itx))
     };
+
+    // Write both bound addresses to addr_file if configured.
+    // Tests use this to discover the actual ports when listen_addr uses port 0.
+    if let Some(ref path) = config.node.addr_file {
+        let content = serde_json::json!({
+            "p2p_addr": p2p_actual_addr.to_string(),
+            "api_addr": api_actual_addr.to_string(),
+        });
+        std::fs::write(path, content.to_string())?;
+    }
 
     for peer_cfg in &config.peers {
         let addr = peer_cfg.addr;
@@ -99,14 +113,32 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_config_arg() -> PathBuf {
+fn parse_config_arg() -> anyhow::Result<PathBuf> {
     let mut args = std::env::args().skip(1);
-    if let Some(flag) = args.next() {
-        if flag == "--config" {
-            if let Some(path) = args.next() {
-                return PathBuf::from(path);
+    let mut config_path = PathBuf::from("config.toml");
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" | "-c" => {
+                let path = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--config requires a path argument"))?;
+                config_path = PathBuf::from(path);
+            }
+            "--help" | "-h" => {
+                println!("Usage: ambros-p2p [--config <path>]");
+                println!();
+                println!("Options:");
+                println!("  -c, --config <path>   Path to TOML config file [default: config.toml]");
+                std::process::exit(0);
+            }
+            other => {
+                anyhow::bail!(
+                    "unknown argument '{other}'\nUsage: ambros-p2p [--config <path>]"
+                );
             }
         }
     }
-    PathBuf::from("config.toml")
+
+    Ok(config_path)
 }

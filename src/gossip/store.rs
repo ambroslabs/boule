@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use chrono::Utc;
 
 use super::{ContentHash, GossipMessage, InsertResult};
 
 pub struct GossipStore {
-    inner: Mutex<StoreInner>,
+    inner: RwLock<StoreInner>,
 }
 
 struct StoreInner {
@@ -17,7 +17,7 @@ struct StoreInner {
 impl GossipStore {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(StoreInner {
+            inner: RwLock::new(StoreInner {
                 messages: HashMap::new(),
                 seen: HashSet::new(),
             }),
@@ -25,11 +25,26 @@ impl GossipStore {
     }
 
     pub fn try_insert(&self, msg: GossipMessage) -> InsertResult {
-        let mut inner = self.inner.lock().unwrap();
+        // Check expiry before taking any lock.
         if msg.is_expired() {
             return InsertResult::Expired;
         }
         let hash = msg.content_hash();
+
+        // Fast path: shared read lock to check seen set.
+        // This is the common case for duplicate messages and does not block other readers.
+        {
+            let inner = self.inner.read().unwrap();
+            if inner.seen.contains(&hash) {
+                return InsertResult::AlreadySeen;
+            }
+        }
+
+        // Slow path: exclusive write lock with re-check (double-checked locking).
+        let mut inner = self.inner.write().unwrap();
+        if msg.is_expired() {
+            return InsertResult::Expired;
+        }
         if inner.seen.contains(&hash) {
             return InsertResult::AlreadySeen;
         }
@@ -39,7 +54,7 @@ impl GossipStore {
     }
 
     pub fn list_live(&self) -> Vec<GossipMessage> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.read().unwrap();
         let now = Utc::now();
         inner
             .messages
@@ -50,7 +65,7 @@ impl GossipStore {
     }
 
     pub fn remove_expired(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let now = Utc::now();
         let expired: Vec<ContentHash> = inner
             .messages

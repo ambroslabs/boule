@@ -46,7 +46,9 @@ pub async fn run(
                     }
                     Some(PeerCommand::SendTo { peer_id, msg }) => {
                         if let Some(tx) = peers.get(&peer_id) {
-                            let _ = tx.try_send(msg);
+                            if tx.try_send(msg).is_err() {
+                                warn!("SendTo {peer_id}: channel full or closed");
+                            }
                         } else {
                             warn!("SendTo unknown peer {peer_id}");
                         }
@@ -60,6 +62,7 @@ pub async fn run(
                     }
                     Some(PeerCommand::ListPeers { reply }) => {
                         let list: Vec<PeerId> = peers.keys().copied().collect();
+                        // Ignore send error: the requester cancelled before receiving the reply.
                         let _ = reply.send(list);
                     }
                     None => break,
@@ -86,7 +89,14 @@ fn register_connection(
 
     tokio::spawn(async move {
         connection::run(addr, stream, write_rx, event_tx).await;
-        let _ = internal_tx.send(ManagerMsg::PeerGone { peer_id: addr }).await;
+        if internal_tx
+            .send(ManagerMsg::PeerGone { peer_id: addr })
+            .await
+            .is_err()
+        {
+            // Expected during shutdown when the manager has already exited.
+            warn!("could not notify manager of PeerGone for {addr}");
+        }
     });
 }
 

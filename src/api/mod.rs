@@ -1,6 +1,5 @@
 pub mod types;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -28,7 +27,7 @@ struct AppState {
 pub async fn serve(
     store: Arc<GossipStore>,
     cmd_tx: mpsc::Sender<PeerCommand>,
-    listen_addr: SocketAddr,
+    listener: tokio::net::TcpListener,
 ) {
     let state = AppState { store, cmd_tx };
 
@@ -37,8 +36,7 @@ pub async fn serve(
         .route("/peers", get(list_peers))
         .with_state(state);
 
-    info!("HTTP API listening on {listen_addr}");
-    let listener = tokio::net::TcpListener::bind(listen_addr).await.unwrap();
+    info!("HTTP API listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }
 

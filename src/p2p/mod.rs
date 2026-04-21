@@ -11,7 +11,7 @@ use crate::wire::WireMessage;
 pub type PeerId = SocketAddr;
 
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO: remove once SendTo and Disconnect are wired up
 pub enum PeerCommand {
     Broadcast { msg: WireMessage },
     SendTo { peer_id: PeerId, msg: WireMessage },

@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, serde::Deserialize)]
 pub struct Config {
@@ -12,6 +12,10 @@ pub struct Config {
 #[derive(Debug, serde::Deserialize)]
 pub struct NodeConfig {
     pub listen_addr: SocketAddr,
+    /// If set, the node writes its actual bound addresses (P2P + API) to this file
+    /// as JSON once both listeners are ready. Used by tests to discover dynamic ports.
+    #[serde(default)]
+    pub addr_file: Option<PathBuf>,
 }
 
 #[derive(Debug, serde::Deserialize)]

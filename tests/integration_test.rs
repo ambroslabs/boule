@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::net::TcpListener as StdTcpListener;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -7,10 +6,18 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use tempfile::NamedTempFile;
 
+#[derive(serde::Deserialize)]
+struct NodeAddrs {
+    p2p_addr: String,
+    api_addr: String,
+}
+
 struct NodeGuard {
     child: Child,
     api_port: u16,
+    p2p_addr: String,
     _config: NamedTempFile,
+    _addr_file: NamedTempFile,
 }
 
 impl NodeGuard {
@@ -26,25 +33,20 @@ impl Drop for NodeGuard {
     }
 }
 
-/// Ask the OS for a free port by binding to :0, recording the assigned port,
-/// then releasing the socket. There is a small TOCTOU window before the node
-/// process binds the port, but it is negligible in a local test environment.
-fn free_port() -> u16 {
-    StdTcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+/// Spawn a node with port 0 for both listeners. The node writes its actual
+/// bound addresses to a temp file; we poll until the file is populated and
+/// parse the real ports — no TOCTOU window, no reserved-port races.
+async fn spawn_node(peers: &[&str]) -> NodeGuard {
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
 
-fn spawn_node(p2p_port: u16, api_port: u16, peers: &[u16]) -> NodeGuard {
     let peer_lines: String = peers
         .iter()
-        .map(|p| format!("\n[[peers]]\naddr = \"127.0.0.1:{p}\"\n"))
+        .map(|addr| format!("\n[[peers]]\naddr = \"{addr}\"\n"))
         .collect();
 
     let config = format!(
-        "[node]\nlisten_addr = \"127.0.0.1:{p2p_port}\"\n\n[api]\nlisten_addr = \"127.0.0.1:{api_port}\"\ncleanup_interval_secs = 5\n{peer_lines}",
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}"
     );
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -58,10 +60,35 @@ fn spawn_node(p2p_port: u16, api_port: u16, peers: &[u16]) -> NodeGuard {
         .spawn()
         .expect("failed to spawn node binary");
 
+    // Poll until the node writes its actual bound addresses to addr_file.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let addrs = loop {
+        if Instant::now() > deadline {
+            panic!("node did not write addr_file within 10s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break addrs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let api_port: u16 = addrs
+        .api_addr
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+
     NodeGuard {
         child,
         api_port,
+        p2p_addr: addrs.p2p_addr,
         _config: config_file,
+        _addr_file: addr_file,
     }
 }
 
@@ -131,15 +158,14 @@ async fn poll_for_message(node: &NodeGuard, content: &str, timeout: Duration) {
     }
 }
 
-/// Start a three-node fully-connected cluster on dynamically allocated ports.
+/// Start a three-node fully-connected cluster using OS-assigned ports.
+/// Sequential startup builds the mesh via inbound connections:
+/// node1 (no peers) → node2 connects to node1 → node3 connects to both.
+/// Each pair ends up with exactly one TCP connection, giving every node 2 peers.
 async fn start_cluster() -> (NodeGuard, NodeGuard, NodeGuard) {
-    let (p2p_1, api_1) = (free_port(), free_port());
-    let (p2p_2, api_2) = (free_port(), free_port());
-    let (p2p_3, api_3) = (free_port(), free_port());
-
-    let node1 = spawn_node(p2p_1, api_1, &[p2p_2, p2p_3]);
-    let node2 = spawn_node(p2p_2, api_2, &[p2p_1, p2p_3]);
-    let node3 = spawn_node(p2p_3, api_3, &[p2p_1, p2p_2]);
+    let node1 = spawn_node(&[]).await;
+    let node2 = spawn_node(&[&node1.p2p_addr]).await;
+    let node3 = spawn_node(&[&node1.p2p_addr, &node2.p2p_addr]).await;
 
     let ready_timeout = Duration::from_secs(10);
     wait_until_ready(&node1, ready_timeout).await;

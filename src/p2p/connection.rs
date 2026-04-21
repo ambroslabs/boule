@@ -82,7 +82,13 @@ pub async fn run(
         }
     }
 
-    let _ = event_tx
+    // send().await returns Err only if the receiver (GossipEngine) has exited.
+    // The channel capacity (256) means this will not block in normal operation.
+    if event_tx
         .send(PeerEvent::PeerDisconnected { peer_id })
-        .await;
+        .await
+        .is_err()
+    {
+        warn!("event channel closed before PeerDisconnected could be sent for {peer_id}");
+    }
 }
