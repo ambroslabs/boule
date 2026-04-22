@@ -2,7 +2,6 @@ mod api;
 mod config;
 mod gossip;
 mod p2p;
-mod wire;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -1,6 +1,7 @@
 pub mod cleanup;
 pub mod engine;
 pub mod store;
+pub mod wire;
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};

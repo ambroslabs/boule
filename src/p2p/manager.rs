@@ -5,9 +5,9 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use super::connection;
+use bytes::Bytes;
 use super::tls::{node_id_to_base58, NodeId, TlsStream};
 use super::{PeerCommand, PeerEvent};
-use crate::wire::WireMessage;
 
 /// Internal messages that flow into the manager (from listener + connection tasks).
 pub enum ManagerMsg {
@@ -23,7 +23,7 @@ pub async fn run(
     internal_tx: mpsc::Sender<ManagerMsg>,
     peer_gone_tx: broadcast::Sender<NodeId>,
 ) {
-    let mut peers: HashMap<NodeId, mpsc::Sender<WireMessage>> = HashMap::new();
+    let mut peers: HashMap<NodeId, mpsc::Sender<Bytes>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -91,7 +91,7 @@ fn register_connection(
     peer_node_id: NodeId,
     addr: SocketAddr,
     stream: TlsStream,
-    peers: &mut HashMap<NodeId, mpsc::Sender<WireMessage>>,
+    peers: &mut HashMap<NodeId, mpsc::Sender<Bytes>>,
     event_tx: mpsc::Sender<PeerEvent>,
     internal_tx: mpsc::Sender<ManagerMsg>,
 ) {
@@ -111,7 +111,7 @@ fn register_connection(
         info!("registering new peer {id} at {addr}");
     }
 
-    let (write_tx, write_rx) = mpsc::channel::<WireMessage>(64);
+    let (write_tx, write_rx) = mpsc::channel::<Bytes>(64);
     peers.insert(peer_node_id, write_tx);
 
     tokio::spawn(async move {
@@ -127,7 +127,7 @@ fn register_connection(
     });
 }
 
-fn broadcast_msg(peers: &HashMap<NodeId, mpsc::Sender<WireMessage>>, msg: WireMessage) {
+fn broadcast_msg(peers: &HashMap<NodeId, mpsc::Sender<Bytes>>, msg: Bytes) {
     for (node_id, tx) in peers {
         let id = node_id_to_base58(node_id);
         if tx.try_send(msg.clone()).is_err() {

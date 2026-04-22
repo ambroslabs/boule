@@ -13,9 +13,10 @@ use tracing::{info, warn};
 
 use crate::gossip::store::GossipStore;
 use crate::gossip::{GossipMessage, InsertResult};
+use bytes::Bytes;
+use crate::gossip::wire::WireMessage;
 use crate::p2p::{PeerCommand, NodeId};
 use crate::p2p::tls::node_id_to_base58;
-use crate::wire::WireMessage;
 
 use types::{MessageItem, PostMessageRequest, PostMessageResponse};
 
@@ -58,11 +59,11 @@ async fn post_message(
 
     match state.store.try_insert(msg.clone()) {
         InsertResult::Inserted => {
+            let encoded = serde_json::to_vec(&WireMessage::Gossip(msg))
+                .expect("WireMessage serialization cannot fail");
             if state
                 .cmd_tx
-                .send(PeerCommand::Broadcast {
-                    msg: WireMessage::Gossip(msg),
-                })
+                .send(PeerCommand::Broadcast { msg: Bytes::from(encoded) })
                 .await
                 .is_err()
             {
