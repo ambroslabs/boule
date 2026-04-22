@@ -7,16 +7,15 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
+use bytes::Bytes;
 use chrono::Utc;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::gossip::store::GossipStore;
-use crate::gossip::{GossipMessage, InsertResult};
-use bytes::Bytes;
 use crate::gossip::wire::WireMessage;
-use crate::p2p::{PeerCommand, NodeId};
-use crate::p2p::tls::node_id_to_base58;
+use crate::gossip::{GossipMessage, InsertResult};
+use crate::p2p::PeerCommand;
 
 use types::{MessageItem, PostMessageRequest, PostMessageResponse};
 
@@ -26,20 +25,11 @@ struct AppState {
     cmd_tx: mpsc::Sender<PeerCommand>,
 }
 
-pub async fn serve(
-    store: Arc<GossipStore>,
-    cmd_tx: mpsc::Sender<PeerCommand>,
-    listener: tokio::net::TcpListener,
-) {
+pub fn router(store: Arc<GossipStore>, cmd_tx: mpsc::Sender<PeerCommand>) -> Router {
     let state = AppState { store, cmd_tx };
-
-    let app = Router::new()
+    Router::new()
         .route("/messages", get(list_messages).post(post_message))
-        .route("/peers", get(list_peers))
-        .with_state(state);
-
-    info!("HTTP API listening on {}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+        .with_state(state)
 }
 
 async fn post_message(
@@ -91,13 +81,4 @@ async fn list_messages(State(state): State<AppState>) -> Json<Vec<MessageItem>> 
             })
             .collect(),
     )
-}
-
-async fn list_peers(State(state): State<AppState>) -> Json<Vec<String>> {
-    let (tx, rx) = oneshot::channel::<Vec<NodeId>>();
-    let _ = state.cmd_tx.send(PeerCommand::ListPeers { reply: tx }).await;
-    // If PeerManager has exited, the oneshot sender is dropped and rx.await returns
-    // RecvError; unwrap_or_default() maps that to an empty Vec, which is correct.
-    let peers = rx.await.unwrap_or_default();
-    Json(peers.iter().map(node_id_to_base58).collect())
 }
