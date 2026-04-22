@@ -4,14 +4,15 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{error, warn};
 
-use crate::p2p::tls::{node_id_to_base58, NodeId, TlsStream};
+use crate::p2p::manager::AnyStream;
+use crate::p2p::tls::{node_id_to_base58, NodeId};
 use crate::p2p::PeerEvent;
 
 const MAX_FRAME_LEN: usize = 1024 * 1024; // 1 MB
 
 pub async fn run(
     node_id: NodeId,
-    stream: TlsStream,
+    stream: AnyStream,
     mut write_rx: mpsc::Receiver<Bytes>,
     event_tx: mpsc::Sender<PeerEvent>,
 ) {
@@ -29,7 +30,7 @@ pub async fn run(
                 match result {
                     Some(Ok(buf)) => {
                         let _ = event_tx
-                            .send(PeerEvent::MessageReceived { node_id, msg: buf.freeze() })
+                            .send(PeerEvent::MessageReceived { node_id, msg: Bytes::from(buf) })
                             .await;
                     }
                     Some(Err(e)) => {

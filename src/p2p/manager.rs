@@ -1,17 +1,26 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
-use super::connection;
 use bytes::Bytes;
-use super::tls::{node_id_to_base58, NodeId, TlsStream};
+use super::connection;
+use super::tls::{node_id_to_base58, NodeId};
 use super::{PeerCommand, PeerEvent};
+
+/// Combined async I/O trait used as a protocol-agnostic stream type.
+/// Rust's trait-object rules only allow one non-auto trait per `dyn`, so we
+/// need this supertrait to combine AsyncRead and AsyncWrite into one.
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncReadWrite for T {}
+
+pub type AnyStream = Box<dyn AsyncReadWrite>;
 
 /// Internal messages that flow into the manager (from listener + connection tasks).
 pub enum ManagerMsg {
-    NewConnection { node_id: NodeId, addr: SocketAddr, stream: TlsStream },
+    NewConnection { node_id: NodeId, addr: SocketAddr, stream: AnyStream },
     PeerGone { node_id: NodeId },
 }
 
@@ -90,7 +99,7 @@ fn register_connection(
     our_node_id: NodeId,
     peer_node_id: NodeId,
     addr: SocketAddr,
-    stream: TlsStream,
+    stream: AnyStream,
     peers: &mut HashMap<NodeId, mpsc::Sender<Bytes>>,
     event_tx: mpsc::Sender<PeerEvent>,
     internal_tx: mpsc::Sender<ManagerMsg>,

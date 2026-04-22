@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::p2p::manager::ManagerMsg;
-use crate::p2p::tls::{base58_to_node_id, node_id_to_base58, TlsIdentity, TlsStream};
+use crate::p2p::tls::{node_id_to_base58, TlsIdentity};
+use crate::p2p::tls_protocol::TlsConnectionProtocol;
+use crate::p2p::ConnectionProtocol;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -73,15 +75,11 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // Bind the P2P listener before spawning the accept loop for the same reason.
-    let listener = TcpListener::bind(config.node.listen_addr).await?;
-    let p2p_actual_addr = listener.local_addr()?;
+    // Bind the P2P listener before spawning the protocol so the actual port is
+    // known before we write addr_file.
+    let p2p_listener = TcpListener::bind(config.node.listen_addr).await?;
+    let p2p_actual_addr = p2p_listener.local_addr()?;
     info!("P2P listening on {p2p_actual_addr}");
-    let listener_handle = {
-        let itx = internal_tx.clone();
-        let acceptor = identity.acceptor.clone();
-        tokio::spawn(p2p::listener::run(listener, acceptor, itx))
-    };
 
     // Write bound addresses + node ID to addr_file if configured.
     // Tests use this to discover actual ports when listen_addr uses port 0.
@@ -94,19 +92,12 @@ async fn main() -> anyhow::Result<()> {
         std::fs::write(path, content.to_string())?;
     }
 
-    // For each configured peer, spawn a reconnect task with exponential backoff.
-    for peer_cfg in &config.peers {
-        let addr = peer_cfg.addr;
-        let expected_node_id = peer_cfg
-            .node_id
-            .as_deref()
-            .map(base58_to_node_id)
-            .transpose()?;
-        let itx = internal_tx.clone();
-        let pgt = peer_gone_tx.clone();
-        let id = Arc::clone(&identity);
-        tokio::spawn(reconnect_loop(addr, expected_node_id, id, itx, pgt));
-    }
+    let protocol = TlsConnectionProtocol {
+        identity: Arc::clone(&identity),
+        peers: config.peers.clone(),
+        listener: p2p_listener,
+    };
+    let protocol_handle = tokio::spawn(protocol.run(internal_tx.clone(), peer_gone_tx.clone()));
 
     tokio::signal::ctrl_c().await?;
     info!("shutting down...");
@@ -118,95 +109,11 @@ async fn main() -> anyhow::Result<()> {
         let _ = engine_handle.await;
         let _ = cleanup_handle.await;
         let _ = api_handle.await;
-        let _ = listener_handle.await;
+        let _ = protocol_handle.await;
     })
     .await;
 
     Ok(())
-}
-
-/// Continuously attempts to maintain an outbound connection to `addr`.
-/// On success, waits for the connection to die (via the peer_gone broadcast)
-/// before retrying. Backs off exponentially on failure, capped at 60 s.
-async fn reconnect_loop(
-    addr: std::net::SocketAddr,
-    expected_node_id: Option<p2p::NodeId>,
-    identity: Arc<TlsIdentity>,
-    internal_tx: mpsc::Sender<ManagerMsg>,
-    peer_gone_tx: broadcast::Sender<p2p::NodeId>,
-) {
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(60);
-
-    loop {
-        let mut peer_gone_rx = peer_gone_tx.subscribe();
-
-        match dial(&addr, expected_node_id, &identity).await {
-            Ok((stream, node_id)) => {
-                if internal_tx
-                    .send(ManagerMsg::NewConnection { node_id, addr, stream })
-                    .await
-                    .is_err()
-                {
-                    return; // manager has exited — we're shutting down
-                }
-                backoff = Duration::from_secs(1);
-
-                // Wait until this specific peer disconnects.
-                loop {
-                    match peer_gone_rx.recv().await {
-                        Ok(gone_id) if gone_id == node_id => break,
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("could not connect to peer {addr}: {e}; retry in {backoff:?}");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(max_backoff);
-            }
-        }
-    }
-}
-
-/// Opens a TLS connection to `addr`, verifies the peer's node ID matches
-/// `expected_node_id` (if set), and returns the TLS stream + peer's NodeId.
-async fn dial(
-    addr: &std::net::SocketAddr,
-    expected_node_id: Option<p2p::NodeId>,
-    identity: &TlsIdentity,
-) -> anyhow::Result<(TlsStream, p2p::NodeId)> {
-    use tokio_rustls::TlsConnector;
-
-    let tcp = tokio::net::TcpStream::connect(addr).await?;
-    let connector = TlsConnector::from(Arc::clone(&identity.client_config));
-    let server_name = rustls::pki_types::ServerName::try_from("ambros-p2p")
-        .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
-    let tls_stream = connector.connect(server_name, tcp).await?;
-
-    let (_, client_conn) = tls_stream.get_ref();
-    let certs = client_conn
-        .peer_certificates()
-        .ok_or_else(|| anyhow::anyhow!("peer presented no certificate"))?;
-    let cert = certs
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("empty peer certificate chain"))?;
-    let node_id = p2p::tls::extract_node_id(cert)?;
-
-    if let Some(expected) = expected_node_id {
-        if node_id != expected {
-            anyhow::bail!(
-                "peer node ID mismatch: expected {}, got {}",
-                node_id_to_base58(&expected),
-                node_id_to_base58(&node_id),
-            );
-        }
-    }
-
-    info!("connected to peer {addr} (node {})", node_id_to_base58(&node_id));
-    Ok((TlsStream::Client(tls_stream), node_id))
 }
 
 fn parse_config_arg() -> anyhow::Result<PathBuf> {

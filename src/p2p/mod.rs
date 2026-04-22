@@ -1,13 +1,23 @@
 pub mod api;
 pub mod connection;
+pub mod dialer;
 pub mod listener;
 pub mod manager;
 pub mod tls;
+pub mod tls_protocol;
 
 use bytes::Bytes;
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub use tls::NodeId;
+
+pub trait ConnectionProtocol: Send + 'static {
+    fn run(
+        self,
+        manager_tx: mpsc::Sender<manager::ManagerMsg>,
+        peer_gone_tx: broadcast::Sender<NodeId>,
+    ) -> impl std::future::Future<Output = ()> + Send;
+}
 
 #[derive(Debug)]
 #[allow(dead_code)] // TODO: remove once SendTo and Disconnect are wired up

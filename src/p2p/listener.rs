@@ -46,7 +46,7 @@ async fn handshake_inbound(
         .send(ManagerMsg::NewConnection {
             node_id,
             addr,
-            stream: TlsStream::Server(tls_stream),
+            stream: Box::new(TlsStream::Server(tls_stream)),
         })
         .await;
     Ok(())
