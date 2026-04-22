@@ -22,13 +22,24 @@ pub trait ConnectionProtocol: Send + 'static {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum PeerCommand {
-    RegisterProtocol { id: u8, reply: oneshot::Sender<ProtocolHandle> },
-    Disconnect { node_id: NodeId },
-    ListPeers { reply: oneshot::Sender<Vec<NodeId>> },
-    HasPeer { node_id: NodeId, reply: oneshot::Sender<bool> },
+    RegisterProtocol {
+        id: u8,
+        reply: oneshot::Sender<ProtocolHandle>,
+    },
+    Disconnect {
+        node_id: NodeId,
+    },
+    ListPeers {
+        reply: oneshot::Sender<Vec<NodeId>>,
+    },
+    HasPeer {
+        node_id: NodeId,
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // SendTo will be used once multi-protocol routing is needed
 pub enum ProtocolOutbound {
     Broadcast(Bytes),
     SendTo { node_id: NodeId, payload: Bytes },

@@ -68,7 +68,13 @@ async fn post_message(
         }
     }
 
-    (StatusCode::CREATED, Json(PostMessageResponse { hash: hex::encode(hash) })).into_response()
+    (
+        StatusCode::CREATED,
+        Json(PostMessageResponse {
+            hash: hex::encode(hash),
+        }),
+    )
+        .into_response()
 }
 
 async fn list_messages(State(state): State<AppState>) -> Json<Vec<MessageItem>> {

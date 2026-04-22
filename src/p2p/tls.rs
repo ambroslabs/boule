@@ -8,7 +8,9 @@ use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::{ClientConfig, DigitallySignedStruct, DistinguishedName, Error, ServerConfig, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, DistinguishedName, Error, ServerConfig, SignatureScheme,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 
@@ -228,7 +230,9 @@ impl ServerCertVerifier for AnyCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.crypto.signature_verification_algorithms.supported_schemes()
+        self.crypto
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -283,6 +287,8 @@ impl ClientCertVerifier for AnyCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.crypto.signature_verification_algorithms.supported_schemes()
+        self.crypto
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

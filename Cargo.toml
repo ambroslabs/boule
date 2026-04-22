@@ -2,6 +2,7 @@
 name = "ambros-p2p"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
 
 [dependencies]
 tokio             = { version = "1", features = ["full"] }
@@ -21,7 +22,6 @@ futures-util      = { version = "0.3", features = ["sink"] }
 rcgen             = { version = "0.13", default-features = false, features = ["ring"] }
 rustls            = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls      = { version = "0.26", default-features = false, features = ["ring"] }
-rustls-pemfile    = "2"
 bs58              = "0.5"
 
 [dev-dependencies]

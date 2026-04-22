@@ -3,14 +3,17 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tracing::{info, warn};
 
+use crate::gossip::InsertResult;
 use crate::gossip::store::GossipStore;
 use crate::gossip::wire::WireMessage;
-use crate::gossip::InsertResult;
 use crate::p2p::tls::node_id_to_base58;
 use crate::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 
 pub async fn run(handle: ProtocolHandle, store: Arc<GossipStore>) {
-    let ProtocolHandle { send_tx, mut event_rx } = handle;
+    let ProtocolHandle {
+        send_tx,
+        mut event_rx,
+    } = handle;
 
     while let Some(event) = event_rx.recv().await {
         match event {

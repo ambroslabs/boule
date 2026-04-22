@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use super::connection;
-use super::tls::{node_id_to_base58, NodeId};
+use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 
 /// Combined async I/O trait used as a protocol-agnostic stream type.
@@ -20,10 +20,22 @@ pub type AnyStream = Box<dyn AsyncReadWrite>;
 
 /// Internal messages that flow into the manager (from listener + connection tasks).
 pub enum ManagerMsg {
-    NewConnection { node_id: NodeId, addr: SocketAddr, stream: AnyStream },
-    PeerGone { node_id: NodeId },
-    InboundMessage { node_id: NodeId, msg: Bytes },
-    ProtocolSend { protocol_id: u8, outbound: ProtocolOutbound },
+    NewConnection {
+        node_id: NodeId,
+        addr: SocketAddr,
+        stream: AnyStream,
+    },
+    PeerGone {
+        node_id: NodeId,
+    },
+    InboundMessage {
+        node_id: NodeId,
+        msg: Bytes,
+    },
+    ProtocolSend {
+        protocol_id: u8,
+        outbound: ProtocolOutbound,
+    },
 }
 
 pub async fn run(
@@ -168,14 +180,18 @@ fn register_connection(
     peers.insert(peer_node_id, write_tx);
 
     for event_tx in protocols.values() {
-        let _ = event_tx.try_send(ProtocolEvent::PeerConnected { node_id: peer_node_id });
+        let _ = event_tx.try_send(ProtocolEvent::PeerConnected {
+            node_id: peer_node_id,
+        });
     }
 
     let conn_tx = internal_tx.clone();
     tokio::spawn(async move {
         connection::run(peer_node_id, stream, write_rx, conn_tx).await;
         if internal_tx
-            .send(ManagerMsg::PeerGone { node_id: peer_node_id })
+            .send(ManagerMsg::PeerGone {
+                node_id: peer_node_id,
+            })
             .await
             .is_err()
         {

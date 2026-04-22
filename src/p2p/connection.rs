@@ -5,7 +5,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::error;
 
 use crate::p2p::manager::{AnyStream, ManagerMsg};
-use crate::p2p::tls::{node_id_to_base58, NodeId};
+use crate::p2p::tls::{NodeId, node_id_to_base58};
 
 const MAX_FRAME_LEN: usize = 1024 * 1024; // 1 MB
 
