@@ -25,7 +25,7 @@ fn default_key_file() -> PathBuf {
     PathBuf::from("node.key")
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct PeerConfig {
     pub addr: SocketAddr,
     /// Expected base58-encoded Ed25519 node ID of this peer.
