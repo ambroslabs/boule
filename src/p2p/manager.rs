@@ -1,39 +1,48 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use super::connection;
-use super::{PeerCommand, PeerEvent, PeerId};
+use super::tls::{node_id_to_base58, NodeId, TlsStream};
+use super::{PeerCommand, PeerEvent};
 use crate::wire::WireMessage;
 
 /// Internal messages that flow into the manager (from listener + connection tasks).
 pub enum ManagerMsg {
-    NewConnection { stream: TcpStream, addr: SocketAddr },
-    PeerGone { peer_id: PeerId },
+    NewConnection { node_id: NodeId, addr: SocketAddr, stream: TlsStream },
+    PeerGone { node_id: NodeId },
 }
 
 pub async fn run(
+    our_node_id: NodeId,
     mut cmd_rx: mpsc::Receiver<PeerCommand>,
     event_tx: mpsc::Sender<PeerEvent>,
     mut internal_rx: mpsc::Receiver<ManagerMsg>,
     internal_tx: mpsc::Sender<ManagerMsg>,
+    peer_gone_tx: broadcast::Sender<NodeId>,
 ) {
-    // peer_id -> per-connection write sender
-    let mut peers: HashMap<PeerId, mpsc::Sender<WireMessage>> = HashMap::new();
+    let mut peers: HashMap<NodeId, mpsc::Sender<WireMessage>> = HashMap::new();
 
     loop {
         tokio::select! {
             msg = internal_rx.recv() => {
                 match msg {
-                    Some(ManagerMsg::NewConnection { stream, addr }) => {
-                        register_connection(addr, stream, &mut peers, event_tx.clone(), internal_tx.clone());
+                    Some(ManagerMsg::NewConnection { node_id, addr, stream }) => {
+                        register_connection(
+                            our_node_id,
+                            node_id,
+                            addr,
+                            stream,
+                            &mut peers,
+                            event_tx.clone(),
+                            internal_tx.clone(),
+                        );
                     }
-                    Some(ManagerMsg::PeerGone { peer_id }) => {
-                        peers.remove(&peer_id);
-                        // The connection task already sent PeerDisconnected to event_tx.
+                    Some(ManagerMsg::PeerGone { node_id }) => {
+                        peers.remove(&node_id);
+                        let _ = peer_gone_tx.send(node_id);
                     }
                     None => break,
                 }
@@ -42,28 +51,33 @@ pub async fn run(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(PeerCommand::Broadcast { msg }) => {
-                        broadcast(&peers, msg);
+                        broadcast_msg(&peers, msg);
                     }
-                    Some(PeerCommand::SendTo { peer_id, msg }) => {
-                        if let Some(tx) = peers.get(&peer_id) {
+                    Some(PeerCommand::SendTo { node_id, msg }) => {
+                        let id = node_id_to_base58(&node_id);
+                        if let Some(tx) = peers.get(&node_id) {
                             if tx.try_send(msg).is_err() {
-                                warn!("SendTo {peer_id}: channel full or closed");
+                                warn!("SendTo {id}: channel full or closed");
                             }
                         } else {
-                            warn!("SendTo unknown peer {peer_id}");
+                            warn!("SendTo unknown peer {id}");
                         }
                     }
-                    Some(PeerCommand::Disconnect { peer_id }) => {
-                        if peers.remove(&peer_id).is_none() {
-                            warn!("Disconnect unknown peer {peer_id}");
+                    Some(PeerCommand::Disconnect { node_id }) => {
+                        let id = node_id_to_base58(&node_id);
+                        if peers.remove(&node_id).is_none() {
+                            warn!("Disconnect unknown peer {id}");
                         }
                         // Dropping the sender closes the write channel, which
                         // causes the connection task to exit and emit PeerDisconnected.
                     }
                     Some(PeerCommand::ListPeers { reply }) => {
-                        let list: Vec<PeerId> = peers.keys().copied().collect();
+                        let list: Vec<NodeId> = peers.keys().copied().collect();
                         // Ignore send error: the requester cancelled before receiving the reply.
                         let _ = reply.send(list);
+                    }
+                    Some(PeerCommand::HasPeer { node_id, reply }) => {
+                        let _ = reply.send(peers.contains_key(&node_id));
                     }
                     None => break,
                 }
@@ -73,37 +87,51 @@ pub async fn run(
 }
 
 fn register_connection(
+    our_node_id: NodeId,
+    peer_node_id: NodeId,
     addr: SocketAddr,
-    stream: TcpStream,
-    peers: &mut HashMap<PeerId, mpsc::Sender<WireMessage>>,
+    stream: TlsStream,
+    peers: &mut HashMap<NodeId, mpsc::Sender<WireMessage>>,
     event_tx: mpsc::Sender<PeerEvent>,
     internal_tx: mpsc::Sender<ManagerMsg>,
 ) {
-    let (write_tx, write_rx) = mpsc::channel::<WireMessage>(64);
+    let id = node_id_to_base58(&peer_node_id);
 
-    // If there's already a connection for this addr, the old sender is dropped,
-    // which will close the old connection task's write channel.
-    if peers.insert(addr, write_tx).is_some() {
-        info!("replacing existing connection for {addr}");
+    if peers.contains_key(&peer_node_id) {
+        // Tie-breaker: the node with the lexicographically lower ID keeps the
+        // existing connection; the higher-ID node accepts the new one instead.
+        if our_node_id < peer_node_id {
+            info!("tie-breaker: keeping existing connection to {id} (we have lower ID)");
+            return;
+        }
+        info!("tie-breaker: replacing existing connection to {id} (we have higher ID)");
+        // Dropping the old sender below closes the old write channel, which
+        // causes the old connection task to exit and fire PeerGone.
+    } else {
+        info!("registering new peer {id} at {addr}");
     }
 
+    let (write_tx, write_rx) = mpsc::channel::<WireMessage>(64);
+    peers.insert(peer_node_id, write_tx);
+
     tokio::spawn(async move {
-        connection::run(addr, stream, write_rx, event_tx).await;
+        connection::run(peer_node_id, stream, write_rx, event_tx).await;
         if internal_tx
-            .send(ManagerMsg::PeerGone { peer_id: addr })
+            .send(ManagerMsg::PeerGone { node_id: peer_node_id })
             .await
             .is_err()
         {
             // Expected during shutdown when the manager has already exited.
-            warn!("could not notify manager of PeerGone for {addr}");
+            warn!("could not notify manager of PeerGone for {id}");
         }
     });
 }
 
-fn broadcast(peers: &HashMap<PeerId, mpsc::Sender<WireMessage>>, msg: WireMessage) {
-    for (peer_id, tx) in peers {
+fn broadcast_msg(peers: &HashMap<NodeId, mpsc::Sender<WireMessage>>, msg: WireMessage) {
+    for (node_id, tx) in peers {
+        let id = node_id_to_base58(node_id);
         if tx.try_send(msg.clone()).is_err() {
-            warn!("broadcast to {peer_id}: channel full or closed, skipping");
+            warn!("broadcast to {id}: channel full or closed, skipping");
         }
     }
 }

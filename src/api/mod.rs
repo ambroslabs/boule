@@ -13,7 +13,8 @@ use tracing::{info, warn};
 
 use crate::gossip::store::GossipStore;
 use crate::gossip::{GossipMessage, InsertResult};
-use crate::p2p::{PeerCommand, PeerId};
+use crate::p2p::{PeerCommand, NodeId};
+use crate::p2p::tls::node_id_to_base58;
 use crate::wire::WireMessage;
 
 use types::{MessageItem, PostMessageRequest, PostMessageResponse};
@@ -91,11 +92,11 @@ async fn list_messages(State(state): State<AppState>) -> Json<Vec<MessageItem>> 
     )
 }
 
-async fn list_peers(State(state): State<AppState>) -> Json<Vec<PeerId>> {
-    let (tx, rx) = oneshot::channel();
+async fn list_peers(State(state): State<AppState>) -> Json<Vec<String>> {
+    let (tx, rx) = oneshot::channel::<Vec<NodeId>>();
     let _ = state.cmd_tx.send(PeerCommand::ListPeers { reply: tx }).await;
     // If PeerManager has exited, the oneshot sender is dropped and rx.await returns
     // RecvError; unwrap_or_default() maps that to an empty Vec, which is correct.
     let peers = rx.await.unwrap_or_default();
-    Json(peers)
+    Json(peers.iter().map(node_id_to_base58).collect())
 }

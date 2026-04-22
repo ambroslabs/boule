@@ -10,13 +10,16 @@ use tempfile::NamedTempFile;
 struct NodeAddrs {
     p2p_addr: String,
     api_addr: String,
+    node_id: String,
 }
 
 struct NodeGuard {
     child: Child,
     api_port: u16,
     p2p_addr: String,
+    node_id: String,
     _config: NamedTempFile,
+    _key_dir: tempfile::TempDir,
     _addr_file: NamedTempFile,
 }
 
@@ -33,20 +36,36 @@ impl Drop for NodeGuard {
     }
 }
 
+/// Peer descriptor used when configuring a node's `[[peers]]` list.
+struct PeerDesc<'a> {
+    p2p_addr: &'a str,
+    node_id: &'a str,
+}
+
 /// Spawn a node with port 0 for both listeners. The node writes its actual
-/// bound addresses to a temp file; we poll until the file is populated and
-/// parse the real ports — no TOCTOU window, no reserved-port races.
-async fn spawn_node(peers: &[&str]) -> NodeGuard {
+/// bound addresses and node ID to a temp file; we poll until the file is
+/// populated and parse the real values — no TOCTOU window, no reserved-port races.
+async fn spawn_node(peers: &[PeerDesc<'_>]) -> NodeGuard {
     let addr_file = NamedTempFile::new().unwrap();
     let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
 
+    // Use a temp dir so the key file path is valid but the file doesn't exist yet,
+    // causing the node to generate a fresh key on first run.
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_file_path = key_dir.path().join("node.key").to_str().unwrap().to_owned();
+
     let peer_lines: String = peers
         .iter()
-        .map(|addr| format!("\n[[peers]]\naddr = \"{addr}\"\n"))
+        .map(|p| {
+            format!(
+                "\n[[peers]]\naddr = \"{}\"\nnode_id = \"{}\"\n",
+                p.p2p_addr, p.node_id
+            )
+        })
         .collect();
 
     let config = format!(
-        "[node]\nlisten_addr = \"127.0.0.1:0\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}"
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_file_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}"
     );
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -87,7 +106,9 @@ async fn spawn_node(peers: &[&str]) -> NodeGuard {
         child,
         api_port,
         p2p_addr: addrs.p2p_addr,
+        node_id: addrs.node_id,
         _config: config_file,
+        _key_dir: key_dir,
         _addr_file: addr_file,
     }
 }
@@ -164,8 +185,16 @@ async fn poll_for_message(node: &NodeGuard, content: &str, timeout: Duration) {
 /// Each pair ends up with exactly one TCP connection, giving every node 2 peers.
 async fn start_cluster() -> (NodeGuard, NodeGuard, NodeGuard) {
     let node1 = spawn_node(&[]).await;
-    let node2 = spawn_node(&[&node1.p2p_addr]).await;
-    let node3 = spawn_node(&[&node1.p2p_addr, &node2.p2p_addr]).await;
+    let node2 = spawn_node(&[PeerDesc {
+        p2p_addr: &node1.p2p_addr,
+        node_id: &node1.node_id,
+    }])
+    .await;
+    let node3 = spawn_node(&[
+        PeerDesc { p2p_addr: &node1.p2p_addr, node_id: &node1.node_id },
+        PeerDesc { p2p_addr: &node2.p2p_addr, node_id: &node2.node_id },
+    ])
+    .await;
 
     let ready_timeout = Duration::from_secs(10);
     wait_until_ready(&node1, ready_timeout).await;

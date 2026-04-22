@@ -4,6 +4,7 @@ use tracing::{info, warn};
 
 use crate::gossip::store::GossipStore;
 use crate::gossip::InsertResult;
+use crate::p2p::tls::node_id_to_base58;
 use crate::p2p::{PeerCommand, PeerEvent};
 use crate::wire::WireMessage;
 
@@ -14,24 +15,25 @@ pub async fn run(
 ) {
     while let Some(event) = event_rx.recv().await {
         match event {
-            PeerEvent::PeerConnected { peer_id } => {
-                info!("peer connected: {peer_id}");
+            PeerEvent::PeerConnected { node_id } => {
+                info!("peer connected: {}", node_id_to_base58(&node_id));
             }
-            PeerEvent::PeerDisconnected { peer_id } => {
-                info!("peer disconnected: {peer_id}");
+            PeerEvent::PeerDisconnected { node_id } => {
+                info!("peer disconnected: {}", node_id_to_base58(&node_id));
             }
-            PeerEvent::MessageReceived { peer_id, msg } => {
+            PeerEvent::MessageReceived { node_id, msg } => {
+                let id = node_id_to_base58(&node_id);
                 let WireMessage::Gossip(gossip_msg) = msg.clone();
                 match store.try_insert(gossip_msg) {
                     InsertResult::Inserted => {
-                        info!("gossip message inserted, broadcasting (from {peer_id})");
+                        info!("gossip message inserted, broadcasting (from {id})");
                         let _ = cmd_tx.send(PeerCommand::Broadcast { msg }).await;
                     }
                     InsertResult::AlreadySeen => {
                         // normal dedup — no log spam
                     }
                     InsertResult::Expired => {
-                        warn!("received expired gossip message from {peer_id}, discarding");
+                        warn!("received expired gossip message from {id}, discarding");
                     }
                 }
             }
