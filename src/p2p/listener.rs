@@ -5,10 +5,14 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::manager::ManagerMsg;
-use super::tls::{extract_node_id, node_id_to_base58, TlsStream};
+use super::tls::{TlsStream, extract_node_id, node_id_to_base58};
 use tokio_rustls::TlsAcceptor;
 
-pub async fn run(listener: TcpListener, acceptor: TlsAcceptor, manager_tx: mpsc::Sender<ManagerMsg>) {
+pub async fn run(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    manager_tx: mpsc::Sender<ManagerMsg>,
+) {
     info!("TCP listener started on {}", listener.local_addr().unwrap());
     loop {
         match listener.accept().await {
@@ -16,7 +20,8 @@ pub async fn run(listener: TcpListener, acceptor: TlsAcceptor, manager_tx: mpsc:
                 let acceptor = acceptor.clone();
                 let manager_tx = manager_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handshake_inbound(tcp_stream, addr, acceptor, manager_tx).await {
+                    if let Err(e) = handshake_inbound(tcp_stream, addr, acceptor, manager_tx).await
+                    {
                         warn!("TLS handshake failed from {addr}: {e}");
                     }
                 });
@@ -39,9 +44,15 @@ async fn handshake_inbound(
     let certs = server_conn
         .peer_certificates()
         .ok_or_else(|| anyhow::anyhow!("no client certificate"))?;
-    let cert = certs.first().ok_or_else(|| anyhow::anyhow!("empty cert chain"))?;
+    let cert = certs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("empty cert chain"))?;
     let node_id = extract_node_id(cert)?;
-    info!("inbound TLS connection from {} (node {})", addr, node_id_to_base58(&node_id));
+    info!(
+        "inbound TLS connection from {} (node {})",
+        addr,
+        node_id_to_base58(&node_id)
+    );
     let _ = manager_tx
         .send(ManagerMsg::NewConnection {
             node_id,

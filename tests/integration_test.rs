@@ -3,7 +3,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
 #[derive(serde::Deserialize)]
@@ -94,13 +94,7 @@ async fn spawn_node(peers: &[PeerDesc<'_>]) -> NodeGuard {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let api_port: u16 = addrs
-        .api_addr
-        .rsplit(':')
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
 
     NodeGuard {
         child,
@@ -118,14 +112,12 @@ async fn wait_until_ready(node: &NodeGuard, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         if Instant::now() > deadline {
-            panic!("node on port {} did not become ready in time", node.api_port);
+            panic!(
+                "node on port {} did not become ready in time",
+                node.api_port
+            );
         }
-        if client
-            .get(node.api_url("/messages"))
-            .send()
-            .await
-            .is_ok()
-        {
+        if client.get(node.api_url("/messages")).send().await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -191,8 +183,14 @@ async fn start_cluster() -> (NodeGuard, NodeGuard, NodeGuard) {
     }])
     .await;
     let node3 = spawn_node(&[
-        PeerDesc { p2p_addr: &node1.p2p_addr, node_id: &node1.node_id },
-        PeerDesc { p2p_addr: &node2.p2p_addr, node_id: &node2.node_id },
+        PeerDesc {
+            p2p_addr: &node1.p2p_addr,
+            node_id: &node1.node_id,
+        },
+        PeerDesc {
+            p2p_addr: &node2.p2p_addr,
+            node_id: &node2.node_id,
+        },
     ])
     .await;
 
@@ -276,7 +274,10 @@ async fn test_duplicate_messages_are_deduplicated() {
         .iter()
         .filter(|m| m["content"] == "unique message")
         .count();
-    assert_eq!(count, 1, "expected exactly one copy after dedup, got {count}");
+    assert_eq!(
+        count, 1,
+        "expected exactly one copy after dedup, got {count}"
+    );
 }
 
 #[tokio::test]

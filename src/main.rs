@@ -10,10 +10,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::info;
 
-use crate::p2p::manager::ManagerMsg;
-use crate::p2p::tls::{node_id_to_base58, TlsIdentity};
-use crate::p2p::tls_protocol::TlsConnectionProtocol;
 use crate::p2p::ConnectionProtocol;
+use crate::p2p::manager::ManagerMsg;
+use crate::p2p::tls::{TlsIdentity, node_id_to_base58};
+use crate::p2p::tls_protocol::TlsConnectionProtocol;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,7 +49,10 @@ async fn main() -> anyhow::Result<()> {
     // PeerConnected events are never missed.
     let (reg_tx, reg_rx) = oneshot::channel();
     p2p_cmd_tx
-        .send(p2p::PeerCommand::RegisterProtocol { id: gossip::PROTOCOL_ID, reply: reg_tx })
+        .send(p2p::PeerCommand::RegisterProtocol {
+            id: gossip::PROTOCOL_ID,
+            reply: reg_tx,
+        })
         .await?;
     let gossip_handle = reg_rx.await?;
     let gossip_send_tx = gossip_handle.send_tx.clone();
@@ -140,9 +143,7 @@ fn parse_config_arg() -> anyhow::Result<PathBuf> {
                 std::process::exit(0);
             }
             other => {
-                anyhow::bail!(
-                    "unknown argument '{other}'\nUsage: ambros-p2p [--config <path>]"
-                );
+                anyhow::bail!("unknown argument '{other}'\nUsage: ambros-p2p [--config <path>]");
             }
         }
     }

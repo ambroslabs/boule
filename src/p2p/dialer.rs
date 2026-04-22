@@ -5,7 +5,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use super::manager::{AnyStream, ManagerMsg};
-use super::tls::{extract_node_id, node_id_to_base58, NodeId, TlsIdentity, TlsStream};
+use super::tls::{NodeId, TlsIdentity, TlsStream, extract_node_id, node_id_to_base58};
 
 /// Continuously attempts to maintain an outbound connection to `addr`.
 /// On success, waits for the connection to die (via the peer_gone broadcast)
@@ -26,7 +26,11 @@ pub async fn reconnect_loop(
         match dial(&addr, expected_node_id, &identity).await {
             Ok((stream, node_id)) => {
                 if internal_tx
-                    .send(ManagerMsg::NewConnection { node_id, addr, stream })
+                    .send(ManagerMsg::NewConnection {
+                        node_id,
+                        addr,
+                        stream,
+                    })
                     .await
                     .is_err()
                 {
@@ -87,6 +91,9 @@ async fn dial(
         }
     }
 
-    info!("connected to peer {addr} (node {})", node_id_to_base58(&node_id));
+    info!(
+        "connected to peer {addr} (node {})",
+        node_id_to_base58(&node_id)
+    );
     Ok((Box::new(TlsStream::Client(tls_stream)), node_id))
 }

@@ -3,12 +3,12 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::config::PeerConfig;
 use super::dialer;
 use super::listener;
 use super::manager::ManagerMsg;
-use super::tls::{base58_to_node_id, TlsIdentity};
+use super::tls::{TlsIdentity, base58_to_node_id};
 use super::{ConnectionProtocol, NodeId};
+use crate::config::PeerConfig;
 
 pub struct TlsConnectionProtocol {
     pub identity: Arc<TlsIdentity>,
@@ -17,7 +17,11 @@ pub struct TlsConnectionProtocol {
 }
 
 impl ConnectionProtocol for TlsConnectionProtocol {
-    async fn run(self, manager_tx: mpsc::Sender<ManagerMsg>, peer_gone_tx: broadcast::Sender<NodeId>) {
+    async fn run(
+        self,
+        manager_tx: mpsc::Sender<ManagerMsg>,
+        peer_gone_tx: broadcast::Sender<NodeId>,
+    ) {
         tokio::spawn(listener::run(
             self.listener,
             self.identity.acceptor.clone(),
