@@ -6,14 +6,13 @@ use tracing::{error, warn};
 
 use crate::p2p::tls::{node_id_to_base58, NodeId, TlsStream};
 use crate::p2p::PeerEvent;
-use crate::wire::WireMessage;
 
 const MAX_FRAME_LEN: usize = 1024 * 1024; // 1 MB
 
 pub async fn run(
     node_id: NodeId,
     stream: TlsStream,
-    mut write_rx: mpsc::Receiver<WireMessage>,
+    mut write_rx: mpsc::Receiver<Bytes>,
     event_tx: mpsc::Sender<PeerEvent>,
 ) {
     let id = node_id_to_base58(&node_id);
@@ -29,16 +28,9 @@ pub async fn run(
             result = framed.next() => {
                 match result {
                     Some(Ok(buf)) => {
-                        match serde_json::from_slice::<WireMessage>(&buf) {
-                            Ok(msg) => {
-                                let _ = event_tx
-                                    .send(PeerEvent::MessageReceived { node_id, msg })
-                                    .await;
-                            }
-                            Err(e) => {
-                                warn!("failed to deserialize message from {id}: {e}");
-                            }
-                        }
+                        let _ = event_tx
+                            .send(PeerEvent::MessageReceived { node_id, msg: buf.freeze() })
+                            .await;
                     }
                     Some(Err(e)) => {
                         error!("read error from {id}: {e}");
@@ -51,16 +43,9 @@ pub async fn run(
             msg = write_rx.recv() => {
                 match msg {
                     Some(msg) => {
-                        match serde_json::to_vec(&msg) {
-                            Ok(encoded) => {
-                                if let Err(e) = framed.send(Bytes::from(encoded)).await {
-                                    error!("write error to {id}: {e}");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                error!("failed to serialize message for {id}: {e}");
-                            }
+                        if let Err(e) = framed.send(msg).await {
+                            error!("write error to {id}: {e}");
+                            break;
                         }
                     }
                     None => break, // write channel closed — shutting down
