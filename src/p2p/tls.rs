@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -13,6 +12,8 @@ use rustls::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
+
+use super::identity::NodeIdentity;
 
 pub type NodeId = [u8; 32];
 
@@ -82,23 +83,13 @@ pub struct TlsIdentity {
 }
 
 impl TlsIdentity {
-    /// Load existing key from `key_file`, or generate a new one and persist it.
-    pub fn load_or_generate(key_file: &Path) -> anyhow::Result<Self> {
+    /// Build a TLS identity from a loaded `NodeIdentity` (PKCS#8 DER bytes).
+    pub fn from_identity(identity: &NodeIdentity) -> anyhow::Result<Self> {
         let crypto = Arc::new(rustls::crypto::ring::default_provider());
 
-        let key_pair = if key_file.exists() {
-            let der_bytes = std::fs::read(key_file).context("reading node key")?;
-            let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(der_bytes);
-            KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519)
-                .context("parsing node key DER")?
-        } else {
-            let kp = KeyPair::generate_for(&PKCS_ED25519).context("generating Ed25519 key")?;
-            if let Some(parent) = key_file.parent() {
-                std::fs::create_dir_all(parent).context("creating key directory")?;
-            }
-            std::fs::write(key_file, kp.serialize_der()).context("writing node key")?;
-            kp
-        };
+        let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(identity.pkcs8_der.as_slice());
+        let key_pair = KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519)
+            .context("parsing node key DER")?;
 
         Self::from_key_pair(key_pair, crypto)
     }

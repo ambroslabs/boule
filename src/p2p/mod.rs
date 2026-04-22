@@ -1,6 +1,7 @@
 pub mod api;
 pub mod connection;
 pub mod dialer;
+pub mod identity;
 pub mod listener;
 pub mod manager;
 pub mod tls;
