@@ -8,27 +8,168 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::config::{IdentityConfig, NodeConfig};
 use crate::p2p::ConnectionProtocol;
 use crate::p2p::manager::ManagerMsg;
 use crate::p2p::tls::{TlsIdentity, node_id_to_base58};
 use crate::p2p::tls_protocol::TlsConnectionProtocol;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+const ENV_PRODUCTION: &str = "AMBROS_ENV";
+const DEFAULT_KEY_FILE: &str = "node.key";
+
+fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "ambros_p2p=info".into()),
         )
         .init();
+}
 
-    let config_path = parse_config_arg()?;
-    let config = config::load(&config_path)?;
-    info!("loaded config from {}", config_path.display());
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_tracing();
 
-    let identity = Arc::new(TlsIdentity::load_or_generate(&config.node.key_file)?);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(first) = args.first() {
+        if first == "key" {
+            return handle_key_subcommand(&args[1..]);
+        }
+        if first == "--help" || first == "-h" {
+            print_help();
+            return Ok(());
+        }
+    }
+
+    let cli = CliArgs::parse(&args)?;
+    run_node(cli).await
+}
+
+fn print_help() {
+    println!("Usage: ambros-p2p [--config <path>] [--production] [--allow-insecure-key-perms]");
+    println!("       ambros-p2p key migrate --to <backend> [backend flags]");
+    println!();
+    println!("Options:");
+    println!("  -c, --config <path>          Path to TOML config file [default: config.toml]");
+    println!(
+        "      --production             Fail closed if no identity backend is explicitly configured"
+    );
+    println!("      --allow-insecure-key-perms");
+    println!(
+        "                               Skip the 0o077 permission check on the node key file (dev only)"
+    );
+    println!();
+    println!("Subcommands:");
+    println!("  key migrate --to file             --path <path>");
+    println!("  key migrate --to encrypted-file   --path <path> [--passphrase-env <var>]");
+    println!("  key migrate --to keyring          [--service <name>] [--account <name>]");
+    println!("     (reads the current [node.identity] from --config; use --delete-source to");
+    println!("      zeroize and remove a file-backed source after a successful migration)");
+}
+
+#[derive(Debug)]
+struct CliArgs {
+    config_path: PathBuf,
+    production: bool,
+    allow_insecure_perms: bool,
+}
+
+impl CliArgs {
+    fn parse(args: &[String]) -> anyhow::Result<Self> {
+        let mut config_path = PathBuf::from("config.toml");
+        let mut production = false;
+        let mut allow_insecure_perms = false;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--config" | "-c" => {
+                    i += 1;
+                    let p = args
+                        .get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--config requires a path argument"))?;
+                    config_path = PathBuf::from(p);
+                }
+                "--production" => production = true,
+                "--allow-insecure-key-perms" => allow_insecure_perms = true,
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => {
+                    anyhow::bail!("unknown argument '{other}'; run with --help");
+                }
+            }
+            i += 1;
+        }
+        Ok(Self {
+            config_path,
+            production,
+            allow_insecure_perms,
+        })
+    }
+}
+
+fn is_production(cli_flag: bool) -> bool {
+    if cli_flag {
+        return true;
+    }
+    std::env::var(ENV_PRODUCTION)
+        .map(|v| v.eq_ignore_ascii_case("production"))
+        .unwrap_or(false)
+}
+
+/// Pick the identity config, applying CLI overrides and fail-closed prod semantics.
+fn resolve_and_validate_identity(
+    node: &NodeConfig,
+    production: bool,
+    allow_insecure_perms: bool,
+) -> anyhow::Result<IdentityConfig> {
+    match config::resolve_identity(node) {
+        Some(mut cfg) => {
+            // Propagate the CLI flag into the file backend variant.
+            if let IdentityConfig::File {
+                allow_insecure_perms: ref mut a,
+                ..
+            } = cfg
+            {
+                if allow_insecure_perms {
+                    *a = true;
+                }
+            }
+            Ok(cfg)
+        }
+        None => {
+            if production {
+                anyhow::bail!(
+                    "refusing to start in production without an explicit [node.identity] backend. \
+                     Configure one of: file, env, keyring, encrypted-file, exec. See --help."
+                );
+            }
+            Ok(IdentityConfig::File {
+                path: PathBuf::from(DEFAULT_KEY_FILE),
+                allow_insecure_perms,
+            })
+        }
+    }
+}
+
+async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
+    let config = config::load(&cli.config_path)?;
+    info!("loaded config from {}", cli.config_path.display());
+
+    let production = is_production(cli.production);
+    let identity_cfg =
+        resolve_and_validate_identity(&config.node, production, cli.allow_insecure_perms)?;
+    info!("identity backend: {}", identity_cfg.backend_name());
+
+    let provider = config::build_provider(&identity_cfg)?;
+    let node_identity = provider.load_or_init()?;
+    let identity = Arc::new(TlsIdentity::from_identity(&node_identity)?);
+    // Drop the raw key material from this scope; TlsIdentity now owns what it needs.
+    drop(node_identity);
+
     info!("node ID: {}", node_id_to_base58(&identity.node_id));
 
     let store = Arc::new(gossip::store::GossipStore::new());
@@ -123,30 +264,160 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn parse_config_arg() -> anyhow::Result<PathBuf> {
-    let mut args = std::env::args().skip(1);
-    let mut config_path = PathBuf::from("config.toml");
+// ── `key` subcommand ────────────────────────────────────────────────────────
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+fn handle_key_subcommand(args: &[String]) -> anyhow::Result<()> {
+    let sub = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing key subcommand (try: migrate)"))?;
+    match sub.as_str() {
+        "migrate" => handle_key_migrate(&args[1..]),
+        other => anyhow::bail!("unknown `key` subcommand: {other}"),
+    }
+}
+
+#[derive(Debug, Default)]
+struct MigrateArgs {
+    config_path: PathBuf,
+    to: Option<String>,
+    path: Option<PathBuf>,
+    passphrase_env: Option<String>,
+    service: Option<String>,
+    account: Option<String>,
+    delete_source: bool,
+}
+
+fn parse_migrate_args(args: &[String]) -> anyhow::Result<MigrateArgs> {
+    let mut out = MigrateArgs {
+        config_path: PathBuf::from("config.toml"),
+        ..Default::default()
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
             "--config" | "-c" => {
-                let path = args
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--config requires a path argument"))?;
-                config_path = PathBuf::from(path);
+                i += 1;
+                out.config_path = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--config needs a value"))?
+                    .into();
             }
-            "--help" | "-h" => {
-                println!("Usage: ambros-p2p [--config <path>]");
-                println!();
-                println!("Options:");
-                println!("  -c, --config <path>   Path to TOML config file [default: config.toml]");
-                std::process::exit(0);
+            "--to" => {
+                i += 1;
+                out.to = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--to needs a value"))?
+                        .clone(),
+                );
             }
-            other => {
-                anyhow::bail!("unknown argument '{other}'\nUsage: ambros-p2p [--config <path>]");
+            "--path" => {
+                i += 1;
+                out.path = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--path needs a value"))?
+                        .into(),
+                );
             }
+            "--passphrase-env" => {
+                i += 1;
+                out.passphrase_env = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--passphrase-env needs a value"))?
+                        .clone(),
+                );
+            }
+            "--service" => {
+                i += 1;
+                out.service = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--service needs a value"))?
+                        .clone(),
+                );
+            }
+            "--account" => {
+                i += 1;
+                out.account = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--account needs a value"))?
+                        .clone(),
+                );
+            }
+            "--delete-source" => out.delete_source = true,
+            other => anyhow::bail!("unknown migrate flag: {other}"),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn handle_key_migrate(args: &[String]) -> anyhow::Result<()> {
+    let args = parse_migrate_args(args)?;
+    let to = args
+        .to
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("key migrate requires --to <backend>"))?;
+
+    let config = config::load(&args.config_path)?;
+    let source_cfg = config::resolve_identity(&config.node).ok_or_else(|| {
+        anyhow::anyhow!(
+            "config {} has no [node.identity] or key_file; nothing to migrate from",
+            args.config_path.display()
+        )
+    })?;
+    info!("migrating from {} to {}", source_cfg.backend_name(), to);
+
+    let source_provider = config::build_provider(&source_cfg)?;
+    let node_identity = source_provider.load_or_init()?;
+
+    let dest_cfg = match to {
+        "file" => IdentityConfig::File {
+            path: args
+                .path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--to file requires --path"))?,
+            allow_insecure_perms: false,
+        },
+        "encrypted-file" => IdentityConfig::EncryptedFile {
+            path: args
+                .path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--to encrypted-file requires --path"))?,
+            passphrase_env: args.passphrase_env.clone(),
+        },
+        "keyring" => IdentityConfig::Keyring {
+            service: args
+                .service
+                .clone()
+                .unwrap_or_else(|| "ambros-p2p".to_string()),
+            account: args.account.clone(),
+        },
+        other => anyhow::bail!("unsupported --to backend: {other}"),
+    };
+
+    let dest_provider = config::build_provider(&dest_cfg)?;
+    dest_provider.provision(&node_identity)?;
+
+    if args.delete_source {
+        if let IdentityConfig::File { path, .. } = &source_cfg {
+            use std::io::Write as _;
+            if path.exists() {
+                // Best-effort shred: overwrite with zeros before unlink.
+                if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+                    let len = std::fs::metadata(path)
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(0);
+                    let zeros = vec![0u8; len];
+                    let _ = f.write_all(&zeros);
+                    let _ = f.sync_all();
+                }
+                std::fs::remove_file(path).ok();
+                warn!("deleted source key file at {}", path.display());
+            }
+        } else {
+            warn!("--delete-source is only supported for file source backends; skipping");
         }
     }
 
-    Ok(config_path)
+    info!("migration complete");
+    Ok(())
 }

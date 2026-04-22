@@ -42,10 +42,22 @@ struct PeerDesc<'a> {
     node_id: &'a str,
 }
 
+#[derive(Clone, Copy)]
+enum IdentitySchema {
+    /// Uses the deprecated `key_file = ...` scalar inside `[node]`.
+    Legacy,
+    /// Uses the `[node.identity]` table with `backend = "file"`.
+    NewFileBackend,
+}
+
+async fn spawn_node(peers: &[PeerDesc<'_>]) -> NodeGuard {
+    spawn_node_with_schema(peers, IdentitySchema::Legacy).await
+}
+
 /// Spawn a node with port 0 for both listeners. The node writes its actual
 /// bound addresses and node ID to a temp file; we poll until the file is
 /// populated and parse the real values — no TOCTOU window, no reserved-port races.
-async fn spawn_node(peers: &[PeerDesc<'_>]) -> NodeGuard {
+async fn spawn_node_with_schema(peers: &[PeerDesc<'_>], schema: IdentitySchema) -> NodeGuard {
     let addr_file = NamedTempFile::new().unwrap();
     let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
 
@@ -64,8 +76,16 @@ async fn spawn_node(peers: &[PeerDesc<'_>]) -> NodeGuard {
         })
         .collect();
 
+    let (scalar_field, identity_table) = match schema {
+        IdentitySchema::Legacy => (format!("key_file = \"{key_file_path}\"\n"), String::new()),
+        IdentitySchema::NewFileBackend => (
+            String::new(),
+            format!("\n[node.identity]\nbackend = \"file\"\npath = \"{key_file_path}\"\n"),
+        ),
+    };
+
     let config = format!(
-        "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_file_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}"
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\n{scalar_field}addr_file = \"{addr_file_path}\"\n{identity_table}\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}"
     );
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -351,6 +371,30 @@ async fn test_expired_messages_are_cleaned_up() {
             .any(|m| m["content"] == "short lived"),
         "message should be gone after cleanup"
     );
+}
+
+/// Boots two nodes with `[node.identity] backend = "file"` (the new schema)
+/// and verifies they connect to each other. Covers the end-to-end path that
+/// the backward-compat legacy tests don't exercise.
+#[tokio::test]
+async fn test_new_identity_schema_end_to_end() {
+    let node1 = spawn_node_with_schema(&[], IdentitySchema::NewFileBackend).await;
+    let node2 = spawn_node_with_schema(
+        &[PeerDesc {
+            p2p_addr: &node1.p2p_addr,
+            node_id: &node1.node_id,
+        }],
+        IdentitySchema::NewFileBackend,
+    )
+    .await;
+
+    let ready_timeout = Duration::from_secs(10);
+    wait_until_ready(&node1, ready_timeout).await;
+    wait_until_ready(&node2, ready_timeout).await;
+
+    let mesh_timeout = Duration::from_secs(10);
+    wait_for_peer_count(&node1, 1, mesh_timeout).await;
+    wait_for_peer_count(&node2, 1, mesh_timeout).await;
 }
 
 #[tokio::test]

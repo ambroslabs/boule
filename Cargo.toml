@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 
+[features]
+# Default builds exclude the OS keyring backend because its Linux
+# implementation needs a running D-Bus / Secret Service. Enable explicitly
+# (`--features keyring-backend`) on desktop / server environments that
+# have a secret service available.
+default = []
+keyring-backend = ["dep:keyring"]
+
 [dependencies]
 tokio             = { version = "1", features = ["full"] }
 tokio-util        = { version = "0.7", features = ["codec"] }
@@ -19,12 +27,20 @@ bytes             = "1"
 hex               = "0.4"
 anyhow            = "1"
 futures-util      = { version = "0.3", features = ["sink"] }
-rcgen             = { version = "0.13", default-features = false, features = ["ring"] }
+rcgen             = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls            = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls      = { version = "0.26", default-features = false, features = ["ring"] }
 bs58              = "0.5"
+zeroize           = { version = "1", features = ["derive"] }
+secrecy           = "0.10"
+base64            = "0.22"
+tempfile          = "3"
+chacha20poly1305  = "0.10"
+argon2            = "0.5"
+rpassword         = "7"
+rand              = "0.9"
+keyring           = { version = "3", optional = true, default-features = false, features = ["async-secret-service", "apple-native", "windows-native", "crypto-rust", "tokio"] }
 
 [dev-dependencies]
 reqwest           = { version = "0.12", features = ["json"] }
-tempfile          = "3"
 tokio             = { version = "1", features = ["full"] }
