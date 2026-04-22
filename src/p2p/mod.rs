@@ -1,3 +1,4 @@
+pub mod api;
 pub mod connection;
 pub mod listener;
 pub mod manager;

@@ -1,4 +1,3 @@
-mod api;
 mod config;
 mod gossip;
 mod p2p;
@@ -65,9 +64,13 @@ async fn main() -> anyhow::Result<()> {
     let api_listener = TcpListener::bind(config.api.listen_addr).await?;
     let api_actual_addr = api_listener.local_addr()?;
     let api_handle = {
-        let store = Arc::clone(&store);
-        let cmd_tx = p2p_cmd_tx.clone();
-        tokio::spawn(api::serve(store, cmd_tx, api_listener))
+        let app = axum::Router::new()
+            .merge(p2p::api::router(p2p_cmd_tx.clone()))
+            .merge(gossip::api::router(Arc::clone(&store), p2p_cmd_tx.clone()));
+        tokio::spawn(async move {
+            info!("HTTP API listening on {api_actual_addr}");
+            axum::serve(api_listener, app).await.unwrap();
+        })
     };
 
     // Bind the P2P listener before spawning the accept loop for the same reason.
