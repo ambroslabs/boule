@@ -15,18 +15,18 @@ use tracing::warn;
 use crate::gossip::store::GossipStore;
 use crate::gossip::wire::WireMessage;
 use crate::gossip::{GossipMessage, InsertResult};
-use crate::p2p::PeerCommand;
+use crate::p2p::ProtocolOutbound;
 
 use types::{MessageItem, PostMessageRequest, PostMessageResponse};
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<GossipStore>,
-    cmd_tx: mpsc::Sender<PeerCommand>,
+    gossip_tx: mpsc::Sender<ProtocolOutbound>,
 }
 
-pub fn router(store: Arc<GossipStore>, cmd_tx: mpsc::Sender<PeerCommand>) -> Router {
-    let state = AppState { store, cmd_tx };
+pub fn router(store: Arc<GossipStore>, gossip_tx: mpsc::Sender<ProtocolOutbound>) -> Router {
+    let state = AppState { store, gossip_tx };
     Router::new()
         .route("/messages", get(list_messages).post(post_message))
         .with_state(state)
@@ -52,12 +52,12 @@ async fn post_message(
             let encoded = serde_json::to_vec(&WireMessage::Gossip(msg))
                 .expect("WireMessage serialization cannot fail");
             if state
-                .cmd_tx
-                .send(PeerCommand::Broadcast { msg: Bytes::from(encoded) })
+                .gossip_tx
+                .send(ProtocolOutbound::Broadcast(Bytes::from(encoded)))
                 .await
                 .is_err()
             {
-                warn!("PeerManager channel closed; message stored locally but not broadcast");
+                warn!("gossip send channel closed; message stored locally but not broadcast");
             }
         }
         InsertResult::AlreadySeen => {
