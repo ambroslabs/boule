@@ -20,18 +20,29 @@ pub trait ConnectionProtocol: Send + 'static {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // TODO: remove once SendTo and Disconnect are wired up
+#[allow(dead_code)]
 pub enum PeerCommand {
-    Broadcast { msg: Bytes },
-    SendTo { node_id: NodeId, msg: Bytes },
+    RegisterProtocol { id: u8, reply: oneshot::Sender<ProtocolHandle> },
     Disconnect { node_id: NodeId },
     ListPeers { reply: oneshot::Sender<Vec<NodeId>> },
     HasPeer { node_id: NodeId, reply: oneshot::Sender<bool> },
 }
 
 #[derive(Debug)]
-pub enum PeerEvent {
+pub enum ProtocolOutbound {
+    Broadcast(Bytes),
+    SendTo { node_id: NodeId, payload: Bytes },
+}
+
+#[derive(Debug)]
+pub enum ProtocolEvent {
     PeerConnected { node_id: NodeId },
     PeerDisconnected { node_id: NodeId },
-    MessageReceived { node_id: NodeId, msg: Bytes },
+    Message { from: NodeId, payload: Bytes },
+}
+
+#[derive(Debug)]
+pub struct ProtocolHandle {
+    pub send_tx: mpsc::Sender<ProtocolOutbound>,
+    pub event_rx: mpsc::Receiver<ProtocolEvent>,
 }

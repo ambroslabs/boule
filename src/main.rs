@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::info;
 
 use crate::p2p::manager::ManagerMsg;
@@ -34,25 +34,29 @@ async fn main() -> anyhow::Result<()> {
     let store = Arc::new(gossip::store::GossipStore::new());
 
     let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
-    let (p2p_event_tx, p2p_event_rx) = mpsc::channel::<p2p::PeerEvent>(256);
     let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (peer_gone_tx, _) = broadcast::channel::<p2p::NodeId>(64);
 
     let manager_handle = {
-        let event_tx = p2p_event_tx.clone();
         let itx = internal_tx.clone();
         let pgt = peer_gone_tx.clone();
         let our_id = identity.node_id;
-        tokio::spawn(p2p::manager::run(
-            our_id, p2p_cmd_rx, event_tx, internal_rx, itx, pgt,
-        ))
+        tokio::spawn(p2p::manager::run(our_id, p2p_cmd_rx, internal_rx, itx, pgt))
     };
+
+    // Register the gossip protocol before spawning TlsConnectionProtocol so
+    // PeerConnected events are never missed.
+    let (reg_tx, reg_rx) = oneshot::channel();
+    p2p_cmd_tx
+        .send(p2p::PeerCommand::RegisterProtocol { id: gossip::PROTOCOL_ID, reply: reg_tx })
+        .await?;
+    let gossip_handle = reg_rx.await?;
+    let gossip_send_tx = gossip_handle.send_tx.clone();
 
     let engine_handle = {
         let store = Arc::clone(&store);
-        let cmd_tx = p2p_cmd_tx.clone();
-        tokio::spawn(gossip::engine::run(p2p_event_rx, cmd_tx, store))
+        tokio::spawn(gossip::engine::run(gossip_handle, store))
     };
 
     let cleanup_handle = {
@@ -68,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     let api_handle = {
         let app = axum::Router::new()
             .merge(p2p::api::router(p2p_cmd_tx.clone()))
-            .merge(gossip::api::router(Arc::clone(&store), p2p_cmd_tx.clone()));
+            .merge(gossip::api::router(Arc::clone(&store), gossip_send_tx));
         tokio::spawn(async move {
             info!("HTTP API listening on {api_actual_addr}");
             axum::serve(api_listener, app).await.unwrap();
