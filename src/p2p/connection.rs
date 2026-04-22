@@ -1,94 +1,79 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{error, warn};
 
-use crate::p2p::{PeerEvent, PeerId};
+use crate::p2p::tls::{node_id_to_base58, NodeId, TlsStream};
+use crate::p2p::PeerEvent;
 use crate::wire::WireMessage;
 
 const MAX_FRAME_LEN: usize = 1024 * 1024; // 1 MB
 
-pub fn make_framed(stream: TcpStream) -> Framed<TcpStream, LengthDelimitedCodec> {
-    let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(MAX_FRAME_LEN)
-        .new_codec();
-    Framed::new(stream, codec)
-}
-
 pub async fn run(
-    peer_id: PeerId,
-    stream: TcpStream,
+    node_id: NodeId,
+    stream: TlsStream,
     mut write_rx: mpsc::Receiver<WireMessage>,
     event_tx: mpsc::Sender<PeerEvent>,
 ) {
-    let mut framed = make_framed(stream);
+    let id = node_id_to_base58(&node_id);
+    let codec = LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_FRAME_LEN)
+        .new_codec();
+    let mut framed = Framed::new(stream, codec);
 
-    let _ = event_tx
-        .send(PeerEvent::PeerConnected { peer_id })
-        .await;
+    let _ = event_tx.send(PeerEvent::PeerConnected { node_id }).await;
 
     loop {
         tokio::select! {
-            // Incoming frame from peer
             result = framed.next() => {
                 match result {
                     Some(Ok(buf)) => {
                         match serde_json::from_slice::<WireMessage>(&buf) {
                             Ok(msg) => {
                                 let _ = event_tx
-                                    .send(PeerEvent::MessageReceived { peer_id, msg })
+                                    .send(PeerEvent::MessageReceived { node_id, msg })
                                     .await;
                             }
                             Err(e) => {
-                                warn!("failed to deserialize message from {peer_id}: {e}");
+                                warn!("failed to deserialize message from {id}: {e}");
                             }
                         }
                     }
                     Some(Err(e)) => {
-                        error!("read error from {peer_id}: {e}");
+                        error!("read error from {id}: {e}");
                         break;
                     }
-                    None => {
-                        // EOF
-                        break;
-                    }
+                    None => break, // EOF
                 }
             }
 
-            // Outgoing message to peer
             msg = write_rx.recv() => {
                 match msg {
                     Some(msg) => {
                         match serde_json::to_vec(&msg) {
                             Ok(encoded) => {
                                 if let Err(e) = framed.send(Bytes::from(encoded)).await {
-                                    error!("write error to {peer_id}: {e}");
+                                    error!("write error to {id}: {e}");
                                     break;
                                 }
                             }
                             Err(e) => {
-                                error!("failed to serialize message for {peer_id}: {e}");
+                                error!("failed to serialize message for {id}: {e}");
                             }
                         }
                     }
-                    None => {
-                        // write channel closed — we're being shut down
-                        break;
-                    }
+                    None => break, // write channel closed — shutting down
                 }
             }
         }
     }
 
-    // send().await returns Err only if the receiver (GossipEngine) has exited.
-    // The channel capacity (256) means this will not block in normal operation.
     if event_tx
-        .send(PeerEvent::PeerDisconnected { peer_id })
+        .send(PeerEvent::PeerDisconnected { node_id })
         .await
         .is_err()
     {
-        warn!("event channel closed before PeerDisconnected could be sent for {peer_id}");
+        warn!("event channel closed before PeerDisconnected could be sent for {id}");
     }
 }

@@ -12,15 +12,27 @@ pub struct Config {
 #[derive(Debug, serde::Deserialize)]
 pub struct NodeConfig {
     pub listen_addr: SocketAddr,
-    /// If set, the node writes its actual bound addresses (P2P + API) to this file
+    /// Path to the Ed25519 private key file (PEM). Generated on first run if absent.
+    #[serde(default = "default_key_file")]
+    pub key_file: PathBuf,
+    /// If set, the node writes its actual bound addresses and node ID to this file
     /// as JSON once both listeners are ready. Used by tests to discover dynamic ports.
     #[serde(default)]
     pub addr_file: Option<PathBuf>,
 }
 
+fn default_key_file() -> PathBuf {
+    PathBuf::from("node.key")
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct PeerConfig {
     pub addr: SocketAddr,
+    /// Expected base58-encoded Ed25519 node ID of this peer.
+    /// If set, the connection is rejected when the peer presents a different identity.
+    /// Omit for trust-on-first-use (e.g. in development).
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
