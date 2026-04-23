@@ -6,47 +6,185 @@
 //! Tests using the driver must run on a `current_thread` runtime started
 //! with `start_paused = true` so the [`SimClock`] cooperates with tokio's
 //! virtual timer.
+//!
+//! # Per-node protocol construction
+//!
+//! [`SimDriver`] delegates per-node construction to a [`SimNodeFactory`].
+//! The default factory ([`GossipFactory`]) reproduces the original
+//! gossip-only behaviour; future milestones will drop in a consensus
+//! factory that wires a `ConsensusNode` per replica. Each node is also
+//! handed its own `Arc<dyn Storage>` + `Arc<dyn Wal>` via a [`SimBacking`]
+//! — [`MemoryBacking`] by default, [`TempDirDiskBacking`] when a test
+//! wants disk-backed crash-recovery semantics.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::clock::Clock;
+use crate::clock::{BoxFuture, Clock};
 use crate::gossip::{self, GossipMessage, store::GossipStore, wire::WireMessage};
 use crate::p2p::manager::{AnyStream, ManagerMsg};
 use crate::p2p::{ConnectionProtocol, NodeId, PeerCommand, ProtocolOutbound};
+use crate::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
 
 use super::SimClock;
 use super::network::{EventId, EventMutator, InFlightEvent, LinkConfig, SimNetwork, TraceEntry};
 use super::stream::{Inbox, SimStream};
 use super::transport::SimConnectionProtocol;
 
+/// Per-node construction context handed to a [`SimNodeFactory`].
+///
+/// Carries the node's identity, the shared virtual clock, the raw
+/// transport streams for every other node in the mesh, and the per-node
+/// `Arc<dyn Storage>` / `Arc<dyn Wal>` the factory should wire into its
+/// protocol stack.
+pub struct SimNodeCtx {
+    pub node_idx: usize,
+    pub node_id: NodeId,
+    pub clock: Arc<dyn Clock>,
+    pub peer_streams: Vec<(NodeId, SocketAddr, AnyStream)>,
+    pub storage: Arc<dyn Storage>,
+    pub wal: Arc<dyn Wal>,
+}
+
+/// Builds one [`SimNode`] from a [`SimNodeCtx`]. Implementations decide
+/// which protocols to run (gossip, consensus, both) and own the returned
+/// background tasks via [`SimNode::_tasks`].
+pub trait SimNodeFactory: Send + Sync + 'static {
+    fn build(&self, ctx: SimNodeCtx) -> BoxFuture<'static, SimNode>;
+}
+
+/// Builds the per-node `Arc<dyn Storage>` + `Arc<dyn Wal>` pair. Called
+/// once per node during [`SimDriver`] construction. Errors abort driver
+/// setup.
+pub trait SimBacking: Send + Sync + 'static {
+    fn build_for_node(
+        &self,
+        idx: usize,
+        node_id: NodeId,
+    ) -> anyhow::Result<(Arc<dyn Storage>, Arc<dyn Wal>)>;
+}
+
+/// Default [`SimBacking`]: fresh [`MemoryStorage`] + [`MemoryWal`] per
+/// node. Zero I/O, zero cleanup, isolated per node.
+#[derive(Default, Clone, Copy)]
+pub struct MemoryBacking;
+
+impl SimBacking for MemoryBacking {
+    fn build_for_node(
+        &self,
+        _idx: usize,
+        _node_id: NodeId,
+    ) -> anyhow::Result<(Arc<dyn Storage>, Arc<dyn Wal>)> {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        Ok((storage, wal))
+    }
+}
+
+/// Opt-in disk [`SimBacking`] backed by a [`tempfile::TempDir`]. Each
+/// node gets its own subdirectory holding a `state.redb` and `wal.redb`.
+/// The temp directory is owned by the backing and cleaned up on drop —
+/// by default that happens when the [`SimDriver`] is dropped, since the
+/// driver keeps the backing alive through every node's
+/// `Arc<dyn Storage>` / `Arc<dyn Wal>`.
+pub struct TempDirDiskBacking {
+    dir: Arc<TempDir>,
+}
+
+impl TempDirDiskBacking {
+    /// Create a new backing rooted at a fresh [`TempDir`].
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            dir: Arc::new(TempDir::new()?),
+        })
+    }
+
+    /// Path of the temp directory holding every node's on-disk state.
+    /// Useful for tests that want to assert cleanup on drop.
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn node_dir(&self, idx: usize) -> PathBuf {
+        self.dir.path().join(format!("node-{idx:04}"))
+    }
+}
+
+impl SimBacking for TempDirDiskBacking {
+    fn build_for_node(
+        &self,
+        idx: usize,
+        _node_id: NodeId,
+    ) -> anyhow::Result<(Arc<dyn Storage>, Arc<dyn Wal>)> {
+        let dir = self.node_dir(idx);
+        std::fs::create_dir_all(&dir)?;
+        let storage: Arc<dyn Storage> = Arc::new(DiskStorage::open(dir.join("state.redb"))?);
+        let wal: Arc<dyn Wal> = Arc::new(DiskWal::open(dir.join("wal.redb"))?);
+        Ok((storage, wal))
+    }
+}
+
+/// Default [`SimNodeFactory`]: reproduces the original gossip-only node
+/// (manager + gossip engine + connection protocol). The factory ignores
+/// `storage` / `wal` — gossip does not persist — but they still flow
+/// through `SimNode` so tests can assert per-node isolation.
+#[derive(Default, Clone, Copy)]
+pub struct GossipFactory;
+
+impl SimNodeFactory for GossipFactory {
+    fn build(&self, ctx: SimNodeCtx) -> BoxFuture<'static, SimNode> {
+        Box::pin(build_gossip_node(ctx))
+    }
+}
+
 /// One sim node — manager + gossip engine + send handle for injecting messages.
+///
+/// Also carries this replica's `Arc<dyn Storage>` + `Arc<dyn Wal>`. The
+/// default [`GossipFactory`] does not use them (gossip is in-memory), but
+/// future consensus factories will, and tests can assert per-node
+/// isolation against them today.
 pub struct SimNode {
     pub node_id: NodeId,
-    pub store: Arc<GossipStore>,
-    gossip_send_tx: mpsc::Sender<ProtocolOutbound>,
+    pub storage: Arc<dyn Storage>,
+    pub wal: Arc<dyn Wal>,
+    /// Gossip-specific handles, present when this node was built by
+    /// [`GossipFactory`]. Non-gossip factories may leave this `None`.
+    gossip: Option<GossipHandles>,
     /// Held to keep the manager alive; dropped on [`SimDriver`] drop.
     _cmd_tx: mpsc::Sender<PeerCommand>,
     /// Background tasks; held so they're cancelled on drop.
     _tasks: Vec<JoinHandle<()>>,
 }
 
+struct GossipHandles {
+    store: Arc<GossipStore>,
+    send_tx: mpsc::Sender<ProtocolOutbound>,
+}
+
 impl SimNode {
     /// Inject a gossip message at this node as if a local API client had
     /// posted it. Inserts into the local store and broadcasts to peers.
+    ///
+    /// Panics if this node was not built by a gossip-capable factory.
     pub async fn inject_gossip(&self, msg: GossipMessage, clock: &dyn Clock) {
-        match self.store.try_insert(msg.clone(), clock.now_wall()) {
+        let gossip_handles = self
+            .gossip
+            .as_ref()
+            .expect("inject_gossip called on a non-gossip SimNode");
+        match gossip_handles.store.try_insert(msg.clone(), clock.now_wall()) {
             gossip::InsertResult::Inserted => {
                 let encoded = serde_json::to_vec(&WireMessage::Gossip(msg))
                     .expect("WireMessage serialization cannot fail");
-                let _ = self
-                    .gossip_send_tx
+                let _ = gossip_handles
+                    .send_tx
                     .send(ProtocolOutbound::Broadcast(Bytes::from(encoded)))
                     .await;
             }
@@ -54,9 +192,19 @@ impl SimNode {
         }
     }
 
-    /// Snapshot of currently-live messages in this node's store.
+    /// Snapshot of currently-live messages in this node's gossip store.
+    ///
+    /// Returns an empty vec if this node has no gossip store.
     pub fn messages(&self, now: DateTime<Utc>) -> Vec<GossipMessage> {
-        self.store.list_live(now)
+        match &self.gossip {
+            Some(g) => g.store.list_live(now),
+            None => Vec::new(),
+        }
+    }
+
+    /// Access to this node's gossip store, if any.
+    pub fn gossip_store(&self) -> Option<&Arc<GossipStore>> {
+        self.gossip.as_ref().map(|g| &g.store)
     }
 }
 
@@ -64,11 +212,17 @@ pub struct SimDriver {
     pub clock: Arc<SimClock>,
     nodes: Vec<SimNode>,
     pub network: Arc<SimNetwork>,
+    /// Held for the driver's lifetime so backings that own external
+    /// resources (e.g. [`TempDirDiskBacking`]'s `TempDir`) aren't
+    /// dropped before the per-node `Storage`/`Wal` they produced.
+    _backing: Box<dyn SimBacking>,
 }
 
 impl SimDriver {
-    /// Build a fully-connected mesh of `n` nodes. Must be called from inside
-    /// a tokio `current_thread` runtime with `start_paused = true`.
+    /// Build a fully-connected mesh of `n` nodes with the default
+    /// gossip-only factory and in-memory per-node storage. Must be
+    /// called from inside a tokio `current_thread` runtime with
+    /// `start_paused = true`.
     pub async fn new(n: usize, seed: u64) -> Self {
         Self::new_with_start(n, seed, Utc::now()).await
     }
@@ -79,6 +233,29 @@ impl SimDriver {
     ///
     /// [`new`]: Self::new
     pub async fn new_with_start(n: usize, seed: u64, start_now: DateTime<Utc>) -> Self {
+        Self::new_with_backing(n, seed, start_now, GossipFactory, MemoryBacking)
+            .await
+            .expect("MemoryBacking cannot fail")
+    }
+
+    /// Fully-configurable entry point. Lets tests swap in a custom
+    /// [`SimNodeFactory`] (e.g. a consensus-node factory for HotStuff
+    /// tests) and a custom [`SimBacking`] (e.g. [`TempDirDiskBacking`]
+    /// for crash-recovery tests).
+    ///
+    /// Returns an error if any per-node backing fails to open; node
+    /// construction itself is infallible.
+    pub async fn new_with_backing<F, B>(
+        n: usize,
+        seed: u64,
+        start_now: DateTime<Utc>,
+        factory: F,
+        backing: B,
+    ) -> anyhow::Result<Self>
+    where
+        F: SimNodeFactory,
+        B: SimBacking,
+    {
         let clock = Arc::new(SimClock::new(start_now));
         let network = SimNetwork::new(seed, start_now);
 
@@ -112,17 +289,28 @@ impl SimDriver {
             }
         }
 
+        let backing: Box<dyn SimBacking> = Box::new(backing);
         let mut nodes = Vec::with_capacity(n);
         for (idx, peer_streams) in per_node_streams.into_iter().enumerate() {
-            let node = build_node(node_ids[idx], peer_streams, Arc::clone(&clock) as _).await;
-            nodes.push(node);
+            let node_id = node_ids[idx];
+            let (storage, wal) = backing.build_for_node(idx, node_id)?;
+            let ctx = SimNodeCtx {
+                node_idx: idx,
+                node_id,
+                clock: Arc::clone(&clock) as Arc<dyn Clock>,
+                peer_streams,
+                storage,
+                wal,
+            };
+            nodes.push(factory.build(ctx).await);
         }
 
-        Self {
+        Ok(Self {
             clock,
             nodes,
             network,
-        }
+            _backing: backing,
+        })
     }
 
     pub fn node(&self, idx: usize) -> &SimNode {
@@ -394,11 +582,19 @@ fn deterministic_node_id(idx: usize) -> NodeId {
     id
 }
 
-async fn build_node(
-    our_id: NodeId,
-    peer_streams: Vec<(NodeId, SocketAddr, AnyStream)>,
-    clock: Arc<dyn Clock>,
-) -> SimNode {
+/// Spawn the manager + gossip engine + transport stack for one node.
+/// Preserves the pre-factory construction order byte-for-byte so
+/// existing seed-locked tests keep their determinism.
+async fn build_gossip_node(ctx: SimNodeCtx) -> SimNode {
+    let SimNodeCtx {
+        node_idx: _,
+        node_id: our_id,
+        clock,
+        peer_streams,
+        storage,
+        wal,
+    } = ctx;
+
     let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(256);
     let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
     let (peer_gone_tx, _) = broadcast::channel::<NodeId>(64);
@@ -407,11 +603,7 @@ async fn build_node(
         let itx = internal_tx.clone();
         let pgt = peer_gone_tx.clone();
         tokio::spawn(crate::p2p::manager::run(
-            our_id,
-            cmd_rx,
-            internal_rx,
-            itx,
-            pgt,
+            our_id, cmd_rx, internal_rx, itx, pgt,
         ))
     };
 
@@ -441,8 +633,12 @@ async fn build_node(
 
     SimNode {
         node_id: our_id,
-        store,
-        gossip_send_tx,
+        storage,
+        wal,
+        gossip: Some(GossipHandles {
+            store,
+            send_tx: gossip_send_tx,
+        }),
         _cmd_tx: cmd_tx,
         _tasks: vec![manager_handle, engine_handle, protocol_handle],
     }
