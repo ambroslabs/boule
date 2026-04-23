@@ -149,11 +149,11 @@ mod tests {
     fn chain_from_genesis(genesis: &Block, views: &[u64]) -> Vec<Block> {
         let mut out = Vec::with_capacity(views.len());
         let mut parent_hash = genesis.hash();
-        let mut parent_height = genesis.header.height;
-        for &view in views {
+        for (i, &view) in views.iter().enumerate() {
+            let height = genesis.header.height + (i as u64) + 1;
             let header = BlockHeader {
                 parent_hash,
-                height: parent_height + 1,
+                height,
                 view,
                 proposer: nid(1),
                 state_commitment: [0; 32],
@@ -164,7 +164,6 @@ mod tests {
                 commands: Vec::new(),
             };
             parent_hash = block.hash();
-            parent_height += 1;
             out.push(block);
         }
         out
