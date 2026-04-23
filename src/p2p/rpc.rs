@@ -67,7 +67,7 @@
 
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -75,7 +75,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -110,6 +110,268 @@ pub const DEFAULT_MAX_OUTSTANDING_PER_PEER: usize = 256;
 /// Payload the server sends on the error frame when the requested method has
 /// no handler registered. Small fixed string so callers can detect it.
 pub const NO_SUCH_METHOD: &[u8] = b"rpc: no such method";
+
+/// Inclusive upper bounds (microseconds) of the per-method latency histogram
+/// buckets. Latencies above the final bucket land in `latency_overflow`.
+const LATENCY_BUCKETS_US: &[u64] = &[
+    100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000, 5_000_000, 30_000_000,
+];
+
+const LATENCY_NUM_BUCKETS: usize = LATENCY_BUCKETS_US.len();
+
+/// Per-method atomic counters. Inserted lazily in [`RpcStatsInner::method`].
+struct PerMethodAtomics {
+    calls: AtomicU64,
+    bytes_sent: AtomicU64,
+    bytes_received: AtomicU64,
+    latency_buckets: [AtomicU64; LATENCY_NUM_BUCKETS],
+    latency_overflow: AtomicU64,
+}
+
+impl Default for PerMethodAtomics {
+    fn default() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+            latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            latency_overflow: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Per-peer atomic counters. Inserted lazily in [`RpcStatsInner::peer`].
+#[derive(Default)]
+struct PerPeerAtomics {
+    in_flight: AtomicU64,
+    timeouts: AtomicU64,
+    peer_gone_events: AtomicU64,
+}
+
+/// Shared-internal stats block. One instance per [`Rpc`], threaded through
+/// both the public [`Rpc`] handle and the spawned [`RpcTask`]. Hot-path
+/// increments are plain atomics; per-method / per-peer maps use a read-mostly
+/// `RwLock` and cache an [`Arc`] on the caller side so the write path is hit
+/// only on first observation of a method id or peer.
+struct RpcStatsInner {
+    in_flight_requests: AtomicU64,
+    total_requests_sent: AtomicU64,
+    total_responses_received: AtomicU64,
+    total_timeouts: AtomicU64,
+    total_stray_responses: AtomicU64,
+    total_busy_rejections: AtomicU64,
+    per_method: RwLock<HashMap<u16, Arc<PerMethodAtomics>>>,
+    per_peer: RwLock<HashMap<NodeId, Arc<PerPeerAtomics>>>,
+}
+
+impl RpcStatsInner {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            in_flight_requests: AtomicU64::new(0),
+            total_requests_sent: AtomicU64::new(0),
+            total_responses_received: AtomicU64::new(0),
+            total_timeouts: AtomicU64::new(0),
+            total_stray_responses: AtomicU64::new(0),
+            total_busy_rejections: AtomicU64::new(0),
+            per_method: RwLock::new(HashMap::new()),
+            per_peer: RwLock::new(HashMap::new()),
+        })
+    }
+
+    fn method(&self, id: u16) -> Arc<PerMethodAtomics> {
+        if let Some(m) = self.per_method.read().get(&id) {
+            return Arc::clone(m);
+        }
+        Arc::clone(self.per_method.write().entry(id).or_default())
+    }
+
+    fn peer(&self, id: NodeId) -> Arc<PerPeerAtomics> {
+        if let Some(p) = self.per_peer.read().get(&id) {
+            return Arc::clone(p);
+        }
+        Arc::clone(self.per_peer.write().entry(id).or_default())
+    }
+
+    fn record_latency(&self, method: &PerMethodAtomics, elapsed: Duration) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        for (i, &bound) in LATENCY_BUCKETS_US.iter().enumerate() {
+            if us <= bound {
+                method.latency_buckets[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        method.latency_overflow.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Cheap, cloneable handle to the observability counters maintained by an
+/// [`Rpc`] instance. Obtain one via [`Rpc::stats`]; it shares state with the
+/// original so a snapshot taken through any clone reflects the current view.
+///
+/// All counters are updated with `Relaxed` atomics from the hot path; a
+/// snapshot is a best-effort read and is not guaranteed to be causally
+/// consistent across fields.
+#[derive(Clone)]
+pub struct RpcStats {
+    inner: Arc<RpcStatsInner>,
+}
+
+impl RpcStats {
+    /// Freeze the current counter values into an owned [`RpcStatsSnapshot`]
+    /// suitable for logging or test assertions.
+    pub fn snapshot(&self) -> RpcStatsSnapshot {
+        let per_method = self
+            .inner
+            .per_method
+            .read()
+            .iter()
+            .map(|(id, m)| {
+                let buckets = LATENCY_BUCKETS_US
+                    .iter()
+                    .zip(m.latency_buckets.iter())
+                    .map(|(bound, a)| (*bound, a.load(Ordering::Relaxed)))
+                    .collect();
+                (
+                    *id,
+                    PerMethodSnapshot {
+                        calls: m.calls.load(Ordering::Relaxed),
+                        bytes_sent: m.bytes_sent.load(Ordering::Relaxed),
+                        bytes_received: m.bytes_received.load(Ordering::Relaxed),
+                        latency_buckets_us: buckets,
+                        latency_overflow: m.latency_overflow.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect();
+        let per_peer = self
+            .inner
+            .per_peer
+            .read()
+            .iter()
+            .map(|(id, p)| {
+                (
+                    *id,
+                    PerPeerSnapshot {
+                        in_flight: p.in_flight.load(Ordering::Relaxed),
+                        timeouts: p.timeouts.load(Ordering::Relaxed),
+                        peer_gone_events: p.peer_gone_events.load(Ordering::Relaxed),
+                    },
+                )
+            })
+            .collect();
+        RpcStatsSnapshot {
+            in_flight_requests: self.inner.in_flight_requests.load(Ordering::Relaxed),
+            total_requests_sent: self.inner.total_requests_sent.load(Ordering::Relaxed),
+            total_responses_received: self.inner.total_responses_received.load(Ordering::Relaxed),
+            total_timeouts: self.inner.total_timeouts.load(Ordering::Relaxed),
+            total_stray_responses: self.inner.total_stray_responses.load(Ordering::Relaxed),
+            total_busy_rejections: self.inner.total_busy_rejections.load(Ordering::Relaxed),
+            per_method,
+            per_peer,
+        }
+    }
+
+    /// Current in-flight request count (issued but not yet resolved).
+    pub fn in_flight_requests(&self) -> u64 {
+        self.inner.in_flight_requests.load(Ordering::Relaxed)
+    }
+
+    /// Requests issued via [`Rpc::call`] since this RPC instance started.
+    pub fn total_requests_sent(&self) -> u64 {
+        self.inner.total_requests_sent.load(Ordering::Relaxed)
+    }
+
+    /// Responses (including remote errors) delivered back to callers.
+    pub fn total_responses_received(&self) -> u64 {
+        self.inner.total_responses_received.load(Ordering::Relaxed)
+    }
+
+    /// Calls that resolved with [`RpcError::Timeout`].
+    pub fn total_timeouts(&self) -> u64 {
+        self.inner.total_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Reply frames received with no matching outstanding request — usually
+    /// the tail of a call the local side already gave up on.
+    pub fn total_stray_responses(&self) -> u64 {
+        self.inner.total_stray_responses.load(Ordering::Relaxed)
+    }
+
+    /// Calls that resolved with [`RpcError::Busy`] because the per-peer
+    /// outstanding-request cap was already full.
+    pub fn total_busy_rejections(&self) -> u64 {
+        self.inner.total_busy_rejections.load(Ordering::Relaxed)
+    }
+}
+
+/// Per-method slice of an [`RpcStatsSnapshot`].
+#[derive(Debug, Clone)]
+pub struct PerMethodSnapshot {
+    /// Calls dispatched for this method id.
+    pub calls: u64,
+    /// Request-payload bytes issued by the client (excluding frame header).
+    pub bytes_sent: u64,
+    /// Reply-payload bytes received (excluding frame header), summed across
+    /// both `KIND_RESPONSE` and `KIND_ERROR` replies.
+    pub bytes_received: u64,
+    /// Histogram of end-to-end call latency, `(inclusive_upper_bound_us,
+    /// count)` pairs in ascending order. Latencies above the final bucket
+    /// are counted separately in [`latency_overflow`](Self::latency_overflow).
+    pub latency_buckets_us: Vec<(u64, u64)>,
+    /// Calls whose latency exceeded the largest bucket bound.
+    pub latency_overflow: u64,
+}
+
+/// Per-peer slice of an [`RpcStatsSnapshot`].
+#[derive(Debug, Clone)]
+pub struct PerPeerSnapshot {
+    /// Requests currently in flight to this peer.
+    pub in_flight: u64,
+    /// Calls to this peer that resolved with [`RpcError::Timeout`].
+    pub timeouts: u64,
+    /// `PeerDisconnected` events observed for this peer.
+    pub peer_gone_events: u64,
+}
+
+/// Immutable snapshot of the counters tracked by an [`Rpc`]. Returned by
+/// [`RpcStats::snapshot`]; all fields are plain data so the whole value can
+/// be logged with `{:?}` or destructured for metric emission.
+#[derive(Debug, Clone)]
+pub struct RpcStatsSnapshot {
+    /// Requests issued but not yet resolved.
+    pub in_flight_requests: u64,
+    /// Total calls dispatched since RPC start.
+    pub total_requests_sent: u64,
+    /// Total replies (including `KIND_ERROR`) delivered to callers.
+    pub total_responses_received: u64,
+    /// Calls that resolved with [`RpcError::Timeout`].
+    pub total_timeouts: u64,
+    /// Reply frames that arrived with no matching outstanding call.
+    pub total_stray_responses: u64,
+    /// Calls that resolved with [`RpcError::Busy`].
+    pub total_busy_rejections: u64,
+    /// Per-method breakdown, keyed by method id.
+    pub per_method: BTreeMap<u16, PerMethodSnapshot>,
+    /// Per-peer breakdown, keyed by [`NodeId`].
+    pub per_peer: BTreeMap<NodeId, PerPeerSnapshot>,
+}
+
+impl std::fmt::Display for RpcStatsSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rpc stats: in_flight={} sent={} responses={} timeouts={} stray={} busy={} methods={} peers={}",
+            self.in_flight_requests,
+            self.total_requests_sent,
+            self.total_responses_received,
+            self.total_timeouts,
+            self.total_stray_responses,
+            self.total_busy_rejections,
+            self.per_method.len(),
+            self.per_peer.len(),
+        )
+    }
+}
 
 /// Error cases surfaced by [`Rpc::call`].
 ///
@@ -324,6 +586,7 @@ impl RpcBuilder {
         let (op_tx, op_rx) = mpsc::channel::<Op>(256);
         let server_handlers: ServerHandlers = Arc::new(Mutex::new(HashMap::new()));
         let server_handler_count = Arc::new(AtomicUsize::new(0));
+        let stats = RpcStatsInner::new();
         let task = RpcTask {
             send_tx: handle.send_tx,
             event_rx: handle.event_rx,
@@ -333,6 +596,7 @@ impl RpcBuilder {
             server_handlers: Arc::clone(&server_handlers),
             server_handler_count: Arc::clone(&server_handler_count),
             max_outstanding_per_peer: self.max_outstanding_per_peer,
+            stats: Arc::clone(&stats),
         };
         tokio::spawn(task.run());
         Rpc {
@@ -340,6 +604,7 @@ impl RpcBuilder {
             next_request_id: Arc::new(AtomicU64::new(1)),
             clock,
             server_handler_count,
+            stats,
         }
     }
 }
@@ -359,6 +624,7 @@ pub struct Rpc {
     // metrics can pick it up when observability work lands.
     #[allow(dead_code)]
     server_handler_count: Arc<AtomicUsize>,
+    stats: Arc<RpcStatsInner>,
 }
 
 impl Rpc {
@@ -400,7 +666,27 @@ impl Rpc {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        self.op_tx
+        // Stats: count the attempt before handing it to the task so snapshots
+        // taken mid-call see the request as in-flight. The cleanup block at
+        // the end undoes the in-flight counts regardless of outcome.
+        let method_stats = self.stats.method(method_id);
+        let peer_stats = self.stats.peer(peer);
+        let payload_len = payload.len() as u64;
+        let start = self.clock.now_monotonic();
+        self.stats
+            .in_flight_requests
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .total_requests_sent
+            .fetch_add(1, Ordering::Relaxed);
+        method_stats.calls.fetch_add(1, Ordering::Relaxed);
+        method_stats
+            .bytes_sent
+            .fetch_add(payload_len, Ordering::Relaxed);
+        peer_stats.in_flight.fetch_add(1, Ordering::Relaxed);
+
+        let send_result = self
+            .op_tx
             .send(Op::Call {
                 peer,
                 request_id,
@@ -408,19 +694,76 @@ impl Rpc {
                 payload,
                 reply: reply_tx,
             })
-            .await
-            .map_err(|_| RpcError::Shutdown)?;
+            .await;
 
         // The timeout is driven by `Clock::sleep`, not wall-clock subtraction,
         // so it's already immune to wall-clock jumps. Any future code on this
         // path that does `t2 - t1` math must use `Clock::now_monotonic`.
-        match clock::timeout(&*self.clock, timeout, reply_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(RpcError::Shutdown),
-            Err(_) => {
-                let _ = self.op_tx.send(Op::Cancel { peer, request_id }).await;
-                Err(RpcError::Timeout)
+        let outcome = if send_result.is_err() {
+            Err(RpcError::Shutdown)
+        } else {
+            match clock::timeout(&*self.clock, timeout, reply_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(RpcError::Shutdown),
+                Err(_) => {
+                    let _ = self.op_tx.send(Op::Cancel { peer, request_id }).await;
+                    Err(RpcError::Timeout)
+                }
             }
+        };
+
+        // Stats: call is no longer in flight. Update the outcome-specific
+        // counters before returning.
+        self.stats
+            .in_flight_requests
+            .fetch_sub(1, Ordering::Relaxed);
+        peer_stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+
+        match &outcome {
+            Ok(body) => {
+                self.stats
+                    .total_responses_received
+                    .fetch_add(1, Ordering::Relaxed);
+                method_stats
+                    .bytes_received
+                    .fetch_add(body.len() as u64, Ordering::Relaxed);
+                let elapsed = self.clock.now_monotonic().saturating_sub(start);
+                self.stats.record_latency(&method_stats, elapsed);
+            }
+            Err(RpcError::Remote(body)) => {
+                self.stats
+                    .total_responses_received
+                    .fetch_add(1, Ordering::Relaxed);
+                method_stats
+                    .bytes_received
+                    .fetch_add(body.len() as u64, Ordering::Relaxed);
+                let elapsed = self.clock.now_monotonic().saturating_sub(start);
+                self.stats.record_latency(&method_stats, elapsed);
+            }
+            Err(RpcError::Timeout) => {
+                self.stats.total_timeouts.fetch_add(1, Ordering::Relaxed);
+                peer_stats.timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(RpcError::Busy) => {
+                self.stats
+                    .total_busy_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(RpcError::PeerGone) | Err(RpcError::Shutdown) => {
+                // PeerGone bookkeeping happens in the task when the disconnect
+                // event is observed; shutdown is a terminal state.
+            }
+        }
+        outcome
+    }
+
+    /// Access the cloneable stats handle for this RPC instance.
+    ///
+    /// The returned [`RpcStats`] shares state with the running task, so
+    /// snapshots taken through the handle always reflect the current view.
+    pub fn stats(&self) -> RpcStats {
+        RpcStats {
+            inner: Arc::clone(&self.stats),
         }
     }
 
@@ -470,6 +813,7 @@ struct RpcTask {
     server_handlers: ServerHandlers,
     server_handler_count: Arc<AtomicUsize>,
     max_outstanding_per_peer: usize,
+    stats: Arc<RpcStatsInner>,
 }
 
 impl RpcTask {
@@ -518,6 +862,15 @@ impl RpcTask {
     ) {
         let per_peer = self.outstanding.entry(peer).or_default();
         if per_peer.len() >= self.max_outstanding_per_peer {
+            // Threshold-transition event: the per-peer cap rejected a call.
+            // This is the only place the cap is exceeded, so emitting here
+            // gives one event per rejection without extra state.
+            warn!(
+                "rpc: per-peer outstanding cap reached ({}) for peer {}; rejecting method {}",
+                self.max_outstanding_per_peer,
+                node_id_to_base58(&peer),
+                method_id,
+            );
             let _ = reply.send(Err(RpcError::Busy));
             return;
         }
@@ -566,6 +919,10 @@ impl RpcTask {
         match event {
             ProtocolEvent::PeerConnected { .. } => {}
             ProtocolEvent::PeerDisconnected { node_id } => {
+                self.stats
+                    .peer(node_id)
+                    .peer_gone_events
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Some(map) = self.outstanding.remove(&node_id) {
                     for (_, tx) in map {
                         let _ = tx.send(Err(RpcError::PeerGone));
@@ -642,6 +999,9 @@ impl RpcTask {
                 return;
             }
         }
+        self.stats
+            .total_stray_responses
+            .fetch_add(1, Ordering::Relaxed);
         warn!(
             "rpc: stray response (request_id={request_id}) from {}",
             node_id_to_base58(&peer)
@@ -792,6 +1152,20 @@ mod tests {
             let _ = self
                 .b_event_tx
                 .send(ProtocolEvent::PeerDisconnected { node_id: self.a })
+                .await;
+        }
+
+        /// Inject a raw protocol message into A's event stream as if it had
+        /// arrived from B. Used to force race conditions (stray replies,
+        /// malformed frames) that are otherwise hard to provoke through the
+        /// public RPC API.
+        async fn inject_message_to_a(&self, payload: Bytes) {
+            let _ = self
+                .a_event_tx
+                .send(ProtocolEvent::Message {
+                    from: self.b,
+                    payload,
+                })
                 .await;
         }
     }
@@ -1517,5 +1891,233 @@ mod tests {
             .await
             .expect("normal call succeeds");
         assert_eq!(r.as_ref(), b"still works");
+    }
+
+    // ── Observability counters (issue #51) ──────────────────────────────────
+
+    /// Snapshot's Display impl must produce a single printable line that
+    /// exercises every global field so it is safe to drop into log lines.
+    #[test]
+    fn snapshot_display_includes_all_globals() {
+        let inner = RpcStatsInner::new();
+        inner.in_flight_requests.store(3, Ordering::Relaxed);
+        inner.total_requests_sent.store(42, Ordering::Relaxed);
+        inner.total_responses_received.store(40, Ordering::Relaxed);
+        inner.total_timeouts.store(1, Ordering::Relaxed);
+        inner.total_stray_responses.store(2, Ordering::Relaxed);
+        inner.total_busy_rejections.store(5, Ordering::Relaxed);
+        let stats = RpcStats { inner };
+        let s = format!("{}", stats.snapshot());
+        assert!(s.contains("in_flight=3"), "missing in_flight: {s}");
+        assert!(s.contains("sent=42"), "missing sent: {s}");
+        assert!(s.contains("responses=40"), "missing responses: {s}");
+        assert!(s.contains("timeouts=1"), "missing timeouts: {s}");
+        assert!(s.contains("stray=2"), "missing stray: {s}");
+        assert!(s.contains("busy=5"), "missing busy: {s}");
+    }
+
+    /// Fire a burst of requests and assert the in-flight counter rises and
+    /// then drains back to zero. A no-reply handler gives us a window where
+    /// the counter is pinned at the burst size, plus an increment of
+    /// `total_timeouts` matching the number of calls that eventually gave up.
+    #[tokio::test]
+    async fn stats_in_flight_rises_and_falls_and_timeouts_increment() {
+        let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
+        let client = RpcBuilder::new()
+            .max_outstanding_per_peer(32)
+            .spawn(ha, test_clock());
+        let _server = RpcBuilder::new()
+            .max_outstanding_per_peer(32)
+            .handler(
+                1u16,
+                |_peer: NodeId, _body: Bytes, _cancel: CancellationToken| async move {
+                    std::future::pending::<Result<Bytes, Bytes>>().await
+                },
+            )
+            .spawn(hb, test_clock());
+
+        let stats = client.stats();
+        assert_eq!(stats.in_flight_requests(), 0);
+        assert_eq!(stats.total_timeouts(), 0);
+
+        const N: u64 = 8;
+        let mut calls = Vec::with_capacity(N as usize);
+        for _ in 0..N {
+            let c = client.clone();
+            calls.push(tokio::spawn(async move {
+                c.call(nid(2), 1, Bytes::new(), Duration::from_millis(80))
+                    .await
+            }));
+        }
+
+        // Wait for all N to become in-flight.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        while tokio::time::Instant::now() < deadline {
+            if stats.in_flight_requests() == N {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(stats.in_flight_requests(), N, "in_flight did not reach {N}");
+        assert_eq!(stats.total_requests_sent(), N);
+
+        // Let them all time out.
+        for c in calls {
+            let r = c.await.unwrap();
+            assert!(matches!(r, Err(RpcError::Timeout)), "got {r:?}");
+        }
+
+        assert_eq!(stats.in_flight_requests(), 0, "in_flight did not drain");
+        assert_eq!(stats.total_timeouts(), N);
+
+        let snap = stats.snapshot();
+        let per_method = snap.per_method.get(&1u16).expect("method 1 recorded");
+        assert_eq!(per_method.calls, N);
+        let per_peer = snap.per_peer.get(&nid(2)).expect("peer recorded");
+        assert_eq!(per_peer.in_flight, 0);
+        assert_eq!(per_peer.timeouts, N);
+    }
+
+    /// Successful round trips increment `total_responses_received`, record
+    /// bytes in/out for the method, and fall into a latency bucket.
+    #[tokio::test]
+    async fn stats_record_success_bytes_and_latency() {
+        let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
+        let client = RpcBuilder::new().spawn(ha, test_clock());
+        let _server = RpcBuilder::new()
+            .handler(
+                7u16,
+                |_peer: NodeId, body: Bytes, _cancel: CancellationToken| async move { Ok(body) },
+            )
+            .spawn(hb, test_clock());
+
+        let stats = client.stats();
+        for _ in 0..3 {
+            let r = client
+                .call(
+                    nid(2),
+                    7,
+                    Bytes::from_static(b"hello"),
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect("echo");
+            assert_eq!(r.as_ref(), b"hello");
+        }
+
+        assert_eq!(stats.total_requests_sent(), 3);
+        assert_eq!(stats.total_responses_received(), 3);
+        assert_eq!(stats.total_timeouts(), 0);
+
+        let snap = stats.snapshot();
+        let m = snap.per_method.get(&7u16).expect("method 7");
+        assert_eq!(m.calls, 3);
+        assert_eq!(m.bytes_sent, 3 * 5);
+        assert_eq!(m.bytes_received, 3 * 5);
+        let total_bucketed: u64 =
+            m.latency_buckets_us.iter().map(|(_, c)| c).sum::<u64>() + m.latency_overflow;
+        assert_eq!(total_bucketed, 3, "every call must land in a bucket");
+    }
+
+    /// Busy rejections increment `total_busy_rejections` and don't inflate
+    /// `total_responses_received`.
+    #[tokio::test]
+    async fn stats_count_busy_rejections() {
+        let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
+        let client = RpcBuilder::new()
+            .max_outstanding_per_peer(1)
+            .spawn(ha, test_clock());
+        let _server = RpcBuilder::new()
+            .handler(
+                1u16,
+                |_peer: NodeId, _body: Bytes, _cancel: CancellationToken| async move {
+                    std::future::pending::<Result<Bytes, Bytes>>().await
+                },
+            )
+            .spawn(hb, test_clock());
+
+        let c1 = client.clone();
+        let pending = tokio::spawn(async move {
+            c1.call(nid(2), 1, Bytes::new(), Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let err = client
+            .call(nid(2), 1, Bytes::new(), Duration::from_secs(1))
+            .await
+            .expect_err("cap full");
+        assert!(matches!(err, RpcError::Busy));
+
+        let stats = client.stats();
+        assert_eq!(stats.total_busy_rejections(), 1);
+        assert_eq!(stats.total_responses_received(), 0);
+
+        pending.abort();
+    }
+
+    /// Disconnecting the peer must bump per-peer `peer_gone_events`.
+    #[tokio::test]
+    async fn stats_track_peer_gone_events() {
+        let (ha, hb, bridge) = paired_handles(nid(1), nid(2)).await;
+        let client = RpcBuilder::new().spawn(ha, test_clock());
+        let _server = RpcBuilder::new()
+            .handler(
+                1u16,
+                |_peer: NodeId, _body: Bytes, _cancel: CancellationToken| async move {
+                    std::future::pending::<Result<Bytes, Bytes>>().await
+                },
+            )
+            .spawn(hb, test_clock());
+
+        let c = client.clone();
+        let call = tokio::spawn(async move {
+            c.call(nid(2), 1, Bytes::new(), Duration::from_secs(5))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        bridge.disconnect().await;
+        assert!(matches!(call.await.unwrap(), Err(RpcError::PeerGone)));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let stats = client.stats();
+        while tokio::time::Instant::now() < deadline {
+            let snap = stats.snapshot();
+            if let Some(p) = snap.per_peer.get(&nid(2)) {
+                if p.peer_gone_events >= 1 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let snap = stats.snapshot();
+        let p = snap.per_peer.get(&nid(2)).expect("peer recorded");
+        assert_eq!(p.peer_gone_events, 1);
+    }
+
+    /// A response frame that doesn't match any outstanding request must
+    /// increment `total_stray_responses`. In normal operation the
+    /// `KIND_CANCEL` round trip prevents real strays, so we synthesize one by
+    /// injecting a fabricated reply frame directly into the client's event
+    /// stream.
+    #[tokio::test]
+    async fn stats_count_stray_responses() {
+        let (ha, _hb, bridge) = paired_handles(nid(1), nid(2)).await;
+        let client = RpcBuilder::new().spawn(ha, test_clock());
+
+        // Request id 9999 was never issued; this frame will hit `complete`
+        // with nothing in `outstanding` and fall into the stray branch.
+        let stray = encode_frame(9999, KIND_RESPONSE, 0, b"unexpected");
+        bridge.inject_message_to_a(stray).await;
+
+        let stats = client.stats();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline {
+            if stats.total_stray_responses() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(stats.total_stray_responses(), 1);
     }
 }
