@@ -539,8 +539,7 @@ impl SimDriver {
 
             let restart_side =
                 SimStream::new(Arc::clone(&self.network), id, peer_id, inbox_to_restart);
-            let peer_side =
-                SimStream::new(Arc::clone(&self.network), peer_id, id, inbox_to_peer);
+            let peer_side = SimStream::new(Arc::clone(&self.network), peer_id, id, inbox_to_peer);
 
             peer_streams.push((peer_id, sim_addr(j), Box::new(restart_side) as AnyStream));
 

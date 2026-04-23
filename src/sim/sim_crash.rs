@@ -130,9 +130,7 @@ async fn crash_recovery_preserves_flushed_storage_and_wal_state() {
         .unwrap();
     let final_flushed: Vec<&[u8]> = final_entries
         .iter()
-        .filter(|(_, v)| {
-            v.as_ref() != b"block-unflushed" && v.as_ref() != b"post-restart"
-        })
+        .filter(|(_, v)| v.as_ref() != b"block-unflushed" && v.as_ref() != b"post-restart")
         .map(|(_, v)| v.as_ref())
         .collect();
     assert_eq!(
@@ -189,7 +187,10 @@ async fn restart_does_not_touch_peer_storage() {
 
     // And the reborn node sees *its own* prior state — not a peer's.
     let reborn = driver.node(1);
-    assert_eq!(reborn.storage.get(b"role").unwrap().as_deref(), Some(&b"node-1"[..]));
+    assert_eq!(
+        reborn.storage.get(b"role").unwrap().as_deref(),
+        Some(&b"node-1"[..])
+    );
     let reborn_entries: Vec<_> = reborn
         .wal
         .iter_from(Lsn::ZERO)
@@ -239,7 +240,8 @@ async fn restart_preserves_byte_identical_trace_under_same_seed() {
     let trace_a = crash_recovery_scenario(/* seed */ 9090).await;
     let trace_b = crash_recovery_scenario(/* seed */ 9090).await;
     assert_eq!(
-        trace_a, trace_b,
+        trace_a,
+        trace_b,
         "crash-recovery traces diverged under same seed: {} vs {} entries",
         trace_a.len(),
         trace_b.len(),
