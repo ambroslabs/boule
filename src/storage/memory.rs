@@ -68,6 +68,30 @@ impl Storage for MemoryStorage {
         }
         Ok(())
     }
+
+    fn compare_and_swap(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> anyhow::Result<bool> {
+        // Hold the write lock across the read-compare-write so the operation
+        // is linearizable against concurrent readers and writers.
+        let mut map = self.inner.write();
+        let current: Option<&[u8]> = map.get(key).map(|b| b.as_ref());
+        if current != expected {
+            return Ok(false);
+        }
+        match new {
+            Some(v) => {
+                map.insert(key.to_vec(), Bytes::copy_from_slice(v));
+            }
+            None => {
+                map.remove(key);
+            }
+        }
+        Ok(true)
+    }
 }
 
 pub struct MemoryWal {
@@ -282,6 +306,141 @@ mod tests {
         }
         let s: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         use_it(&*s).unwrap();
+    }
+
+    // ── CAS tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn cas_succeeds_when_expected_matches_and_sets_new_value() {
+        let s = MemoryStorage::new();
+        s.put(b"k", b"old").unwrap();
+        let swapped = s.compare_and_swap(b"k", Some(b"old"), Some(b"new")).unwrap();
+        assert!(swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"new"[..]));
+    }
+
+    #[test]
+    fn cas_succeeds_when_expected_is_none_and_key_absent_and_sets_new_value() {
+        let s = MemoryStorage::new();
+        let swapped = s.compare_and_swap(b"k", None, Some(b"v")).unwrap();
+        assert!(swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn cas_fails_when_expected_is_some_but_key_absent() {
+        let s = MemoryStorage::new();
+        let swapped = s.compare_and_swap(b"k", Some(b"v"), Some(b"new")).unwrap();
+        assert!(!swapped);
+        assert_eq!(s.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn cas_fails_when_expected_is_none_but_key_present() {
+        let s = MemoryStorage::new();
+        s.put(b"k", b"existing").unwrap();
+        let swapped = s.compare_and_swap(b"k", None, Some(b"new")).unwrap();
+        assert!(!swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"existing"[..]));
+    }
+
+    #[test]
+    fn cas_fails_when_expected_does_not_match_current() {
+        let s = MemoryStorage::new();
+        s.put(b"k", b"actual").unwrap();
+        let swapped = s
+            .compare_and_swap(b"k", Some(b"different"), Some(b"new"))
+            .unwrap();
+        assert!(!swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"actual"[..]));
+    }
+
+    #[test]
+    fn cas_deletes_key_when_new_is_none_and_expected_matches() {
+        let s = MemoryStorage::new();
+        s.put(b"k", b"v").unwrap();
+        let swapped = s.compare_and_swap(b"k", Some(b"v"), None).unwrap();
+        assert!(swapped);
+        assert_eq!(s.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn cas_noop_when_expected_and_new_are_both_none_and_key_absent() {
+        // Pins the "condition satisfied, no write needed" semantics: observed
+        // state (absent) equals desired state (absent), so Ok(true).
+        let s = MemoryStorage::new();
+        let swapped = s.compare_and_swap(b"k", None, None).unwrap();
+        assert!(swapped);
+        assert_eq!(s.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn cas_does_not_modify_state_on_mismatch() {
+        // Verify no partial write slipped through on the mismatch path.
+        let s = MemoryStorage::new();
+        s.put(b"k", b"v0").unwrap();
+        s.put(b"other", b"untouched").unwrap();
+        let swapped = s
+            .compare_and_swap(b"k", Some(b"wrong"), Some(b"v1"))
+            .unwrap();
+        assert!(!swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v0"[..]));
+        assert_eq!(s.get(b"other").unwrap().as_deref(), Some(&b"untouched"[..]));
+    }
+
+    #[test]
+    fn cas_via_arc_dyn_storage() {
+        // Compile-time object-safety check for the CAS method.
+        fn use_it(s: &dyn Storage) -> anyhow::Result<bool> {
+            s.put(b"k", b"v")?;
+            s.compare_and_swap(b"k", Some(b"v"), Some(b"v2"))
+        }
+        let s: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        assert!(use_it(&*s).unwrap());
+    }
+
+    #[test]
+    fn cas_is_atomic_vs_concurrent_writers() {
+        // Multiple writer threads each try to advance a counter stored at
+        // `b"counter"` via CAS loops. Invariant: the final value equals the
+        // total number of successful swaps, and no two threads ever observe
+        // the same transition — CAS serializes them.
+        const THREADS: usize = 4;
+        const ITERS_PER_THREAD: u64 = 200;
+        let s = Arc::new(MemoryStorage::new());
+        s.put(b"counter", &0u64.to_be_bytes()).unwrap();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || {
+                    for _ in 0..ITERS_PER_THREAD {
+                        loop {
+                            let current = s.get(b"counter").unwrap().unwrap();
+                            let mut buf = [0u8; 8];
+                            buf.copy_from_slice(&current);
+                            let n = u64::from_be_bytes(buf);
+                            let next = (n + 1).to_be_bytes();
+                            if s.compare_and_swap(b"counter", Some(&current), Some(&next))
+                                .unwrap()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let final_bytes = s.get(b"counter").unwrap().unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&final_bytes);
+        assert_eq!(
+            u64::from_be_bytes(buf),
+            (THREADS as u64) * ITERS_PER_THREAD,
+        );
     }
 
     // ── Wal tests ──────────────────────────────────────────────────────────

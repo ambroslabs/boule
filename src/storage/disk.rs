@@ -121,6 +121,38 @@ impl Storage for DiskStorage {
         txn.commit()?;
         Ok(())
     }
+
+    fn compare_and_swap(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> anyhow::Result<bool> {
+        // redb serializes write transactions, so the entire read-compare-write
+        // below is linearizable against concurrent writers without any extra
+        // locking. On mismatch we drop the txn (abort) instead of committing,
+        // skipping the fsync on the hot "someone else won the race" path.
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(KV_TABLE)?;
+            let current = table.get(key)?;
+            let current_bytes: Option<&[u8]> = current.as_ref().map(|g| g.value());
+            if current_bytes != expected {
+                return Ok(false);
+            }
+            drop(current);
+            match new {
+                Some(v) => {
+                    table.insert(key, v)?;
+                }
+                None => {
+                    table.remove(key)?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(true)
+    }
 }
 
 // ── DiskWal ────────────────────────────────────────────────────────────────
@@ -379,6 +411,159 @@ mod tests {
         let s = DiskStorage::open(&path).unwrap();
         assert_eq!(s.get(b"k1").unwrap().as_deref(), Some(&b"v1"[..]));
         assert_eq!(s.get(b"k2").unwrap().as_deref(), Some(&b"v2"[..]));
+    }
+
+    // ── CAS tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn cas_succeeds_when_expected_matches_and_sets_new_value() {
+        let tmp = TempDir::new().unwrap();
+        let s = DiskStorage::open(tmp.path().join("kv.redb")).unwrap();
+        s.put(b"k", b"old").unwrap();
+        let swapped = s.compare_and_swap(b"k", Some(b"old"), Some(b"new")).unwrap();
+        assert!(swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"new"[..]));
+    }
+
+    #[test]
+    fn cas_succeeds_when_expected_is_none_and_key_absent_and_sets_new_value() {
+        let tmp = TempDir::new().unwrap();
+        let s = DiskStorage::open(tmp.path().join("kv.redb")).unwrap();
+        let swapped = s.compare_and_swap(b"k", None, Some(b"v")).unwrap();
+        assert!(swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+    }
+
+    #[test]
+    fn cas_fails_when_expected_is_some_but_key_absent() {
+        let tmp = TempDir::new().unwrap();
+        let s = DiskStorage::open(tmp.path().join("kv.redb")).unwrap();
+        let swapped = s.compare_and_swap(b"k", Some(b"v"), Some(b"new")).unwrap();
+        assert!(!swapped);
+        assert_eq!(s.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn cas_fails_when_expected_is_none_but_key_present() {
+        let tmp = TempDir::new().unwrap();
+        let s = DiskStorage::open(tmp.path().join("kv.redb")).unwrap();
+        s.put(b"k", b"existing").unwrap();
+        let swapped = s.compare_and_swap(b"k", None, Some(b"new")).unwrap();
+        assert!(!swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"existing"[..]));
+    }
+
+    #[test]
+    fn cas_fails_when_expected_does_not_match_current() {
+        let tmp = TempDir::new().unwrap();
+        let s = DiskStorage::open(tmp.path().join("kv.redb")).unwrap();
+        s.put(b"k", b"actual").unwrap();
+        let swapped = s
+            .compare_and_swap(b"k", Some(b"different"), Some(b"new"))
+            .unwrap();
+        assert!(!swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"actual"[..]));
+    }
+
+    #[test]
+    fn cas_deletes_key_when_new_is_none_and_expected_matches() {
+        let tmp = TempDir::new().unwrap();
+        let s = DiskStorage::open(tmp.path().join("kv.redb")).unwrap();
+        s.put(b"k", b"v").unwrap();
+        let swapped = s.compare_and_swap(b"k", Some(b"v"), None).unwrap();
+        assert!(swapped);
+        assert_eq!(s.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn cas_noop_when_expected_and_new_are_both_none_and_key_absent() {
+        let tmp = TempDir::new().unwrap();
+        let s = DiskStorage::open(tmp.path().join("kv.redb")).unwrap();
+        let swapped = s.compare_and_swap(b"k", None, None).unwrap();
+        assert!(swapped);
+        assert_eq!(s.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn cas_does_not_modify_state_on_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let s = DiskStorage::open(tmp.path().join("kv.redb")).unwrap();
+        s.put(b"k", b"v0").unwrap();
+        s.put(b"other", b"untouched").unwrap();
+        let swapped = s
+            .compare_and_swap(b"k", Some(b"wrong"), Some(b"v1"))
+            .unwrap();
+        assert!(!swapped);
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v0"[..]));
+        assert_eq!(s.get(b"other").unwrap().as_deref(), Some(&b"untouched"[..]));
+    }
+
+    #[test]
+    fn cas_via_arc_dyn_storage() {
+        let tmp = TempDir::new().unwrap();
+        let s: Arc<dyn Storage> = Arc::new(DiskStorage::open(tmp.path().join("kv.redb")).unwrap());
+        s.put(b"k", b"v").unwrap();
+        assert!(s.compare_and_swap(b"k", Some(b"v"), Some(b"v2")).unwrap());
+    }
+
+    #[test]
+    fn cas_is_atomic_vs_concurrent_writers() {
+        // Modest thread/iter count: every disk CAS fsyncs on success, so
+        // contention is a real cost here. Enough to catch a broken
+        // serialization contract without slowing down the suite.
+        const THREADS: usize = 4;
+        const ITERS_PER_THREAD: u64 = 50;
+        let tmp = TempDir::new().unwrap();
+        let s = Arc::new(DiskStorage::open(tmp.path().join("kv.redb")).unwrap());
+        s.put(b"counter", &0u64.to_be_bytes()).unwrap();
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || {
+                    for _ in 0..ITERS_PER_THREAD {
+                        loop {
+                            let current = s.get(b"counter").unwrap().unwrap();
+                            let mut buf = [0u8; 8];
+                            buf.copy_from_slice(&current);
+                            let n = u64::from_be_bytes(buf);
+                            let next = (n + 1).to_be_bytes();
+                            if s.compare_and_swap(b"counter", Some(&current), Some(&next))
+                                .unwrap()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let final_bytes = s.get(b"counter").unwrap().unwrap();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&final_bytes);
+        assert_eq!(
+            u64::from_be_bytes(buf),
+            (THREADS as u64) * ITERS_PER_THREAD,
+        );
+    }
+
+    #[test]
+    fn disk_cas_survives_reopen() {
+        // Regression guard: a successful CAS must actually commit so the
+        // value survives a clean close/reopen.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("kv.redb");
+
+        let s = DiskStorage::open(&path).unwrap();
+        s.put(b"k", b"v0").unwrap();
+        assert!(s.compare_and_swap(b"k", Some(b"v0"), Some(b"v1")).unwrap());
+        drop(s);
+
+        let s = DiskStorage::open(&path).unwrap();
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v1"[..]));
     }
 
     // ── Unit tests: Wal basic behavior ────────────────────────────────────
@@ -691,5 +876,28 @@ mod tests {
         let s = DiskStorage::open(&path).unwrap();
         assert_eq!(s.get(b"seed").unwrap().as_deref(), Some(&b"original"[..]));
         assert_eq!(s.get(b"new").unwrap(), None);
+    }
+
+    #[test]
+    fn storage_cas_is_durable_across_crash() {
+        let test_name = "storage::disk::tests::storage_cas_is_durable_across_crash";
+        if let Ok(_mode) = env::var(CRASH_MODE) {
+            // Child: seed a key, run a successful CAS, then abort. The CAS'd
+            // value must survive (parity with apply_batch durability).
+            let path = env::var(CRASH_DB_PATH).unwrap();
+            let s = DiskStorage::open(&path).unwrap();
+            s.put(b"k", b"v0").unwrap();
+            let swapped = s.compare_and_swap(b"k", Some(b"v0"), Some(b"v1")).unwrap();
+            assert!(swapped);
+            std::process::abort();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("kv.redb");
+        let status = spawn_crash_child(test_name, "after_cas", &path);
+        assert!(!status.success(), "child should have aborted");
+
+        let s = DiskStorage::open(&path).unwrap();
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v1"[..]));
     }
 }
