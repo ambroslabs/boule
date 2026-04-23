@@ -1,7 +1,7 @@
 //! Matched request/response RPC on top of the protocol multiplexer.
 //!
 //! Opt-in layer: a caller gets a `ProtocolHandle` for a protocol ID (as usual)
-//! and hands it to [`RpcBuilder::spawn`] to obtain an [`Rpc`]. Both peers in a
+//! and hands it to `RpcBuilder::spawn` to obtain an `Rpc`. Both peers in a
 //! conversation must agree to run RPC on the same protocol ID; within that
 //! protocol, each endpoint is distinguished by a `u16` method ID.
 //!
@@ -11,7 +11,41 @@
 //! | request_id: u64 BE | kind: u8 | method_id: u16 BE | payload: bytes |
 //! ```
 //!
-//! `kind` is one of [`KIND_REQUEST`], [`KIND_RESPONSE`], [`KIND_ERROR`].
+//! `kind` is one of `KIND_REQUEST`, `KIND_RESPONSE`, `KIND_ERROR`, or
+//! `KIND_CANCEL`.
+//!
+//! # Quick start
+//!
+//! Registering ping RPC in `main.rs` (see `src/ping.rs` for the full
+//! integration):
+//!
+//! ```ignore
+//! // 1. Register a protocol ID with the peer manager.
+//! let (reg_tx, reg_rx) = tokio::sync::oneshot::channel();
+//! p2p_cmd_tx
+//!     .send(p2p::PeerCommand::RegisterProtocol {
+//!         id: ping::PROTOCOL_ID,
+//!         reply: reg_tx,
+//!     })
+//!     .await?;
+//! let handle = reg_rx.await?;
+//!
+//! // 2. Build an Rpc with handlers for each method ID you want to serve.
+//! let rpc = p2p::rpc::RpcBuilder::new()
+//!     .handler(ping::METHOD_PING, ping::echo)
+//!     .spawn(handle, clock);
+//!
+//! // 3. Issue calls with the returned handle.
+//! let reply = rpc
+//!     .call(peer, ping::METHOD_PING, payload, Duration::from_secs(2))
+//!     .await?;
+//! ```
+//!
+//! Both sides of the conversation use the same `RpcBuilder::spawn` entry
+//! point; whether a node acts as client, server, or both is purely a matter
+//! of which handlers it registers and which `Rpc::call`s it issues.
+
+#![warn(missing_docs)]
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -30,13 +64,21 @@ use crate::clock::{self, Clock};
 use crate::p2p::tls::{NodeId, node_id_to_base58};
 use crate::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 
+/// Frame kind: an outbound request from a client. The server looks up
+/// `method_id` in its handler table and dispatches.
 pub const KIND_REQUEST: u8 = 0x01;
+/// Frame kind: a successful reply. Body is whatever bytes the handler
+/// returned in `Ok(body)`.
 pub const KIND_RESPONSE: u8 = 0x02;
+/// Frame kind: a failed reply. Body is whatever bytes the handler returned
+/// in `Err(body)`, or the fixed [`NO_SUCH_METHOD`] string when no handler
+/// is registered for the requested method.
 pub const KIND_ERROR: u8 = 0x03;
-/// Sent by the client side to tell the server that a previously issued request
-/// is no longer of interest (timeout, explicit cancel, or `PeerGone`). The
-/// server signals the matching handler's [`CancellationToken`] and drops any
-/// reply the handler might still produce.
+/// Frame kind: sent by the client side to tell the server that a previously
+/// issued request is no longer of interest (timeout, explicit cancel, or
+/// `PeerGone`). The server signals the matching handler's
+/// [`CancellationToken`] and drops any reply the handler might still
+/// produce.
 pub const KIND_CANCEL: u8 = 0x04;
 
 const HEADER_LEN: usize = 8 + 1 + 2;
@@ -50,19 +92,34 @@ pub const DEFAULT_MAX_OUTSTANDING_PER_PEER: usize = 256;
 pub const NO_SUCH_METHOD: &[u8] = b"rpc: no such method";
 
 /// Error cases surfaced by [`Rpc::call`].
+///
+/// Callers typically care about the discriminant — e.g. "retry on
+/// [`PeerGone`], propagate [`Remote`] to the user, surface [`Timeout`] as a
+/// 504, …". See `src/ping.rs` for a mapping from `RpcError` to HTTP
+/// responses.
+///
+/// [`PeerGone`]: RpcError::PeerGone
+/// [`Remote`]: RpcError::Remote
+/// [`Timeout`]: RpcError::Timeout
 #[derive(Debug)]
 pub enum RpcError {
     /// The request did not complete within the caller-provided timeout.
+    /// The RPC task will have already sent a [`KIND_CANCEL`] to the peer so
+    /// the server-side handler can bail out promptly.
     Timeout,
-    /// The peer disconnected before a reply arrived.
+    /// The peer disconnected before a reply arrived. Every in-flight call
+    /// to that peer fails with this variant.
     PeerGone,
-    /// The per-peer outstanding-request limit was already reached.
+    /// The per-peer outstanding-request limit (see
+    /// [`RpcBuilder::max_outstanding_per_peer`]) was already reached.
+    /// Callers should back off or apply their own queueing policy.
     Busy,
     /// The RPC task has been shut down (the `ProtocolHandle` it owns was
     /// closed). Calls made after shutdown return this.
     Shutdown,
-    /// Peer responded with an `Error` frame. The payload is whatever bytes the
-    /// remote handler returned.
+    /// Peer responded with an `Error` frame. The payload is whatever bytes
+    /// the remote handler returned in `Err(body)`, or [`NO_SUCH_METHOD`] if
+    /// the peer had no handler registered for the requested method ID.
     Remote(Bytes),
 }
 
@@ -80,30 +137,53 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-/// Future returned by an [`RpcHandler`]. `Ok` bytes become a `Response` frame;
-/// `Err` bytes become an `Error` frame. Both are opaque — the application
-/// picks its own serialization.
+/// Future returned by an [`RpcHandler`]. `Ok` bytes become a `Response`
+/// frame; `Err` bytes become an `Error` frame. Both are opaque — the
+/// application picks its own serialization.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Bytes, Bytes>> + Send>>;
 
 /// Server-side handler for one method ID.
 ///
+/// A handler is a pure function of `(peer, payload, cancel)` that produces
+/// one of:
+///
+/// - `Ok(body)` — success; the RPC task sends a [`KIND_RESPONSE`] frame.
+/// - `Err(body)` — failure; the RPC task sends a [`KIND_ERROR`] frame and
+///   the caller receives [`RpcError::Remote(body)`](RpcError::Remote).
+///
+/// The blanket implementation below means any `Fn(NodeId, Bytes,
+/// CancellationToken) -> impl Future<Output = Result<Bytes, Bytes>>` is a
+/// valid handler, so the typical registration is just a closure or a free
+/// async function — see [`ping::echo`](../../ping/fn.echo.html):
+///
+/// ```ignore
+/// let rpc = RpcBuilder::new()
+///     .handler(ping::METHOD_PING, ping::echo)
+///     .spawn(handle, clock);
+/// ```
+///
 /// # Cancellation contract
 ///
 /// Handlers receive a [`CancellationToken`] alongside the request payload.
-/// The RPC task signals the token when the originating client has given up on
-/// the request — a caller-side timeout fires, the caller explicitly cancels,
-/// or the peer disconnects (`PeerGone`). Honoring the token is a *soft
-/// contract*: long-running handlers (block assembly, signature verification,
-/// storage scans) SHOULD check `cancel.is_cancelled()` or `select!` against
-/// `cancel.cancelled()` at natural yield points so the work exits promptly
-/// once the reply is no longer wanted. Handlers that don't check will still be
-/// dropped at their next `await`, since the RPC task races the handler future
-/// against the token — but explicit checks let a handler release locks,
-/// return buffers, or update metrics before exiting.
+/// The RPC task signals the token when the originating client has given up
+/// on the request — a caller-side timeout fires, the caller explicitly
+/// cancels, or the peer disconnects (`PeerGone`). Honoring the token is a
+/// *soft contract*: long-running handlers (block assembly, signature
+/// verification, storage scans) SHOULD check `cancel.is_cancelled()` or
+/// `select!` against `cancel.cancelled()` at natural yield points so the
+/// work exits promptly once the reply is no longer wanted. Handlers that
+/// don't check will still be dropped at their next `await`, since the RPC
+/// task races the handler future against the token — but explicit checks
+/// let a handler release locks, return buffers, or update metrics before
+/// exiting.
 ///
-/// Whether or not the handler honors cancellation, the RPC task will discard
-/// any reply it eventually produces for a cancelled request.
+/// Whether or not the handler honors cancellation, the RPC task will
+/// discard any reply it eventually produces for a cancelled request.
 pub trait RpcHandler: Send + Sync + 'static {
+    /// Dispatch a single inbound request.
+    ///
+    /// Implementors rarely write this directly; see the blanket impl for
+    /// any compatible `Fn` closure.
     fn handle(&self, peer: NodeId, payload: Bytes, cancel: CancellationToken) -> HandlerFuture;
 }
 
@@ -117,7 +197,21 @@ where
     }
 }
 
-/// Builds an [`Rpc`] from a set of registered handlers and configuration.
+/// Builder for an [`Rpc`].
+///
+/// Collect handlers and tuning knobs, then call [`spawn`](Self::spawn) with
+/// a [`ProtocolHandle`] to start the task and get back a cloneable [`Rpc`]
+/// handle. One builder yields one running RPC task; register a builder per
+/// protocol ID you want to serve.
+///
+/// # Example
+///
+/// ```ignore
+/// let rpc = RpcBuilder::new()
+///     .handler(METHOD_PING, ping::echo)
+///     .handler(METHOD_STATUS, status_handler)
+///     .spawn(protocol_handle, clock);
+/// ```
 pub struct RpcBuilder {
     handlers: HashMap<u16, Arc<dyn RpcHandler>>,
     max_outstanding_per_peer: usize,
@@ -133,18 +227,28 @@ impl Default for RpcBuilder {
 }
 
 impl RpcBuilder {
+    /// Start a fresh builder with no handlers and the default per-peer
+    /// ceiling ([`DEFAULT_MAX_OUTSTANDING_PER_PEER`]).
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Register a handler for `method_id`. Later registrations overwrite
     /// earlier ones for the same ID.
+    ///
+    /// Any `Fn(NodeId, Bytes, CancellationToken) -> impl Future<Output =
+    /// Result<Bytes, Bytes>>` is accepted via the blanket [`RpcHandler`]
+    /// impl — in practice this is an async function or closure.
     pub fn handler<H: RpcHandler>(mut self, method_id: u16, handler: H) -> Self {
         self.handlers.insert(method_id, Arc::new(handler));
         self
     }
 
     /// Override the per-peer outstanding-request ceiling.
+    ///
+    /// When a peer has this many in-flight requests, further [`Rpc::call`]s
+    /// to that peer fail immediately with [`RpcError::Busy`]. Values less
+    /// than 1 are clamped to 1.
     #[allow(dead_code)] // public tuning knob; exercised by unit tests only for now
     pub fn max_outstanding_per_peer(mut self, n: usize) -> Self {
         self.max_outstanding_per_peer = n.max(1);
@@ -152,8 +256,16 @@ impl RpcBuilder {
     }
 
     /// Consume the builder and the protocol handle, spawn the RPC task, and
-    /// return a cloneable [`Rpc`] handle. `clock` is used for the per-call
-    /// timeout in [`Rpc::call`].
+    /// return a cloneable [`Rpc`] handle.
+    ///
+    /// `clock` is used for the per-call timeout in [`Rpc::call`] — pass
+    /// [`TokioClock`](crate::clock::TokioClock) in production; the sim
+    /// harness injects a virtual clock.
+    ///
+    /// The RPC task runs until the [`ProtocolHandle`]'s event channel
+    /// closes (i.e. the peer manager drops the protocol). On shutdown every
+    /// pending caller is woken with [`RpcError::Shutdown`] and every
+    /// in-flight server handler is cancelled.
     pub fn spawn(self, handle: ProtocolHandle, clock: Arc<dyn Clock>) -> Rpc {
         let (op_tx, op_rx) = mpsc::channel::<Op>(256);
         let server_handlers: ServerHandlers = Arc::new(Mutex::new(HashMap::new()));
@@ -179,6 +291,11 @@ impl RpcBuilder {
 }
 
 /// Cloneable client handle to the running RPC task.
+///
+/// Obtained from [`RpcBuilder::spawn`]. Cloning is cheap — clones share
+/// the same task and request-ID counter, so clones can make interleaved
+/// calls freely. The same handle also serves responses (via the handlers
+/// registered at build time), so there is no separate "server handle".
 #[derive(Clone)]
 pub struct Rpc {
     op_tx: mpsc::Sender<Op>,
@@ -191,10 +308,34 @@ pub struct Rpc {
 }
 
 impl Rpc {
-    /// Issue an RPC request and await its response. Resolves with
-    /// [`RpcError::Timeout`] if `timeout` elapses first, [`RpcError::PeerGone`]
-    /// if the peer disconnects first, or [`RpcError::Busy`] if the per-peer
-    /// outstanding limit is already full.
+    /// Issue an RPC request and await its response.
+    ///
+    /// # Parameters
+    ///
+    /// - `peer`: the target node. Must be currently connected — if not, the
+    ///   call fails with [`RpcError::PeerGone`] the moment the connection
+    ///   drops (or never completes if already gone).
+    /// - `method_id`: the `u16` method identifier the remote peer must have
+    ///   a handler for. Unknown methods resolve to
+    ///   [`RpcError::Remote(NO_SUCH_METHOD)`](RpcError::Remote).
+    /// - `payload`: opaque request body. This crate does not pick a
+    ///   serialization format for you.
+    /// - `timeout`: wall-clock budget for the round trip. On expiry the
+    ///   call resolves [`RpcError::Timeout`] and the RPC task sends a
+    ///   [`KIND_CANCEL`] frame to the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns one of:
+    ///
+    /// - [`RpcError::Timeout`] if `timeout` elapses first.
+    /// - [`RpcError::PeerGone`] if the peer disconnects before a reply
+    ///   arrives.
+    /// - [`RpcError::Busy`] if the per-peer outstanding-request limit is
+    ///   already full (see [`RpcBuilder::max_outstanding_per_peer`]).
+    /// - [`RpcError::Shutdown`] if the RPC task has exited.
+    /// - [`RpcError::Remote`] if the peer's handler returned `Err(body)` or
+    ///   no handler was registered for `method_id`.
     pub async fn call(
         &self,
         peer: NodeId,
@@ -227,9 +368,13 @@ impl Rpc {
     }
 
     /// Number of server-side handler tasks currently in flight on this RPC
-    /// instance. Exposed primarily for tests and metrics: a healthy instance
-    /// settles back to zero shortly after its callers time out or the peer
-    /// disconnects.
+    /// instance.
+    ///
+    /// Exposed primarily for tests and metrics: a healthy instance settles
+    /// back to zero shortly after its callers time out or the peer
+    /// disconnects. A persistent non-zero value in steady state points to
+    /// handlers that don't honor their cancellation token and don't hit any
+    /// `await` points that would let the RPC task drop them.
     #[allow(dead_code)] // exposed for tests / future metrics
     pub fn server_handler_count(&self) -> usize {
         self.server_handler_count.load(Ordering::Relaxed)
