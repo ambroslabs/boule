@@ -20,7 +20,9 @@
 //!
 //! - [`leader`] (6.A / #86): [`leader::LeaderSelector`] trait + default
 //!   [`leader::RoundRobinSelector`].
-//! - `timeout` (6.B / #87): `TimeoutPolicy` trait + exponential backoff.
+//! - [`timeout`] (6.B / #87): [`timeout::TimeoutPolicy`] trait +
+//!   [`timeout::ExponentialBackoff`].
 //! - `Pacemaker` state machine (6.C / #88): `step(Event) -> Vec<Action>`.
 
 pub mod leader;
+pub mod timeout;

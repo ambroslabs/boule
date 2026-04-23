@@ -19,8 +19,7 @@
 //! - Milestone 7 (#23): HotStuff safety core as a pure state machine.
 //!   Composes with pacemaker, does not call into it.
 //! - Milestone 8 (#24): integration layer that translates safety-core and
-//!   pacemaker [`Action`](pacemaker::Action)s into real timers, network
-//!   sends, and storage writes.
+//!   pacemaker actions into real timers, network sends, and storage writes.
 //!
 //! # `View`
 //!
