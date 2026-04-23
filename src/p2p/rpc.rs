@@ -410,6 +410,9 @@ impl Rpc {
             .await
             .map_err(|_| RpcError::Shutdown)?;
 
+        // The timeout is driven by `Clock::sleep`, not wall-clock subtraction,
+        // so it's already immune to wall-clock jumps. Any future code on this
+        // path that does `t2 - t1` math must use `Clock::now_monotonic`.
         match clock::timeout(&*self.clock, timeout, reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RpcError::Shutdown),

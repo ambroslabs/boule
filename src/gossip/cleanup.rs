@@ -18,6 +18,10 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // `expiry` is an absolute wall-clock timestamp serialized on
+                // the wire, so this is timestamp comparison, not duration
+                // math. Consensus-adjacent code must use
+                // [`Clock::now_monotonic`] for any `t2 - t1` style math.
                 let removed = store.remove_expired(clock.now_wall());
                 if removed > 0 {
                     info!("cleanup removed {removed} expired messages");

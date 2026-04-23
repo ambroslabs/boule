@@ -148,6 +148,74 @@ async fn per_node_skew_is_deterministic_across_runs_with_same_seed() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_clock_monotonic_tracks_driver_advance() {
+    // The shared SimClock and every per-node view must return a
+    // monotonic duration that advances in lockstep with
+    // `driver.advance` and never goes backward.
+    let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let driver = SimDriver::new_with_skew(
+        2,
+        /* seed */ 0,
+        start,
+        GossipFactory,
+        MemoryBacking,
+        |idx, _rng| {
+            if idx == 0 {
+                Duration::from_secs(3)
+            } else {
+                Duration::ZERO
+            }
+        },
+    )
+    .await
+    .expect("memory backing infallible");
+
+    let shared = Arc::clone(&driver.clock) as Arc<dyn Clock>;
+    let view_a = driver.clock.for_node(driver.node_id(0));
+    let view_b = driver.clock.for_node(driver.node_id(1));
+
+    assert_eq!(shared.now_monotonic(), Duration::ZERO);
+    assert_eq!(view_a.now_monotonic(), Duration::ZERO);
+    assert_eq!(view_b.now_monotonic(), Duration::ZERO);
+
+    driver.advance(Duration::from_millis(500)).await;
+    assert_eq!(shared.now_monotonic(), Duration::from_millis(500));
+    // Per-node wall-clock skew must not perturb the monotonic reading.
+    assert_eq!(view_a.now_monotonic(), Duration::from_millis(500));
+    assert_eq!(view_b.now_monotonic(), Duration::from_millis(500));
+
+    driver.advance(Duration::from_secs(2)).await;
+    assert_eq!(shared.now_monotonic(), Duration::from_millis(2_500));
+    assert_eq!(view_a.now_monotonic(), Duration::from_millis(2_500));
+    assert_eq!(view_b.now_monotonic(), Duration::from_millis(2_500));
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn sim_clock_monotonic_is_non_decreasing_across_advances() {
+    // Drive a sequence of arbitrary advances and confirm the monotonic
+    // reading never regresses. This is the acceptance-criterion test:
+    // when the harness eventually simulates a backward wall-clock jump,
+    // `now_monotonic` must still not move backward.
+    let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let driver =
+        SimDriver::new_with_backing(1, /* seed */ 42, start, GossipFactory, MemoryBacking)
+            .await
+            .unwrap();
+    let clock = Arc::clone(&driver.clock) as Arc<dyn Clock>;
+
+    let mut last = clock.now_monotonic();
+    for step in [5, 50, 1, 1_000, 7, 250] {
+        driver.advance(Duration::from_millis(step)).await;
+        let now = clock.now_monotonic();
+        assert!(
+            now >= last,
+            "monotonic regressed from {last:?} to {now:?} after step {step}ms",
+        );
+        last = now;
+    }
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn per_node_skew_does_not_perturb_non_skewed_trace() {
     // Regression: the default `new_with_backing` path (no skew) must
     // produce a byte-identical trace to a run that explicitly supplies

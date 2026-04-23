@@ -18,7 +18,28 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait Clock: Send + Sync + 'static {
     /// Current wall-clock time as a UTC datetime.
+    ///
+    /// **Not monotonic.** NTP adjustments, leap-second smearing, VM
+    /// suspend/resume, and plain operator error can make this jump
+    /// backward by seconds or more. Use [`Clock::now_monotonic`] for
+    /// any duration math in consensus-adjacent code (pacemaker view
+    /// timers, safety-core "has the timeout elapsed?" checks, retry
+    /// backoffs). `now_wall` is for human-readable fields only:
+    /// log timestamps, gossip-message expiry, serialized wire
+    /// timestamps, etc.
     fn now_wall(&self) -> chrono::DateTime<chrono::Utc>;
+
+    /// Elapsed duration since an implementation-defined epoch that is
+    /// fixed for the lifetime of this `Clock` instance (process start
+    /// for [`TokioClock`], sim-start for `SimClock`).
+    ///
+    /// Guaranteed to never return a smaller value than a prior call on
+    /// the same instance. Intended for consensus and pacemaker code
+    /// that needs to compute `elapsed = now_monotonic() - earlier` and
+    /// compare against a timeout without worrying about wall-clock
+    /// adjustments.
+    #[allow(dead_code)] // Wired for pacemaker/safety-core work in #22 and #23.
+    fn now_monotonic(&self) -> Duration;
 
     /// Sleep for `dur`.
     fn sleep(&self, dur: Duration) -> BoxFuture<'static, ()>;
@@ -58,5 +79,33 @@ pub async fn timeout<F: Future>(
         biased;
         out = &mut fut => Ok(out),
         _ = clock.sleep(dur) => Err(Elapsed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokio_clock_monotonic_is_non_decreasing() {
+        let clock = TokioClock::new();
+        let mut last = clock.now_monotonic();
+        for _ in 0..1000 {
+            let next = clock.now_monotonic();
+            assert!(next >= last, "monotonic went backward: {next:?} < {last:?}");
+            last = next;
+        }
+    }
+
+    #[test]
+    fn tokio_clock_monotonic_advances_across_a_real_sleep() {
+        let clock = TokioClock::new();
+        let before = clock.now_monotonic();
+        std::thread::sleep(Duration::from_millis(5));
+        let after = clock.now_monotonic();
+        assert!(
+            after > before,
+            "monotonic did not advance across a 5ms real sleep: {before:?} -> {after:?}"
+        );
     }
 }
