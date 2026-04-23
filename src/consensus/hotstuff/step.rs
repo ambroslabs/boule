@@ -28,7 +28,7 @@
 use crate::consensus::View;
 use crate::crypto::signed::Signed;
 
-use super::qc::{NewView, Proposal, Vote};
+use super::qc::{NewView, Proposal, QuorumCertificate, Vote};
 
 /// Inputs the safety core reacts to.
 ///
@@ -52,4 +52,25 @@ pub enum Event {
     /// safety core itself — always injected from the integration layer
     /// after a pacemaker `AdvanceToView` fires.
     PacemakerAdvance(View),
+}
+
+/// A durable state change the integration layer must persist (WAL /
+/// on-disk state) so the same value survives a restart.
+///
+/// `StateUpdate`s are produced, never consumed, by the safety core. The
+/// core updates its own in-memory [`super::state::HotStuffState`]
+/// immediately and emits the corresponding `StateUpdate` so the driver
+/// can mirror the change durably before any outbound `Action` that
+/// depends on it leaves the machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StateUpdate {
+    /// Replica voted in `view`. Persist so we never double-vote across
+    /// restarts — the safety property of HotStuff depends on this
+    /// survivor guarantee.
+    VotedInView { view: View },
+    /// Replica promoted its `locked_qc` via the two-chain rule.
+    LockedQc(QuorumCertificate),
+    /// Replica adopted a fresher `high_qc` (seen via a proposal's
+    /// justify, a freshly-formed QC, or a `NewView`).
+    HighQc(QuorumCertificate),
 }
