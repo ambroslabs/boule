@@ -469,7 +469,9 @@ async fn per_node_memory_storage_is_independent_across_nodes() {
 
     // Same drill for the Wal: each append must be node-local.
     for (i, node) in driver.nodes().iter().enumerate() {
-        node.wal.append(format!("entry-node-{i}").as_bytes()).unwrap();
+        node.wal
+            .append(format!("entry-node-{i}").as_bytes())
+            .unwrap();
     }
     for (i, node) in driver.nodes().iter().enumerate() {
         let entries: Vec<_> = node
@@ -478,7 +480,11 @@ async fn per_node_memory_storage_is_independent_across_nodes() {
             .unwrap()
             .collect::<anyhow::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(entries.len(), 1, "node {i} wal must only hold its own entry");
+        assert_eq!(
+            entries.len(),
+            1,
+            "node {i} wal must only hold its own entry"
+        );
         assert_eq!(entries[0].1.as_ref(), format!("entry-node-{i}").as_bytes());
     }
 
@@ -499,23 +505,24 @@ async fn per_node_disk_storage_via_tempdir_supports_gossip_and_cleans_up_on_drop
     // once the driver (and therefore the backing) is dropped.
     let backing = TempDirDiskBacking::new().expect("tempdir");
     let tempdir_path = backing.path().to_path_buf();
-    assert!(tempdir_path.exists(), "backing tempdir must exist while alive");
+    assert!(
+        tempdir_path.exists(),
+        "backing tempdir must exist while alive"
+    );
 
-    let driver = SimDriver::new_with_backing(
-        3,
-        /* seed */ 201,
-        Utc::now(),
-        GossipFactory,
-        backing,
-    )
-    .await
-    .expect("disk backing must open");
+    let driver =
+        SimDriver::new_with_backing(3, /* seed */ 201, Utc::now(), GossipFactory, backing)
+            .await
+            .expect("disk backing must open");
 
     // Sanity-check each node's backing is really on disk and isolated.
     for (i, node) in driver.nodes().iter().enumerate() {
         let key = b"disk-probe";
         node.storage.put(key, &[i as u8]).unwrap();
-        let lsn = node.wal.append(format!("disk-entry-{i}").as_bytes()).unwrap();
+        let lsn = node
+            .wal
+            .append(format!("disk-entry-{i}").as_bytes())
+            .unwrap();
         node.wal.flush().unwrap();
         assert_eq!(lsn.raw(), 1, "each node's wal starts at lsn 1");
     }

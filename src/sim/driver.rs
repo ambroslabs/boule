@@ -179,7 +179,10 @@ impl SimNode {
             .gossip
             .as_ref()
             .expect("inject_gossip called on a non-gossip SimNode");
-        match gossip_handles.store.try_insert(msg.clone(), clock.now_wall()) {
+        match gossip_handles
+            .store
+            .try_insert(msg.clone(), clock.now_wall())
+        {
             gossip::InsertResult::Inserted => {
                 let encoded = serde_json::to_vec(&WireMessage::Gossip(msg))
                     .expect("WireMessage serialization cannot fail");
@@ -603,7 +606,11 @@ async fn build_gossip_node(ctx: SimNodeCtx) -> SimNode {
         let itx = internal_tx.clone();
         let pgt = peer_gone_tx.clone();
         tokio::spawn(crate::p2p::manager::run(
-            our_id, cmd_rx, internal_rx, itx, pgt,
+            our_id,
+            cmd_rx,
+            internal_rx,
+            itx,
+            pgt,
         ))
     };
 
