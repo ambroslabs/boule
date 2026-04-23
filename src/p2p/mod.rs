@@ -41,6 +41,7 @@
 //! p2p_cmd_tx
 //!     .send(PeerCommand::RegisterProtocol {
 //!         id: gossip::PROTOCOL_ID,
+//!         max_frame_bytes: Some(gossip::MAX_FRAME_BYTES),
 //!         reply: reg_tx,
 //!     })
 //!     .await?;
@@ -178,10 +179,26 @@ pub enum PeerCommand {
     /// [`tls_protocol::TlsConnectionProtocol::run`].
     ///
     /// Registering the same `id` twice overwrites the previous handle;
-    /// events from that point forward go to the new receiver.
+    /// events from that point forward go to the new receiver. The new
+    /// registration's `max_frame_bytes` also replaces the previous cap.
+    ///
+    /// # Frame-size enforcement
+    ///
+    /// `max_frame_bytes` bounds the length-delimited frame body (the 1-byte
+    /// protocol tag plus the application payload). A peer that sends a
+    /// frame exceeding this cap has its connection closed immediately; the
+    /// manager emits the usual `PeerGone` event. `None` keeps only the
+    /// transport-wide [`connection::DEFAULT_MAX_FRAME_LEN`] ceiling, while
+    /// `Some(n)` installs a per-protocol cap enforced against every
+    /// connection. Pick a cap tight enough to rule out obvious abuse
+    /// (e.g. votes should not fit 1 MB) without rejecting legitimate
+    /// traffic.
     RegisterProtocol {
         /// Single-byte protocol identifier. Must be unique across the node.
         id: u8,
+        /// Optional per-protocol frame-size cap. `None` falls back to the
+        /// global transport cap.
+        max_frame_bytes: Option<usize>,
         /// Channel for the manager to return the newly created handle on.
         reply: oneshot::Sender<ProtocolHandle>,
     },

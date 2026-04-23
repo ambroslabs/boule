@@ -1,12 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use super::connection;
+use super::connection::ProtocolCaps;
 use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 
@@ -51,6 +54,9 @@ pub async fn run(
     // production bugs.
     let mut peers: BTreeMap<NodeId, mpsc::Sender<Bytes>> = BTreeMap::new();
     let mut protocols: BTreeMap<u8, mpsc::Sender<ProtocolEvent>> = BTreeMap::new();
+    // Shared with every spawned connection task; updated in place when a
+    // protocol registers a tighter-than-global cap.
+    let protocol_caps: ProtocolCaps = Arc::new(RwLock::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -68,6 +74,7 @@ pub async fn run(
                             &mut peers,
                             &protocols,
                             internal_tx.clone(),
+                            Arc::clone(&protocol_caps),
                         );
                     }
                     Some(ManagerMsg::PeerGone { node_id }) => {
@@ -117,7 +124,7 @@ pub async fn run(
 
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(PeerCommand::RegisterProtocol { id, reply }) => {
+                    Some(PeerCommand::RegisterProtocol { id, max_frame_bytes, reply }) => {
                         let (event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(256);
                         let (send_tx, mut send_rx) = mpsc::channel::<ProtocolOutbound>(256);
                         let itx = internal_tx.clone();
@@ -133,6 +140,17 @@ pub async fn run(
                             }
                         });
                         protocols.insert(id, event_tx);
+                        // `None` falls back to the global cap in connection::run;
+                        // `Some(n)` installs a tighter per-protocol limit
+                        // enforced on every connection, present and future.
+                        match max_frame_bytes {
+                            Some(cap) => {
+                                protocol_caps.write().insert(id, cap);
+                            }
+                            None => {
+                                protocol_caps.write().remove(&id);
+                            }
+                        }
                         let _ = reply.send(ProtocolHandle { send_tx, event_rx });
                     }
                     Some(PeerCommand::Disconnect { node_id }) => {
@@ -158,6 +176,7 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_connection(
     our_node_id: NodeId,
     peer_node_id: NodeId,
@@ -166,6 +185,7 @@ fn register_connection(
     peers: &mut BTreeMap<NodeId, mpsc::Sender<Bytes>>,
     protocols: &BTreeMap<u8, mpsc::Sender<ProtocolEvent>>,
     internal_tx: mpsc::Sender<ManagerMsg>,
+    protocol_caps: ProtocolCaps,
 ) {
     let id = node_id_to_base58(&peer_node_id);
 
@@ -194,7 +214,7 @@ fn register_connection(
 
     let conn_tx = internal_tx.clone();
     tokio::spawn(async move {
-        connection::run(peer_node_id, stream, write_rx, conn_tx).await;
+        connection::run(peer_node_id, stream, write_rx, conn_tx, protocol_caps).await;
         if internal_tx
             .send(ManagerMsg::PeerGone {
                 node_id: peer_node_id,
@@ -272,10 +292,19 @@ mod tests {
         }
 
         async fn register(&self, id: u8) -> ProtocolHandle {
+            self.register_with_cap(id, None).await
+        }
+
+        async fn register_with_cap(
+            &self,
+            id: u8,
+            max_frame_bytes: Option<usize>,
+        ) -> ProtocolHandle {
             let (reply_tx, reply_rx) = oneshot::channel();
             self.cmd_tx
                 .send(PeerCommand::RegisterProtocol {
                     id,
+                    max_frame_bytes,
                     reply: reply_tx,
                 })
                 .await
@@ -550,5 +579,107 @@ mod tests {
             .unwrap();
         // Manager survives and still answers.
         assert!(mgr.list_peers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn per_protocol_cap_admits_small_frames_and_drops_oversize() {
+        use tokio::io::AsyncWriteExt;
+
+        // Register protocol 0xAB with a 1000-byte cap. A 500-byte frame
+        // should be delivered to the protocol handle; a 2000-byte frame
+        // should close the connection and surface PeerGone.
+        let mut mgr = TestManager::start(nid(1));
+        let mut h = mgr.register_with_cap(0xAB, Some(1_000)).await;
+
+        let mut remote = add_peer(&mgr, nid(5)).await;
+
+        // Drain the PeerConnected event so the next recv() is guaranteed
+        // to be either the inbound Message or the later PeerDisconnected.
+        let connected = tokio::time::timeout(Duration::from_millis(200), h.event_rx.recv())
+            .await
+            .expect("peer-connected times out")
+            .expect("event channel closed");
+        assert!(matches!(connected, ProtocolEvent::PeerConnected { node_id } if node_id == nid(5)));
+
+        // Helper: pack a length-delimited frame whose body is
+        // `[protocol_id][payload...]`.
+        let frame = |protocol_id: u8, payload_len: usize| -> BytesMut {
+            let body_len = 1 + payload_len;
+            let mut buf = BytesMut::with_capacity(4 + body_len);
+            buf.put_u32(body_len as u32);
+            buf.put_u8(protocol_id);
+            buf.extend_from_slice(&vec![0u8; payload_len]);
+            buf
+        };
+
+        // Under-cap frame: body is 500 bytes (< 1000), delivered intact.
+        remote.write_all(&frame(0xAB, 499)).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_millis(500), h.event_rx.recv())
+            .await
+            .expect("inbound message times out")
+            .expect("event channel closed");
+        match msg {
+            ProtocolEvent::Message { from, payload } => {
+                assert_eq!(from, nid(5));
+                assert_eq!(payload.len(), 499);
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+
+        // Over-cap frame: body is 2000 bytes (> 1000). The connection
+        // task must close; the manager emits PeerGone and fans out
+        // PeerDisconnected to every registered protocol.
+        remote.write_all(&frame(0xAB, 1_999)).await.unwrap();
+
+        let gone = tokio::time::timeout(Duration::from_millis(500), mgr.peer_gone_rx.recv())
+            .await
+            .expect("peer-gone broadcast times out")
+            .expect("peer-gone channel closed");
+        assert_eq!(gone, nid(5));
+
+        let disc = tokio::time::timeout(Duration::from_millis(500), h.event_rx.recv())
+            .await
+            .expect("peer-disconnected times out")
+            .expect("event channel closed");
+        assert!(matches!(disc, ProtocolEvent::PeerDisconnected { node_id } if node_id == nid(5)));
+
+        // Peer table reflects the drop.
+        assert!(!mgr.has_peer(nid(5)).await);
+    }
+
+    #[tokio::test]
+    async fn register_protocol_without_cap_preserves_global_1mb_limit() {
+        use tokio::io::AsyncWriteExt;
+
+        // Registering with `max_frame_bytes: None` must keep the existing
+        // behaviour: frames below the global 1 MB ceiling are accepted
+        // regardless of body size.
+        let mgr = TestManager::start(nid(1));
+        let mut h = mgr.register_with_cap(0xAB, None).await;
+
+        let mut remote = add_peer(&mgr, nid(5)).await;
+
+        // Drain PeerConnected.
+        let _ = tokio::time::timeout(Duration::from_millis(200), h.event_rx.recv())
+            .await
+            .expect("peer-connected times out");
+
+        // 100 KB body — would have been rejected under a 1000-byte cap,
+        // but the protocol registered no cap so this must be delivered.
+        let body_len = 100 * 1024 + 1; // +1 for the protocol tag
+        let mut buf = BytesMut::with_capacity(4 + body_len);
+        buf.put_u32(body_len as u32);
+        buf.put_u8(0xAB);
+        buf.extend_from_slice(&vec![0u8; 100 * 1024]);
+        remote.write_all(&buf).await.unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_millis(500), h.event_rx.recv())
+            .await
+            .expect("inbound message times out")
+            .expect("event channel closed");
+        match msg {
+            ProtocolEvent::Message { payload, .. } => assert_eq!(payload.len(), 100 * 1024),
+            other => panic!("expected Message, got {other:?}"),
+        }
     }
 }

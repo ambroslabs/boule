@@ -811,6 +811,7 @@ async fn build_gossip_node(ctx: SimNodeCtx) -> SimNode {
     cmd_tx
         .send(PeerCommand::RegisterProtocol {
             id: gossip::PROTOCOL_ID,
+            max_frame_bytes: Some(gossip::MAX_FRAME_BYTES),
             reply: reg_tx,
         })
         .await

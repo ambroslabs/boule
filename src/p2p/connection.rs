@@ -1,7 +1,10 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::RwLock;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -10,7 +13,18 @@ use tracing::{debug, error};
 use crate::p2p::manager::{AnyStream, ManagerMsg};
 use crate::p2p::tls::{NodeId, node_id_to_base58};
 
-const MAX_FRAME_LEN: usize = 1024 * 1024; // 1 MB
+/// Global transport-level cap. Acts as the codec's `max_frame_length`, so a
+/// peer that sends a length prefix above this is rejected before any body
+/// bytes are buffered. Protocols that register an explicit
+/// `max_frame_bytes <= DEFAULT_MAX_FRAME_LEN` are additionally checked after
+/// the frame is read.
+pub const DEFAULT_MAX_FRAME_LEN: usize = 1024 * 1024; // 1 MB
+
+/// Shared per-protocol frame-size cap registry, populated by
+/// `PeerCommand::RegisterProtocol`. Each connection task consults it to
+/// reject oversize frames for protocols that declared a tighter cap than
+/// [`DEFAULT_MAX_FRAME_LEN`].
+pub type ProtocolCaps = Arc<RwLock<HashMap<u8, usize>>>;
 
 /// Upper bound on how long we'll wait for the TLS `close_notify` + TCP FIN
 /// round-trip on the shutdown path. A dead peer must not be able to pin the
@@ -22,10 +36,11 @@ pub async fn run(
     stream: AnyStream,
     mut write_rx: mpsc::Receiver<Bytes>,
     inbound_tx: mpsc::Sender<ManagerMsg>,
+    protocol_caps: ProtocolCaps,
 ) {
     let id = node_id_to_base58(&node_id);
     let codec = LengthDelimitedCodec::builder()
-        .max_frame_length(MAX_FRAME_LEN)
+        .max_frame_length(DEFAULT_MAX_FRAME_LEN)
         .new_codec();
     let mut framed = Framed::new(stream, codec);
 
@@ -34,6 +49,18 @@ pub async fn run(
             result = framed.next() => {
                 match result {
                     Some(Ok(buf)) => {
+                        if let Some(&protocol_id) = buf.first() {
+                            if let Some(cap) = protocol_caps.read().get(&protocol_id).copied() {
+                                if buf.len() > cap {
+                                    error!(
+                                        "oversize frame from {id}: protocol {protocol_id:#04x} frame is {} bytes > cap {} bytes",
+                                        buf.len(),
+                                        cap
+                                    );
+                                    break;
+                                }
+                            }
+                        }
                         let _ = inbound_tx
                             .send(ManagerMsg::InboundMessage { node_id, msg: Bytes::from(buf) })
                             .await;
@@ -80,18 +107,20 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
-    use std::time::Duration;
 
     use bytes::{BufMut, BytesMut};
-    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, duplex};
 
     use super::*;
 
     fn nid(byte: u8) -> NodeId {
         [byte; 32]
+    }
+
+    fn empty_caps() -> ProtocolCaps {
+        Arc::new(RwLock::new(HashMap::new()))
     }
 
     /// Stream wrapper that records whether `poll_shutdown` was invoked. Lets
@@ -142,11 +171,22 @@ mod tests {
         mpsc::Receiver<ManagerMsg>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_connection_with_caps(empty_caps())
+    }
+
+    fn spawn_connection_with_caps(
+        caps: ProtocolCaps,
+    ) -> (
+        tokio::io::DuplexStream,
+        mpsc::Sender<Bytes>,
+        mpsc::Receiver<ManagerMsg>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (local, remote) = duplex(64 * 1024);
         let (write_tx, write_rx) = mpsc::channel::<Bytes>(16);
         let (inbound_tx, inbound_rx) = mpsc::channel::<ManagerMsg>(16);
         let join = tokio::spawn(async move {
-            run(nid(7), Box::new(local), write_rx, inbound_tx).await;
+            run(nid(7), Box::new(local), write_rx, inbound_tx, caps).await;
         });
         (remote, write_tx, inbound_rx, join)
     }
@@ -256,10 +296,10 @@ mod tests {
     async fn oversized_frame_is_rejected() {
         let (mut remote, _write_tx, mut inbound_rx, join) = spawn_connection();
 
-        // Send a length prefix > MAX_FRAME_LEN so the codec returns an
-        // error before reading the body.
+        // Send a length prefix > DEFAULT_MAX_FRAME_LEN so the codec returns
+        // an error before reading the body.
         let mut header = BytesMut::new();
-        header.put_u32((MAX_FRAME_LEN as u32) + 1);
+        header.put_u32((DEFAULT_MAX_FRAME_LEN as u32) + 1);
         remote.write_all(&header).await.unwrap();
 
         // The connection should exit with an error, not surface the frame.
@@ -268,6 +308,64 @@ mod tests {
             .expect("connection task did not exit after oversized frame")
             .expect("connection task panicked");
         assert!(inbound_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn per_protocol_cap_rejects_oversize_frame() {
+        // Register protocol 0x42 with a tight 100-byte cap. A 50-byte body
+        // (tag + payload = 51 bytes) passes through; a 200-byte body closes
+        // the connection before the manager ever sees it.
+        let caps = Arc::new(RwLock::new(HashMap::from([(0x42u8, 100usize)])));
+        let (mut remote, _write_tx, mut inbound_rx, join) = spawn_connection_with_caps(caps);
+
+        // Small frame under the cap: accepted.
+        let mut ok = BytesMut::new();
+        ok.put_u8(0x42);
+        ok.extend_from_slice(&[0u8; 50]);
+        remote.write_all(&length_prefixed(&ok)).await.unwrap();
+        let msg = tokio::time::timeout(Duration::from_millis(500), inbound_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("connection exited");
+        match msg {
+            ManagerMsg::InboundMessage { msg, .. } => assert_eq!(msg.len(), 51),
+            _ => panic!("expected InboundMessage"),
+        }
+
+        // Large frame over the cap: connection closes.
+        let mut big = BytesMut::new();
+        big.put_u8(0x42);
+        big.extend_from_slice(&[0u8; 200]);
+        remote.write_all(&length_prefixed(&big)).await.unwrap();
+
+        tokio::time::timeout(Duration::from_millis(500), join)
+            .await
+            .expect("connection task did not exit after per-protocol oversize")
+            .expect("connection task panicked");
+        // No further InboundMessage for the oversize frame.
+        assert!(inbound_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn per_protocol_cap_ignored_for_unknown_protocol_id() {
+        // Only protocol 0x42 has a cap registered; a frame tagged 0x99 is
+        // bounded only by DEFAULT_MAX_FRAME_LEN.
+        let caps = Arc::new(RwLock::new(HashMap::from([(0x42u8, 100usize)])));
+        let (mut remote, _write_tx, mut inbound_rx, _join) = spawn_connection_with_caps(caps);
+
+        let mut msg = BytesMut::new();
+        msg.put_u8(0x99);
+        msg.extend_from_slice(&[0u8; 500]); // well over 0x42's cap
+        remote.write_all(&length_prefixed(&msg)).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_millis(500), inbound_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("connection exited");
+        match got {
+            ManagerMsg::InboundMessage { msg, .. } => assert_eq!(msg.len(), 501),
+            _ => panic!("expected InboundMessage"),
+        }
     }
 
     #[tokio::test]
@@ -302,7 +400,7 @@ mod tests {
         let (write_tx, write_rx) = mpsc::channel::<Bytes>(16);
         let (inbound_tx, _inbound_rx) = mpsc::channel::<ManagerMsg>(16);
         let join = tokio::spawn(async move {
-            run(nid(7), Box::new(spy), write_rx, inbound_tx).await;
+            run(nid(7), Box::new(spy), write_rx, inbound_tx, empty_caps()).await;
         });
 
         // Initiate orderly shutdown from our side: drop the write sender
@@ -330,8 +428,6 @@ mod tests {
     /// close_notify").
     #[tokio::test]
     async fn tls_peer_sees_clean_eof_on_orderly_shutdown() {
-        use std::sync::Arc;
-
         use rcgen::{KeyPair, PKCS_ED25519};
         use tokio_rustls::{TlsConnector, rustls};
         use zeroize::Zeroizing;
@@ -370,6 +466,7 @@ mod tests {
                 Box::new(client_tls),
                 client_write_rx,
                 client_inbound_tx,
+                empty_caps(),
             )
             .await;
         });
@@ -381,7 +478,7 @@ mod tests {
         // must observe a clean EOF rather than an `UnexpectedEof` that
         // production code would surface as ERROR.
         let codec = LengthDelimitedCodec::builder()
-            .max_frame_length(MAX_FRAME_LEN)
+            .max_frame_length(DEFAULT_MAX_FRAME_LEN)
             .new_codec();
         let mut server_framed = Framed::new(server_tls, codec);
 
