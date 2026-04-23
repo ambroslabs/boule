@@ -599,9 +599,7 @@ mod tests {
             .await
             .expect("peer-connected times out")
             .expect("event channel closed");
-        assert!(
-            matches!(connected, ProtocolEvent::PeerConnected { node_id } if node_id == nid(5))
-        );
+        assert!(matches!(connected, ProtocolEvent::PeerConnected { node_id } if node_id == nid(5)));
 
         // Helper: pack a length-delimited frame whose body is
         // `[protocol_id][payload...]`.
@@ -643,9 +641,7 @@ mod tests {
             .await
             .expect("peer-disconnected times out")
             .expect("event channel closed");
-        assert!(
-            matches!(disc, ProtocolEvent::PeerDisconnected { node_id } if node_id == nid(5))
-        );
+        assert!(matches!(disc, ProtocolEvent::PeerDisconnected { node_id } if node_id == nid(5)));
 
         // Peer table reflects the drop.
         assert!(!mgr.has_peer(nid(5)).await);
