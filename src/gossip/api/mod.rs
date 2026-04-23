@@ -68,14 +68,25 @@ struct AppState {
 ///
 /// See `main.rs`:
 ///
-/// ```ignore
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use ambros_p2p::clock::{Clock, TokioClock};
+/// use ambros_p2p::gossip::{self, store::GossipStore};
+/// use ambros_p2p::p2p::{self, PeerCommand, ProtocolOutbound};
+/// use tokio::sync::mpsc;
+///
+/// # fn wiring(
+/// #     p2p_cmd_tx: mpsc::Sender<PeerCommand>,
+/// #     gossip_send_tx: mpsc::Sender<ProtocolOutbound>,
+/// # ) {
+/// let store = Arc::new(GossipStore::new());
+/// let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 /// let app = axum::Router::new()
-///     .merge(p2p::api::router(p2p_cmd_tx.clone()))
-///     .merge(gossip::api::router(
-///         Arc::clone(&store),
-///         gossip_send_tx,
-///         Arc::clone(&clock),
-///     ));
+///     .merge(p2p::api::router(p2p_cmd_tx))
+///     .merge(gossip::api::router(store, gossip_send_tx, clock));
+/// # let _ = app;
+/// # }
 /// ```
 pub fn router(
     store: Arc<GossipStore>,

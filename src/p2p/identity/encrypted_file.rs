@@ -2,14 +2,16 @@
 //!
 //! On-disk format (base64-wrapped inside a PEM-like envelope):
 //!
-//!     magic:       "AMBROS\0"   (7 bytes)
-//!     version:     1            (1 byte)
-//!     argon_m:     u32 BE       (memory cost in KiB)
-//!     argon_t:     u32 BE       (iterations)
-//!     argon_p:     u32 BE       (lanes)
-//!     salt:        16 bytes
-//!     nonce:       24 bytes     (XChaCha20)
-//!     ciphertext:  PKCS#8 DER encrypted with XChaCha20-Poly1305, AAD = first 40 bytes
+//! ```text
+//! magic:       "AMBROS\0"   (7 bytes)
+//! version:     1            (1 byte)
+//! argon_m:     u32 BE       (memory cost in KiB)
+//! argon_t:     u32 BE       (iterations)
+//! argon_p:     u32 BE       (lanes)
+//! salt:        16 bytes
+//! nonce:       24 bytes     (XChaCha20)
+//! ciphertext:  PKCS#8 DER encrypted with XChaCha20-Poly1305, AAD = first 40 bytes
+//! ```
 //!
 //! The passphrase is taken from `passphrase_env` if set, else read from the
 //! TTY via rpassword. Passphrases are held in `SecretBox<String>` and zeroed
