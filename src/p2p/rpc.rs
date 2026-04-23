@@ -1864,6 +1864,44 @@ mod tests {
         assert_eq!(reply_c.as_ref(), b"from-C");
     }
 
+    // ── Property tests (issue #52) ──────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        // encode_frame → decode_frame is the identity on any (request_id,
+        // kind, method_id, body). Covers permutations hand-written tests
+        // don't enumerate (e.g. every kind byte, arbitrarily long bodies).
+        #[test]
+        fn prop_frame_round_trips(
+            request_id in any::<u64>(),
+            kind in any::<u8>(),
+            method_id in any::<u16>(),
+            body in proptest::collection::vec(any::<u8>(), 0..=2048),
+        ) {
+            let encoded = encode_frame(request_id, kind, method_id, &body);
+            let decoded = decode_frame(&encoded).expect("valid frame decodes");
+            prop_assert_eq!(decoded.request_id, request_id);
+            prop_assert_eq!(decoded.kind, kind);
+            prop_assert_eq!(decoded.method_id, method_id);
+            prop_assert_eq!(decoded.body.as_ref(), body.as_slice());
+        }
+
+        // Any buffer shorter than the header is rejected with an error and
+        // never panics. Inputs at or beyond `HEADER_LEN` decode cleanly (the
+        // body is whatever trailing bytes happen to be present).
+        #[test]
+        fn prop_decode_frame_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            let buf = Bytes::from(bytes.clone());
+            match decode_frame(&buf) {
+                Ok(_) => prop_assert!(bytes.len() >= HEADER_LEN),
+                Err(_) => prop_assert!(bytes.len() < HEADER_LEN),
+            }
+        }
+    }
+
     /// Malformed / too-short frames must not panic the RPC task: delivering
     /// one and then issuing a normal request must still work.
     #[tokio::test]

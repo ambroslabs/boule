@@ -50,3 +50,4 @@ keyring           = { version = "3", optional = true, default-features = false, 
 reqwest           = { version = "0.12", features = ["json"] }
 tokio             = { version = "1", features = ["full", "test-util"] }
 libc              = "0.2"
+proptest          = { version = "1", default-features = false, features = ["std", "bit-set"] }
