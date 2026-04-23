@@ -35,7 +35,7 @@ use crate::replication::block::{Block, BlockHash};
 
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
 use super::safety_rules::{safe_to_vote, should_update_high_qc};
-use super::state::HotStuffState;
+use super::state::{HotStuffState, Locked};
 use crate::consensus::validator_set::ValidatorSet;
 
 /// Inputs the safety core reacts to.
@@ -76,8 +76,12 @@ pub enum StateUpdate {
     /// restarts — the safety property of HotStuff depends on this
     /// survivor guarantee.
     VotedInView { view: View },
-    /// Replica promoted its `locked_qc` via the two-chain rule.
-    LockedQc(QuorumCertificate),
+    /// Replica promoted its lock via the two-chain rule. Only the
+    /// (view, block_hash) pair is durable — the safety core never
+    /// reads signer data off the lock, and nothing ships it on the
+    /// wire (`NewView` carries `high_qc`, not the lock). See
+    /// `docs/consensus/hotstuff-notes.md#the-bjustify-problem-relevant-to-b4`.
+    Locked(Locked),
     /// Replica adopted a fresher `high_qc` (seen via a proposal's
     /// justify, a freshly-formed QC, or a `NewView`).
     HighQc(QuorumCertificate),
@@ -460,7 +464,7 @@ mod tests {
         assert_eq!(actions, vec![Action::RequestBlock(orphan_parent, sender)]);
         assert!(core.parked_proposals.contains_key(&child_hash));
         assert_eq!(core.state().last_voted_view, 0);
-        assert!(core.state().locked_qc.is_none());
+        assert!(core.state().locked.is_none());
         assert!(core.state().high_qc.is_none());
     }
 
@@ -607,8 +611,13 @@ mod tests {
         // Lock the core on a block at view 5.
         let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
         let locked_hash = locked_block.hash();
+        let locked_height = locked_block.header.height;
         core.state.insert_pending(locked_block);
-        core.state.locked_qc = Some(dummy_qc(5, locked_hash));
+        core.state.locked = Some(Locked {
+            view: 5,
+            height: locked_height,
+            block_hash: locked_hash,
+        });
         core.state.last_voted_view = 5;
 
         // Fork at view 6 rooted directly on genesis (does NOT extend
@@ -632,7 +641,7 @@ mod tests {
             "last_voted_view untouched when refusing to vote",
         );
         assert_eq!(
-            core.state().locked_qc.as_ref().map(|q| q.view),
+            core.state().locked.map(|l| l.view),
             Some(5),
             "lock is not disturbed by a refused proposal",
         );
@@ -655,8 +664,13 @@ mod tests {
 
         let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
         let locked_hash = locked_block.hash();
+        let locked_height = locked_block.header.height;
         core.state.insert_pending(locked_block);
-        core.state.locked_qc = Some(dummy_qc(5, locked_hash));
+        core.state.locked = Some(Locked {
+            view: 5,
+            height: locked_height,
+            block_hash: locked_hash,
+        });
         core.state.last_voted_view = 5;
 
         let fork = fork_rooted_on_genesis(genesis.hash(), 10);

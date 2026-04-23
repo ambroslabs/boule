@@ -14,6 +14,33 @@ use crate::replication::block::{Block, BlockHash};
 
 use super::qc::QuorumCertificate;
 
+/// The block this replica has promised (via the two-chain rule) not to
+/// diverge from.
+///
+/// Carries the block's `view`, `height`, and `block_hash` rather than
+/// the full [`QuorumCertificate`]. The safety core never reads a
+/// signature set off the lock: [`super::safety_rules::safe_to_vote`]
+/// inspects `view` (liveness rule) and `block_hash` (extension rule),
+/// and two-chain promotion in `step::on_proposal_received` uses
+/// `height` for the monotonicity check. Nothing ships the lock on the
+/// wire (`NewView` carries `high_qc`). This matches how the HotStuff
+/// paper's Algorithm 4 tracks the lock as a node reference — see
+/// `docs/consensus/hotstuff-notes.md#the-bjustify-problem-relevant-to-b4`.
+///
+/// `height` is part of the lock rather than derived from
+/// `pending_blocks` because views can skip (validate_structural only
+/// requires `child.view > parent.view`) while heights increment by
+/// one. Comparing by height for two-chain promotion keeps the
+/// monotonicity Lemma 6 of the paper's Appendix B relies on; using
+/// `view` would let a Byzantine proposer wedge us into a stuck state
+/// by claiming a huge view on a short chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Locked {
+    pub view: View,
+    pub height: u64,
+    pub block_hash: BlockHash,
+}
+
 /// All state the HotStuff safety core needs to answer "is this proposal
 /// safe to vote for?" / "what (if anything) should be committed?".
 ///
@@ -25,11 +52,10 @@ pub struct HotStuffState {
     /// `Event::PacemakerAdvance` does.
     pub current_view: View,
 
-    /// Highest-view QC whose block this replica has promised (via the
-    /// two-chain rule) not to diverge from. HotStuff's *extension* rule
-    /// forbids voting for any proposal whose block doesn't extend
-    /// `locked_qc.block_hash`.
-    pub locked_qc: Option<QuorumCertificate>,
+    /// Block this replica has promised (via the two-chain rule) not to
+    /// diverge from. HotStuff's *extension* rule forbids voting for any
+    /// proposal whose block doesn't extend `locked.block_hash`.
+    pub locked: Option<Locked>,
 
     /// Highest-view QC this replica has seen anywhere (proposal,
     /// NewView, freshly assembled). Used to piggyback our most recent
@@ -60,14 +86,15 @@ pub struct HotStuffState {
 impl HotStuffState {
     /// Build a fresh state rooted at `genesis`. The genesis block is
     /// pre-inserted into `pending_blocks` so parent-walking safety
-    /// predicates can terminate on it. Locked/high QC start as `None`.
+    /// predicates can terminate on it. Locked and `high_qc` start as
+    /// `None`.
     pub fn new(validator_set: ValidatorSet, genesis: Block) -> Self {
         let genesis_hash = genesis.hash();
         let mut pending = HashMap::new();
         pending.insert(genesis_hash, genesis);
         Self {
             current_view: 0,
-            locked_qc: None,
+            locked: None,
             high_qc: None,
             last_voted_view: 0,
             validator_set,
@@ -105,7 +132,7 @@ mod tests {
         let state = HotStuffState::new(vs.clone(), genesis.clone());
         assert_eq!(state.current_view, 0);
         assert_eq!(state.last_voted_view, 0);
-        assert!(state.locked_qc.is_none());
+        assert!(state.locked.is_none());
         assert!(state.high_qc.is_none());
         assert_eq!(state.genesis_hash, g_hash);
         assert_eq!(state.get_pending(&g_hash), Some(&genesis));
