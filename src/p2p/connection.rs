@@ -1,13 +1,21 @@
+use std::time::Duration;
+
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::p2p::manager::{AnyStream, ManagerMsg};
 use crate::p2p::tls::{NodeId, node_id_to_base58};
 
 const MAX_FRAME_LEN: usize = 1024 * 1024; // 1 MB
+
+/// Upper bound on how long we'll wait for the TLS `close_notify` + TCP FIN
+/// round-trip on the shutdown path. A dead peer must not be able to pin the
+/// task after the read/write loop has already decided to exit.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub async fn run(
     node_id: NodeId,
@@ -31,7 +39,17 @@ pub async fn run(
                             .await;
                     }
                     Some(Err(e)) => {
-                        error!("read error from {id}: {e}");
+                        // rustls surfaces "peer closed TCP without
+                        // close_notify" as `UnexpectedEof`. That's a
+                        // peer-side hygiene issue — nothing actionable on
+                        // our end — so don't log it as ERROR. Genuine I/O
+                        // failures (decrypt errors, malformed frames) still
+                        // surface at error level.
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                            debug!("peer {id} closed without TLS close_notify: {e}");
+                        } else {
+                            error!("read error from {id}: {e}");
+                        }
                         break;
                     }
                     None => break, // EOF
@@ -51,19 +69,69 @@ pub async fn run(
             }
         }
     }
+
+    // Orderly close: flush any pending writes and send TLS `close_notify`
+    // before dropping the TCP stream. `poll_shutdown` on a rustls stream
+    // emits close_notify; on the sim's in-memory stream it's a no-op. Guard
+    // with a timeout so a dead peer can't wedge us.
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, framed.get_mut().shutdown()).await;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use bytes::{BufMut, BytesMut};
-    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, duplex};
 
     use super::*;
 
     fn nid(byte: u8) -> NodeId {
         [byte; 32]
+    }
+
+    /// Stream wrapper that records whether `poll_shutdown` was invoked. Lets
+    /// the unit tests assert the connection task flushes a clean close on
+    /// exit, without having to stand up a real TLS handshake.
+    struct ShutdownSpy<S> {
+        inner: S,
+        shutdown_called: Arc<AtomicBool>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for ShutdownSpy<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for ShutdownSpy<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.shutdown_called.store(true, Ordering::SeqCst);
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
     }
 
     /// Boilerplate: spawn a connection task against a duplex stream. Returns
@@ -216,5 +284,120 @@ mod tests {
             .await
             .expect("connection task did not exit")
             .expect("connection task panicked");
+    }
+
+    /// On the orderly-shutdown path, the connection task must call
+    /// `poll_shutdown` on the underlying stream. Over TLS this is what
+    /// emits `close_notify`; the `ShutdownSpy` wrapper lets us verify the
+    /// call without the cost of standing up a real TLS handshake.
+    #[tokio::test]
+    async fn orderly_exit_calls_shutdown_on_stream() {
+        let (local, remote) = duplex(64 * 1024);
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let spy = ShutdownSpy {
+            inner: local,
+            shutdown_called: Arc::clone(&shutdown_flag),
+        };
+
+        let (write_tx, write_rx) = mpsc::channel::<Bytes>(16);
+        let (inbound_tx, _inbound_rx) = mpsc::channel::<ManagerMsg>(16);
+        let join = tokio::spawn(async move {
+            run(nid(7), Box::new(spy), write_rx, inbound_tx).await;
+        });
+
+        // Initiate orderly shutdown from our side: drop the write sender
+        // and close the remote so the read half observes EOF. The loop
+        // breaks and then must flush a clean close.
+        drop(write_tx);
+        drop(remote);
+
+        tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .expect("connection task did not exit")
+            .expect("connection task panicked");
+
+        assert!(
+            shutdown_flag.load(Ordering::SeqCst),
+            "connection::run must call poll_shutdown on orderly exit \
+             (so TLS close_notify is sent on real connections)"
+        );
+    }
+
+    /// End-to-end orderly shutdown over real TLS: one side runs
+    /// `connection::run` and closes cleanly; the other side reads framed
+    /// bytes and must see a clean EOF (`None`) instead of rustls'
+    /// `UnexpectedEof` ("peer closed connection without sending TLS
+    /// close_notify").
+    #[tokio::test]
+    async fn tls_peer_sees_clean_eof_on_orderly_shutdown() {
+        use std::sync::Arc;
+
+        use rcgen::{KeyPair, PKCS_ED25519};
+        use tokio_rustls::{TlsConnector, rustls};
+        use zeroize::Zeroizing;
+
+        use crate::p2p::identity::NodeIdentity;
+        use crate::p2p::tls::TlsIdentity;
+
+        fn fresh_tls() -> Arc<TlsIdentity> {
+            let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+            let id = NodeIdentity {
+                pkcs8_der: Zeroizing::new(kp.serialize_der()),
+            };
+            Arc::new(TlsIdentity::from_identity(&id).unwrap())
+        }
+
+        let client_id = fresh_tls();
+        let server_id = fresh_tls();
+
+        let (client_io, server_io) = duplex(64 * 1024);
+        let connector = TlsConnector::from(Arc::clone(&client_id.client_config));
+        let acceptor = server_id.acceptor.clone();
+
+        // Drive the handshake — accept on a spawned task, connect on the
+        // current one, so both sides make progress concurrently.
+        let accept_task = tokio::spawn(async move { acceptor.accept(server_io).await });
+        let server_name = rustls::pki_types::ServerName::try_from("ambros-p2p").unwrap();
+        let client_tls = connector.connect(server_name, client_io).await.unwrap();
+        let server_tls = accept_task.await.unwrap().unwrap();
+
+        // Client side runs the production connection task.
+        let (client_write_tx, client_write_rx) = mpsc::channel::<Bytes>(16);
+        let (client_inbound_tx, _client_inbound_rx) = mpsc::channel::<ManagerMsg>(16);
+        let client_join = tokio::spawn(async move {
+            run(
+                nid(7),
+                Box::new(client_tls),
+                client_write_rx,
+                client_inbound_tx,
+            )
+            .await;
+        });
+
+        // Trigger orderly close on the client side.
+        drop(client_write_tx);
+
+        // Server side reads from the TLS stream with the same framing. It
+        // must observe a clean EOF rather than an `UnexpectedEof` that
+        // production code would surface as ERROR.
+        let codec = LengthDelimitedCodec::builder()
+            .max_frame_length(MAX_FRAME_LEN)
+            .new_codec();
+        let mut server_framed = Framed::new(server_tls, codec);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server_framed.next())
+            .await
+            .expect("server-side framed read timed out waiting for EOF");
+
+        match result {
+            None => { /* clean EOF — close_notify was received */ }
+            Some(Ok(frame)) => panic!("expected EOF, got a frame of {} bytes", frame.len()),
+            Some(Err(e)) => panic!(
+                "expected clean EOF, got read error (kind={:?}): {e}",
+                e.kind()
+            ),
+        }
+
+        client_join.await.expect("client connection task panicked");
     }
 }

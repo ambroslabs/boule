@@ -31,8 +31,53 @@ impl NodeGuard {
 
 impl Drop for NodeGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Graceful shutdown: send SIGINT so the node runs its ctrl_c path
+        // (flushing TLS `close_notify` on every connection) before exiting.
+        // Without this, peers still running in other NodeGuards would see
+        // the TCP FIN without a close_notify and log ERROR.
+        //
+        // If the node can't be reached by signal (already exited, platform
+        // unsupported), or doesn't exit within the grace period, fall back
+        // to SIGKILL so the test doesn't hang.
+        let graceful = send_sigint(&self.child)
+            && wait_with_timeout(&mut self.child, Duration::from_secs(3)).is_some();
+        if !graceful {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn send_sigint(child: &Child) -> bool {
+    // `Child::id()` returns `Option<u32>` only after being waited on; the
+    // std variant returns `u32` directly.
+    // SAFETY: libc::kill with a valid PID is safe; an invalid/stale PID
+    // just returns -1 with errno set to ESRCH, which we treat as "already
+    // gone" and return false.
+    let pid = child.id();
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+    rc == 0
+}
+
+#[cfg(not(unix))]
+fn send_sigint(_child: &Child) -> bool {
+    false
+}
+
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
     }
 }
 

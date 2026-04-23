@@ -47,6 +47,7 @@ dependencies = [
  "futures-util",
  "hex",
  "keyring",
+ "libc",
  "parking_lot",
  "postcard",
  "rand 0.9.4",
