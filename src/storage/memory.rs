@@ -2,9 +2,9 @@
 //! deterministic simulator.
 
 use std::collections::BTreeMap;
-use std::sync::RwLock;
 
 use bytes::Bytes;
+use parking_lot::RwLock;
 
 use super::{Lsn, Storage, Wal, WalIter, WriteBatch, WriteOp};
 
@@ -28,24 +28,23 @@ impl Default for MemoryStorage {
 
 impl Storage for MemoryStorage {
     fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
-        Ok(self.inner.read().unwrap().get(key).cloned())
+        Ok(self.inner.read().get(key).cloned())
     }
 
     fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
         self.inner
             .write()
-            .unwrap()
             .insert(key.to_vec(), Bytes::copy_from_slice(value));
         Ok(())
     }
 
     fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
-        self.inner.write().unwrap().remove(key);
+        self.inner.write().remove(key);
         Ok(())
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
-        let map = self.inner.read().unwrap();
+        let map = self.inner.read();
         Ok(map
             .range(prefix.to_vec()..)
             .take_while(|(k, _)| k.starts_with(prefix))
@@ -56,7 +55,7 @@ impl Storage for MemoryStorage {
     fn apply_batch(&self, batch: WriteBatch) -> anyhow::Result<()> {
         // Hold the write lock across all ops so concurrent readers see the
         // batch as an atomic snapshot.
-        let mut map = self.inner.write().unwrap();
+        let mut map = self.inner.write();
         for op in batch.ops {
             match op {
                 WriteOp::Put(k, v) => {
@@ -100,7 +99,7 @@ impl Default for MemoryWal {
 
 impl Wal for MemoryWal {
     fn append(&self, entry: &[u8]) -> anyhow::Result<Lsn> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         inner.next_lsn += 1;
         let lsn = Lsn(inner.next_lsn);
         inner.entries.push((lsn, Bytes::copy_from_slice(entry)));
@@ -115,7 +114,7 @@ impl Wal for MemoryWal {
     }
 
     fn iter_from(&self, lsn: Lsn) -> anyhow::Result<WalIter<'_>> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         // Snapshot into a Vec so the iterator doesn't hold the lock.
         let start = inner.entries.partition_point(|(l, _)| *l < lsn);
         let snapshot: Vec<(Lsn, Bytes)> = inner.entries[start..].to_vec();
@@ -123,7 +122,7 @@ impl Wal for MemoryWal {
     }
 
     fn truncate_before(&self, lsn: Lsn) -> anyhow::Result<()> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         let cut = inner.entries.partition_point(|(l, _)| *l < lsn);
         inner.entries.drain(..cut);
         Ok(())
