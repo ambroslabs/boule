@@ -197,9 +197,10 @@ async fn sim_clock_monotonic_is_non_decreasing_across_advances() {
     // when the harness eventually simulates a backward wall-clock jump,
     // `now_monotonic` must still not move backward.
     let start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-    let driver = SimDriver::new_with_backing(1, /* seed */ 42, start, GossipFactory, MemoryBacking)
-        .await
-        .unwrap();
+    let driver =
+        SimDriver::new_with_backing(1, /* seed */ 42, start, GossipFactory, MemoryBacking)
+            .await
+            .unwrap();
     let clock = Arc::clone(&driver.clock) as Arc<dyn Clock>;
 
     let mut last = clock.now_monotonic();
