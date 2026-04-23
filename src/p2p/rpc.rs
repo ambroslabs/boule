@@ -392,9 +392,14 @@ fn decode_frame(buf: &Bytes) -> Result<Frame, &'static str> {
     if buf.len() < HEADER_LEN {
         return Err("frame shorter than header");
     }
-    let request_id = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+    let request_id =
+        u64::from_be_bytes(buf[0..8].try_into().map_err(|_| "frame header truncated")?);
     let kind = buf[8];
-    let method_id = u16::from_be_bytes(buf[9..11].try_into().unwrap());
+    let method_id = u16::from_be_bytes(
+        buf[9..11]
+            .try_into()
+            .map_err(|_| "frame header truncated")?,
+    );
     let body = buf.slice(HEADER_LEN..);
     Ok(Frame {
         request_id,
@@ -534,6 +539,34 @@ mod tests {
     #[test]
     fn frame_short_is_rejected() {
         assert!(decode_frame(&Bytes::from_static(b"short")).is_err());
+    }
+
+    #[test]
+    fn frame_one_byte_shorter_than_header_is_rejected() {
+        let buf = Bytes::copy_from_slice(&[0u8; HEADER_LEN - 1]);
+        assert!(decode_frame(&buf).is_err());
+    }
+
+    #[test]
+    fn frame_exactly_header_len_decodes_with_empty_body() {
+        let encoded = encode_frame(0x0102_0304_0506_0708, KIND_RESPONSE, 0xABCD, b"");
+        assert_eq!(encoded.len(), HEADER_LEN);
+        let decoded = decode_frame(&encoded).expect("decodes");
+        assert_eq!(decoded.request_id, 0x0102_0304_0506_0708);
+        assert_eq!(decoded.kind, KIND_RESPONSE);
+        assert_eq!(decoded.method_id, 0xABCD);
+        assert!(decoded.body.is_empty());
+    }
+
+    #[test]
+    fn frame_any_sub_header_length_is_rejected() {
+        for len in 0..HEADER_LEN {
+            let buf = Bytes::copy_from_slice(&vec![0xA5u8; len]);
+            assert!(
+                decode_frame(&buf).is_err(),
+                "length {len} should be rejected",
+            );
+        }
     }
 
     #[tokio::test]
