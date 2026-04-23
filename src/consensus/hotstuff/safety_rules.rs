@@ -74,7 +74,7 @@ pub fn safe_to_vote(proposal: &Proposal, state: &HotStuffState) -> bool {
     if view <= state.last_voted_view {
         return false;
     }
-    let Some(locked) = state.locked_qc.as_ref() else {
+    let Some(locked) = state.locked else {
         // No lock yet — any fresh-view proposal is safe.
         return true;
     };
@@ -130,6 +130,7 @@ pub fn three_chain_commit(new_qc: &QuorumCertificate, state: &HotStuffState) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::state::Locked;
     use super::*;
     use crate::consensus::validator_set::ValidatorSet;
     use crate::p2p::NodeId;
@@ -328,7 +329,11 @@ mod tests {
         let locked_block = &chain[0];
         let new_block = &chain[1];
         let mut state = state_with_chain(&chain, g.clone());
-        state.locked_qc = Some(dummy_qc(3, locked_block.hash()));
+        state.locked = Some(Locked {
+            view: 3,
+            height: locked_block.header.height,
+            block_hash: locked_block.hash(),
+        });
         state.last_voted_view = 3;
         let p = proposal(new_block.clone(), dummy_qc(3, locked_block.hash()));
         assert!(safe_to_vote(&p, &state));
@@ -355,7 +360,11 @@ mod tests {
         let mut state = HotStuffState::new(validators(), g.clone());
         state.insert_pending(locked_block.clone());
         state.insert_pending(fork.clone());
-        state.locked_qc = Some(dummy_qc(5, locked_block.hash()));
+        state.locked = Some(Locked {
+            view: 5,
+            height: locked_block.header.height,
+            block_hash: locked_block.hash(),
+        });
         state.last_voted_view = 5;
 
         let stale_justify = dummy_qc(3, g.hash());
@@ -382,7 +391,11 @@ mod tests {
         let mut state = HotStuffState::new(validators(), g.clone());
         state.insert_pending(locked_block.clone());
         state.insert_pending(fork.clone());
-        state.locked_qc = Some(dummy_qc(5, locked_block.hash()));
+        state.locked = Some(Locked {
+            view: 5,
+            height: locked_block.header.height,
+            block_hash: locked_block.hash(),
+        });
         state.last_voted_view = 5;
 
         let fresh_justify = dummy_qc(9, [0xEE; 32]);

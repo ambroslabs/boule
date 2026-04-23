@@ -35,7 +35,7 @@ use crate::replication::block::{Block, BlockHash};
 
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
 use super::safety_rules::{safe_to_vote, should_update_high_qc};
-use super::state::HotStuffState;
+use super::state::{HotStuffState, Locked};
 use crate::consensus::validator_set::ValidatorSet;
 
 /// Inputs the safety core reacts to.
@@ -76,8 +76,12 @@ pub enum StateUpdate {
     /// restarts — the safety property of HotStuff depends on this
     /// survivor guarantee.
     VotedInView { view: View },
-    /// Replica promoted its `locked_qc` via the two-chain rule.
-    LockedQc(QuorumCertificate),
+    /// Replica promoted its lock via the two-chain rule. Only the
+    /// (view, block_hash) pair is durable — the safety core never
+    /// reads signer data off the lock, and nothing ships it on the
+    /// wire (`NewView` carries `high_qc`, not the lock). See
+    /// `docs/consensus/hotstuff-notes.md#the-bjustify-problem-relevant-to-b4`.
+    Locked(Locked),
     /// Replica adopted a fresher `high_qc` (seen via a proposal's
     /// justify, a freshly-formed QC, or a `NewView`).
     HighQc(QuorumCertificate),
@@ -259,6 +263,53 @@ impl HotStuffCore {
                 next_leader,
                 ConsensusMsg::Vote(Vote { view, block_hash }),
             ));
+        }
+
+        // B4: Two-Chain lock promotion.
+        //
+        // Walk `b* → b'' (parent, in pending_blocks thanks to B1/B2) →
+        // b' (grandparent, present only if we saw the proposal that
+        // originally proposed b'')`. If `b'` exists and sits at a
+        // strictly greater height than our current lock, promote —
+        // emit `Persist(Locked(..))` and mirror the update on
+        // `state.locked`.
+        //
+        // Runs regardless of `safe_to_vote` firing: the paper's
+        // Algorithm 4 runs `update(bnew)` unconditionally, and the
+        // safety proof (Appendix B, Lemma 6) covers unconditional
+        // lock updates. Refusing to update here would turn a liveness
+        // concern into a safety one — we'd stay stuck on an older
+        // lock even when a fresher one is demonstrably safer.
+        //
+        // Height-based comparison follows the paper; using view would
+        // let a Byzantine proposer wedge us with a short chain
+        // claiming a huge view. See
+        // `docs/consensus/hotstuff-notes.md#the-chain-rules`.
+        let two_chain_candidate: Option<Locked> = self
+            .state
+            .pending_blocks
+            .get(&parent_hash)
+            .and_then(|b_prime_prime| {
+                let grandparent_hash = b_prime_prime.header.parent_hash;
+                self.state
+                    .pending_blocks
+                    .get(&grandparent_hash)
+                    .map(|b_prime| Locked {
+                        view: b_prime.header.view,
+                        height: b_prime.header.height,
+                        block_hash: grandparent_hash,
+                    })
+            });
+        if let Some(candidate) = two_chain_candidate {
+            // Treat a missing lock as "height 0" for the monotonicity
+            // check: the paper initializes `block ← b0` (genesis,
+            // height 0), so promoting to a positive-height `b'`
+            // matches, and locking on genesis stays a no-op.
+            let current_height = self.state.locked.map(|l| l.height).unwrap_or(0);
+            if candidate.height > current_height {
+                self.state.locked = Some(candidate);
+                actions.push(Action::Persist(StateUpdate::Locked(candidate)));
+            }
         }
 
         actions
@@ -460,7 +511,7 @@ mod tests {
         assert_eq!(actions, vec![Action::RequestBlock(orphan_parent, sender)]);
         assert!(core.parked_proposals.contains_key(&child_hash));
         assert_eq!(core.state().last_voted_view, 0);
-        assert!(core.state().locked_qc.is_none());
+        assert!(core.state().locked.is_none());
         assert!(core.state().high_qc.is_none());
     }
 
@@ -607,8 +658,13 @@ mod tests {
         // Lock the core on a block at view 5.
         let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
         let locked_hash = locked_block.hash();
+        let locked_height = locked_block.header.height;
         core.state.insert_pending(locked_block);
-        core.state.locked_qc = Some(dummy_qc(5, locked_hash));
+        core.state.locked = Some(Locked {
+            view: 5,
+            height: locked_height,
+            block_hash: locked_hash,
+        });
         core.state.last_voted_view = 5;
 
         // Fork at view 6 rooted directly on genesis (does NOT extend
@@ -632,7 +688,7 @@ mod tests {
             "last_voted_view untouched when refusing to vote",
         );
         assert_eq!(
-            core.state().locked_qc.as_ref().map(|q| q.view),
+            core.state().locked.map(|l| l.view),
             Some(5),
             "lock is not disturbed by a refused proposal",
         );
@@ -655,8 +711,13 @@ mod tests {
 
         let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
         let locked_hash = locked_block.hash();
+        let locked_height = locked_block.header.height;
         core.state.insert_pending(locked_block);
-        core.state.locked_qc = Some(dummy_qc(5, locked_hash));
+        core.state.locked = Some(Locked {
+            view: 5,
+            height: locked_height,
+            block_hash: locked_hash,
+        });
         core.state.last_voted_view = 5;
 
         let fork = fork_rooted_on_genesis(genesis.hash(), 10);
@@ -750,5 +811,108 @@ mod tests {
         // storage leak back into safety semantics.
         assert!(core.state().pending_blocks.contains_key(&block_a_hash));
         assert!(core.state().pending_blocks.contains_key(&block_b_hash));
+    }
+
+    // ── B4: two-chain lock promotion ────────────────────────────────
+
+    #[test]
+    fn two_chain_promotes_lock_to_grandparent() {
+        // Build genesis → block1 (view 1) → block2 (view 2), then
+        // receive a proposal at view 3 whose parent is block2. The
+        // two-chain walk reaches block1 as the grandparent; B4
+        // promotes the lock to it.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let prefix = chain_from_genesis(&genesis, &[1, 2], nid(2));
+        let block1 = prefix[0].clone();
+        let block2 = prefix[1].clone();
+        core.state.insert_pending(block1.clone());
+        core.state.insert_pending(block2.clone());
+
+        // block3 extends block2 at view 3. We construct it via a
+        // fresh `chain_from_genesis` so it descends from the same
+        // block1/block2 we just inserted.
+        let full_chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
+        let block3 = full_chain[2].clone();
+        let block3_hash = block3.hash();
+        let justify = dummy_qc(2, block2.hash());
+        let signed = signed_proposal(block3, justify.clone(), nid(2));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        let expected_lock = Locked {
+            view: 1,
+            height: 1,
+            block_hash: block1.hash(),
+        };
+        // Emission order: B2/B3 first (VotedInView, HighQc,
+        // SendTo(Vote)), then B4's Persist(Locked).
+        // leader(4) over `[nid(1), nid(2), nid(3), nid(4)]`:
+        // 4 % 4 = 0 → nid(1).
+        assert_eq!(
+            actions,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 3 }),
+                Action::Persist(StateUpdate::HighQc(justify)),
+                Action::SendTo(
+                    nid(1),
+                    ConsensusMsg::Vote(Vote {
+                        view: 3,
+                        block_hash: block3_hash,
+                    }),
+                ),
+                Action::Persist(StateUpdate::Locked(expected_lock)),
+            ],
+            "B2/B3 emissions followed by B4's Persist(Locked)",
+        );
+        assert_eq!(core.state().locked, Some(expected_lock));
+    }
+
+    #[test]
+    fn two_chain_does_not_move_lock_backward() {
+        // Preset the lock at a height strictly above anything the
+        // proposal could promote to (it'd only see block1 at height
+        // 1). A regression that always promoted would emit a stray
+        // `Persist(Locked)` here; a regression that compared by
+        // view instead of height could also silently rewrite the
+        // lock.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let prefix = chain_from_genesis(&genesis, &[1, 2], nid(2));
+        core.state.insert_pending(prefix[0].clone());
+        core.state.insert_pending(prefix[1].clone());
+
+        let preset = Locked {
+            view: 99,
+            height: 99,
+            block_hash: [0xAB; 32],
+        };
+        core.state.locked = Some(preset);
+
+        // Proposal at view 100 extending block2; b' is block1 at
+        // height 1 — strictly below the current lock at height 99.
+        let block3 = Block {
+            header: BlockHeader {
+                parent_hash: prefix[1].hash(),
+                height: 3,
+                view: 100,
+                proposer: nid(2),
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        };
+        let justify = dummy_qc(2, prefix[1].hash());
+        let signed = signed_proposal(block3, justify, nid(2));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Persist(StateUpdate::Locked(_)))),
+            "lock must not move backward: {actions:?}",
+        );
+        assert_eq!(core.state().locked, Some(preset), "state.locked untouched",);
     }
 }
