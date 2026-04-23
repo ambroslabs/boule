@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
 
 use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
 
 use super::{ContentHash, GossipMessage, InsertResult};
 
@@ -34,14 +34,14 @@ impl GossipStore {
         // Fast path: shared read lock to check seen set.
         // This is the common case for duplicate messages and does not block other readers.
         {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read();
             if inner.seen.contains(&hash) {
                 return InsertResult::AlreadySeen;
             }
         }
 
         // Slow path: exclusive write lock with re-check (double-checked locking).
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         if msg.is_expired(now) {
             return InsertResult::Expired;
         }
@@ -54,7 +54,7 @@ impl GossipStore {
     }
 
     pub fn list_live(&self, now: DateTime<Utc>) -> Vec<GossipMessage> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         inner
             .messages
             .values()
@@ -64,7 +64,7 @@ impl GossipStore {
     }
 
     pub fn remove_expired(&self, now: DateTime<Utc>) -> usize {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         let expired: Vec<ContentHash> = inner
             .messages
             .iter()
@@ -77,6 +77,12 @@ impl GossipStore {
             inner.seen.remove(&hash);
         }
         count
+    }
+
+    #[cfg(test)]
+    fn panic_holding_write_lock(&self) -> ! {
+        let _guard = self.inner.write();
+        panic!("intentional panic while holding gossip store write lock");
     }
 }
 
@@ -218,6 +224,29 @@ mod tests {
             store.try_insert(revived, Utc::now()),
             InsertResult::Inserted
         ));
+    }
+
+    #[test]
+    fn write_lock_is_not_poisoned_after_panic() {
+        // Regression test for gossip-poisoning issue (#42): a task that panics
+        // while holding the write lock must not prevent subsequent acquisition.
+        // parking_lot::RwLock provides this by construction; this test pins it
+        // so a future change back to std::sync::RwLock would fail loudly.
+        let store = Arc::new(GossipStore::new());
+
+        let s = Arc::clone(&store);
+        let joined = thread::spawn(move || {
+            s.panic_holding_write_lock();
+        })
+        .join();
+        assert!(joined.is_err(), "panic thread should have unwound");
+
+        let fresh = msg("post-panic", 60_000);
+        assert!(matches!(
+            store.try_insert(fresh, Utc::now()),
+            InsertResult::Inserted
+        ));
+        assert_eq!(store.list_live(Utc::now()).len(), 1);
     }
 
     #[test]
