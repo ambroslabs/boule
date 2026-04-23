@@ -357,6 +357,20 @@ impl SimNetwork {
         }
     }
 
+    /// Whether `node` is currently marked as killed.
+    pub fn is_killed(&self, node: NodeId) -> bool {
+        self.inner.lock().unwrap().killed.contains(&node)
+    }
+
+    /// Reverse a prior [`kill`]: allow writes from and deliveries to `node`
+    /// again. Does not re-register inboxes — the caller is responsible for
+    /// installing fresh ones (the old ones were flipped to `closed = true`).
+    ///
+    /// [`kill`]: Self::kill
+    pub fn revive(&self, node: NodeId) {
+        self.inner.lock().unwrap().killed.remove(&node);
+    }
+
     /// Install a global message-mutation hook. Consulted at delivery time for
     /// every event whose `(from, to)` pair has no per-link mutator set.
     pub fn set_mutator(&self, mutator: Arc<dyn EventMutator>) {
