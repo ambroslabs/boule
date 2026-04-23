@@ -488,4 +488,96 @@ mod tests {
         );
         assert_eq!(core.parked_proposals.len(), 1);
     }
+
+    // ── B2 / B3: happy-path vote and HighQc adoption ─────────────────
+
+    // Round-robin leader for the canonical four-validator set:
+    // `[nid(1), nid(2), nid(3), nid(4)]`. view 1 → nid(2),
+    // view 2 → nid(3). These are hard-coded in the test assertions
+    // below on purpose — if the RoundRobinSelector mapping ever
+    // changes, the tests should fail loudly rather than silently
+    // keep using a stale leader.
+
+    #[test]
+    fn first_proposal_emits_persist_vote_and_adopts_high_qc() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let block = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let block_hash = block.hash();
+        let justify = dummy_qc(0, genesis.hash());
+        let signed = signed_proposal(block, justify.clone(), nid(2));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        assert_eq!(
+            actions,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 1 }),
+                Action::Persist(StateUpdate::HighQc(justify)),
+                Action::SendTo(
+                    nid(3),
+                    ConsensusMsg::Vote(Vote {
+                        view: 1,
+                        block_hash,
+                    }),
+                ),
+            ],
+            "happy-path emission order is VotedInView → HighQc → SendTo(Vote)",
+        );
+        assert_eq!(core.state().last_voted_view, 1);
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.view),
+            Some(0),
+            "high_qc adopted from the proposal's justify",
+        );
+    }
+
+    // ── D3: vote-only-once at same view ──────────────────────────────
+
+    #[test]
+    fn second_proposal_at_same_view_emits_no_vote() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let justify = dummy_qc(0, genesis.hash());
+
+        // First proposal at view 1 — vote emitted.
+        let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let _ = core.step(Event::ProposalReceived(signed_proposal(
+            block_a,
+            justify.clone(),
+            nid(2),
+        )));
+        assert_eq!(core.state().last_voted_view, 1);
+
+        // Second proposal at view 1 with a DIFFERENT block. Same
+        // view, different state_commitment → different hash. This is
+        // the fork-attempt shape the safe-to-vote view check rules
+        // out; we assert explicitly that no `Vote` action is
+        // produced, and that `high_qc` / `last_voted_view` stay put
+        // (HighQc adoption is gated on safe_to_vote firing).
+        let block_b = Block {
+            header: BlockHeader {
+                parent_hash: genesis.hash(),
+                height: 1,
+                view: 1,
+                proposer: nid(2),
+                state_commitment: [0xFF; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        };
+        let block_b_hash = block_b.hash();
+        let signed_b = signed_proposal(block_b, justify, nid(2));
+        let second = core.step(Event::ProposalReceived(signed_b));
+
+        assert!(
+            second.is_empty(),
+            "a second proposal at the same view must emit no actions: {second:?}",
+        );
+        assert_eq!(core.state().last_voted_view, 1);
+        // The forked block IS inserted into pending_blocks — the
+        // core tracks the fork even though it won't vote on it —
+        // which matters for the three-chain commit rule later.
+        assert!(core.state().pending_blocks.contains_key(&block_b_hash));
+    }
 }
