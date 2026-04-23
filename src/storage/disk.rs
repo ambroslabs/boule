@@ -25,9 +25,10 @@
 //! and buffered entries — across a crash, only flushed entries survive.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::{Lsn, Storage, Wal, WalIter, WriteBatch, WriteOp};
@@ -177,13 +178,19 @@ impl DiskWal {
     /// For tests: the current in-memory `next_lsn`.
     #[cfg(test)]
     fn next_lsn_for_tests(&self) -> u64 {
-        self.state.lock().unwrap().next_lsn
+        self.state.lock().next_lsn
+    }
+
+    #[cfg(test)]
+    fn panic_holding_state_lock(&self) -> ! {
+        let _guard = self.state.lock();
+        panic!("intentional panic while holding WAL state mutex");
     }
 }
 
 impl Wal for DiskWal {
     fn append(&self, entry: &[u8]) -> anyhow::Result<Lsn> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         let lsn = Lsn::from_raw(state.next_lsn);
         state.next_lsn += 1;
         state.buffer.push((lsn, Bytes::copy_from_slice(entry)));
@@ -196,7 +203,7 @@ impl Wal for DiskWal {
         // alongside so subsequent appends that race with the commit don't get
         // written twice.
         let (to_flush, target_next_lsn) = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock();
             if state.buffer.is_empty() {
                 return Ok(());
             }
@@ -218,7 +225,7 @@ impl Wal for DiskWal {
 
         // Success: drop the entries we just flushed, keeping any that were
         // appended while we were committing.
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.buffer.retain(|(lsn, _)| lsn.raw() >= target_next_lsn);
         Ok(())
     }
@@ -237,7 +244,7 @@ impl Wal for DiskWal {
         }
 
         let buffer_snapshot = {
-            let state = self.state.lock().unwrap();
+            let state = self.state.lock();
             state.buffer.clone()
         };
         for (l, b) in buffer_snapshot {
@@ -278,7 +285,7 @@ impl Wal for DiskWal {
         txn.commit()?;
 
         // Drop matching entries from the in-memory buffer.
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         state.buffer.retain(|(l, _)| *l >= lsn);
         Ok(())
     }
@@ -483,6 +490,38 @@ mod tests {
         assert_eq!(w.next_lsn_for_tests(), 3);
         let l = w.append(b"c").unwrap();
         assert_eq!(l.raw(), 3);
+    }
+
+    #[test]
+    fn disk_wal_state_mutex_is_not_poisoned_after_panic() {
+        // Regression test mirroring gossip's (#42 / PR #55): a thread that
+        // panics while holding the WAL state mutex must not prevent subsequent
+        // acquisition. `parking_lot::Mutex` provides this by construction;
+        // this test pins it so a future regression back to `std::sync::Mutex`
+        // (whose poisoning kills the WAL for the lifetime of the process,
+        // violating HotStuff's `last_voted_view` / `locked_qc` safety
+        // invariants) would fail loudly.
+        let tmp = TempDir::new().unwrap();
+        let w = Arc::new(DiskWal::open(tmp.path().join("wal.redb")).unwrap());
+
+        let w_panic = Arc::clone(&w);
+        let joined = std::thread::spawn(move || {
+            w_panic.panic_holding_state_lock();
+        })
+        .join();
+        assert!(joined.is_err(), "panic thread should have unwound");
+
+        // A subsequent append from another thread must still succeed.
+        let l = w.append(b"post-panic").unwrap();
+        assert_eq!(l.raw(), 1);
+        w.flush().unwrap();
+        let entries: Vec<_> = w
+            .iter_from(Lsn::ZERO)
+            .unwrap()
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.as_ref(), b"post-panic");
     }
 
     #[test]
