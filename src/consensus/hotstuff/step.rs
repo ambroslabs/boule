@@ -25,12 +25,16 @@
 //!
 //! [`Signed`]: crate::crypto::signed::Signed
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::consensus::View;
 use crate::crypto::signed::Signed;
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
+use super::state::HotStuffState;
 
 /// Inputs the safety core reacts to.
 ///
@@ -127,6 +131,81 @@ pub trait BlockBuilder: Send + Sync {
     /// `header.proposer` from context known to the integration layer;
     /// the safety core does not thread its own `NodeId` in here.
     fn build(&self, parent: &Block, view: View, high_qc: &QuorumCertificate) -> Block;
+}
+
+/// HotStuff safety core: the `Event → Vec<Action>` state machine.
+///
+/// Construct with the local [`NodeId`], an initial [`HotStuffState`],
+/// and a [`BlockBuilder`] the integration layer plugs in. Drive it by
+/// calling [`step`] for each event; the returned actions are the
+/// integration layer's to carry out.
+///
+/// # Purity
+///
+/// No `tokio`, no clock, no storage, no network. The machine is
+/// deterministic: identical `(state, event-sequence)` inputs produce
+/// identical `Vec<Vec<Action>>` outputs — which is exactly what
+/// [`replay`] exploits to turn a failing property-test seed into a
+/// reproducible regression.
+///
+/// [`step`]: HotStuffCore::step
+/// [`replay`]: HotStuffCore::replay
+pub struct HotStuffCore {
+    self_id: NodeId,
+    state: HotStuffState,
+    /// Partial QCs the leader is accumulating, keyed by
+    /// `(vote.view, vote.block_hash)`. A bucket becomes a full QC once
+    /// `signer_count >= quorum_size(validator_set.len())`.
+    vote_bucket: HashMap<(View, BlockHash), QuorumCertificate>,
+    /// Proposals we received before their parent landed. Keyed by the
+    /// proposal's own block hash so a later `PacemakerAdvance` can
+    /// re-evaluate every parked child whose parent has since arrived.
+    parked_proposals: HashMap<BlockHash, Signed<Proposal>>,
+    builder: Arc<dyn BlockBuilder>,
+}
+
+impl HotStuffCore {
+    /// Build a fresh core around `state`, with `builder` supplying
+    /// block contents when this replica is the leader.
+    pub fn new(self_id: NodeId, state: HotStuffState, builder: Arc<dyn BlockBuilder>) -> Self {
+        Self {
+            self_id,
+            state,
+            vote_bucket: HashMap::new(),
+            parked_proposals: HashMap::new(),
+            builder,
+        }
+    }
+
+    /// The local node's identity, as supplied at construction.
+    pub fn self_id(&self) -> NodeId {
+        self.self_id
+    }
+
+    /// Borrow the current safety-core state. Read-only by design — the
+    /// only way to mutate is through [`step`].
+    ///
+    /// [`step`]: HotStuffCore::step
+    pub fn state(&self) -> &HotStuffState {
+        &self.state
+    }
+
+    /// React to `event` and return the [`Action`]s the integration
+    /// layer must carry out, in emission order.
+    ///
+    /// **Scaffold.** Every dispatch rule from #93 is introduced by a
+    /// later commit alongside the unit test that pins its behavior;
+    /// for now, `step` is the identity-over-no-effect function.
+    pub fn step(&mut self, _event: Event) -> Vec<Action> {
+        Vec::new()
+    }
+
+    /// Feed a trace of events through `step` in order, returning one
+    /// `Vec<Action>` per event. Consumes `self` so callers can't
+    /// accidentally keep a reference into the core across the replay.
+    pub fn replay(mut self, events: impl IntoIterator<Item = Event>) -> Vec<Vec<Action>> {
+        events.into_iter().map(|e| self.step(e)).collect()
+    }
 }
 
 #[cfg(test)]
