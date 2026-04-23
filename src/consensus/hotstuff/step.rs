@@ -103,3 +103,64 @@ pub enum Action {
     /// typically the sender of the proposal that couldn't be resolved.
     RequestBlock(BlockHash, NodeId),
 }
+
+/// Integration-layer hook that turns "I am the leader and I have a
+/// fresh justify-QC" into a concrete [`Block`].
+///
+/// The safety core never invents block contents — that's the mempool's
+/// and state machine's job. Keeping this as a trait (rather than a
+/// hard-coded dependency on either) preserves the #21 swap-components
+/// story and keeps `HotStuffCore` unit-testable in isolation.
+///
+/// # Determinism
+///
+/// Implementations used under [`HotStuffCore::replay`] or the property
+/// test **must** be deterministic for a given `(parent, view, high_qc)`
+/// triple. Non-determinism here would let the property-test shrinker
+/// produce seeds that fail irreproducibly, which defeats the whole
+/// point of seed-based regression capture.
+///
+/// [`HotStuffCore::replay`]: HotStuffCore::replay
+pub trait BlockBuilder: Send + Sync {
+    /// Produce a child block extending `parent` at `view` with
+    /// `high_qc` as the proposal's justify. Implementations fill in
+    /// `header.proposer` from context known to the integration layer;
+    /// the safety core does not thread its own `NodeId` in here.
+    fn build(&self, parent: &Block, view: View, high_qc: &QuorumCertificate) -> Block;
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    //! Deterministic `BlockBuilder` impls the unit and property tests
+    //! reach for. Gated behind `cfg(test)` so non-test builds don't
+    //! accidentally ship them.
+
+    use super::*;
+    use crate::replication::block::BlockHeader;
+
+    /// `BlockBuilder` that stamps an empty-commands child over `parent`
+    /// with a caller-configured `proposer` and a zero
+    /// `state_commitment`. The header is deterministic in `(parent,
+    /// view, proposer)`; the `high_qc` argument is intentionally
+    /// ignored because these tests don't exercise the execution layer.
+    pub(crate) struct TestBlockBuilder {
+        pub proposer: NodeId,
+    }
+
+    impl BlockBuilder for TestBlockBuilder {
+        fn build(&self, parent: &Block, view: View, _high_qc: &QuorumCertificate) -> Block {
+            let header = BlockHeader {
+                parent_hash: parent.hash(),
+                height: parent.header.height + 1,
+                view,
+                proposer: self.proposer,
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            };
+            Block {
+                header,
+                commands: Vec::new(),
+            }
+        }
+    }
+}
