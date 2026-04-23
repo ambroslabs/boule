@@ -951,4 +951,60 @@ mod tests {
         );
         assert_eq!(core.state().locked, Some(preset), "state.locked untouched",);
     }
+
+    // ── B5: three-chain commit + prune ──────────────────────────────
+
+    #[test]
+    fn three_chain_commits_great_grandparent_and_prunes_below() {
+        // Build a 4-deep chain past genesis: `v1, v2, v3, v4`. Pre-load
+        // all of them into `pending_blocks`, then send a proposal at
+        // view 5 whose parent is v4 and whose justify is QC(v4). The
+        // three-chain walk from the justify (`v4 → v3 → v2`) is
+        // strictly consecutive, so B5 commits v2 and prunes everything
+        // at height ≤ 2.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let chain = chain_from_genesis(&genesis, &[1, 2, 3, 4], nid(2));
+        for block in &chain {
+            core.state.insert_pending(block.clone());
+        }
+        let block_v1 = chain[0].clone();
+        let block_v2 = chain[1].clone();
+        let block_v3 = chain[2].clone();
+        let block_v4 = chain[3].clone();
+
+        let full = chain_from_genesis(&genesis, &[1, 2, 3, 4, 5], nid(2));
+        let block_v5 = full[4].clone();
+        let justify = dummy_qc(4, block_v4.hash());
+        let signed = signed_proposal(block_v5.clone(), justify, nid(2));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        // Exactly one Commit, and it's over v2 — the QC's
+        // great-grandparent. Not genesis (that would be the
+        // great-great-grandparent, outside the predicate's walk) and
+        // not v3 (that's only the grandparent).
+        let commits: Vec<&Block> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Commit(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commits.len(), 1, "exactly one Commit action: {actions:?}",);
+        assert_eq!(commits[0], &block_v2);
+
+        // Pruning removes every entry at height ≤ 2: genesis (h=0),
+        // v1 (h=1), v2 (h=2, the committed block itself).
+        let pending = &core.state().pending_blocks;
+        assert!(!pending.contains_key(&genesis.hash()));
+        assert!(!pending.contains_key(&block_v1.hash()));
+        assert!(!pending.contains_key(&block_v2.hash()));
+        // Everything strictly above the commit survives — future
+        // two-chain / three-chain walks on subsequent proposals will
+        // need these.
+        assert!(pending.contains_key(&block_v3.hash()));
+        assert!(pending.contains_key(&block_v4.hash()));
+        assert!(pending.contains_key(&block_v5.hash()));
+    }
 }
