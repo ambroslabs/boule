@@ -2,29 +2,26 @@
 
 Thank you for your interest in contributing!
 
-## Developer Certificate of Origin (DCO)
+## Contributor Representations
 
-This project uses the [Developer Certificate of Origin v1.1](DCO) to certify
-that contributors have the right to submit their work under the project license.
+This project is licensed under the GNU General Public License v3.0 (see
+[LICENSE](LICENSE)). By opening a pull request against this repository, the
+GitHub account that authors the PR represents and warrants that:
 
-**Every commit must include a `Signed-off-by` trailer** with your real name and
-email address:
+1. They are the author of the contributed code, or otherwise have the legal
+   right to submit it under the terms of GPL-3.0-only.
+2. The contribution does not knowingly incorporate third-party material that
+   is incompatible with GPL-3.0-only, and any third-party material it does
+   incorporate is used in compliance with its license (with attribution and
+   license notices preserved as required).
+3. If the contributor's employer holds rights to the work, the contributor
+   has obtained the necessary permission to contribute it under GPL-3.0-only.
+4. The contribution is licensed to the project and its users under the terms
+   of GPL-3.0-only (inbound=outbound).
 
-```
-Signed-off-by: Jane Smith <jane@example.com>
-```
-
-Add it automatically with the `-s` flag:
-
-```sh
-git commit -s -m "your commit message"
-```
-
-By adding the sign-off you certify the statements in the `DCO` file. If your
-employer owns the copyright to your work, ensure you have permission to
-contribute before signing off.
-
-Pull requests containing unsigned commits will not be merged.
+The authoring GitHub account identified on the pull request is the party
+responsible for these representations. No separate sign-off or DCO trailer
+is required.
 
 ## Development Setup
 
@@ -67,14 +64,14 @@ clear documented reason.
 ## Submitting a Pull Request
 
 1. Fork the repository and create a branch from `main`.
-2. Make your changes with signed-off commits (`git commit -s`).
-3. Ensure `cargo fmt`, `cargo clippy`, and `cargo test` all pass locally.
-4. Open a PR against `main` with a clear description of the change and why.
+2. Ensure `cargo fmt`, `cargo clippy`, and `cargo test` all pass locally.
+3. Open a PR against `main` with a clear description of the change and why.
 
 If your change touches the public API or wire format, note that in the PR
 description — those changes require extra care around compatibility.
 
 ## License
 
-By contributing you agree that your work will be licensed under the terms in
-[LICENSE](LICENSE) (GPL-3.0-only).
+All contributions are accepted under the terms of [LICENSE](LICENSE)
+(GPL-3.0-only). See "Contributor Representations" above for the rights and
+warranties every pull request author makes when submitting code.
