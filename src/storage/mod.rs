@@ -87,6 +87,66 @@ pub trait Storage: Send + Sync {
     /// no op is visible. Concurrent readers see either the pre-batch state
     /// or the post-batch state, never a partial one.
     fn apply_batch(&self, batch: WriteBatch) -> anyhow::Result<()>;
+
+    /// Atomically compare-and-swap the value at `key`.
+    ///
+    /// Semantics:
+    /// - `expected == None` succeeds only if the key is absent;
+    ///   `expected == Some(v)` succeeds only if the current value is exactly `v`.
+    /// - `new == None` deletes the key on success;
+    ///   `new == Some(v)` writes `v` on success.
+    ///
+    /// Returns `Ok(true)` if the swap happened, or `Ok(false)` if `expected`
+    /// did not match the current value (no change was made). `Err` is reserved
+    /// for backend failures (I/O, corruption); a bare "expected mismatched"
+    /// outcome is never an error.
+    ///
+    /// The entire read-compare-write is atomic: concurrent readers see either
+    /// the pre-swap state or the post-swap state, never a partial one;
+    /// concurrent writers are linearized against this call.
+    ///
+    /// The degenerate call `compare_and_swap(key, None, None)` against an
+    /// absent key returns `Ok(true)` — the observed state already equals the
+    /// desired state, so the condition is satisfied and no write is performed.
+    ///
+    /// The typical HotStuff use is guarding `last_voted_view` against a
+    /// racing timeout path: only update the view if it matches the value we
+    /// observed when we decided to vote.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ambros_p2p::storage::{MemoryStorage, Storage};
+    ///
+    /// let store = MemoryStorage::new();
+    /// store.put(b"view", &7u64.to_be_bytes()).unwrap();
+    ///
+    /// // Match: swap succeeds and the new value is observable.
+    /// let ok = store
+    ///     .compare_and_swap(b"view", Some(&7u64.to_be_bytes()), Some(&8u64.to_be_bytes()))
+    ///     .unwrap();
+    /// assert!(ok);
+    /// assert_eq!(
+    ///     store.get(b"view").unwrap().unwrap().as_ref(),
+    ///     &8u64.to_be_bytes(),
+    /// );
+    ///
+    /// // Mismatch: no change, returns Ok(false).
+    /// let ok = store
+    ///     .compare_and_swap(b"view", Some(&7u64.to_be_bytes()), Some(&9u64.to_be_bytes()))
+    ///     .unwrap();
+    /// assert!(!ok);
+    /// assert_eq!(
+    ///     store.get(b"view").unwrap().unwrap().as_ref(),
+    ///     &8u64.to_be_bytes(),
+    /// );
+    /// ```
+    fn compare_and_swap(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> anyhow::Result<bool>;
 }
 
 /// Ergonomic closure wrapper around [`Storage::apply_batch`]. Blanket-impl'd
