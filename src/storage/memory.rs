@@ -314,7 +314,9 @@ mod tests {
     fn cas_succeeds_when_expected_matches_and_sets_new_value() {
         let s = MemoryStorage::new();
         s.put(b"k", b"old").unwrap();
-        let swapped = s.compare_and_swap(b"k", Some(b"old"), Some(b"new")).unwrap();
+        let swapped = s
+            .compare_and_swap(b"k", Some(b"old"), Some(b"new"))
+            .unwrap();
         assert!(swapped);
         assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"new"[..]));
     }
@@ -437,10 +439,7 @@ mod tests {
         let final_bytes = s.get(b"counter").unwrap().unwrap();
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&final_bytes);
-        assert_eq!(
-            u64::from_be_bytes(buf),
-            (THREADS as u64) * ITERS_PER_THREAD,
-        );
+        assert_eq!(u64::from_be_bytes(buf), (THREADS as u64) * ITERS_PER_THREAD,);
     }
 
     // ── Wal tests ──────────────────────────────────────────────────────────
