@@ -84,6 +84,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod consensus;
 pub mod crypto;
 pub mod gossip;
 pub mod p2p;
