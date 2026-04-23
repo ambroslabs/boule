@@ -580,4 +580,109 @@ mod tests {
         // which matters for the three-chain commit rule later.
         assert!(core.state().pending_blocks.contains_key(&block_b_hash));
     }
+
+    // ── D4: refuse-to-vote when both extension and liveness fail ─────
+
+    /// Build a "fork at `view`, rooted on genesis" — the canonical
+    /// shape the safety-rule tests use to exercise non-extension.
+    fn fork_rooted_on_genesis(genesis_hash: BlockHash, view: View) -> Block {
+        Block {
+            header: BlockHeader {
+                parent_hash: genesis_hash,
+                height: 1,
+                view,
+                proposer: nid(3),
+                state_commitment: [view as u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refuses_to_vote_when_not_extending_lock_and_justify_stale() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+
+        // Lock the core on a block at view 5.
+        let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
+        let locked_hash = locked_block.hash();
+        core.state.insert_pending(locked_block);
+        core.state.locked_qc = Some(dummy_qc(5, locked_hash));
+        core.state.last_voted_view = 5;
+
+        // Fork at view 6 rooted directly on genesis (does NOT extend
+        // the locked block at view 5) with a justify at view 3 —
+        // strictly older than the lock. Neither the extension rule
+        // nor the liveness rule fires; safe_to_vote returns false.
+        let fork = fork_rooted_on_genesis(genesis.hash(), 6);
+        let fork_hash = fork.hash();
+        let stale_justify = dummy_qc(3, genesis.hash());
+        let signed = signed_proposal(fork, stale_justify, nid(3));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        assert!(
+            actions.is_empty(),
+            "stale justify + non-extension must yield no actions: {actions:?}",
+        );
+        assert_eq!(
+            core.state().last_voted_view,
+            5,
+            "last_voted_view untouched when refusing to vote",
+        );
+        assert_eq!(
+            core.state().locked_qc.as_ref().map(|q| q.view),
+            Some(5),
+            "lock is not disturbed by a refused proposal",
+        );
+        // The fork IS inserted into pending_blocks — a later proposal
+        // whose chain happens to pass through this fork can still
+        // walk through it; the safety rules, not the storage layer,
+        // are what gate voting.
+        assert!(core.state().pending_blocks.contains_key(&fork_hash));
+    }
+
+    #[test]
+    fn liveness_rule_permits_vote_on_fork_when_justify_fresher_than_lock() {
+        // Companion to the refuse test above. Same lock setup, but
+        // the fork's justify is view 9 > locked view 5. The liveness
+        // rule fires and the core votes even though the fork does
+        // not extend the locked block. Without this path, a slow
+        // node that locked on a dead branch would never catch up.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+
+        let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
+        let locked_hash = locked_block.hash();
+        core.state.insert_pending(locked_block);
+        core.state.locked_qc = Some(dummy_qc(5, locked_hash));
+        core.state.last_voted_view = 5;
+
+        let fork = fork_rooted_on_genesis(genesis.hash(), 10);
+        let fork_hash = fork.hash();
+        let fresh_justify = dummy_qc(9, [0xEE; 32]);
+        let signed = signed_proposal(fork, fresh_justify.clone(), nid(3));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        assert_eq!(
+            actions,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 10 }),
+                Action::Persist(StateUpdate::HighQc(fresh_justify)),
+                // leader(11) over `[nid(1), nid(2), nid(3), nid(4)]`:
+                // 11 % 4 = 3 → nid(4).
+                Action::SendTo(
+                    nid(4),
+                    ConsensusMsg::Vote(Vote {
+                        view: 10,
+                        block_hash: fork_hash,
+                    }),
+                ),
+            ],
+        );
+        assert_eq!(core.state().last_voted_view, 10);
+        assert_eq!(core.state().high_qc.as_ref().map(|q| q.view), Some(9));
+    }
 }
