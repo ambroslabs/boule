@@ -11,6 +11,7 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use bytes::Bytes;
+use tokio_util::sync::CancellationToken;
 
 use crate::p2p::NodeId;
 use crate::p2p::rpc::{Rpc, RpcError};
@@ -22,7 +23,14 @@ pub const METHOD_PING: u16 = 0x0001;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Handler registered server-side: echo the request body.
-pub async fn echo(_peer: NodeId, body: Bytes) -> Result<Bytes, Bytes> {
+///
+/// `_cancel` is unused here because echoing is synchronous-ish — there's
+/// nothing to abort. Real handlers (block assembly, signature verification,
+/// long storage scans) should honor the token; see [`RpcHandler`] for the
+/// cancellation contract.
+///
+/// [`RpcHandler`]: crate::p2p::rpc::RpcHandler
+pub async fn echo(_peer: NodeId, body: Bytes, _cancel: CancellationToken) -> Result<Bytes, Bytes> {
     Ok(body)
 }
 
