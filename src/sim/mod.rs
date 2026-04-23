@@ -36,7 +36,9 @@ pub mod transport;
 
 pub use clock::SimClock;
 pub use driver::SimDriver;
-pub use network::{LatencyDist, LinkConfig};
+pub use network::{EventMutator, LatencyDist, LinkConfig, MutatorInput, MutatorOutput};
 
+#[cfg(test)]
+mod sim_adversary;
 #[cfg(test)]
 mod sim_gossip;
