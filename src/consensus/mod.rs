@@ -31,6 +31,7 @@
 // Allow dead code until then, matching `replication/mod.rs`.
 #![allow(dead_code)]
 
+pub mod hotstuff;
 pub mod pacemaker;
 pub mod validator_set;
 
