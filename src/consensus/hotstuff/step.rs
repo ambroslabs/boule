@@ -201,9 +201,9 @@ impl HotStuffCore {
     pub fn step(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::ProposalReceived(signed) => self.on_proposal_received(signed),
-            Event::VoteReceived(_)
-            | Event::NewViewReceived(_)
-            | Event::PacemakerAdvance(_) => Vec::new(),
+            Event::VoteReceived(_) | Event::NewViewReceived(_) | Event::PacemakerAdvance(_) => {
+                Vec::new()
+            }
         }
     }
 
@@ -684,5 +684,71 @@ mod tests {
         );
         assert_eq!(core.state().last_voted_view, 10);
         assert_eq!(core.state().high_qc.as_ref().map(|q| q.view), Some(9));
+    }
+
+    // ── D5: Byzantine fork at same view from different proposers ─────
+
+    #[test]
+    fn byzantine_second_proposer_at_same_view_does_not_extract_a_vote() {
+        // Distinct from D3's vote-only-once test: there the second
+        // proposal came from the same proposer (shaped like a
+        // retry). Here the second proposal comes from a DIFFERENT
+        // validator — the Byzantine shape — pretending to lead the
+        // same view. Either the view-freshness check or a
+        // higher-level "wrong leader" filter could block this; the
+        // test pins that *at least* the view-freshness check does,
+        // which is the lower bound the safety core needs to uphold
+        // regardless of what the integration layer (#24) filters.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let justify = dummy_qc(0, genesis.hash());
+
+        // The legitimate view-1 leader (nid(2)) proposes first.
+        let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let block_a_hash = block_a.hash();
+        let first = core.step(Event::ProposalReceived(signed_proposal(
+            block_a,
+            justify.clone(),
+            nid(2),
+        )));
+        assert!(
+            first
+                .iter()
+                .any(|a| matches!(a, Action::SendTo(_, ConsensusMsg::Vote(_)))),
+            "legitimate first proposal is expected to produce a Vote: {first:?}",
+        );
+
+        // Byzantine nid(3) stuffs a conflicting block at the same
+        // view. `safe_to_vote` rejects on view-freshness grounds;
+        // the core emits no action at all.
+        let block_b = Block {
+            header: BlockHeader {
+                parent_hash: genesis.hash(),
+                height: 1,
+                view: 1,
+                proposer: nid(3),
+                state_commitment: [0xCC; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        };
+        let block_b_hash = block_b.hash();
+        let second = core.step(Event::ProposalReceived(signed_proposal(
+            block_b,
+            justify,
+            nid(3),
+        )));
+
+        assert!(
+            second.is_empty(),
+            "Byzantine fork must not extract a second vote: {second:?}",
+        );
+        assert_eq!(core.state().last_voted_view, 1);
+        // Both branches of the fork stay tracked in pending_blocks:
+        // a future three-chain walk might need either of them, and
+        // removing a block because we didn't vote on it would be a
+        // storage leak back into safety semantics.
+        assert!(core.state().pending_blocks.contains_key(&block_a_hash));
+        assert!(core.state().pending_blocks.contains_key(&block_b_hash));
     }
 }
