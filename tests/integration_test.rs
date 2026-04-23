@@ -397,6 +397,68 @@ async fn test_new_identity_schema_end_to_end() {
     wait_for_peer_count(&node2, 1, mesh_timeout).await;
 }
 
+/// Round-trips a ping RPC between two real nodes, exercising the full
+/// protocol-multiplexer → RPC framing → handler-dispatch path.
+#[tokio::test]
+async fn test_ping_rpc_round_trip_between_nodes() {
+    let node1 = spawn_node(&[]).await;
+    let node2 = spawn_node(&[PeerDesc {
+        p2p_addr: &node1.p2p_addr,
+        node_id: &node1.node_id,
+    }])
+    .await;
+
+    let ready_timeout = Duration::from_secs(10);
+    wait_until_ready(&node1, ready_timeout).await;
+    wait_until_ready(&node2, ready_timeout).await;
+
+    let mesh_timeout = Duration::from_secs(10);
+    wait_for_peer_count(&node1, 1, mesh_timeout).await;
+    wait_for_peer_count(&node2, 1, mesh_timeout).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(node1.api_url(&format!("/rpc/ping/{}", node2.node_id)))
+        .json(&json!({ "payload": "hello rpc" }))
+        .send()
+        .await
+        .expect("POST /rpc/ping failed");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["payload"], "hello rpc");
+
+    // And the reverse direction, to make sure both sides are wired up.
+    let resp = client
+        .post(node2.api_url(&format!("/rpc/ping/{}", node1.node_id)))
+        .json(&json!({ "payload": "back atcha" }))
+        .send()
+        .await
+        .expect("POST /rpc/ping failed");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["payload"], "back atcha");
+}
+
+#[tokio::test]
+async fn test_ping_rpc_to_unknown_peer_fails() {
+    let node = spawn_node(&[]).await;
+    wait_until_ready(&node, Duration::from_secs(10)).await;
+
+    // Valid base58 but a node ID that isn't connected. The call should time
+    // out (since SendTo drops silently to unknown peers) rather than succeed.
+    let fake_peer = "11111111111111111111111111111111";
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(node.api_url(&format!("/rpc/ping/{fake_peer}")))
+        .json(&json!({ "payload": "lost in space" }))
+        .send()
+        .await
+        .expect("POST /rpc/ping failed");
+    // 504 Gateway Timeout — handler maps RpcError::Timeout to that status.
+    assert_eq!(resp.status(), 504);
+}
+
 #[tokio::test]
 async fn test_peers_endpoint_lists_connected_peers() {
     let (node1, node2, node3) = start_cluster().await;

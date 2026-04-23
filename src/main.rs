@@ -2,6 +2,7 @@ mod config;
 mod crypto;
 mod gossip;
 mod p2p;
+mod ping;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -204,6 +205,20 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
         tokio::spawn(gossip::engine::run(gossip_handle, store))
     };
 
+    // Register the ping RPC protocol on its own ID and build an Rpc client
+    // with the echo handler registered for incoming calls.
+    let (ping_reg_tx, ping_reg_rx) = oneshot::channel();
+    p2p_cmd_tx
+        .send(p2p::PeerCommand::RegisterProtocol {
+            id: ping::PROTOCOL_ID,
+            reply: ping_reg_tx,
+        })
+        .await?;
+    let ping_handle = ping_reg_rx.await?;
+    let ping_rpc = p2p::rpc::RpcBuilder::new()
+        .handler(ping::METHOD_PING, ping::echo)
+        .spawn(ping_handle);
+
     let cleanup_handle = {
         let store = Arc::clone(&store);
         let interval = config.api.cleanup_interval_secs;
@@ -217,7 +232,8 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let api_handle = {
         let app = axum::Router::new()
             .merge(p2p::api::router(p2p_cmd_tx.clone()))
-            .merge(gossip::api::router(Arc::clone(&store), gossip_send_tx));
+            .merge(gossip::api::router(Arc::clone(&store), gossip_send_tx))
+            .merge(ping::router(ping_rpc));
         tokio::spawn(async move {
             info!("HTTP API listening on {api_actual_addr}");
             axum::serve(api_listener, app).await.unwrap();

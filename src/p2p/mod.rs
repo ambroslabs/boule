@@ -4,6 +4,7 @@ pub mod dialer;
 pub mod identity;
 pub mod listener;
 pub mod manager;
+pub mod rpc;
 pub mod tls;
 pub mod tls_protocol;
 
