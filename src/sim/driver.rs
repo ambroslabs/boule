@@ -17,6 +17,7 @@
 //! — [`MemoryBacking`] by default, [`TempDirDiskBacking`] when a test
 //! wants disk-backed crash-recovery semantics.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +25,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use rand_chacha::ChaCha20Rng;
+use rand_chacha::rand_core::SeedableRng as _;
 use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -259,10 +262,50 @@ impl SimDriver {
         F: SimNodeFactory,
         B: SimBacking,
     {
-        let clock = Arc::new(SimClock::new(start_now));
+        Self::new_with_skew(n, seed, start_now, factory, backing, NO_SKEW).await
+    }
+
+    /// Like [`new_with_backing`] but each node observes a per-node clock
+    /// offset from shared virtual time. `skew(idx, rng)` is invoked once
+    /// per node during construction; the RNG is seeded deterministically
+    /// from `seed` so runs with matching inputs stay byte-identical.
+    ///
+    /// Offsets are signed: positive values put the node *ahead* of shared
+    /// time, negative values *behind*. A timer scheduled on the node's
+    /// local timeline to instant `t` fires at `shared = t - offset`, since
+    /// the node computes the sleep from its own `now_wall`.
+    ///
+    /// [`new_with_backing`]: Self::new_with_backing
+    pub async fn new_with_skew<F, B, S>(
+        n: usize,
+        seed: u64,
+        start_now: DateTime<Utc>,
+        factory: F,
+        backing: B,
+        skew: S,
+    ) -> anyhow::Result<Self>
+    where
+        F: SimNodeFactory,
+        B: SimBacking,
+        S: Fn(usize, &mut ChaCha20Rng) -> Duration,
+    {
         let network = SimNetwork::new(seed, start_now);
 
         let node_ids: Vec<NodeId> = (0..n).map(deterministic_node_id).collect();
+
+        // Sample offsets from a dedicated RNG derived from `seed` so that
+        // skew generation is deterministic without coupling to the
+        // network's RNG sequence. Nodes with a zero offset are omitted so
+        // `SimClock::for_node` hands back the shared clock unwrapped.
+        let mut skew_rng = ChaCha20Rng::seed_from_u64(seed ^ SKEW_RNG_SUBKEY);
+        let mut offsets: HashMap<NodeId, Duration> = HashMap::new();
+        for (idx, node_id) in node_ids.iter().enumerate() {
+            let d = skew(idx, &mut skew_rng);
+            if !d.is_zero() {
+                offsets.insert(*node_id, d);
+            }
+        }
+        let clock = Arc::new(SimClock::with_offsets(start_now, offsets));
 
         // For each unordered pair (i, j) with i < j, create two scheduler-
         // driven streams (one per direction). Each side gets a SimStream
@@ -300,7 +343,7 @@ impl SimDriver {
             let ctx = SimNodeCtx {
                 node_idx: idx,
                 node_id,
-                clock: Arc::clone(&clock) as Arc<dyn Clock>,
+                clock: clock.for_node(node_id),
                 peer_streams,
                 storage,
                 wal,
@@ -572,6 +615,14 @@ impl SimDriver {
         self.advance(delta).await;
     }
 }
+
+/// Dedicated subkey for the skew-RNG seed so it doesn't collide with the
+/// network's RNG sequence derived from the same `seed`.
+const SKEW_RNG_SUBKEY: u64 = 0xC10C_5CEC_D15B_ACED;
+
+/// Sentinel skew function used by [`SimDriver::new_with_backing`] — every
+/// node gets a zero offset.
+const NO_SKEW: fn(usize, &mut ChaCha20Rng) -> Duration = |_, _| Duration::ZERO;
 
 fn sim_addr(idx: usize) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 65000 + idx as u16))
