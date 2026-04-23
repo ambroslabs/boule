@@ -51,4 +51,40 @@ mod tests {
     fn malformed_bytes_are_rejected() {
         assert!(serde_json::from_slice::<WireMessage>(b"not json").is_err());
     }
+
+    // ── Property tests (issue #52) ──────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        // JSON round-trip of any WireMessage::Gossip preserves the content,
+        // the expiry (to nanosecond precision), and the content_hash the
+        // gossip store keys on.
+        #[test]
+        fn prop_wire_round_trip_preserves_hash(
+            content in any::<String>(),
+            secs in 0i64..=2_000_000_000_i64,
+            nanos in 0u32..1_000_000_000,
+        ) {
+            let expiry = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+                .expect("in-range timestamp always decodes");
+            let msg = GossipMessage { content: content.clone(), expiry };
+            let wire = WireMessage::Gossip(msg.clone());
+
+            let bytes = serde_json::to_vec(&wire).unwrap();
+            let WireMessage::Gossip(back) = serde_json::from_slice(&bytes).unwrap();
+
+            prop_assert_eq!(&back.content, &content);
+            prop_assert_eq!(back.expiry, expiry);
+            prop_assert_eq!(back.content_hash(), msg.content_hash());
+        }
+
+        // Feeding arbitrary bytes to the decoder must never panic. The
+        // gossip engine treats decode errors as "drop the frame and log" —
+        // so the only requirement here is no panic on adversarial input.
+        #[test]
+        fn prop_random_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..=4096)) {
+            let _ = serde_json::from_slice::<WireMessage>(&bytes);
+        }
+    }
 }

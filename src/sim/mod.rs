@@ -53,4 +53,6 @@ mod sim_clock;
 #[cfg(test)]
 mod sim_crash;
 #[cfg(test)]
+mod sim_faults;
+#[cfg(test)]
 mod sim_gossip;
