@@ -35,7 +35,15 @@ pub mod stream;
 pub mod transport;
 
 pub use clock::SimClock;
-pub use driver::SimDriver;
+// Some re-exports (SimBacking, SimNodeCtx, SimNodeFactory) describe the
+// extension seam future consensus work (#23/#24) will plug into; they
+// are not consumed inside this binary yet. The broader `#![allow(dead_code)]`
+// on this module doesn't silence unused re-exports, so narrow-allow here.
+#[allow(unused_imports)]
+pub use driver::{
+    GossipFactory, MemoryBacking, SimBacking, SimDriver, SimNodeCtx, SimNodeFactory,
+    TempDirDiskBacking,
+};
 pub use network::{EventMutator, LatencyDist, LinkConfig, MutatorInput, MutatorOutput};
 
 #[cfg(test)]

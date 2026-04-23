@@ -11,7 +11,9 @@ use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
 
 use crate::clock::Clock;
 use crate::gossip::GossipMessage;
-use crate::sim::{LatencyDist, LinkConfig, SimDriver};
+use crate::sim::{
+    GossipFactory, LatencyDist, LinkConfig, MemoryBacking, SimDriver, TempDirDiskBacking,
+};
 
 fn gossip(content: &str) -> GossipMessage {
     GossipMessage {
@@ -415,5 +417,141 @@ async fn duplicate_event_causes_second_delivery_but_dedup_wins() {
     assert!(
         matching >= 2,
         "expected >= 2 trace entries from node0 to {target_to:?} with {target_bytes} bytes, saw {matching}",
+    );
+}
+
+// ---- Per-node Storage/Wal injection (#45) ----
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn per_node_memory_storage_is_independent_across_nodes() {
+    // Build a 3-node sim with the default gossip factory and the default
+    // memory backing. Gossip must still propagate a message end-to-end
+    // while each node's Storage is fully isolated — a write on node 0
+    // must be invisible on node 1 and node 2.
+    let driver = SimDriver::new_with_backing(
+        3,
+        /* seed */ 200,
+        Utc::now(),
+        GossipFactory,
+        MemoryBacking,
+    )
+    .await
+    .expect("memory backing infallible");
+
+    // Each node gets a distinct, independent Storage.
+    for (i, node) in driver.nodes().iter().enumerate() {
+        let key = format!("probe-{i}");
+        node.storage.put(key.as_bytes(), &[i as u8]).unwrap();
+    }
+    for (i, node) in driver.nodes().iter().enumerate() {
+        // Own key is present.
+        assert_eq!(
+            node.storage
+                .get(format!("probe-{i}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(&[i as u8][..]),
+        );
+        // Other nodes' keys are not.
+        for j in 0..driver.nodes().len() {
+            if i == j {
+                continue;
+            }
+            assert!(
+                node.storage
+                    .get(format!("probe-{j}").as_bytes())
+                    .unwrap()
+                    .is_none(),
+                "node {i} unexpectedly observed node {j}'s key",
+            );
+        }
+    }
+
+    // Same drill for the Wal: each append must be node-local.
+    for (i, node) in driver.nodes().iter().enumerate() {
+        node.wal
+            .append(format!("entry-node-{i}").as_bytes())
+            .unwrap();
+    }
+    for (i, node) in driver.nodes().iter().enumerate() {
+        let entries: Vec<_> = node
+            .wal
+            .iter_from(crate::storage::Lsn::ZERO)
+            .unwrap()
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "node {i} wal must only hold its own entry"
+        );
+        assert_eq!(entries[0].1.as_ref(), format!("entry-node-{i}").as_bytes());
+    }
+
+    // Gossip still works end-to-end on top of the new factory plumbing.
+    driver
+        .node(0)
+        .inject_gossip(gossip("backing-ok"), &*driver.clock as &dyn Clock)
+        .await;
+    driver.run_until_quiescent().await;
+    driver.assert_all_have("backing-ok");
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn per_node_disk_storage_via_tempdir_supports_gossip_and_cleans_up_on_drop() {
+    // Build a 3-node sim where each node's Storage/Wal is backed by
+    // redb files under a tempfile::TempDir. Drive a gossip exchange —
+    // no panics allowed — and verify the temp directory is removed
+    // once the driver (and therefore the backing) is dropped.
+    let backing = TempDirDiskBacking::new().expect("tempdir");
+    let tempdir_path = backing.path().to_path_buf();
+    assert!(
+        tempdir_path.exists(),
+        "backing tempdir must exist while alive"
+    );
+
+    let driver =
+        SimDriver::new_with_backing(3, /* seed */ 201, Utc::now(), GossipFactory, backing)
+            .await
+            .expect("disk backing must open");
+
+    // Sanity-check each node's backing is really on disk and isolated.
+    for (i, node) in driver.nodes().iter().enumerate() {
+        let key = b"disk-probe";
+        node.storage.put(key, &[i as u8]).unwrap();
+        let lsn = node
+            .wal
+            .append(format!("disk-entry-{i}").as_bytes())
+            .unwrap();
+        node.wal.flush().unwrap();
+        assert_eq!(lsn.raw(), 1, "each node's wal starts at lsn 1");
+    }
+    for (i, node) in driver.nodes().iter().enumerate() {
+        let v = node.storage.get(b"disk-probe").unwrap();
+        assert_eq!(v.as_deref(), Some(&[i as u8][..]));
+    }
+    // Each node wrote its own subdirectory under the tempdir root.
+    let node_dirs: Vec<_> = std::fs::read_dir(&tempdir_path)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(node_dirs.len(), 3, "expected one subdir per node");
+
+    // Gossip exchange: must not panic and must propagate under the
+    // disk-backed nodes just like memory-backed ones.
+    driver
+        .node(0)
+        .inject_gossip(gossip("disk-backed"), &*driver.clock as &dyn Clock)
+        .await;
+    driver.run_until_quiescent().await;
+    driver.assert_all_have("disk-backed");
+
+    // Drop the driver → drops each SimNode → drops the last Arc to
+    // Storage/Wal → drops the underlying redb Database → drops the
+    // backing's Arc<TempDir> → TempDir::drop removes the directory.
+    drop(driver);
+    assert!(
+        !tempdir_path.exists(),
+        "tempdir at {tempdir_path:?} must be cleaned up after driver drop",
     );
 }
