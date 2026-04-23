@@ -34,7 +34,9 @@ use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
+use super::safety_rules::{safe_to_vote, should_update_high_qc};
 use super::state::HotStuffState;
+use crate::consensus::validator_set::ValidatorSet;
 
 /// Inputs the safety core reacts to.
 ///
@@ -193,11 +195,73 @@ impl HotStuffCore {
     /// React to `event` and return the [`Action`]s the integration
     /// layer must carry out, in emission order.
     ///
-    /// **Scaffold.** Every dispatch rule from #93 is introduced by a
-    /// later commit alongside the unit test that pins its behavior;
-    /// for now, `step` is the identity-over-no-effect function.
-    pub fn step(&mut self, _event: Event) -> Vec<Action> {
-        Vec::new()
+    /// Dispatch lands one branch at a time; the rules for events whose
+    /// branches aren't in place yet return an empty vector (a harmless
+    /// safe-by-default).
+    pub fn step(&mut self, event: Event) -> Vec<Action> {
+        match event {
+            Event::ProposalReceived(signed) => self.on_proposal_received(signed),
+            Event::VoteReceived(_) | Event::NewViewReceived(_) | Event::PacemakerAdvance(_) => {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Handle an inbound [`Proposal`]. Branches land in separate
+    /// commits per the #93 breakdown.
+    fn on_proposal_received(&mut self, signed: Signed<Proposal>) -> Vec<Action> {
+        let parent_hash = signed.payload.block.header.parent_hash;
+        // B1: parent isn't in `pending_blocks` — we can't evaluate
+        // extension against our locked block without it. Ask the
+        // sender for the missing block and park the child so a later
+        // `PacemakerAdvance` (or explicit re-drive) can re-run
+        // dispatch once the parent arrives.
+        if !self.state.pending_blocks.contains_key(&parent_hash) {
+            let child_hash = signed.payload.block.hash();
+            let sender = signed.signer;
+            self.parked_proposals.insert(child_hash, signed);
+            return vec![Action::RequestBlock(parent_hash, sender)];
+        }
+
+        // B2: insert the proposed block into `pending_blocks` so the
+        // `safe_to_vote` extension walk has something to follow, then
+        // run the predicate.
+        self.state.insert_pending(signed.payload.block.clone());
+
+        let mut actions = Vec::new();
+        if safe_to_vote(&signed.payload, &self.state) {
+            let view = signed.payload.block.header.view;
+            let block_hash = signed.payload.block.hash();
+
+            // Persist the vote-view before anything fires on the wire:
+            // the survivor guarantee HotStuff safety rests on is that
+            // a restarted replica never votes twice at the same view.
+            self.state.last_voted_view = view;
+            actions.push(Action::Persist(StateUpdate::VotedInView { view }));
+
+            // B3: adopt the proposal's justify as `high_qc` if it's
+            // strictly fresher. Gating this on `safe_to_vote` firing
+            // is deliberate — if we rejected the proposal we
+            // wouldn't vote on its chain, and we shouldn't trust its
+            // justify either. The independent NewView path in C3
+            // provides a separate adoption route when we trust the
+            // sender but haven't seen a proposal.
+            if should_update_high_qc(&signed.payload.justify, &self.state) {
+                let qc = signed.payload.justify.clone();
+                self.state.high_qc = Some(qc.clone());
+                actions.push(Action::Persist(StateUpdate::HighQc(qc)));
+            }
+
+            // Send the vote to the next-view leader, who will assemble
+            // the QC and use it as the justify of the next proposal.
+            let next_leader = round_robin_leader(&self.state.validator_set, view + 1);
+            actions.push(Action::SendTo(
+                next_leader,
+                ConsensusMsg::Vote(Vote { view, block_hash }),
+            ));
+        }
+
+        actions
     }
 
     /// Feed a trace of events through `step` in order, returning one
@@ -208,20 +272,120 @@ impl HotStuffCore {
     }
 }
 
+/// Round-robin leader for `view` over `vs`. Mirrors
+/// [`crate::consensus::pacemaker::leader::RoundRobinSelector`]. The
+/// safety core doesn't own an `Arc<dyn LeaderSelector>` in milestone
+/// 7.C because its constructor doesn't take one; this keeps the two
+/// modules from having to agree on a selector instance. Swappable
+/// selectors are the integration layer's job (#24).
+fn round_robin_leader(vs: &ValidatorSet, view: View) -> NodeId {
+    let len = vs.len();
+    debug_assert!(len > 0, "validator set must be non-empty");
+    *vs.get((view as usize) % len)
+        .expect("validator set is non-empty")
+}
+
 #[cfg(test)]
-pub(crate) mod testing {
-    //! Deterministic `BlockBuilder` impls the unit and property tests
-    //! reach for. Gated behind `cfg(test)` so non-test builds don't
-    //! accidentally ship them.
+mod tests {
+    //! Unit tests and the shared fixtures they build on.
+    //!
+    //! We hand-construct `Signed<T>` envelopes rather than signing with
+    //! real Ed25519 keys: the safety core explicitly does **not**
+    //! verify signatures (that's the integration layer's job per #24),
+    //! so tests can put any byte pattern in the `sig` field and the
+    //! core will trust it. The upside is determinism — no keypair
+    //! generation in hot test paths — and the downside is that these
+    //! envelopes would be rejected on the wire, which is exactly the
+    //! boundary we want.
+    //!
+    //! `TestBlockBuilder` and friends live here rather than in a
+    //! separate `testing` submodule because clippy's
+    //! `items_after_test_module` forbids a second top-level test
+    //! module past this one; keeping everything under a single
+    //! `#[cfg(test)] mod tests` root makes room for future `mod
+    //! property` additions as nested submodules.
 
     use super::*;
+    use crate::consensus::validator_set::ValidatorSet;
     use crate::replication::block::BlockHeader;
 
-    /// `BlockBuilder` that stamps an empty-commands child over `parent`
-    /// with a caller-configured `proposer` and a zero
-    /// `state_commitment`. The header is deterministic in `(parent,
-    /// view, proposer)`; the `high_qc` argument is intentionally
-    /// ignored because these tests don't exercise the execution layer.
+    // ── Fixture constants and helpers ────────────────────────────────
+
+    /// Stand-in [`NodeId`] constructor. Tests only ever identify nodes
+    /// by the discriminator byte, so `nid(3)` is shorthand for the
+    /// all-`0x03` node id that sorts into position 2 of the canonical
+    /// four-validator set.
+    pub(crate) fn nid(b: u8) -> NodeId {
+        [b; 32]
+    }
+
+    /// The canonical four-validator set used across the step tests.
+    /// Sorted order matches the byte value: `[nid(1), nid(2), nid(3), nid(4)]`.
+    pub(crate) fn validators() -> ValidatorSet {
+        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+    }
+
+    /// Build an all-zero-signature [`Signed<Proposal>`] from `sender`.
+    /// The safety core never verifies the envelope; the `sig` bytes
+    /// are deliberately meaningless so tests stay deterministic.
+    pub(crate) fn signed_proposal(
+        block: Block,
+        justify: QuorumCertificate,
+        sender: NodeId,
+    ) -> Signed<Proposal> {
+        Signed {
+            payload: Proposal { block, justify },
+            signer: sender,
+            sig: [0u8; 64],
+        }
+    }
+
+    /// Build a skeletal [`QuorumCertificate`] — right view and block
+    /// hash, no signatures populated — sized for the canonical
+    /// four-validator set. Adequate for the safety-rule predicates
+    /// because they only read `view` / `block_hash`.
+    pub(crate) fn dummy_qc(view: View, block_hash: BlockHash) -> QuorumCertificate {
+        QuorumCertificate::new(view, block_hash, validators().len())
+    }
+
+    /// Chain `views` blocks onto `genesis`, each parented to its
+    /// predecessor; `views[0]` becomes genesis's child. Height advances
+    /// alongside the index so the chain respects
+    /// [`crate::replication::block::validate_structural`].
+    ///
+    /// `proposer` is stamped into every header; callers that need a
+    /// per-block proposer can mutate the returned blocks.
+    pub(crate) fn chain_from_genesis(
+        genesis: &Block,
+        views: &[View],
+        proposer: NodeId,
+    ) -> Vec<Block> {
+        let mut out = Vec::with_capacity(views.len());
+        let mut parent_hash = genesis.hash();
+        for (i, &view) in views.iter().enumerate() {
+            let height = genesis.header.height + (i as u64) + 1;
+            let header = BlockHeader {
+                parent_hash,
+                height,
+                view,
+                proposer,
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            };
+            let block = Block {
+                header,
+                commands: Vec::new(),
+            };
+            parent_hash = block.hash();
+            out.push(block);
+        }
+        out
+    }
+
+    /// Deterministic [`BlockBuilder`] used wherever a core's
+    /// leader-path needs a block stamped out. Stamps an empty-commands
+    /// child with zero `state_commitment` — the execution layer is
+    /// out of scope here.
     pub(crate) struct TestBlockBuilder {
         pub proposer: NodeId,
     }
@@ -241,5 +405,350 @@ pub(crate) mod testing {
                 commands: Vec::new(),
             }
         }
+    }
+
+    /// Build a fresh [`HotStuffCore`] whose `self_id` is `nid(self_byte)`
+    /// over the canonical four-validator set, rooted at a standard
+    /// all-zero-state-commitment genesis block.
+    pub(crate) fn make_core(self_byte: u8) -> HotStuffCore {
+        let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+        let builder = Arc::new(TestBlockBuilder {
+            proposer: nid(self_byte),
+        });
+        HotStuffCore::new(nid(self_byte), state, builder)
+    }
+
+    /// Build an orphan block whose `parent_hash` is `orphan_parent` and
+    /// whose own contents are deterministic given the view. Used to
+    /// exercise the missing-parent dispatch branch.
+    fn orphan_child(orphan_parent: BlockHash, view: View, proposer: NodeId) -> Block {
+        let header = BlockHeader {
+            parent_hash: orphan_parent,
+            height: 1,
+            view,
+            proposer,
+            state_commitment: [0; 32],
+            commands_commitment: Block::commands_commitment(&[]),
+        };
+        Block {
+            header,
+            commands: Vec::new(),
+        }
+    }
+
+    // ── B1: missing-parent branch ───────────────────────────────────
+
+    #[test]
+    fn proposal_with_unknown_parent_parks_and_requests_block() {
+        let mut core = make_core(1);
+        let sender = nid(2);
+        let orphan_parent: BlockHash = [0xAA; 32];
+        let child = orphan_child(orphan_parent, 1, nid(3));
+        let child_hash = child.hash();
+
+        // Justify can be any QC — dispatch doesn't inspect it on the
+        // missing-parent branch because it returns before the
+        // safe-to-vote check.
+        let justify = dummy_qc(0, core.state().genesis_hash);
+        let signed = signed_proposal(child, justify, sender);
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        // Single RequestBlock aimed at the sender with the orphan
+        // parent hash. The safety state is untouched: we have not
+        // voted, not locked, not updated high_qc.
+        assert_eq!(actions, vec![Action::RequestBlock(orphan_parent, sender)]);
+        assert!(core.parked_proposals.contains_key(&child_hash));
+        assert_eq!(core.state().last_voted_view, 0);
+        assert!(core.state().locked_qc.is_none());
+        assert!(core.state().high_qc.is_none());
+    }
+
+    #[test]
+    fn reparking_same_proposal_is_idempotent() {
+        // Repeated delivery of the same orphan proposal must neither
+        // grow `parked_proposals` unboundedly nor silently drop the
+        // second `RequestBlock` — the integration layer might resend
+        // the probe if the first went unanswered.
+        let mut core = make_core(1);
+        let sender = nid(2);
+        let orphan_parent: BlockHash = [0xAA; 32];
+        let child = orphan_child(orphan_parent, 1, nid(3));
+        let justify = dummy_qc(0, core.state().genesis_hash);
+        let signed = signed_proposal(child, justify, sender);
+
+        let _ = core.step(Event::ProposalReceived(signed.clone()));
+        let second = core.step(Event::ProposalReceived(signed));
+
+        assert_eq!(
+            second,
+            vec![Action::RequestBlock(orphan_parent, sender)],
+            "re-delivery must still produce a RequestBlock so the \
+             driver can retry the fetch",
+        );
+        assert_eq!(core.parked_proposals.len(), 1);
+    }
+
+    // ── B2 / B3: happy-path vote and HighQc adoption ─────────────────
+
+    // Round-robin leader for the canonical four-validator set:
+    // `[nid(1), nid(2), nid(3), nid(4)]`. view 1 → nid(2),
+    // view 2 → nid(3). These are hard-coded in the test assertions
+    // below on purpose — if the RoundRobinSelector mapping ever
+    // changes, the tests should fail loudly rather than silently
+    // keep using a stale leader.
+
+    #[test]
+    fn first_proposal_emits_persist_vote_and_adopts_high_qc() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let block = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let block_hash = block.hash();
+        let justify = dummy_qc(0, genesis.hash());
+        let signed = signed_proposal(block, justify.clone(), nid(2));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        assert_eq!(
+            actions,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 1 }),
+                Action::Persist(StateUpdate::HighQc(justify)),
+                Action::SendTo(
+                    nid(3),
+                    ConsensusMsg::Vote(Vote {
+                        view: 1,
+                        block_hash,
+                    }),
+                ),
+            ],
+            "happy-path emission order is VotedInView → HighQc → SendTo(Vote)",
+        );
+        assert_eq!(core.state().last_voted_view, 1);
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.view),
+            Some(0),
+            "high_qc adopted from the proposal's justify",
+        );
+    }
+
+    // ── D3: vote-only-once at same view ──────────────────────────────
+
+    #[test]
+    fn second_proposal_at_same_view_emits_no_vote() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let justify = dummy_qc(0, genesis.hash());
+
+        // First proposal at view 1 — vote emitted.
+        let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let _ = core.step(Event::ProposalReceived(signed_proposal(
+            block_a,
+            justify.clone(),
+            nid(2),
+        )));
+        assert_eq!(core.state().last_voted_view, 1);
+
+        // Second proposal at view 1 with a DIFFERENT block. Same
+        // view, different state_commitment → different hash. This is
+        // the fork-attempt shape the safe-to-vote view check rules
+        // out; we assert explicitly that no `Vote` action is
+        // produced, and that `high_qc` / `last_voted_view` stay put
+        // (HighQc adoption is gated on safe_to_vote firing).
+        let block_b = Block {
+            header: BlockHeader {
+                parent_hash: genesis.hash(),
+                height: 1,
+                view: 1,
+                proposer: nid(2),
+                state_commitment: [0xFF; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        };
+        let block_b_hash = block_b.hash();
+        let signed_b = signed_proposal(block_b, justify, nid(2));
+        let second = core.step(Event::ProposalReceived(signed_b));
+
+        assert!(
+            second.is_empty(),
+            "a second proposal at the same view must emit no actions: {second:?}",
+        );
+        assert_eq!(core.state().last_voted_view, 1);
+        // The forked block IS inserted into pending_blocks — the
+        // core tracks the fork even though it won't vote on it —
+        // which matters for the three-chain commit rule later.
+        assert!(core.state().pending_blocks.contains_key(&block_b_hash));
+    }
+
+    // ── D4: refuse-to-vote when both extension and liveness fail ─────
+
+    /// Build a "fork at `view`, rooted on genesis" — the canonical
+    /// shape the safety-rule tests use to exercise non-extension.
+    fn fork_rooted_on_genesis(genesis_hash: BlockHash, view: View) -> Block {
+        Block {
+            header: BlockHeader {
+                parent_hash: genesis_hash,
+                height: 1,
+                view,
+                proposer: nid(3),
+                state_commitment: [view as u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refuses_to_vote_when_not_extending_lock_and_justify_stale() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+
+        // Lock the core on a block at view 5.
+        let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
+        let locked_hash = locked_block.hash();
+        core.state.insert_pending(locked_block);
+        core.state.locked_qc = Some(dummy_qc(5, locked_hash));
+        core.state.last_voted_view = 5;
+
+        // Fork at view 6 rooted directly on genesis (does NOT extend
+        // the locked block at view 5) with a justify at view 3 —
+        // strictly older than the lock. Neither the extension rule
+        // nor the liveness rule fires; safe_to_vote returns false.
+        let fork = fork_rooted_on_genesis(genesis.hash(), 6);
+        let fork_hash = fork.hash();
+        let stale_justify = dummy_qc(3, genesis.hash());
+        let signed = signed_proposal(fork, stale_justify, nid(3));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        assert!(
+            actions.is_empty(),
+            "stale justify + non-extension must yield no actions: {actions:?}",
+        );
+        assert_eq!(
+            core.state().last_voted_view,
+            5,
+            "last_voted_view untouched when refusing to vote",
+        );
+        assert_eq!(
+            core.state().locked_qc.as_ref().map(|q| q.view),
+            Some(5),
+            "lock is not disturbed by a refused proposal",
+        );
+        // The fork IS inserted into pending_blocks — a later proposal
+        // whose chain happens to pass through this fork can still
+        // walk through it; the safety rules, not the storage layer,
+        // are what gate voting.
+        assert!(core.state().pending_blocks.contains_key(&fork_hash));
+    }
+
+    #[test]
+    fn liveness_rule_permits_vote_on_fork_when_justify_fresher_than_lock() {
+        // Companion to the refuse test above. Same lock setup, but
+        // the fork's justify is view 9 > locked view 5. The liveness
+        // rule fires and the core votes even though the fork does
+        // not extend the locked block. Without this path, a slow
+        // node that locked on a dead branch would never catch up.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+
+        let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
+        let locked_hash = locked_block.hash();
+        core.state.insert_pending(locked_block);
+        core.state.locked_qc = Some(dummy_qc(5, locked_hash));
+        core.state.last_voted_view = 5;
+
+        let fork = fork_rooted_on_genesis(genesis.hash(), 10);
+        let fork_hash = fork.hash();
+        let fresh_justify = dummy_qc(9, [0xEE; 32]);
+        let signed = signed_proposal(fork, fresh_justify.clone(), nid(3));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        assert_eq!(
+            actions,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 10 }),
+                Action::Persist(StateUpdate::HighQc(fresh_justify)),
+                // leader(11) over `[nid(1), nid(2), nid(3), nid(4)]`:
+                // 11 % 4 = 3 → nid(4).
+                Action::SendTo(
+                    nid(4),
+                    ConsensusMsg::Vote(Vote {
+                        view: 10,
+                        block_hash: fork_hash,
+                    }),
+                ),
+            ],
+        );
+        assert_eq!(core.state().last_voted_view, 10);
+        assert_eq!(core.state().high_qc.as_ref().map(|q| q.view), Some(9));
+    }
+
+    // ── D5: Byzantine fork at same view from different proposers ─────
+
+    #[test]
+    fn byzantine_second_proposer_at_same_view_does_not_extract_a_vote() {
+        // Distinct from D3's vote-only-once test: there the second
+        // proposal came from the same proposer (shaped like a
+        // retry). Here the second proposal comes from a DIFFERENT
+        // validator — the Byzantine shape — pretending to lead the
+        // same view. Either the view-freshness check or a
+        // higher-level "wrong leader" filter could block this; the
+        // test pins that *at least* the view-freshness check does,
+        // which is the lower bound the safety core needs to uphold
+        // regardless of what the integration layer (#24) filters.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let justify = dummy_qc(0, genesis.hash());
+
+        // The legitimate view-1 leader (nid(2)) proposes first.
+        let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let block_a_hash = block_a.hash();
+        let first = core.step(Event::ProposalReceived(signed_proposal(
+            block_a,
+            justify.clone(),
+            nid(2),
+        )));
+        assert!(
+            first
+                .iter()
+                .any(|a| matches!(a, Action::SendTo(_, ConsensusMsg::Vote(_)))),
+            "legitimate first proposal is expected to produce a Vote: {first:?}",
+        );
+
+        // Byzantine nid(3) stuffs a conflicting block at the same
+        // view. `safe_to_vote` rejects on view-freshness grounds;
+        // the core emits no action at all.
+        let block_b = Block {
+            header: BlockHeader {
+                parent_hash: genesis.hash(),
+                height: 1,
+                view: 1,
+                proposer: nid(3),
+                state_commitment: [0xCC; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        };
+        let block_b_hash = block_b.hash();
+        let second = core.step(Event::ProposalReceived(signed_proposal(
+            block_b,
+            justify,
+            nid(3),
+        )));
+
+        assert!(
+            second.is_empty(),
+            "Byzantine fork must not extract a second vote: {second:?}",
+        );
+        assert_eq!(core.state().last_voted_view, 1);
+        // Both branches of the fork stay tracked in pending_blocks:
+        // a future three-chain walk might need either of them, and
+        // removing a block because we didn't vote on it would be a
+        // storage leak back into safety semantics.
+        assert!(core.state().pending_blocks.contains_key(&block_a_hash));
+        assert!(core.state().pending_blocks.contains_key(&block_b_hash));
     }
 }
