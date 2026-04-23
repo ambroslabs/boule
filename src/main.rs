@@ -4,6 +4,8 @@ mod crypto;
 mod gossip;
 mod p2p;
 mod ping;
+#[cfg(test)]
+mod sim;
 
 use std::path::PathBuf;
 use std::sync::Arc;
