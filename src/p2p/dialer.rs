@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use super::manager::{AnyStream, ManagerMsg};
 use super::tls::{NodeId, TlsIdentity, TlsStream, extract_node_id, node_id_to_base58};
+use crate::clock::Clock;
 
 /// Continuously attempts to maintain an outbound connection to `addr`.
 /// On success, waits for the connection to die (via the peer_gone broadcast)
@@ -16,6 +17,7 @@ pub async fn reconnect_loop(
     identity: Arc<TlsIdentity>,
     internal_tx: mpsc::Sender<ManagerMsg>,
     peer_gone_tx: broadcast::Sender<NodeId>,
+    clock: Arc<dyn Clock>,
 ) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(60);
@@ -50,7 +52,7 @@ pub async fn reconnect_loop(
             }
             Err(e) => {
                 warn!("could not connect to peer {addr}: {e}; retry in {backoff:?}");
-                tokio::time::sleep(backoff).await;
+                clock.sleep(backoff).await;
                 backoff = (backoff * 2).min(max_backoff);
             }
         }

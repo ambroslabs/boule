@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use super::{ContentHash, GossipMessage, InsertResult};
 
@@ -24,9 +24,9 @@ impl GossipStore {
         }
     }
 
-    pub fn try_insert(&self, msg: GossipMessage) -> InsertResult {
+    pub fn try_insert(&self, msg: GossipMessage, now: DateTime<Utc>) -> InsertResult {
         // Check expiry before taking any lock.
-        if msg.is_expired() {
+        if msg.is_expired(now) {
             return InsertResult::Expired;
         }
         let hash = msg.content_hash();
@@ -42,7 +42,7 @@ impl GossipStore {
 
         // Slow path: exclusive write lock with re-check (double-checked locking).
         let mut inner = self.inner.write().unwrap();
-        if msg.is_expired() {
+        if msg.is_expired(now) {
             return InsertResult::Expired;
         }
         if inner.seen.contains(&hash) {
@@ -53,9 +53,8 @@ impl GossipStore {
         InsertResult::Inserted
     }
 
-    pub fn list_live(&self) -> Vec<GossipMessage> {
+    pub fn list_live(&self, now: DateTime<Utc>) -> Vec<GossipMessage> {
         let inner = self.inner.read().unwrap();
-        let now = Utc::now();
         inner
             .messages
             .values()
@@ -64,9 +63,8 @@ impl GossipStore {
             .collect()
     }
 
-    pub fn remove_expired(&self) -> usize {
+    pub fn remove_expired(&self, now: DateTime<Utc>) -> usize {
         let mut inner = self.inner.write().unwrap();
-        let now = Utc::now();
         let expired: Vec<ContentHash> = inner
             .messages
             .iter()
@@ -104,11 +102,11 @@ mod tests {
         let m = msg("hello", 60_000);
 
         assert!(matches!(
-            store.try_insert(m.clone()),
+            store.try_insert(m.clone(), Utc::now()),
             InsertResult::Inserted
         ));
 
-        let live = store.list_live();
+        let live = store.list_live(Utc::now());
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].content, "hello");
     }
@@ -119,14 +117,14 @@ mod tests {
         let m = msg("hello", 60_000);
 
         assert!(matches!(
-            store.try_insert(m.clone()),
+            store.try_insert(m.clone(), Utc::now()),
             InsertResult::Inserted
         ));
         assert!(matches!(
-            store.try_insert(m.clone()),
+            store.try_insert(m.clone(), Utc::now()),
             InsertResult::AlreadySeen
         ));
-        assert_eq!(store.list_live().len(), 1);
+        assert_eq!(store.list_live(Utc::now()).len(), 1);
     }
 
     #[test]
@@ -137,8 +135,11 @@ mod tests {
             expiry: Utc::now() - Duration::seconds(1),
         };
 
-        assert!(matches!(store.try_insert(m), InsertResult::Expired));
-        assert!(store.list_live().is_empty());
+        assert!(matches!(
+            store.try_insert(m, Utc::now()),
+            InsertResult::Expired
+        ));
+        assert!(store.list_live(Utc::now()).is_empty());
     }
 
     #[test]
@@ -156,9 +157,9 @@ mod tests {
             expiry: now + Duration::seconds(120),
         };
 
-        assert!(matches!(store.try_insert(a), InsertResult::Inserted));
-        assert!(matches!(store.try_insert(b), InsertResult::Inserted));
-        assert_eq!(store.list_live().len(), 2);
+        assert!(matches!(store.try_insert(a, now), InsertResult::Inserted));
+        assert!(matches!(store.try_insert(b, now), InsertResult::Inserted));
+        assert_eq!(store.list_live(now).len(), 2);
     }
 
     #[test]
@@ -166,12 +167,12 @@ mod tests {
         let store = GossipStore::new();
         let shortlived = msg("gone-soon", 50);
         let longlived = msg("still-here", 60_000);
-        store.try_insert(shortlived);
-        store.try_insert(longlived);
+        store.try_insert(shortlived, Utc::now());
+        store.try_insert(longlived, Utc::now());
 
         thread::sleep(std::time::Duration::from_millis(150));
 
-        let live = store.list_live();
+        let live = store.list_live(Utc::now());
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].content, "still-here");
     }
@@ -179,13 +180,13 @@ mod tests {
     #[test]
     fn remove_expired_drops_only_past_entries() {
         let store = GossipStore::new();
-        store.try_insert(msg("gone-soon", 50));
-        store.try_insert(msg("still-here", 60_000));
+        store.try_insert(msg("gone-soon", 50), Utc::now());
+        store.try_insert(msg("still-here", 60_000), Utc::now());
 
         thread::sleep(std::time::Duration::from_millis(150));
 
-        assert_eq!(store.remove_expired(), 1);
-        let live = store.list_live();
+        assert_eq!(store.remove_expired(Utc::now()), 1);
+        let live = store.list_live(Utc::now());
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].content, "still-here");
     }
@@ -202,18 +203,21 @@ mod tests {
             expiry,
         };
         assert!(matches!(
-            store.try_insert(m.clone()),
+            store.try_insert(m.clone(), Utc::now()),
             InsertResult::Inserted
         ));
 
         thread::sleep(std::time::Duration::from_millis(150));
-        assert_eq!(store.remove_expired(), 1);
+        assert_eq!(store.remove_expired(Utc::now()), 1);
 
         let revived = GossipMessage {
             content: "recycled".into(),
             expiry: Utc::now() + Duration::seconds(60),
         };
-        assert!(matches!(store.try_insert(revived), InsertResult::Inserted));
+        assert!(matches!(
+            store.try_insert(revived, Utc::now()),
+            InsertResult::Inserted
+        ));
     }
 
     #[test]
@@ -227,7 +231,7 @@ mod tests {
         for _ in 0..16 {
             let store = Arc::clone(&store);
             let m = m.clone();
-            handles.push(thread::spawn(move || store.try_insert(m)));
+            handles.push(thread::spawn(move || store.try_insert(m, Utc::now())));
         }
 
         let results: Vec<InsertResult> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -242,6 +246,6 @@ mod tests {
 
         assert_eq!(inserted, 1, "exactly one thread should insert");
         assert_eq!(seen, 15, "all others should see AlreadySeen");
-        assert_eq!(store.list_live().len(), 1);
+        assert_eq!(store.list_live(Utc::now()).len(), 1);
     }
 }
