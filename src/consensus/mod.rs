@@ -1,0 +1,42 @@
+//! HotStuff-style BFT consensus layer.
+//!
+//! Consensus sits above [`crate::replication`] (state machine, mempool,
+//! block format) and [`crate::storage`] (durable state), and ships its
+//! messages through [`crate::p2p`]. The design discipline of this crate —
+//! small object-safe traits, `Arc<dyn Trait>` at the edges, pure state
+//! machines in the core — applies here especially hard: HotStuff
+//! implementations are historically buggy when safety, liveness, and I/O
+//! get tangled together.
+//!
+//! # Roadmap (#21–#24)
+//!
+//! - Milestone 6 (#22): [`pacemaker`] — view synchronization and leader
+//!   rotation. **Pure state machine, no `tokio`, no I/O.** Broken into:
+//!   - 6.A (#86): [`pacemaker::leader`] and [`validator_set`] + this module
+//!     skeleton.
+//!   - 6.B (#87): `pacemaker::timeout`.
+//!   - 6.C (#88): the `Pacemaker` state machine itself.
+//! - Milestone 7 (#23): HotStuff safety core as a pure state machine.
+//!   Composes with pacemaker, does not call into it.
+//! - Milestone 8 (#24): integration layer that translates safety-core and
+//!   pacemaker [`Action`](pacemaker::Action)s into real timers, network
+//!   sends, and storage writes.
+//!
+//! # `View`
+//!
+//! The [`View`] alias is a `u64` matching `BlockHeader::view` in
+//! [`crate::replication::block`]. HotStuff relies on views being strictly
+//! increasing; the pacemaker is the only module allowed to advance it.
+
+// Types here are consumed by future milestones (#22.B/#22.C onward).
+// Allow dead code until then, matching `replication/mod.rs`.
+#![allow(dead_code)]
+
+pub mod pacemaker;
+pub mod validator_set;
+
+/// HotStuff view number.
+pub type View = u64;
+
+#[allow(unused_imports)]
+pub use validator_set::ValidatorSet;
