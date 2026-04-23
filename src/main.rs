@@ -6,6 +6,7 @@ mod p2p;
 mod ping;
 #[cfg(test)]
 mod sim;
+mod storage;
 
 use std::path::PathBuf;
 use std::sync::Arc;

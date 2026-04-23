@@ -1,0 +1,157 @@
+//! Persistent state abstraction for consensus.
+//!
+//! HotStuff safety requires that a replica never forget its last-voted view
+//! or its locked QC across crashes (see issue #20). This module defines two
+//! object-safe traits that consensus will sit on top of:
+//!
+//! - [`Storage`]: a small KV surface for "control-plane state" — the pieces
+//!   of state that mutate over time (last-voted view, locked QC). Callers
+//!   group related writes into atomic batches via [`StorageExt::batch`].
+//! - [`Wal`]: a thin append-only log for "log state" — blocks, decisions,
+//!   anything the replica replays on startup. [`Wal::flush`] is the only
+//!   durability barrier; [`Wal::append`] may buffer.
+//!
+//! Milestone 4a (this module) provides only the in-memory backends in
+//! [`memory`]. Milestone 4b will add an on-disk `redb`-backed implementation
+//! and a subprocess-based crash-safety harness.
+//!
+//! Both traits are consumed as `Arc<dyn Storage>` / `Arc<dyn Wal>`, matching
+//! the `Clock` abstraction in [`crate::clock`] — backends are swapped at the
+//! edges, not plumbed through generics.
+
+// Traits and types defined here are consumed by future consensus milestones
+// (#20 sub-tasks and beyond). Allow dead code until then, following the
+// pattern established in `crypto/mod.rs`.
+#![allow(dead_code)]
+
+pub mod memory;
+
+use bytes::Bytes;
+
+// Re-export the in-memory backends from the crate-root path. The `#[allow]`
+// is needed because nothing in the binary consumes these yet; future
+// consensus milestones will.
+#[allow(unused_imports)]
+pub use memory::{MemoryStorage, MemoryWal};
+
+/// A boxed iterator over WAL entries. Used in [`Wal::iter_from`].
+pub type WalIter<'a> = Box<dyn Iterator<Item = anyhow::Result<(Lsn, Bytes)>> + Send + 'a>;
+
+/// Log Sequence Number. Monotonically increasing, assigned by the WAL on
+/// append. [`Lsn::ZERO`] is reserved to mean "before any appended entry"
+/// and is the conventional argument to [`Wal::iter_from`] when replaying
+/// the entire log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Lsn(u64);
+
+impl Lsn {
+    pub const ZERO: Lsn = Lsn(0);
+
+    pub fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for Lsn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lsn:{}", self.0)
+    }
+}
+
+/// Key-value storage for small, mutable "control-plane" state.
+///
+/// Implementations must be safe to share across threads. Single-key methods
+/// (`put`, `delete`) are their own atomic unit; multi-key atomicity goes
+/// through [`Storage::apply_batch`] (typically via the [`StorageExt::batch`]
+/// closure helper).
+pub trait Storage: Send + Sync {
+    fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>>;
+
+    fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()>;
+
+    fn delete(&self, key: &[u8]) -> anyhow::Result<()>;
+
+    /// Return every `(key, value)` whose key begins with `prefix`, in
+    /// ascending key order.
+    fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>>;
+
+    /// Apply `batch` atomically: on `Ok`, every op is visible; on `Err`,
+    /// no op is visible. Concurrent readers see either the pre-batch state
+    /// or the post-batch state, never a partial one.
+    fn apply_batch(&self, batch: WriteBatch) -> anyhow::Result<()>;
+}
+
+/// Ergonomic closure wrapper around [`Storage::apply_batch`]. Blanket-impl'd
+/// for any `Storage` (including `dyn Storage`), so callers holding an
+/// `Arc<dyn Storage>` can write `s.batch(|b| { b.put(...); Ok(()) })`.
+pub trait StorageExt: Storage {
+    fn batch<F>(&self, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut WriteBatch) -> anyhow::Result<()>,
+    {
+        let mut batch = WriteBatch::default();
+        f(&mut batch)?;
+        self.apply_batch(batch)
+    }
+}
+
+impl<S: Storage + ?Sized> StorageExt for S {}
+
+/// A group of writes that will be applied atomically by [`Storage::apply_batch`].
+#[derive(Default, Debug)]
+pub struct WriteBatch {
+    pub(crate) ops: Vec<WriteOp>,
+}
+
+#[derive(Debug)]
+pub(crate) enum WriteOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+impl WriteBatch {
+    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.ops.push(WriteOp::Put(key.to_vec(), value.to_vec()));
+    }
+
+    pub fn delete(&mut self, key: &[u8]) {
+        self.ops.push(WriteOp::Delete(key.to_vec()));
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+}
+
+/// Append-only log for "log state" (blocks, decisions, anything consensus
+/// replays on startup).
+///
+/// Durability contract: [`Wal::flush`] must fsync before returning. After a
+/// successful `flush()`, every entry whose `append` returned before the
+/// `flush()` is guaranteed to survive a crash. Entries appended but not yet
+/// flushed may or may not survive.
+pub trait Wal: Send + Sync {
+    /// Append `entry`. Returns the assigned [`Lsn`], which is strictly
+    /// greater than every previously returned LSN (and strictly greater
+    /// than [`Lsn::ZERO`]). May buffer; call [`Wal::flush`] to force
+    /// durability.
+    fn append(&self, entry: &[u8]) -> anyhow::Result<Lsn>;
+
+    /// fsync the log. See the trait-level durability contract.
+    fn flush(&self) -> anyhow::Result<()>;
+
+    /// Iterate entries in ascending LSN order, starting with the first
+    /// entry whose LSN is `>= lsn`. Pass [`Lsn::ZERO`] to iterate from the
+    /// beginning. The returned iterator may borrow from `self`; iteration
+    /// observes a point-in-time snapshot and does not include entries
+    /// appended after it begins.
+    fn iter_from(&self, lsn: Lsn) -> anyhow::Result<WalIter<'_>>;
+
+    /// Drop every entry whose LSN is `< lsn`. Entries with LSN `>= lsn` are
+    /// retained. `truncate_before(Lsn::ZERO)` is a no-op.
+    fn truncate_before(&self, lsn: Lsn) -> anyhow::Result<()>;
+}
