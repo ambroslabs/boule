@@ -22,7 +22,7 @@ use crate::p2p::manager::{AnyStream, ManagerMsg};
 use crate::p2p::{ConnectionProtocol, NodeId, PeerCommand, ProtocolOutbound};
 
 use super::SimClock;
-use super::network::{EventId, InFlightEvent, LinkConfig, SimNetwork, TraceEntry};
+use super::network::{EventId, EventMutator, InFlightEvent, LinkConfig, SimNetwork, TraceEntry};
 use super::stream::{Inbox, SimStream};
 use super::transport::SimConnectionProtocol;
 
@@ -232,6 +232,24 @@ impl SimDriver {
     /// The duplicate gets a fresh [`EventId`], returned to the caller.
     pub fn duplicate_event(&self, id: EventId) -> Option<EventId> {
         self.network.duplicate_event(id)
+    }
+
+    /// Install a global Byzantine message-mutation hook. See
+    /// [`SimNetwork::set_mutator`] for semantics.
+    pub fn set_mutator(&self, mutator: Arc<dyn EventMutator>) {
+        self.network.set_mutator(mutator);
+    }
+
+    /// Install a directional per-link Byzantine mutator. Takes precedence
+    /// over the global mutator.
+    pub fn set_link_mutator(&self, from_idx: usize, to_idx: usize, mutator: Arc<dyn EventMutator>) {
+        self.network
+            .set_link_mutator(self.node_id(from_idx), self.node_id(to_idx), mutator);
+    }
+
+    /// Drop every registered mutator.
+    pub fn clear_mutators(&self) {
+        self.network.clear_mutators();
     }
 
     // ---- Determinism trace ----

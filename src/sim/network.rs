@@ -134,6 +134,56 @@ pub struct TraceEntry {
     pub byte_len: usize,
 }
 
+/// Input to an [`EventMutator`]: the event as scheduled, immediately before
+/// it would be delivered to the destination inbox.
+#[derive(Debug, Clone)]
+pub struct MutatorInput {
+    pub id: EventId,
+    pub time: DateTime<Utc>,
+    pub from: NodeId,
+    pub to: NodeId,
+    pub bytes: Vec<u8>,
+}
+
+/// One replacement event produced by an [`EventMutator`]. The network
+/// re-resolves the inbox for `(from, to)` at delivery time, so mutators may
+/// spoof the sender or redirect delivery.
+#[derive(Debug, Clone)]
+pub struct MutatorOutput {
+    pub from: NodeId,
+    pub to: NodeId,
+    pub bytes: Vec<u8>,
+}
+
+impl MutatorOutput {
+    /// Pass-through: deliver the event unchanged.
+    pub fn passthrough(input: &MutatorInput) -> Self {
+        Self {
+            from: input.from,
+            to: input.to,
+            bytes: input.bytes.clone(),
+        }
+    }
+}
+
+/// Byzantine hook applied to events just before delivery. Returning an empty
+/// vec drops the event; returning multiple outputs duplicates it. Mutators
+/// must be deterministic — the sim's determinism guarantee is that two runs
+/// with the same seed and the same mutator produce byte-identical traces.
+pub trait EventMutator: Send + Sync {
+    fn mutate(&self, input: &MutatorInput) -> Vec<MutatorOutput>;
+}
+
+/// Convenience: any `Fn(&MutatorInput) -> Vec<MutatorOutput>` is a mutator.
+impl<F> EventMutator for F
+where
+    F: Fn(&MutatorInput) -> Vec<MutatorOutput> + Send + Sync,
+{
+    fn mutate(&self, input: &MutatorInput) -> Vec<MutatorOutput> {
+        (self)(input)
+    }
+}
+
 struct Event {
     id: EventId,
     time: DateTime<Utc>,
@@ -187,6 +237,11 @@ struct Inner {
     killed: HashSet<NodeId>,
     /// Ordered log of delivered events, used as the determinism fingerprint.
     trace: Vec<TraceEntry>,
+    /// Per-link Byzantine mutator, consulted first at delivery time.
+    link_mutators: HashMap<(NodeId, NodeId), Arc<dyn EventMutator>>,
+    /// Fallback Byzantine mutator, applied when no per-link mutator exists
+    /// for the event's `(from, to)` pair.
+    global_mutator: Option<Arc<dyn EventMutator>>,
 }
 
 struct StagedWrite {
@@ -213,6 +268,8 @@ impl SimNetwork {
                 paused: HashSet::new(),
                 killed: HashSet::new(),
                 trace: Vec::new(),
+                link_mutators: HashMap::new(),
+                global_mutator: None,
             }),
         })
     }
@@ -298,6 +355,29 @@ impl SimNetwork {
                 w.wake();
             }
         }
+    }
+
+    /// Install a global message-mutation hook. Consulted at delivery time for
+    /// every event whose `(from, to)` pair has no per-link mutator set.
+    pub fn set_mutator(&self, mutator: Arc<dyn EventMutator>) {
+        self.inner.lock().unwrap().global_mutator = Some(mutator);
+    }
+
+    /// Install a directional per-link message-mutation hook. Takes precedence
+    /// over any global mutator for events on this link.
+    pub fn set_link_mutator(&self, from: NodeId, to: NodeId, mutator: Arc<dyn EventMutator>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .link_mutators
+            .insert((from, to), mutator);
+    }
+
+    /// Remove every registered mutator (global and per-link).
+    pub fn clear_mutators(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.link_mutators.clear();
+        inner.global_mutator = None;
     }
 
     /// Non-destructive snapshot of every event currently in the main heap.
@@ -466,29 +546,95 @@ impl SimNetwork {
             let mut inner = self.inner.lock().unwrap();
             let now = event.time.max(inner.now);
             inner.now = now;
-            if record_trace {
-                inner.trace.push(TraceEntry {
-                    time: now,
-                    id: event.id,
-                    from: event.from,
-                    to: event.to,
-                    byte_len: event.bytes.len(),
-                });
-            }
             now
         };
 
-        // Check paused state outside the main lock to minimise hold time.
-        let destination_paused = self.inner.lock().unwrap().paused.contains(&event.to);
+        // Look up the Byzantine hook for this link, falling back to global.
+        let mutator = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .link_mutators
+                .get(&(event.from, event.to))
+                .cloned()
+                .or_else(|| inner.global_mutator.clone())
+        };
 
-        let mut inbox = event.inbox.lock().unwrap();
-        inbox.bytes.extend_from_slice(&event.bytes);
-        if !destination_paused {
+        match mutator {
+            None => {
+                // Fast path: deliver once using the inbox captured at enqueue.
+                if record_trace {
+                    self.inner.lock().unwrap().trace.push(TraceEntry {
+                        time: new_now,
+                        id: event.id,
+                        from: event.from,
+                        to: event.to,
+                        byte_len: event.bytes.len(),
+                    });
+                }
+                let destination_paused = self.inner.lock().unwrap().paused.contains(&event.to);
+                let mut inbox = event.inbox.lock().unwrap();
+                inbox.bytes.extend_from_slice(&event.bytes);
+                if !destination_paused {
+                    if let Some(waker) = inbox.waker.take() {
+                        waker.wake();
+                    }
+                }
+            }
+            Some(hook) => {
+                let input = MutatorInput {
+                    id: event.id,
+                    time: new_now,
+                    from: event.from,
+                    to: event.to,
+                    bytes: event.bytes,
+                };
+                for out in hook.mutate(&input) {
+                    self.deliver_mutated(new_now, out, record_trace);
+                }
+            }
+        }
+        new_now
+    }
+
+    /// Deliver one mutator output. Each output gets a fresh `EventId` so the
+    /// trace stays one-entry-per-delivery. Respects the destination's
+    /// kill/pause state and silently drops if the `(from, to)` pair has no
+    /// registered inbox (i.e. the mutator spoofed an unreachable peer).
+    fn deliver_mutated(&self, now: DateTime<Utc>, out: MutatorOutput, record_trace: bool) {
+        let (killed, paused, inbox, id) = {
+            let mut inner = self.inner.lock().unwrap();
+            let killed = inner.killed.contains(&out.from) || inner.killed.contains(&out.to);
+            let paused = inner.paused.contains(&out.to);
+            let inbox = inner.inboxes.get(&(out.from, out.to)).cloned();
+            inner.seq += 1;
+            let id = EventId(inner.seq);
+            (killed, paused, inbox, id)
+        };
+
+        if killed {
+            return;
+        }
+        let Some(inbox) = inbox else {
+            return;
+        };
+
+        if record_trace {
+            self.inner.lock().unwrap().trace.push(TraceEntry {
+                time: now,
+                id,
+                from: out.from,
+                to: out.to,
+                byte_len: out.bytes.len(),
+            });
+        }
+
+        let mut inbox = inbox.lock().unwrap();
+        inbox.bytes.extend_from_slice(&out.bytes);
+        if !paused {
             if let Some(waker) = inbox.waker.take() {
                 waker.wake();
             }
         }
-        new_now
     }
 
     pub(crate) fn flush_reorder_buffers(&self) {
