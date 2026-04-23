@@ -209,19 +209,106 @@ impl HotStuffCore {
 }
 
 #[cfg(test)]
-pub(crate) mod testing {
-    //! Deterministic `BlockBuilder` impls the unit and property tests
-    //! reach for. Gated behind `cfg(test)` so non-test builds don't
-    //! accidentally ship them.
+mod tests {
+    //! Unit tests and the shared fixtures they build on.
+    //!
+    //! We hand-construct `Signed<T>` envelopes rather than signing with
+    //! real Ed25519 keys: the safety core explicitly does **not**
+    //! verify signatures (that's the integration layer's job per #24),
+    //! so tests can put any byte pattern in the `sig` field and the
+    //! core will trust it. The upside is determinism — no keypair
+    //! generation in hot test paths — and the downside is that these
+    //! envelopes would be rejected on the wire, which is exactly the
+    //! boundary we want.
+    //!
+    //! `TestBlockBuilder` and friends live here rather than in a
+    //! separate `testing` submodule because clippy's
+    //! `items_after_test_module` forbids a second top-level test
+    //! module past this one; keeping everything under a single
+    //! `#[cfg(test)] mod tests` root makes room for future `mod
+    //! property` additions as nested submodules.
 
     use super::*;
+    use crate::consensus::validator_set::ValidatorSet;
     use crate::replication::block::BlockHeader;
 
-    /// `BlockBuilder` that stamps an empty-commands child over `parent`
-    /// with a caller-configured `proposer` and a zero
-    /// `state_commitment`. The header is deterministic in `(parent,
-    /// view, proposer)`; the `high_qc` argument is intentionally
-    /// ignored because these tests don't exercise the execution layer.
+    // ── Fixture constants and helpers ────────────────────────────────
+
+    /// Stand-in [`NodeId`] constructor. Tests only ever identify nodes
+    /// by the discriminator byte, so `nid(3)` is shorthand for the
+    /// all-`0x03` node id that sorts into position 2 of the canonical
+    /// four-validator set.
+    pub(crate) fn nid(b: u8) -> NodeId {
+        [b; 32]
+    }
+
+    /// The canonical four-validator set used across the step tests.
+    /// Sorted order matches the byte value: `[nid(1), nid(2), nid(3), nid(4)]`.
+    pub(crate) fn validators() -> ValidatorSet {
+        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+    }
+
+    /// Build an all-zero-signature [`Signed<Proposal>`] from `sender`.
+    /// The safety core never verifies the envelope; the `sig` bytes
+    /// are deliberately meaningless so tests stay deterministic.
+    pub(crate) fn signed_proposal(
+        block: Block,
+        justify: QuorumCertificate,
+        sender: NodeId,
+    ) -> Signed<Proposal> {
+        Signed {
+            payload: Proposal { block, justify },
+            signer: sender,
+            sig: [0u8; 64],
+        }
+    }
+
+    /// Build a skeletal [`QuorumCertificate`] — right view and block
+    /// hash, no signatures populated — sized for the canonical
+    /// four-validator set. Adequate for the safety-rule predicates
+    /// because they only read `view` / `block_hash`.
+    pub(crate) fn dummy_qc(view: View, block_hash: BlockHash) -> QuorumCertificate {
+        QuorumCertificate::new(view, block_hash, validators().len())
+    }
+
+    /// Chain `views` blocks onto `genesis`, each parented to its
+    /// predecessor; `views[0]` becomes genesis's child. Height advances
+    /// alongside the index so the chain respects
+    /// [`crate::replication::block::validate_structural`].
+    ///
+    /// `proposer` is stamped into every header; callers that need a
+    /// per-block proposer can mutate the returned blocks.
+    pub(crate) fn chain_from_genesis(
+        genesis: &Block,
+        views: &[View],
+        proposer: NodeId,
+    ) -> Vec<Block> {
+        let mut out = Vec::with_capacity(views.len());
+        let mut parent_hash = genesis.hash();
+        for (i, &view) in views.iter().enumerate() {
+            let height = genesis.header.height + (i as u64) + 1;
+            let header = BlockHeader {
+                parent_hash,
+                height,
+                view,
+                proposer,
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            };
+            let block = Block {
+                header,
+                commands: Vec::new(),
+            };
+            parent_hash = block.hash();
+            out.push(block);
+        }
+        out
+    }
+
+    /// Deterministic [`BlockBuilder`] used wherever a core's
+    /// leader-path needs a block stamped out. Stamps an empty-commands
+    /// child with zero `state_commitment` — the execution layer is
+    /// out of scope here.
     pub(crate) struct TestBlockBuilder {
         pub proposer: NodeId,
     }
@@ -241,5 +328,16 @@ pub(crate) mod testing {
                 commands: Vec::new(),
             }
         }
+    }
+
+    /// Build a fresh [`HotStuffCore`] whose `self_id` is `nid(self_byte)`
+    /// over the canonical four-validator set, rooted at a standard
+    /// all-zero-state-commitment genesis block.
+    pub(crate) fn make_core(self_byte: u8) -> HotStuffCore {
+        let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+        let builder = Arc::new(TestBlockBuilder {
+            proposer: nid(self_byte),
+        });
+        HotStuffCore::new(nid(self_byte), state, builder)
     }
 }
