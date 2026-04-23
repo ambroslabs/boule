@@ -34,7 +34,9 @@ use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
+use super::safety_rules::safe_to_vote;
 use super::state::HotStuffState;
+use crate::consensus::validator_set::ValidatorSet;
 
 /// Inputs the safety core reacts to.
 ///
@@ -206,8 +208,7 @@ impl HotStuffCore {
     }
 
     /// Handle an inbound [`Proposal`]. Branches land in separate
-    /// commits per the #93 breakdown; this one implements only the
-    /// missing-parent case (B1). Everything else returns no actions.
+    /// commits per the #93 breakdown.
     fn on_proposal_received(&mut self, signed: Signed<Proposal>) -> Vec<Action> {
         let parent_hash = signed.payload.block.header.parent_hash;
         // B1: parent isn't in `pending_blocks` — we can't evaluate
@@ -221,7 +222,33 @@ impl HotStuffCore {
             self.parked_proposals.insert(child_hash, signed);
             return vec![Action::RequestBlock(parent_hash, sender)];
         }
-        Vec::new()
+
+        // B2: insert the proposed block into `pending_blocks` so the
+        // `safe_to_vote` extension walk has something to follow, then
+        // run the predicate.
+        self.state.insert_pending(signed.payload.block.clone());
+
+        let mut actions = Vec::new();
+        if safe_to_vote(&signed.payload, &self.state) {
+            let view = signed.payload.block.header.view;
+            let block_hash = signed.payload.block.hash();
+
+            // Persist the vote-view before anything fires on the wire:
+            // the survivor guarantee HotStuff safety rests on is that
+            // a restarted replica never votes twice at the same view.
+            self.state.last_voted_view = view;
+            actions.push(Action::Persist(StateUpdate::VotedInView { view }));
+
+            // Send the vote to the next-view leader, who will assemble
+            // the QC and use it as the justify of the next proposal.
+            let next_leader = round_robin_leader(&self.state.validator_set, view + 1);
+            actions.push(Action::SendTo(
+                next_leader,
+                ConsensusMsg::Vote(Vote { view, block_hash }),
+            ));
+        }
+
+        actions
     }
 
     /// Feed a trace of events through `step` in order, returning one
@@ -230,6 +257,19 @@ impl HotStuffCore {
     pub fn replay(mut self, events: impl IntoIterator<Item = Event>) -> Vec<Vec<Action>> {
         events.into_iter().map(|e| self.step(e)).collect()
     }
+}
+
+/// Round-robin leader for `view` over `vs`. Mirrors
+/// [`crate::consensus::pacemaker::leader::RoundRobinSelector`]. The
+/// safety core doesn't own an `Arc<dyn LeaderSelector>` in milestone
+/// 7.C because its constructor doesn't take one; this keeps the two
+/// modules from having to agree on a selector instance. Swappable
+/// selectors are the integration layer's job (#24).
+fn round_robin_leader(vs: &ValidatorSet, view: View) -> NodeId {
+    let len = vs.len();
+    debug_assert!(len > 0, "validator set must be non-empty");
+    *vs.get((view as usize) % len)
+        .expect("validator set is non-empty")
 }
 
 #[cfg(test)]
