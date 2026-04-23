@@ -37,3 +37,66 @@ pub enum InsertResult {
     AlreadySeen,
     Expired,
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, TimeZone};
+
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0).unwrap()
+    }
+
+    #[test]
+    fn content_hash_is_deterministic() {
+        let m = GossipMessage {
+            content: "hello".into(),
+            expiry: at(1_700_000_000),
+        };
+        assert_eq!(m.content_hash(), m.content_hash());
+    }
+
+    #[test]
+    fn content_hash_differs_when_content_differs() {
+        let a = GossipMessage {
+            content: "alpha".into(),
+            expiry: at(1_700_000_000),
+        };
+        let b = GossipMessage {
+            content: "beta".into(),
+            expiry: at(1_700_000_000),
+        };
+        assert_ne!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn content_hash_differs_when_expiry_differs() {
+        // Two messages with identical content but different expiries must hash
+        // differently; otherwise the store would dedup a re-broadcast with an
+        // extended lifetime.
+        let a = GossipMessage {
+            content: "same".into(),
+            expiry: at(1_700_000_000),
+        };
+        let b = GossipMessage {
+            content: "same".into(),
+            expiry: at(1_700_000_001),
+        };
+        assert_ne!(a.content_hash(), b.content_hash());
+    }
+
+    #[test]
+    fn is_expired_respects_current_time() {
+        let past = GossipMessage {
+            content: "p".into(),
+            expiry: Utc::now() - Duration::seconds(1),
+        };
+        let future = GossipMessage {
+            content: "f".into(),
+            expiry: Utc::now() + Duration::seconds(60),
+        };
+        assert!(past.is_expired());
+        assert!(!future.is_expired());
+    }
+}

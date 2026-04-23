@@ -283,3 +283,98 @@ impl ClientCertVerifier for AnyCertVerifier {
             .supported_schemes()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use zeroize::Zeroizing;
+
+    use super::*;
+    use crate::p2p::identity::NodeIdentity;
+
+    fn fresh_identity() -> NodeIdentity {
+        let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        NodeIdentity {
+            pkcs8_der: Zeroizing::new(kp.serialize_der()),
+        }
+    }
+
+    #[test]
+    fn base58_round_trip() {
+        let id: NodeId = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31,
+        ];
+        let encoded = node_id_to_base58(&id);
+        let decoded = base58_to_node_id(&encoded).unwrap();
+        assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn base58_rejects_invalid_alphabet() {
+        // '0', 'O', 'I', 'l' are not in the base58 alphabet.
+        let err = base58_to_node_id("0OIl").unwrap_err();
+        assert!(format!("{err}").contains("invalid base58"));
+    }
+
+    #[test]
+    fn base58_rejects_wrong_length() {
+        // Valid base58 but decodes to 4 bytes, not 32.
+        let short = node_id_to_base58(&[1u8; 32]);
+        // Truncate the base58 string and confirm the result fails length check.
+        let too_short = &short[..4];
+        let err = base58_to_node_id(too_short).unwrap_err();
+        assert!(format!("{err}").contains("32 bytes"));
+    }
+
+    #[test]
+    fn tls_identity_from_identity_succeeds_on_generated_key() {
+        let id = fresh_identity();
+        let tls = TlsIdentity::from_identity(&id).unwrap();
+        assert_eq!(tls.node_id.len(), 32);
+    }
+
+    #[test]
+    fn tls_identity_node_id_matches_key_public_half() {
+        let id = fresh_identity();
+        let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(id.pkcs8_der.as_slice());
+        let kp = KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519).unwrap();
+        let expected: NodeId = kp.public_key_raw().try_into().unwrap();
+
+        let tls = TlsIdentity::from_identity(&id).unwrap();
+        assert_eq!(tls.node_id, expected);
+    }
+
+    #[test]
+    fn tls_identity_rejects_non_pkcs8_bytes() {
+        let id = NodeIdentity {
+            pkcs8_der: Zeroizing::new(b"not a real key".to_vec()),
+        };
+        // TlsIdentity is not Debug, so avoid unwrap_err; match directly.
+        let err = match TlsIdentity::from_identity(&id) {
+            Ok(_) => panic!("expected failure on garbage DER"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("parsing node key DER"));
+    }
+
+    #[test]
+    fn extract_node_id_recovers_public_key_from_self_signed_cert() {
+        let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let expected: NodeId = kp.public_key_raw().try_into().unwrap();
+
+        let params = CertificateParams::new(vec!["ambros-p2p".to_string()]).unwrap();
+        let cert = params.self_signed(&kp).unwrap();
+        let cert_der = CertificateDer::from(cert.der().to_vec());
+
+        let extracted = extract_node_id(&cert_der).unwrap();
+        assert_eq!(extracted, expected);
+    }
+
+    #[test]
+    fn extract_node_id_fails_when_no_ed25519_key_present() {
+        // A buffer with no Ed25519 SPKI prefix anywhere must produce an error,
+        // not a panic.
+        let bogus = CertificateDer::from(vec![0u8; 64]);
+        assert!(extract_node_id(&bogus).is_err());
+    }
+}
