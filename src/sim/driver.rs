@@ -163,6 +163,14 @@ pub struct SimNode {
     gossip: Option<GossipHandles>,
     /// Held to keep the manager alive; dropped on [`SimDriver`] drop.
     _cmd_tx: mpsc::Sender<PeerCommand>,
+    /// Internal-message sender for this node's manager. Populated by
+    /// factories that want to participate in
+    /// [`SimDriver::restart_node_preserving_state`] — the driver injects a
+    /// fresh `NewConnection` through this channel on every surviving peer
+    /// when a node comes back up, simulating the TCP reconnect a production
+    /// replica would observe. Left `None` by factories that don't need
+    /// reconnect semantics.
+    reconnect_tx: Option<mpsc::Sender<ManagerMsg>>,
     /// Background tasks; held so they're cancelled on drop.
     _tasks: Vec<JoinHandle<()>>,
 }
@@ -216,12 +224,22 @@ impl SimNode {
 
 pub struct SimDriver {
     pub clock: Arc<SimClock>,
-    nodes: Vec<SimNode>,
+    /// Always `Some` from outside the driver's POV. The `Option` is a
+    /// short-lived implementation detail of
+    /// [`SimDriver::restart_node_preserving_state`], which takes the old
+    /// node out to release its storage/WAL file locks before reopening
+    /// fresh handles against the same backing.
+    nodes: Vec<Option<SimNode>>,
     pub network: Arc<SimNetwork>,
     /// Held for the driver's lifetime so backings that own external
     /// resources (e.g. [`TempDirDiskBacking`]'s `TempDir`) aren't
     /// dropped before the per-node `Storage`/`Wal` they produced.
-    _backing: Box<dyn SimBacking>,
+    /// Also re-consulted on [`SimDriver::restart_node_preserving_state`]
+    /// to reopen the same per-node backing against its still-live files.
+    backing: Box<dyn SimBacking>,
+    /// Retained so a restarted node is rebuilt with the same protocol
+    /// stack as its original incarnation.
+    factory: Box<dyn SimNodeFactory>,
 }
 
 impl SimDriver {
@@ -336,7 +354,8 @@ impl SimDriver {
         }
 
         let backing: Box<dyn SimBacking> = Box::new(backing);
-        let mut nodes = Vec::with_capacity(n);
+        let factory: Box<dyn SimNodeFactory> = Box::new(factory);
+        let mut nodes: Vec<Option<SimNode>> = Vec::with_capacity(n);
         for (idx, peer_streams) in per_node_streams.into_iter().enumerate() {
             let node_id = node_ids[idx];
             let (storage, wal) = backing.build_for_node(idx, node_id)?;
@@ -348,27 +367,36 @@ impl SimDriver {
                 storage,
                 wal,
             };
-            nodes.push(factory.build(ctx).await);
+            nodes.push(Some(factory.build(ctx).await));
         }
 
         Ok(Self {
             clock,
             nodes,
             network,
-            _backing: backing,
+            backing,
+            factory,
         })
     }
 
     pub fn node(&self, idx: usize) -> &SimNode {
-        &self.nodes[idx]
+        self.nodes[idx]
+            .as_ref()
+            .expect("node slot unexpectedly empty outside restart_node_preserving_state")
     }
 
-    pub fn nodes(&self) -> &[SimNode] {
-        &self.nodes
+    pub fn nodes(&self) -> Vec<&SimNode> {
+        self.nodes
+            .iter()
+            .map(|n| {
+                n.as_ref()
+                    .expect("node slot unexpectedly empty outside restart_node_preserving_state")
+            })
+            .collect()
     }
 
     pub fn node_id(&self, idx: usize) -> NodeId {
-        self.nodes[idx].node_id
+        self.node(idx).node_id
     }
 
     /// Configure both directions of the link between two nodes to the given
@@ -439,15 +467,116 @@ impl SimDriver {
     /// Permanently take `idx` offline. Aborts its background tasks, closes
     /// every inbox it owns or writes to so peers see EOF on connection
     /// reads, and refuses any further writes from or to this node.
-    ///
-    /// Restarting a killed node (persistent-state recovery) is follow-up
-    /// work that needs milestone-4 state to be meaningful.
     pub fn kill_node(&self, idx: usize) {
         let id = self.node_id(idx);
         self.network.kill(id);
-        for handle in &self.nodes[idx]._tasks {
+        for handle in &self.node(idx)._tasks {
             handle.abort();
         }
+    }
+
+    /// Crash `idx` and bring it back up against the same on-disk state.
+    /// Equivalent to `kill_node(idx)` followed by rebuilding the node from
+    /// the original [`SimNodeFactory`] with fresh `Arc<dyn Storage>` and
+    /// `Arc<dyn Wal>` handles produced by the driver's [`SimBacking`].
+    ///
+    /// With [`TempDirDiskBacking`] the backing holds the `TempDir` past
+    /// the kill, so the redb files at `node-<idx>/state.redb` and
+    /// `node-<idx>/wal.redb` are still present; the reborn
+    /// [`DiskStorage`]/[`DiskWal`] see every durably-flushed byte the
+    /// prior instance wrote. This is the minimum primitive HotStuff
+    /// safety tests need: crash a replica mid-operation, restart it
+    /// against its persisted state, and re-assert invariants such as
+    /// "never double-vote in the same view".
+    ///
+    /// The mesh is re-plumbed: fresh `SimStream` pairs replace every
+    /// link between `idx` and its surviving peers, and each peer's
+    /// manager receives a `NewConnection` so subsequent gossip/consensus
+    /// traffic flows both ways again. Peers that are themselves killed
+    /// are skipped — a reborn node does not resurrect dead neighbours.
+    ///
+    /// Determinism: the restart itself consumes no network RNG, so two
+    /// runs with the same seed and the same restart script produce
+    /// byte-identical traces.
+    ///
+    /// Returns an error only if the backing fails to reopen the node's
+    /// storage; the rest of the flow is infallible.
+    pub async fn restart_node_preserving_state(&mut self, idx: usize) -> anyhow::Result<()> {
+        let id = self.node_id(idx);
+
+        if !self.network.is_killed(id) {
+            self.kill_node(idx);
+        }
+
+        // Let each peer's connection::run task observe EOF on its now-closed
+        // inbox and emit its final `PeerGone` before we inject a fresh
+        // `NewConnection`. Without this, the manager could process the new
+        // connection first, then the stale `PeerGone` would evict it.
+        for _ in 0..RESTART_DRAIN_YIELDS {
+            tokio::task::yield_now().await;
+        }
+
+        self.network.revive(id);
+
+        let n = self.nodes.len();
+        let mut peer_streams: Vec<(NodeId, SocketAddr, AnyStream)> = Vec::new();
+        for j in 0..n {
+            if j == idx {
+                continue;
+            }
+            let peer = self.node(j);
+            let peer_id = peer.node_id;
+            if self.network.is_killed(peer_id) {
+                continue;
+            }
+
+            let inbox_to_restart = Inbox::new();
+            let inbox_to_peer = Inbox::new();
+            self.network
+                .register_inbox(peer_id, id, Arc::clone(&inbox_to_restart));
+            self.network
+                .register_inbox(id, peer_id, Arc::clone(&inbox_to_peer));
+
+            let restart_side =
+                SimStream::new(Arc::clone(&self.network), id, peer_id, inbox_to_restart);
+            let peer_side =
+                SimStream::new(Arc::clone(&self.network), peer_id, id, inbox_to_peer);
+
+            peer_streams.push((peer_id, sim_addr(j), Box::new(restart_side) as AnyStream));
+
+            if let Some(reconnect_tx) = peer.reconnect_tx.as_ref() {
+                let _ = reconnect_tx
+                    .send(ManagerMsg::NewConnection {
+                        node_id: id,
+                        addr: sim_addr(idx),
+                        stream: Box::new(peer_side) as AnyStream,
+                    })
+                    .await;
+            }
+        }
+
+        // Drop the old node *before* reopening its redb files — the backing
+        // holds a file lock that must be released first, which only happens
+        // when the last `Arc<dyn Storage>` / `Arc<dyn Wal>` clone inside the
+        // old `SimNode` goes out of scope. Yielding again lets any tasks
+        // that the old SimNode spawned (and we aborted in `kill_node`)
+        // finish unwinding and drop their own Arc clones.
+        drop(self.nodes[idx].take());
+        for _ in 0..RESTART_DRAIN_YIELDS {
+            tokio::task::yield_now().await;
+        }
+
+        let (storage, wal) = self.backing.build_for_node(idx, id)?;
+        let ctx = SimNodeCtx {
+            node_idx: idx,
+            node_id: id,
+            clock: self.clock.for_node(id),
+            peer_streams,
+            storage,
+            wal,
+        };
+        self.nodes[idx] = Some(self.factory.build(ctx).await);
+        Ok(())
     }
 
     /// Non-destructive snapshot of events currently in the main heap.
@@ -504,11 +633,14 @@ impl SimDriver {
     /// driver's current virtual wall time.
     pub fn per_node_contents(&self) -> Vec<Vec<String>> {
         let now = self.clock.now_wall();
-        self.nodes
-            .iter()
-            .map(|n| {
-                let mut contents: Vec<String> =
-                    n.messages(now).into_iter().map(|m| m.content).collect();
+        (0..self.nodes.len())
+            .map(|i| {
+                let mut contents: Vec<String> = self
+                    .node(i)
+                    .messages(now)
+                    .into_iter()
+                    .map(|m| m.content)
+                    .collect();
                 contents.sort();
                 contents
             })
@@ -624,6 +756,15 @@ const SKEW_RNG_SUBKEY: u64 = 0xC10C_5CEC_D15B_ACED;
 /// node gets a zero offset.
 const NO_SKEW: fn(usize, &mut ChaCha20Rng) -> Duration = |_, _| Duration::ZERO;
 
+/// How many `yield_now` rounds [`SimDriver::restart_node_preserving_state`]
+/// awaits after killing a node so the peers' `connection::run` tasks can
+/// observe EOF and emit their final `PeerGone`s before the new
+/// `NewConnection`s we inject land in each peer's manager. Empirically 16
+/// is well above the longest chain observed for a 32-node mesh; tokio's
+/// paused-timer model means the cost is per-round bookkeeping, not real
+/// wall time.
+const RESTART_DRAIN_YIELDS: usize = 16;
+
 fn sim_addr(idx: usize) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 65000 + idx as u16))
 }
@@ -684,6 +825,7 @@ async fn build_gossip_node(ctx: SimNodeCtx) -> SimNode {
         tokio::spawn(gossip::engine::run(gossip_handle, store, clock))
     };
 
+    let reconnect_tx = internal_tx.clone();
     let protocol = SimConnectionProtocol {
         peers: peer_streams,
     };
@@ -698,6 +840,7 @@ async fn build_gossip_node(ctx: SimNodeCtx) -> SimNode {
             send_tx: gossip_send_tx,
         }),
         _cmd_tx: cmd_tx,
+        reconnect_tx: Some(reconnect_tx),
         _tasks: vec![manager_handle, engine_handle, protocol_handle],
     }
 }
