@@ -1,3 +1,20 @@
+//! HTTP admin surface for the gossip overlay.
+//!
+//! Mounted into the node's main [`axum::Router`] alongside the peer admin
+//! endpoints. Endpoints:
+//!
+//! - `POST /messages` — submit a new gossip message. Stored locally and
+//!   broadcast to every connected peer. See [`types::PostMessageRequest`].
+//! - `GET /messages` — list currently live messages (not yet expired).
+//!
+//! The wire format used between peers is [`wire::WireMessage`](crate::gossip::wire::WireMessage);
+//! these HTTP types are independent of that and exist only for the admin
+//! surface.
+
+#![warn(missing_docs)]
+
+/// HTTP request/response types. See [`types::PostMessageRequest`] for the
+/// primary input shape.
 pub mod types;
 
 use std::sync::Arc;
@@ -26,6 +43,40 @@ struct AppState {
     clock: Arc<dyn Clock>,
 }
 
+/// Build the gossip HTTP router.
+///
+/// # Parameters
+///
+/// - `store`: the shared in-memory gossip store. Writes go here; reads
+///   flow out of here through `/messages`.
+/// - `gossip_tx`: outbound side of the gossip [`ProtocolHandle`](crate::p2p::ProtocolHandle).
+///   `POST /messages` pushes a [`ProtocolOutbound::Broadcast`] here so the
+///   peer manager fans out the message to every connected peer.
+/// - `clock`: wall-clock source used for expiry comparisons.
+///
+/// # Invariants
+///
+/// - `store` and `gossip_tx` must correspond to the same registered
+///   protocol ID: [`gossip::PROTOCOL_ID`](crate::gossip::PROTOCOL_ID).
+///   Mixing up protocol handles would silently route messages to the
+///   wrong application.
+/// - Works equally whether or not any peer is currently connected; with
+///   zero peers `POST /messages` still succeeds locally and the warn log
+///   notes that the broadcast channel was closed.
+///
+/// # Example
+///
+/// See `main.rs`:
+///
+/// ```ignore
+/// let app = axum::Router::new()
+///     .merge(p2p::api::router(p2p_cmd_tx.clone()))
+///     .merge(gossip::api::router(
+///         Arc::clone(&store),
+///         gossip_send_tx,
+///         Arc::clone(&clock),
+///     ));
+/// ```
 pub fn router(
     store: Arc<GossipStore>,
     gossip_tx: mpsc::Sender<ProtocolOutbound>,
