@@ -1007,4 +1007,36 @@ mod tests {
         assert!(pending.contains_key(&block_v4.hash()));
         assert!(pending.contains_key(&block_v5.hash()));
     }
+
+    #[test]
+    fn three_chain_does_not_fire_on_view_gap() {
+        // Chain with a view gap: views 1, 2, 5 past genesis. When the
+        // dispatcher walks `b3 → b2 → b1` starting from a QC(v=5),
+        // the check `b2.view + 1 == b3.view` fails (v=2 + 1 ≠ 5).
+        // `three_chain_commit` returns None, dispatch emits no
+        // `Commit`, and `pending_blocks` is not pruned — genesis in
+        // particular stays. Appendix B.1 ("Why direct parent") makes
+        // this the one arm of `update` that must remain strict.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let chain = chain_from_genesis(&genesis, &[1, 2, 5], nid(2));
+        for block in &chain {
+            core.state.insert_pending(block.clone());
+        }
+
+        // Proposal at view 6, parent=v5, justify=QC(v5).
+        let full = chain_from_genesis(&genesis, &[1, 2, 5, 6], nid(2));
+        let block_v6 = full[3].clone();
+        let justify = dummy_qc(5, chain[2].hash());
+        let signed = signed_proposal(block_v6, justify, nid(2));
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Commit(_))),
+            "view gap must suppress commit: {actions:?}",
+        );
+        // Genesis is still in pending_blocks because no prune ran.
+        assert!(core.state().pending_blocks.contains_key(&genesis.hash()));
+    }
 }
