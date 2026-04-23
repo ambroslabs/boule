@@ -33,6 +33,11 @@ use crate::p2p::NodeId;
 #[derive(Clone)]
 pub struct SimClock {
     wall: Arc<Mutex<DateTime<Utc>>>,
+    /// Monotonic virtual time since sim start. Advances in lockstep with
+    /// [`SimClock::advance_wall`] but never moves backward even if/when
+    /// the harness starts simulating backward wall-clock jumps, matching
+    /// the [`Clock::now_monotonic`] contract.
+    monotonic: Arc<Mutex<Duration>>,
     /// Per-node offsets from shared time, fixed at construction. Nodes
     /// without an entry (or present with `Duration::ZERO`) see the shared
     /// clock unskewed.
@@ -45,6 +50,7 @@ impl SimClock {
     pub fn new(start: DateTime<Utc>) -> Self {
         Self {
             wall: Arc::new(Mutex::new(start)),
+            monotonic: Arc::new(Mutex::new(Duration::ZERO)),
             offsets: Arc::new(HashMap::new()),
         }
     }
@@ -54,6 +60,7 @@ impl SimClock {
     pub fn with_offsets(start: DateTime<Utc>, offsets: HashMap<NodeId, Duration>) -> Self {
         Self {
             wall: Arc::new(Mutex::new(start)),
+            monotonic: Arc::new(Mutex::new(Duration::ZERO)),
             offsets: Arc::new(offsets),
         }
     }
@@ -87,12 +94,18 @@ impl SimClock {
     pub(crate) fn advance_wall(&self, dur: Duration) {
         let mut w = self.wall.lock().unwrap();
         *w += chrono::Duration::from_std(dur).expect("duration fits");
+        let mut m = self.monotonic.lock().unwrap();
+        *m = m.saturating_add(dur);
     }
 }
 
 impl Clock for SimClock {
     fn now_wall(&self) -> DateTime<Utc> {
         *self.wall.lock().unwrap()
+    }
+
+    fn now_monotonic(&self) -> Duration {
+        *self.monotonic.lock().unwrap()
     }
 
     fn sleep(&self, dur: Duration) -> BoxFuture<'static, ()> {
@@ -116,6 +129,13 @@ impl Clock for SimClockView {
         let shared_now = *self.shared.wall.lock().unwrap();
         shared_now
             + chrono::Duration::from_std(self.offset).expect("per-node offset fits in chrono")
+    }
+
+    fn now_monotonic(&self) -> Duration {
+        // Per-node offsets model wall-clock skew (NTP disagreement); the
+        // monotonic clock is about elapsed time since sim start and is
+        // shared across all nodes.
+        self.shared.now_monotonic()
     }
 
     fn sleep(&self, dur: Duration) -> BoxFuture<'static, ()> {
