@@ -22,6 +22,11 @@ pub const METHOD_PING: u16 = 0x0001;
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Per-protocol frame-size cap for the ping RPC channel. Generous enough
+/// for any reasonable echo payload while still bounded well below the
+/// global transport ceiling.
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Handler registered server-side: echo the request body.
 ///
 /// `_cancel` is unused here because echoing is synchronous-ish — there's

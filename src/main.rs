@@ -285,6 +285,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     p2p_cmd_tx
         .send(p2p::PeerCommand::RegisterProtocol {
             id: gossip::PROTOCOL_ID,
+            max_frame_bytes: Some(gossip::MAX_FRAME_BYTES),
             reply: reg_tx,
         })
         .await?;
@@ -303,6 +304,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     p2p_cmd_tx
         .send(p2p::PeerCommand::RegisterProtocol {
             id: ping::PROTOCOL_ID,
+            max_frame_bytes: Some(ping::MAX_FRAME_BYTES),
             reply: ping_reg_tx,
         })
         .await?;

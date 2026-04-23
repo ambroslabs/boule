@@ -54,3 +54,79 @@ pub async fn run(handle: ProtocolHandle, store: Arc<GossipStore>, clock: Arc<dyn
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use bytes::{BufMut, BytesMut};
+    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::sync::{broadcast, mpsc, oneshot};
+
+    use crate::gossip::{self, PROTOCOL_ID};
+    use crate::p2p::manager::{self, ManagerMsg};
+    use crate::p2p::{NodeId, PeerCommand};
+
+    fn nid(byte: u8) -> NodeId {
+        [byte; 32]
+    }
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    /// Oversize gossip frame: the p2p multiplexer must close the
+    /// connection before the bytes are ever decoded. Guards the claim in
+    /// #68 that Byzantine peers can't label a 1 MB payload as gossip when
+    /// gossip has registered a tighter cap.
+    #[tokio::test]
+    async fn oversize_gossip_frame_closes_connection() {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(16);
+        let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(64);
+        let (peer_gone_tx, mut peer_gone_rx) = broadcast::channel::<NodeId>(16);
+        let itx = internal_tx.clone();
+        tokio::spawn(async move {
+            manager::run(nid(1), cmd_rx, internal_rx, itx, peer_gone_tx).await;
+        });
+
+        // Register gossip with its declared cap so the connection task
+        // rejects anything larger at framing time.
+        let (reg_tx, reg_rx) = oneshot::channel();
+        cmd_tx
+            .send(PeerCommand::RegisterProtocol {
+                id: PROTOCOL_ID,
+                max_frame_bytes: Some(gossip::MAX_FRAME_BYTES),
+                reply: reg_tx,
+            })
+            .await
+            .unwrap();
+        let _gossip_handle = reg_rx.await.unwrap();
+
+        // Attach a peer.
+        let (local, mut remote) = duplex(256 * 1024);
+        internal_tx
+            .send(ManagerMsg::NewConnection {
+                node_id: nid(5),
+                addr: addr(),
+                stream: Box::new(local),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Write a gossip-tagged frame whose body exceeds MAX_FRAME_BYTES.
+        let body_len = gossip::MAX_FRAME_BYTES + 32;
+        let mut buf = BytesMut::with_capacity(4 + body_len);
+        buf.put_u32(body_len as u32);
+        buf.put_u8(PROTOCOL_ID);
+        buf.extend_from_slice(&vec![0u8; body_len - 1]);
+        remote.write_all(&buf).await.unwrap();
+
+        let gone = tokio::time::timeout(Duration::from_millis(500), peer_gone_rx.recv())
+            .await
+            .expect("peer-gone broadcast times out")
+            .expect("peer-gone channel closed");
+        assert_eq!(gone, nid(5));
+    }
+}

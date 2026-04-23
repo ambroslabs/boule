@@ -6,6 +6,13 @@ pub mod wire;
 
 pub const PROTOCOL_ID: u8 = 0x01;
 
+/// Per-protocol frame-size cap passed to `PeerCommand::RegisterProtocol`.
+/// Sized for the serialized [`wire::WireMessage::Gossip`] payload plus a
+/// small slack for the protocol-tag byte and JSON framing overhead. Peers
+/// sending a frame above this have their connection closed by the p2p
+/// multiplexer before the gossip engine sees it.
+pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 

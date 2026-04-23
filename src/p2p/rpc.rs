@@ -25,6 +25,7 @@
 //! p2p_cmd_tx
 //!     .send(p2p::PeerCommand::RegisterProtocol {
 //!         id: ping::PROTOCOL_ID,
+//!         max_frame_bytes: Some(ping::MAX_FRAME_BYTES),
 //!         reply: reg_tx,
 //!     })
 //!     .await?;
