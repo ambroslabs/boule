@@ -11,9 +11,10 @@
 //!   anything the replica replays on startup. [`Wal::flush`] is the only
 //!   durability barrier; [`Wal::append`] may buffer.
 //!
-//! Milestone 4a (this module) provides only the in-memory backends in
-//! [`memory`]. Milestone 4b will add an on-disk `redb`-backed implementation
-//! and a subprocess-based crash-safety harness.
+//! Two backends ship here: [`memory`] for unit tests and the deterministic
+//! simulator, and [`disk`] backed by `redb` for production. See the [`disk`]
+//! module docs for the backend choice rationale and the crash-safety
+//! guarantees it upholds.
 //!
 //! Both traits are consumed as `Arc<dyn Storage>` / `Arc<dyn Wal>`, matching
 //! the `Clock` abstraction in [`crate::clock`] — backends are swapped at the
@@ -24,13 +25,16 @@
 // pattern established in `crypto/mod.rs`.
 #![allow(dead_code)]
 
+pub mod disk;
 pub mod memory;
 
 use bytes::Bytes;
 
-// Re-export the in-memory backends from the crate-root path. The `#[allow]`
-// is needed because nothing in the binary consumes these yet; future
-// consensus milestones will.
+// Re-export the backends from the crate-root path. The `#[allow]` is needed
+// because nothing in the binary consumes these yet; future consensus
+// milestones will.
+#[allow(unused_imports)]
+pub use disk::{DiskStorage, DiskWal};
 #[allow(unused_imports)]
 pub use memory::{MemoryStorage, MemoryWal};
 
@@ -46,6 +50,10 @@ pub struct Lsn(u64);
 
 impl Lsn {
     pub const ZERO: Lsn = Lsn(0);
+
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 
     pub fn raw(self) -> u64 {
         self.0
@@ -136,9 +144,13 @@ impl WriteBatch {
 /// flushed may or may not survive.
 pub trait Wal: Send + Sync {
     /// Append `entry`. Returns the assigned [`Lsn`], which is strictly
-    /// greater than every previously returned LSN (and strictly greater
-    /// than [`Lsn::ZERO`]). May buffer; call [`Wal::flush`] to force
-    /// durability.
+    /// greater than every previously returned LSN within this process
+    /// (and strictly greater than [`Lsn::ZERO`]). May buffer; call
+    /// [`Wal::flush`] to force durability.
+    ///
+    /// Across a crash, LSNs assigned to unflushed entries may be reused —
+    /// the only LSNs that are durably reserved are those whose `append`
+    /// returned before a successful `flush`.
     fn append(&self, entry: &[u8]) -> anyhow::Result<Lsn>;
 
     /// fsync the log. See the trait-level durability contract.
