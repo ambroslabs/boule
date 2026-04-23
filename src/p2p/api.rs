@@ -3,11 +3,29 @@
 //! Exposes read-only endpoints that are mounted into the node's main
 //! [`axum::Router`] in `main.rs`:
 //!
-//! ```ignore
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use ambros_p2p::clock::{Clock, TokioClock};
+//! use ambros_p2p::gossip::{self, store::GossipStore};
+//! use ambros_p2p::p2p::{self, PeerCommand, ProtocolOutbound};
+//! use ambros_p2p::p2p::rpc::Rpc;
+//! use ambros_p2p::ping;
+//! use tokio::sync::mpsc;
+//!
+//! # fn wiring(
+//! #     p2p_cmd_tx: mpsc::Sender<PeerCommand>,
+//! #     gossip_send_tx: mpsc::Sender<ProtocolOutbound>,
+//! #     ping_rpc: Rpc,
+//! # ) {
+//! let store = Arc::new(GossipStore::new());
+//! let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 //! let app = axum::Router::new()
-//!     .merge(p2p::api::router(p2p_cmd_tx.clone()))
+//!     .merge(p2p::api::router(p2p_cmd_tx))
 //!     .merge(gossip::api::router(store, gossip_send_tx, clock))
 //!     .merge(ping::router(ping_rpc));
+//! # let _ = app;
+//! # }
 //! ```
 //!
 //! Endpoints:
@@ -32,10 +50,13 @@ use super::{NodeId, PeerCommand};
 /// [`PeerCommand`]s through this sender to answer requests; the typical
 /// wiring lives in `main.rs`:
 ///
-/// ```ignore
-/// let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
-/// // … spawn manager with p2p_cmd_rx …
-/// let app = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx.clone()));
+/// ```no_run
+/// use ambros_p2p::p2p::{self, PeerCommand};
+/// use tokio::sync::mpsc;
+///
+/// let (p2p_cmd_tx, _p2p_cmd_rx) = mpsc::channel::<PeerCommand>(256);
+/// // … spawn manager with _p2p_cmd_rx …
+/// let app = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx));
 /// ```
 ///
 /// # Invariants
