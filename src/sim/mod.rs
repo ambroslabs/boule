@@ -49,4 +49,6 @@ pub use network::{EventMutator, LatencyDist, LinkConfig, MutatorInput, MutatorOu
 #[cfg(test)]
 mod sim_adversary;
 #[cfg(test)]
+mod sim_clock;
+#[cfg(test)]
 mod sim_gossip;
