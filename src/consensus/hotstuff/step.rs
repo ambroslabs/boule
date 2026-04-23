@@ -265,6 +265,53 @@ impl HotStuffCore {
             ));
         }
 
+        // B4: Two-Chain lock promotion.
+        //
+        // Walk `b* → b'' (parent, in pending_blocks thanks to B1/B2) →
+        // b' (grandparent, present only if we saw the proposal that
+        // originally proposed b'')`. If `b'` exists and sits at a
+        // strictly greater height than our current lock, promote —
+        // emit `Persist(Locked(..))` and mirror the update on
+        // `state.locked`.
+        //
+        // Runs regardless of `safe_to_vote` firing: the paper's
+        // Algorithm 4 runs `update(bnew)` unconditionally, and the
+        // safety proof (Appendix B, Lemma 6) covers unconditional
+        // lock updates. Refusing to update here would turn a liveness
+        // concern into a safety one — we'd stay stuck on an older
+        // lock even when a fresher one is demonstrably safer.
+        //
+        // Height-based comparison follows the paper; using view would
+        // let a Byzantine proposer wedge us with a short chain
+        // claiming a huge view. See
+        // `docs/consensus/hotstuff-notes.md#the-chain-rules`.
+        let two_chain_candidate: Option<Locked> =
+            self.state
+                .pending_blocks
+                .get(&parent_hash)
+                .and_then(|b_prime_prime| {
+                    let grandparent_hash = b_prime_prime.header.parent_hash;
+                    self.state
+                        .pending_blocks
+                        .get(&grandparent_hash)
+                        .map(|b_prime| Locked {
+                            view: b_prime.header.view,
+                            height: b_prime.header.height,
+                            block_hash: grandparent_hash,
+                        })
+                });
+        if let Some(candidate) = two_chain_candidate {
+            // Treat a missing lock as "height 0" for the monotonicity
+            // check: the paper initializes `block ← b0` (genesis,
+            // height 0), so promoting to a positive-height `b'`
+            // matches, and locking on genesis stays a no-op.
+            let current_height = self.state.locked.map(|l| l.height).unwrap_or(0);
+            if candidate.height > current_height {
+                self.state.locked = Some(candidate);
+                actions.push(Action::Persist(StateUpdate::Locked(candidate)));
+            }
+        }
+
         actions
     }
 
