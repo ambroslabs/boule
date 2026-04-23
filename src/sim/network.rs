@@ -11,9 +11,13 @@
 //! to its scheduled instant, and deliver bytes to the destination inbox
 //! (waking its reader). Determinism comes from the
 //! `(virtual_time, seq)` heap key plus the seeded RNG.
+//!
+//! This module also owns the adversary API plumbing (pause/resume/kill,
+//! deliver-specific-event, duplicate) and the trace recorder used by the
+//! byte-identical-determinism test.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,28 +80,19 @@ impl LatencyDist {
                         return Duration::from_micros(val as u64);
                     }
                 }
-                // Rejection failed (extreme tail); clamp.
                 Duration::from_micros(mean_us.max(0.0) as u64)
             }
         }
     }
 }
 
-/// Per-directional-link configuration. Defaults reproduce an ideal network
-/// (no latency, no drops, link up, no reorder, no bandwidth cap).
+/// Per-directional-link configuration.
 #[derive(Debug, Clone, Default)]
 pub struct LinkConfig {
     pub latency: LatencyDist,
-    /// Probability a write is silently dropped. `0.0` = never, `1.0` = always.
     pub drop_rate: f64,
-    /// `false` = link partitioned; writes are dropped silently.
-    /// Initially `true`.
     pub up: bool,
-    /// If set, every byte costs an additional `1.0 / bandwidth_bps` virtual
-    /// seconds of latency on top of the sampled latency.
     pub bandwidth_bps: Option<u64>,
-    /// If non-zero, writes are batched into groups of this size and shuffled
-    /// before being scheduled. Useful for testing reorder tolerance.
     pub reorder_window: usize,
 }
 
@@ -113,21 +108,48 @@ impl LinkConfig {
     }
 }
 
+/// Stable identifier for a scheduled event. Assigned monotonically at
+/// enqueue time; unique per `SimNetwork`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EventId(pub u64);
+
+/// Snapshot of one in-flight event, for adversary API introspection.
+#[derive(Debug, Clone)]
+pub struct InFlightEvent {
+    pub id: EventId,
+    pub time: DateTime<Utc>,
+    pub from: NodeId,
+    pub to: NodeId,
+    pub byte_len: usize,
+}
+
+/// One delivered-event entry in the trace. The trace is the byte-identical
+/// fingerprint used to verify simulator determinism.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceEntry {
+    pub time: DateTime<Utc>,
+    pub id: EventId,
+    pub from: NodeId,
+    pub to: NodeId,
+    pub byte_len: usize,
+}
+
 struct Event {
+    id: EventId,
     time: DateTime<Utc>,
-    seq: u64,
-    /// Where the bytes go on delivery.
+    from: NodeId,
+    to: NodeId,
     inbox: Arc<Mutex<Inbox>>,
     bytes: Vec<u8>,
 }
 
-// `BinaryHeap` is a max-heap; reverse the Ord so the earliest time wins.
 impl Ord for Event {
     fn cmp(&self, other: &Self) -> Ordering {
+        // `BinaryHeap` is a max-heap; reverse so earliest time pops first.
         other
             .time
             .cmp(&self.time)
-            .then_with(|| other.seq.cmp(&self.seq))
+            .then_with(|| other.id.cmp(&self.id))
     }
 }
 impl PartialOrd for Event {
@@ -138,7 +160,7 @@ impl PartialOrd for Event {
 impl Eq for Event {}
 impl PartialEq for Event {
     fn eq(&self, other: &Self) -> bool {
-        self.time == other.time && self.seq == other.seq
+        self.time == other.time && self.id == other.id
     }
 }
 
@@ -154,14 +176,24 @@ struct Inner {
     links: HashMap<(NodeId, NodeId), LinkConfig>,
     inboxes: HashMap<(NodeId, NodeId), Arc<Mutex<Inbox>>>,
     default_link: LinkConfig,
-    /// Per-link reorder staging: bytes wait here until the buffer fills, then
-    /// get shuffled and scheduled.
     reorder_buffers: HashMap<(NodeId, NodeId), Vec<StagedWrite>>,
+    /// Nodes currently paused: inbound events are delivered to their inbox
+    /// but no waker is fired (the node's reader blocks until resume);
+    /// outbound writes are silently dropped (task is notionally frozen).
+    paused: HashSet<NodeId>,
+    /// Nodes that have been killed. Writes from and deliveries to killed
+    /// nodes are dropped; their peer-facing inboxes are marked closed so
+    /// remote `connection::run` tasks see EOF and clean up.
+    killed: HashSet<NodeId>,
+    /// Ordered log of delivered events, used as the determinism fingerprint.
+    trace: Vec<TraceEntry>,
 }
 
 struct StagedWrite {
-    seq: u64,
+    id: EventId,
     time: DateTime<Utc>,
+    from: NodeId,
+    to: NodeId,
     inbox: Arc<Mutex<Inbox>>,
     bytes: Vec<u8>,
 }
@@ -178,29 +210,28 @@ impl SimNetwork {
                 inboxes: HashMap::new(),
                 default_link: LinkConfig::ideal(),
                 reorder_buffers: HashMap::new(),
+                paused: HashSet::new(),
+                killed: HashSet::new(),
+                trace: Vec::new(),
             }),
         })
     }
 
-    /// Register `inbox` as the destination for bytes flowing `from → to`.
     pub fn register_inbox(&self, from: NodeId, to: NodeId, inbox: Arc<Mutex<Inbox>>) {
         let mut inner = self.inner.lock().unwrap();
         inner.inboxes.insert((from, to), inbox);
     }
 
-    /// Set per-directional-link config. Affects future writes only.
     pub fn set_link(&self, from: NodeId, to: NodeId, config: LinkConfig) {
         let mut inner = self.inner.lock().unwrap();
         inner.links.insert((from, to), config);
     }
 
-    /// Take down both directions of the (a ↔ b) link.
     pub fn partition(&self, a: NodeId, b: NodeId) {
         self.set_link_up(a, b, false);
         self.set_link_up(b, a, false);
     }
 
-    /// Re-enable both directions of the (a ↔ b) link.
     pub fn heal(&self, a: NodeId, b: NodeId) {
         self.set_link_up(a, b, true);
         self.set_link_up(b, a, true);
@@ -213,11 +244,148 @@ impl SimNetwork {
         cfg.up = up;
     }
 
-    /// Called by `SimStream::poll_write`. Always accepts the full slice;
-    /// drops/partitions/reorder are handled internally. Returns the byte
-    /// count for the caller's `poll_write` reply.
+    // ---- Adversary API ----
+
+    /// Freeze `node`: inbound bytes still accumulate in its inboxes but the
+    /// reader is not woken; outbound writes from this node are dropped.
+    pub fn pause(&self, node: NodeId) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.paused.insert(node);
+    }
+
+    /// Un-freeze `node` and wake its inbox readers so any bytes that
+    /// accumulated during the pause can be consumed.
+    pub fn resume(&self, node: NodeId) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.paused.remove(&node);
+        let inboxes: Vec<_> = inner
+            .inboxes
+            .iter()
+            .filter_map(|((_, to), ibx)| if *to == node { Some(ibx.clone()) } else { None })
+            .collect();
+        drop(inner);
+        for ibx in inboxes {
+            let mut guard = ibx.lock().unwrap();
+            if let Some(w) = guard.waker.take() {
+                w.wake();
+            }
+        }
+    }
+
+    /// Mark `node` as permanently offline for the rest of the sim run.
+    /// Closes every inbox this node writes to (so peers see EOF) and every
+    /// inbox this node reads from (so the node's own tasks unwind). The
+    /// caller is responsible for aborting the node's task handles.
+    pub fn kill(&self, node: NodeId) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.killed.insert(node);
+        let relevant: Vec<_> = inner
+            .inboxes
+            .iter()
+            .filter_map(|((from, to), ibx)| {
+                if *from == node || *to == node {
+                    Some(ibx.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        drop(inner);
+        for ibx in relevant {
+            let mut guard = ibx.lock().unwrap();
+            guard.closed = true;
+            if let Some(w) = guard.waker.take() {
+                w.wake();
+            }
+        }
+    }
+
+    /// Non-destructive snapshot of every event currently in the main heap.
+    /// Reorder-staged writes are not included.
+    pub fn in_flight_events(&self) -> Vec<InFlightEvent> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .queue
+            .iter()
+            .map(|e| InFlightEvent {
+                id: e.id,
+                time: e.time,
+                from: e.from,
+                to: e.to,
+                byte_len: e.bytes.len(),
+            })
+            .collect()
+    }
+
+    /// Pop the event with `id` and deliver it now, ignoring its scheduled
+    /// time. Returns `true` if the event was found and delivered.
+    pub fn deliver_event_now(&self, id: EventId) -> bool {
+        let event = {
+            let mut inner = self.inner.lock().unwrap();
+            let taken: Vec<Event> = std::mem::take(&mut inner.queue).into_vec();
+            let mut found = None;
+            for e in taken {
+                if e.id == id && found.is_none() {
+                    found = Some(e);
+                } else {
+                    inner.queue.push(e);
+                }
+            }
+            found
+        };
+        match event {
+            Some(e) => {
+                self.deliver(e, /* record_trace */ true);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Find the event with `id` and enqueue a clone of it at the same
+    /// scheduled time with a fresh id. Returns the new event's id if found.
+    pub fn duplicate_event(&self, id: EventId) -> Option<EventId> {
+        let mut inner = self.inner.lock().unwrap();
+        let source = inner.queue.iter().find(|e| e.id == id);
+        let (time, from, to, inbox, bytes) = match source {
+            Some(e) => (e.time, e.from, e.to, Arc::clone(&e.inbox), e.bytes.clone()),
+            None => return None,
+        };
+        inner.seq += 1;
+        let new_id = EventId(inner.seq);
+        inner.queue.push(Event {
+            id: new_id,
+            time,
+            from,
+            to,
+            inbox,
+            bytes,
+        });
+        Some(new_id)
+    }
+
+    // ---- Trace ----
+
+    pub fn trace_snapshot(&self) -> Vec<TraceEntry> {
+        self.inner.lock().unwrap().trace.clone()
+    }
+
+    pub fn drain_trace(&self) -> Vec<TraceEntry> {
+        std::mem::take(&mut self.inner.lock().unwrap().trace)
+    }
+
+    // ---- Write / deliver path ----
+
     pub(crate) fn enqueue_write(&self, from: NodeId, to: NodeId, buf: &[u8]) -> usize {
         let mut inner = self.inner.lock().unwrap();
+
+        if inner.killed.contains(&from) || inner.killed.contains(&to) {
+            return buf.len();
+        }
+        if inner.paused.contains(&from) {
+            return buf.len();
+        }
+
         let cfg = inner
             .links
             .get(&(from, to))
@@ -225,9 +393,6 @@ impl SimNetwork {
             .unwrap_or_else(|| inner.default_link.clone());
 
         if !cfg.up {
-            // Partition: bytes vanish silently. Real TCP would queue them
-            // locally and TLS would eventually error; that nuance is left to
-            // the adversary API (sub-task #31).
             return buf.len();
         }
         if cfg.drop_rate > 0.0 && inner.rng.random::<f64>() < cfg.drop_rate {
@@ -236,7 +401,7 @@ impl SimNetwork {
 
         let inbox = match inner.inboxes.get(&(from, to)).cloned() {
             Some(i) => i,
-            None => return buf.len(), // not wired up; should not happen with the driver
+            None => return buf.len(),
         };
 
         let latency = cfg.latency.sample(&mut inner.rng);
@@ -249,16 +414,17 @@ impl SimNetwork {
         };
 
         let total = latency + bandwidth_extra;
-        let chrono_total = chrono::Duration::from_std(total).unwrap_or_else(|_| {
-            // Saturate at i64::MAX nanos if pathological.
-            chrono::Duration::nanoseconds(i64::MAX)
-        });
+        let chrono_total = chrono::Duration::from_std(total)
+            .unwrap_or_else(|_| chrono::Duration::nanoseconds(i64::MAX));
         let time = inner.now + chrono_total;
 
         inner.seq += 1;
+        let id = EventId(inner.seq);
         let staged = StagedWrite {
-            seq: inner.seq,
+            id,
             time,
+            from,
+            to,
             inbox,
             bytes: buf.to_vec(),
         };
@@ -266,22 +432,17 @@ impl SimNetwork {
         if cfg.reorder_window <= 1 {
             push_event(&mut inner.queue, staged);
         } else {
-            let buf = inner.reorder_buffers.entry((from, to)).or_default();
-            buf.push(staged);
-            if buf.len() >= cfg.reorder_window {
-                let mut taken = std::mem::take(buf);
+            let buffer = inner.reorder_buffers.entry((from, to)).or_default();
+            buffer.push(staged);
+            if buffer.len() >= cfg.reorder_window {
+                let mut taken = std::mem::take(buffer);
                 taken.shuffle(&mut inner.rng);
-                // Reassign times monotonically over the original window so
-                // shuffled events still respect the per-link latency budget.
-                let (min_time, max_seq) = taken
+                let min_time = taken
                     .iter()
-                    .fold((DateTime::<Utc>::MAX_UTC, 0u64), |(t, s), w| {
-                        (t.min(w.time), s.max(w.seq))
-                    });
-                let _ = max_seq; // staged seqs already unique
+                    .map(|w| w.time)
+                    .min()
+                    .unwrap_or_else(|| inner.now);
                 for (i, mut w) in taken.into_iter().enumerate() {
-                    // Spread shuffled events from min_time forward at 1µs
-                    // intervals to keep the heap order well-defined.
                     w.time = min_time + chrono::Duration::microseconds(i as i64);
                     push_event(&mut inner.queue, w);
                 }
@@ -291,31 +452,45 @@ impl SimNetwork {
         buf.len()
     }
 
-    /// Pop the earliest scheduled event, advance virtual time to its
-    /// scheduled instant, deliver bytes, wake the reader.
-    /// Returns `Some(time_advanced_to)` if an event was delivered, `None` if
-    /// the queue is empty (and no reorder buffer needs flushing).
+    /// Pop the earliest scheduled event and deliver it.
     pub(crate) fn try_deliver_one(&self) -> Option<DateTime<Utc>> {
-        let mut inner = self.inner.lock().unwrap();
-        let event = inner.queue.pop()?;
-        let new_now = event.time.max(inner.now);
-        inner.now = new_now;
-        // Drop the network lock before grabbing the inbox lock so a reader
-        // task can't ever observe network-then-inbox order vs. inbox-then-
-        // network on the writer side.
-        drop(inner);
+        let event = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.queue.pop()?
+        };
+        Some(self.deliver(event, /* record_trace */ true))
+    }
+
+    fn deliver(&self, event: Event, record_trace: bool) -> DateTime<Utc> {
+        let new_now = {
+            let mut inner = self.inner.lock().unwrap();
+            let now = event.time.max(inner.now);
+            inner.now = now;
+            if record_trace {
+                inner.trace.push(TraceEntry {
+                    time: now,
+                    id: event.id,
+                    from: event.from,
+                    to: event.to,
+                    byte_len: event.bytes.len(),
+                });
+            }
+            now
+        };
+
+        // Check paused state outside the main lock to minimise hold time.
+        let destination_paused = self.inner.lock().unwrap().paused.contains(&event.to);
 
         let mut inbox = event.inbox.lock().unwrap();
         inbox.bytes.extend_from_slice(&event.bytes);
-        if let Some(waker) = inbox.waker.take() {
-            waker.wake();
+        if !destination_paused {
+            if let Some(waker) = inbox.waker.take() {
+                waker.wake();
+            }
         }
-        Some(new_now)
+        new_now
     }
 
-    /// Force any partially-filled reorder buffers to flush (shuffle + enqueue).
-    /// Called by the driver when it suspects all writes have completed and
-    /// wants to make sure no bytes are stranded.
     pub(crate) fn flush_reorder_buffers(&self) {
         let mut inner = self.inner.lock().unwrap();
         let keys: Vec<_> = inner.reorder_buffers.keys().copied().collect();
@@ -325,11 +500,7 @@ impl SimNetwork {
                     continue;
                 }
                 buf.shuffle(&mut inner.rng);
-                let min_time = buf
-                    .iter()
-                    .map(|w| w.time)
-                    .min()
-                    .unwrap_or_else(|| inner.now);
+                let min_time = buf.iter().map(|w| w.time).min().unwrap_or(inner.now);
                 for (i, mut w) in buf.into_iter().enumerate() {
                     w.time = min_time + chrono::Duration::microseconds(i as i64);
                     push_event(&mut inner.queue, w);
@@ -346,9 +517,6 @@ impl SimNetwork {
         self.inner.lock().unwrap().now = t;
     }
 
-    /// Number of in-flight scheduled events. Includes events whose time has
-    /// already passed (the driver hasn't called `try_deliver_one` yet).
-    /// Useful for the driver's quiescence check.
     pub(crate) fn queue_len(&self) -> usize {
         let inner = self.inner.lock().unwrap();
         inner.queue.len()
@@ -362,8 +530,10 @@ impl SimNetwork {
 
 fn push_event(queue: &mut BinaryHeap<Event>, w: StagedWrite) {
     queue.push(Event {
+        id: w.id,
         time: w.time,
-        seq: w.seq,
+        from: w.from,
+        to: w.to,
         inbox: w.inbox,
         bytes: w.bytes,
     });

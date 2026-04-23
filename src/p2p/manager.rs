@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -45,11 +45,18 @@ pub async fn run(
     internal_tx: mpsc::Sender<ManagerMsg>,
     peer_gone_tx: broadcast::Sender<NodeId>,
 ) {
-    let mut peers: HashMap<NodeId, mpsc::Sender<Bytes>> = HashMap::new();
-    let mut protocols: HashMap<u8, mpsc::Sender<ProtocolEvent>> = HashMap::new();
+    // `BTreeMap` so broadcast and event-fan-out iteration is deterministic;
+    // the sim's byte-identical-trace determinism test relies on this, and
+    // consistent broadcast ordering is also helpful for reproducing
+    // production bugs.
+    let mut peers: BTreeMap<NodeId, mpsc::Sender<Bytes>> = BTreeMap::new();
+    let mut protocols: BTreeMap<u8, mpsc::Sender<ProtocolEvent>> = BTreeMap::new();
 
     loop {
         tokio::select! {
+            // Bias branches in declared order so the select arm pick is
+            // deterministic across runs (same rationale as above).
+            biased;
             msg = internal_rx.recv() => {
                 match msg {
                     Some(ManagerMsg::NewConnection { node_id, addr, stream }) => {
@@ -156,8 +163,8 @@ fn register_connection(
     peer_node_id: NodeId,
     addr: SocketAddr,
     stream: AnyStream,
-    peers: &mut HashMap<NodeId, mpsc::Sender<Bytes>>,
-    protocols: &HashMap<u8, mpsc::Sender<ProtocolEvent>>,
+    peers: &mut BTreeMap<NodeId, mpsc::Sender<Bytes>>,
+    protocols: &BTreeMap<u8, mpsc::Sender<ProtocolEvent>>,
     internal_tx: mpsc::Sender<ManagerMsg>,
 ) {
     let id = node_id_to_base58(&peer_node_id);
@@ -208,7 +215,7 @@ fn tag(protocol_id: u8, payload: Bytes) -> Bytes {
     buf.freeze()
 }
 
-fn broadcast_msg(peers: &HashMap<NodeId, mpsc::Sender<Bytes>>, msg: Bytes) {
+fn broadcast_msg(peers: &BTreeMap<NodeId, mpsc::Sender<Bytes>>, msg: Bytes) {
     for (node_id, tx) in peers {
         let id = node_id_to_base58(node_id);
         if tx.try_send(msg.clone()).is_err() {

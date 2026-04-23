@@ -22,7 +22,7 @@ use crate::p2p::manager::{AnyStream, ManagerMsg};
 use crate::p2p::{ConnectionProtocol, NodeId, PeerCommand, ProtocolOutbound};
 
 use super::SimClock;
-use super::network::{LinkConfig, SimNetwork};
+use super::network::{EventId, InFlightEvent, LinkConfig, SimNetwork, TraceEntry};
 use super::stream::{Inbox, SimStream};
 use super::transport::SimConnectionProtocol;
 
@@ -70,7 +70,15 @@ impl SimDriver {
     /// Build a fully-connected mesh of `n` nodes. Must be called from inside
     /// a tokio `current_thread` runtime with `start_paused = true`.
     pub async fn new(n: usize, seed: u64) -> Self {
-        let start_now = Utc::now();
+        Self::new_with_start(n, seed, Utc::now()).await
+    }
+
+    /// Like [`new`] but uses an explicit virtual wall-clock starting
+    /// instant. Useful for determinism tests that want byte-identical
+    /// traces across runs.
+    ///
+    /// [`new`]: Self::new
+    pub async fn new_with_start(n: usize, seed: u64, start_now: DateTime<Utc>) -> Self {
         let clock = Arc::new(SimClock::new(start_now));
         let network = SimNetwork::new(seed, start_now);
 
@@ -174,6 +182,120 @@ impl SimDriver {
                     self.heal_pair(i, j);
                 }
             }
+        }
+    }
+
+    // ---- Adversary API ----
+
+    /// Freeze a node: inbound bytes accumulate in its inboxes but its reader
+    /// is not woken; outbound writes from this node are dropped. Use
+    /// [`resume_node`] to release.
+    ///
+    /// [`resume_node`]: Self::resume_node
+    pub fn pause_node(&self, idx: usize) {
+        self.network.pause(self.node_id(idx));
+    }
+
+    /// Un-freeze a node and wake its inbox readers so bytes buffered during
+    /// the pause can be consumed.
+    pub fn resume_node(&self, idx: usize) {
+        self.network.resume(self.node_id(idx));
+    }
+
+    /// Permanently take `idx` offline. Aborts its background tasks, closes
+    /// every inbox it owns or writes to so peers see EOF on connection
+    /// reads, and refuses any further writes from or to this node.
+    ///
+    /// Restarting a killed node (persistent-state recovery) is follow-up
+    /// work that needs milestone-4 state to be meaningful.
+    pub fn kill_node(&self, idx: usize) {
+        let id = self.node_id(idx);
+        self.network.kill(id);
+        for handle in &self.nodes[idx]._tasks {
+            handle.abort();
+        }
+    }
+
+    /// Non-destructive snapshot of events currently in the main heap.
+    pub fn in_flight_events(&self) -> Vec<InFlightEvent> {
+        self.network.in_flight_events()
+    }
+
+    /// Pop the scheduled event with `id` and deliver it immediately,
+    /// bypassing its scheduled time. Returns `false` if `id` was not found
+    /// (already delivered or never enqueued).
+    pub fn deliver_next(&self, id: EventId) -> bool {
+        self.network.deliver_event_now(id)
+    }
+
+    /// Enqueue a copy of the event with `id` at the same scheduled time.
+    /// The duplicate gets a fresh [`EventId`], returned to the caller.
+    pub fn duplicate_event(&self, id: EventId) -> Option<EventId> {
+        self.network.duplicate_event(id)
+    }
+
+    // ---- Determinism trace ----
+
+    /// Non-destructive snapshot of the delivery trace so far.
+    pub fn trace(&self) -> Vec<TraceEntry> {
+        self.network.trace_snapshot()
+    }
+
+    /// Consume the delivery trace and return it.
+    pub fn drain_trace(&self) -> Vec<TraceEntry> {
+        self.network.drain_trace()
+    }
+
+    // ---- Convergence assertion helpers ----
+
+    /// Collect every node's live-message content sets (sorted) at the
+    /// driver's current virtual wall time.
+    pub fn per_node_contents(&self) -> Vec<Vec<String>> {
+        let now = self.clock.now_wall();
+        self.nodes
+            .iter()
+            .map(|n| {
+                let mut contents: Vec<String> =
+                    n.messages(now).into_iter().map(|m| m.content).collect();
+                contents.sort();
+                contents
+            })
+            .collect()
+    }
+
+    /// Assert every node's live-message contents match `expected` (as a
+    /// sorted set). Panics with a diff on mismatch.
+    pub fn assert_all_converged_to(&self, expected: &[&str]) {
+        let mut expected_sorted: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        expected_sorted.sort();
+        let actual = self.per_node_contents();
+        for (i, contents) in actual.iter().enumerate() {
+            assert_eq!(
+                contents, &expected_sorted,
+                "node {i} did not converge to {expected_sorted:?}, saw {contents:?}",
+            );
+        }
+    }
+
+    /// Assert every node has seen `content`.
+    pub fn assert_all_have(&self, content: &str) {
+        let per_node = self.per_node_contents();
+        for (i, contents) in per_node.iter().enumerate() {
+            assert!(
+                contents.iter().any(|c| c == content),
+                "node {i} missing message {content:?}, saw {contents:?}",
+            );
+        }
+    }
+
+    /// Assert no node has seen `content`.
+    pub fn assert_none_have(&self, content: &str) {
+        let per_node = self.per_node_contents();
+        for (i, contents) in per_node.iter().enumerate() {
+            assert!(
+                !contents.iter().any(|c| c == content),
+                "node {i} unexpectedly has message {content:?}, saw {contents:?}",
+            );
         }
     }
 
