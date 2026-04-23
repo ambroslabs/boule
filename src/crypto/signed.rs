@@ -379,6 +379,80 @@ mod tests {
         }
     }
 
+    // ── Property tests (issue #52) ──────────────────────────────────────────
+
+    use proptest::prelude::*;
+    use std::sync::OnceLock;
+
+    fn shared_signer() -> &'static NodeSigner {
+        static SIGNER: OnceLock<NodeSigner> = OnceLock::new();
+        SIGNER.get_or_init(fresh_signer)
+    }
+
+    fn shared_other_signer() -> &'static NodeSigner {
+        static OTHER: OnceLock<NodeSigner> = OnceLock::new();
+        OTHER.get_or_init(fresh_signer)
+    }
+
+    proptest! {
+        // Any structurally valid Vote signs and then verifies under the same
+        // NodeId. Catches accidental non-determinism in the pre-image (domain
+        // framing, postcard output) that hand-written inputs wouldn't hit.
+        #[test]
+        fn prop_sign_verify_round_trip(round in any::<u64>(), hash in any::<[u8; 32]>()) {
+            let signer = shared_signer();
+            let vote = Vote { round, block_hash: hash };
+            let signed = Signed::sign(vote.clone(), signer).unwrap();
+            signed.verify(&signer.node_id()).unwrap();
+
+            let wire = postcard::to_stdvec(&signed).unwrap();
+            let back: Signed<Vote> = postcard::from_bytes(&wire).unwrap();
+            prop_assert_eq!(&back.payload, &vote);
+            prop_assert_eq!(back.signer, signer.node_id());
+            back.verify(&signer.node_id()).unwrap();
+        }
+
+        // Any random 64-byte "signature" other than one the real signer would
+        // produce must fail verification. We can't exclude the (astronomically
+        // unlikely) real signature, so we only reject forgeries that are also
+        // not the genuine signature for this payload.
+        #[test]
+        fn prop_forged_signature_rejected(
+            round in any::<u64>(),
+            hash in any::<[u8; 32]>(),
+            forged in any::<[u8; 64]>(),
+        ) {
+            let signer = shared_signer();
+            let vote = Vote { round, block_hash: hash };
+            let real = Signed::sign(vote.clone(), signer).unwrap();
+            prop_assume!(forged != real.sig);
+
+            let tampered = Signed::<Vote> { payload: vote, signer: signer.node_id(), sig: forged };
+            prop_assert!(tampered.verify(&signer.node_id()).is_err());
+        }
+
+        // A signature produced by one signer must not verify under a different
+        // claimed signer, even when the claim on the envelope is rewritten to
+        // match the verifier.
+        #[test]
+        fn prop_cross_signer_rejected(round in any::<u64>(), hash in any::<[u8; 32]>()) {
+            let alice = shared_signer();
+            let bob = shared_other_signer();
+            prop_assume!(alice.node_id() != bob.node_id());
+
+            let vote = Vote { round, block_hash: hash };
+            let mut signed = Signed::sign(vote, alice).unwrap();
+
+            // Passing bob as expected without rewriting the envelope: mismatch.
+            prop_assert!(signed.verify(&bob.node_id()).is_err());
+
+            // Rewriting the envelope's `signer` claim to bob while keeping
+            // alice's signature: the ed25519 check must still fail.
+            signed.signer = bob.node_id();
+            prop_assert!(signed.verify(&bob.node_id()).is_err());
+        }
+    }
+
     #[test]
     fn sign_verify_latency_bench() {
         // Not a gated benchmark — just logs representative numbers so regressions
