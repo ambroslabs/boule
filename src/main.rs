@@ -1,4 +1,5 @@
 mod config;
+mod crypto;
 mod gossip;
 mod p2p;
 

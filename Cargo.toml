@@ -39,6 +39,8 @@ chacha20poly1305  = "0.10"
 argon2            = "0.5"
 rpassword         = "7"
 rand              = "0.9"
+ring              = "0.17"
+bincode           = "1.3"
 keyring           = { version = "3", optional = true, default-features = false, features = ["async-secret-service", "apple-native", "windows-native", "crypto-rust", "tokio"] }
 
 [dev-dependencies]
