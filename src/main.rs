@@ -9,10 +9,10 @@ use tracing::{info, warn};
 use ambros_p2p::clock::{Clock, TokioClock};
 use ambros_p2p::config::{self, IdentityConfig, NodeConfig};
 use ambros_p2p::gossip;
-use ambros_p2p::p2p::{self, ConnectionProtocol};
 use ambros_p2p::p2p::manager::ManagerMsg;
 use ambros_p2p::p2p::tls::{TlsIdentity, node_id_to_base58};
 use ambros_p2p::p2p::tls_protocol::TlsConnectionProtocol;
+use ambros_p2p::p2p::{self, ConnectionProtocol};
 use ambros_p2p::ping;
 
 const ENV_PRODUCTION: &str = "AMBROS_ENV";
