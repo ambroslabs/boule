@@ -16,14 +16,29 @@
 //!
 //! # Quick start
 //!
-//! Registering ping RPC in `main.rs` (see `src/ping.rs` for the full
+//! Registering ping RPC as `main.rs` does (see `src/ping.rs` for the full
 //! integration):
 //!
-//! ```ignore
+//! ```no_run
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
+//! use ambros_p2p::clock::{Clock, TokioClock};
+//! use ambros_p2p::p2p::{self, PeerCommand};
+//! use ambros_p2p::p2p::rpc::RpcBuilder;
+//! use ambros_p2p::ping;
+//! use bytes::Bytes;
+//! use tokio::sync::{mpsc, oneshot};
+//!
+//! # async fn wiring(
+//! #     p2p_cmd_tx: mpsc::Sender<PeerCommand>,
+//! #     peer: p2p::NodeId,
+//! #     payload: Bytes,
+//! # ) -> anyhow::Result<()> {
 //! // 1. Register a protocol ID with the peer manager.
-//! let (reg_tx, reg_rx) = tokio::sync::oneshot::channel();
+//! let (reg_tx, reg_rx) = oneshot::channel();
 //! p2p_cmd_tx
-//!     .send(p2p::PeerCommand::RegisterProtocol {
+//!     .send(PeerCommand::RegisterProtocol {
 //!         id: ping::PROTOCOL_ID,
 //!         reply: reg_tx,
 //!     })
@@ -31,7 +46,8 @@
 //! let handle = reg_rx.await?;
 //!
 //! // 2. Build an Rpc with handlers for each method ID you want to serve.
-//! let rpc = p2p::rpc::RpcBuilder::new()
+//! let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+//! let rpc = RpcBuilder::new()
 //!     .handler(ping::METHOD_PING, ping::echo)
 //!     .spawn(handle, clock);
 //!
@@ -39,6 +55,9 @@
 //! let reply = rpc
 //!     .call(peer, ping::METHOD_PING, payload, Duration::from_secs(2))
 //!     .await?;
+//! # let _ = reply;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Both sides of the conversation use the same `RpcBuilder::spawn` entry
@@ -156,10 +175,21 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Bytes, Bytes>> + Sen
 /// valid handler, so the typical registration is just a closure or a free
 /// async function — see [`ping::echo`](../../ping/fn.echo.html):
 ///
-/// ```ignore
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use ambros_p2p::clock::{Clock, TokioClock};
+/// use ambros_p2p::p2p::ProtocolHandle;
+/// use ambros_p2p::p2p::rpc::RpcBuilder;
+/// use ambros_p2p::ping;
+///
+/// # fn wiring(handle: ProtocolHandle) {
+/// let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 /// let rpc = RpcBuilder::new()
 ///     .handler(ping::METHOD_PING, ping::echo)
 ///     .spawn(handle, clock);
+/// # let _ = rpc;
+/// # }
 /// ```
 ///
 /// # Cancellation contract
@@ -206,11 +236,34 @@ where
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use ambros_p2p::clock::{Clock, TokioClock};
+/// use ambros_p2p::p2p::ProtocolHandle;
+/// use ambros_p2p::p2p::rpc::RpcBuilder;
+/// use ambros_p2p::ping;
+/// use bytes::Bytes;
+/// use tokio_util::sync::CancellationToken;
+///
+/// # fn wiring(protocol_handle: ProtocolHandle) {
+/// const METHOD_STATUS: u16 = 0x0002;
+///
+/// async fn status_handler(
+///     _peer: ambros_p2p::p2p::NodeId,
+///     _body: Bytes,
+///     _cancel: CancellationToken,
+/// ) -> Result<Bytes, Bytes> {
+///     Ok(Bytes::from_static(b"ok"))
+/// }
+///
+/// let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 /// let rpc = RpcBuilder::new()
-///     .handler(METHOD_PING, ping::echo)
+///     .handler(ping::METHOD_PING, ping::echo)
 ///     .handler(METHOD_STATUS, status_handler)
 ///     .spawn(protocol_handle, clock);
+/// # let _ = rpc;
+/// # }
 /// ```
 pub struct RpcBuilder {
     handlers: HashMap<u16, Arc<dyn RpcHandler>>,
@@ -357,6 +410,9 @@ impl Rpc {
             .await
             .map_err(|_| RpcError::Shutdown)?;
 
+        // The timeout is driven by `Clock::sleep`, not wall-clock subtraction,
+        // so it's already immune to wall-clock jumps. Any future code on this
+        // path that does `t2 - t1` math must use `Clock::now_monotonic`.
         match clock::timeout(&*self.clock, timeout, reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RpcError::Shutdown),

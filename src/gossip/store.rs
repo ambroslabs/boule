@@ -14,6 +14,12 @@ struct StoreInner {
     seen: HashSet<ContentHash>,
 }
 
+impl Default for GossipStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GossipStore {
     pub fn new() -> Self {
         Self {

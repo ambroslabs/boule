@@ -5,12 +5,13 @@
 //! Tests live under `src/sim/` rather than `tests/` because the crate has no
 //! library target — integration tests in the latter cannot reach internals.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
 
 use crate::clock::Clock;
-use crate::gossip::GossipMessage;
+use crate::gossip::{self, GossipMessage};
 use crate::sim::{
     GossipFactory, LatencyDist, LinkConfig, MemoryBacking, SimDriver, TempDirDiskBacking,
 };
@@ -554,4 +555,88 @@ async fn per_node_disk_storage_via_tempdir_supports_gossip_and_cleans_up_on_drop
         !tempdir_path.exists(),
         "tempdir at {tempdir_path:?} must be cleaned up after driver drop",
     );
+}
+
+// ---- Expiry cleanup under virtual time (#48) ----
+
+/// Ports `tests/integration_test.rs::test_expired_messages_are_cleaned_up`
+/// off wall time. The original test slept 8 real seconds (2s expiry + 5s
+/// cleanup interval + 1s buffer) waiting for the background cleanup loop
+/// to sweep an expired message; driving the clock through [`SimDriver`]
+/// instead collapses that to sub-millisecond wall time while still
+/// exercising `gossip::cleanup::run` end-to-end against every node's
+/// store.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn expired_messages_are_cleaned_up_under_sim_clock() {
+    let driver = SimDriver::new(3, /* seed */ 100).await;
+
+    // Wire the real cleanup loop to each node's store with the same 5s
+    // virtual interval the integration-test node config used. The
+    // shutdown channel is held through the end of the test so the task
+    // doesn't busy-loop on a closed watch.
+    let cleanup_interval_secs = 5u64;
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let mut cleanup_handles = Vec::new();
+    for i in 0..driver.nodes().len() {
+        let store = Arc::clone(
+            driver
+                .node(i)
+                .gossip_store()
+                .expect("gossip factory always builds a store"),
+        );
+        let clock = driver.clock.for_node(driver.node_id(i));
+        let rx = shutdown_tx.subscribe();
+        cleanup_handles.push(tokio::spawn(gossip::cleanup::run(
+            store,
+            cleanup_interval_secs,
+            rx,
+            clock,
+        )));
+    }
+
+    // Inject a message that expires in 2s of virtual time.
+    let now = driver.clock.now_wall();
+    let expiring = GossipMessage {
+        content: "short lived".to_string(),
+        expiry: now + ChronoDuration::seconds(2),
+    };
+    driver
+        .node(0)
+        .inject_gossip(expiring, &*driver.clock as &dyn Clock)
+        .await;
+    driver.run_until_quiescent().await;
+
+    // Visible on every node before expiry.
+    driver.assert_all_have("short lived");
+
+    // Advance past expiry + one cleanup cycle (2s expiry + 5s interval +
+    // 1s buffer = 8s — the exact budget the wall-clock version consumed).
+    driver.advance(Duration::from_secs(8)).await;
+    driver.run_until_quiescent().await;
+
+    // External observation: the message is gone from list_live on every node.
+    driver.assert_none_have("short lived");
+
+    // Internal observation: the cleanup task itself has already swept the
+    // entry out of each store. A follow-up remove_expired should find
+    // nothing left to drop.
+    let now = driver.clock.now_wall();
+    for i in 0..driver.nodes().len() {
+        let store = driver
+            .node(i)
+            .gossip_store()
+            .expect("gossip factory always builds a store");
+        assert_eq!(
+            store.remove_expired(now),
+            0,
+            "node {i} cleanup task should have already swept the expired message",
+        );
+    }
+
+    // Graceful shutdown so the cleanup tasks don't busy-loop on a dead
+    // watch channel after the driver drops.
+    let _ = shutdown_tx.send(true);
+    for h in cleanup_handles {
+        let _ = h.await;
+    }
 }

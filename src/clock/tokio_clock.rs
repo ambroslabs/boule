@@ -1,22 +1,37 @@
-//! Production [`Clock`] implementation backed by tokio's runtime and
-//! [`chrono::Utc::now`].
+//! Production [`Clock`] implementation backed by tokio's runtime,
+//! [`chrono::Utc::now`], and [`std::time::Instant`].
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{BoxFuture, Clock, ClockInterval};
 
-#[derive(Default, Debug, Clone, Copy)]
-pub struct TokioClock;
+#[derive(Debug, Clone, Copy)]
+pub struct TokioClock {
+    #[allow(dead_code)] // Read through `now_monotonic`; see `Clock` trait.
+    start: Instant,
+}
 
 impl TokioClock {
     pub fn new() -> Self {
-        Self
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Default for TokioClock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 impl Clock for TokioClock {
     fn now_wall(&self) -> chrono::DateTime<chrono::Utc> {
         chrono::Utc::now()
+    }
+
+    fn now_monotonic(&self) -> Duration {
+        Instant::now().saturating_duration_since(self.start)
     }
 
     fn sleep(&self, dur: Duration) -> BoxFuture<'static, ()> {

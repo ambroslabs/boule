@@ -11,6 +11,13 @@
 //! backend (e.g. PKCS#11 / HSM) can plug in via a `NodeSigner` adapter
 //! without changing call sites.
 
+// Backends expose small, operator-facing surfaces (constructors, one trait
+// method). They're promoted to library-public items by lifting the crate to
+// a library target, but their documentation burden is covered by the
+// module-level doc above. Matches the `#[allow(missing_docs)]` style used on
+// the other p2p submodules (connection, dialer, listener, manager, tls).
+#![allow(missing_docs)]
+
 pub mod encrypted_file;
 pub mod env;
 pub mod exec;

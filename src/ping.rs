@@ -37,6 +37,11 @@ pub async fn echo(_peer: NodeId, body: Bytes, _cancel: CancellationToken) -> Res
 #[derive(serde::Deserialize)]
 struct PingRequest {
     payload: String,
+    /// Per-call timeout override in milliseconds. Falls back to
+    /// [`DEFAULT_TIMEOUT`] when absent. Integration tests that exercise
+    /// the timeout path use this to stay inside their wall-clock budget.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -60,12 +65,17 @@ async fn ping_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid peer node id").into_response(),
     };
 
+    let timeout = req
+        .timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_TIMEOUT);
+
     match rpc
         .call(
             node_id,
             METHOD_PING,
             Bytes::from(req.payload.into_bytes()),
-            DEFAULT_TIMEOUT,
+            timeout,
         )
         .await
     {
