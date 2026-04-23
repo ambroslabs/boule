@@ -1,3 +1,4 @@
+mod clock;
 mod config;
 mod crypto;
 mod gossip;
@@ -12,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
+use crate::clock::{Clock, TokioClock};
 use crate::config::{IdentityConfig, NodeConfig};
 use crate::p2p::ConnectionProtocol;
 use crate::p2p::manager::ManagerMsg;
@@ -174,6 +176,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
 
     info!("node ID: {}", node_id_to_base58(&identity.node_id));
 
+    let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
     let store = Arc::new(gossip::store::GossipStore::new());
 
     let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
@@ -202,7 +205,8 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
 
     let engine_handle = {
         let store = Arc::clone(&store);
-        tokio::spawn(gossip::engine::run(gossip_handle, store))
+        let clock = Arc::clone(&clock);
+        tokio::spawn(gossip::engine::run(gossip_handle, store, clock))
     };
 
     // Register the ping RPC protocol on its own ID and build an Rpc client
@@ -217,13 +221,14 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let ping_handle = ping_reg_rx.await?;
     let ping_rpc = p2p::rpc::RpcBuilder::new()
         .handler(ping::METHOD_PING, ping::echo)
-        .spawn(ping_handle);
+        .spawn(ping_handle, Arc::clone(&clock));
 
     let cleanup_handle = {
         let store = Arc::clone(&store);
         let interval = config.api.cleanup_interval_secs;
         let srx = shutdown_rx.clone();
-        tokio::spawn(gossip::cleanup::run(store, interval, srx))
+        let clock = Arc::clone(&clock);
+        tokio::spawn(gossip::cleanup::run(store, interval, srx, clock))
     };
 
     // Bind the API listener here so we know the actual port before writing addr_file.
@@ -232,7 +237,11 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let api_handle = {
         let app = axum::Router::new()
             .merge(p2p::api::router(p2p_cmd_tx.clone()))
-            .merge(gossip::api::router(Arc::clone(&store), gossip_send_tx))
+            .merge(gossip::api::router(
+                Arc::clone(&store),
+                gossip_send_tx,
+                Arc::clone(&clock),
+            ))
             .merge(ping::router(ping_rpc));
         tokio::spawn(async move {
             info!("HTTP API listening on {api_actual_addr}");
@@ -261,6 +270,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
         identity: Arc::clone(&identity),
         peers: config.peers.clone(),
         listener: p2p_listener,
+        clock: Arc::clone(&clock),
     };
     let protocol_handle = tokio::spawn(protocol.run(internal_tx.clone(), peer_gone_tx.clone()));
 

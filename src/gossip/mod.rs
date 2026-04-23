@@ -26,8 +26,8 @@ impl GossipMessage {
         hasher.finalize().into()
     }
 
-    pub fn is_expired(&self) -> bool {
-        self.expiry <= Utc::now()
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        self.expiry <= now
     }
 }
 
@@ -87,16 +87,17 @@ mod tests {
     }
 
     #[test]
-    fn is_expired_respects_current_time() {
+    fn is_expired_respects_provided_now() {
+        let now = Utc::now();
         let past = GossipMessage {
             content: "p".into(),
-            expiry: Utc::now() - Duration::seconds(1),
+            expiry: now - Duration::seconds(1),
         };
         let future = GossipMessage {
             content: "f".into(),
-            expiry: Utc::now() + Duration::seconds(60),
+            expiry: now + Duration::seconds(60),
         };
-        assert!(past.is_expired());
-        assert!(!future.is_expired());
+        assert!(past.is_expired(now));
+        assert!(!future.is_expired(now));
     }
 }
