@@ -39,10 +39,11 @@ chacha20poly1305  = "0.10"
 argon2            = "0.5"
 rpassword         = "7"
 rand              = "0.9"
+rand_chacha       = "0.9"
 ring              = "0.17"
 postcard          = { version = "1", default-features = false, features = ["use-std"] }
 keyring           = { version = "3", optional = true, default-features = false, features = ["async-secret-service", "apple-native", "windows-native", "crypto-rust", "tokio"] }
 
 [dev-dependencies]
 reqwest           = { version = "0.12", features = ["json"] }
-tokio             = { version = "1", features = ["full"] }
+tokio             = { version = "1", features = ["full", "test-util"] }

@@ -3,13 +3,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tracing::{info, warn};
 
+use crate::clock::Clock;
 use crate::gossip::InsertResult;
 use crate::gossip::store::GossipStore;
 use crate::gossip::wire::WireMessage;
 use crate::p2p::tls::node_id_to_base58;
 use crate::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 
-pub async fn run(handle: ProtocolHandle, store: Arc<GossipStore>) {
+pub async fn run(handle: ProtocolHandle, store: Arc<GossipStore>, clock: Arc<dyn Clock>) {
     let ProtocolHandle {
         send_tx,
         mut event_rx,
@@ -27,7 +28,7 @@ pub async fn run(handle: ProtocolHandle, store: Arc<GossipStore>) {
                 let id = node_id_to_base58(&from);
                 match serde_json::from_slice::<WireMessage>(&payload) {
                     Ok(WireMessage::Gossip(gossip_msg)) => {
-                        match store.try_insert(gossip_msg.clone()) {
+                        match store.try_insert(gossip_msg.clone(), clock.now_wall()) {
                             InsertResult::Inserted => {
                                 info!("gossip message inserted, broadcasting (from {id})");
                                 match serde_json::to_vec(&WireMessage::Gossip(gossip_msg)) {

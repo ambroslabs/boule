@@ -24,6 +24,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
+use crate::clock::{self, Clock};
 use crate::p2p::tls::{NodeId, node_id_to_base58};
 use crate::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 
@@ -127,8 +128,9 @@ impl RpcBuilder {
     }
 
     /// Consume the builder and the protocol handle, spawn the RPC task, and
-    /// return a cloneable [`Rpc`] handle.
-    pub fn spawn(self, handle: ProtocolHandle) -> Rpc {
+    /// return a cloneable [`Rpc`] handle. `clock` is used for the per-call
+    /// timeout in [`Rpc::call`].
+    pub fn spawn(self, handle: ProtocolHandle, clock: Arc<dyn Clock>) -> Rpc {
         let (op_tx, op_rx) = mpsc::channel::<Op>(256);
         let task = RpcTask {
             send_tx: handle.send_tx,
@@ -142,6 +144,7 @@ impl RpcBuilder {
         Rpc {
             op_tx,
             next_request_id: Arc::new(AtomicU64::new(1)),
+            clock,
         }
     }
 }
@@ -151,6 +154,7 @@ impl RpcBuilder {
 pub struct Rpc {
     op_tx: mpsc::Sender<Op>,
     next_request_id: Arc<AtomicU64>,
+    clock: Arc<dyn Clock>,
 }
 
 impl Rpc {
@@ -179,7 +183,7 @@ impl Rpc {
             .await
             .map_err(|_| RpcError::Shutdown)?;
 
-        match tokio::time::timeout(timeout, reply_rx).await {
+        match clock::timeout(&*self.clock, timeout, reply_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RpcError::Shutdown),
             Err(_) => {
@@ -407,6 +411,11 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::clock::TokioClock;
+
+    fn test_clock() -> Arc<dyn Clock> {
+        Arc::new(TokioClock::new())
+    }
 
     /// Shared state controlling an in-memory bridge between two
     /// `ProtocolHandle`s.
@@ -532,10 +541,10 @@ mod tests {
         let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
 
         // Client on side A, echo server on side B.
-        let client = RpcBuilder::new().spawn(ha);
+        let client = RpcBuilder::new().spawn(ha, test_clock());
         let _server = RpcBuilder::new()
             .handler(42u16, |_peer: NodeId, body: Bytes| async move { Ok(body) })
-            .spawn(hb);
+            .spawn(hb, test_clock());
 
         let reply = client
             .call(
@@ -552,12 +561,12 @@ mod tests {
     #[tokio::test]
     async fn server_error_surfaces_as_remote() {
         let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
-        let client = RpcBuilder::new().spawn(ha);
+        let client = RpcBuilder::new().spawn(ha, test_clock());
         let _server = RpcBuilder::new()
             .handler(7u16, |_peer: NodeId, _body: Bytes| async move {
                 Err(Bytes::from_static(b"boom"))
             })
-            .spawn(hb);
+            .spawn(hb, test_clock());
 
         let err = client
             .call(nid(2), 7, Bytes::new(), Duration::from_secs(2))
@@ -572,8 +581,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_produces_remote_error() {
         let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
-        let client = RpcBuilder::new().spawn(ha);
-        let _server = RpcBuilder::new().spawn(hb); // no handlers
+        let client = RpcBuilder::new().spawn(ha, test_clock());
+        let _server = RpcBuilder::new().spawn(hb, test_clock()); // no handlers
 
         let err = client
             .call(nid(2), 999, Bytes::new(), Duration::from_secs(2))
@@ -588,13 +597,13 @@ mod tests {
     #[tokio::test]
     async fn timeout_fires_when_peer_never_replies() {
         let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
-        let client = RpcBuilder::new().spawn(ha);
+        let client = RpcBuilder::new().spawn(ha, test_clock());
         // Handler that never resolves.
         let _server = RpcBuilder::new()
             .handler(1u16, |_peer: NodeId, _body: Bytes| async move {
                 std::future::pending::<Result<Bytes, Bytes>>().await
             })
-            .spawn(hb);
+            .spawn(hb, test_clock());
 
         let err = client
             .call(nid(2), 1, Bytes::new(), Duration::from_millis(100))
@@ -606,12 +615,12 @@ mod tests {
     #[tokio::test]
     async fn peer_gone_resolves_in_flight_requests() {
         let (ha, hb, bridge) = paired_handles(nid(1), nid(2)).await;
-        let client = RpcBuilder::new().spawn(ha);
+        let client = RpcBuilder::new().spawn(ha, test_clock());
         let _server = RpcBuilder::new()
             .handler(1u16, |_peer: NodeId, _body: Bytes| async move {
                 std::future::pending::<Result<Bytes, Bytes>>().await
             })
-            .spawn(hb);
+            .spawn(hb, test_clock());
 
         let client_clone = client.clone();
         let call = tokio::spawn(async move {
@@ -634,13 +643,15 @@ mod tests {
     #[tokio::test]
     async fn busy_when_outstanding_limit_hit() {
         let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
-        let client = RpcBuilder::new().max_outstanding_per_peer(1).spawn(ha);
+        let client = RpcBuilder::new()
+            .max_outstanding_per_peer(1)
+            .spawn(ha, test_clock());
         // Server handler blocks forever so the first call stays in flight.
         let _server = RpcBuilder::new()
             .handler(1u16, |_peer: NodeId, _body: Bytes| async move {
                 std::future::pending::<Result<Bytes, Bytes>>().await
             })
-            .spawn(hb);
+            .spawn(hb, test_clock());
 
         let client1 = client.clone();
         let pending = tokio::spawn(async move {
@@ -664,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn distinct_request_ids_allow_interleaved_replies() {
         let (ha, hb, _bridge) = paired_handles(nid(1), nid(2)).await;
-        let client = RpcBuilder::new().spawn(ha);
+        let client = RpcBuilder::new().spawn(ha, test_clock());
         let _server = RpcBuilder::new()
             .handler(5u16, |_peer: NodeId, body: Bytes| async move {
                 // Add an arbitrary delay per request so replies can interleave.
@@ -672,7 +683,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 Ok(body)
             })
-            .spawn(hb);
+            .spawn(hb, test_clock());
 
         let c1 = client.clone();
         let c2 = client.clone();

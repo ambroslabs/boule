@@ -8,10 +8,10 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use bytes::Bytes;
-use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+use crate::clock::Clock;
 use crate::gossip::store::GossipStore;
 use crate::gossip::wire::WireMessage;
 use crate::gossip::{GossipMessage, InsertResult};
@@ -23,10 +23,19 @@ use types::{MessageItem, PostMessageRequest, PostMessageResponse};
 struct AppState {
     store: Arc<GossipStore>,
     gossip_tx: mpsc::Sender<ProtocolOutbound>,
+    clock: Arc<dyn Clock>,
 }
 
-pub fn router(store: Arc<GossipStore>, gossip_tx: mpsc::Sender<ProtocolOutbound>) -> Router {
-    let state = AppState { store, gossip_tx };
+pub fn router(
+    store: Arc<GossipStore>,
+    gossip_tx: mpsc::Sender<ProtocolOutbound>,
+    clock: Arc<dyn Clock>,
+) -> Router {
+    let state = AppState {
+        store,
+        gossip_tx,
+        clock,
+    };
     Router::new()
         .route("/messages", get(list_messages).post(post_message))
         .with_state(state)
@@ -36,7 +45,8 @@ async fn post_message(
     State(state): State<AppState>,
     Json(req): Json<PostMessageRequest>,
 ) -> impl IntoResponse {
-    if req.expiry <= Utc::now() {
+    let now = state.clock.now_wall();
+    if req.expiry <= now {
         return (StatusCode::BAD_REQUEST, "expiry is in the past").into_response();
     }
 
@@ -47,7 +57,7 @@ async fn post_message(
 
     let hash = msg.content_hash();
 
-    match state.store.try_insert(msg.clone()) {
+    match state.store.try_insert(msg.clone(), now) {
         InsertResult::Inserted => {
             let encoded = serde_json::to_vec(&WireMessage::Gossip(msg))
                 .expect("WireMessage serialization cannot fail");
@@ -78,7 +88,7 @@ async fn post_message(
 }
 
 async fn list_messages(State(state): State<AppState>) -> Json<Vec<MessageItem>> {
-    let msgs = state.store.list_live();
+    let msgs = state.store.list_live(state.clock.now_wall());
     Json(
         msgs.into_iter()
             .map(|m| MessageItem {
