@@ -88,6 +88,7 @@ pub mod crypto;
 pub mod gossip;
 pub mod p2p;
 pub mod ping;
+pub mod replication;
 #[cfg(test)]
 mod sim;
 pub mod storage;
