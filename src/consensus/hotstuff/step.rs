@@ -364,4 +364,75 @@ mod tests {
         });
         HotStuffCore::new(nid(self_byte), state, builder)
     }
+
+    /// Build an orphan block whose `parent_hash` is `orphan_parent` and
+    /// whose own contents are deterministic given the view. Used to
+    /// exercise the missing-parent dispatch branch.
+    fn orphan_child(orphan_parent: BlockHash, view: View, proposer: NodeId) -> Block {
+        let header = BlockHeader {
+            parent_hash: orphan_parent,
+            height: 1,
+            view,
+            proposer,
+            state_commitment: [0; 32],
+            commands_commitment: Block::commands_commitment(&[]),
+        };
+        Block {
+            header,
+            commands: Vec::new(),
+        }
+    }
+
+    // ── B1: missing-parent branch ───────────────────────────────────
+
+    #[test]
+    fn proposal_with_unknown_parent_parks_and_requests_block() {
+        let mut core = make_core(1);
+        let sender = nid(2);
+        let orphan_parent: BlockHash = [0xAA; 32];
+        let child = orphan_child(orphan_parent, 1, nid(3));
+        let child_hash = child.hash();
+
+        // Justify can be any QC — dispatch doesn't inspect it on the
+        // missing-parent branch because it returns before the
+        // safe-to-vote check.
+        let justify = dummy_qc(0, core.state().genesis_hash);
+        let signed = signed_proposal(child, justify, sender);
+
+        let actions = core.step(Event::ProposalReceived(signed));
+
+        // Single RequestBlock aimed at the sender with the orphan
+        // parent hash. The safety state is untouched: we have not
+        // voted, not locked, not updated high_qc.
+        assert_eq!(actions, vec![Action::RequestBlock(orphan_parent, sender)]);
+        assert!(core.parked_proposals.contains_key(&child_hash));
+        assert_eq!(core.state().last_voted_view, 0);
+        assert!(core.state().locked_qc.is_none());
+        assert!(core.state().high_qc.is_none());
+    }
+
+    #[test]
+    fn reparking_same_proposal_is_idempotent() {
+        // Repeated delivery of the same orphan proposal must neither
+        // grow `parked_proposals` unboundedly nor silently drop the
+        // second `RequestBlock` — the integration layer might resend
+        // the probe if the first went unanswered.
+        let mut core = make_core(1);
+        let sender = nid(2);
+        let orphan_parent: BlockHash = [0xAA; 32];
+        let child = orphan_child(orphan_parent, 1, nid(3));
+        let justify = dummy_qc(0, core.state().genesis_hash);
+        let signed = signed_proposal(child, justify, sender);
+
+        let _ = core.step(Event::ProposalReceived(signed.clone()));
+        let second = core.step(Event::ProposalReceived(signed));
+
+        assert_eq!(
+            second,
+            vec![Action::RequestBlock(orphan_parent, sender)],
+            "re-delivery must still produce a RequestBlock so the \
+             driver can retry the fetch",
+        );
+        assert_eq!(core.parked_proposals.len(), 1);
+    }
 }
