@@ -27,8 +27,10 @@
 
 use crate::consensus::View;
 use crate::crypto::signed::Signed;
+use crate::p2p::NodeId;
+use crate::replication::block::{Block, BlockHash};
 
-use super::qc::{NewView, Proposal, QuorumCertificate, Vote};
+use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
 
 /// Inputs the safety core reacts to.
 ///
@@ -73,4 +75,31 @@ pub enum StateUpdate {
     /// Replica adopted a fresher `high_qc` (seen via a proposal's
     /// justify, a freshly-formed QC, or a `NewView`).
     HighQc(QuorumCertificate),
+}
+
+/// Effects the safety core asks the integration layer to perform.
+///
+/// The core never performs these itself; it returns them from `step`
+/// and the integration layer (#24) translates each variant into real
+/// side effects (broadcasting bytes, syncing the WAL, committing to the
+/// state machine). The emission order within a single `step` call is
+/// deterministic and is part of the tested surface — later commits
+/// introduce that ordering alongside the unit tests that pin it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Send `msg` to every validator in the set.
+    Broadcast(ConsensusMsg),
+    /// Send `msg` to a single validator. Used for votes addressed to
+    /// the leader of the next view.
+    SendTo(NodeId, ConsensusMsg),
+    /// Persist `update` durably before any outbound network effect that
+    /// semantically depends on it is flushed.
+    Persist(StateUpdate),
+    /// Commit `block` to the state machine. Emitted when the three-chain
+    /// rule fires on a freshly-adopted QC.
+    Commit(Block),
+    /// Parent of a received proposal is not in `pending_blocks`; ask
+    /// the named peer for the block identified by the hash. The peer is
+    /// typically the sender of the proposal that couldn't be resolved.
+    RequestBlock(BlockHash, NodeId),
 }
