@@ -34,7 +34,7 @@ use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
-use super::safety_rules::safe_to_vote;
+use super::safety_rules::{safe_to_vote, should_update_high_qc};
 use super::state::HotStuffState;
 use crate::consensus::validator_set::ValidatorSet;
 
@@ -238,6 +238,19 @@ impl HotStuffCore {
             // a restarted replica never votes twice at the same view.
             self.state.last_voted_view = view;
             actions.push(Action::Persist(StateUpdate::VotedInView { view }));
+
+            // B3: adopt the proposal's justify as `high_qc` if it's
+            // strictly fresher. Gating this on `safe_to_vote` firing
+            // is deliberate — if we rejected the proposal we
+            // wouldn't vote on its chain, and we shouldn't trust its
+            // justify either. The independent NewView path in C3
+            // provides a separate adoption route when we trust the
+            // sender but haven't seen a proposal.
+            if should_update_high_qc(&signed.payload.justify, &self.state) {
+                let qc = signed.payload.justify.clone();
+                self.state.high_qc = Some(qc.clone());
+                actions.push(Action::Persist(StateUpdate::HighQc(qc)));
+            }
 
             // Send the vote to the next-view leader, who will assemble
             // the QC and use it as the justify of the next proposal.
