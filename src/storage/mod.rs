@@ -92,6 +92,32 @@ pub trait Storage: Send + Sync {
 /// Ergonomic closure wrapper around [`Storage::apply_batch`]. Blanket-impl'd
 /// for any `Storage` (including `dyn Storage`), so callers holding an
 /// `Arc<dyn Storage>` can write `s.batch(|b| { b.put(...); Ok(()) })`.
+///
+/// # Example
+///
+/// Atomically write HotStuff-style "last voted view" and "locked QC hash"
+/// against the in-memory backend:
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use ambros_p2p::storage::{MemoryStorage, Storage, StorageExt};
+///
+/// let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+///
+/// store
+///     .batch(|b| {
+///         b.put(b"last_voted_view", &42u64.to_be_bytes());
+///         b.put(b"locked_qc_hash", &[0xAB; 32]);
+///         Ok(())
+///     })
+///     .unwrap();
+///
+/// assert_eq!(
+///     store.get(b"last_voted_view").unwrap().unwrap().as_ref(),
+///     &42u64.to_be_bytes(),
+/// );
+/// ```
 pub trait StorageExt: Storage {
     fn batch<F>(&self, f: F) -> anyhow::Result<()>
     where

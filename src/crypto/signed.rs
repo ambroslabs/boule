@@ -101,6 +101,36 @@ where
     T: Serialize + SignedMessage,
 {
     /// Produce a signed envelope over `payload`.
+    ///
+    /// # Example
+    ///
+    /// Sign and verify a consensus-style payload. The domain separator on
+    /// `SignedMessage` makes a signature produced for `Vote` distinct from
+    /// any other type, even when the byte layout happens to match.
+    ///
+    /// ```
+    /// use ambros_p2p::crypto::signed::{NodeSigner, Signed, SignedMessage, Signer};
+    /// use ambros_p2p::p2p::identity::NodeIdentity;
+    /// use rcgen::{KeyPair, PKCS_ED25519};
+    /// use serde::{Deserialize, Serialize};
+    /// use zeroize::Zeroizing;
+    ///
+    /// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    /// struct Vote { round: u64, block_hash: [u8; 32] }
+    ///
+    /// impl SignedMessage for Vote {
+    ///     const DOMAIN: &'static str = "example.vote.v1";
+    /// }
+    ///
+    /// let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+    /// let identity = NodeIdentity { pkcs8_der: Zeroizing::new(kp.serialize_der()) };
+    /// let signer = NodeSigner::from_identity(&identity).unwrap();
+    ///
+    /// let vote = Vote { round: 7, block_hash: [0xAB; 32] };
+    /// let signed = Signed::sign(vote, &signer).unwrap();
+    ///
+    /// signed.verify(&signer.node_id()).unwrap();
+    /// ```
     pub fn sign<S: Signer>(payload: T, signer: &S) -> Result<Self> {
         let bytes = preimage::<T>(&payload)?;
         let sig = signer.sign(&bytes);

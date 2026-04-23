@@ -26,21 +26,33 @@
 //!
 //! # Registering a new protocol
 //!
-//! The canonical example is gossip's registration in `main.rs`:
+//! The canonical example is gossip's registration as `main.rs` does it:
 //!
-//! ```ignore
-//! let (reg_tx, reg_rx) = tokio::sync::oneshot::channel();
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use ambros_p2p::clock::{Clock, TokioClock};
+//! use ambros_p2p::gossip::{self, store::GossipStore};
+//! use ambros_p2p::p2p::{self, PeerCommand, ProtocolHandle};
+//! use tokio::sync::{mpsc, oneshot};
+//!
+//! # async fn wiring(p2p_cmd_tx: mpsc::Sender<PeerCommand>) -> anyhow::Result<()> {
+//! let (reg_tx, reg_rx) = oneshot::channel();
 //! p2p_cmd_tx
-//!     .send(p2p::PeerCommand::RegisterProtocol {
+//!     .send(PeerCommand::RegisterProtocol {
 //!         id: gossip::PROTOCOL_ID,
 //!         max_frame_bytes: Some(gossip::MAX_FRAME_BYTES),
 //!         reply: reg_tx,
 //!     })
 //!     .await?;
-//! let handle: p2p::ProtocolHandle = reg_rx.await?;
+//! let handle: ProtocolHandle = reg_rx.await?;
 //!
-//! // Spawn the protocol task with its handle; it owns `send_tx`/`event_rx`.
+//! // Spawn the protocol task with its handle; it owns `send_tx` / `event_rx`.
+//! let store = Arc::new(GossipStore::new());
+//! let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 //! tokio::spawn(gossip::engine::run(handle, store, clock));
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Ping's registration in `src/ping.rs` shows how to layer `rpc::Rpc` on
@@ -108,11 +120,35 @@ pub use tls::NodeId;
 ///
 /// # Example
 ///
-/// Wiring the TLS protocol in `main.rs`:
+/// Wiring the TLS protocol as `main.rs` does (every field in
+/// `TlsConnectionProtocol` is the one the binary feeds in):
 ///
-/// ```ignore
-/// let protocol = TlsConnectionProtocol { identity, peers, listener, clock };
-/// tokio::spawn(protocol.run(internal_tx.clone(), peer_gone_tx.clone()));
+/// ```no_run
+/// use std::sync::Arc;
+///
+/// use ambros_p2p::clock::{Clock, TokioClock};
+/// use ambros_p2p::p2p::{ConnectionProtocol, NodeId};
+/// use ambros_p2p::p2p::manager::ManagerMsg;
+/// use ambros_p2p::p2p::tls::TlsIdentity;
+/// use ambros_p2p::p2p::tls_protocol::TlsConnectionProtocol;
+/// use tokio::net::TcpListener;
+/// use tokio::sync::{broadcast, mpsc};
+///
+/// # async fn wiring(
+/// #     identity: Arc<TlsIdentity>,
+/// #     listener: TcpListener,
+/// #     internal_tx: mpsc::Sender<ManagerMsg>,
+/// #     peer_gone_tx: broadcast::Sender<NodeId>,
+/// # ) {
+/// let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+/// let protocol = TlsConnectionProtocol {
+///     identity,
+///     peers: Vec::new(),
+///     listener,
+///     clock,
+/// };
+/// tokio::spawn(protocol.run(internal_tx, peer_gone_tx));
+/// # }
 /// ```
 pub trait ConnectionProtocol: Send + 'static {
     /// Drive the transport forever. Sends
@@ -250,16 +286,19 @@ pub enum ProtocolEvent {
 /// See `gossip::engine::run` and `ping::echo` in the tree for real usage.
 /// The typical shape is:
 ///
-/// ```ignore
-/// let handle: ProtocolHandle = /* from RegisterProtocol */;
+/// ```no_run
+/// use ambros_p2p::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
+/// use bytes::Bytes;
+///
+/// # async fn wiring(handle: ProtocolHandle) {
 /// let ProtocolHandle { send_tx, mut event_rx } = handle;
 ///
 /// while let Some(event) = event_rx.recv().await {
 ///     match event {
-///         ProtocolEvent::PeerConnected { .. } => { /* … */ }
-///         ProtocolEvent::PeerDisconnected { .. } => { /* … */ }
-///         ProtocolEvent::Message { from, payload } => {
-///             // handle inbound frame …
+///         ProtocolEvent::PeerConnected { .. } => { /* greet */ }
+///         ProtocolEvent::PeerDisconnected { .. } => { /* clean up */ }
+///         ProtocolEvent::Message { from: _, payload: _ } => {
+///             let reply = Bytes::from_static(b"ack");
 ///             send_tx
 ///                 .send(ProtocolOutbound::Broadcast(reply))
 ///                 .await
@@ -267,6 +306,7 @@ pub enum ProtocolEvent {
 ///         }
 ///     }
 /// }
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct ProtocolHandle {
