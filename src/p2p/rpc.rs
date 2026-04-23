@@ -392,11 +392,8 @@ fn decode_frame(buf: &Bytes) -> Result<Frame, &'static str> {
     if buf.len() < HEADER_LEN {
         return Err("frame shorter than header");
     }
-    let request_id = u64::from_be_bytes(
-        buf[0..8]
-            .try_into()
-            .map_err(|_| "frame header truncated")?,
-    );
+    let request_id =
+        u64::from_be_bytes(buf[0..8].try_into().map_err(|_| "frame header truncated")?);
     let kind = buf[8];
     let method_id = u16::from_be_bytes(
         buf[9..11]
