@@ -1039,4 +1039,123 @@ mod tests {
         // Genesis is still in pending_blocks because no prune ran.
         assert!(core.state().pending_blocks.contains_key(&genesis.hash()));
     }
+
+    // ── D2: happy-path three consecutive proposals → Commit ─────────
+
+    #[test]
+    fn three_consecutive_proposals_commit_block_at_view_zero() {
+        // End-to-end happy path from #93's verification list: feed the
+        // core three proposals at views 1, 2, 3 through distinct
+        // `step()` calls. On the third, B5 commits the "block at view
+        // 0" — genesis — per the Chained HotStuff three-chain rule.
+        // Lock promotion fires for the first time on the third
+        // proposal (the grandparent finally becomes visible). The
+        // first two proposals emit only vote + high_qc adoption.
+        //
+        // This is the integration shape that exercises state
+        // accumulating across multiple `step` invocations — each
+        // unit test above holds one step; D2 is the only test that
+        // pins the cross-step behavior end-to-end.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
+        let block_v1 = chain[0].clone();
+        let block_v2 = chain[1].clone();
+        let block_v3 = chain[2].clone();
+
+        // ── Step 1 — proposal at view 1, parent=genesis ────────────
+        let justify_v0 = dummy_qc(0, genesis.hash());
+        let signed_v1 = signed_proposal(block_v1.clone(), justify_v0.clone(), nid(2));
+        let step1 = core.step(Event::ProposalReceived(signed_v1));
+
+        // B4 skips (grandparent is genesis's [0; 32] sentinel).
+        // B5 skips (great-grandparent missing).
+        // leader(2) = 2 % 4 = 2 → validators[2] = nid(3).
+        assert_eq!(
+            step1,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 1 }),
+                Action::Persist(StateUpdate::HighQc(justify_v0)),
+                Action::SendTo(
+                    nid(3),
+                    ConsensusMsg::Vote(Vote {
+                        view: 1,
+                        block_hash: block_v1.hash(),
+                    }),
+                ),
+            ],
+            "first proposal: vote + high_qc only",
+        );
+        assert!(core.state().locked.is_none());
+        assert_eq!(core.state().last_voted_view, 1);
+
+        // ── Step 2 — proposal at view 2, parent=block_v1 ───────────
+        let justify_v1 = dummy_qc(1, block_v1.hash());
+        let signed_v2 = signed_proposal(block_v2.clone(), justify_v1.clone(), nid(2));
+        let step2 = core.step(Event::ProposalReceived(signed_v2));
+
+        // B4: b'' = block_v1 (h=1), b' = genesis (h=0). Candidate at
+        // height 0 doesn't beat the `None → 0` baseline, so no
+        // promote. B5: walk hits genesis as b2 (h=0) and the
+        // sentinel as b1 — returns None.
+        // leader(3) = 3 % 4 = 3 → validators[3] = nid(4).
+        assert_eq!(
+            step2,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 2 }),
+                Action::Persist(StateUpdate::HighQc(justify_v1)),
+                Action::SendTo(
+                    nid(4),
+                    ConsensusMsg::Vote(Vote {
+                        view: 2,
+                        block_hash: block_v2.hash(),
+                    }),
+                ),
+            ],
+            "second proposal: still vote + high_qc only",
+        );
+        assert!(core.state().locked.is_none());
+        assert_eq!(core.state().last_voted_view, 2);
+
+        // ── Step 3 — proposal at view 3, parent=block_v2 ───────────
+        let justify_v2 = dummy_qc(2, block_v2.hash());
+        let signed_v3 = signed_proposal(block_v3.clone(), justify_v2.clone(), nid(2));
+        let step3 = core.step(Event::ProposalReceived(signed_v3));
+
+        // B4 fires: b'' = v2 (h=2), b' = v1 (h=1). Current lock
+        // baseline is 0, so candidate h=1 wins. Persist(Locked(v1)).
+        // B5 fires: walk v2 → v1 → genesis with consecutive views
+        // 2,1,0. Commit genesis; prune height ≤ 0.
+        // leader(4) = 4 % 4 = 0 → validators[0] = nid(1).
+        let expected_lock = Locked {
+            view: 1,
+            height: 1,
+            block_hash: block_v1.hash(),
+        };
+        assert_eq!(
+            step3,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 3 }),
+                Action::Persist(StateUpdate::HighQc(justify_v2)),
+                Action::SendTo(
+                    nid(1),
+                    ConsensusMsg::Vote(Vote {
+                        view: 3,
+                        block_hash: block_v3.hash(),
+                    }),
+                ),
+                Action::Persist(StateUpdate::Locked(expected_lock)),
+                Action::Commit(genesis.clone()),
+            ],
+            "third proposal: vote + high_qc + lock promote + Commit(genesis)",
+        );
+        assert_eq!(core.state().last_voted_view, 3);
+        assert_eq!(core.state().locked, Some(expected_lock));
+        // Genesis pruned; v1, v2, v3 remain.
+        let pending = &core.state().pending_blocks;
+        assert!(!pending.contains_key(&genesis.hash()));
+        assert!(pending.contains_key(&block_v1.hash()));
+        assert!(pending.contains_key(&block_v2.hash()));
+        assert!(pending.contains_key(&block_v3.hash()));
+    }
 }
