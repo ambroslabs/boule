@@ -1,6 +1,7 @@
 //! [`SimDriver`]: builds N nodes, wires them into a fully-connected mesh
-//! through in-memory duplex pipes, and exposes test-facing controls
-//! (inject gossip, advance time, run-until-quiescent, inspect stores).
+//! through scheduler-driven [`SimStream`] pairs, and exposes test-facing
+//! controls (inject gossip, advance time, run-until-quiescent, configure
+//! per-link faults, partition/heal).
 //!
 //! Tests using the driver must run on a `current_thread` runtime started
 //! with `start_paused = true` so the [`SimClock`] cooperates with tokio's
@@ -21,12 +22,9 @@ use crate::p2p::manager::{AnyStream, ManagerMsg};
 use crate::p2p::{ConnectionProtocol, NodeId, PeerCommand, ProtocolOutbound};
 
 use super::SimClock;
-use super::network::SimNetwork;
+use super::network::{LinkConfig, SimNetwork};
+use super::stream::{Inbox, SimStream};
 use super::transport::SimConnectionProtocol;
-
-/// Default duplex pipe buffer size. Generous enough that test-scale gossip
-/// won't block in [`tokio::io::AsyncWrite::poll_write`].
-const DUPLEX_BUF: usize = 64 * 1024;
 
 /// One sim node — manager + gossip engine + send handle for injecting messages.
 pub struct SimNode {
@@ -43,7 +41,6 @@ impl SimNode {
     /// Inject a gossip message at this node as if a local API client had
     /// posted it. Inserts into the local store and broadcasts to peers.
     pub async fn inject_gossip(&self, msg: GossipMessage, clock: &dyn Clock) {
-        // Mirror the API path: try_insert + broadcast.
         match self.store.try_insert(msg.clone(), clock.now_wall()) {
             gossip::InsertResult::Inserted => {
                 let encoded = serde_json::to_vec(&WireMessage::Gossip(msg))
@@ -66,31 +63,44 @@ impl SimNode {
 pub struct SimDriver {
     pub clock: Arc<SimClock>,
     nodes: Vec<SimNode>,
-    #[allow(dead_code)] // Held for sub-task #30 (fault injection) to consume.
-    network: Arc<SimNetwork>,
+    pub network: Arc<SimNetwork>,
 }
 
 impl SimDriver {
     /// Build a fully-connected mesh of `n` nodes. Must be called from inside
     /// a tokio `current_thread` runtime with `start_paused = true`.
     pub async fn new(n: usize, seed: u64) -> Self {
-        let clock = Arc::new(SimClock::new(Utc::now()));
-        let network = SimNetwork::new(seed);
+        let start_now = Utc::now();
+        let clock = Arc::new(SimClock::new(start_now));
+        let network = SimNetwork::new(seed, start_now);
 
-        // Generate distinct deterministic NodeIds. We seed from `n` so a
-        // larger mesh doesn't reuse a smaller one's IDs across tests.
         let node_ids: Vec<NodeId> = (0..n).map(deterministic_node_id).collect();
 
-        // For each unordered pair (i, j) with i < j, create a duplex pipe.
-        // node `i` gets the `a` half mapped to peer `j`; node `j` gets the
-        // `b` half mapped to peer `i`.
+        // For each unordered pair (i, j) with i < j, create two scheduler-
+        // driven streams (one per direction). Each side gets a SimStream
+        // configured with its outbound (from, to) and the inbound inbox the
+        // network will deliver to.
         let mut per_node_streams: Vec<Vec<(NodeId, SocketAddr, AnyStream)>> =
             (0..n).map(|_| Vec::new()).collect();
         for i in 0..n {
             for j in (i + 1)..n {
-                let (a, b) = tokio::io::duplex(DUPLEX_BUF);
-                per_node_streams[i].push((node_ids[j], sim_addr(j), Box::new(a)));
-                per_node_streams[j].push((node_ids[i], sim_addr(i), Box::new(b)));
+                let ai = node_ids[i];
+                let aj = node_ids[j];
+
+                // Inboxes: where bytes get delivered for each direction.
+                let inbox_to_i = Inbox::new(); // bytes flowing j → i land here
+                let inbox_to_j = Inbox::new(); // bytes flowing i → j land here
+
+                network.register_inbox(aj, ai, Arc::clone(&inbox_to_i));
+                network.register_inbox(ai, aj, Arc::clone(&inbox_to_j));
+
+                // i's stream: writes go i → j; reads pull from inbox_to_i.
+                let s_i = SimStream::new(Arc::clone(&network), ai, aj, inbox_to_i);
+                // j's stream: writes go j → i; reads pull from inbox_to_j.
+                let s_j = SimStream::new(Arc::clone(&network), aj, ai, inbox_to_j);
+
+                per_node_streams[i].push((aj, sim_addr(j), Box::new(s_i) as AnyStream));
+                per_node_streams[j].push((ai, sim_addr(i), Box::new(s_j) as AnyStream));
             }
         }
 
@@ -115,64 +125,131 @@ impl SimDriver {
         &self.nodes
     }
 
-    /// Advance both the virtual wall clock and tokio's paused timer by `dur`.
-    /// After this returns, any tokio sleep or interval scheduled to fire
-    /// within the elapsed window will be ready to make progress.
-    pub async fn advance(&self, dur: Duration) {
-        self.clock.advance_wall(dur);
-        tokio::time::advance(dur).await;
+    pub fn node_id(&self, idx: usize) -> NodeId {
+        self.nodes[idx].node_id
     }
 
-    /// Yield repeatedly until no node makes observable progress for
-    /// `quiescent_passes` consecutive yields, or the wall-clock budget
-    /// `max_real_wait` is exhausted.
-    ///
-    /// "Observable progress" is measured as the sum of stored message
-    /// counts across nodes. This is a coarse proxy that's good enough for
-    /// the gossip-flood test; later sub-issues will replace it with an
-    /// event-queue-aware drain once the central scheduler exists.
-    pub async fn run_until_quiescent(&self) {
-        const QUIESCENT_PASSES: usize = 8;
-        const MAX_PASSES: usize = 10_000;
+    /// Configure both directions of the link between two nodes to the given
+    /// config. For asymmetric links use [`set_link_directional`].
+    pub fn set_link(&self, a_idx: usize, b_idx: usize, config: LinkConfig) {
+        let a = self.node_id(a_idx);
+        let b = self.node_id(b_idx);
+        self.network.set_link(a, b, config.clone());
+        self.network.set_link(b, a, config);
+    }
 
-        let mut last_total = self.total_messages();
-        let mut stable = 0usize;
-        for _ in 0..MAX_PASSES {
-            tokio::task::yield_now().await;
-            let now_total = self.total_messages();
-            if now_total == last_total {
-                stable += 1;
-                if stable >= QUIESCENT_PASSES {
-                    return;
+    pub fn set_link_directional(&self, from_idx: usize, to_idx: usize, config: LinkConfig) {
+        self.network
+            .set_link(self.node_id(from_idx), self.node_id(to_idx), config);
+    }
+
+    /// Take down both directions of the link between two nodes.
+    pub fn partition_pair(&self, a_idx: usize, b_idx: usize) {
+        self.network
+            .partition(self.node_id(a_idx), self.node_id(b_idx));
+    }
+
+    /// Re-enable both directions of the link between two nodes.
+    pub fn heal_pair(&self, a_idx: usize, b_idx: usize) {
+        self.network.heal(self.node_id(a_idx), self.node_id(b_idx));
+    }
+
+    /// Cut every link between the two groups (bidirectional). Links inside
+    /// each group are untouched.
+    pub fn partition_groups(&self, group_a: &[usize], group_b: &[usize]) {
+        for &i in group_a {
+            for &j in group_b {
+                if i != j {
+                    self.partition_pair(i, j);
                 }
-            } else {
-                stable = 0;
-                last_total = now_total;
             }
         }
     }
 
-    fn total_messages(&self) -> usize {
+    /// Re-enable every link between the two groups.
+    pub fn heal_groups(&self, group_a: &[usize], group_b: &[usize]) {
+        for &i in group_a {
+            for &j in group_b {
+                if i != j {
+                    self.heal_pair(i, j);
+                }
+            }
+        }
+    }
+
+    /// Advance both the virtual wall clock and tokio's paused timer by `dur`.
+    pub async fn advance(&self, dur: Duration) {
+        self.clock.advance_wall(dur);
+        self.network.set_now(self.clock.now_wall());
+        tokio::time::advance(dur).await;
+    }
+
+    /// Drive the simulation until no scheduled events remain and tasks have
+    /// stopped emitting new ones for several consecutive yield rounds.
+    ///
+    /// Algorithm:
+    /// 1. Yield to let writer tasks push fresh events into the network.
+    /// 2. Flush reorder buffers (so partial windows aren't stranded).
+    /// 3. While the queue is non-empty, pop the next event, advance virtual
+    ///    time to its scheduled instant (in lockstep with tokio's paused
+    ///    timer), deliver bytes, yield to let the reader task consume.
+    /// 4. Repeat until N consecutive idle passes show no new events.
+    pub async fn run_until_quiescent(&self) {
+        const QUIESCENT_PASSES: usize = 8;
+        const MAX_PASSES: usize = 100_000;
+
+        let mut idle = 0usize;
+        for _ in 0..MAX_PASSES {
+            // Let writer tasks push.
+            tokio::task::yield_now().await;
+
+            self.network.flush_reorder_buffers();
+
+            let mut delivered_any = false;
+            while let Some(target_time) = self.network.try_deliver_one() {
+                self.advance_clock_to(target_time).await;
+                delivered_any = true;
+                // Let the reader task consume the bytes before the next pop.
+                tokio::task::yield_now().await;
+            }
+
+            if delivered_any {
+                idle = 0;
+            } else {
+                idle += 1;
+                if idle >= QUIESCENT_PASSES {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Advance the virtual wall clock and tokio's paused timer to `target`.
+    /// No-op if `target` is in the past.
+    async fn advance_clock_to(&self, target: DateTime<Utc>) {
         let now = self.clock.now_wall();
-        self.nodes
-            .iter()
-            .map(|n| n.store.list_live(now).len())
-            .sum()
+        if target <= now {
+            return;
+        }
+        let delta = target
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or_default();
+        if delta.is_zero() {
+            return;
+        }
+        self.advance(delta).await;
     }
 }
 
 fn sim_addr(idx: usize) -> SocketAddr {
-    // Loopback in the documentation/test range. Only used for log lines.
     SocketAddr::from(([127, 0, 0, 1], 65000 + idx as u16))
 }
 
 fn deterministic_node_id(idx: usize) -> NodeId {
-    // Distinct, deterministic, easy to read in logs. NodeId is `[u8; 32]`.
     let mut id = [0u8; 32];
     id[31] = idx as u8;
     id[30] = (idx >> 8) as u8;
-    // Avoid the all-zero ID, which the manager treats specially in some
-    // log lines and which is reserved as a "no peer" sentinel by tests.
     id[0] = 0xA1;
     id
 }
@@ -200,8 +277,6 @@ async fn build_node(
 
     let store = Arc::new(GossipStore::new());
 
-    // Register the gossip protocol BEFORE the connection protocol fires
-    // NewConnection events, so PeerConnected isn't lost.
     let (reg_tx, reg_rx) = oneshot::channel();
     cmd_tx
         .send(PeerCommand::RegisterProtocol {
@@ -219,8 +294,6 @@ async fn build_node(
         tokio::spawn(gossip::engine::run(gossip_handle, store, clock))
     };
 
-    // Hand pre-established peer streams to the manager via the
-    // SimConnectionProtocol shim.
     let protocol = SimConnectionProtocol {
         peers: peer_streams,
     };

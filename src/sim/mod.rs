@@ -31,10 +31,12 @@
 pub mod clock;
 pub mod driver;
 pub mod network;
+pub mod stream;
 pub mod transport;
 
 pub use clock::SimClock;
 pub use driver::SimDriver;
+pub use network::{LatencyDist, LinkConfig};
 
 #[cfg(test)]
 mod sim_gossip;
