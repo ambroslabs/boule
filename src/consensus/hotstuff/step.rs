@@ -193,10 +193,34 @@ impl HotStuffCore {
     /// React to `event` and return the [`Action`]s the integration
     /// layer must carry out, in emission order.
     ///
-    /// **Scaffold.** Every dispatch rule from #93 is introduced by a
-    /// later commit alongside the unit test that pins its behavior;
-    /// for now, `step` is the identity-over-no-effect function.
-    pub fn step(&mut self, _event: Event) -> Vec<Action> {
+    /// Dispatch lands one branch at a time; the rules for events whose
+    /// branches aren't in place yet return an empty vector (a harmless
+    /// safe-by-default).
+    pub fn step(&mut self, event: Event) -> Vec<Action> {
+        match event {
+            Event::ProposalReceived(signed) => self.on_proposal_received(signed),
+            Event::VoteReceived(_)
+            | Event::NewViewReceived(_)
+            | Event::PacemakerAdvance(_) => Vec::new(),
+        }
+    }
+
+    /// Handle an inbound [`Proposal`]. Branches land in separate
+    /// commits per the #93 breakdown; this one implements only the
+    /// missing-parent case (B1). Everything else returns no actions.
+    fn on_proposal_received(&mut self, signed: Signed<Proposal>) -> Vec<Action> {
+        let parent_hash = signed.payload.block.header.parent_hash;
+        // B1: parent isn't in `pending_blocks` — we can't evaluate
+        // extension against our locked block without it. Ask the
+        // sender for the missing block and park the child so a later
+        // `PacemakerAdvance` (or explicit re-drive) can re-run
+        // dispatch once the parent arrives.
+        if !self.state.pending_blocks.contains_key(&parent_hash) {
+            let child_hash = signed.payload.block.hash();
+            let sender = signed.signer;
+            self.parked_proposals.insert(child_hash, signed);
+            return vec![Action::RequestBlock(parent_hash, sender)];
+        }
         Vec::new()
     }
 
