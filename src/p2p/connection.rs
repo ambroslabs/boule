@@ -421,6 +421,61 @@ mod tests {
         );
     }
 
+    // ── Property tests (issue #52) ──────────────────────────────────────────
+
+    use proptest::prelude::*;
+    use tokio_util::codec::{Decoder, Encoder};
+
+    fn fresh_codec() -> LengthDelimitedCodec {
+        LengthDelimitedCodec::builder()
+            .max_frame_length(DEFAULT_MAX_FRAME_LEN)
+            .new_codec()
+    }
+
+    proptest! {
+        // Any body up to the cap encodes into a single length-prefixed frame
+        // that decodes back to the original bytes. Catches off-by-one errors
+        // at buffer boundaries and the empty-body case in one sweep.
+        #[test]
+        fn prop_length_delimited_round_trips(
+            body in proptest::collection::vec(any::<u8>(), 0..=8192),
+        ) {
+            let mut encoder = fresh_codec();
+            let mut buf = BytesMut::new();
+            encoder.encode(Bytes::from(body.clone()), &mut buf).unwrap();
+
+            let mut decoder = fresh_codec();
+            let frame = decoder.decode(&mut buf).unwrap().expect("complete frame decodes");
+            prop_assert_eq!(frame.as_ref(), body.as_slice());
+
+            // Anything left in the buffer after one frame came out is a bug.
+            prop_assert!(buf.is_empty());
+            prop_assert!(decoder.decode(&mut buf).unwrap().is_none());
+        }
+
+        // Feeding arbitrary bytes to the decoder must never panic. The
+        // codec either returns an incomplete frame (Ok(None)), a valid
+        // frame whose length prefix fit the cap (Ok(Some(_))), or an
+        // oversize / truncated-prefix error — none of which may unwind.
+        #[test]
+        fn prop_decode_arbitrary_bytes_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            let mut decoder = fresh_codec();
+            let mut buf = BytesMut::from(bytes.as_slice());
+            // Drain until the decoder stops producing frames or errors out.
+            // A malformed / oversize length prefix must surface as Err and
+            // must not panic regardless of what the random bytes looked like.
+            for _ in 0..8 {
+                match decoder.decode(&mut buf) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+
     /// End-to-end orderly shutdown over real TLS: one side runs
     /// `connection::run` and closes cleanly; the other side reads framed
     /// bytes and must see a clean EOF (`None`) instead of rustls'
