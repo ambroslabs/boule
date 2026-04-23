@@ -15,16 +15,16 @@
 //! representation of the envelope. That pre-image is:
 //!
 //! ```text
-//! be_u32(|domain|) || domain || bincode(payload)
+//! be_u32(|domain|) || domain || postcard(payload)
 //! ```
 //!
 //! The domain tag is fixed per payload type via [`SignedMessage::DOMAIN`],
 //! preventing a signature produced in one context from being replayed in
 //! another (e.g. a vote signature reinterpreted as a proposal signature).
-//! Bincode with its default (fixed-int) configuration is deterministic for
-//! the fixed-shape payloads we sign — structs, enums, primitives, arrays.
-//! Callers should avoid payloads whose serialization is order-dependent
-//! (e.g. `HashMap`); prefer `BTreeMap` or explicit sequences.
+//! Postcard is deterministic for the fixed-shape payloads we sign —
+//! structs, enums, primitives, arrays. Callers should avoid payloads
+//! whose serialization is order-dependent (e.g. `HashMap`); prefer
+//! `BTreeMap` or explicit sequences.
 
 use anyhow::{Context as _, Result, bail};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
@@ -129,13 +129,13 @@ where
     }
 }
 
-/// Canonical signing pre-image: `be_u32(|domain|) || domain || bincode(payload)`.
+/// Canonical signing pre-image: `be_u32(|domain|) || domain || postcard(payload)`.
 fn preimage<T: Serialize + SignedMessage>(payload: &T) -> Result<Vec<u8>> {
     let domain = T::DOMAIN.as_bytes();
     if domain.len() > u32::MAX as usize {
         bail!("domain tag too long");
     }
-    let body = bincode::serialize(payload).context("serializing payload for signing")?;
+    let body = postcard::to_stdvec(payload).context("serializing payload for signing")?;
     let mut out = Vec::with_capacity(4 + domain.len() + body.len());
     out.extend_from_slice(&(domain.len() as u32).to_be_bytes());
     out.extend_from_slice(domain);
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn sign_verify_round_trip_through_bincode() {
+    fn sign_verify_round_trip_through_postcard() {
         let signer = fresh_signer();
         let vote = Vote {
             round: 42,
@@ -218,8 +218,8 @@ mod tests {
         let signed = Signed::sign(vote.clone(), &signer).unwrap();
 
         // Serialize the envelope, deserialize it, verify on the reconstructed copy.
-        let wire = bincode::serialize(&signed).unwrap();
-        let recovered: Signed<Vote> = bincode::deserialize(&wire).unwrap();
+        let wire = postcard::to_stdvec(&signed).unwrap();
+        let recovered: Signed<Vote> = postcard::from_bytes(&wire).unwrap();
 
         assert_eq!(recovered.payload, vote);
         assert_eq!(recovered.signer, signer.node_id());
