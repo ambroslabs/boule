@@ -318,60 +318,11 @@ async fn test_expired_messages_are_rejected() {
     assert_eq!(resp.status(), 400);
 }
 
-#[tokio::test]
-async fn test_expired_messages_are_cleaned_up() {
-    let (node1, node2, node3) = start_cluster().await;
-    let _ = (&node2, &node3); // keep alive
-
-    let client = reqwest::Client::new();
-    // Expire in 2 seconds; cleanup_interval_secs = 5 in the test config.
-    let expiry = expiry_from_now(2);
-
-    let resp = client
-        .post(node1.api_url("/messages"))
-        .json(&json!({ "content": "short lived", "expiry": expiry }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-
-    // Message should be visible immediately.
-    let msgs: Value = client
-        .get(node1.api_url("/messages"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(
-        msgs.as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["content"] == "short lived"),
-        "message should be visible before expiry"
-    );
-
-    // Wait past expiry + one cleanup cycle (2s expiry + 5s interval + 1s buffer = 8s).
-    tokio::time::sleep(Duration::from_secs(8)).await;
-
-    let msgs: Value = client
-        .get(node1.api_url("/messages"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(
-        !msgs
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["content"] == "short lived"),
-        "message should be gone after cleanup"
-    );
-}
+// Expiry-cleanup coverage lives in the deterministic simulator now — see
+// `src/sim/sim_gossip.rs::expired_messages_are_cleaned_up_under_sim_clock`.
+// The wall-clock version of this test used to sleep 8s here, which made CI
+// flaky and dominated the runtime of this file; the sim-clock port runs
+// the same scenario (inject, expire, cleanup sweep) in virtual time.
 
 /// Boots two nodes with `[node.identity] backend = "file"` (the new schema)
 /// and verifies they connect to each other. Covers the end-to-end path that
@@ -446,12 +397,14 @@ async fn test_ping_rpc_to_unknown_peer_fails() {
 
     // Valid base58 but a node ID that isn't connected. The call should time
     // out (since SendTo drops silently to unknown peers) rather than succeed.
+    // Use a short per-call timeout so the test stays under the wall-clock
+    // budget; the timeout path is identical regardless of duration.
     let fake_peer = "11111111111111111111111111111111";
 
     let client = reqwest::Client::new();
     let resp = client
         .post(node.api_url(&format!("/rpc/ping/{fake_peer}")))
-        .json(&json!({ "payload": "lost in space" }))
+        .json(&json!({ "payload": "lost in space", "timeout_ms": 300 }))
         .send()
         .await
         .expect("POST /rpc/ping failed");
