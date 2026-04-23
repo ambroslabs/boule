@@ -30,9 +30,12 @@
 #![allow(dead_code)]
 
 pub mod impls;
+pub mod mempool;
 pub mod state_machine;
 
 #[allow(unused_imports)]
-pub use impls::CounterStateMachine;
+pub use impls::{CounterStateMachine, InMemoryMempool};
+#[allow(unused_imports)]
+pub use mempool::Mempool;
 #[allow(unused_imports)]
 pub use state_machine::StateMachine;
