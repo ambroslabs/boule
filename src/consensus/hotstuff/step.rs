@@ -1748,4 +1748,264 @@ mod tests {
             "step 9 (PacemakerAdvance) must broadcast NewView",
         );
     }
+
+    // ── E1 / E4: Multi-replica property-test harness ────────────────
+    //
+    // The harness lives as a nested `mod property` so clippy's
+    // `items_after_test_module` stays happy (only one top-level
+    // `#[cfg(test)] mod tests` in the file). Later commits add the
+    // invariant function and the proptest driver; this module ships
+    // the deterministic fixture plus a hand-built end-to-end test
+    // that proves the bus wiring before any randomization.
+
+    mod property {
+        //! Deterministic simulator for `n = 3f + 1` honest HotStuff
+        //! replicas.
+        //!
+        //! `ReplicaSet` owns one [`HotStuffCore`] per validator, plus
+        //! a per-replica inbox of pending [`Event`]s. `apply_actions`
+        //! converts each replica's emitted [`Action`]s into the
+        //! appropriate inbox pushes on the other replicas — the
+        //! "fake bus" from #93's property-test spec. No clock, no
+        //! network; just deterministic delivery.
+        //!
+        //! `Persist` and `RequestBlock` actions are ignored in the
+        //! sim: the harness doesn't model durability (the cores'
+        //! in-memory state is the source of truth) and every block
+        //! the cores need is delivered inline via `ProposalReceived`
+        //! events, so no fetch path is necessary.
+
+        use std::collections::{BTreeMap, VecDeque};
+
+        use super::*;
+
+        /// The four-nids-with-increasing-bytes layout from the unit
+        /// tests generalized to arbitrary `n`: validator `i` has
+        /// NodeId `[i as u8 + 1; 32]` so `validators[i].cmp(validators[j])`
+        /// matches `i.cmp(&j)` — the `RoundRobinSelector` inside each
+        /// core maps view `v` to validator index `v % n`.
+        pub(crate) fn validator_set(n: usize) -> ValidatorSet {
+            let members: Vec<NodeId> = (1..=n as u8).map(|b| [b; 32]).collect();
+            ValidatorSet::new(members)
+        }
+
+        pub(crate) struct ReplicaSet {
+            pub cores: Vec<HotStuffCore>,
+            pub inboxes: Vec<VecDeque<Event>>,
+            pub commits: Vec<BTreeMap<u64, Block>>,
+            pub validators: ValidatorSet,
+            pub genesis: Block,
+        }
+
+        impl ReplicaSet {
+            /// Build `n` replicas over the canonical validator set,
+            /// each with its own `TestBlockBuilder` stamped with
+            /// that replica's NodeId as the proposer.
+            pub fn new(n: usize) -> Self {
+                let validators = validator_set(n);
+                let genesis = Block::genesis([0; 32]);
+                let cores: Vec<HotStuffCore> = (0..n)
+                    .map(|i| {
+                        let nid = *validators.get(i).unwrap();
+                        let state = HotStuffState::new(validators.clone(), genesis.clone());
+                        let builder = Arc::new(TestBlockBuilder { proposer: nid });
+                        HotStuffCore::new(nid, state, builder)
+                    })
+                    .collect();
+                let inboxes = (0..n).map(|_| VecDeque::new()).collect();
+                let commits = (0..n).map(|_| BTreeMap::new()).collect();
+                Self {
+                    cores,
+                    inboxes,
+                    commits,
+                    validators,
+                    genesis,
+                }
+            }
+
+            pub fn len(&self) -> usize {
+                self.cores.len()
+            }
+
+            /// Queue `event` for `replica`'s next `deliver_one`.
+            pub fn inject(&mut self, replica: usize, event: Event) {
+                self.inboxes[replica].push_back(event);
+            }
+
+            /// Queue `event` for every replica's inbox.
+            pub fn inject_all(&mut self, event: Event) {
+                for i in 0..self.cores.len() {
+                    self.inject(i, event.clone());
+                }
+            }
+
+            /// Pop the next pending event for `replica` and feed it
+            /// through `step`. Returns `true` if an event was
+            /// delivered, `false` if the inbox was empty.
+            pub fn deliver_one(&mut self, replica: usize) -> bool {
+                let Some(event) = self.inboxes[replica].pop_front() else {
+                    return false;
+                };
+                let actions = self.cores[replica].step(event);
+                self.apply_actions(replica, actions);
+                true
+            }
+
+            fn apply_actions(&mut self, source: usize, actions: Vec<Action>) {
+                let source_nid = *self.validators.get(source).unwrap();
+                for action in actions {
+                    match action {
+                        Action::Broadcast(msg) => {
+                            for target in 0..self.cores.len() {
+                                self.inboxes[target]
+                                    .push_back(event_from_msg(source_nid, msg.clone()));
+                            }
+                        }
+                        Action::SendTo(target_id, msg) => {
+                            if let Some(target) = self.validators.index_of(&target_id) {
+                                self.inboxes[target].push_back(event_from_msg(source_nid, msg));
+                            }
+                        }
+                        Action::Commit(block) => {
+                            self.commits[source].insert(block.header.height, block);
+                        }
+                        // Safety-core effects the harness doesn't
+                        // model. `Persist` is durability, `RequestBlock`
+                        // is sync; both are integration-layer jobs.
+                        Action::Persist(_) | Action::RequestBlock(_, _) => {}
+                    }
+                }
+            }
+
+            /// Round-robin deliver for up to `max_rounds` passes, or
+            /// until every inbox is empty. Does NOT panic on
+            /// non-quiescence: honest HotStuff is self-sustaining
+            /// (each successful view triggers the next), so tests
+            /// bound the run explicitly and inspect the recorded
+            /// commits afterwards.
+            pub fn run_bounded(&mut self, max_rounds: usize) {
+                for _ in 0..max_rounds {
+                    let mut progress = false;
+                    for i in 0..self.cores.len() {
+                        if self.deliver_one(i) {
+                            progress = true;
+                        }
+                    }
+                    if !progress {
+                        return;
+                    }
+                }
+            }
+
+            /// Seed a fully-signed QC over `(view, block_hash)` —
+            /// exactly what `HotStuff::add_signature` would produce
+            /// from `n` real validators voting. Used for crafting
+            /// the kickoff proposal; not something the safety core
+            /// would ever build internally.
+            pub fn synth_qc(&self, view: View, block_hash: BlockHash) -> QuorumCertificate {
+                let mut qc = QuorumCertificate::new(view, block_hash, self.validators.len());
+                for i in 0..self.validators.len() {
+                    qc.add_signature(i, [i as u8 + 1; 64]);
+                }
+                qc
+            }
+        }
+
+        /// Wrap a `ConsensusMsg` from `source` in the corresponding
+        /// `Signed<_>` envelope and promote it to the matching
+        /// `Event` kind. Signatures aren't verified by the safety
+        /// core, so we stamp a zero sig.
+        fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
+            let sig = [0u8; 64];
+            match msg {
+                ConsensusMsg::Proposal(payload) => Event::ProposalReceived(Signed {
+                    payload,
+                    signer: source,
+                    sig,
+                }),
+                ConsensusMsg::Vote(payload) => Event::VoteReceived(Signed {
+                    payload,
+                    signer: source,
+                    sig,
+                }),
+                ConsensusMsg::NewView(payload) => Event::NewViewReceived(Signed {
+                    payload,
+                    signer: source,
+                    sig,
+                }),
+            }
+        }
+
+        // ── Hand-built deterministic driver ────────────────────────
+
+        /// Build a view-1 kickoff proposal rooted on `genesis` with a
+        /// synthesized genesis QC as its justify. The leader of view
+        /// 1 (`validators[1]`) would normally produce this after
+        /// collecting view-0 NewView messages; we bypass bootstrap
+        /// by injecting it as an incoming event.
+        fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
+            let genesis_qc = replicas.synth_qc(0, replicas.genesis.hash());
+            let leader_idx = 1 % replicas.len();
+            let leader_nid = *replicas.validators.get(leader_idx).unwrap();
+            let builder = TestBlockBuilder {
+                proposer: leader_nid,
+            };
+            let block_v1 = builder.build(&replicas.genesis, 1, &genesis_qc);
+            Signed {
+                payload: Proposal {
+                    block: block_v1,
+                    justify: genesis_qc,
+                },
+                signer: leader_nid,
+                sig: [0u8; 64],
+            }
+        }
+
+        #[test]
+        fn four_honest_replicas_agree_on_a_commit() {
+            // Smoke test: n = 3f + 1 for f = 1. Kick off view 1 by
+            // broadcasting a hand-crafted proposal to every replica,
+            // run the bus to quiescence, and assert all four
+            // replicas record a commit. The committed block must be
+            // byte-identical across replicas — same hash on every
+            // history.
+            //
+            // This is the minimum proof that the bus correctly
+            // relays `SendTo(leader, Vote)` and `Broadcast(Proposal)`
+            // between cores. If any action kind were mishandled, the
+            // run would either hang past `run_to_quiescence`'s
+            // bound or produce divergent commit sets.
+            let mut replicas = ReplicaSet::new(4);
+            let kickoff = kickoff_proposal(&replicas);
+            replicas.inject_all(Event::ProposalReceived(kickoff));
+
+            // Honest HotStuff keeps going indefinitely; bound the
+            // run and inspect commits afterwards. 64 rounds is
+            // comfortably past the ~8 rounds to the first commit on
+            // this schedule.
+            replicas.run_bounded(64);
+
+            // Every replica committed at least one block.
+            for i in 0..replicas.len() {
+                assert!(
+                    !replicas.commits[i].is_empty(),
+                    "replica {i} recorded no commits: did the bus hang?",
+                );
+            }
+
+            // The first committed block (lowest height) must match
+            // across replicas.
+            let (&h0, b0) = replicas.commits[0].iter().next().unwrap();
+            for i in 1..replicas.len() {
+                let other = replicas.commits[i]
+                    .get(&h0)
+                    .unwrap_or_else(|| panic!("replica {i} missing commit at height {h0}"));
+                assert_eq!(
+                    other.hash(),
+                    b0.hash(),
+                    "replica {i}'s block at height {h0} diverges from replica 0's",
+                );
+            }
+        }
+    }
 }
