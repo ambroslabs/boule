@@ -2220,5 +2220,139 @@ mod tests {
                 assert_no_conflicting_commits(&replicas);
             }
         }
+
+        // ── β3: Byzantine proposal strategy ─────────────────────────
+        //
+        // A Byzantine proposer can craft a `Signed<Proposal>` with
+        // any block contents and any justify QC. Because the safety
+        // core explicitly doesn't verify QC signatures (that's the
+        // integration layer's job per #24), this covers the
+        // "proposal with bogus justify" attack from #93's
+        // verification list: the core trusts the `justify` view
+        // field but can only vote on a proposal that passes
+        // `safe_to_vote`, so a fake justify.view attempting to hit
+        // the liveness rule needs the block to either not extend
+        // the lock or to be fresh-view relative to it. Either way,
+        // safety of committed blocks must hold.
+
+        #[derive(Debug, Clone)]
+        enum ByzantineProposalStep {
+            Deliver(usize),
+            InjectProposal {
+                parent_hash: BlockHash,
+                view: View,
+                justify_view: View,
+                justify_block_hash: BlockHash,
+                target_honest: usize,
+            },
+        }
+
+        fn byzantine_proposal_step_strategy(
+            n_honest: usize,
+        ) -> impl Strategy<Value = ByzantineProposalStep> {
+            prop_oneof![
+                3 => (0..n_honest).prop_map(ByzantineProposalStep::Deliver),
+                1 => (
+                    prop::array::uniform32(any::<u8>()),
+                    0u64..10,
+                    0u64..10,
+                    prop::array::uniform32(any::<u8>()),
+                    0..n_honest,
+                )
+                    .prop_map(
+                        |(parent_hash, view, justify_view, justify_block_hash, target_honest)| {
+                            ByzantineProposalStep::InjectProposal {
+                                parent_hash,
+                                view,
+                                justify_view,
+                                justify_block_hash,
+                                target_honest,
+                            }
+                        },
+                    ),
+            ]
+        }
+
+        /// Assemble a `Signed<Proposal>` from a Byzantine adversary:
+        /// arbitrary block over `parent_hash` at `view`, arbitrary
+        /// justify-QC with the claimed signatures the safety core
+        /// won't actually verify.
+        fn byzantine_proposal(
+            n_validators: usize,
+            byz_nid: NodeId,
+            parent_hash: BlockHash,
+            view: View,
+            justify_view: View,
+            justify_block_hash: BlockHash,
+        ) -> Signed<Proposal> {
+            let header = BlockHeader {
+                parent_hash,
+                height: view,
+                view,
+                proposer: byz_nid,
+                state_commitment: [view as u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            };
+            let block = Block {
+                header,
+                commands: Vec::new(),
+            };
+            let mut justify =
+                QuorumCertificate::new(justify_view, justify_block_hash, n_validators);
+            // Synthesize a full set of fake signatures. The safety
+            // core doesn't verify them; this just clears
+            // `has_quorum` so the core treats the QC as legitimate.
+            for i in 0..n_validators {
+                justify.add_signature(i, [i as u8 + 1; 64]);
+            }
+            Signed {
+                payload: Proposal { block, justify },
+                signer: byz_nid,
+                sig: [0u8; 64],
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn byzantine_proposals_never_break_safety(
+                schedule in proptest::collection::vec(
+                    byzantine_proposal_step_strategy(3),
+                    1..=200,
+                ),
+            ) {
+                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
+                let byz_nid = replicas.byzantine_nids()[0];
+                let n_validators = replicas.validators.len();
+                let kickoff = kickoff_proposal(&replicas);
+                replicas.inject_all(Event::ProposalReceived(kickoff));
+
+                for step in schedule {
+                    match step {
+                        ByzantineProposalStep::Deliver(i) => {
+                            replicas.deliver_one(i);
+                        }
+                        ByzantineProposalStep::InjectProposal {
+                            parent_hash,
+                            view,
+                            justify_view,
+                            justify_block_hash,
+                            target_honest,
+                        } => {
+                            let proposal = byzantine_proposal(
+                                n_validators,
+                                byz_nid,
+                                parent_hash,
+                                view,
+                                justify_view,
+                                justify_block_hash,
+                            );
+                            replicas.inject(target_honest, Event::ProposalReceived(proposal));
+                        }
+                    }
+                }
+
+                assert_no_conflicting_commits(&replicas);
+            }
+        }
     }
 }
