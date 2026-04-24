@@ -403,10 +403,7 @@ impl ConsensusNode {
     /// is already a sane snapshot (current_view=0 on a fresh boot),
     /// so the HTTP endpoint never returns 500 during the window between
     /// node construction and the first event-loop tick.
-    pub fn with_status_publisher(
-        mut self,
-        tx: watch::Sender<Arc<ConsensusStatus>>,
-    ) -> Self {
+    pub fn with_status_publisher(mut self, tx: watch::Sender<Arc<ConsensusStatus>>) -> Self {
         self.status_tx = Some(tx);
         self
     }

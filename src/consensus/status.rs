@@ -190,7 +190,10 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
 
         // Top-level scalar fields.
-        assert_eq!(json["node_id"], "DmX44PdK8JNVZUkbLTpD3W5ngmVnWBGyYrmFhh2Mkdb4");
+        assert_eq!(
+            json["node_id"],
+            "DmX44PdK8JNVZUkbLTpD3W5ngmVnWBGyYrmFhh2Mkdb4"
+        );
         assert_eq!(json["self_role"], "leader(view=157)");
         assert_eq!(json["current_view"], 157);
         assert_eq!(json["last_voted_view"], 156);

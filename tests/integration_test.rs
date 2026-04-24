@@ -748,8 +748,13 @@ async fn start_consensus_cluster(n: usize) -> (Vec<NodeGuard>, Vec<tempfile::Tem
             })
             .collect();
         guards.push(
-            spawn_consensus_node(&spec.key_path, &spec.p2p_addr, &peer_descs, &validators_toml)
-                .await,
+            spawn_consensus_node(
+                &spec.key_path,
+                &spec.p2p_addr,
+                &peer_descs,
+                &validators_toml,
+            )
+            .await,
         );
     }
 
