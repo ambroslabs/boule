@@ -33,6 +33,12 @@ cargo doc --document-private-items --open
 
 # Doctests (any code in `//!` / `///` blocks)
 cargo test --doc
+
+# HotStuff safety-core property tests at higher seed counts. The
+# default (256 cases) runs in about a second; deeper runs catch
+# rarer Byzantine interleavings. A failing case is saved to
+# `proptest-regressions/` so the exact seed persists across runs.
+PROPTEST_CASES=4096 cargo test -p ambros-p2p --lib consensus::hotstuff::step::tests::property
 ```
 
 Format and lint before pushing:
