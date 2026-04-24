@@ -10,6 +10,7 @@ use tracing::{info, warn};
 use ambros_p2p::clock::{Clock, TokioClock};
 use ambros_p2p::config::{self, ConsensusConfig, IdentityConfig, NodeConfig};
 use ambros_p2p::consensus::node::{ConsensusNode, NodeConfigForConsensus};
+use ambros_p2p::consensus::status::ConsensusStatus;
 use ambros_p2p::consensus::validator_set::ValidatorSet;
 use ambros_p2p::crypto::signed::NodeSigner;
 use ambros_p2p::gossip;
@@ -26,13 +27,32 @@ use ambros_p2p::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storag
 const ENV_PRODUCTION: &str = "AMBROS_ENV";
 const DEFAULT_KEY_FILE: &str = "node.key";
 
+/// Initialize the tracing subscriber.
+///
+/// Honors two environment variables:
+///
+/// - `RUST_LOG`: standard `tracing-subscriber` env filter. Defaults to
+///   `ambros_p2p=info`. Set to `info,ambros_p2p::consensus=debug` to get
+///   the structured event-boundary logs the consensus layer emits.
+/// - `RUST_LOG_FORMAT`: `pretty` (default) or `json`. JSON emits one
+///   structured event per line, which operators can pipe through `jq` to
+///   filter across nodes.
 fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ambros_p2p=info".into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "ambros_p2p=info".into());
+
+    let json = std::env::var("RUST_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    if json {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 }
 
 #[tokio::main]
@@ -255,7 +275,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let api_listener = TcpListener::bind(config.api.listen_addr).await?;
     let api_actual_addr = api_listener.local_addr()?;
     let api_handle = {
-        let app = axum::Router::new()
+        let mut app = axum::Router::new()
             .merge(p2p::api::router(p2p_cmd_tx.clone()))
             .merge(gossip::api::router(
                 Arc::clone(&store),
@@ -263,6 +283,13 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
                 Arc::clone(&clock),
             ))
             .merge(ping::router(ping_rpc));
+        // Mount the consensus admin routes only when consensus is
+        // running — on a gossip-only node, hitting `/consensus/status`
+        // naturally returns 404, matching the design-issue acceptance
+        // criterion.
+        if let Some((_, _, ref status_rx)) = consensus_runtime {
+            app = app.merge(ambros_p2p::consensus::api::router(status_rx.clone()));
+        }
         tokio::spawn(async move {
             info!("HTTP API listening on {api_actual_addr}");
             axum::serve(api_listener, app).await.unwrap();
@@ -301,7 +328,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     drop(p2p_cmd_tx);
 
     // Signal the consensus loop to exit before awaiting joins below.
-    let consensus_join = consensus_runtime.map(|(handle, sd)| {
+    let consensus_join = consensus_runtime.map(|(handle, sd, _status_rx)| {
         let _ = sd.send(());
         handle
     });
@@ -336,6 +363,7 @@ async fn start_consensus(
 ) -> anyhow::Result<(
     tokio::task::JoinHandle<anyhow::Result<()>>,
     oneshot::Sender<()>,
+    watch::Receiver<Arc<ConsensusStatus>>,
 )> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     info!(
@@ -388,11 +416,20 @@ async fn start_consensus(
 
     let node = ConsensusNode::recover(*self_id, node_cfg, state_machine, mempool, storage, wal)?;
 
+    // Seed the status watch-channel with an initial snapshot before
+    // the event loop starts, so callers hitting /consensus/status in
+    // the tiny window between `start_consensus` returning and the
+    // first event-loop tick see a sane all-zero state rather than a
+    // blocked read.
+    let initial_status = Arc::new(node.build_status());
+    let (status_tx, status_rx) = watch::channel(initial_status);
+    let node = node.with_status_publisher(status_tx);
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let signer = Arc::clone(signer) as Arc<dyn ambros_p2p::crypto::signed::Signer>;
     let join = tokio::spawn(async move { node.run(consensus_handle, signer, shutdown_rx).await });
     info!("consensus: event loop spawned");
-    Ok((join, shutdown_tx))
+    Ok((join, shutdown_tx, status_rx))
 }
 
 /// Build a [`ValidatorSet`] from base58-encoded NodeIds in the config,

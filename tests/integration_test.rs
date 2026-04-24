@@ -695,3 +695,263 @@ async fn test_peers_endpoint_lists_connected_peers() {
         peer_list.len()
     );
 }
+
+// ── Consensus status endpoint (#123) ────────────────────────────────────────
+
+/// Node spec used by [`start_consensus_cluster`]: a node IDs in the
+/// committee has a stable key path (so phase 1 / phase 2 re-spawn
+/// preserves identity) and a pre-bound P2P address.
+struct ConsensusNodeSpec {
+    key_path: String,
+    p2p_addr: String,
+    node_id: String,
+}
+
+/// Spawn a 4-node HotStuff cluster with `[consensus]` configured on
+/// every node. Uses the same two-phase discovery pattern as the full-
+/// mesh stability test: mint identities, capture base58 IDs, then
+/// relaunch every node with the complete committee list.
+async fn start_consensus_cluster(n: usize) -> (Vec<NodeGuard>, Vec<tempfile::TempDir>) {
+    let key_dirs: Vec<tempfile::TempDir> = (0..n).map(|_| tempfile::tempdir().unwrap()).collect();
+    let key_paths: Vec<String> = key_dirs
+        .iter()
+        .map(|d| d.path().join("node.key").to_str().unwrap().to_owned())
+        .collect();
+
+    // Phase 1: discover addresses + node IDs.
+    let mut specs: Vec<ConsensusNodeSpec> = Vec::with_capacity(n);
+    for key_path in &key_paths {
+        let info = launch_once_for_discovery(key_path).await;
+        specs.push(ConsensusNodeSpec {
+            key_path: key_path.clone(),
+            p2p_addr: info.p2p_addr,
+            node_id: info.node_id,
+        });
+    }
+
+    // Phase 2: relaunch with full peer list + [consensus] section.
+    let validators_toml = specs
+        .iter()
+        .map(|s| format!("\"{}\"", s.node_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut guards: Vec<NodeGuard> = Vec::with_capacity(n);
+    for (i, spec) in specs.iter().enumerate() {
+        let peer_descs: Vec<PeerDesc<'_>> = specs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, other)| PeerDesc {
+                p2p_addr: &other.p2p_addr,
+                node_id: &other.node_id,
+            })
+            .collect();
+        guards.push(
+            spawn_consensus_node(
+                &spec.key_path,
+                &spec.p2p_addr,
+                &peer_descs,
+                &validators_toml,
+            )
+            .await,
+        );
+    }
+
+    let ready_timeout = Duration::from_secs(10);
+    for g in &guards {
+        wait_until_ready(g, ready_timeout).await;
+    }
+
+    let mesh_timeout = Duration::from_secs(10);
+    for g in &guards {
+        wait_for_peer_count(g, n - 1, mesh_timeout).await;
+    }
+
+    (guards, key_dirs)
+}
+
+async fn spawn_consensus_node(
+    key_path: &str,
+    fixed_p2p_addr: &str,
+    peers: &[PeerDesc<'_>],
+    validators_toml: &str,
+) -> NodeGuard {
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+
+    let peer_lines: String = peers
+        .iter()
+        .map(|p| {
+            format!(
+                "\n[[peers]]\naddr = \"{}\"\nnode_id = \"{}\"\n",
+                p.p2p_addr, p.node_id
+            )
+        })
+        .collect();
+
+    // Use short timeouts + in-memory storage so the test commits
+    // blocks within a few hundred ms. Without this a stock config
+    // (timeout_base_ms = 200) still works, but shorter base keeps the
+    // test tight.
+    let config = format!(
+        "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}\n\
+        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let child = Command::new(bin)
+        .args(["--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn consensus node binary");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let addrs = loop {
+        if Instant::now() > deadline {
+            panic!("consensus node did not write addr_file within 10s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break addrs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    NodeGuard {
+        child,
+        api_port,
+        p2p_addr: addrs.p2p_addr,
+        node_id: addrs.node_id,
+        _config: config_file,
+        _key_dir: tempfile::tempdir().unwrap(),
+        _addr_file: addr_file,
+    }
+}
+
+/// Acceptance criterion for #123: every node in a running 4-node
+/// consensus cluster must eventually return a `/consensus/status`
+/// response reporting `last_committed_height > 0`, `current_view > 0`,
+/// and a peer list of size `n - 1`. Also covers the gossip-only
+/// negative path (no `[consensus]` section → 404) and the stale-
+/// initial-state path (freshly booted → sane zero-valued snapshot).
+#[tokio::test]
+async fn test_consensus_status_endpoint_reports_live_progress() {
+    const N: usize = 4;
+    let (guards, key_dirs) = start_consensus_cluster(N).await;
+
+    let client = reqwest::Client::new();
+
+    // Before committing anything, every node must already serve a
+    // sane snapshot (startup-window path): the status is published
+    // once at boot, so the endpoint must never 500.
+    for g in &guards {
+        let resp = client.get(g.api_url("/consensus/status")).send().await;
+        let resp = resp.expect("/consensus/status must respond during startup");
+        assert_eq!(
+            resp.status(),
+            200,
+            "consensus/status must return 200 even pre-commit",
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert!(body["current_view"].is_u64());
+        assert!(body["last_committed_height"].is_u64());
+        assert_eq!(body["validator_set"].as_array().map(|a| a.len()), Some(N));
+        assert_eq!(body["node_id"], g.node_id);
+    }
+
+    // Wait until every node reports `last_committed_height > 0` and
+    // `current_view > 0`. 15s is generous for a 4-node cluster on a
+    // laptop (HotStuff commits the 3rd proposal, which at
+    // timeout_base_ms=200 lands in well under a second).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    'outer: loop {
+        if Instant::now() > deadline {
+            panic!("consensus cluster did not commit within 15s");
+        }
+        for g in &guards {
+            let resp = client.get(g.api_url("/consensus/status")).send().await;
+            let body: Value = match resp {
+                Ok(r) if r.status() == 200 => r.json().await.unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            let committed = body["last_committed_height"].as_u64().unwrap_or(0);
+            let current_view = body["current_view"].as_u64().unwrap_or(0);
+            if committed == 0 || current_view == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+
+    // All nodes now show live state. Assert the peer_connected set is
+    // correct on every node.
+    for g in &guards {
+        let body: Value = client
+            .get(g.api_url("/consensus/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let peers = body["peers_connected"].as_array().unwrap();
+        assert_eq!(
+            peers.len(),
+            N - 1,
+            "node {} reported {} consensus peers, expected {}",
+            g.node_id,
+            peers.len(),
+            N - 1,
+        );
+
+        let vset = body["validator_set"].as_array().unwrap();
+        assert_eq!(vset.len(), N);
+        assert!(
+            vset.iter().any(|v| v == &Value::String(g.node_id.clone())),
+            "validator_set on node {} must include self",
+            g.node_id,
+        );
+
+        // self_role is either "replica" or "leader(view=N)".
+        let role = body["self_role"].as_str().unwrap();
+        assert!(
+            role == "replica" || role.starts_with("leader(view="),
+            "unexpected self_role: {role}",
+        );
+    }
+
+    drop(guards);
+    drop(key_dirs);
+}
+
+#[tokio::test]
+async fn test_consensus_status_returns_404_on_gossip_only_node() {
+    // A vanilla (no [consensus]) node must not expose the endpoint.
+    // Mounting is gated in main.rs on consensus being enabled; axum's
+    // default 404 covers the negative path.
+    let node = spawn_node(&[]).await;
+    wait_until_ready(&node, Duration::from_secs(10)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(node.api_url("/consensus/status"))
+        .send()
+        .await
+        .expect("GET /consensus/status must reach the node");
+    assert_eq!(
+        resp.status(),
+        404,
+        "gossip-only node must return 404 on /consensus/status",
+    );
+}
