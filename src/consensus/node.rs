@@ -34,11 +34,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
-use crate::consensus::hotstuff::step::{BlockBuilder, HotStuffCore};
+use crate::consensus::hotstuff::Locked;
+use crate::consensus::hotstuff::step::{BlockBuilder, HotStuffCore, StateUpdate};
 use crate::consensus::hotstuff::{HotStuffState, QuorumCertificate};
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::pacemaker::leader::RoundRobinSelector;
@@ -49,9 +51,25 @@ use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash, BlockHeader};
 use crate::replication::mempool::Mempool;
 use crate::replication::state_machine::StateMachine;
-use crate::storage::{Storage, Wal};
+use crate::storage::{Storage, StorageExt, Wal};
 
 // ── Protocol constants ───────────────────────────────────────────────────────
+
+/// Storage key under which the replica's `last_voted_view` is persisted.
+///
+/// HotStuff safety rests on "never vote twice at the same view across
+/// restarts" — the event loop writes this key (via [`ConsensusNode::persist_updates`])
+/// before any outbound vote is allowed to leave the node, and the
+/// recovery path ([`recover_state`]) reads it back at startup.
+pub const STORAGE_KEY_LAST_VOTED_VIEW: &[u8] = b"consensus/last_voted_view";
+
+/// Storage key for the replica's locked block (two-chain lock). See
+/// [`Locked`] for the fields persisted.
+pub const STORAGE_KEY_LOCKED: &[u8] = b"consensus/locked";
+
+/// Storage key for the replica's highest-known QC, used as the
+/// justify on proposals and piggybacked on `NewView`.
+pub const STORAGE_KEY_HIGH_QC: &[u8] = b"consensus/high_qc";
 
 /// Protocol ID registered with the p2p multiplexer for consensus traffic.
 /// Gossip uses `0x01`, ping-RPC uses `0x02`.
@@ -279,10 +297,188 @@ impl ConsensusNode {
         }
     }
 
+    /// Construct a `ConsensusNode`, restoring any durable control-plane
+    /// state from `storage` (see [`recover_state`]).
+    ///
+    /// On a fresh `storage` with no persisted keys this behaves
+    /// identically to [`ConsensusNode::new`]. On a storage that has
+    /// previously recorded `last_voted_view` / `locked` / `high_qc` via
+    /// [`ConsensusNode::persist_updates`], those values are read back
+    /// into the [`HotStuffState`] so the safety-core invariants
+    /// (no double-voting, no regression of the lock) survive a restart.
+    ///
+    /// Returns `Err` only on storage backend failures or corrupted
+    /// stored bytes. Missing keys are the normal fresh-start case and
+    /// are not errors.
+    pub fn recover(
+        self_id: NodeId,
+        config: NodeConfigForConsensus,
+        state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
+        mempool: Arc<dyn Mempool>,
+        storage: Arc<dyn Storage>,
+        wal: Arc<dyn Wal>,
+    ) -> anyhow::Result<Self> {
+        let hs_state = recover_state(
+            storage.as_ref(),
+            config.validator_set.clone(),
+            config.genesis.clone(),
+        )?;
+
+        let validator_set = Arc::new(config.validator_set.clone());
+        let timeout_policy = Arc::new(ExponentialBackoff::new(
+            config.timeout_base,
+            config.timeout_max,
+        ));
+        let selector = Arc::new(RoundRobinSelector::new(Arc::clone(&validator_set)));
+        let pacemaker = Pacemaker::new(
+            self_id,
+            Arc::clone(&selector) as _,
+            Arc::clone(&timeout_policy) as _,
+        );
+
+        let builder = Arc::new(MempoolBlockBuilder::new(
+            self_id,
+            Arc::clone(&mempool),
+            Arc::clone(&state_machine),
+            config.propose_limit,
+        ));
+        let core = HotStuffCore::new(self_id, hs_state, builder as Arc<dyn BlockBuilder>);
+
+        Ok(Self {
+            self_id,
+            core,
+            pacemaker,
+            state_machine,
+            mempool,
+            storage,
+            wal,
+            validator_set: config.validator_set,
+            timeout_policy,
+        })
+    }
+
+    /// Durably record a slice of [`StateUpdate`]s to
+    /// [`ConsensusNode::storage`].
+    ///
+    /// Every update is applied inside a single atomic batch: on success
+    /// every key is visible, on failure none are. If the same logical
+    /// key appears multiple times in `updates`, the last write wins —
+    /// this matches the safety-core's emission order, where freshly
+    /// emitted updates semantically supersede earlier ones within the
+    /// same `step`.
+    ///
+    /// The integration event loop (Phase D) must call this for every
+    /// `Action::Persist` **before** forwarding any `Action::Broadcast` /
+    /// `Action::SendTo` / `Action::Commit` that depends on the persisted
+    /// state. That ordering is the durability discipline HotStuff
+    /// safety requires — a crash between "send vote" and "write
+    /// `last_voted_view`" would otherwise let a restarted replica vote
+    /// twice at the same view.
+    pub fn persist_updates(&self, updates: &[StateUpdate]) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        self.storage.batch(|b| {
+            for u in updates {
+                match u {
+                    StateUpdate::VotedInView { view } => {
+                        let bytes = encode_voted_view(*view)?;
+                        b.put(STORAGE_KEY_LAST_VOTED_VIEW, &bytes);
+                    }
+                    StateUpdate::Locked(locked) => {
+                        let bytes = encode_locked(locked)?;
+                        b.put(STORAGE_KEY_LOCKED, &bytes);
+                    }
+                    StateUpdate::HighQc(qc) => {
+                        let bytes = encode_high_qc(qc)?;
+                        b.put(STORAGE_KEY_HIGH_QC, &bytes);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Current view from the pacemaker's perspective.
     pub fn current_view(&self) -> View {
         self.pacemaker.current_view()
     }
+}
+
+// ── Durability bridge ────────────────────────────────────────────────────────
+
+/// Serialize a `last_voted_view` value to its on-storage encoding.
+pub fn encode_voted_view(view: View) -> anyhow::Result<Vec<u8>> {
+    postcard::to_stdvec(&view).context("encode last_voted_view")
+}
+
+/// Inverse of [`encode_voted_view`].
+pub fn decode_voted_view(bytes: &[u8]) -> anyhow::Result<View> {
+    postcard::from_bytes(bytes).context("decode last_voted_view")
+}
+
+/// Serialize a [`Locked`] value to its on-storage encoding.
+pub fn encode_locked(locked: &Locked) -> anyhow::Result<Vec<u8>> {
+    postcard::to_stdvec(locked).context("encode locked")
+}
+
+/// Inverse of [`encode_locked`].
+pub fn decode_locked(bytes: &[u8]) -> anyhow::Result<Locked> {
+    postcard::from_bytes(bytes).context("decode locked")
+}
+
+/// Serialize a [`QuorumCertificate`] (as `high_qc`) to its on-storage
+/// encoding.
+pub fn encode_high_qc(qc: &QuorumCertificate) -> anyhow::Result<Vec<u8>> {
+    postcard::to_stdvec(qc).context("encode high_qc")
+}
+
+/// Inverse of [`encode_high_qc`].
+pub fn decode_high_qc(bytes: &[u8]) -> anyhow::Result<QuorumCertificate> {
+    postcard::from_bytes(bytes).context("decode high_qc")
+}
+
+/// Recover a [`HotStuffState`] by reading the persisted control-plane
+/// keys from `storage`.
+///
+/// A fresh node state (equivalent to `HotStuffState::new(vs, genesis)`)
+/// is the baseline; any of `last_voted_view`, `locked`, `high_qc` that
+/// were previously persisted by [`ConsensusNode::persist_updates`] are
+/// overlaid. The `pending_blocks` field is **not** recovered from the
+/// WAL yet — that is future work for the block-replay PR. Only the
+/// durable pieces of the safety-core contract (the ones that, if lost,
+/// would let a restarted replica double-vote) are restored here.
+///
+/// Missing keys are expected on a first startup and are not errors.
+pub fn recover_state(
+    storage: &dyn Storage,
+    validator_set: ValidatorSet,
+    genesis: Block,
+) -> anyhow::Result<HotStuffState> {
+    let mut state = HotStuffState::new(validator_set, genesis);
+
+    if let Some(raw) = storage
+        .get(STORAGE_KEY_LAST_VOTED_VIEW)
+        .context("read last_voted_view from storage")?
+    {
+        state.last_voted_view = decode_voted_view(&raw)?;
+    }
+
+    if let Some(raw) = storage
+        .get(STORAGE_KEY_LOCKED)
+        .context("read locked from storage")?
+    {
+        state.locked = Some(decode_locked(&raw)?);
+    }
+
+    if let Some(raw) = storage
+        .get(STORAGE_KEY_HIGH_QC)
+        .context("read high_qc from storage")?
+    {
+        state.high_qc = Some(decode_high_qc(&raw)?);
+    }
+
+    Ok(state)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -575,5 +771,260 @@ mod tests {
 
         let recomputed = Block::commands_commitment(&block.commands);
         assert_eq!(block.header.commands_commitment, recomputed);
+    }
+
+    // ── C-series: durability bridge ──────────────────────────────────────────
+
+    fn sample_locked() -> Locked {
+        Locked {
+            view: 40,
+            height: 5,
+            block_hash: [0xABu8; 32],
+        }
+    }
+
+    fn sample_full_qc() -> QuorumCertificate {
+        let mut qc = QuorumCertificate::new(41, [0xCDu8; 32], 4);
+        qc.add_signature(0, [0x11u8; 64]);
+        qc.add_signature(2, [0x22u8; 64]);
+        qc.add_signature(3, [0x33u8; 64]);
+        qc
+    }
+
+    #[test]
+    fn encode_decode_voted_view_roundtrips() {
+        let cases = [0u64, 1, 42, u64::MAX];
+        for v in cases {
+            let bytes = encode_voted_view(v).unwrap();
+            assert_eq!(decode_voted_view(&bytes).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn encode_decode_locked_roundtrips() {
+        let l = sample_locked();
+        let bytes = encode_locked(&l).unwrap();
+        assert_eq!(decode_locked(&bytes).unwrap(), l);
+    }
+
+    #[test]
+    fn encode_decode_high_qc_roundtrips() {
+        let qc = sample_full_qc();
+        let bytes = encode_high_qc(&qc).unwrap();
+        assert_eq!(decode_high_qc(&bytes).unwrap(), qc);
+    }
+
+    #[test]
+    fn decode_voted_view_surfaces_error_on_garbage() {
+        assert!(decode_voted_view(&[0xFFu8; 64]).is_err());
+    }
+
+    #[test]
+    fn recover_state_from_empty_storage_matches_fresh_new() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let state = recover_state(storage.as_ref(), four_validators(), genesis()).unwrap();
+        assert_eq!(state.current_view, 0);
+        assert_eq!(state.last_voted_view, 0);
+        assert!(state.locked.is_none());
+        assert!(state.high_qc.is_none());
+        assert!(state.pending_blocks.contains_key(&genesis().hash()));
+    }
+
+    #[test]
+    fn persist_updates_empty_is_noop() {
+        let node = make_node(nid(1));
+        node.persist_updates(&[]).unwrap();
+        assert!(
+            node.storage
+                .get(STORAGE_KEY_LAST_VOTED_VIEW)
+                .unwrap()
+                .is_none(),
+        );
+    }
+
+    #[test]
+    fn persist_then_recover_preserves_voted_view() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        // Session 1: persist a vote.
+        let node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        );
+        node.persist_updates(&[StateUpdate::VotedInView { view: 99 }])
+            .unwrap();
+        drop(node);
+
+        // Session 2: recover. The voted view survives.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(recovered.core.state().last_voted_view, 99);
+    }
+
+    #[test]
+    fn persist_then_recover_preserves_locked_and_high_qc() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+        let locked = sample_locked();
+        let qc = sample_full_qc();
+
+        let node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        );
+        node.persist_updates(&[StateUpdate::Locked(locked), StateUpdate::HighQc(qc.clone())])
+            .unwrap();
+        drop(node);
+
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(recovered.core.state().locked, Some(locked));
+        assert_eq!(recovered.core.state().high_qc.as_ref(), Some(&qc));
+    }
+
+    #[test]
+    fn persist_all_three_fields_and_recover() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        let node = ConsensusNode::new(
+            nid(2),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        );
+        let updates = vec![
+            StateUpdate::VotedInView { view: 7 },
+            StateUpdate::Locked(sample_locked()),
+            StateUpdate::HighQc(sample_full_qc()),
+        ];
+        node.persist_updates(&updates).unwrap();
+        drop(node);
+
+        let recovered = ConsensusNode::recover(
+            nid(2),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(recovered.core.state().last_voted_view, 7);
+        assert_eq!(recovered.core.state().locked, Some(sample_locked()));
+        assert_eq!(
+            recovered.core.state().high_qc.as_ref(),
+            Some(&sample_full_qc()),
+        );
+        // `recover` does not reset the pacemaker — it always starts at 0.
+        assert_eq!(recovered.current_view(), 0);
+    }
+
+    #[test]
+    fn persist_is_last_write_wins_within_batch() {
+        let node = make_node(nid(1));
+        node.persist_updates(&[
+            StateUpdate::VotedInView { view: 3 },
+            StateUpdate::VotedInView { view: 5 },
+            StateUpdate::VotedInView { view: 4 },
+        ])
+        .unwrap();
+        let raw = node
+            .storage
+            .get(STORAGE_KEY_LAST_VOTED_VIEW)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_voted_view(&raw).unwrap(), 4);
+    }
+
+    #[test]
+    fn persist_monotonic_overwrites_previous() {
+        // Subsequent persist calls overwrite the previous value: there's
+        // no accumulation, each key is a single cell in storage.
+        let node = make_node(nid(1));
+        node.persist_updates(&[StateUpdate::VotedInView { view: 1 }])
+            .unwrap();
+        node.persist_updates(&[StateUpdate::VotedInView { view: 2 }])
+            .unwrap();
+        let raw = node
+            .storage
+            .get(STORAGE_KEY_LAST_VOTED_VIEW)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_voted_view(&raw).unwrap(), 2);
+    }
+
+    #[test]
+    fn recover_surfaces_error_on_corrupted_stored_bytes() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        storage
+            .put(STORAGE_KEY_LAST_VOTED_VIEW, &[0xFFu8; 64])
+            .unwrap();
+        let err = recover_state(storage.as_ref(), four_validators(), genesis()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("last_voted_view"),
+            "error should mention the failing key: {err:#}",
+        );
+    }
+
+    #[test]
+    fn recover_only_locked_preserves_default_voted_view_and_high_qc() {
+        // Partial persistence: only `locked` was flushed. Recovery
+        // restores it and leaves the other two at their defaults.
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+        let node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        );
+        node.persist_updates(&[StateUpdate::Locked(sample_locked())])
+            .unwrap();
+        drop(node);
+
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(recovered.core.state().last_voted_view, 0);
+        assert_eq!(recovered.core.state().locked, Some(sample_locked()));
+        assert!(recovered.core.state().high_qc.is_none());
     }
 }

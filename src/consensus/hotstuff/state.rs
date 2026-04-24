@@ -8,6 +8,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::consensus::View;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::replication::block::{Block, BlockHash};
@@ -34,7 +36,7 @@ use super::qc::QuorumCertificate;
 /// monotonicity Lemma 6 of the paper's Appendix B relies on; using
 /// `view` would let a Byzantine proposer wedge us into a stuck state
 /// by claiming a huge view on a short chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Locked {
     pub view: View,
     pub height: u64,
