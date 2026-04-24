@@ -44,12 +44,13 @@ use tokio::sync::{mpsc, oneshot};
 use crate::consensus::View;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
 use crate::consensus::hotstuff::Locked;
-use crate::consensus::hotstuff::qc::{TimeoutVote, quorum_size};
+use crate::consensus::hotstuff::qc::{ConsensusMsg, TimeoutVote, quorum_size};
 use crate::consensus::hotstuff::step::{
-    Action as SafetyAction, BlockBuilder, HotStuffCore, StateUpdate,
+    Action as SafetyAction, BlockBuilder, Event as SafetyEvent, HotStuffCore, StateUpdate,
 };
 use crate::consensus::hotstuff::{HotStuffState, NewView, QuorumCertificate, genesis_qc};
 use crate::consensus::pacemaker::Action as PacemakerAction;
+use crate::consensus::pacemaker::Event as PacemakerEvent;
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::pacemaker::leader::RoundRobinSelector;
 use crate::consensus::pacemaker::timeout::ExponentialBackoff;
@@ -58,11 +59,67 @@ use crate::consensus::view_timer::ViewTimer;
 use crate::crypto::signed::Signed;
 use crate::crypto::signed::Signer;
 use crate::p2p::NodeId;
+use crate::p2p::tls::node_id_to_base58;
 use crate::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 use crate::replication::block::{Block, BlockHash, BlockHeader};
 use crate::replication::mempool::Mempool;
 use crate::replication::state_machine::StateMachine;
 use crate::storage::{Storage, StorageExt, Wal};
+
+/// Tracing target used by every structured trace emitted from the
+/// consensus integration layer. Filter it with
+/// `RUST_LOG=info,ambros_p2p::consensus=debug` to see just the event
+/// boundaries without drowning in p2p / gossip traffic.
+pub const TRACE_TARGET: &str = "ambros_p2p::consensus";
+
+/// Short, stable tag for a [`ConsensusMsg`] variant — suitable as a
+/// structured-log field value.
+fn msg_kind(msg: &ConsensusMsg) -> &'static str {
+    match msg {
+        ConsensusMsg::Proposal(_) => "Proposal",
+        ConsensusMsg::Vote(_) => "Vote",
+        ConsensusMsg::NewView(_) => "NewView",
+    }
+}
+
+/// Short, stable tag for a [`StateUpdate`] variant — suitable as a
+/// structured-log field value.
+fn update_kind(u: &StateUpdate) -> &'static str {
+    match u {
+        StateUpdate::VotedInView { .. } => "VotedInView",
+        StateUpdate::Locked(_) => "Locked",
+        StateUpdate::HighQc(_) => "HighQc",
+    }
+}
+
+/// Short, stable tag for a pacemaker [`PacemakerEvent`] variant.
+fn pacemaker_event_kind(ev: &PacemakerEvent) -> &'static str {
+    match ev {
+        PacemakerEvent::OnQc(_) => "OnQc",
+        PacemakerEvent::OnTimeoutCert(_) => "OnTimeoutCert",
+        PacemakerEvent::OnTimeout(_) => "OnTimeout",
+        PacemakerEvent::OnProposalReceived(_) => "OnProposalReceived",
+    }
+}
+
+/// Snapshot of the tracing fields we want to log around a safety-core
+/// step. Captured *before* the step consumes the event so we still
+/// have access to the signer / view / height after the event is moved.
+enum SafetyLogCtx {
+    Proposal {
+        proposer: NodeId,
+        view: View,
+        height: u64,
+    },
+    Vote {
+        voter: NodeId,
+        view: View,
+    },
+    NewView {
+        sender: NodeId,
+        high_qc_view: View,
+    },
+}
 
 // ── Protocol constants ───────────────────────────────────────────────────────
 
@@ -466,7 +523,14 @@ impl ConsensusNode {
                 }
             }
             Ok(())
-        })
+        })?;
+        let kinds: Vec<&'static str> = updates.iter().map(update_kind).collect();
+        tracing::debug!(
+            target: TRACE_TARGET,
+            kinds = ?kinds,
+            "persisted",
+        );
+        Ok(())
     }
 
     /// Current view from the pacemaker's perspective.
@@ -508,9 +572,7 @@ impl ConsensusNode {
 
         // Boot: advance pacemaker from 0 → 1, arm the view timer, and
         // broadcast NewView (if we have a high_qc from a prior session).
-        let boot_actions = self
-            .pacemaker
-            .step(crate::consensus::pacemaker::Event::OnQc(0));
+        let boot_actions = self.step_pacemaker(PacemakerEvent::OnQc(0));
         self.apply_pacemaker_actions(boot_actions, &send_tx, &mut view_timer, &signer)
             .await?;
 
@@ -521,9 +583,7 @@ impl ConsensusNode {
                 _ = &mut shutdown => break,
 
                 Some(view) = timer_rx.recv() => {
-                    let pm_actions = self
-                        .pacemaker
-                        .step(crate::consensus::pacemaker::Event::OnTimeout(view));
+                    let pm_actions = self.step_pacemaker(PacemakerEvent::OnTimeout(view));
                     self.apply_pacemaker_actions(pm_actions, &send_tx, &mut view_timer, &signer)
                         .await?;
                 }
@@ -571,13 +631,13 @@ impl ConsensusNode {
     ) -> anyhow::Result<()> {
         match d {
             Dispatch::Safety(ev) => {
-                let actions = self.core.step(ev);
+                let actions = self.step_safety(ev);
                 self.apply_safety_actions(actions, send_tx, view_timer, signer)
                     .await?;
             }
 
             Dispatch::Pacemaker(ev) => {
-                let pm_actions = self.pacemaker.step(ev);
+                let pm_actions = self.step_pacemaker(ev);
                 self.apply_pacemaker_actions(pm_actions, send_tx, view_timer, signer)
                     .await?;
             }
@@ -596,11 +656,7 @@ impl ConsensusNode {
             } => {
                 self.core.insert_pending_block(block);
                 let current = self.pacemaker.current_view();
-                let actions =
-                    self.core
-                        .step(crate::consensus::hotstuff::step::Event::PacemakerAdvance(
-                            current,
-                        ));
+                let actions = self.step_safety(SafetyEvent::PacemakerAdvance(current));
                 self.apply_safety_actions(actions, send_tx, view_timer, signer)
                     .await?;
             }
@@ -663,6 +719,11 @@ impl ConsensusNode {
                 SafetyAction::Persist(_) => unreachable!(),
 
                 SafetyAction::Broadcast(msg) => {
+                    tracing::debug!(
+                        target: TRACE_TARGET,
+                        msg = msg_kind(&msg),
+                        "outbound_broadcast",
+                    );
                     let (payload, loopback) =
                         dispatch::egress_consensus_msg_with_loopback(&msg, signer.as_ref())?;
                     send_outbound(send_tx, Outbound::Broadcast(payload)).await;
@@ -674,11 +735,22 @@ impl ConsensusNode {
                     let (payload, loopback) =
                         dispatch::egress_consensus_msg_with_loopback(&msg, signer.as_ref())?;
                     if target == self.self_id {
+                        tracing::debug!(
+                            target: TRACE_TARGET,
+                            msg = msg_kind(&msg),
+                            "outbound_loopback",
+                        );
                         // Self-addressed: deliver locally; do not put bytes
                         // on the wire (the p2p layer would drop them).
                         self.deliver_loopback(loopback, send_tx, view_timer, signer)
                             .await?;
                     } else {
+                        tracing::debug!(
+                            target: TRACE_TARGET,
+                            dest = %node_id_to_base58(&target),
+                            msg = msg_kind(&msg),
+                            "outbound_send_to",
+                        );
                         send_outbound(
                             send_tx,
                             Outbound::SendTo {
@@ -696,9 +768,17 @@ impl ConsensusNode {
                         // don't already have it, the p2p layer can't
                         // fetch it from us. Log at debug and move on.
                         tracing::debug!(
-                            "consensus: dropping self-addressed RequestBlock for {hash:?}",
+                            target: TRACE_TARGET,
+                            hash = ?hash,
+                            "request_block_self_dropped",
                         );
                     } else {
+                        tracing::debug!(
+                            target: TRACE_TARGET,
+                            dest = %node_id_to_base58(&peer),
+                            hash = ?hash,
+                            "outbound_block_request",
+                        );
                         let out = dispatch::egress_block_request(hash, peer);
                         send_outbound(send_tx, out).await;
                     }
@@ -748,13 +828,24 @@ impl ConsensusNode {
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
         for action in actions {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                view = self.pacemaker.current_view(),
+                self_id = %node_id_to_base58(&self.self_id),
+                action = ?action,
+                "pacemaker_action",
+            );
             match action {
-                PacemakerAction::AdvanceToView(v) => {
+                PacemakerAction::AdvanceToView { view: v, cause } => {
+                    tracing::debug!(
+                        target: TRACE_TARGET,
+                        new_view = v,
+                        cause = cause.as_str(),
+                        "view_advanced",
+                    );
                     // Feed PacemakerAdvance into the safety core so it updates
                     // current_view and un-parks pending proposals.
-                    let safety_actions = self
-                        .core
-                        .step(crate::consensus::hotstuff::step::Event::PacemakerAdvance(v));
+                    let safety_actions = self.step_safety(SafetyEvent::PacemakerAdvance(v));
                     self.apply_safety_actions(safety_actions, send_tx, view_timer, signer)
                         .await?;
                 }
@@ -776,6 +867,99 @@ impl ConsensusNode {
             }
         }
         Ok(())
+    }
+
+    /// Step the pacemaker, emitting a structured trace at the event
+    /// boundary so operators can correlate inbound causes (timer fires,
+    /// QCs, TCs, proposals) with the resulting view-change decisions.
+    fn step_pacemaker(&mut self, ev: PacemakerEvent) -> Vec<PacemakerAction> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            view = self.pacemaker.current_view(),
+            self_id = %node_id_to_base58(&self.self_id),
+            event = pacemaker_event_kind(&ev),
+            "pacemaker_event",
+        );
+        self.pacemaker.step(ev)
+    }
+
+    /// Step the safety core, emitting a structured trace after the step
+    /// for `ProposalReceived` / `VoteReceived` / `NewViewReceived` so the
+    /// "did it vote?", "did it form a QC?", "was it parked?" information
+    /// is visible from the debug logs. The trace lives at the integration
+    /// layer specifically to keep the safety core I/O-free.
+    fn step_safety(&mut self, ev: SafetyEvent) -> Vec<SafetyAction> {
+        // Snapshot the fields we want to log *before* moving `ev` into
+        // the core — the event is consumed by `core.step` so we can't
+        // re-borrow after.
+        let log_ctx = match &ev {
+            SafetyEvent::ProposalReceived(signed) => Some(SafetyLogCtx::Proposal {
+                proposer: signed.signer,
+                view: signed.payload.block.header.view,
+                height: signed.payload.block.header.height,
+            }),
+            SafetyEvent::VoteReceived(signed) => Some(SafetyLogCtx::Vote {
+                voter: signed.signer,
+                view: signed.payload.view,
+            }),
+            SafetyEvent::NewViewReceived(signed) => Some(SafetyLogCtx::NewView {
+                sender: signed.signer,
+                high_qc_view: signed.payload.high_qc.view,
+            }),
+            SafetyEvent::PacemakerAdvance(_) => None,
+        };
+
+        let actions = self.core.step(ev);
+
+        match log_ctx {
+            Some(SafetyLogCtx::Proposal {
+                proposer,
+                view,
+                height,
+            }) => {
+                let voted = actions
+                    .iter()
+                    .any(|a| matches!(a, SafetyAction::SendTo(_, ConsensusMsg::Vote(_))));
+                let parked = actions
+                    .iter()
+                    .any(|a| matches!(a, SafetyAction::RequestBlock(_, _)));
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    proposer = %node_id_to_base58(&proposer),
+                    view,
+                    height,
+                    voted,
+                    parked,
+                    "proposal_received",
+                );
+            }
+            Some(SafetyLogCtx::Vote { voter, view }) => {
+                let formed_qc = actions
+                    .iter()
+                    .any(|a| matches!(a, SafetyAction::Broadcast(ConsensusMsg::Proposal(_))));
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    voter = %node_id_to_base58(&voter),
+                    view,
+                    formed_qc,
+                    "vote_received",
+                );
+            }
+            Some(SafetyLogCtx::NewView {
+                sender,
+                high_qc_view,
+            }) => {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    sender = %node_id_to_base58(&sender),
+                    high_qc_view,
+                    "new_view_received",
+                );
+            }
+            None => {}
+        }
+
+        actions
     }
 
     /// Build, broadcast, and self-deliver a [`TimeoutVote`] for `view`.
@@ -844,6 +1028,8 @@ impl ConsensusNode {
         }
 
         let quorum = quorum_size(self.validator_set.len());
+        let signer_id = signed.signer;
+        let is_local = signer_id == self.self_id;
         let adopt_qc = {
             let bucket = self.timeout_buckets.entry(view).or_default();
             let is_new = bucket.signers.insert(signed.signer);
@@ -863,11 +1049,29 @@ impl ConsensusNode {
                 }
             }
 
-            if bucket.signers.len() < quorum {
+            let bucket_size = bucket.signers.len();
+            tracing::debug!(
+                target: TRACE_TARGET,
+                view,
+                signer = %node_id_to_base58(&signer_id),
+                bucket_size,
+                quorum,
+                is_local,
+                "timeout_vote",
+            );
+
+            if bucket_size < quorum {
                 return Ok(());
             }
             bucket.best_high_qc.clone()
         };
+
+        tracing::debug!(
+            target: TRACE_TARGET,
+            view,
+            adopt_qc_view = ?adopt_qc.as_ref().map(|q| q.view),
+            "tc_formed",
+        );
 
         // Drop the bucket: the TC has fired, further duplicates are
         // stale and no additional accounting is needed.
@@ -886,19 +1090,13 @@ impl ConsensusNode {
             let nv = NewView { high_qc: qc };
             let self_signed =
                 Signed::sign(nv, signer.as_ref()).context("signing self-NewView for TC adopt")?;
-            let safety_actions =
-                self.core
-                    .step(crate::consensus::hotstuff::step::Event::NewViewReceived(
-                        self_signed,
-                    ));
+            let safety_actions = self.step_safety(SafetyEvent::NewViewReceived(self_signed));
             self.apply_safety_actions(safety_actions, send_tx, view_timer, signer)
                 .await?;
         }
 
         // Feed the TC into the pacemaker so the view advances.
-        let pm_actions = self
-            .pacemaker
-            .step(crate::consensus::pacemaker::Event::OnTimeoutCert(view));
+        let pm_actions = self.step_pacemaker(PacemakerEvent::OnTimeoutCert(view));
         // NOTE: recursive-ish call through apply_pacemaker_actions is
         // safe — that function handles `AdvanceToView` / `BecomeLeader` /
         // `ResetTimer` / `SendTimeout`, and the pacemaker's reaction to
@@ -1971,5 +2169,154 @@ mod tests {
             .await
             .unwrap();
         assert!(send_rx.try_recv().is_err());
+    }
+
+    // ── Structured tracing capture (#122) ───────────────────────────────────
+
+    /// Shared buffer of captured log lines. Cloneable so the same sink
+    /// can back every `MakeWriter::make_writer` call issued by the
+    /// subscriber during a test run.
+    #[derive(Clone)]
+    struct CaptureBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl CaptureBuf {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn take_string(&self) -> String {
+            String::from_utf8(self.0.lock().clone()).expect("capture writer produced non-UTF8")
+        }
+    }
+
+    impl std::io::Write for CaptureBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
+        type Writer = CaptureBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Extract the ordered `message` field from each JSON-encoded trace
+    /// event in `captured`, ignoring lines that don't parse (defensive).
+    fn trace_messages(captured: &str) -> Vec<String> {
+        captured
+            .lines()
+            .filter_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                v.get("fields")?
+                    .get("message")?
+                    .as_str()
+                    .map(|s| s.to_owned())
+            })
+            .collect()
+    }
+
+    /// Panic if `expected` does not appear (in order, possibly with other
+    /// events in between) as a subsequence of `actual`.
+    fn assert_subsequence(actual: &[String], expected: &[&str]) {
+        let mut it = actual.iter();
+        for want in expected {
+            let found = it.any(|got| got == want);
+            assert!(
+                found,
+                "expected subsequence {expected:?}, missing {want:?} in {actual:?}",
+            );
+        }
+    }
+
+    /// Happy-path flow: feed a QC to the pacemaker, then trigger a
+    /// leader proposal through the safety core. Verify the integration
+    /// layer emits the expected ordered trace events so operators get
+    /// pacemaker → safety → outbound visibility without grepping for
+    /// p2p-layer accidents.
+    ///
+    /// This guards against accidentally removing instrumentation later.
+    /// The actual proposal is driven by `core.become_leader` directly
+    /// rather than through `PacemakerAction::BecomeLeader` because
+    /// `ValidatorSet::new` sorts by `NodeId` and a fresh Ed25519 public
+    /// key ends up at a non-deterministic sorted position — so we can't
+    /// rely on the pacemaker picking `self` as the view-1 leader.
+    #[tokio::test]
+    async fn tracing_emits_expected_events_for_proposal_and_vote_flow() {
+        let capture = CaptureBuf::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "ambros_p2p::consensus=debug",
+            ))
+            .with_writer(capture.clone())
+            .json()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let ns = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&ns, 1);
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+
+        let (handle, _event_tx, _send_rx) = make_protocol_handle();
+        let ProtocolHandle { send_tx, .. } = handle;
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Phase 1: OnQc(0) through the pacemaker. Covers pacemaker_event,
+        // pacemaker_action, view_advanced (cause=qc), plus the
+        // Broadcast(NewView) that on_pacemaker_advance emits once the
+        // safety core sees the view jump — so outbound_broadcast and
+        // new_view_received appear as part of the same flow.
+        let boot_actions = node.step_pacemaker(PacemakerEvent::OnQc(0));
+        node.apply_pacemaker_actions(boot_actions, &send_tx, &mut view_timer, &signer)
+            .await
+            .unwrap();
+
+        // Phase 2: directly drive the view-1 leader path so the proposal
+        // broadcast + self-loopback vote emission is deterministic
+        // regardless of sort-order-dependent leader selection.
+        let proposal_actions = node.core.become_leader(1);
+        node.apply_safety_actions(proposal_actions, &send_tx, &mut view_timer, &signer)
+            .await
+            .unwrap();
+
+        drop(_guard);
+
+        let captured = capture.take_string();
+        let events = trace_messages(&captured);
+
+        // Required subsequence. Extra events are allowed between these
+        // points — the assertion is that each named boundary fires in
+        // the expected order, not that nothing else fires.
+        assert_subsequence(
+            &events,
+            &[
+                "pacemaker_event",    // OnQc(0)
+                "pacemaker_action",   // AdvanceToView { view: 1, cause: Qc }
+                "view_advanced",      // cause = "qc"
+                "outbound_broadcast", // NewView emitted on PacemakerAdvance
+                "new_view_received",  // self-loopback into safety core
+                "outbound_broadcast", // Proposal from become_leader(1)
+                "proposal_received",  // self-loopback into safety core
+                "persisted",          // VotedInView flushed before the vote
+                "outbound_send_to",   // Vote addressed to the next-view leader
+            ],
+        );
+
+        // Sanity: the view_advanced event must be tagged cause="qc", not
+        // "tc". This is what distinguishes happy-path progress from
+        // view-change recovery in the logs.
+        let has_qc_view_advanced = captured.lines().any(|line| {
+            line.contains("\"message\":\"view_advanced\"") && line.contains("\"cause\":\"qc\"")
+        });
+        assert!(
+            has_qc_view_advanced,
+            "view_advanced must carry cause=\"qc\"; got: {captured}",
+        );
     }
 }

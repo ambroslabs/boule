@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::consensus::View;
 use crate::consensus::pacemaker::leader::{LeaderSelector, RoundRobinSelector};
 use crate::consensus::pacemaker::timeout::{ExponentialBackoff, TimeoutPolicy};
-use crate::consensus::pacemaker::{Action, Event, Pacemaker};
+use crate::consensus::pacemaker::{Action, AdvanceCause, Event, Pacemaker};
 use crate::consensus::validator_set::ValidatorSet;
 use crate::p2p::NodeId;
 
@@ -78,7 +78,13 @@ fn two_timeouts_then_tc_advances_to_view_1() {
     let actions = pm.step(Event::OnTimeoutCert(0));
     assert_eq!(pm.current_view(), 1);
     assert_eq!(pm.consecutive_failures(), 0);
-    assert_eq!(actions[0], Action::AdvanceToView(1));
+    assert_eq!(
+        actions[0],
+        Action::AdvanceToView {
+            view: 1,
+            cause: AdvanceCause::Tc,
+        }
+    );
     assert_eq!(find_reset_timer(&actions), Some(base_timeout()));
 }
 
@@ -93,7 +99,13 @@ fn qc_for_future_view_jumps_and_resets_failures() {
     assert_eq!(pm.current_view(), 6);
     assert_eq!(pm.high_qc_view(), 5);
     assert_eq!(pm.consecutive_failures(), 0);
-    assert_eq!(actions[0], Action::AdvanceToView(6));
+    assert_eq!(
+        actions[0],
+        Action::AdvanceToView {
+            view: 6,
+            cause: AdvanceCause::Qc,
+        }
+    );
     assert_eq!(find_reset_timer(&actions), Some(base_timeout()));
 }
 
@@ -159,7 +171,13 @@ fn become_leader_fires_iff_self_is_leader_of_new_view() {
         "self is leader of view 1: {actions:?}"
     );
     // Emission order: AdvanceToView, BecomeLeader, ResetTimer.
-    assert_eq!(actions[0], Action::AdvanceToView(1));
+    assert_eq!(
+        actions[0],
+        Action::AdvanceToView {
+            view: 1,
+            cause: AdvanceCause::Qc,
+        }
+    );
     assert_eq!(actions[1], Action::BecomeLeader(1));
     assert!(matches!(actions[2], Action::ResetTimer(_)));
 
@@ -310,7 +328,9 @@ impl Bus {
                         self.record_timeout(j, v);
                     }
                 }
-                Action::AdvanceToView(_) | Action::BecomeLeader(_) | Action::ResetTimer(_) => {
+                Action::AdvanceToView { .. }
+                | Action::BecomeLeader(_)
+                | Action::ResetTimer(_) => {
                     // No network effect in the sim. Each scenario
                     // manually bootstraps the first proposal / timeout
                     // it cares about, so cascading view advancement is
