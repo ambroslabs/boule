@@ -549,11 +549,11 @@ mod tests {
 
         // Each surviving node must have committed at least one additional
         // block during the views-5–7 window.
-        for idx in 1..4 {
+        for (idx, commits) in post_kill[1..].iter().enumerate() {
             assert!(
-                post_kill[idx].len() >= 1,
-                "survivor {idx} must commit >= 1 block after the crash, got {}",
-                post_kill[idx].len(),
+                !commits.is_empty(),
+                "survivor {} must commit >= 1 block after the crash, got 0",
+                idx + 1,
             );
         }
     }
