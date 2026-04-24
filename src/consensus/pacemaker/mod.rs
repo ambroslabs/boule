@@ -74,6 +74,30 @@ pub enum Event {
     OnProposalReceived(View),
 }
 
+/// Why the pacemaker advanced to a new view. Plumbed through on
+/// [`Action::AdvanceToView`] so the integration layer can emit a single
+/// structured trace per view change distinguishing happy-path (QC)
+/// progress from view-change (TC) recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvanceCause {
+    /// A quorum certificate for the prior view was observed; the cluster
+    /// made happy-path progress.
+    Qc,
+    /// A timeout certificate for the prior view was observed; the
+    /// cluster abandoned that view via view-change recovery.
+    Tc,
+}
+
+impl AdvanceCause {
+    /// Short, stable tag suitable for use as a structured log value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdvanceCause::Qc => "qc",
+            AdvanceCause::Tc => "tc",
+        }
+    }
+}
+
 /// Effects the pacemaker asks the outer driver to perform.
 ///
 /// The state machine never executes these itself; it returns them from
@@ -81,8 +105,11 @@ pub enum Event {
 /// translating each variant into real side effects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Record that the local pacemaker has moved to `View`.
-    AdvanceToView(View),
+    /// Record that the local pacemaker has moved to `view`. `cause`
+    /// distinguishes happy-path QC progress from TC-driven view-change
+    /// recovery — both have the same state-machine effect but look very
+    /// different in traces.
+    AdvanceToView { view: View, cause: AdvanceCause },
     /// This replica is the leader for `View`; the outer driver should
     /// start building and broadcasting a proposal. Emitted immediately
     /// after [`Action::AdvanceToView`] when applicable.
@@ -163,13 +190,13 @@ impl Pacemaker {
                 if v > self.high_qc_view {
                     self.high_qc_view = v;
                 }
-                self.advance_to(v + 1)
+                self.advance_to(v + 1, AdvanceCause::Qc)
             }
             Event::OnTimeoutCert(v) => {
                 if v < self.current_view {
                     return Vec::new();
                 }
-                self.advance_to(v + 1)
+                self.advance_to(v + 1, AdvanceCause::Tc)
             }
             Event::OnTimeout(v) => {
                 if v != self.current_view {
@@ -195,11 +222,14 @@ impl Pacemaker {
         }
     }
 
-    fn advance_to(&mut self, new_view: View) -> Vec<Action> {
+    fn advance_to(&mut self, new_view: View, cause: AdvanceCause) -> Vec<Action> {
         self.current_view = new_view;
         self.consecutive_failures = 0;
         let mut actions = Vec::with_capacity(3);
-        actions.push(Action::AdvanceToView(new_view));
+        actions.push(Action::AdvanceToView {
+            view: new_view,
+            cause,
+        });
         if self.selector.leader_for_view(new_view) == self.self_id {
             actions.push(Action::BecomeLeader(new_view));
         }

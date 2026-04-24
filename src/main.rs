@@ -27,13 +27,32 @@ use ambros_p2p::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storag
 const ENV_PRODUCTION: &str = "AMBROS_ENV";
 const DEFAULT_KEY_FILE: &str = "node.key";
 
+/// Initialize the tracing subscriber.
+///
+/// Honors two environment variables:
+///
+/// - `RUST_LOG`: standard `tracing-subscriber` env filter. Defaults to
+///   `ambros_p2p=info`. Set to `info,ambros_p2p::consensus=debug` to get
+///   the structured event-boundary logs the consensus layer emits.
+/// - `RUST_LOG_FORMAT`: `pretty` (default) or `json`. JSON emits one
+///   structured event per line, which operators can pipe through `jq` to
+///   filter across nodes.
 fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ambros_p2p=info".into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "ambros_p2p=info".into());
+
+    let json = std::env::var("RUST_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    if json {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 }
 
 #[tokio::main]
