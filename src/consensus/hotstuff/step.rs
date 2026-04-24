@@ -1790,21 +1790,45 @@ mod tests {
         }
 
         pub(crate) struct ReplicaSet {
+            /// Honest cores, indexed 0..n_honest. Byzantine validators
+            /// have no core — their NodeIds appear in `validators`
+            /// (so leader election still maps views to them), but
+            /// they produce events only via the adversary strategies
+            /// in the property tests below.
             pub cores: Vec<HotStuffCore>,
+            /// Per-honest-replica event inbox.
             pub inboxes: Vec<VecDeque<Event>>,
+            /// Per-honest-replica committed-blocks ledger.
             pub commits: Vec<BTreeMap<u64, Block>>,
             pub validators: ValidatorSet,
             pub genesis: Block,
+            /// How many of the trailing `validators` entries are
+            /// Byzantine. Honest validator indices are `0..n_honest`
+            /// where `n_honest = validators.len() - byzantine_count`.
+            pub byzantine_count: usize,
         }
 
         impl ReplicaSet {
-            /// Build `n` replicas over the canonical validator set,
-            /// each with its own `TestBlockBuilder` stamped with
-            /// that replica's NodeId as the proposer.
+            /// Build `n` all-honest replicas. Shorthand for
+            /// `new_with_byzantine(n, 0)`.
             pub fn new(n: usize) -> Self {
-                let validators = validator_set(n);
+                Self::new_with_byzantine(n, 0)
+            }
+
+            /// Build `n_total` validators with the last `byzantine_count`
+            /// treated as Byzantine: their NodeIds appear in
+            /// `validators` for leader-election purposes, but no
+            /// honest core runs for them, and messages addressed to
+            /// them via `SendTo` are dropped (adversarial void).
+            pub fn new_with_byzantine(n_total: usize, byzantine_count: usize) -> Self {
+                assert!(
+                    byzantine_count < n_total,
+                    "byzantine_count must be strictly less than n_total",
+                );
+                let n_honest = n_total - byzantine_count;
+                let validators = validator_set(n_total);
                 let genesis = Block::genesis([0; 32]);
-                let cores: Vec<HotStuffCore> = (0..n)
+                let cores: Vec<HotStuffCore> = (0..n_honest)
                     .map(|i| {
                         let nid = *validators.get(i).unwrap();
                         let state = HotStuffState::new(validators.clone(), genesis.clone());
@@ -1812,27 +1836,54 @@ mod tests {
                         HotStuffCore::new(nid, state, builder)
                     })
                     .collect();
-                let inboxes = (0..n).map(|_| VecDeque::new()).collect();
-                let commits = (0..n).map(|_| BTreeMap::new()).collect();
+                let inboxes = (0..n_honest).map(|_| VecDeque::new()).collect();
+                let commits = (0..n_honest).map(|_| BTreeMap::new()).collect();
                 Self {
                     cores,
                     inboxes,
                     commits,
                     validators,
                     genesis,
+                    byzantine_count,
                 }
             }
 
+            /// Number of honest replicas the harness is running.
             pub fn len(&self) -> usize {
                 self.cores.len()
             }
 
-            /// Queue `event` for `replica`'s next `deliver_one`.
+            /// Byzantine NodeIds — the trailing validator slots that
+            /// have no core. Property tests use this list to pick
+            /// signers for adversarial events.
+            pub fn byzantine_nids(&self) -> Vec<NodeId> {
+                let n_honest = self.cores.len();
+                (n_honest..n_honest + self.byzantine_count)
+                    .map(|i| *self.validators.get(i).unwrap())
+                    .collect()
+            }
+
+            /// Map a NodeId to an honest-replica index, if that
+            /// NodeId belongs to an honest validator. Returns `None`
+            /// for Byzantine (or unknown) ids. `apply_actions`
+            /// uses this to drop `SendTo` destined for Byzantine —
+            /// the adversary sees the message but doesn't process
+            /// it through any harness-owned core.
+            pub fn honest_index_of(&self, nid: &NodeId) -> Option<usize> {
+                let idx = self.validators.index_of(nid)?;
+                if idx < self.cores.len() {
+                    Some(idx)
+                } else {
+                    None
+                }
+            }
+
+            /// Queue `event` for honest `replica`'s next `deliver_one`.
             pub fn inject(&mut self, replica: usize, event: Event) {
                 self.inboxes[replica].push_back(event);
             }
 
-            /// Queue `event` for every replica's inbox.
+            /// Queue `event` for every honest replica's inbox.
             pub fn inject_all(&mut self, event: Event) {
                 for i in 0..self.cores.len() {
                     self.inject(i, event.clone());
@@ -1856,13 +1907,20 @@ mod tests {
                 for action in actions {
                     match action {
                         Action::Broadcast(msg) => {
+                            // Only honest replicas have inboxes;
+                            // Byzantine "receipt" is a no-op.
                             for target in 0..self.cores.len() {
                                 self.inboxes[target]
                                     .push_back(event_from_msg(source_nid, msg.clone()));
                             }
                         }
                         Action::SendTo(target_id, msg) => {
-                            if let Some(target) = self.validators.index_of(&target_id) {
+                            // Drop silently if the target is
+                            // Byzantine — the adversary sees it on
+                            // the wire, but we don't model what they
+                            // do with it beyond the strategies in
+                            // the property tests.
+                            if let Some(target) = self.honest_index_of(&target_id) {
                                 self.inboxes[target].push_back(event_from_msg(source_nid, msg));
                             }
                         }
@@ -2073,6 +2131,370 @@ mod tests {
 
                 for replica in schedule {
                     replicas.deliver_one(replica);
+                }
+
+                assert_no_conflicting_commits(&replicas);
+            }
+        }
+
+        // ── β2: Byzantine vote strategy ─────────────────────────────
+        //
+        // A single enum carries both honest-delivery schedule steps
+        // and Byzantine vote injections. Keeping them in one
+        // `Vec<ByzantineVoteStep>` (rather than two parallel
+        // sequences) lets proptest's shrinker trim the trace
+        // uniformly — a failure shrinks to the minimal prefix that
+        // triggers the invariant violation.
+        //
+        // "Byzantine vote" covers double-voting (same Byzantine
+        // signer, different (view, block_hash)), voting for forked
+        // / phantom blocks (block_hash chosen arbitrarily, likely
+        // not in any honest `pending_blocks`), and stale/out-of-
+        // order delivery (view bounded low, injected at arbitrary
+        // schedule positions). Those three Byzantine attack vectors
+        // collapse to "arbitrary signed vote from a Byzantine id".
+
+        #[derive(Debug, Clone)]
+        enum ByzantineVoteStep {
+            Deliver(usize),
+            InjectVote {
+                view: View,
+                block_hash: BlockHash,
+                target_honest: usize,
+            },
+        }
+
+        fn byzantine_vote_step_strategy(
+            n_honest: usize,
+        ) -> impl Strategy<Value = ByzantineVoteStep> {
+            prop_oneof![
+                // Honest deliveries: heavier weight so the run
+                // actually makes progress between injections. 3:1
+                // is a coarse dial; if Byzantine rates ever need
+                // tuning the only effect is test latency vs.
+                // strategy coverage.
+                3 => (0..n_honest).prop_map(ByzantineVoteStep::Deliver),
+                1 => (0u64..8, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
+                    |(view, block_hash, target_honest)| ByzantineVoteStep::InjectVote {
+                        view,
+                        block_hash,
+                        target_honest,
+                    },
+                ),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn byzantine_votes_never_break_safety(
+                schedule in proptest::collection::vec(
+                    byzantine_vote_step_strategy(3),
+                    1..=200,
+                ),
+            ) {
+                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
+                let byz_nid = replicas.byzantine_nids()[0];
+                let kickoff = kickoff_proposal(&replicas);
+                replicas.inject_all(Event::ProposalReceived(kickoff));
+
+                for step in schedule {
+                    match step {
+                        ByzantineVoteStep::Deliver(i) => {
+                            replicas.deliver_one(i);
+                        }
+                        ByzantineVoteStep::InjectVote {
+                            view,
+                            block_hash,
+                            target_honest,
+                        } => {
+                            let vote = Signed {
+                                payload: Vote { view, block_hash },
+                                signer: byz_nid,
+                                sig: [0u8; 64],
+                            };
+                            replicas.inject(target_honest, Event::VoteReceived(vote));
+                        }
+                    }
+                }
+
+                assert_no_conflicting_commits(&replicas);
+            }
+        }
+
+        // ── β3: Byzantine proposal strategy ─────────────────────────
+        //
+        // A Byzantine proposer can craft a `Signed<Proposal>` with
+        // any block contents and any justify QC. Because the safety
+        // core explicitly doesn't verify QC signatures (that's the
+        // integration layer's job per #24), this covers the
+        // "proposal with bogus justify" attack from #93's
+        // verification list: the core trusts the `justify` view
+        // field but can only vote on a proposal that passes
+        // `safe_to_vote`, so a fake justify.view attempting to hit
+        // the liveness rule needs the block to either not extend
+        // the lock or to be fresh-view relative to it. Either way,
+        // safety of committed blocks must hold.
+
+        #[derive(Debug, Clone)]
+        enum ByzantineProposalStep {
+            Deliver(usize),
+            InjectProposal {
+                parent_hash: BlockHash,
+                view: View,
+                justify_view: View,
+                justify_block_hash: BlockHash,
+                target_honest: usize,
+            },
+        }
+
+        fn byzantine_proposal_step_strategy(
+            n_honest: usize,
+        ) -> impl Strategy<Value = ByzantineProposalStep> {
+            prop_oneof![
+                3 => (0..n_honest).prop_map(ByzantineProposalStep::Deliver),
+                1 => (
+                    prop::array::uniform32(any::<u8>()),
+                    0u64..10,
+                    0u64..10,
+                    prop::array::uniform32(any::<u8>()),
+                    0..n_honest,
+                )
+                    .prop_map(
+                        |(parent_hash, view, justify_view, justify_block_hash, target_honest)| {
+                            ByzantineProposalStep::InjectProposal {
+                                parent_hash,
+                                view,
+                                justify_view,
+                                justify_block_hash,
+                                target_honest,
+                            }
+                        },
+                    ),
+            ]
+        }
+
+        /// Assemble a `Signed<Proposal>` from a Byzantine adversary:
+        /// arbitrary block over `parent_hash` at `view`, arbitrary
+        /// justify-QC with the claimed signatures the safety core
+        /// won't actually verify.
+        fn byzantine_proposal(
+            n_validators: usize,
+            byz_nid: NodeId,
+            parent_hash: BlockHash,
+            view: View,
+            justify_view: View,
+            justify_block_hash: BlockHash,
+        ) -> Signed<Proposal> {
+            let header = BlockHeader {
+                parent_hash,
+                height: view,
+                view,
+                proposer: byz_nid,
+                state_commitment: [view as u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            };
+            let block = Block {
+                header,
+                commands: Vec::new(),
+            };
+            let mut justify =
+                QuorumCertificate::new(justify_view, justify_block_hash, n_validators);
+            // Synthesize a full set of fake signatures. The safety
+            // core doesn't verify them; this just clears
+            // `has_quorum` so the core treats the QC as legitimate.
+            for i in 0..n_validators {
+                justify.add_signature(i, [i as u8 + 1; 64]);
+            }
+            Signed {
+                payload: Proposal { block, justify },
+                signer: byz_nid,
+                sig: [0u8; 64],
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn byzantine_proposals_never_break_safety(
+                schedule in proptest::collection::vec(
+                    byzantine_proposal_step_strategy(3),
+                    1..=200,
+                ),
+            ) {
+                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
+                let byz_nid = replicas.byzantine_nids()[0];
+                let n_validators = replicas.validators.len();
+                let kickoff = kickoff_proposal(&replicas);
+                replicas.inject_all(Event::ProposalReceived(kickoff));
+
+                for step in schedule {
+                    match step {
+                        ByzantineProposalStep::Deliver(i) => {
+                            replicas.deliver_one(i);
+                        }
+                        ByzantineProposalStep::InjectProposal {
+                            parent_hash,
+                            view,
+                            justify_view,
+                            justify_block_hash,
+                            target_honest,
+                        } => {
+                            let proposal = byzantine_proposal(
+                                n_validators,
+                                byz_nid,
+                                parent_hash,
+                                view,
+                                justify_view,
+                                justify_block_hash,
+                            );
+                            replicas.inject(target_honest, Event::ProposalReceived(proposal));
+                        }
+                    }
+                }
+
+                assert_no_conflicting_commits(&replicas);
+            }
+        }
+
+        // ── β4: Combined Byzantine strategies ───────────────────────
+        //
+        // Umbrella proptest mixing honest delivery with all three
+        // Byzantine event kinds — vote, proposal, NewView —
+        // interleaved arbitrarily. The individual strategies above
+        // stay: each one shrinks to a smaller failing seed if a
+        // single attack vector is the culprit. This mixed test
+        // catches interactions between them that the standalone
+        // strategies can't reach (e.g., a bogus NewView that bumps
+        // `high_qc` to a high view, followed by a Byzantine
+        // proposal whose justify lines up with that high view to
+        // trigger the liveness rule).
+
+        #[derive(Debug, Clone)]
+        enum MixedStep {
+            Deliver(usize),
+            InjectVote {
+                view: View,
+                block_hash: BlockHash,
+                target_honest: usize,
+            },
+            InjectProposal {
+                parent_hash: BlockHash,
+                view: View,
+                justify_view: View,
+                justify_block_hash: BlockHash,
+                target_honest: usize,
+            },
+            InjectNewView {
+                qc_view: View,
+                qc_block_hash: BlockHash,
+                target_honest: usize,
+            },
+        }
+
+        fn mixed_step_strategy(n_honest: usize) -> impl Strategy<Value = MixedStep> {
+            prop_oneof![
+                // 6:1:1:1 honest:byz_vote:byz_proposal:byz_newview.
+                // Heavy honest weight keeps the trace making
+                // progress; light Byzantine weight leaves room for
+                // rare-but-nasty interaction patterns to surface.
+                6 => (0..n_honest).prop_map(MixedStep::Deliver),
+                1 => (0u64..10, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
+                    |(view, block_hash, target_honest)| MixedStep::InjectVote {
+                        view,
+                        block_hash,
+                        target_honest,
+                    },
+                ),
+                1 => (
+                    prop::array::uniform32(any::<u8>()),
+                    0u64..10,
+                    0u64..10,
+                    prop::array::uniform32(any::<u8>()),
+                    0..n_honest,
+                )
+                    .prop_map(
+                        |(parent_hash, view, justify_view, justify_block_hash, target_honest)| {
+                            MixedStep::InjectProposal {
+                                parent_hash,
+                                view,
+                                justify_view,
+                                justify_block_hash,
+                                target_honest,
+                            }
+                        },
+                    ),
+                1 => (0u64..10, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
+                    |(qc_view, qc_block_hash, target_honest)| MixedStep::InjectNewView {
+                        qc_view,
+                        qc_block_hash,
+                        target_honest,
+                    },
+                ),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn mixed_byzantine_events_never_break_safety(
+                schedule in proptest::collection::vec(mixed_step_strategy(3), 1..=300),
+            ) {
+                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
+                let byz_nid = replicas.byzantine_nids()[0];
+                let n_validators = replicas.validators.len();
+                let kickoff = kickoff_proposal(&replicas);
+                replicas.inject_all(Event::ProposalReceived(kickoff));
+
+                for step in schedule {
+                    match step {
+                        MixedStep::Deliver(i) => {
+                            replicas.deliver_one(i);
+                        }
+                        MixedStep::InjectVote {
+                            view,
+                            block_hash,
+                            target_honest,
+                        } => {
+                            let vote = Signed {
+                                payload: Vote { view, block_hash },
+                                signer: byz_nid,
+                                sig: [0u8; 64],
+                            };
+                            replicas.inject(target_honest, Event::VoteReceived(vote));
+                        }
+                        MixedStep::InjectProposal {
+                            parent_hash,
+                            view,
+                            justify_view,
+                            justify_block_hash,
+                            target_honest,
+                        } => {
+                            let proposal = byzantine_proposal(
+                                n_validators,
+                                byz_nid,
+                                parent_hash,
+                                view,
+                                justify_view,
+                                justify_block_hash,
+                            );
+                            replicas.inject(target_honest, Event::ProposalReceived(proposal));
+                        }
+                        MixedStep::InjectNewView {
+                            qc_view,
+                            qc_block_hash,
+                            target_honest,
+                        } => {
+                            let mut qc =
+                                QuorumCertificate::new(qc_view, qc_block_hash, n_validators);
+                            for i in 0..n_validators {
+                                qc.add_signature(i, [i as u8 + 1; 64]);
+                            }
+                            let nv = Signed {
+                                payload: NewView { high_qc: qc },
+                                signer: byz_nid,
+                                sig: [0u8; 64],
+                            };
+                            replicas.inject(target_honest, Event::NewViewReceived(nv));
+                        }
+                    }
                 }
 
                 assert_no_conflicting_commits(&replicas);
