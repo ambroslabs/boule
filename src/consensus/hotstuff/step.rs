@@ -2136,5 +2136,89 @@ mod tests {
                 assert_no_conflicting_commits(&replicas);
             }
         }
+
+        // ── β2: Byzantine vote strategy ─────────────────────────────
+        //
+        // A single enum carries both honest-delivery schedule steps
+        // and Byzantine vote injections. Keeping them in one
+        // `Vec<ByzantineVoteStep>` (rather than two parallel
+        // sequences) lets proptest's shrinker trim the trace
+        // uniformly — a failure shrinks to the minimal prefix that
+        // triggers the invariant violation.
+        //
+        // "Byzantine vote" covers double-voting (same Byzantine
+        // signer, different (view, block_hash)), voting for forked
+        // / phantom blocks (block_hash chosen arbitrarily, likely
+        // not in any honest `pending_blocks`), and stale/out-of-
+        // order delivery (view bounded low, injected at arbitrary
+        // schedule positions). Those three Byzantine attack vectors
+        // collapse to "arbitrary signed vote from a Byzantine id".
+
+        #[derive(Debug, Clone)]
+        enum ByzantineVoteStep {
+            Deliver(usize),
+            InjectVote {
+                view: View,
+                block_hash: BlockHash,
+                target_honest: usize,
+            },
+        }
+
+        fn byzantine_vote_step_strategy(
+            n_honest: usize,
+        ) -> impl Strategy<Value = ByzantineVoteStep> {
+            prop_oneof![
+                // Honest deliveries: heavier weight so the run
+                // actually makes progress between injections. 3:1
+                // is a coarse dial; if Byzantine rates ever need
+                // tuning the only effect is test latency vs.
+                // strategy coverage.
+                3 => (0..n_honest).prop_map(ByzantineVoteStep::Deliver),
+                1 => (0u64..8, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
+                    |(view, block_hash, target_honest)| ByzantineVoteStep::InjectVote {
+                        view,
+                        block_hash,
+                        target_honest,
+                    },
+                ),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn byzantine_votes_never_break_safety(
+                schedule in proptest::collection::vec(
+                    byzantine_vote_step_strategy(3),
+                    1..=200,
+                ),
+            ) {
+                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
+                let byz_nid = replicas.byzantine_nids()[0];
+                let kickoff = kickoff_proposal(&replicas);
+                replicas.inject_all(Event::ProposalReceived(kickoff));
+
+                for step in schedule {
+                    match step {
+                        ByzantineVoteStep::Deliver(i) => {
+                            replicas.deliver_one(i);
+                        }
+                        ByzantineVoteStep::InjectVote {
+                            view,
+                            block_hash,
+                            target_honest,
+                        } => {
+                            let vote = Signed {
+                                payload: Vote { view, block_hash },
+                                signer: byz_nid,
+                                sig: [0u8; 64],
+                            };
+                            replicas.inject(target_honest, Event::VoteReceived(vote));
+                        }
+                    }
+                }
+
+                assert_no_conflicting_commits(&replicas);
+            }
+        }
     }
 }
