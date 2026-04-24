@@ -318,6 +318,65 @@ fn sign_consensus_msg(msg: &ConsensusMsg, signer: &dyn Signer) -> anyhow::Result
     }
 }
 
+/// Sign `msg` and return both the wire payload and the [`Dispatch`] items
+/// that a peer would produce on receiving that wire frame.
+///
+/// The integration layer uses this to drive a single source of truth for
+/// self-addressed consensus actions: the same signed envelope is shipped
+/// on the wire (for peers) and fed back through the local dispatcher
+/// (for this node's own safety core / pacemaker). Production p2p
+/// broadcasts and point-to-point sends do not loop back to the sender,
+/// so without this local feed the leader of view `v` would never vote
+/// on its own proposal and the leader of view `v+1` would never count
+/// its own vote — see issue #118.
+///
+/// Signature verification is skipped for the local-loopback dispatches:
+/// the envelope was just produced by `signer`, so re-verifying is
+/// redundant work. The returned `Dispatch` items otherwise match the
+/// output of [`ingress_wire`] for this frame arriving from
+/// `signer.node_id()`.
+pub fn egress_consensus_msg_with_loopback(
+    msg: &ConsensusMsg,
+    signer: &dyn Signer,
+) -> anyhow::Result<(Bytes, Vec<Dispatch>)> {
+    let wire = sign_consensus_msg(msg, signer)?;
+    let payload = postcard::to_stdvec(&wire)
+        .map(Bytes::from)
+        .map_err(anyhow::Error::from)?;
+    let dispatches = match &wire {
+        WireMessage::Proposal(signed) => {
+            let view = signed.payload.block.header.view;
+            vec![
+                Dispatch::Safety(crate::consensus::hotstuff::step::Event::ProposalReceived(
+                    signed.clone(),
+                )),
+                Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
+            ]
+        }
+        WireMessage::Vote(signed) => {
+            vec![Dispatch::Safety(
+                crate::consensus::hotstuff::step::Event::VoteReceived(signed.clone()),
+            )]
+        }
+        WireMessage::NewView(signed) => {
+            let high_qc_view = signed.payload.high_qc.view;
+            vec![
+                Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
+                    signed.clone(),
+                )),
+                Dispatch::Pacemaker(pacemaker::Event::OnQc(high_qc_view)),
+            ]
+        }
+        // sign_consensus_msg only ever produces Proposal/Vote/NewView.
+        WireMessage::TimeoutVote(_)
+        | WireMessage::BlockRequest(_)
+        | WireMessage::BlockResponse(_) => {
+            unreachable!("sign_consensus_msg always produces Proposal/Vote/NewView wire variants")
+        }
+    };
+    Ok((payload, dispatches))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -620,11 +620,30 @@ impl ConsensusNode {
     /// Apply a slice of safety-core actions with the persist-before-send
     /// discipline: any `Persist` updates are written atomically to storage
     /// before the next non-`Persist` action is executed.
+    ///
+    /// # Self-loopback for `Broadcast` / `SendTo`
+    ///
+    /// Production p2p broadcasts exclude the sender and `SendTo(self)`
+    /// is dropped by the p2p manager (see `src/p2p/manager.rs`). Without
+    /// help from this layer the proposing leader would never receive its
+    /// own `Broadcast(Proposal)` and the next-view leader would never
+    /// count the `SendTo(self_id, Vote)` it emits when it votes on the
+    /// current leader's proposal. Both losses combine to keep quorum one
+    /// signer short of threshold and deadlock the cluster (#118).
+    ///
+    /// For every `Broadcast(msg)` we both ship the signed frame on the
+    /// wire AND feed the same signed envelope through the local
+    /// dispatcher, mirroring what a peer would do on receipt. For
+    /// `SendTo(target, msg)` where `target == self.self_id` we skip the
+    /// wire and only feed locally; for any other target we wire-send
+    /// without a local feed. `RequestBlock(hash, peer)` where
+    /// `peer == self.self_id` is degenerate (we would be asking
+    /// ourselves for a block we just asked about) and is dropped.
     async fn apply_safety_actions(
         &mut self,
         actions: Vec<SafetyAction>,
         send_tx: &mpsc::Sender<ProtocolOutbound>,
-        _view_timer: &mut ViewTimer,
+        view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
         let mut persist_buf: Vec<StateUpdate> = Vec::new();
@@ -643,10 +662,44 @@ impl ConsensusNode {
             match action {
                 SafetyAction::Persist(_) => unreachable!(),
 
-                SafetyAction::Broadcast(_)
-                | SafetyAction::SendTo(..)
-                | SafetyAction::RequestBlock(..) => {
-                    if let Some(out) = dispatch::egress_safety(&action, signer.as_ref())? {
+                SafetyAction::Broadcast(msg) => {
+                    let (payload, loopback) =
+                        dispatch::egress_consensus_msg_with_loopback(&msg, signer.as_ref())?;
+                    send_outbound(send_tx, Outbound::Broadcast(payload)).await;
+                    self.deliver_loopback(loopback, send_tx, view_timer, signer)
+                        .await?;
+                }
+
+                SafetyAction::SendTo(target, msg) => {
+                    let (payload, loopback) =
+                        dispatch::egress_consensus_msg_with_loopback(&msg, signer.as_ref())?;
+                    if target == self.self_id {
+                        // Self-addressed: deliver locally; do not put bytes
+                        // on the wire (the p2p layer would drop them).
+                        self.deliver_loopback(loopback, send_tx, view_timer, signer)
+                            .await?;
+                    } else {
+                        send_outbound(
+                            send_tx,
+                            Outbound::SendTo {
+                                to: target,
+                                payload,
+                            },
+                        )
+                        .await;
+                    }
+                }
+
+                SafetyAction::RequestBlock(hash, peer) => {
+                    if peer == self.self_id {
+                        // Asking ourselves for a block is a no-op: if we
+                        // don't already have it, the p2p layer can't
+                        // fetch it from us. Log at debug and move on.
+                        tracing::debug!(
+                            "consensus: dropping self-addressed RequestBlock for {hash:?}",
+                        );
+                    } else {
+                        let out = dispatch::egress_block_request(hash, peer);
                         send_outbound(send_tx, out).await;
                     }
                 }
@@ -664,6 +717,24 @@ impl ConsensusNode {
             self.persist_updates(&persist_buf)?;
         }
 
+        Ok(())
+    }
+
+    /// Feed self-addressed dispatch items back through the same entry
+    /// point a peer message would take.
+    ///
+    /// Boxed so the mutual recursion with [`Self::apply_safety_actions`]
+    /// and [`Self::apply_pacemaker_actions`] compiles as an async fn.
+    async fn deliver_loopback(
+        &mut self,
+        loopback: Vec<Dispatch>,
+        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        view_timer: &mut ViewTimer,
+        signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        for d in loopback {
+            Box::pin(self.apply_dispatch(d, send_tx, view_timer, signer)).await?;
+        }
         Ok(())
     }
 
@@ -1694,5 +1765,211 @@ mod tests {
         // but the timer IS armed. We verify the loop at least processed the
         // boot sequence without panicking: if the task panicked, the test
         // harness would surface it on the next await or drop.
+    }
+
+    // ── Self-addressed loopback (#118) ───────────────────────────────────────
+
+    /// Build a node whose `self_id` matches `signer.node_id()` and who
+    /// sits at `validator_set[self_idx]` of a 4-node committee. The
+    /// remaining three slots are filled with placeholder ids so the
+    /// safety core can route votes by validator index.
+    fn make_node_with_signer(
+        signer: &NodeSigner,
+        self_idx: usize,
+    ) -> (ConsensusNode, ValidatorSet) {
+        assert!(self_idx < 4);
+        let self_id = signer.node_id();
+        let placeholders = [nid(0xA1), nid(0xA2), nid(0xA3)];
+        let mut ids: Vec<NodeId> = Vec::with_capacity(4);
+        let mut ph = placeholders.iter();
+        for i in 0..4 {
+            if i == self_idx {
+                ids.push(self_id);
+            } else {
+                ids.push(*ph.next().unwrap());
+            }
+        }
+        let vs = ValidatorSet::new(ids);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        let node = ConsensusNode::new(
+            self_id,
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+        (node, vs)
+    }
+
+    /// Regression for issue #118: when a node is the proposing leader it
+    /// must process its own `Broadcast(Proposal)` locally so it votes on
+    /// its own proposal. Before the fix this path was silent — the p2p
+    /// broadcast excluded the sender, the leader never ran
+    /// `on_proposal_received` on its own frame, and the next-view
+    /// leader's vote bucket was one signer short of quorum.
+    #[tokio::test]
+    async fn broadcast_proposal_is_delivered_locally_to_leader() {
+        // Sit at index 1 so round-robin makes self the view-1 leader
+        // (leader(1) = validator_set[1 % 4] = self).
+        let ns = fresh_signer();
+        let (mut node, vs) = make_node_with_signer(&ns, 1);
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+
+        let (handle, _event_tx, mut send_rx) = make_protocol_handle();
+        let ProtocolHandle { send_tx, .. } = handle;
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Safety core emits exactly `[Broadcast(Proposal)]` for a freshly
+        // booted leader seeded with the genesis QC (regression-tested by
+        // `new_seeds_genesis_qc_so_view_one_leader_can_propose`).
+        let actions = node.core.become_leader(1);
+        assert_eq!(actions.len(), 1);
+
+        node.apply_safety_actions(actions, &send_tx, &mut view_timer, &signer)
+            .await
+            .unwrap();
+
+        // Observable effect of local self-delivery: the safety core
+        // processed its own proposal through `on_proposal_received`,
+        // which persists `last_voted_view = 1` before emitting the vote.
+        let raw = node
+            .storage
+            .get(STORAGE_KEY_LAST_VOTED_VIEW)
+            .unwrap()
+            .expect("last_voted_view must be persisted after self-vote");
+        assert_eq!(decode_voted_view(&raw).unwrap(), 1);
+        assert_eq!(node.core.state().last_voted_view, 1);
+
+        // Wire traffic: the proposal broadcast must have gone out; the
+        // vote SendTo goes to the next-view leader, which in the 4-node
+        // round-robin is validator_set[2] — that slot is a placeholder,
+        // not self, so we expect exactly one Broadcast and one SendTo.
+        let next_leader = *vs.get(2).unwrap();
+        assert_ne!(next_leader, node.self_id);
+
+        let first = send_rx
+            .try_recv()
+            .expect("Broadcast(Proposal) must be sent");
+        assert!(
+            matches!(first, ProtocolOutbound::Broadcast(_)),
+            "first outbound must be the proposal broadcast"
+        );
+        let second = send_rx
+            .try_recv()
+            .expect("SendTo(next_leader, Vote) must be sent");
+        match second {
+            ProtocolOutbound::SendTo { node_id, .. } => {
+                assert_eq!(node_id, next_leader);
+                assert_ne!(node_id, node.self_id, "self-vote must not reach the wire");
+            }
+            other => panic!("expected SendTo(next_leader, Vote), got {other:?}"),
+        }
+        // No further traffic.
+        assert!(send_rx.try_recv().is_err());
+    }
+
+    /// Regression for issue #118: when this node is the next-view leader
+    /// and votes on the current-view proposal, the safety core emits
+    /// `SendTo(self_id, Vote)`. That must be delivered through the local
+    /// dispatcher instead of leaking onto the wire, where the p2p layer
+    /// would log "SendTo unknown peer SELF" and drop it.
+    #[tokio::test]
+    async fn send_to_self_vote_loops_back_without_wire_traffic() {
+        let ns = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&ns, 0);
+        let self_id = node.self_id;
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+
+        let (handle, _event_tx, mut send_rx) = make_protocol_handle();
+        let ProtocolHandle { send_tx, .. } = handle;
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Hand-craft a self-addressed Vote action (as the safety core
+        // would emit when this node is the next-view leader).
+        let vote = crate::consensus::hotstuff::qc::Vote {
+            view: 7,
+            block_hash: [0x42; 32],
+        };
+        let action = SafetyAction::SendTo(
+            self_id,
+            crate::consensus::hotstuff::ConsensusMsg::Vote(vote),
+        );
+
+        node.apply_safety_actions(vec![action], &send_tx, &mut view_timer, &signer)
+            .await
+            .unwrap();
+
+        // No wire traffic: a self-addressed SendTo must be consumed
+        // entirely by the local-loopback path.
+        assert!(
+            send_rx.try_recv().is_err(),
+            "self-addressed SendTo must not emit any ProtocolOutbound on the wire",
+        );
+    }
+
+    /// Non-self `SendTo` must still go on the wire unchanged — the
+    /// loopback machinery must only intercept self-addressed sends.
+    #[tokio::test]
+    async fn send_to_peer_vote_goes_on_the_wire_unchanged() {
+        let ns = fresh_signer();
+        let (mut node, vs) = make_node_with_signer(&ns, 0);
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+        // A placeholder peer that is *not* self.
+        let peer = *vs.get(1).unwrap();
+        assert_ne!(peer, node.self_id);
+
+        let (handle, _event_tx, mut send_rx) = make_protocol_handle();
+        let ProtocolHandle { send_tx, .. } = handle;
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let vote = crate::consensus::hotstuff::qc::Vote {
+            view: 3,
+            block_hash: [0x7A; 32],
+        };
+        let action =
+            SafetyAction::SendTo(peer, crate::consensus::hotstuff::ConsensusMsg::Vote(vote));
+
+        node.apply_safety_actions(vec![action], &send_tx, &mut view_timer, &signer)
+            .await
+            .unwrap();
+
+        let out = send_rx
+            .try_recv()
+            .expect("peer-addressed SendTo must be sent");
+        match out {
+            ProtocolOutbound::SendTo { node_id, payload } => {
+                assert_eq!(node_id, peer);
+                let decoded: WireMessage = postcard::from_bytes(&payload).unwrap();
+                assert!(matches!(decoded, WireMessage::Vote(_)));
+            }
+            other => panic!("expected SendTo to peer, got {other:?}"),
+        }
+        assert!(send_rx.try_recv().is_err());
+    }
+
+    /// A self-addressed `RequestBlock` is degenerate — we can't service
+    /// a block request from ourselves. It must be dropped locally rather
+    /// than leaking to the p2p layer as "SendTo unknown peer SELF".
+    #[tokio::test]
+    async fn request_block_from_self_is_dropped() {
+        let ns = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&ns, 0);
+        let self_id = node.self_id;
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+
+        let (handle, _event_tx, mut send_rx) = make_protocol_handle();
+        let ProtocolHandle { send_tx, .. } = handle;
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let action = SafetyAction::RequestBlock([0xCD; 32], self_id);
+        node.apply_safety_actions(vec![action], &send_tx, &mut view_timer, &signer)
+            .await
+            .unwrap();
+        assert!(send_rx.try_recv().is_err());
     }
 }
