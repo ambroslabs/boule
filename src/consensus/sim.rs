@@ -89,6 +89,12 @@ pub struct SimCluster {
     /// tasks. `kill_node` uses this map to dispatch `PeerDisconnected`
     /// to every survivor at kill time.
     event_txs: Arc<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>,
+    /// Commits buffered by [`SimCluster::peek_commit_heights`] so that
+    /// non-destructive height snapshots do not steal blocks from the
+    /// next [`SimCluster::drain_commits`] call. `drain_commits` takes
+    /// and resets this buffer in the same call that flushes the
+    /// `commit_rxs`.
+    commit_cache: Vec<Vec<Block>>,
     /// Shutdown senders; `None` after `kill_node` has been called for that slot.
     shutdown_txs: Vec<Option<oneshot::Sender<()>>>,
 }
@@ -194,6 +200,8 @@ impl SimCluster {
             });
         }
 
+        let commit_cache: Vec<Vec<Block>> = (0..n).map(|_| Vec::new()).collect();
+
         SimCluster {
             commit_rxs,
             node_ids,
@@ -201,6 +209,7 @@ impl SimCluster {
             link_cuts,
             dead_nodes,
             event_txs,
+            commit_cache,
             shutdown_txs,
         }
     }
@@ -306,19 +315,79 @@ impl SimCluster {
             .remove(&(self.node_ids[from_idx], self.node_ids[to_idx]));
     }
 
-    /// Drain all blocks currently buffered in every `commit_rx` and return
-    /// them grouped by node (in the same order as `node_ids`).
+    /// Drain all blocks currently buffered in every `commit_rx` — plus
+    /// any blocks previously cached by
+    /// [`SimCluster::peek_commit_heights`] — and return them grouped by
+    /// node (in the same order as `node_ids`).
+    ///
+    /// After this call the per-node cache is empty, so a subsequent
+    /// `drain_commits` only returns blocks that have arrived since.
     pub fn drain_commits(&mut self) -> Vec<Vec<Block>> {
-        self.commit_rxs
-            .iter_mut()
-            .map(|rx| {
-                let mut blocks = Vec::new();
-                while let Ok(b) = rx.try_recv() {
-                    blocks.push(b);
-                }
-                blocks
-            })
+        self.flush_into_cache();
+        let n = self.node_ids.len();
+        std::mem::replace(&mut self.commit_cache, (0..n).map(|_| Vec::new()).collect())
+    }
+
+    /// Non-destructively report the highest committed [`Block`] height
+    /// observed by each node so far (or `0` if the node has yet to
+    /// commit anything).
+    ///
+    /// Idempotent: it drains whatever is currently buffered in the
+    /// `commit_rx`s into an internal per-node cache, returns max
+    /// heights from the cache, and leaves the cache in place so a
+    /// later [`SimCluster::drain_commits`] still sees those blocks.
+    ///
+    /// Order matches [`SimCluster::node_ids`].
+    pub fn peek_commit_heights(&mut self) -> Vec<u64> {
+        self.flush_into_cache();
+        self.commit_cache
+            .iter()
+            .map(|blocks| blocks.iter().map(|b| b.header.height).max().unwrap_or(0))
             .collect()
+    }
+
+    /// Advance tokio's paused virtual clock by `total`, yielding the
+    /// task scheduler between small advance steps so timer-driven work
+    /// (view-timer fires, pacemaker backoff) and the message-pump tasks
+    /// they wake actually get a chance to run.
+    ///
+    /// `tokio::time::advance` by itself only fires timers; it doesn't
+    /// re-enter the scheduler enough times for the downstream
+    /// broadcast → ingress → safety-core → outbound chain to run to
+    /// quiescence. Without the inter-step yield loop, tests can
+    /// advance 5s of virtual time but only execute the work of the
+    /// first 50ms — a silent source of false-green liveness
+    /// assertions.
+    ///
+    /// Requires an active [`tokio::time::pause`].
+    pub async fn advance_and_yield(&self, total: Duration) {
+        // Advance in 50ms chunks: short enough to interleave pacemaker
+        // timer fires with message delivery at common `timeout_base`
+        // settings, long enough to finish a multi-second advance
+        // without thousands of iterations.
+        let chunk = Duration::from_millis(50);
+        let mut remaining = total;
+        while !remaining.is_zero() {
+            let step = remaining.min(chunk);
+            tokio::time::advance(step).await;
+            remaining -= step;
+            // Yield batch: large enough to drain a full
+            // broadcast/vote/QC ingress round across n=4 nodes, which
+            // is typically ~20–40 task wake-ups.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// Drain both receivers into the per-node cache. Shared by
+    /// [`SimCluster::drain_commits`] and [`SimCluster::peek_commit_heights`].
+    fn flush_into_cache(&mut self) {
+        for (rx, cache) in self.commit_rxs.iter_mut().zip(self.commit_cache.iter_mut()) {
+            while let Ok(b) = rx.try_recv() {
+                cache.push(b);
+            }
+        }
     }
 }
 
@@ -1187,5 +1256,219 @@ mod tests {
             survivor_commits > 0,
             "survivors must keep committing after kill_node; got {survivor_commits}",
         );
+    }
+
+    // ── K-series: post-crash liveness regression guards (#121) ────────────────
+    //
+    // The older crash/partition tests above use `tokio::time::pause()` +
+    // `yield_now()` loops without virtual-time advancement. That pattern
+    // yields the scheduler but never fires the pacemaker's view timer
+    // (a `tokio::time::Sleep`), so consensus progress is entirely at
+    // the mercy of whatever messages happened to be in flight at kill
+    // time. Combined with weak `> 0` commit assertions, those tests can
+    // pass even when the cluster deadlocks milliseconds after a kill —
+    // which is exactly the class of production regression #124 was
+    // filed for.
+    //
+    // The K-series below drive virtual time forward via
+    // `SimCluster::advance_and_yield` and assert concrete commit-gain
+    // floors via `SimCluster::peek_commit_heights`, so a post-crash
+    // stall is visible to the suite.
+
+    /// Per-node gained-commits assertion: after `before` → `after` the
+    /// blocks committed by each indexed node must have grown by at
+    /// least `floor` heights. `exclude` lets the caller skip nodes
+    /// that are crashed/partitioned and not expected to keep up.
+    fn assert_each_gained_at_least(
+        before: &[u64],
+        after: &[u64],
+        floor: u64,
+        exclude: &[usize],
+        label: &str,
+    ) {
+        for (idx, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+            if exclude.contains(&idx) {
+                continue;
+            }
+            let gained = a.saturating_sub(*b);
+            assert!(
+                gained >= floor,
+                "{label}: node {idx} gained only {gained} commits \
+                 (height {b} → {a}); expected ≥ {floor}",
+            );
+        }
+    }
+
+    /// Crash of a minority (one of four) must not stall steady-state
+    /// liveness: after a healthy warm-up the cluster is committing
+    /// blocks; after `kill_node(idx)` on a non-leader the surviving
+    /// three must continue committing many additional blocks within a
+    /// few simulated seconds.
+    ///
+    /// This is the primary post-crash liveness regression guard called
+    /// out in #121. Unlike the older
+    /// `crash_of_minority_does_not_violate_safety`, this test:
+    ///
+    /// 1. Advances virtual time (`advance_and_yield`) so the view
+    ///    timer actually fires and the pacemaker can drive TC
+    ///    formation when the dead node's turn to lead comes around.
+    /// 2. Snapshots per-node committed height before and after the
+    ///    kill and asserts each survivor gained a concrete minimum
+    ///    number of commits — floor = 10, chosen to comfortably rule
+    ///    out "deadlock + a handful of stragglers" while leaving
+    ///    ample headroom above the expected commit rate (~50ms per
+    ///    view, 3-chain commit ⇒ dozens of commits per 5s).
+    ///
+    /// Currently ignored: this test is the regression guard for the
+    /// production liveness bug tracked in #124. It is expected to FAIL
+    /// on the current `main` (post-#120, pre-#124) and to PASS once
+    /// #124 lands the actual fix — at which point `#[ignore]` should
+    /// be removed in that same PR so it becomes a permanent guard.
+    #[tokio::test]
+    #[ignore = "#121 regression guard: fails until the liveness fix in #124 lands"]
+    async fn crash_of_minority_preserves_liveness() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Warm up to steady state: advance ~500ms so several views
+        // complete and the cluster has produced real commits.
+        cluster.advance_and_yield(Duration::from_millis(500)).await;
+
+        let heights_before = cluster.peek_commit_heights();
+        let warm_total: u64 = heights_before.iter().sum();
+        assert!(
+            warm_total > 0,
+            "warmup must produce at least one commit across the cluster; heights={heights_before:?}",
+        );
+
+        // Kill a non-leader: with 4 sorted validators the view-1
+        // leader is index 1, so index 0 is a convenient non-view-1
+        // leader. It will still be the leader for views 4, 8, 12, …
+        // which is precisely why this test is meaningful — survivors
+        // must TC past those views.
+        let killed_idx = 0;
+        cluster.kill_node(killed_idx);
+
+        // Drive ~5 simulated seconds of post-crash execution.
+        cluster.advance_and_yield(Duration::from_secs(5)).await;
+
+        let heights_after = cluster.peek_commit_heights();
+
+        // Safety: no conflicting commits across all nodes.
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // Liveness: every survivor gained at least 10 commits. The
+        // killed node is excluded from the floor check because its
+        // run loop is gone.
+        assert_each_gained_at_least(
+            &heights_before,
+            &heights_after,
+            10,
+            &[killed_idx],
+            "crash_of_minority",
+        );
+    }
+
+    /// Crash of the view-1 leader at steady state must not stall
+    /// liveness: the surviving three replicas must advance past every
+    /// view the crashed node would have led (views 1, 5, 9, …) via
+    /// the TC path and continue committing.
+    ///
+    /// Complements `crash_of_minority_preserves_liveness` by proving
+    /// the liveness property holds even when the crashed node is the
+    /// one that proposes first on the most common rotation slot.
+    ///
+    /// Currently ignored for the same reason as
+    /// `crash_of_minority_preserves_liveness` — see that test's
+    /// docstring.
+    #[tokio::test]
+    #[ignore = "#121 regression guard: fails until the liveness fix in #124 lands"]
+    async fn crash_of_leader_preserves_liveness() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        cluster.advance_and_yield(Duration::from_millis(500)).await;
+        let heights_before = cluster.peek_commit_heights();
+
+        // View-1 leader under round-robin is validators[1 % 4] =
+        // sorted index 1.
+        let killed_idx = 1;
+        cluster.kill_node(killed_idx);
+
+        cluster.advance_and_yield(Duration::from_secs(5)).await;
+
+        let heights_after = cluster.peek_commit_heights();
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        assert_each_gained_at_least(
+            &heights_before,
+            &heights_after,
+            10,
+            &[killed_idx],
+            "crash_of_leader",
+        );
+    }
+
+    /// Partitioning a node must not stall the remaining three, and
+    /// healing must restore full participation: after a partition of
+    /// node 0 the three connected replicas must commit ≥ 10 additional
+    /// blocks in 2 simulated seconds; after healing, every replica
+    /// (including the previously partitioned one) must commit ≥ 5
+    /// further blocks in another 2 simulated seconds.
+    ///
+    /// The catch-up floor on the previously partitioned node is the
+    /// whole point: a weak `> 0` assertion would pass even if the
+    /// healed node permanently lagged, which is exactly the regression
+    /// #121 flags.
+    ///
+    /// Currently ignored for the same reason as
+    /// `crash_of_minority_preserves_liveness` — see that test's
+    /// docstring.
+    #[tokio::test]
+    #[ignore = "#121 regression guard: fails until the liveness fix in #124 lands"]
+    async fn partition_and_heal_preserves_liveness() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        cluster.advance_and_yield(Duration::from_millis(500)).await;
+
+        // Partition node 0. Its messages are dropped in both
+        // directions (full partition, unlike the directed `cut_link`).
+        let partitioned_idx = 0;
+        cluster.partition_node(partitioned_idx);
+
+        let heights_before_partition = cluster.peek_commit_heights();
+
+        // 2 simulated seconds with one node partitioned.
+        cluster.advance_and_yield(Duration::from_secs(2)).await;
+
+        let heights_mid = cluster.peek_commit_heights();
+        assert_each_gained_at_least(
+            &heights_before_partition,
+            &heights_mid,
+            10,
+            &[partitioned_idx],
+            "partition_phase",
+        );
+
+        // Heal and give the cluster another 2 simulated seconds so
+        // the previously partitioned node catches up on the chain via
+        // post-heal proposal/justify propagation.
+        cluster.heal_node(partitioned_idx);
+        cluster.advance_and_yield(Duration::from_secs(2)).await;
+
+        let heights_after_heal = cluster.peek_commit_heights();
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // Now the healed node must gain too — ≥ 5 additional commits
+        // since the mid-point. Connected nodes keep going at the same
+        // rate, so they should also gain ≥ 5.
+        assert_each_gained_at_least(&heights_mid, &heights_after_heal, 5, &[], "post_heal_phase");
     }
 }
