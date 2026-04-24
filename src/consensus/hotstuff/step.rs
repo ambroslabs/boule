@@ -2354,5 +2354,151 @@ mod tests {
                 assert_no_conflicting_commits(&replicas);
             }
         }
+
+        // ── β4: Combined Byzantine strategies ───────────────────────
+        //
+        // Umbrella proptest mixing honest delivery with all three
+        // Byzantine event kinds — vote, proposal, NewView —
+        // interleaved arbitrarily. The individual strategies above
+        // stay: each one shrinks to a smaller failing seed if a
+        // single attack vector is the culprit. This mixed test
+        // catches interactions between them that the standalone
+        // strategies can't reach (e.g., a bogus NewView that bumps
+        // `high_qc` to a high view, followed by a Byzantine
+        // proposal whose justify lines up with that high view to
+        // trigger the liveness rule).
+
+        #[derive(Debug, Clone)]
+        enum MixedStep {
+            Deliver(usize),
+            InjectVote {
+                view: View,
+                block_hash: BlockHash,
+                target_honest: usize,
+            },
+            InjectProposal {
+                parent_hash: BlockHash,
+                view: View,
+                justify_view: View,
+                justify_block_hash: BlockHash,
+                target_honest: usize,
+            },
+            InjectNewView {
+                qc_view: View,
+                qc_block_hash: BlockHash,
+                target_honest: usize,
+            },
+        }
+
+        fn mixed_step_strategy(n_honest: usize) -> impl Strategy<Value = MixedStep> {
+            prop_oneof![
+                // 6:1:1:1 honest:byz_vote:byz_proposal:byz_newview.
+                // Heavy honest weight keeps the trace making
+                // progress; light Byzantine weight leaves room for
+                // rare-but-nasty interaction patterns to surface.
+                6 => (0..n_honest).prop_map(MixedStep::Deliver),
+                1 => (0u64..10, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
+                    |(view, block_hash, target_honest)| MixedStep::InjectVote {
+                        view,
+                        block_hash,
+                        target_honest,
+                    },
+                ),
+                1 => (
+                    prop::array::uniform32(any::<u8>()),
+                    0u64..10,
+                    0u64..10,
+                    prop::array::uniform32(any::<u8>()),
+                    0..n_honest,
+                )
+                    .prop_map(
+                        |(parent_hash, view, justify_view, justify_block_hash, target_honest)| {
+                            MixedStep::InjectProposal {
+                                parent_hash,
+                                view,
+                                justify_view,
+                                justify_block_hash,
+                                target_honest,
+                            }
+                        },
+                    ),
+                1 => (0u64..10, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
+                    |(qc_view, qc_block_hash, target_honest)| MixedStep::InjectNewView {
+                        qc_view,
+                        qc_block_hash,
+                        target_honest,
+                    },
+                ),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn mixed_byzantine_events_never_break_safety(
+                schedule in proptest::collection::vec(mixed_step_strategy(3), 1..=300),
+            ) {
+                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
+                let byz_nid = replicas.byzantine_nids()[0];
+                let n_validators = replicas.validators.len();
+                let kickoff = kickoff_proposal(&replicas);
+                replicas.inject_all(Event::ProposalReceived(kickoff));
+
+                for step in schedule {
+                    match step {
+                        MixedStep::Deliver(i) => {
+                            replicas.deliver_one(i);
+                        }
+                        MixedStep::InjectVote {
+                            view,
+                            block_hash,
+                            target_honest,
+                        } => {
+                            let vote = Signed {
+                                payload: Vote { view, block_hash },
+                                signer: byz_nid,
+                                sig: [0u8; 64],
+                            };
+                            replicas.inject(target_honest, Event::VoteReceived(vote));
+                        }
+                        MixedStep::InjectProposal {
+                            parent_hash,
+                            view,
+                            justify_view,
+                            justify_block_hash,
+                            target_honest,
+                        } => {
+                            let proposal = byzantine_proposal(
+                                n_validators,
+                                byz_nid,
+                                parent_hash,
+                                view,
+                                justify_view,
+                                justify_block_hash,
+                            );
+                            replicas.inject(target_honest, Event::ProposalReceived(proposal));
+                        }
+                        MixedStep::InjectNewView {
+                            qc_view,
+                            qc_block_hash,
+                            target_honest,
+                        } => {
+                            let mut qc =
+                                QuorumCertificate::new(qc_view, qc_block_hash, n_validators);
+                            for i in 0..n_validators {
+                                qc.add_signature(i, [i as u8 + 1; 64]);
+                            }
+                            let nv = Signed {
+                                payload: NewView { high_qc: qc },
+                                signer: byz_nid,
+                                sig: [0u8; 64],
+                            };
+                            replicas.inject(target_honest, Event::NewViewReceived(nv));
+                        }
+                    }
+                }
+
+                assert_no_conflicting_commits(&replicas);
+            }
+        }
     }
 }
