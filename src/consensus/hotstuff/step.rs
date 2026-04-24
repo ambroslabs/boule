@@ -1273,6 +1273,33 @@ mod tests {
     }
 
     #[test]
+    fn subquorum_votes_accumulate_without_actions() {
+        // self = nid(1), leader of view 4. Feed two valid votes at
+        // view 3 (quorum over n=4 is 3). The bucket should grow to
+        // two signatures, but neither `step` call produces any
+        // actions — C2's first-crosses-threshold gate only fires on
+        // the transition to quorum, which we haven't reached.
+        let mut core = make_core(1);
+        let block_hash: BlockHash = [0xAA; 32];
+
+        let step1 = core.step(Event::VoteReceived(signed_vote(3, block_hash, nid(2))));
+        assert!(step1.is_empty(), "first sub-quorum vote is silent");
+
+        let step2 = core.step(Event::VoteReceived(signed_vote(3, block_hash, nid(3))));
+        assert!(step2.is_empty(), "second sub-quorum vote is silent");
+
+        let bucket = core
+            .vote_bucket
+            .get(&(3, block_hash))
+            .expect("bucket keyed by (view, block_hash) must exist after two votes");
+        assert_eq!(bucket.signer_count(), 2, "both signatures recorded",);
+        assert!(
+            !bucket.has_quorum(&core.state.validator_set),
+            "2 of 4 is below the quorum threshold of 3",
+        );
+    }
+
+    #[test]
     fn vote_from_non_validator_signer_is_dropped() {
         // self = nid(1) is the leader of view 4 (4 % 4 = 0), so a
         // vote at view 3 would normally accumulate. But this vote
