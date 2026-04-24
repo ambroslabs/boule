@@ -16,11 +16,12 @@
 //!
 //! # Topology
 //!
-//! Every `Broadcast` is delivered to **all** nodes including the sender;
-//! this is necessary for the leader to vote on its own proposal and for
-//! f=1 fault-tolerance (with n=4, quorum=3: the leader's own vote plus
-//! two others reaches quorum even when one non-leader is crashed).
-//! `SendTo` is delivered exactly to the named peer.
+//! `Broadcast` is delivered to every node **except** the sender and
+//! `SendTo` is delivered exactly to the named peer — matching production
+//! p2p semantics (`src/p2p/manager.rs`). Self-addressed consensus
+//! actions are looped back inside the integration layer itself (see
+//! [`ConsensusNode`] / issue #118); delivering them here as well would
+//! double-feed the safety core and mask regressions of the loopback.
 //! Messages are delivered in-order per sender (channels are FIFO).
 //!
 //! # Fault injection
@@ -164,9 +165,13 @@ impl SimCluster {
             // Routing task: translate each outbound frame into inbound events
             // on the target node(s), honouring the partition set.
             //
-            // Broadcasts are delivered to ALL nodes including the sender so
-            // the leader can vote on its own proposal — required for f=1
-            // fault-tolerance with n=4 (quorum=3: leader vote + 2 others).
+            // Self-delivery is suppressed in both broadcast and send-to
+            // paths so the sim matches the production p2p semantics
+            // (`src/p2p/manager.rs`). The integration layer now loops
+            // self-addressed consensus actions back into the local
+            // safety core inside `ConsensusNode::apply_safety_actions`;
+            // duplicating the delivery here would double-feed the core
+            // and hide regressions of that loopback.
             let route_txs = Arc::clone(&event_txs);
             let part = Arc::clone(&partitioned);
             let cuts = Arc::clone(&link_cuts);
@@ -181,6 +186,9 @@ impl SimCluster {
                     match outbound {
                         ProtocolOutbound::Broadcast(payload) => {
                             for (target, tx) in route_txs.iter() {
+                                if *target == my_id {
+                                    continue;
+                                }
                                 if part.lock().contains(target) {
                                     continue;
                                 }
@@ -196,6 +204,9 @@ impl SimCluster {
                             }
                         }
                         ProtocolOutbound::SendTo { node_id, payload } => {
+                            if node_id == my_id {
+                                continue;
+                            }
                             if part.lock().contains(&node_id) {
                                 continue;
                             }
