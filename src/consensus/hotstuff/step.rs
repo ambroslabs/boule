@@ -205,9 +205,8 @@ impl HotStuffCore {
     pub fn step(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::ProposalReceived(signed) => self.on_proposal_received(signed),
-            Event::VoteReceived(_) | Event::NewViewReceived(_) | Event::PacemakerAdvance(_) => {
-                Vec::new()
-            }
+            Event::VoteReceived(signed) => self.on_vote_received(signed),
+            Event::NewViewReceived(_) | Event::PacemakerAdvance(_) => Vec::new(),
         }
     }
 
@@ -342,6 +341,88 @@ impl HotStuffCore {
         actions
     }
 
+    /// Handle an inbound [`Vote`]. Only meaningful to the leader of
+    /// `vote.view + 1`; other replicas drop. When the added partial
+    /// signature takes a bucket across quorum for the first time, the
+    /// leader adopts the freshly-formed QC as `high_qc` (emitting
+    /// `Persist(HighQc)`) and broadcasts a new [`Proposal`] that
+    /// carries the QC as its justify.
+    ///
+    /// Mirrors Algorithm 4's `onReceiveVote` (paper §6), with the
+    /// onBeat-triggered `onPropose` collapsed into the same step.
+    /// That collapse is acceptable for the safety core — the
+    /// integration layer (#24) can choose to batch proposals
+    /// application-side by queueing multiple votes before forwarding
+    /// to `step`.
+    fn on_vote_received(&mut self, signed: Signed<Vote>) -> Vec<Action> {
+        let vote = &signed.payload;
+
+        // C1a: only the leader of the next view cares about this vote.
+        // The QC this vote contributes to is the justify for that
+        // leader's next proposal.
+        let next_view = vote.view + 1;
+        if round_robin_leader(&self.state.validator_set, next_view) != self.self_id {
+            return Vec::new();
+        }
+
+        // C1b: the voter must be a known validator; otherwise we have
+        // no index into the `SignerBitmap`. A well-behaved integration
+        // layer already filters these in signature verification, but
+        // we repeat the check here for defence-in-depth against a
+        // replay or test-wiring bug.
+        let Some(voter_idx) = self.state.validator_set.index_of(&signed.signer) else {
+            return Vec::new();
+        };
+
+        // C1c: accumulate into the bucket for this `(view, block_hash)`
+        // pair. `QuorumCertificate::add_signature` is idempotent on
+        // the set-bit — duplicate votes from the same signer are
+        // no-ops.
+        let key = (vote.view, vote.block_hash);
+        let validator_set_len = self.state.validator_set.len();
+        let qc = self.vote_bucket.entry(key).or_insert_with(|| {
+            QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len)
+        });
+        let had_quorum = qc.has_quorum(&self.state.validator_set);
+        qc.add_signature(voter_idx, signed.sig);
+        let has_quorum_now = qc.has_quorum(&self.state.validator_set);
+
+        // C2: only fire on the transition from sub-quorum to quorum.
+        // Late votes arriving after the QC formed are absorbed
+        // silently: `add_signature` idempotently ignores set bits,
+        // `has_quorum` stays true, so this block is skipped.
+        if had_quorum || !has_quorum_now {
+            return Vec::new();
+        }
+
+        let formed = qc.clone();
+        let mut actions = Vec::new();
+
+        // Adopt as `high_qc` if strictly fresher, mirroring the
+        // `updateQCHigh(qc)` call at the end of `onReceiveVote`
+        // in the paper's Algorithm 4.
+        if should_update_high_qc(&formed, &self.state) {
+            self.state.high_qc = Some(formed.clone());
+            actions.push(Action::Persist(StateUpdate::HighQc(formed.clone())));
+        }
+
+        // Propose the next block if we have the parent on hand.
+        // In normal operation the leader also previously received
+        // the proposal for `block_hash`; edge cases where we don't
+        // have it (leader restart, etc.) safely skip the broadcast
+        // — the pacemaker handles the resulting view stall via its
+        // usual timeout path.
+        if let Some(parent) = self.state.pending_blocks.get(&formed.block_hash).cloned() {
+            let new_block = self.builder.build(&parent, next_view, &formed);
+            actions.push(Action::Broadcast(ConsensusMsg::Proposal(Proposal {
+                block: new_block,
+                justify: formed,
+            })));
+        }
+
+        actions
+    }
+
     /// Feed a trace of events through `step` in order, returning one
     /// `Vec<Action>` per event. Consumes `self` so callers can't
     /// accidentally keep a reference into the core across the replay.
@@ -401,6 +482,18 @@ mod tests {
     /// Sorted order matches the byte value: `[nid(1), nid(2), nid(3), nid(4)]`.
     pub(crate) fn validators() -> ValidatorSet {
         ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+    }
+
+    /// Build a [`Signed<Vote>`] whose `sig` bytes are
+    /// `[sender[0]; 64]` — distinct per sender so tests can inspect
+    /// QC signature ordering if needed. The core doesn't verify
+    /// signatures; any byte pattern is accepted.
+    pub(crate) fn signed_vote(view: View, block_hash: BlockHash, sender: NodeId) -> Signed<Vote> {
+        Signed {
+            payload: Vote { view, block_hash },
+            signer: sender,
+            sig: [sender[0]; 64],
+        }
     }
 
     /// Build an all-zero-signature [`Signed<Proposal>`] from `sender`.
@@ -1157,5 +1250,185 @@ mod tests {
         assert!(pending.contains_key(&block_v1.hash()));
         assert!(pending.contains_key(&block_v2.hash()));
         assert!(pending.contains_key(&block_v3.hash()));
+    }
+
+    // ── C1/C2: VoteReceived leader path ─────────────────────────────
+
+    #[test]
+    fn vote_dropped_when_not_leader_of_next_view() {
+        // self = nid(1). Vote at view 2 → next view = 3. Leader of
+        // view 3 = validators[3 % 4] = validators[3] = nid(4), not
+        // nid(1). The vote must be dropped silently — no bucket
+        // entry, no actions. C1a's cheapest branch.
+        let mut core = make_core(1);
+        let vote = signed_vote(2, [0xAA; 32], nid(2));
+
+        let actions = core.step(Event::VoteReceived(vote));
+
+        assert!(actions.is_empty(), "not-leader drops vote: {actions:?}");
+        assert!(
+            core.vote_bucket.is_empty(),
+            "bucket must not accumulate when we're not the leader",
+        );
+    }
+
+    #[test]
+    fn subquorum_votes_accumulate_without_actions() {
+        // self = nid(1), leader of view 4. Feed two valid votes at
+        // view 3 (quorum over n=4 is 3). The bucket should grow to
+        // two signatures, but neither `step` call produces any
+        // actions — C2's first-crosses-threshold gate only fires on
+        // the transition to quorum, which we haven't reached.
+        let mut core = make_core(1);
+        let block_hash: BlockHash = [0xAA; 32];
+
+        let step1 = core.step(Event::VoteReceived(signed_vote(3, block_hash, nid(2))));
+        assert!(step1.is_empty(), "first sub-quorum vote is silent");
+
+        let step2 = core.step(Event::VoteReceived(signed_vote(3, block_hash, nid(3))));
+        assert!(step2.is_empty(), "second sub-quorum vote is silent");
+
+        let bucket = core
+            .vote_bucket
+            .get(&(3, block_hash))
+            .expect("bucket keyed by (view, block_hash) must exist after two votes");
+        assert_eq!(bucket.signer_count(), 2, "both signatures recorded",);
+        assert!(
+            !bucket.has_quorum(&core.state.validator_set),
+            "2 of 4 is below the quorum threshold of 3",
+        );
+    }
+
+    #[test]
+    fn quorum_emits_high_qc_persist_then_broadcast_proposal() {
+        // self = nid(1), leader of view 4. Install `block_v3` into
+        // `pending_blocks` so the parent lookup at quorum time
+        // succeeds. Feed three votes at view 3 — the threshold over
+        // n=4 — and assert the third one emits, in order:
+        //   1. Persist(HighQc(formed_qc))
+        //   2. Broadcast(Proposal { block: new_v4, justify: formed_qc })
+        // where `new_v4` is what the `TestBlockBuilder` stamps over
+        // block_v3 at view 4.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
+        let block_v3_hash = block_v3.hash();
+        core.state.insert_pending(block_v3.clone());
+
+        // First two votes accumulate silently.
+        let step1 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
+        let step2 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3))));
+        assert!(step1.is_empty(), "first sub-quorum vote silent: {step1:?}");
+        assert!(step2.is_empty(), "second sub-quorum vote silent: {step2:?}");
+
+        // Third vote crosses the threshold. Reconstruct the expected
+        // QC by signing in the same (bitmap) order the dispatcher
+        // would — validator indices 1, 2, 3 for nid(2), nid(3), nid(4).
+        let mut expected_qc = QuorumCertificate::new(3, block_v3_hash, 4);
+        expected_qc.add_signature(1, [nid(2)[0]; 64]);
+        expected_qc.add_signature(2, [nid(3)[0]; 64]);
+        expected_qc.add_signature(3, [nid(4)[0]; 64]);
+
+        // The builder extends block_v3 (height 1) with an empty-commands
+        // child at height 2, view 4, proposer nid(1).
+        let expected_new_block = Block {
+            header: BlockHeader {
+                parent_hash: block_v3_hash,
+                height: block_v3.header.height + 1,
+                view: 4,
+                proposer: nid(1),
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        };
+
+        let step3 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4))));
+
+        assert_eq!(
+            step3,
+            vec![
+                Action::Persist(StateUpdate::HighQc(expected_qc.clone())),
+                Action::Broadcast(ConsensusMsg::Proposal(Proposal {
+                    block: expected_new_block,
+                    justify: expected_qc.clone(),
+                })),
+            ],
+            "quorum transition emits HighQc persist then Broadcast(Proposal)",
+        );
+        assert_eq!(core.state().high_qc.as_ref(), Some(&expected_qc));
+    }
+
+    #[test]
+    fn post_quorum_votes_do_not_rebroadcast() {
+        // Form the QC with 3 votes as before, then feed two additional
+        // votes: (a) from `nid(1)` — a new signer not yet in the QC
+        // — and (b) a duplicate from `nid(2)` — already in the QC.
+        // Neither step may re-fire the `Broadcast(Proposal)` — C2's
+        // first-crosses-threshold gate already fired, and `has_quorum`
+        // stays true forever after.
+        //
+        // The bucket is intentionally not cleared on quorum, so these
+        // late deliveries land in it as idempotent sinks rather than
+        // re-materializing an empty QC and re-firing.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
+        let block_v3_hash = block_v3.hash();
+        core.state.insert_pending(block_v3.clone());
+
+        // Drive to quorum: first three votes.
+        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
+        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3))));
+        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4))));
+
+        // Late vote from a new signer — still a no-op at the dispatch
+        // surface even though the bucket grows to 4 sigs.
+        let step_late_new = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(1))));
+        assert!(
+            step_late_new.is_empty(),
+            "late vote from new signer must not re-broadcast: {step_late_new:?}",
+        );
+
+        // Duplicate vote from an existing signer — `add_signature` is
+        // a no-op on the set-bit; dispatch also early-returns.
+        let step_dup = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
+        assert!(
+            step_dup.is_empty(),
+            "duplicate vote must not re-broadcast: {step_dup:?}",
+        );
+
+        // Bucket should now carry all four validator signatures
+        // (added by nid(2), nid(3), nid(4), nid(1)), and still be at
+        // quorum. The duplicate didn't bump the count.
+        let bucket = core
+            .vote_bucket
+            .get(&(3, block_v3_hash))
+            .expect("bucket keyed by (3, block_v3_hash) must still exist");
+        assert_eq!(bucket.signer_count(), 4);
+        assert!(bucket.has_quorum(&core.state.validator_set));
+    }
+
+    #[test]
+    fn vote_from_non_validator_signer_is_dropped() {
+        // self = nid(1) is the leader of view 4 (4 % 4 = 0), so a
+        // vote at view 3 would normally accumulate. But this vote
+        // comes from `nid(99)` — not in the validator set. C1b
+        // drops because `ValidatorSet::index_of` returns None, and
+        // without an index we have no slot in the `SignerBitmap` to
+        // record the signature.
+        let mut core = make_core(1);
+        let vote = signed_vote(3, [0xAA; 32], nid(99));
+
+        let actions = core.step(Event::VoteReceived(vote));
+
+        assert!(
+            actions.is_empty(),
+            "non-validator signer drops: {actions:?}",
+        );
+        assert!(
+            core.vote_bucket.is_empty(),
+            "bucket must not grow on unknown signer",
+        );
     }
 }
