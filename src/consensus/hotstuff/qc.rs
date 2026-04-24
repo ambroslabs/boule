@@ -305,6 +305,27 @@ impl SignedMessage for NewView {
     const DOMAIN: &'static str = "ambros.hotstuff.newview.v1";
 }
 
+/// A replica's signed "I am giving up on `view`" notice. Quoted across
+/// a quorum these form a *timeout certificate* that lets the pacemaker
+/// advance to `view + 1` even when the leader crashed or its proposal
+/// never reached enough replicas.
+///
+/// The piggybacked `high_qc` lets the cluster converge on the freshest
+/// QC any timed-out replica had observed — the standard HotStuff
+/// liveness trick that prevents a departing leader's fresher QC from
+/// being lost. `None` means this replica has never seen any QC (only
+/// possible at very early bootstrap; the genesis-QC seed normally
+/// keeps this `Some`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutVote {
+    pub view: View,
+    pub high_qc: Option<QuorumCertificate>,
+}
+
+impl SignedMessage for TimeoutVote {
+    const DOMAIN: &'static str = "ambros.hotstuff.timeout.v1";
+}
+
 /// Logical consensus message emitted by the safety core via
 /// [`Action::Broadcast`] / [`Action::SendTo`]. The integration layer
 /// (#24) wraps the contained payload in a [`Signed`] before putting it
@@ -318,6 +339,31 @@ pub enum ConsensusMsg {
     Proposal(Proposal),
     Vote(Vote),
     NewView(NewView),
+}
+
+/// Build the cluster-agreed genesis [`QuorumCertificate`] every replica
+/// seeds into its `high_qc` at boot.
+///
+/// By convention a genesis QC has `view = 0`, `block_hash =
+/// genesis.hash()`, and the first `quorum_size(vs_len)` validator slots
+/// signed with all-zero placeholders. The safety core never re-verifies
+/// embedded QC signatures (that is the ingress layer's job at the
+/// envelope level), so the placeholder signatures never reach a
+/// verifier; they exist only to make the QC's
+/// [`QuorumCertificate::has_quorum`] / [`QuorumCertificate::is_well_formed`]
+/// predicates tell the truth about "a quorum signed off on the chain
+/// root."
+///
+/// Every honest replica constructs an identical genesis QC from the
+/// same `(genesis, validator_set_len)` pair, so the view-1 leader's
+/// proposal — justified by this QC — is indistinguishable across
+/// replicas.
+pub fn genesis_qc(genesis: &Block, validator_set_len: usize) -> QuorumCertificate {
+    let mut qc = QuorumCertificate::new(0, genesis.hash(), validator_set_len);
+    for i in 0..quorum_size(validator_set_len) {
+        qc.add_signature(i, [0u8; 64]);
+    }
+    qc
 }
 
 #[cfg(test)]

@@ -7,13 +7,12 @@
 //!
 //! # Bootstrap
 //!
-//! A fresh cluster has no `high_qc`, which prevents the view-1 leader
-//! from building a proposal. [`SimCluster::spawn`] pre-seeds every node
-//! with a genesis QC (dummy signatures — the safety core does not
-//! re-verify embedded QC signatures, so this is safe for simulation).
-//! With the genesis QC in place the view-1 leader proposes immediately on
-//! boot, and the cluster makes progress through message passing alone —
-//! no view-timer fires are required for the happy path.
+//! [`ConsensusNode::new`] seeds every node with the cluster-agreed
+//! genesis QC on construction (see
+//! [`crate::consensus::hotstuff::genesis_qc`]). With the genesis QC in
+//! place the view-1 leader proposes immediately on boot, and the cluster
+//! makes progress through message passing alone — no view-timer fires
+//! are required for the happy path.
 //!
 //! # Topology
 //!
@@ -39,8 +38,6 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::consensus::hotstuff::QuorumCertificate;
-use crate::consensus::hotstuff::qc::quorum_size;
 use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{NodeSigner, Signer};
@@ -109,11 +106,6 @@ impl SimCluster {
         let vs = ValidatorSet::new(node_ids_unsorted);
         let genesis = Block::genesis([0u8; 32]);
 
-        // Genesis QC: view=0 over genesis, with quorum_size(n) dummy sigs.
-        // The safety core does not verify embedded QC signatures, so dummy
-        // sigs are safe here — they never reach `Signed::verify`.
-        let genesis_qc = make_genesis_qc(&genesis, vs.len());
-
         // Build a signer lookup by NodeId.
         let signer_map: HashMap<NodeId, Arc<dyn Signer>> = signers
             .into_iter()
@@ -160,8 +152,9 @@ impl SimCluster {
             let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
             commit_rxs.push(commit_rx);
 
+            // ConsensusNode::new already auto-seeds the cluster-agreed
+            // genesis QC; no explicit with_genesis_qc override here.
             let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
-                .with_genesis_qc(genesis_qc.clone())
                 .with_commit_observer(commit_tx);
 
             // Per-node outbound channel: node writes here; routing task reads.
@@ -316,17 +309,6 @@ fn fresh_signer() -> NodeSigner {
         pkcs8_der: Zeroizing::new(kp.serialize_der()),
     };
     NodeSigner::from_identity(&identity).unwrap()
-}
-
-/// Build a genesis QC at view 0 with `quorum_size(vs_len)` dummy
-/// signatures. The safety core does not re-verify embedded QC signatures,
-/// so these placeholders are safe for simulation bootstrapping.
-fn make_genesis_qc(genesis: &Block, vs_len: usize) -> QuorumCertificate {
-    let mut qc = QuorumCertificate::new(0, genesis.hash(), vs_len);
-    for i in 0..quorum_size(vs_len) {
-        qc.add_signature(i, [0u8; 64]);
-    }
-    qc
 }
 
 /// Check that all blocks committed across all nodes are consistent:
@@ -716,5 +698,58 @@ mod tests {
                 "seed {seed}: non-victim nodes must have committed at least one block",
             );
         }
+    }
+
+    // ── I: timeout-certificate liveness escape hatch (#116) ───────────────────
+
+    /// Kill the view-1 leader BEFORE the cluster has exchanged any
+    /// messages. The surviving three replicas cannot form a normal QC
+    /// (nobody proposed view-1), so the only way out is a timeout
+    /// certificate: each replica's view timer fires, they all broadcast
+    /// `TimeoutVote { view: 1 }`, and on quorum every replica advances
+    /// to view 2 where a new leader proposes. The cluster must commit
+    /// at least one block without ever receiving a view-1 proposal.
+    ///
+    /// This is the pure Fix-B regression test for #116: with
+    /// `PacemakerAction::SendTimeout` as a no-op the cluster deadlocks
+    /// in view 1 forever.
+    #[tokio::test]
+    async fn timeout_certificate_advances_view_when_leader_is_dead() {
+        tokio::time::pause();
+
+        // Very short timeout so the test completes quickly in sim time.
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Kill the view-1 leader immediately: the round-robin selector
+        // picks `validators[1 % 4] = index 1` as the view-1 leader
+        // (since validators are sorted ascending). Drop it before any
+        // proposal can be emitted.
+        cluster.kill_node(1);
+
+        // Advance the virtual clock past several timeout intervals so
+        // the view timer fires on every surviving node. With base=50ms
+        // and exponential backoff, a few seconds of simulated time is
+        // ample for the cluster to form a TC for view 1 and proceed.
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        let survivor_commits: usize = committed
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != 1)
+            .map(|(_, c)| c.len())
+            .sum();
+        assert!(
+            survivor_commits > 0,
+            "the TC liveness path must let the cluster make progress when the \
+             view-1 leader is dead; survivors committed {survivor_commits} blocks",
+        );
     }
 }
