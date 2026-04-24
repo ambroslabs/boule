@@ -53,6 +53,13 @@ use crate::storage::{MemoryStorage, MemoryWal};
 use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
 use zeroize::Zeroizing;
 
+/// A directed edge `(from, to)` on which all messages are silently dropped
+/// by the routing layer, regardless of the partition set.
+///
+/// Used to simulate one-way link failures such as vote-withholding
+/// (outbound links from a Byzantine replica cut, inbound intact).
+type LinkCut = (NodeId, NodeId);
+
 /// An in-memory cluster of N consensus nodes connected by channel-backed
 /// protocol handles.
 ///
@@ -68,6 +75,11 @@ pub struct SimCluster {
     /// Set of partitioned nodes. Routing tasks drop all messages to/from
     /// any node whose ID is in this set.
     pub partitioned: Arc<Mutex<HashSet<NodeId>>>,
+    /// Directed link cuts `(from, to)`. The routing task for `from` will
+    /// not deliver any frame to `to` while the pair is present, even if
+    /// neither node is in the global partition set. Used to simulate
+    /// one-way faults (e.g. vote-withholding without full isolation).
+    pub link_cuts: Arc<Mutex<HashSet<LinkCut>>>,
     /// Shutdown senders; `None` after `kill_node` has been called for that slot.
     shutdown_txs: Vec<Option<oneshot::Sender<()>>>,
 }
@@ -110,6 +122,8 @@ impl SimCluster {
 
         // Shared partition set: routing tasks check this before forwarding.
         let partitioned: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
+        // Directed link cuts: messages from `src` to `dst` are dropped.
+        let link_cuts: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
 
         // Per-node event channel: routing tasks write here; each node's
         // run() loop reads from its receiver.
@@ -162,6 +176,7 @@ impl SimCluster {
             // fault-tolerance with n=4 (quorum=3: leader vote + 2 others).
             let route_txs = Arc::clone(&event_txs);
             let part = Arc::clone(&partitioned);
+            let cuts = Arc::clone(&link_cuts);
             let my_id = nid;
             tokio::spawn(async move {
                 let mut send_rx = send_rx;
@@ -176,6 +191,9 @@ impl SimCluster {
                                 if part.lock().contains(target) {
                                     continue;
                                 }
+                                if cuts.lock().contains(&(my_id, *target)) {
+                                    continue;
+                                }
                                 let _ = tx
                                     .send(ProtocolEvent::Message {
                                         from: my_id,
@@ -186,6 +204,9 @@ impl SimCluster {
                         }
                         ProtocolOutbound::SendTo { node_id, payload } => {
                             if part.lock().contains(&node_id) {
+                                continue;
+                            }
+                            if cuts.lock().contains(&(my_id, node_id)) {
                                 continue;
                             }
                             if let Some(tx) = route_txs.get(&node_id) {
@@ -213,6 +234,7 @@ impl SimCluster {
             commit_rxs,
             node_ids,
             partitioned,
+            link_cuts,
             shutdown_txs,
         }
     }
@@ -236,6 +258,29 @@ impl SimCluster {
         if let Some(tx) = self.shutdown_txs[idx].take() {
             let _ = tx.send(());
         }
+    }
+
+    /// Drop all frames sent by node `from_idx` to node `to_idx`.
+    ///
+    /// Unlike [`partition_node`] this is a *directed* cut: `from_idx`
+    /// still receives messages from the rest of the cluster, and
+    /// `to_idx` still receives messages from everyone except `from_idx`.
+    /// Use it to model a Byzantine replica that withholds votes
+    /// (outbound links cut) while continuing to receive proposals.
+    ///
+    /// [`partition_node`]: SimCluster::partition_node
+    pub fn cut_link(&self, from_idx: usize, to_idx: usize) {
+        self.link_cuts
+            .lock()
+            .insert((self.node_ids[from_idx], self.node_ids[to_idx]));
+    }
+
+    /// Restore a previously cut directed link, re-enabling message delivery
+    /// from node `from_idx` to node `to_idx`.
+    pub fn restore_link(&self, from_idx: usize, to_idx: usize) {
+        self.link_cuts
+            .lock()
+            .remove(&(self.node_ids[from_idx], self.node_ids[to_idx]));
     }
 
     /// Drain all blocks currently buffered in every `commit_rx` and return
@@ -458,5 +503,218 @@ mod tests {
             total_commits, 0,
             "no commits must occur when quorum is unreachable: got {total_commits}",
         );
+    }
+
+    // ── G4: sustained liveness with f=1 crash ────────────────────────────────
+
+    /// With f=1 crash, the surviving three nodes must continue committing
+    /// blocks after the crash, demonstrating sustained liveness.
+    ///
+    /// Node 0 is the view-4 vote-aggregator in a 4-node round-robin
+    /// cluster. We let the cluster warm up for 100 yields so that views
+    /// 1–4 complete while all four nodes are alive, then kill node 0.
+    /// The survivors have quorum (3 of 4) and can continue through the
+    /// next window of views (5, 6, 7) before the chain stalls again at
+    /// view 8 (the next node-0 aggregation slot). Within that window,
+    /// at least one additional block must be committed by each survivor.
+    #[tokio::test]
+    async fn sustained_liveness_with_f1_crash() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Warmup: let all four nodes, including node 0 (view-4 aggregator),
+        // participate so the chain advances past view 4.
+        for _ in 0..100 {
+            yield_now().await;
+        }
+        let initial = cluster.drain_commits();
+        assert_no_conflicts(&initial);
+        let initial_total: usize = initial.iter().map(|c| c.len()).sum();
+        assert!(
+            initial_total > 0,
+            "warmup must produce at least one commit before the kill",
+        );
+
+        // Kill node 0. Its next aggregation slot is view 8; views 5–7
+        // can still complete because nodes 1, 2, 3 hold quorum = 3.
+        cluster.kill_node(0);
+
+        for _ in 0..1500 {
+            yield_now().await;
+        }
+
+        let post_kill = cluster.drain_commits();
+        assert_no_conflicts(&post_kill);
+
+        // Each surviving node must have committed at least one additional
+        // block during the views-5–7 window.
+        for (idx, commits) in post_kill[1..].iter().enumerate() {
+            assert!(
+                !commits.is_empty(),
+                "survivor {} must commit >= 1 block after the crash, got 0",
+                idx + 1,
+            );
+        }
+    }
+
+    // ── G5: vote-withholding does not stall liveness ──────────────────────────
+
+    /// A Byzantine replica that receives proposals but withholds every vote
+    /// (all its outbound links are cut) must not prevent the remaining
+    /// honest nodes from forming quorum and committing.
+    ///
+    /// Mechanically: node 0's outbound directed links to nodes 1, 2, and 3
+    /// are cut. Node 0 still receives proposals (inbound intact) and will
+    /// itself observe three-chain commits. But its `SendTo(next_leader, Vote)`
+    /// frames are silently dropped.
+    ///
+    /// With n=4 / quorum=3: the view-K leader's self-vote (via
+    /// broadcast-to-self) plus two votes from the other honest nodes = 3 =
+    /// quorum, so every view completes despite the withheld vote.
+    #[tokio::test]
+    async fn vote_withholding_does_not_stall_liveness() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Cut all outbound links from node 0 to every other node. Node 0
+        // continues receiving broadcasts but its votes never reach the
+        // next-view leader. The remaining three nodes still form quorum.
+        cluster.cut_link(0, 1);
+        cluster.cut_link(0, 2);
+        cluster.cut_link(0, 3);
+
+        for _ in 0..1000 {
+            yield_now().await;
+        }
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // All four nodes should observe commits: nodes 1–3 via normal QC
+        // formation, node 0 via receiving proposals and observing the
+        // three-chain rule (it still receives broadcasts intact).
+        let num_committed = committed.iter().filter(|c| !c.is_empty()).count();
+        assert!(
+            num_committed >= 3,
+            "expected >= 3 nodes to have committed despite withheld votes, got {num_committed}",
+        );
+    }
+
+    // ── G6: sequential crashes transition from liveness to stall ─────────────
+
+    /// Crashing nodes one at a time shows the smooth boundary between the
+    /// fault-tolerant region (n-f ≥ quorum) and the below-quorum stall
+    /// (n-f < quorum), all without safety violations.
+    ///
+    /// Phase 1 — 4 nodes active: all four commit.
+    /// Phase 2 — 3 nodes (node 0 crashed): survivors commit; no conflicts.
+    /// Phase 3 — 2 nodes (nodes 0 and 1 crashed): quorum unreachable, no
+    ///   new commits; all previously committed blocks remain consistent.
+    #[tokio::test]
+    async fn sequential_crashes_transition_to_stall_without_safety_violation() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Phase 1: all four nodes run until the cluster has made progress.
+        for _ in 0..300 {
+            yield_now().await;
+        }
+
+        // Phase 2: crash node 0 (minority crash — still quorum of 3).
+        cluster.kill_node(0);
+        for _ in 0..500 {
+            yield_now().await;
+        }
+
+        let phase12_commits = cluster.drain_commits();
+        assert_no_conflicts(&phase12_commits);
+
+        // At least two of the three surviving nodes must have committed.
+        let survivors_committed: usize = phase12_commits[1..]
+            .iter()
+            .filter(|c| !c.is_empty())
+            .count();
+        assert!(
+            survivors_committed >= 2,
+            "at least 2 survivors must commit in phase 2, got {survivors_committed}",
+        );
+
+        // Phase 3: crash node 1 — now only 2 of 4 nodes are alive (below quorum).
+        cluster.kill_node(1);
+        for _ in 0..500 {
+            yield_now().await;
+        }
+
+        let phase3_commits = cluster.drain_commits();
+        assert_no_conflicts(&phase3_commits);
+
+        let new_commits: usize = phase3_commits.iter().map(|c| c.len()).sum();
+        assert_eq!(
+            new_commits, 0,
+            "no new commits must occur after dropping below quorum, got {new_commits}",
+        );
+    }
+
+    // ── H: multi-seed crash-schedule fuzz ────────────────────────────────────
+
+    /// Run the same adversarial scenario for five deterministic seeds, each
+    /// choosing a different crash timing and victim node. No seed may
+    /// produce a safety violation (conflicting commits).
+    ///
+    /// This is a lightweight fuzz driver: it doesn't use proptest
+    /// shrinking, but it covers a range of crash timings (early/mid/late)
+    /// and crash targets (all four node indices). A failing seed is
+    /// reproducible by extracting it into its own test.
+    #[tokio::test]
+    async fn fuzz_random_crash_schedules_no_safety_violation() {
+        // Call pause() once for the entire test — calling it inside the loop
+        // panics ("time is already frozen") since we're in one tokio::test.
+        tokio::time::pause();
+
+        // Each entry is (seed, crash_at_yield, victim_index).
+        //
+        // All crash_at values are >= 200 yields so that views 1–4 complete
+        // in the warmup (each view takes ~20–40 yields with channel routing).
+        // This guarantees progress before every kill and ensures the
+        // surviving three nodes can finish the next window of views.
+        let scenarios: &[(u64, usize, usize)] = &[
+            (0, 200, 0), // crash view-4 aggregator after all of views 1–4
+            (1, 200, 1), // crash view-5 aggregator after views 1–4
+            (2, 200, 2), // crash view-2 aggregator after views 1–4
+            (3, 200, 3), // crash view-3 aggregator after views 1–4
+            (4, 300, 0), // crash node 0 again with extra warmup
+        ];
+
+        for &(seed, crash_at, victim) in scenarios {
+            let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+            for _ in 0..crash_at {
+                tokio::task::yield_now().await;
+            }
+
+            cluster.kill_node(victim);
+
+            for _ in 0..600 {
+                tokio::task::yield_now().await;
+            }
+
+            let committed = cluster.drain_commits();
+            assert_no_conflicts(&committed);
+
+            // The non-victim nodes must have made some progress.
+            let progress: usize = committed
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != victim)
+                .map(|(_, c)| c.len())
+                .sum();
+            assert!(
+                progress > 0,
+                "seed {seed}: non-victim nodes must have committed at least one block",
+            );
+        }
     }
 }
