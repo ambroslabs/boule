@@ -1271,4 +1271,27 @@ mod tests {
             "bucket must not accumulate when we're not the leader",
         );
     }
+
+    #[test]
+    fn vote_from_non_validator_signer_is_dropped() {
+        // self = nid(1) is the leader of view 4 (4 % 4 = 0), so a
+        // vote at view 3 would normally accumulate. But this vote
+        // comes from `nid(99)` — not in the validator set. C1b
+        // drops because `ValidatorSet::index_of` returns None, and
+        // without an index we have no slot in the `SignerBitmap` to
+        // record the signature.
+        let mut core = make_core(1);
+        let vote = signed_vote(3, [0xAA; 32], nid(99));
+
+        let actions = core.step(Event::VoteReceived(vote));
+
+        assert!(
+            actions.is_empty(),
+            "non-validator signer drops: {actions:?}",
+        );
+        assert!(
+            core.vote_bucket.is_empty(),
+            "bucket must not grow on unknown signer",
+        );
+    }
 }
