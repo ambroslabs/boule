@@ -17,13 +17,22 @@
 //!
 //! # Topology
 //!
-//! Every `Broadcast` is delivered to all peers except the sender.
-//! `SendTo` is delivered exactly to the named peer. Messages are
-//! delivered in-order per sender (channels are FIFO). No artificial
-//! network delay is introduced; tests that need delay should extend this
-//! module.
+//! Every `Broadcast` is delivered to **all** nodes including the sender;
+//! this is necessary for the leader to vote on its own proposal and for
+//! f=1 fault-tolerance (with n=4, quorum=3: the leader's own vote plus
+//! two others reaches quorum even when one non-leader is crashed).
+//! `SendTo` is delivered exactly to the named peer.
+//! Messages are delivered in-order per sender (channels are FIFO).
+//!
+//! # Fault injection
+//!
+//! [`SimCluster::partition_node`] / [`heal_node`] toggle a shared
+//! "partitioned" set that the routing tasks check before forwarding any
+//! frame; a partitioned node neither sends nor receives. [`kill_node`]
+//! sends a shutdown signal to the node's run loop, permanently stopping
+//! it for that slot.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +46,7 @@ use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{NodeSigner, Signer};
 use crate::p2p::identity::NodeIdentity;
 use crate::p2p::{NodeId, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
-use crate::replication::block::Block;
+use crate::replication::block::{Block, BlockHash};
 use crate::replication::impls::{CounterStateMachine, InMemoryMempool};
 use crate::replication::state_machine::StateMachine;
 use crate::storage::{MemoryStorage, MemoryWal};
@@ -49,11 +58,18 @@ use zeroize::Zeroizing;
 ///
 /// Obtain via [`SimCluster::spawn`]. The caller drives time with
 /// `tokio::time::pause()` + `advance()` or with `yield_now()` loops.
+///
+/// Dropping the cluster sends shutdown to all still-running nodes.
 pub struct SimCluster {
     /// Per-node commit receivers, in ascending [`NodeId`] (sorted) order.
     pub commit_rxs: Vec<mpsc::UnboundedReceiver<Block>>,
-    /// Shutdown senders for each node's `run()` loop, same order.
-    pub shutdown_txs: Vec<oneshot::Sender<()>>,
+    /// Node IDs in the same sorted order as `commit_rxs`.
+    pub node_ids: Vec<NodeId>,
+    /// Set of partitioned nodes. Routing tasks drop all messages to/from
+    /// any node whose ID is in this set.
+    pub partitioned: Arc<Mutex<HashSet<NodeId>>>,
+    /// Shutdown senders; `None` after `kill_node` has been called for that slot.
+    shutdown_txs: Vec<Option<oneshot::Sender<()>>>,
 }
 
 impl SimCluster {
@@ -75,10 +91,10 @@ impl SimCluster {
 
         // Create N fresh signers and collect their node IDs.
         let signers: Vec<NodeSigner> = (0..n).map(|_| fresh_signer()).collect();
-        let node_ids: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
+        let node_ids_unsorted: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
 
         // ValidatorSet sorts IDs ascending, establishing leader-rotation order.
-        let vs = ValidatorSet::new(node_ids);
+        let vs = ValidatorSet::new(node_ids_unsorted);
         let genesis = Block::genesis([0u8; 32]);
 
         // Genesis QC: view=0 over genesis, with quorum_size(n) dummy sigs.
@@ -92,6 +108,9 @@ impl SimCluster {
             .map(|s| (s.node_id(), Arc::new(s) as Arc<dyn Signer>))
             .collect();
 
+        // Shared partition set: routing tasks check this before forwarding.
+        let partitioned: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
+
         // Per-node event channel: routing tasks write here; each node's
         // run() loop reads from its receiver.
         let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
@@ -103,8 +122,9 @@ impl SimCluster {
         }
         let event_txs = Arc::new(event_txs);
 
+        let node_ids: Vec<NodeId> = vs.iter().copied().collect();
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
-        let mut shutdown_txs: Vec<oneshot::Sender<()>> = Vec::new();
+        let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
 
         for (nid, event_rx) in event_rxs {
             let signer = signer_map[&nid].clone();
@@ -134,27 +154,40 @@ impl SimCluster {
             let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
             let handle = ProtocolHandle { send_tx, event_rx };
 
-            // Routing task: translate each outbound frame into one or more
-            // inbound events on the target node(s).
+            // Routing task: translate each outbound frame into inbound events
+            // on the target node(s), honouring the partition set.
+            //
+            // Broadcasts are delivered to ALL nodes including the sender so
+            // the leader can vote on its own proposal — required for f=1
+            // fault-tolerance with n=4 (quorum=3: leader vote + 2 others).
             let route_txs = Arc::clone(&event_txs);
+            let part = Arc::clone(&partitioned);
             let my_id = nid;
             tokio::spawn(async move {
                 let mut send_rx = send_rx;
                 while let Some(outbound) = send_rx.recv().await {
+                    if part.lock().contains(&my_id) {
+                        // This node is partitioned — drop all outbound frames.
+                        continue;
+                    }
                     match outbound {
                         ProtocolOutbound::Broadcast(payload) => {
                             for (target, tx) in route_txs.iter() {
-                                if *target != my_id {
-                                    let _ = tx
-                                        .send(ProtocolEvent::Message {
-                                            from: my_id,
-                                            payload: payload.clone(),
-                                        })
-                                        .await;
+                                if part.lock().contains(target) {
+                                    continue;
                                 }
+                                let _ = tx
+                                    .send(ProtocolEvent::Message {
+                                        from: my_id,
+                                        payload: payload.clone(),
+                                    })
+                                    .await;
                             }
                         }
                         ProtocolOutbound::SendTo { node_id, payload } => {
+                            if part.lock().contains(&node_id) {
+                                continue;
+                            }
                             if let Some(tx) = route_txs.get(&node_id) {
                                 let _ = tx
                                     .send(ProtocolEvent::Message {
@@ -169,7 +202,7 @@ impl SimCluster {
             });
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            shutdown_txs.push(shutdown_tx);
+            shutdown_txs.push(Some(shutdown_tx));
 
             tokio::spawn(async move {
                 let _ = node.run(handle, signer, shutdown_rx).await;
@@ -178,7 +211,55 @@ impl SimCluster {
 
         SimCluster {
             commit_rxs,
+            node_ids,
+            partitioned,
             shutdown_txs,
+        }
+    }
+
+    /// Add node `idx` to the partition set. The routing tasks will drop all
+    /// messages to and from this node until [`heal_node`] is called.
+    ///
+    /// [`heal_node`]: SimCluster::heal_node
+    pub fn partition_node(&self, idx: usize) {
+        self.partitioned.lock().insert(self.node_ids[idx]);
+    }
+
+    /// Remove node `idx` from the partition set, restoring full connectivity.
+    pub fn heal_node(&self, idx: usize) {
+        self.partitioned.lock().remove(&self.node_ids[idx]);
+    }
+
+    /// Send a shutdown signal to node `idx`, stopping its event loop.
+    /// Subsequent calls for the same `idx` are no-ops.
+    pub fn kill_node(&mut self, idx: usize) {
+        if let Some(tx) = self.shutdown_txs[idx].take() {
+            let _ = tx.send(());
+        }
+    }
+
+    /// Drain all blocks currently buffered in every `commit_rx` and return
+    /// them grouped by node (in the same order as `node_ids`).
+    pub fn drain_commits(&mut self) -> Vec<Vec<Block>> {
+        self.commit_rxs
+            .iter_mut()
+            .map(|rx| {
+                let mut blocks = Vec::new();
+                while let Ok(b) = rx.try_recv() {
+                    blocks.push(b);
+                }
+                blocks
+            })
+            .collect()
+    }
+}
+
+impl Drop for SimCluster {
+    fn drop(&mut self) {
+        for opt in &mut self.shutdown_txs {
+            if let Some(tx) = opt.take() {
+                let _ = tx.send(());
+            }
         }
     }
 }
@@ -203,6 +284,23 @@ fn make_genesis_qc(genesis: &Block, vs_len: usize) -> QuorumCertificate {
     qc
 }
 
+/// Check that all blocks committed across all nodes are consistent:
+/// every height must map to exactly one block hash. Panics on violation.
+fn assert_no_conflicts(all_committed: &[Vec<Block>]) {
+    let mut canonical: HashMap<u64, BlockHash> = HashMap::new();
+    for node_commits in all_committed {
+        for block in node_commits {
+            let h = block.header.height;
+            let hash = block.hash();
+            let prev = canonical.entry(h).or_insert(hash);
+            assert_eq!(
+                *prev, hash,
+                "safety violation: nodes committed different blocks at height {h}",
+            );
+        }
+    }
+}
+
 // ── Integration tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -211,24 +309,17 @@ mod tests {
 
     use tokio::task::yield_now;
 
-    use super::SimCluster;
+    use super::{SimCluster, assert_no_conflicts};
+
+    // ── F-series: happy path (PR5) ────────────────────────────────────────────
 
     /// Four honest nodes should commit at least one block through message
     /// passing alone (no timer fires needed in the happy path).
     ///
-    /// The test pauses the clock so the view timer never fires; progress
-    /// is driven entirely by proposals → votes → QC formation → proposals.
-    ///
-    /// Commit sequence (round-robin leaders N[0..3] in sorted-key order):
-    ///   - View 1 (leader N[1]): proposes B1 using genesis_qc as justify.
-    ///   - View 2 (leader N[2]): collects 3 votes for B1 → QC_1 → proposes B2.
-    ///   - View 3 (leader N[3]): collects 3 votes for B2 → QC_2 → proposes B3.
-    ///   - View 4 (leader N[0]): collects 3 votes for B3 → QC_3 → proposes B4.
-    ///   - Nodes receiving B3 call three_chain_commit(QC_2) → commit genesis.
-    ///   - Nodes receiving B4 call three_chain_commit(QC_3) → commit B1.
-    ///
-    /// After the first round of commits, at least 3 of 4 nodes should have
-    /// received a committed block on their `commit_rx`.
+    /// With broadcast-to-self enabled, the view-1 leader votes on its own
+    /// proposal. This means all 4 nodes can reach quorum independently of
+    /// which node is the leader for each view — and all 4 commit genesis
+    /// when they receive B3's justify.
     #[tokio::test]
     async fn four_honest_nodes_commit_at_least_one_block() {
         tokio::time::pause();
@@ -242,27 +333,130 @@ mod tests {
             yield_now().await;
         }
 
-        let num_committed = {
-            let mut n = 0usize;
-            for rx in &mut cluster.commit_rxs {
-                if rx.try_recv().is_ok() {
-                    n += 1;
-                }
-            }
-            n
-        };
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
 
-        // 3 of 4 nodes receive each broadcast (the broadcaster excluded).
-        // After B3 all 3 recipients commit genesis; after B4 all 3 recipients
-        // of B4 commit B1. The broadcaster of each round commits on the next
-        // round, so ≥ 3 nodes should have committed by this point.
+        let num_committed = committed.iter().filter(|c| !c.is_empty()).count();
         assert!(
             num_committed >= 3,
             "expected >= 3 nodes to have committed, got {num_committed}",
         );
+    }
 
-        for tx in cluster.shutdown_txs {
-            let _ = tx.send(());
+    // ── G1: crash safety ─────────────────────────────────────────────────────
+
+    /// Killing one node (below-quorum loss = 1 of 4) must not cause the
+    /// surviving three to commit conflicting blocks.
+    ///
+    /// With broadcast-to-self, quorum = 3 votes and the leader always
+    /// contributes its own vote, so n-1 = 3 surviving nodes can still
+    /// reach quorum when one is crashed.
+    #[tokio::test]
+    async fn crash_of_minority_does_not_violate_safety() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Let the cluster warm up and produce its first commits.
+        for _ in 0..200 {
+            yield_now().await;
         }
+
+        // Kill one node (sorted index 0). The remaining 3 still have quorum.
+        cluster.kill_node(0);
+
+        // Let the surviving three nodes continue committing.
+        for _ in 0..500 {
+            yield_now().await;
+        }
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // The three survivors must have made (additional) progress.
+        let survivor_commits: usize = committed[1..].iter().map(|c| c.len()).sum();
+        assert!(
+            survivor_commits > 0,
+            "survivors must commit at least one block after minority crash",
+        );
+    }
+
+    // ── G2: partition-heal safety ─────────────────────────────────────────────
+
+    /// Partitioning one node (dropping all messages to/from it) must not
+    /// cause the remaining three to diverge, and healing must restore
+    /// full cluster participation without safety violations.
+    #[tokio::test]
+    async fn partition_and_heal_does_not_violate_safety() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Let nodes boot and exchange their first messages.
+        for _ in 0..50 {
+            yield_now().await;
+        }
+
+        // Partition node 0: its messages are dropped in both directions.
+        cluster.partition_node(0);
+
+        // Three connected nodes make progress (they still form a quorum of 3).
+        for _ in 0..400 {
+            yield_now().await;
+        }
+
+        // Heal the partition — node 0 rejoins the network.
+        cluster.heal_node(0);
+
+        // Give all four nodes time to exchange messages after healing.
+        for _ in 0..300 {
+            yield_now().await;
+        }
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // The three non-partitioned nodes must have committed while partitioned.
+        let connected_commits: usize = committed[1..].iter().map(|c| c.len()).sum();
+        assert!(
+            connected_commits > 0,
+            "connected nodes must commit while one is partitioned",
+        );
+    }
+
+    // ── G3: no quorum → no progress ───────────────────────────────────────────
+
+    /// With only 2 of 4 nodes active the system cannot form a quorum (3)
+    /// and must make no commits — even if the surviving pair includes the
+    /// view-1 leader.
+    ///
+    /// Concretely: the view-1 leader proposes B1, but the view-2 leader
+    /// (sorted index 2) is killed and cannot accumulate votes. The
+    /// surviving pair each vote for B1 but their votes go to the dead
+    /// view-2 leader's channel, which silently drops them.
+    #[tokio::test]
+    async fn below_quorum_makes_no_progress() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Kill nodes at sorted indices 2 and 3, leaving indices 0 and 1.
+        // Index 1 is the view-1 leader and will try to propose; index 2
+        // (the view-2 leader that would accumulate votes) is killed.
+        cluster.kill_node(2);
+        cluster.kill_node(3);
+
+        // Give remaining nodes time to run — they cannot commit without quorum.
+        for _ in 0..500 {
+            yield_now().await;
+        }
+
+        let committed = cluster.drain_commits();
+
+        let total_commits: usize = committed.iter().map(|c| c.len()).sum();
+        assert_eq!(
+            total_commits, 0,
+            "no commits must occur when quorum is unreachable: got {total_commits}",
+        );
     }
 }
