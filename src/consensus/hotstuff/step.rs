@@ -322,13 +322,23 @@ impl HotStuffCore {
                 actions.push(Action::Persist(StateUpdate::HighQc(qc)));
             }
 
-            // Send the vote to the next-view leader, who will assemble
-            // the QC and use it as the justify of the next proposal.
-            let next_leader = round_robin_leader(&self.state.validator_set, view + 1);
-            actions.push(Action::SendTo(
-                next_leader,
-                ConsensusMsg::Vote(Vote { view, block_hash }),
-            ));
+            // Broadcast the vote so every replica — not just the
+            // next-view leader — can aggregate it. This is what
+            // gives chained HotStuff f=1 liveness under round-robin
+            // leadership: if the next-view leader is down, any other
+            // live replica that gathers quorum can still form the QC
+            // and propagate it (via its NewView at the next pacemaker
+            // advance, or as `justify` when it becomes leader later).
+            // Historically the paper's Algorithm 4 addresses the vote
+            // specifically to the next leader for bandwidth, but a
+            // deterministic round-robin under a single crash means
+            // every fourth view's vote-target is permanently dead and
+            // no QC would ever form for those views — starving the
+            // 3-chain commit rule forever (#124).
+            actions.push(Action::Broadcast(ConsensusMsg::Vote(Vote {
+                view,
+                block_hash,
+            })));
         }
 
         // B4: Two-Chain lock promotion.
@@ -408,32 +418,32 @@ impl HotStuffCore {
         actions
     }
 
-    /// Handle an inbound [`Vote`]. Only meaningful to the leader of
-    /// `vote.view + 1`; other replicas drop. When the added partial
-    /// signature takes a bucket across quorum for the first time, the
-    /// leader adopts the freshly-formed QC as `high_qc` (emitting
-    /// `Persist(HighQc)`) and broadcasts a new [`Proposal`] that
-    /// carries the QC as its justify.
+    /// Handle an inbound [`Vote`]. Every replica aggregates — not
+    /// just the leader of `vote.view + 1` — so that QC formation
+    /// survives the next-view leader being crashed (#124).
     ///
-    /// Mirrors Algorithm 4's `onReceiveVote` (paper §6), with the
-    /// onBeat-triggered `onPropose` collapsed into the same step.
-    /// That collapse is acceptable for the safety core — the
-    /// integration layer (#24) can choose to batch proposals
-    /// application-side by queueing multiple votes before forwarding
-    /// to `step`.
+    /// When the added partial signature takes a bucket across quorum
+    /// for the first time, the replica:
+    /// 1. Adopts the freshly-formed QC as `high_qc` (emitting
+    ///    `Persist(HighQc)`), so a later NewView / proposal carries
+    ///    the freshest QC the cluster knows about.
+    /// 2. If it is itself the leader of `vote.view + 1`, immediately
+    ///    broadcasts a new [`Proposal`] that carries the QC as its
+    ///    justify. Non-leaders stop here — they keep the QC locally
+    ///    for high_qc-freshness purposes and let the next live
+    ///    leader drive the proposal.
+    ///
+    /// Mirrors Algorithm 4's `onReceiveVote` (paper §6), widened on
+    /// aggregation so chained HotStuff under deterministic
+    /// round-robin still commits when one validator is permanently
+    /// down (otherwise every fourth view's QC would never form and
+    /// the 3-chain commit rule would never fire).
     fn on_vote_received(&mut self, signed: Signed<Vote>) -> Vec<Action> {
         let vote = &signed.payload;
-
-        // C1a: only the leader of the next view cares about this vote.
-        // The QC this vote contributes to is the justify for that
-        // leader's next proposal.
         let next_view = vote.view + 1;
-        if round_robin_leader(&self.state.validator_set, next_view) != self.self_id {
-            return Vec::new();
-        }
 
-        // C1b: the voter must be a known validator; otherwise we have
-        // no index into the `SignerBitmap`. A well-behaved integration
+        // The voter must be a known validator; otherwise we have no
+        // index into the `SignerBitmap`. A well-behaved integration
         // layer already filters these in signature verification, but
         // we repeat the check here for defence-in-depth against a
         // replay or test-wiring bug.
@@ -441,7 +451,7 @@ impl HotStuffCore {
             return Vec::new();
         };
 
-        // C1c: accumulate into the bucket for this `(view, block_hash)`
+        // Accumulate into the bucket for this `(view, block_hash)`
         // pair. `QuorumCertificate::add_signature` is idempotent on
         // the set-bit — duplicate votes from the same signer are
         // no-ops.
@@ -454,7 +464,7 @@ impl HotStuffCore {
         qc.add_signature(voter_idx, signed.sig);
         let has_quorum_now = qc.has_quorum(&self.state.validator_set);
 
-        // C2: only fire on the transition from sub-quorum to quorum.
+        // Only fire on the transition from sub-quorum to quorum.
         // Late votes arriving after the QC formed are absorbed
         // silently: `add_signature` idempotently ignores set bits,
         // `has_quorum` stays true, so this block is skipped.
@@ -473,13 +483,16 @@ impl HotStuffCore {
             actions.push(Action::Persist(StateUpdate::HighQc(formed.clone())));
         }
 
-        // Propose the next block if we have the parent on hand.
-        // In normal operation the leader also previously received
-        // the proposal for `block_hash`; edge cases where we don't
-        // have it (leader restart, etc.) safely skip the broadcast
-        // — the pacemaker handles the resulting view stall via its
-        // usual timeout path.
-        if let Some(parent) = self.state.pending_blocks.get(&formed.block_hash).cloned() {
+        // Propose the next block if we are the leader of the next
+        // view and have the parent on hand. In normal operation the
+        // leader also previously received the proposal for
+        // `block_hash`; edge cases where we don't have it (leader
+        // restart, etc.) safely skip the broadcast — the pacemaker
+        // handles the resulting view stall via its usual timeout
+        // path.
+        if round_robin_leader(&self.state.validator_set, next_view) == self.self_id
+            && let Some(parent) = self.state.pending_blocks.get(&formed.block_hash).cloned()
+        {
             let new_block = self.builder.build(&parent, next_view, &formed);
             actions.push(Action::Broadcast(ConsensusMsg::Proposal(Proposal {
                 block: new_block,
@@ -843,15 +856,12 @@ mod tests {
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 1 }),
                 Action::Persist(StateUpdate::HighQc(justify)),
-                Action::SendTo(
-                    nid(3),
-                    ConsensusMsg::Vote(Vote {
-                        view: 1,
-                        block_hash,
-                    }),
-                ),
+                Action::Broadcast(ConsensusMsg::Vote(Vote {
+                    view: 1,
+                    block_hash,
+                })),
             ],
-            "happy-path emission order is VotedInView → HighQc → SendTo(Vote)",
+            "happy-path emission order is VotedInView → HighQc → Broadcast(Vote)",
         );
         assert_eq!(core.state().last_voted_view, 1);
         assert_eq!(
@@ -1010,15 +1020,14 @@ mod tests {
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 10 }),
                 Action::Persist(StateUpdate::HighQc(fresh_justify)),
-                // leader(11) over `[nid(1), nid(2), nid(3), nid(4)]`:
-                // 11 % 4 = 3 → nid(4).
-                Action::SendTo(
-                    nid(4),
-                    ConsensusMsg::Vote(Vote {
-                        view: 10,
-                        block_hash: fork_hash,
-                    }),
-                ),
+                // Votes are broadcast (not addressed to the next
+                // leader) so that QC formation survives the next
+                // leader being crashed — see `on_proposal_received`
+                // (#124).
+                Action::Broadcast(ConsensusMsg::Vote(Vote {
+                    view: 10,
+                    block_hash: fork_hash,
+                })),
             ],
         );
         assert_eq!(core.state().last_voted_view, 10);
@@ -1053,7 +1062,7 @@ mod tests {
         assert!(
             first
                 .iter()
-                .any(|a| matches!(a, Action::SendTo(_, ConsensusMsg::Vote(_)))),
+                .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Vote(_)))),
             "legitimate first proposal is expected to produce a Vote: {first:?}",
         );
 
@@ -1126,22 +1135,17 @@ mod tests {
             height: 1,
             block_hash: block1.hash(),
         };
-        // Emission order: B2/B3 (VotedInView, HighQc, SendTo(Vote)),
+        // Emission order: B2/B3 (VotedInView, HighQc, Broadcast(Vote)),
         // then B4 (Persist(Locked)), then B5 (Commit(genesis)).
-        // leader(4) over `[nid(1), nid(2), nid(3), nid(4)]`:
-        // 4 % 4 = 0 → nid(1).
         assert_eq!(
             actions,
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 3 }),
                 Action::Persist(StateUpdate::HighQc(justify)),
-                Action::SendTo(
-                    nid(1),
-                    ConsensusMsg::Vote(Vote {
-                        view: 3,
-                        block_hash: block3_hash,
-                    }),
-                ),
+                Action::Broadcast(ConsensusMsg::Vote(Vote {
+                    view: 3,
+                    block_hash: block3_hash,
+                })),
                 Action::Persist(StateUpdate::Locked(expected_lock)),
                 Action::Commit(genesis.clone()),
             ],
@@ -1321,19 +1325,15 @@ mod tests {
 
         // B4 skips (grandparent is genesis's [0; 32] sentinel).
         // B5 skips (great-grandparent missing).
-        // leader(2) = 2 % 4 = 2 → validators[2] = nid(3).
         assert_eq!(
             step1,
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 1 }),
                 Action::Persist(StateUpdate::HighQc(justify_v0)),
-                Action::SendTo(
-                    nid(3),
-                    ConsensusMsg::Vote(Vote {
-                        view: 1,
-                        block_hash: block_v1.hash(),
-                    }),
-                ),
+                Action::Broadcast(ConsensusMsg::Vote(Vote {
+                    view: 1,
+                    block_hash: block_v1.hash(),
+                })),
             ],
             "first proposal: vote + high_qc only",
         );
@@ -1349,19 +1349,15 @@ mod tests {
         // height 0 doesn't beat the `None → 0` baseline, so no
         // promote. B5: walk hits genesis as b2 (h=0) and the
         // sentinel as b1 — returns None.
-        // leader(3) = 3 % 4 = 3 → validators[3] = nid(4).
         assert_eq!(
             step2,
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 2 }),
                 Action::Persist(StateUpdate::HighQc(justify_v1)),
-                Action::SendTo(
-                    nid(4),
-                    ConsensusMsg::Vote(Vote {
-                        view: 2,
-                        block_hash: block_v2.hash(),
-                    }),
-                ),
+                Action::Broadcast(ConsensusMsg::Vote(Vote {
+                    view: 2,
+                    block_hash: block_v2.hash(),
+                })),
             ],
             "second proposal: still vote + high_qc only",
         );
@@ -1377,7 +1373,6 @@ mod tests {
         // baseline is 0, so candidate h=1 wins. Persist(Locked(v1)).
         // B5 fires: walk v2 → v1 → genesis with consecutive views
         // 2,1,0. Commit genesis; prune height ≤ 0.
-        // leader(4) = 4 % 4 = 0 → validators[0] = nid(1).
         let expected_lock = Locked {
             view: 1,
             height: 1,
@@ -1388,13 +1383,10 @@ mod tests {
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 3 }),
                 Action::Persist(StateUpdate::HighQc(justify_v2)),
-                Action::SendTo(
-                    nid(1),
-                    ConsensusMsg::Vote(Vote {
-                        view: 3,
-                        block_hash: block_v3.hash(),
-                    }),
-                ),
+                Action::Broadcast(ConsensusMsg::Vote(Vote {
+                    view: 3,
+                    block_hash: block_v3.hash(),
+                })),
                 Action::Persist(StateUpdate::Locked(expected_lock)),
                 Action::Commit(genesis.clone()),
             ],
@@ -1413,20 +1405,32 @@ mod tests {
     // ── C1/C2: VoteReceived leader path ─────────────────────────────
 
     #[test]
-    fn vote_dropped_when_not_leader_of_next_view() {
+    fn non_leader_aggregates_vote_silently_without_proposing() {
         // self = nid(1). Vote at view 2 → next view = 3. Leader of
         // view 3 = validators[3 % 4] = validators[3] = nid(4), not
-        // nid(1). The vote must be dropped silently — no bucket
-        // entry, no actions. C1a's cheapest branch.
+        // nid(1).
+        //
+        // Pre-#124 this node dropped the vote outright. After #124
+        // every replica aggregates into its local bucket (so QC
+        // formation survives the next leader being crashed — #124),
+        // but only the next-view leader broadcasts a follow-up
+        // proposal. At sub-quorum the non-leader emits no actions
+        // but records the vote in its bucket.
         let mut core = make_core(1);
-        let vote = signed_vote(2, [0xAA; 32], nid(2));
+        let block_hash: BlockHash = [0xAA; 32];
+        let vote = signed_vote(2, block_hash, nid(2));
 
         let actions = core.step(Event::VoteReceived(vote));
 
-        assert!(actions.is_empty(), "not-leader drops vote: {actions:?}");
-        assert!(
-            core.vote_bucket.is_empty(),
-            "bucket must not accumulate when we're not the leader",
+        assert!(actions.is_empty(), "sub-quorum vote is silent: {actions:?}");
+        let bucket = core
+            .vote_bucket
+            .get(&(2, block_hash))
+            .expect("non-leader still accumulates into its local bucket");
+        assert_eq!(
+            bucket.signer_count(),
+            1,
+            "bucket must record the vote even when self isn't the next leader",
         );
     }
 
@@ -1709,22 +1713,18 @@ mod tests {
         let advance = core.step(Event::PacemakerAdvance(3));
 
         // Re-dispatch of v2 yields the normal B2/B3 actions:
-        // VotedInView + HighQc + SendTo(leader(3)=nid(4), Vote).
-        // B4/B5 skip (grandparent is genesis's sentinel).
-        // Then C4's trailing `Broadcast(NewView)` carries the just-
-        // adopted high_qc.
+        // VotedInView + HighQc + Broadcast(Vote). B4/B5 skip
+        // (grandparent is genesis's sentinel). Then C4's trailing
+        // `Broadcast(NewView)` carries the just-adopted high_qc.
         assert_eq!(
             advance,
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 2 }),
                 Action::Persist(StateUpdate::HighQc(justify_v1.clone())),
-                Action::SendTo(
-                    nid(4),
-                    ConsensusMsg::Vote(Vote {
-                        view: 2,
-                        block_hash: block_v2_hash,
-                    }),
-                ),
+                Action::Broadcast(ConsensusMsg::Vote(Vote {
+                    view: 2,
+                    block_hash: block_v2_hash,
+                })),
                 Action::Broadcast(ConsensusMsg::NewView(NewView {
                     high_qc: justify_v1,
                 })),
@@ -2126,7 +2126,7 @@ mod tests {
             // replicas has conflicting commits.
             //
             // This is the minimum proof that the bus correctly
-            // relays `SendTo(leader, Vote)` and `Broadcast(Proposal)`
+            // relays `Broadcast(Vote)` and `Broadcast(Proposal)`
             // between cores, and that the invariant we'll actually
             // check against Byzantine inputs in PR β holds trivially
             // for honest inputs.

@@ -1319,13 +1319,12 @@ mod tests {
     ///    ample headroom above the expected commit rate (~50ms per
     ///    view, 3-chain commit ⇒ dozens of commits per 5s).
     ///
-    /// Currently ignored: this test is the regression guard for the
-    /// production liveness bug tracked in #124. It is expected to FAIL
-    /// on the current `main` (post-#120, pre-#124) and to PASS once
-    /// #124 lands the actual fix — at which point `#[ignore]` should
-    /// be removed in that same PR so it becomes a permanent guard.
+    /// The #124 fix (broadcast-and-aggregate votes) is what makes
+    /// this pass: under a permanent crash of one of four validators,
+    /// round-robin leadership means one in four views' next-leader
+    /// is dead, and point-to-point vote routing would drop every
+    /// such vote, starving the 3-chain commit rule forever.
     #[tokio::test]
-    #[ignore = "#121 regression guard: fails until the liveness fix in #124 lands"]
     async fn crash_of_minority_preserves_liveness() {
         tokio::time::pause();
 
@@ -1379,12 +1378,7 @@ mod tests {
     /// Complements `crash_of_minority_preserves_liveness` by proving
     /// the liveness property holds even when the crashed node is the
     /// one that proposes first on the most common rotation slot.
-    ///
-    /// Currently ignored for the same reason as
-    /// `crash_of_minority_preserves_liveness` — see that test's
-    /// docstring.
     #[tokio::test]
-    #[ignore = "#121 regression guard: fails until the liveness fix in #124 lands"]
     async fn crash_of_leader_preserves_liveness() {
         tokio::time::pause();
 
@@ -1424,12 +1418,7 @@ mod tests {
     /// whole point: a weak `> 0` assertion would pass even if the
     /// healed node permanently lagged, which is exactly the regression
     /// #121 flags.
-    ///
-    /// Currently ignored for the same reason as
-    /// `crash_of_minority_preserves_liveness` — see that test's
-    /// docstring.
     #[tokio::test]
-    #[ignore = "#121 regression guard: fails until the liveness fix in #124 lands"]
     async fn partition_and_heal_preserves_liveness() {
         tokio::time::pause();
 
