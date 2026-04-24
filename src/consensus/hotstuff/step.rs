@@ -1790,21 +1790,45 @@ mod tests {
         }
 
         pub(crate) struct ReplicaSet {
+            /// Honest cores, indexed 0..n_honest. Byzantine validators
+            /// have no core — their NodeIds appear in `validators`
+            /// (so leader election still maps views to them), but
+            /// they produce events only via the adversary strategies
+            /// in the property tests below.
             pub cores: Vec<HotStuffCore>,
+            /// Per-honest-replica event inbox.
             pub inboxes: Vec<VecDeque<Event>>,
+            /// Per-honest-replica committed-blocks ledger.
             pub commits: Vec<BTreeMap<u64, Block>>,
             pub validators: ValidatorSet,
             pub genesis: Block,
+            /// How many of the trailing `validators` entries are
+            /// Byzantine. Honest validator indices are `0..n_honest`
+            /// where `n_honest = validators.len() - byzantine_count`.
+            pub byzantine_count: usize,
         }
 
         impl ReplicaSet {
-            /// Build `n` replicas over the canonical validator set,
-            /// each with its own `TestBlockBuilder` stamped with
-            /// that replica's NodeId as the proposer.
+            /// Build `n` all-honest replicas. Shorthand for
+            /// `new_with_byzantine(n, 0)`.
             pub fn new(n: usize) -> Self {
-                let validators = validator_set(n);
+                Self::new_with_byzantine(n, 0)
+            }
+
+            /// Build `n_total` validators with the last `byzantine_count`
+            /// treated as Byzantine: their NodeIds appear in
+            /// `validators` for leader-election purposes, but no
+            /// honest core runs for them, and messages addressed to
+            /// them via `SendTo` are dropped (adversarial void).
+            pub fn new_with_byzantine(n_total: usize, byzantine_count: usize) -> Self {
+                assert!(
+                    byzantine_count < n_total,
+                    "byzantine_count must be strictly less than n_total",
+                );
+                let n_honest = n_total - byzantine_count;
+                let validators = validator_set(n_total);
                 let genesis = Block::genesis([0; 32]);
-                let cores: Vec<HotStuffCore> = (0..n)
+                let cores: Vec<HotStuffCore> = (0..n_honest)
                     .map(|i| {
                         let nid = *validators.get(i).unwrap();
                         let state = HotStuffState::new(validators.clone(), genesis.clone());
@@ -1812,27 +1836,54 @@ mod tests {
                         HotStuffCore::new(nid, state, builder)
                     })
                     .collect();
-                let inboxes = (0..n).map(|_| VecDeque::new()).collect();
-                let commits = (0..n).map(|_| BTreeMap::new()).collect();
+                let inboxes = (0..n_honest).map(|_| VecDeque::new()).collect();
+                let commits = (0..n_honest).map(|_| BTreeMap::new()).collect();
                 Self {
                     cores,
                     inboxes,
                     commits,
                     validators,
                     genesis,
+                    byzantine_count,
                 }
             }
 
+            /// Number of honest replicas the harness is running.
             pub fn len(&self) -> usize {
                 self.cores.len()
             }
 
-            /// Queue `event` for `replica`'s next `deliver_one`.
+            /// Byzantine NodeIds — the trailing validator slots that
+            /// have no core. Property tests use this list to pick
+            /// signers for adversarial events.
+            pub fn byzantine_nids(&self) -> Vec<NodeId> {
+                let n_honest = self.cores.len();
+                (n_honest..n_honest + self.byzantine_count)
+                    .map(|i| *self.validators.get(i).unwrap())
+                    .collect()
+            }
+
+            /// Map a NodeId to an honest-replica index, if that
+            /// NodeId belongs to an honest validator. Returns `None`
+            /// for Byzantine (or unknown) ids. `apply_actions`
+            /// uses this to drop `SendTo` destined for Byzantine —
+            /// the adversary sees the message but doesn't process
+            /// it through any harness-owned core.
+            pub fn honest_index_of(&self, nid: &NodeId) -> Option<usize> {
+                let idx = self.validators.index_of(nid)?;
+                if idx < self.cores.len() {
+                    Some(idx)
+                } else {
+                    None
+                }
+            }
+
+            /// Queue `event` for honest `replica`'s next `deliver_one`.
             pub fn inject(&mut self, replica: usize, event: Event) {
                 self.inboxes[replica].push_back(event);
             }
 
-            /// Queue `event` for every replica's inbox.
+            /// Queue `event` for every honest replica's inbox.
             pub fn inject_all(&mut self, event: Event) {
                 for i in 0..self.cores.len() {
                     self.inject(i, event.clone());
@@ -1856,13 +1907,20 @@ mod tests {
                 for action in actions {
                     match action {
                         Action::Broadcast(msg) => {
+                            // Only honest replicas have inboxes;
+                            // Byzantine "receipt" is a no-op.
                             for target in 0..self.cores.len() {
                                 self.inboxes[target]
                                     .push_back(event_from_msg(source_nid, msg.clone()));
                             }
                         }
                         Action::SendTo(target_id, msg) => {
-                            if let Some(target) = self.validators.index_of(&target_id) {
+                            // Drop silently if the target is
+                            // Byzantine — the adversary sees it on
+                            // the wire, but we don't model what they
+                            // do with it beyond the strategies in
+                            // the property tests.
+                            if let Some(target) = self.honest_index_of(&target_id) {
                                 self.inboxes[target].push_back(event_from_msg(source_nid, msg));
                             }
                         }
