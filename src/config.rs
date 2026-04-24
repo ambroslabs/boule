@@ -16,6 +16,11 @@ pub struct Config {
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
     pub api: ApiConfig,
+    /// Optional HotStuff consensus configuration. When absent the node
+    /// runs gossip-only; when present a [`crate::consensus::node::ConsensusNode`]
+    /// is started alongside the gossip and ping protocols.
+    #[serde(default)]
+    pub consensus: Option<ConsensusConfig>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -112,6 +117,48 @@ pub struct ApiConfig {
 
 fn default_cleanup_interval() -> u64 {
     60
+}
+
+/// HotStuff consensus configuration. Opt-in via the top-level
+/// `[consensus]` table; absent means the binary runs gossip-only.
+///
+/// The `validators` list must contain this node's own base58 NodeId
+/// and must be byte-identical across every replica in the cluster
+/// (validator-set ordering determines round-robin leader rotation).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ConsensusConfig {
+    /// Base58-encoded NodeIds of every validator in the committee.
+    /// Must include this node's own ID.
+    pub validators: Vec<String>,
+    /// 32-byte hex string used as the genesis block's `state_commitment`.
+    /// Must match across all replicas. Defaults to all zeros.
+    #[serde(default)]
+    pub genesis_seed_hex: Option<String>,
+    /// Maximum commands the leader pulls from the mempool per proposal.
+    #[serde(default = "default_propose_limit")]
+    pub propose_limit: usize,
+    /// View-timer base duration in milliseconds.
+    #[serde(default = "default_timeout_base_ms")]
+    pub timeout_base_ms: u64,
+    /// View-timer ceiling (exponential backoff saturates here) in ms.
+    #[serde(default = "default_timeout_max_ms")]
+    pub timeout_max_ms: u64,
+    /// Directory holding the consensus KV store and WAL on disk.
+    /// If unset, in-memory storage is used (no crash recovery).
+    #[serde(default)]
+    pub storage_dir: Option<PathBuf>,
+}
+
+fn default_propose_limit() -> usize {
+    64
+}
+
+fn default_timeout_base_ms() -> u64 {
+    200
+}
+
+fn default_timeout_max_ms() -> u64 {
+    10_000
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -314,6 +361,69 @@ listen_addr = "127.0.0.1:8080"
             }
             _ => panic!("expected exec backend"),
         }
+    }
+
+    #[test]
+    fn consensus_section_parses() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["abc", "def", "ghi", "jkl"]
+genesis_seed_hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+propose_limit = 32
+timeout_base_ms = 100
+timeout_max_ms = 5000
+storage_dir = "/tmp/cons"
+"#,
+        );
+        let cons = c.consensus.expect("consensus section");
+        assert_eq!(cons.validators.len(), 4);
+        assert_eq!(cons.propose_limit, 32);
+        assert_eq!(cons.timeout_base_ms, 100);
+        assert_eq!(cons.timeout_max_ms, 5000);
+        assert_eq!(cons.storage_dir, Some(PathBuf::from("/tmp/cons")));
+    }
+
+    #[test]
+    fn consensus_defaults_apply_when_omitted() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+"#,
+        );
+        let cons = c.consensus.expect("consensus section");
+        assert_eq!(cons.propose_limit, 64);
+        assert_eq!(cons.timeout_base_ms, 200);
+        assert_eq!(cons.timeout_max_ms, 10_000);
+        assert!(cons.storage_dir.is_none());
+        assert!(cons.genesis_seed_hex.is_none());
+    }
+
+    #[test]
+    fn missing_consensus_section_is_none() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+"#,
+        );
+        assert!(c.consensus.is_none());
     }
 
     #[test]
