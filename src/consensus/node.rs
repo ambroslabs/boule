@@ -39,7 +39,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::consensus::View;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
@@ -54,6 +54,10 @@ use crate::consensus::pacemaker::Event as PacemakerEvent;
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::pacemaker::leader::RoundRobinSelector;
 use crate::consensus::pacemaker::timeout::ExponentialBackoff;
+use crate::consensus::status::{
+    BUCKET_VIEW_WINDOW, ConsensusStatus, LockedStatus, ParkedProposalStatus, QcStatus,
+    TimeoutBucketStatus, VoteBucketStatus,
+};
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::view_timer::ViewTimer;
 use crate::crypto::signed::Signed;
@@ -326,6 +330,25 @@ pub struct ConsensusNode {
     /// Optional channel to notify an observer (e.g. a test harness) of
     /// each committed block. `None` in production builds.
     commit_tx: Option<tokio::sync::mpsc::UnboundedSender<Block>>,
+    /// Peers the consensus layer has observed as connected via
+    /// `ProtocolEvent::PeerConnected`. This is the consensus-layer
+    /// notion of connectivity, which may diverge from the p2p
+    /// manager's raw peer map (the safety core only acts on peers it
+    /// has seen through its own protocol channel).
+    peers_connected: HashSet<NodeId>,
+    /// Height of the most recently committed block, updated in
+    /// [`ConsensusNode::apply_commit`]. Zero before the first commit.
+    last_committed_height: u64,
+    /// View of the most recently committed block. Zero before the
+    /// first commit.
+    last_committed_view: View,
+    /// Watch-channel publisher for [`ConsensusStatus`] snapshots. When
+    /// `Some`, [`ConsensusNode::run`] republishes at the end of each
+    /// event-loop iteration. The field is public at the module level
+    /// via [`ConsensusNode::with_status_publisher`] so wiring in
+    /// `main.rs` can attach a channel built around the initial
+    /// snapshot.
+    status_tx: Option<watch::Sender<Arc<ConsensusStatus>>>,
 }
 
 /// Accumulator for one view's timeout votes.
@@ -397,6 +420,10 @@ impl ConsensusNode {
             timeout_policy,
             timeout_buckets: HashMap::new(),
             commit_tx: None,
+            peers_connected: HashSet::new(),
+            last_committed_height: 0,
+            last_committed_view: 0,
+            status_tx: None,
         }
     }
 
@@ -420,6 +447,138 @@ impl ConsensusNode {
     pub fn with_genesis_qc(mut self, qc: QuorumCertificate) -> Self {
         self.core.set_high_qc(qc);
         self
+    }
+
+    /// Attach a [`watch::Sender`] that [`ConsensusNode::run`] will use
+    /// to republish the [`ConsensusStatus`] snapshot after each event-
+    /// loop iteration.
+    ///
+    /// The caller typically obtains the paired receiver by calling
+    /// [`ConsensusNode::build_status`] on the just-constructed node and
+    /// wrapping the result in [`watch::channel`] before attaching the
+    /// sender here. That way the initial value published on the channel
+    /// is already a sane snapshot (current_view=0 on a fresh boot),
+    /// so the HTTP endpoint never returns 500 during the window between
+    /// node construction and the first event-loop tick.
+    pub fn with_status_publisher(mut self, tx: watch::Sender<Arc<ConsensusStatus>>) -> Self {
+        self.status_tx = Some(tx);
+        self
+    }
+
+    /// Build a fresh [`ConsensusStatus`] snapshot from the current
+    /// safety-core, pacemaker, mempool, and peer-tracking state.
+    ///
+    /// Cheap — shallow-copies a handful of fields, clones a small
+    /// handful of bounded-size vectors. Safe to call from the event
+    /// loop after each state-mutating tick without affecting
+    /// throughput.
+    pub fn build_status(&self) -> ConsensusStatus {
+        let current_view = self.pacemaker.current_view();
+        let state = self.core.state();
+        let vs_len = self.validator_set.len();
+        let quorum = quorum_size(vs_len);
+
+        let self_role = self_role_string(&self.validator_set, &self.self_id, current_view);
+
+        let locked = state.locked.as_ref().map(|l| LockedStatus {
+            view: l.view,
+            height: l.height,
+            block_hash: hex::encode(l.block_hash),
+        });
+
+        let high_qc = state.high_qc.as_ref().map(|qc| {
+            let height = state
+                .pending_blocks
+                .get(&qc.block_hash)
+                .map(|b| b.header.height);
+            QcStatus {
+                view: qc.view,
+                height,
+                block_hash: hex::encode(qc.block_hash),
+            }
+        });
+
+        let min_view = current_view.saturating_sub(BUCKET_VIEW_WINDOW);
+        let max_view = current_view.saturating_add(BUCKET_VIEW_WINDOW);
+
+        let mut vote_buckets: Vec<VoteBucketStatus> = self
+            .core
+            .vote_buckets()
+            .filter(|((view, _), _)| *view >= min_view && *view <= max_view)
+            .map(|((view, block_hash), qc)| VoteBucketStatus {
+                view: *view,
+                block_hash: hex::encode(block_hash),
+                signers: qc.signer_count(),
+                quorum,
+            })
+            .collect();
+        // Stable ordering keeps the JSON shape deterministic across
+        // calls, which makes logs and diff-based debugging workable.
+        vote_buckets.sort_by(|a, b| a.view.cmp(&b.view).then(a.block_hash.cmp(&b.block_hash)));
+
+        let mut timeout_buckets: Vec<TimeoutBucketStatus> = self
+            .timeout_buckets
+            .iter()
+            .filter(|(view, _)| **view >= min_view && **view <= max_view)
+            .map(|(view, bucket)| TimeoutBucketStatus {
+                view: *view,
+                signers: bucket.signers.len(),
+                quorum,
+            })
+            .collect();
+        timeout_buckets.sort_by_key(|b| b.view);
+
+        let mut parked_proposals: Vec<ParkedProposalStatus> = self
+            .core
+            .parked_proposals()
+            .map(|signed| ParkedProposalStatus {
+                block_hash: hex::encode(signed.payload.block.hash()),
+                parent_hash: hex::encode(signed.payload.block.header.parent_hash),
+                view: signed.payload.block.header.view,
+            })
+            .collect();
+        parked_proposals.sort_by(|a, b| a.view.cmp(&b.view).then(a.block_hash.cmp(&b.block_hash)));
+
+        let mut peers_connected: Vec<String> = self
+            .peers_connected
+            .iter()
+            .map(crate::p2p::tls::node_id_to_base58)
+            .collect();
+        peers_connected.sort();
+
+        let validator_set: Vec<String> = self
+            .validator_set
+            .iter()
+            .map(crate::p2p::tls::node_id_to_base58)
+            .collect();
+
+        ConsensusStatus {
+            node_id: crate::p2p::tls::node_id_to_base58(&self.self_id),
+            self_role,
+            current_view,
+            last_voted_view: state.last_voted_view,
+            last_committed_height: self.last_committed_height,
+            last_committed_view: self.last_committed_view,
+            locked,
+            high_qc,
+            vote_buckets,
+            timeout_buckets,
+            parked_proposals,
+            pending_blocks_count: state.pending_blocks.len(),
+            peers_connected,
+            validator_set,
+            mempool_size: self.mempool.len(),
+        }
+    }
+
+    /// Publish a fresh snapshot on the watch channel (if attached).
+    /// Called by [`ConsensusNode::run`] at the end of each event-loop
+    /// iteration. `send_replace` ignores the "no receivers" case so the
+    /// node keeps running even if no-one is listening.
+    fn publish_status(&self) {
+        if let Some(tx) = &self.status_tx {
+            let _ = tx.send_replace(Arc::new(self.build_status()));
+        }
     }
 
     /// Construct a `ConsensusNode`, restoring any durable control-plane
@@ -481,6 +640,10 @@ impl ConsensusNode {
             timeout_policy,
             timeout_buckets: HashMap::new(),
             commit_tx: None,
+            peers_connected: HashSet::new(),
+            last_committed_height: 0,
+            last_committed_view: 0,
+            status_tx: None,
         })
     }
 
@@ -570,11 +733,17 @@ impl ConsensusNode {
         let (timer_tx, mut timer_rx) = mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
+        // Publish an initial snapshot before doing anything else, so
+        // the HTTP endpoint has a sane value available even if it's
+        // queried in the tiny window before the boot actions fire.
+        self.publish_status();
+
         // Boot: advance pacemaker from 0 → 1, arm the view timer, and
         // broadcast NewView (if we have a high_qc from a prior session).
         let boot_actions = self.step_pacemaker(PacemakerEvent::OnQc(0));
         self.apply_pacemaker_actions(boot_actions, &send_tx, &mut view_timer, &signer)
             .await?;
+        self.publish_status();
 
         loop {
             tokio::select! {
@@ -605,15 +774,23 @@ impl ConsensusNode {
                         }
                         ProtocolEvent::PeerConnected { node_id } => {
                             tracing::debug!("consensus: peer connected {node_id:?}");
+                            self.peers_connected.insert(node_id);
                         }
                         ProtocolEvent::PeerDisconnected { node_id } => {
                             tracing::debug!("consensus: peer disconnected {node_id:?}");
+                            self.peers_connected.remove(&node_id);
                         }
                     }
                 }
 
                 else => break,
             }
+
+            // Publish a fresh snapshot at the end of every iteration,
+            // after all dispatched actions have been applied. No hot-
+            // path locking — just a shallow rebuild and a watch-channel
+            // `send_replace`.
+            self.publish_status();
         }
 
         view_timer.cancel();
@@ -1106,7 +1283,7 @@ impl ConsensusNode {
 
     /// Commit `block` to the state machine and drain the committed commands
     /// from the mempool.
-    fn apply_commit(&self, block: crate::replication::block::Block) {
+    fn apply_commit(&mut self, block: crate::replication::block::Block) {
         {
             let mut sm = self.state_machine.lock();
             for cmd in &block.commands {
@@ -1120,6 +1297,14 @@ impl ConsensusNode {
             }
         }
         self.mempool.remove_committed(&block.commands);
+        // Track the most recent commit for the status snapshot. The
+        // safety core emits `Action::Commit` in height order, so a
+        // plain max-by-value assignment keeps this monotonic without
+        // any extra bookkeeping.
+        if block.header.height > self.last_committed_height {
+            self.last_committed_height = block.header.height;
+            self.last_committed_view = block.header.view;
+        }
         tracing::info!(
             "consensus: committed block height={} view={}",
             block.header.height,
@@ -1212,6 +1397,31 @@ pub fn recover_state(
     }
 
     Ok(state)
+}
+
+// ── Status-snapshot helper ───────────────────────────────────────────────────
+
+/// Compute the `self_role` string for a [`ConsensusStatus`]: either
+/// `"leader(view=N)"` when `self_id` is the round-robin proposer for
+/// `view`, or `"replica"` otherwise.
+///
+/// Kept module-private and free-standing so
+/// [`ConsensusNode::build_status`] doesn't have to hold a
+/// [`RoundRobinSelector`]: the round-robin rule
+/// (`validators[view % len]`) is the selector the rest of the
+/// integration layer uses, and duplicating that one-liner here keeps
+/// `ConsensusNode` from threading the selector through every call.
+/// See [`crate::consensus::pacemaker::leader::RoundRobinSelector`]
+/// for the authoritative implementation.
+fn self_role_string(validator_set: &ValidatorSet, self_id: &NodeId, view: View) -> String {
+    if validator_set.is_empty() {
+        return "replica".to_string();
+    }
+    let idx = (view % validator_set.len() as u64) as usize;
+    match validator_set.get(idx) {
+        Some(leader) if leader == self_id => format!("leader(view={view})"),
+        _ => "replica".to_string(),
+    }
 }
 
 // ── Internal send helper ─────────────────────────────────────────────────────
@@ -1887,7 +2097,7 @@ mod tests {
         let sm = make_sm();
         let vs = four_validators();
         let cfg = test_config(vs);
-        let node = ConsensusNode::new(
+        let mut node = ConsensusNode::new(
             nid(1),
             cfg,
             Arc::clone(&sm),
