@@ -13,6 +13,19 @@ use super::connection::ProtocolCaps;
 use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 
+/// Monotonic per-connection identity assigned by the manager. Used to
+/// distinguish connections to the same peer so a tie-breaker replacement
+/// does not look like a disconnect to the rest of the system (issue #114).
+pub type ConnectionId = u64;
+
+/// What the manager stores for each currently-connected peer: the id of the
+/// specific connection that owns the peer slot plus the channel that writes
+/// bytes onto it.
+struct PeerSlot {
+    conn_id: ConnectionId,
+    write_tx: mpsc::Sender<Bytes>,
+}
+
 /// Combined async I/O trait used as a protocol-agnostic stream type.
 /// Rust's trait-object rules only allow one non-auto trait per `dyn`, so we
 /// need this supertrait to combine AsyncRead and AsyncWrite into one.
@@ -28,8 +41,14 @@ pub enum ManagerMsg {
         addr: SocketAddr,
         stream: AnyStream,
     },
+    /// Emitted by a connection task when its read/write loop exits. The
+    /// `connection_id` disambiguates between the current connection for
+    /// `node_id` and any prior connections that the tie-breaker has since
+    /// replaced — the manager only treats this as a true disconnect if it
+    /// matches the currently-registered connection (see #114).
     PeerGone {
         node_id: NodeId,
+        connection_id: ConnectionId,
     },
     InboundMessage {
         node_id: NodeId,
@@ -52,11 +71,15 @@ pub async fn run(
     // the sim's byte-identical-trace determinism test relies on this, and
     // consistent broadcast ordering is also helpful for reproducing
     // production bugs.
-    let mut peers: BTreeMap<NodeId, mpsc::Sender<Bytes>> = BTreeMap::new();
+    let mut peers: BTreeMap<NodeId, PeerSlot> = BTreeMap::new();
     let mut protocols: BTreeMap<u8, mpsc::Sender<ProtocolEvent>> = BTreeMap::new();
     // Shared with every spawned connection task; updated in place when a
     // protocol registers a tighter-than-global cap.
     let protocol_caps: ProtocolCaps = Arc::new(RwLock::new(HashMap::new()));
+    // Monotonically increasing id for every connection the manager accepts.
+    // Used to distinguish current vs. replaced connections when a PeerGone
+    // arrives (see #114 / the tie-breaker path in `register_connection`).
+    let mut next_conn_id: ConnectionId = 0;
 
     loop {
         tokio::select! {
@@ -66,22 +89,34 @@ pub async fn run(
             msg = internal_rx.recv() => {
                 match msg {
                     Some(ManagerMsg::NewConnection { node_id, addr, stream }) => {
+                        next_conn_id += 1;
                         register_connection(
                             our_node_id,
                             node_id,
                             addr,
                             stream,
+                            next_conn_id,
                             &mut peers,
                             &protocols,
                             internal_tx.clone(),
                             Arc::clone(&protocol_caps),
                         );
                     }
-                    Some(ManagerMsg::PeerGone { node_id }) => {
-                        peers.remove(&node_id);
-                        let _ = peer_gone_tx.send(node_id);
-                        for event_tx in protocols.values() {
-                            let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id });
+                    Some(ManagerMsg::PeerGone { node_id, connection_id }) => {
+                        // Only treat this as a disconnect if the registered
+                        // connection is the one that just exited. Otherwise
+                        // this PeerGone is for a connection the tie-breaker
+                        // replaced: the peer is still reachable via the new
+                        // connection and no event fires (see #114).
+                        let is_current = peers
+                            .get(&node_id)
+                            .is_some_and(|slot| slot.conn_id == connection_id);
+                        if is_current {
+                            peers.remove(&node_id);
+                            let _ = peer_gone_tx.send(node_id);
+                            for event_tx in protocols.values() {
+                                let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id });
+                            }
                         }
                     }
                     Some(ManagerMsg::InboundMessage { node_id, msg }) => {
@@ -108,8 +143,8 @@ pub async fn run(
                             ProtocolOutbound::SendTo { node_id, payload } => {
                                 let tagged = tag(protocol_id, payload);
                                 let id = node_id_to_base58(&node_id);
-                                if let Some(tx) = peers.get(&node_id) {
-                                    if tx.try_send(tagged).is_err() {
+                                if let Some(slot) = peers.get(&node_id) {
+                                    if slot.write_tx.try_send(tagged).is_err() {
                                         warn!("SendTo {id}: channel full or closed");
                                     }
                                 } else {
@@ -155,11 +190,20 @@ pub async fn run(
                     }
                     Some(PeerCommand::Disconnect { node_id }) => {
                         let id = node_id_to_base58(&node_id);
-                        if peers.remove(&node_id).is_none() {
+                        if peers.remove(&node_id).is_some() {
+                            // Broadcast the disconnect immediately instead
+                            // of waiting for the connection task's PeerGone
+                            // to land — that stale PeerGone will now see a
+                            // missing slot and no-op (see #114). Dropping
+                            // the slot's `write_tx` still closes the write
+                            // channel and lets the connection task exit.
+                            let _ = peer_gone_tx.send(node_id);
+                            for event_tx in protocols.values() {
+                                let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id });
+                            }
+                        } else {
                             warn!("Disconnect unknown peer {id}");
                         }
-                        // Dropping the sender closes the write channel, which
-                        // causes the connection task to exit and emit PeerGone.
                     }
                     Some(PeerCommand::ListPeers { reply }) => {
                         let list: Vec<NodeId> = peers.keys().copied().collect();
@@ -182,14 +226,16 @@ fn register_connection(
     peer_node_id: NodeId,
     addr: SocketAddr,
     stream: AnyStream,
-    peers: &mut BTreeMap<NodeId, mpsc::Sender<Bytes>>,
+    conn_id: ConnectionId,
+    peers: &mut BTreeMap<NodeId, PeerSlot>,
     protocols: &BTreeMap<u8, mpsc::Sender<ProtocolEvent>>,
     internal_tx: mpsc::Sender<ManagerMsg>,
     protocol_caps: ProtocolCaps,
 ) {
     let id = node_id_to_base58(&peer_node_id);
 
-    if peers.contains_key(&peer_node_id) {
+    let is_replacement = peers.contains_key(&peer_node_id);
+    if is_replacement {
         // Tie-breaker: the node with the lexicographically lower ID keeps the
         // existing connection; the higher-ID node accepts the new one instead.
         if our_node_id < peer_node_id {
@@ -197,19 +243,27 @@ fn register_connection(
             return;
         }
         info!("tie-breaker: replacing existing connection to {id} (we have higher ID)");
-        // Dropping the old sender below closes the old write channel, which
-        // causes the old connection task to exit and fire PeerGone.
+        // Overwriting the slot below drops the old `write_tx`, closing the
+        // old connection task's write channel so it exits. Because the slot
+        // now has a new `conn_id`, the old task's PeerGone is recognised as
+        // stale and no spurious peer-gone event fires (see #114).
     } else {
         info!("registering new peer {id} at {addr}");
     }
 
     let (write_tx, write_rx) = mpsc::channel::<Bytes>(64);
-    peers.insert(peer_node_id, write_tx);
+    peers.insert(peer_node_id, PeerSlot { conn_id, write_tx });
 
-    for event_tx in protocols.values() {
-        let _ = event_tx.try_send(ProtocolEvent::PeerConnected {
-            node_id: peer_node_id,
-        });
+    // Only notify protocols on a fresh connection. Replacing the underlying
+    // stream doesn't change the logical "is this peer reachable" answer, so
+    // firing an extra PeerConnected (without a matching PeerDisconnected)
+    // would confuse any protocol that tracks per-peer state.
+    if !is_replacement {
+        for event_tx in protocols.values() {
+            let _ = event_tx.try_send(ProtocolEvent::PeerConnected {
+                node_id: peer_node_id,
+            });
+        }
     }
 
     let conn_tx = internal_tx.clone();
@@ -218,6 +272,7 @@ fn register_connection(
         if internal_tx
             .send(ManagerMsg::PeerGone {
                 node_id: peer_node_id,
+                connection_id: conn_id,
             })
             .await
             .is_err()
@@ -235,10 +290,10 @@ fn tag(protocol_id: u8, payload: Bytes) -> Bytes {
     buf.freeze()
 }
 
-fn broadcast_msg(peers: &BTreeMap<NodeId, mpsc::Sender<Bytes>>, msg: Bytes) {
-    for (node_id, tx) in peers {
+fn broadcast_msg(peers: &BTreeMap<NodeId, PeerSlot>, msg: Bytes) {
+    for (node_id, slot) in peers {
         let id = node_id_to_base58(node_id);
-        if tx.try_send(msg.clone()).is_err() {
+        if slot.write_tx.try_send(msg.clone()).is_err() {
             warn!("broadcast to {id}: channel full or closed, skipping");
         }
     }
@@ -467,9 +522,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Simulate peer departure.
-        mgr.internal_tx
-            .send(ManagerMsg::PeerGone { node_id: nid(7) })
+        // Simulate peer departure via the public Disconnect command — the
+        // manager broadcasts peer_gone and fans the event out to every
+        // registered protocol. (Post-#114 we can no longer synthesise a
+        // bare `ManagerMsg::PeerGone` from a test because it carries the
+        // opaque, manager-assigned `connection_id`.)
+        mgr.cmd_tx
+            .send(PeerCommand::Disconnect { node_id: nid(7) })
             .await
             .unwrap();
 
@@ -568,6 +627,65 @@ mod tests {
         // Still exactly one entry in the peer table.
         let peers = mgr.list_peers().await;
         assert_eq!(peers, vec![nid(9)]);
+    }
+
+    /// Regression test for #114: when the higher-ID side of the
+    /// tie-breaker replaces an existing connection with a fresh one, the
+    /// old connection's teardown must NOT surface as a peer_gone broadcast
+    /// (or as a PeerDisconnected fan-out) — the peer is still reachable
+    /// via the replacement, and a spurious peer_gone triggers a dialer
+    /// reconnect loop.
+    #[tokio::test]
+    async fn tie_breaker_replace_does_not_emit_peer_gone() {
+        // `our_node_id` is nid(9), peer is nid(1). 9 > 1, so the manager
+        // takes the REPLACE branch on the second NewConnection.
+        let mut mgr = TestManager::start(nid(9));
+        let mut h = mgr.register(0x01).await;
+
+        // First connection for nid(1). The protocol sees the initial
+        // PeerConnected event.
+        let _first = add_peer(&mgr, nid(1)).await;
+        let connected = tokio::time::timeout(Duration::from_millis(200), h.event_rx.recv())
+            .await
+            .expect("initial PeerConnected times out")
+            .expect("event channel closed");
+        assert!(matches!(connected, ProtocolEvent::PeerConnected { node_id } if node_id == nid(1)));
+
+        // Second connection for the same peer triggers the REPLACE path.
+        // The old `_first` connection's write channel is dropped and the
+        // underlying task exits, which would previously have fired
+        // peer_gone. Post-fix, it must stay silent.
+        let _second = add_peer(&mgr, nid(1)).await;
+
+        // Give the replaced connection task time to exit and push its
+        // (stale) PeerGone through the manager.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Assertion 1: no peer_gone broadcast was emitted.
+        match mgr.peer_gone_rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Empty) => {}
+            Ok(n) => panic!(
+                "tie-breaker REPLACE must not broadcast peer_gone, got {:?}",
+                n
+            ),
+            Err(other) => panic!("unexpected peer_gone channel state: {other:?}"),
+        }
+
+        // Assertion 2: no extra PeerConnected or PeerDisconnected event
+        // fanned out to protocols. (Replacing the stream doesn't change
+        // whether the peer is reachable, so protocol state should stay
+        // consistent.)
+        match tokio::time::timeout(Duration::from_millis(50), h.event_rx.recv()).await {
+            Err(_) => {}
+            Ok(Some(ev)) => {
+                panic!("replacement must not fan a protocol event out to handlers, got {ev:?}")
+            }
+            Ok(None) => panic!("event channel closed unexpectedly"),
+        }
+
+        // Assertion 3: the peer is still registered (via the replacement).
+        assert!(mgr.has_peer(nid(1)).await);
+        assert_eq!(mgr.list_peers().await, vec![nid(1)]);
     }
 
     #[tokio::test]

@@ -146,6 +146,7 @@ pub use tls::NodeId;
 ///     peers: Vec::new(),
 ///     listener,
 ///     clock,
+///     peer_cmd_tx: None,
 /// };
 /// tokio::spawn(protocol.run(internal_tx, peer_gone_tx));
 /// # }

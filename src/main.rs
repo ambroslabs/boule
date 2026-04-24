@@ -291,6 +291,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
         peers: config.peers.clone(),
         listener: p2p_listener,
         clock: Arc::clone(&clock),
+        peer_cmd_tx: Some(p2p_cmd_tx.clone()),
     };
     let protocol_handle = tokio::spawn(protocol.run(internal_tx.clone(), peer_gone_tx.clone()));
 
