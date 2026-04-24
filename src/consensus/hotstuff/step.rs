@@ -484,6 +484,18 @@ mod tests {
         ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
     }
 
+    /// Build a [`Signed<Vote>`] whose `sig` bytes are
+    /// `[sender[0]; 64]` — distinct per sender so tests can inspect
+    /// QC signature ordering if needed. The core doesn't verify
+    /// signatures; any byte pattern is accepted.
+    pub(crate) fn signed_vote(view: View, block_hash: BlockHash, sender: NodeId) -> Signed<Vote> {
+        Signed {
+            payload: Vote { view, block_hash },
+            signer: sender,
+            sig: [sender[0]; 64],
+        }
+    }
+
     /// Build an all-zero-signature [`Signed<Proposal>`] from `sender`.
     /// The safety core never verifies the envelope; the `sig` bytes
     /// are deliberately meaningless so tests stay deterministic.
@@ -1238,5 +1250,25 @@ mod tests {
         assert!(pending.contains_key(&block_v1.hash()));
         assert!(pending.contains_key(&block_v2.hash()));
         assert!(pending.contains_key(&block_v3.hash()));
+    }
+
+    // ── C1/C2: VoteReceived leader path ─────────────────────────────
+
+    #[test]
+    fn vote_dropped_when_not_leader_of_next_view() {
+        // self = nid(1). Vote at view 2 → next view = 3. Leader of
+        // view 3 = validators[3 % 4] = validators[3] = nid(4), not
+        // nid(1). The vote must be dropped silently — no bucket
+        // entry, no actions. C1a's cheapest branch.
+        let mut core = make_core(1);
+        let vote = signed_vote(2, [0xAA; 32], nid(2));
+
+        let actions = core.step(Event::VoteReceived(vote));
+
+        assert!(actions.is_empty(), "not-leader drops vote: {actions:?}");
+        assert!(
+            core.vote_bucket.is_empty(),
+            "bucket must not accumulate when we're not the leader",
+        );
     }
 }
