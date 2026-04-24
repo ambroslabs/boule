@@ -1360,6 +1360,56 @@ mod tests {
     }
 
     #[test]
+    fn post_quorum_votes_do_not_rebroadcast() {
+        // Form the QC with 3 votes as before, then feed two additional
+        // votes: (a) from `nid(1)` — a new signer not yet in the QC
+        // — and (b) a duplicate from `nid(2)` — already in the QC.
+        // Neither step may re-fire the `Broadcast(Proposal)` — C2's
+        // first-crosses-threshold gate already fired, and `has_quorum`
+        // stays true forever after.
+        //
+        // The bucket is intentionally not cleared on quorum, so these
+        // late deliveries land in it as idempotent sinks rather than
+        // re-materializing an empty QC and re-firing.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
+        let block_v3_hash = block_v3.hash();
+        core.state.insert_pending(block_v3.clone());
+
+        // Drive to quorum: first three votes.
+        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
+        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3))));
+        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4))));
+
+        // Late vote from a new signer — still a no-op at the dispatch
+        // surface even though the bucket grows to 4 sigs.
+        let step_late_new = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(1))));
+        assert!(
+            step_late_new.is_empty(),
+            "late vote from new signer must not re-broadcast: {step_late_new:?}",
+        );
+
+        // Duplicate vote from an existing signer — `add_signature` is
+        // a no-op on the set-bit; dispatch also early-returns.
+        let step_dup = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
+        assert!(
+            step_dup.is_empty(),
+            "duplicate vote must not re-broadcast: {step_dup:?}",
+        );
+
+        // Bucket should now carry all four validator signatures
+        // (added by nid(2), nid(3), nid(4), nid(1)), and still be at
+        // quorum. The duplicate didn't bump the count.
+        let bucket = core
+            .vote_bucket
+            .get(&(3, block_v3_hash))
+            .expect("bucket keyed by (3, block_v3_hash) must still exist");
+        assert_eq!(bucket.signer_count(), 4);
+        assert!(bucket.has_quorum(&core.state.validator_set));
+    }
+
+    #[test]
     fn vote_from_non_validator_signer_is_dropped() {
         // self = nid(1) is the leader of view 4 (4 % 4 = 0), so a
         // vote at view 3 would normally accumulate. But this vote
