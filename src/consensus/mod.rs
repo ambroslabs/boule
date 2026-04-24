@@ -30,10 +30,12 @@
 // Some items in sub-modules are consumed across PRs; allow until wired up.
 #![allow(dead_code)]
 
+pub mod dispatch;
 pub mod hotstuff;
 pub mod node;
 pub mod pacemaker;
 pub mod validator_set;
+pub mod view_timer;
 
 /// HotStuff view number.
 pub type View = u64;

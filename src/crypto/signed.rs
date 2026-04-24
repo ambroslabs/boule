@@ -131,7 +131,7 @@ where
     ///
     /// signed.verify(&signer.node_id()).unwrap();
     /// ```
-    pub fn sign<S: Signer>(payload: T, signer: &S) -> Result<Self> {
+    pub fn sign<S: Signer + ?Sized>(payload: T, signer: &S) -> Result<Self> {
         let bytes = preimage::<T>(&payload)?;
         let sig = signer.sign(&bytes);
         Ok(Self {
