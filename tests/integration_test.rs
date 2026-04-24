@@ -457,6 +457,223 @@ async fn test_ping_rpc_to_unknown_peer_fails() {
     assert_eq!(resp.status(), 504);
 }
 
+/// Regression test for #114. Spawns a full-mesh 4-node cluster where every
+/// node lists every other node as a `[[peers]]` entry — so every pair
+/// dials each other concurrently at startup and the tie-breaker at each
+/// manager has to resolve the resulting duplicate connections.
+///
+/// Pre-fix: the tie-breaker replace path fired a spurious `peer_gone` for
+/// every duplicate, which made the dialer redial immediately, producing
+/// an unending connect → tie-breaker → reconnect churn. Post-fix the mesh
+/// forms within seconds and stays stable.
+///
+/// The two-phase scheme (discover addresses → relaunch with full peer
+/// lists) is needed because every node must know every other node's
+/// `node_id` and listen port before it starts, which is a chicken-and-egg
+/// problem when ports are OS-assigned.
+#[tokio::test]
+async fn test_four_node_full_mesh_is_stable_under_simultaneous_dials() {
+    // Phase 1: spawn each node once with no peers so it generates its
+    // identity and binds a port. Capture the address + node_id, then
+    // shut it down — but keep the key file tempdir alive so phase 2 can
+    // reuse the same identity.
+    const N: usize = 4;
+    let key_dirs: Vec<tempfile::TempDir> =
+        (0..N).map(|_| tempfile::tempdir().unwrap()).collect();
+    let key_paths: Vec<String> = key_dirs
+        .iter()
+        .map(|d| d.path().join("node.key").to_str().unwrap().to_owned())
+        .collect();
+
+    let mut p2p_addrs: Vec<String> = Vec::with_capacity(N);
+    let mut node_ids: Vec<String> = Vec::with_capacity(N);
+    for key_path in &key_paths {
+        let info = launch_once_for_discovery(key_path).await;
+        p2p_addrs.push(info.p2p_addr);
+        node_ids.push(info.node_id);
+    }
+
+    // Phase 2: relaunch every node concurrently with the full peer list.
+    let mut guards: Vec<NodeGuard> = Vec::with_capacity(N);
+    for i in 0..N {
+        let peer_descs: Vec<PeerDesc<'_>> = (0..N)
+            .filter(|j| *j != i)
+            .map(|j| PeerDesc {
+                p2p_addr: &p2p_addrs[j],
+                node_id: &node_ids[j],
+            })
+            .collect();
+        guards.push(spawn_node_fixed_port(&key_paths[i], &p2p_addrs[i], &peer_descs).await);
+    }
+
+    let ready_timeout = Duration::from_secs(10);
+    for guard in &guards {
+        wait_until_ready(guard, ready_timeout).await;
+    }
+
+    // Every node must see every other node, within the 2s budget from the
+    // issue's acceptance criteria (after the last node starts).
+    let mesh_timeout = Duration::from_secs(10);
+    for guard in &guards {
+        wait_for_peer_count(guard, N - 1, mesh_timeout).await;
+    }
+
+    // Mesh is up. Watch it for 5s and assert every node keeps reporting
+    // (N - 1) peers continuously — no flapping.
+    let client = reqwest::Client::new();
+    let watch_end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < watch_end {
+        for guard in &guards {
+            let peers: Value = client
+                .get(guard.api_url("/peers"))
+                .send()
+                .await
+                .expect("/peers request failed")
+                .json()
+                .await
+                .expect("/peers returned non-JSON");
+            let count = peers.as_array().map(|a| a.len()).unwrap_or(0);
+            assert_eq!(
+                count,
+                N - 1,
+                "mesh flapped: node {} reported {} peers at t+{:?} (expected {}); churn from #114 has regressed",
+                guard.node_id,
+                count,
+                watch_end.saturating_duration_since(Instant::now()),
+                N - 1,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Keep key_dirs alive until end of test; NodeGuard drops shut nodes down
+    // first so we can then safely let the tempdirs clean up.
+    drop(guards);
+    drop(key_dirs);
+}
+
+struct DiscoveryInfo {
+    p2p_addr: String,
+    node_id: String,
+}
+
+/// Spawn a node with a persistent key file at `key_path`, wait for it to
+/// bind + write its addr file, capture p2p addr + node_id, and shut it
+/// down gracefully. The key file survives the shutdown so a subsequent
+/// spawn with the same path gets the same node_id.
+async fn launch_once_for_discovery(key_path: &str) -> DiscoveryInfo {
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+
+    let config = format!(
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n"
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let mut child = Command::new(bin)
+        .args(["--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn node binary");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let info = loop {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("discovery node did not write addr_file within 10s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break DiscoveryInfo {
+                    p2p_addr: addrs.p2p_addr,
+                    node_id: addrs.node_id,
+                };
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // Discovery-phase nodes have no peers, so nothing is gained by a
+    // graceful close. SIGKILL releases the port immediately and keeps the
+    // test's wall-clock short.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    info
+}
+
+/// Spawn a node whose P2P listener binds to `fixed_p2p_addr` (so phase 2
+/// reuses the address phase 1 discovered) and whose `[[peers]]` list is
+/// set from `peers`. The API listener still uses port 0.
+async fn spawn_node_fixed_port(
+    key_path: &str,
+    fixed_p2p_addr: &str,
+    peers: &[PeerDesc<'_>],
+) -> NodeGuard {
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+
+    let peer_lines: String = peers
+        .iter()
+        .map(|p| {
+            format!(
+                "\n[[peers]]\naddr = \"{}\"\nnode_id = \"{}\"\n",
+                p.p2p_addr, p.node_id
+            )
+        })
+        .collect();
+
+    let config = format!(
+        "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}"
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let child = Command::new(bin)
+        .args(["--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn node binary");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let addrs = loop {
+        if Instant::now() > deadline {
+            panic!("phase-2 node did not write addr_file within 10s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break addrs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    // The key_dir is owned by the test function (so the key survives the
+    // phase-1 shutdown); hand this guard a throwaway TempDir to keep the
+    // Drop invariant simple.
+    let placeholder_dir = tempfile::tempdir().unwrap();
+
+    NodeGuard {
+        child,
+        api_port,
+        p2p_addr: addrs.p2p_addr,
+        node_id: addrs.node_id,
+        _config: config_file,
+        _key_dir: placeholder_dir,
+        _addr_file: addr_file,
+    }
+}
+
 #[tokio::test]
 async fn test_peers_endpoint_lists_connected_peers() {
     let (node1, node2, node3) = start_cluster().await;

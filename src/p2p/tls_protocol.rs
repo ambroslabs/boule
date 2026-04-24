@@ -7,7 +7,7 @@ use super::dialer;
 use super::listener;
 use super::manager::ManagerMsg;
 use super::tls::{TlsIdentity, base58_to_node_id};
-use super::{ConnectionProtocol, NodeId};
+use super::{ConnectionProtocol, NodeId, PeerCommand};
 use crate::clock::Clock;
 use crate::config::PeerConfig;
 
@@ -16,6 +16,11 @@ pub struct TlsConnectionProtocol {
     pub peers: Vec<PeerConfig>,
     pub listener: TcpListener,
     pub clock: Arc<dyn Clock>,
+    /// Optional handle back into the peer manager's command channel so the
+    /// dialer can ask whether a peer is already connected before redialing
+    /// (see #114). `None` falls back to the old broadcast-only loop, which
+    /// the sim transport is fine with because it never redials.
+    pub peer_cmd_tx: Option<mpsc::Sender<PeerCommand>>,
 }
 
 impl ConnectionProtocol for TlsConnectionProtocol {
@@ -43,6 +48,7 @@ impl ConnectionProtocol for TlsConnectionProtocol {
                 Arc::clone(&self.identity),
                 manager_tx.clone(),
                 peer_gone_tx.clone(),
+                self.peer_cmd_tx.clone(),
                 Arc::clone(&self.clock),
             ));
         }
