@@ -2250,12 +2250,12 @@ mod tests {
         assert_eq!(decode_voted_view(&raw).unwrap(), 1);
         assert_eq!(node.core.state().last_voted_view, 1);
 
-        // Wire traffic: the proposal broadcast must have gone out; the
-        // vote SendTo goes to the next-view leader, which in the 4-node
-        // round-robin is validator_set[2] — that slot is a placeholder,
-        // not self, so we expect exactly one Broadcast and one SendTo.
-        let next_leader = *vs.get(2).unwrap();
-        assert_ne!(next_leader, node.self_id);
+        // Wire traffic: the proposal broadcast must have gone out, and
+        // the subsequent vote must also be broadcast (not SendTo) —
+        // #124 changed vote routing from point-to-point-to-next-leader
+        // to broadcast-and-let-every-replica-aggregate so that QC
+        // formation survives the next-view leader being crashed.
+        let _next_leader = *vs.get(2).unwrap();
 
         let first = send_rx
             .try_recv()
@@ -2264,16 +2264,11 @@ mod tests {
             matches!(first, ProtocolOutbound::Broadcast(_)),
             "first outbound must be the proposal broadcast"
         );
-        let second = send_rx
-            .try_recv()
-            .expect("SendTo(next_leader, Vote) must be sent");
-        match second {
-            ProtocolOutbound::SendTo { node_id, .. } => {
-                assert_eq!(node_id, next_leader);
-                assert_ne!(node_id, node.self_id, "self-vote must not reach the wire");
-            }
-            other => panic!("expected SendTo(next_leader, Vote), got {other:?}"),
-        }
+        let second = send_rx.try_recv().expect("Broadcast(Vote) must be sent");
+        assert!(
+            matches!(second, ProtocolOutbound::Broadcast(_)),
+            "second outbound must be the vote broadcast, got {second:?}",
+        );
         // No further traffic.
         assert!(send_rx.try_recv().is_err());
     }
@@ -2514,7 +2509,7 @@ mod tests {
                 "outbound_broadcast", // Proposal from become_leader(1)
                 "proposal_received",  // self-loopback into safety core
                 "persisted",          // VotedInView flushed before the vote
-                "outbound_send_to",   // Vote addressed to the next-view leader
+                "outbound_broadcast", // Vote broadcast to the cluster (#124)
             ],
         );
 
