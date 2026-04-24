@@ -205,9 +205,8 @@ impl HotStuffCore {
     pub fn step(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::ProposalReceived(signed) => self.on_proposal_received(signed),
-            Event::VoteReceived(_) | Event::NewViewReceived(_) | Event::PacemakerAdvance(_) => {
-                Vec::new()
-            }
+            Event::VoteReceived(signed) => self.on_vote_received(signed),
+            Event::NewViewReceived(_) | Event::PacemakerAdvance(_) => Vec::new(),
         }
     }
 
@@ -337,6 +336,88 @@ impl HotStuffCore {
             self.state
                 .pending_blocks
                 .retain(|_, b| b.header.height > commit_height);
+        }
+
+        actions
+    }
+
+    /// Handle an inbound [`Vote`]. Only meaningful to the leader of
+    /// `vote.view + 1`; other replicas drop. When the added partial
+    /// signature takes a bucket across quorum for the first time, the
+    /// leader adopts the freshly-formed QC as `high_qc` (emitting
+    /// `Persist(HighQc)`) and broadcasts a new [`Proposal`] that
+    /// carries the QC as its justify.
+    ///
+    /// Mirrors Algorithm 4's `onReceiveVote` (paper §6), with the
+    /// onBeat-triggered `onPropose` collapsed into the same step.
+    /// That collapse is acceptable for the safety core — the
+    /// integration layer (#24) can choose to batch proposals
+    /// application-side by queueing multiple votes before forwarding
+    /// to `step`.
+    fn on_vote_received(&mut self, signed: Signed<Vote>) -> Vec<Action> {
+        let vote = &signed.payload;
+
+        // C1a: only the leader of the next view cares about this vote.
+        // The QC this vote contributes to is the justify for that
+        // leader's next proposal.
+        let next_view = vote.view + 1;
+        if round_robin_leader(&self.state.validator_set, next_view) != self.self_id {
+            return Vec::new();
+        }
+
+        // C1b: the voter must be a known validator; otherwise we have
+        // no index into the `SignerBitmap`. A well-behaved integration
+        // layer already filters these in signature verification, but
+        // we repeat the check here for defence-in-depth against a
+        // replay or test-wiring bug.
+        let Some(voter_idx) = self.state.validator_set.index_of(&signed.signer) else {
+            return Vec::new();
+        };
+
+        // C1c: accumulate into the bucket for this `(view, block_hash)`
+        // pair. `QuorumCertificate::add_signature` is idempotent on
+        // the set-bit — duplicate votes from the same signer are
+        // no-ops.
+        let key = (vote.view, vote.block_hash);
+        let validator_set_len = self.state.validator_set.len();
+        let qc = self.vote_bucket.entry(key).or_insert_with(|| {
+            QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len)
+        });
+        let had_quorum = qc.has_quorum(&self.state.validator_set);
+        qc.add_signature(voter_idx, signed.sig);
+        let has_quorum_now = qc.has_quorum(&self.state.validator_set);
+
+        // C2: only fire on the transition from sub-quorum to quorum.
+        // Late votes arriving after the QC formed are absorbed
+        // silently: `add_signature` idempotently ignores set bits,
+        // `has_quorum` stays true, so this block is skipped.
+        if had_quorum || !has_quorum_now {
+            return Vec::new();
+        }
+
+        let formed = qc.clone();
+        let mut actions = Vec::new();
+
+        // Adopt as `high_qc` if strictly fresher, mirroring the
+        // `updateQCHigh(qc)` call at the end of `onReceiveVote`
+        // in the paper's Algorithm 4.
+        if should_update_high_qc(&formed, &self.state) {
+            self.state.high_qc = Some(formed.clone());
+            actions.push(Action::Persist(StateUpdate::HighQc(formed.clone())));
+        }
+
+        // Propose the next block if we have the parent on hand.
+        // In normal operation the leader also previously received
+        // the proposal for `block_hash`; edge cases where we don't
+        // have it (leader restart, etc.) safely skip the broadcast
+        // — the pacemaker handles the resulting view stall via its
+        // usual timeout path.
+        if let Some(parent) = self.state.pending_blocks.get(&formed.block_hash).cloned() {
+            let new_block = self.builder.build(&parent, next_view, &formed);
+            actions.push(Action::Broadcast(ConsensusMsg::Proposal(Proposal {
+                block: new_block,
+                justify: formed,
+            })));
         }
 
         actions
