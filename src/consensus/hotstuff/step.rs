@@ -1671,4 +1671,81 @@ mod tests {
             "parked entry removed after successful re-dispatch",
         );
     }
+
+    // ── D9: replay determinism ─────────────────────────────────────
+
+    #[test]
+    fn replay_is_deterministic_over_a_mixed_trace() {
+        // Two freshly-constructed cores fed the same event trace
+        // through `replay` must produce byte-identical outputs. This
+        // is the property the integration layer (#24) relies on to
+        // turn a failing sim trace into a reproducible regression,
+        // and the one the E-series property test will stress under
+        // arbitrary interleavings.
+        //
+        // The trace hits every dispatch branch: PacemakerAdvance,
+        // ProposalReceived, VoteReceived, NewViewReceived. It also
+        // drives a commit and a quorum-triggered broadcast, so the
+        // action vectors across steps vary in shape.
+        fn build_trace() -> Vec<Event> {
+            let genesis = Block::genesis([0; 32]);
+            let chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
+            let block_v1_hash = chain[0].hash();
+            let block_v2_hash = chain[1].hash();
+            let block_v3_hash = chain[2].hash();
+
+            vec![
+                Event::PacemakerAdvance(1),
+                Event::ProposalReceived(signed_proposal(
+                    chain[0].clone(),
+                    dummy_qc(0, genesis.hash()),
+                    nid(2),
+                )),
+                Event::ProposalReceived(signed_proposal(
+                    chain[1].clone(),
+                    dummy_qc(1, block_v1_hash),
+                    nid(2),
+                )),
+                Event::ProposalReceived(signed_proposal(
+                    chain[2].clone(),
+                    dummy_qc(2, block_v2_hash),
+                    nid(2),
+                )),
+                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))),
+                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3))),
+                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4))),
+                Event::NewViewReceived(signed_newview(dummy_qc(99, [0x99; 32]), nid(4))),
+                Event::PacemakerAdvance(100),
+            ]
+        }
+
+        let run1 = make_core(1).replay(build_trace());
+        let run2 = make_core(1).replay(build_trace());
+
+        assert_eq!(run1, run2, "replay must be deterministic for a fixed trace",);
+        assert_eq!(run1.len(), 9, "one action vector per event");
+
+        // Spot-checks so the test fails informatively if a future
+        // dispatch change widens or shrinks a step's output.
+        assert!(
+            run1[0].is_empty(),
+            "step 1 (PacemakerAdvance, no high_qc) emits nothing",
+        );
+        assert!(
+            run1[3].iter().any(|a| matches!(a, Action::Commit(_))),
+            "step 4 (third proposal) must emit Commit(genesis)",
+        );
+        assert!(
+            run1[6]
+                .iter()
+                .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_)))),
+            "step 7 (quorum fires) must broadcast a Proposal",
+        );
+        assert!(
+            run1[8]
+                .iter()
+                .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::NewView(_)))),
+            "step 9 (PacemakerAdvance) must broadcast NewView",
+        );
+    }
 }
