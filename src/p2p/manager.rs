@@ -252,13 +252,7 @@ fn register_connection(
     }
 
     let (write_tx, write_rx) = mpsc::channel::<Bytes>(64);
-    peers.insert(
-        peer_node_id,
-        PeerSlot {
-            conn_id,
-            write_tx,
-        },
-    );
+    peers.insert(peer_node_id, PeerSlot { conn_id, write_tx });
 
     // Only notify protocols on a fresh connection. Replacing the underlying
     // stream doesn't change the logical "is this peer reachable" answer, so
@@ -683,9 +677,9 @@ mod tests {
         // consistent.)
         match tokio::time::timeout(Duration::from_millis(50), h.event_rx.recv()).await {
             Err(_) => {}
-            Ok(Some(ev)) => panic!(
-                "replacement must not fan a protocol event out to handlers, got {ev:?}"
-            ),
+            Ok(Some(ev)) => {
+                panic!("replacement must not fan a protocol event out to handlers, got {ev:?}")
+            }
             Ok(None) => panic!("event channel closed unexpectedly"),
         }
 

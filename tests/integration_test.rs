@@ -478,8 +478,7 @@ async fn test_four_node_full_mesh_is_stable_under_simultaneous_dials() {
     // shut it down — but keep the key file tempdir alive so phase 2 can
     // reuse the same identity.
     const N: usize = 4;
-    let key_dirs: Vec<tempfile::TempDir> =
-        (0..N).map(|_| tempfile::tempdir().unwrap()).collect();
+    let key_dirs: Vec<tempfile::TempDir> = (0..N).map(|_| tempfile::tempdir().unwrap()).collect();
     let key_paths: Vec<String> = key_dirs
         .iter()
         .map(|d| d.path().join("node.key").to_str().unwrap().to_owned())
