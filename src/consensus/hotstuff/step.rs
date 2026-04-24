@@ -196,6 +196,22 @@ impl HotStuffCore {
         &self.state
     }
 
+    /// Iterate over the currently-accumulating vote buckets. Consumed
+    /// by [`crate::consensus::status`] to surface partial-QC progress
+    /// through the admin HTTP endpoint; never mutated from outside.
+    pub(crate) fn vote_buckets(
+        &self,
+    ) -> impl Iterator<Item = (&(View, BlockHash), &QuorumCertificate)> {
+        self.vote_bucket.iter()
+    }
+
+    /// Iterate over the currently-parked proposals (proposals whose
+    /// parent block has not yet arrived). Consumed by
+    /// [`crate::consensus::status`].
+    pub(crate) fn parked_proposals(&self) -> impl Iterator<Item = &Signed<Proposal>> {
+        self.parked_proposals.values()
+    }
+
     /// Insert a block into `pending_blocks` directly.
     ///
     /// Used by the integration layer when a `BlockResponse` arrives for

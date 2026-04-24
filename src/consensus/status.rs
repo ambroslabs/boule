@@ -1,0 +1,287 @@
+//! Read-only snapshot of consensus-internal state for the
+//! `GET /consensus/status` HTTP endpoint.
+//!
+//! # Shape and purpose
+//!
+//! The snapshot is a plain-data struct that captures the fields a human
+//! operator needs to answer the common "what is this node doing right
+//! now?" questions during testnet debugging:
+//!
+//! - Which view is the node in? Is it the current leader?
+//! - What is the highest QC / lock the node has observed?
+//! - Are vote-buckets or timeout-buckets close to quorum?
+//! - Is there a proposal parked waiting for a missing parent?
+//! - Which peers does the consensus layer currently talk to?
+//!
+//! # Encoding conventions
+//!
+//! - **Block hashes** are hex-encoded (32 bytes → 64 hex chars). Block
+//!   hashes are content digests, not identities, so hex (a stable
+//!   byte-for-byte representation) is the right choice. Base58 is
+//!   reserved for [`NodeId`](crate::p2p::NodeId).
+//! - **NodeIds** are base58, matching
+//!   [`crate::p2p::tls::node_id_to_base58`] — the convention used
+//!   everywhere else the node surfaces a NodeId (logs, `/peers`).
+//!
+//! # Publication model
+//!
+//! [`ConsensusNode`](crate::consensus::node::ConsensusNode) builds a
+//! fresh [`ConsensusStatus`] at the end of each event-loop iteration
+//! and publishes it through a [`tokio::sync::watch`] channel. The HTTP
+//! handler holds the receiver and returns the latest value; this is a
+//! snapshot-and-publish pattern with zero hot-path contention. If the
+//! event loop hasn't ticked yet, the initial value published at startup
+//! is returned (all counters zero).
+
+use serde::{Deserialize, Serialize};
+
+/// The `locked` block (HotStuff two-chain lock) as of the snapshot
+/// instant. See [`crate::consensus::hotstuff::state::Locked`] for the
+/// safety-core representation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockedStatus {
+    pub view: u64,
+    pub height: u64,
+    /// 32-byte block hash, hex-encoded.
+    pub block_hash: String,
+}
+
+/// Summary of the highest-view QC the node has observed. `height` is
+/// looked up in `pending_blocks` and may be `None` for a QC whose
+/// block is no longer retained (post-commit pruning — a future
+/// enhancement).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QcStatus {
+    pub view: u64,
+    pub height: Option<u64>,
+    /// 32-byte block hash, hex-encoded.
+    pub block_hash: String,
+}
+
+/// Partial QC the leader is accumulating. `signers` is the current
+/// distinct-signer count; `quorum` is the threshold needed to seal the
+/// QC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteBucketStatus {
+    pub view: u64,
+    /// 32-byte block hash the votes in this bucket are for, hex-encoded.
+    pub block_hash: String,
+    pub signers: usize,
+    pub quorum: usize,
+}
+
+/// Partial timeout certificate. Same "signers / quorum" shape as
+/// [`VoteBucketStatus`] but keyed only by view (timeout votes are not
+/// tied to a specific block).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutBucketStatus {
+    pub view: u64,
+    pub signers: usize,
+    pub quorum: usize,
+}
+
+/// A proposal the safety core is holding onto while it waits for the
+/// parent block to arrive via the block-sync sub-protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedProposalStatus {
+    /// 32-byte hash of the proposal's own block, hex-encoded.
+    pub block_hash: String,
+    /// 32-byte hash of the missing parent, hex-encoded.
+    pub parent_hash: String,
+    pub view: u64,
+}
+
+/// A snapshot of a consensus node's live state, returned by
+/// `GET /consensus/status`.
+///
+/// Fields are public so callers can match against specific paths in
+/// tests. Serialization is driven by `serde`; the JSON shape is the
+/// public contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsensusStatus {
+    /// This node's base58-encoded [`NodeId`](crate::p2p::NodeId).
+    pub node_id: String,
+    /// `"leader(view=N)"` when this node is the round-robin leader for
+    /// the current view; otherwise `"replica"`.
+    pub self_role: String,
+    pub current_view: u64,
+    pub last_voted_view: u64,
+    pub last_committed_height: u64,
+    pub last_committed_view: u64,
+    pub locked: Option<LockedStatus>,
+    pub high_qc: Option<QcStatus>,
+    /// Vote buckets whose view falls within `current_view ± 4`. The
+    /// bound keeps the payload small under a Byzantine flood of
+    /// future-view votes.
+    pub vote_buckets: Vec<VoteBucketStatus>,
+    /// Timeout-vote buckets within `current_view ± 4`.
+    pub timeout_buckets: Vec<TimeoutBucketStatus>,
+    pub parked_proposals: Vec<ParkedProposalStatus>,
+    pub pending_blocks_count: usize,
+    /// Consensus-layer view of connected peers (not the raw p2p
+    /// manager's peer map). Base58-encoded [`NodeId`](crate::p2p::NodeId)s.
+    pub peers_connected: Vec<String>,
+    /// Every validator in the committee, base58-encoded and sorted in
+    /// the order used for round-robin leader rotation.
+    pub validator_set: Vec<String>,
+    pub mempool_size: usize,
+}
+
+/// How far on either side of `current_view` to include in the bucket
+/// summaries. Kept module-public so the node builder and the unit tests
+/// agree.
+pub(crate) const BUCKET_VIEW_WINDOW: u64 = 4;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_status() -> ConsensusStatus {
+        ConsensusStatus {
+            node_id: "DmX44PdK8JNVZUkbLTpD3W5ngmVnWBGyYrmFhh2Mkdb4".to_string(),
+            self_role: "leader(view=157)".to_string(),
+            current_view: 157,
+            last_voted_view: 156,
+            last_committed_height: 156,
+            last_committed_view: 157,
+            locked: Some(LockedStatus {
+                view: 155,
+                height: 154,
+                block_hash: "aa".repeat(32),
+            }),
+            high_qc: Some(QcStatus {
+                view: 156,
+                height: Some(155),
+                block_hash: "bb".repeat(32),
+            }),
+            vote_buckets: vec![VoteBucketStatus {
+                view: 158,
+                block_hash: "cc".repeat(32),
+                signers: 2,
+                quorum: 3,
+            }],
+            timeout_buckets: vec![TimeoutBucketStatus {
+                view: 159,
+                signers: 1,
+                quorum: 3,
+            }],
+            parked_proposals: vec![ParkedProposalStatus {
+                block_hash: "dd".repeat(32),
+                parent_hash: "ee".repeat(32),
+                view: 158,
+            }],
+            pending_blocks_count: 3,
+            peers_connected: vec![
+                "B3CRZ1KHU3cvFUPbPtWq8v9aaqC6eexaQqqjMrDrXgNX".to_string(),
+                "BHx4E18joU7w95zGkJwuCJ6RY8HMZC394aezTXTES5yA".to_string(),
+            ],
+            validator_set: vec![
+                "B3CRZ1KHU3cvFUPbPtWq8v9aaqC6eexaQqqjMrDrXgNX".to_string(),
+                "BHx4E18joU7w95zGkJwuCJ6RY8HMZC394aezTXTES5yA".to_string(),
+                "DmX44PdK8JNVZUkbLTpD3W5ngmVnWBGyYrmFhh2Mkdb4".to_string(),
+            ],
+            mempool_size: 0,
+        }
+    }
+
+    #[test]
+    fn serializes_to_json_with_expected_key_paths() {
+        let status = sample_status();
+        let json = serde_json::to_value(&status).unwrap();
+
+        // Top-level scalar fields.
+        assert_eq!(json["node_id"], "DmX44PdK8JNVZUkbLTpD3W5ngmVnWBGyYrmFhh2Mkdb4");
+        assert_eq!(json["self_role"], "leader(view=157)");
+        assert_eq!(json["current_view"], 157);
+        assert_eq!(json["last_voted_view"], 156);
+        assert_eq!(json["last_committed_height"], 156);
+        assert_eq!(json["last_committed_view"], 157);
+        assert_eq!(json["pending_blocks_count"], 3);
+        assert_eq!(json["mempool_size"], 0);
+
+        // Nested `locked`.
+        assert_eq!(json["locked"]["view"], 155);
+        assert_eq!(json["locked"]["height"], 154);
+        assert_eq!(json["locked"]["block_hash"], "aa".repeat(32));
+
+        // Nested `high_qc`.
+        assert_eq!(json["high_qc"]["view"], 156);
+        assert_eq!(json["high_qc"]["height"], 155);
+        assert_eq!(json["high_qc"]["block_hash"], "bb".repeat(32));
+
+        // Bucket arrays.
+        assert_eq!(json["vote_buckets"][0]["view"], 158);
+        assert_eq!(json["vote_buckets"][0]["signers"], 2);
+        assert_eq!(json["vote_buckets"][0]["quorum"], 3);
+
+        assert_eq!(json["timeout_buckets"][0]["view"], 159);
+        assert_eq!(json["timeout_buckets"][0]["signers"], 1);
+
+        assert_eq!(json["parked_proposals"][0]["view"], 158);
+        assert_eq!(json["parked_proposals"][0]["block_hash"], "dd".repeat(32));
+
+        // Peers + validator set.
+        assert_eq!(json["peers_connected"].as_array().unwrap().len(), 2);
+        assert_eq!(json["validator_set"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn block_hashes_are_64_hex_chars() {
+        // Guard against accidental base58 / base64 encoding of block hashes.
+        let status = sample_status();
+        let json = serde_json::to_value(&status).unwrap();
+        let hash = json["locked"]["block_hash"].as_str().unwrap();
+        assert_eq!(hash.len(), 64);
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "block_hash must be hex: {hash}",
+        );
+    }
+
+    #[test]
+    fn roundtrips_through_json() {
+        let status = sample_status();
+        let bytes = serde_json::to_vec(&status).unwrap();
+        let decoded: ConsensusStatus = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn optional_fields_serialize_as_null_when_absent() {
+        let mut s = sample_status();
+        s.locked = None;
+        s.high_qc = None;
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json["locked"].is_null());
+        assert!(json["high_qc"].is_null());
+    }
+
+    #[test]
+    fn initial_zeroed_snapshot_serializes() {
+        // The status published before the event loop ticks must be
+        // serializable as-is, so the endpoint never 500s in the
+        // "just-booted" window the integration test cares about.
+        let s = ConsensusStatus {
+            node_id: String::new(),
+            self_role: "replica".to_string(),
+            current_view: 0,
+            last_voted_view: 0,
+            last_committed_height: 0,
+            last_committed_view: 0,
+            locked: None,
+            high_qc: None,
+            vote_buckets: Vec::new(),
+            timeout_buckets: Vec::new(),
+            parked_proposals: Vec::new(),
+            pending_blocks_count: 0,
+            peers_connected: Vec::new(),
+            validator_set: Vec::new(),
+            mempool_size: 0,
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["current_view"], 0);
+        assert_eq!(json["last_committed_height"], 0);
+        assert!(json["locked"].is_null());
+        assert!(json["vote_buckets"].as_array().unwrap().is_empty());
+    }
+}

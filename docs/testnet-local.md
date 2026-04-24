@@ -288,6 +288,36 @@ Restart each node in the same order. Logs now include
 > value and make sure every replica uses the same one, or they will
 > disagree on the genesis block and refuse to make progress.
 
+### Inspect live consensus state
+
+With `[consensus]` enabled, each node serves
+`GET /consensus/status`. It returns a JSON snapshot of the consensus
+node's current view, the locked/high QC it holds, any partial vote or
+timeout buckets, parked proposals, and the connected peer set. The
+snapshot is published once per event-loop iteration, so reads are
+cheap and never contend with the hot path.
+
+```sh
+curl -s http://127.0.0.1:8000/consensus/status | jq
+curl -s http://127.0.0.1:8001/consensus/status | jq
+curl -s http://127.0.0.1:8002/consensus/status | jq
+```
+
+On a healthy cluster each node reports `last_committed_height` > 0
+and `current_view` > 0 within a few seconds of startup, and
+`peers_connected` mirrors the validator set minus self. The field
+`self_role` reads `"leader(view=N)"` on whichever node is the round-
+robin proposer for the current view, and `"replica"` on everyone
+else.
+
+If a cluster is wedged, `/consensus/status` replaces the usual
+grepping routine: a node stuck with `last_committed_height` unchanged
+while `current_view` keeps advancing means liveness without progress
+(look at `timeout_buckets`); a node with a growing `parked_proposals`
+list is missing a parent block in its block-sync path. A gossip-only
+node (no `[consensus]` section) returns `404 Not Found` here, which
+is a useful one-liner check for whether consensus is configured.
+
 ---
 
 ## 9. Shut down and clean up
@@ -341,6 +371,7 @@ curl -s -X POST http://127.0.0.1:8000/messages \
 curl -s -X POST http://127.0.0.1:8000/rpc/ping/<peer-node-id> \
      -H 'content-type: application/json' \
      -d '{"payload":"ping"}'
+curl -s http://127.0.0.1:8000/consensus/status | jq  # only when [consensus] is enabled
 ```
 
 For deeper reading: `cargo doc --document-private-items --open` renders
