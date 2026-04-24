@@ -2040,5 +2040,43 @@ mod tests {
                 );
             }
         }
+
+        // ── E3 (honest-only slice) ──────────────────────────────────
+        //
+        // Randomize the delivery schedule: at each step, pick which
+        // replica gets to drain one event from its inbox. Unlike the
+        // strict round-robin above, this exercises arbitrary
+        // interleavings of inter-replica messages — including
+        // pathological skews like "replica 0 drains ten events
+        // before anyone else delivers once".
+        //
+        // With no Byzantine replicas the invariant holds trivially
+        // (safety rests on the cores themselves, which we've already
+        // unit-tested to death). The point of this proptest is to
+        // stress the harness: if `apply_actions` has an ordering
+        // bug, or if the cores carry implicit schedule-dependent
+        // state, the invariant will fail under some seed. PR β
+        // extends this with Byzantine event generators; this PR
+        // ships the plumbing first so that β's failures are
+        // unambiguously Byzantine-driven rather than harness-driven.
+
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn honest_replicas_never_conflict_under_random_delivery(
+                schedule in proptest::collection::vec(0usize..4, 1..=200),
+            ) {
+                let mut replicas = ReplicaSet::new(4);
+                let kickoff = kickoff_proposal(&replicas);
+                replicas.inject_all(Event::ProposalReceived(kickoff));
+
+                for replica in schedule {
+                    replicas.deliver_one(replica);
+                }
+
+                assert_no_conflicting_commits(&replicas);
+            }
+        }
     }
 }
