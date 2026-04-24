@@ -2,18 +2,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 use ambros_p2p::clock::{Clock, TokioClock};
-use ambros_p2p::config::{self, IdentityConfig, NodeConfig};
+use ambros_p2p::config::{self, ConsensusConfig, IdentityConfig, NodeConfig};
+use ambros_p2p::consensus::node::{ConsensusNode, NodeConfigForConsensus};
+use ambros_p2p::consensus::validator_set::ValidatorSet;
+use ambros_p2p::crypto::signed::NodeSigner;
 use ambros_p2p::gossip;
 use ambros_p2p::p2p::manager::ManagerMsg;
-use ambros_p2p::p2p::tls::{TlsIdentity, node_id_to_base58};
+use ambros_p2p::p2p::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
 use ambros_p2p::p2p::tls_protocol::TlsConnectionProtocol;
 use ambros_p2p::p2p::{self, ConnectionProtocol};
 use ambros_p2p::ping;
+use ambros_p2p::replication::block::Block;
+use ambros_p2p::replication::impls::{CounterStateMachine, InMemoryMempool};
+use ambros_p2p::replication::state_machine::StateMachine;
+use ambros_p2p::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
 
 const ENV_PRODUCTION: &str = "AMBROS_ENV";
 const DEFAULT_KEY_FILE: &str = "node.key";
@@ -166,7 +174,10 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let provider = config::build_provider(&identity_cfg)?;
     let node_identity = provider.load_or_init()?;
     let identity = Arc::new(TlsIdentity::from_identity(&node_identity)?);
-    // Drop the raw key material from this scope; TlsIdentity now owns what it needs.
+    // Build the consensus signer here as well so we can drop the raw
+    // key material from this scope; both `TlsIdentity` and `NodeSigner`
+    // now hold their own internal copies of the parsed key.
+    let consensus_signer = Arc::new(NodeSigner::from_identity(&node_identity)?);
     drop(node_identity);
 
     info!("node ID: {}", node_id_to_base58(&identity.node_id));
@@ -219,6 +230,18 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let ping_rpc = p2p::rpc::RpcBuilder::new()
         .handler(ping::METHOD_PING, ping::echo)
         .spawn(ping_handle, Arc::clone(&clock));
+
+    // Optionally start consensus. The protocol is registered, the
+    // ConsensusNode is constructed (with disk storage if configured,
+    // otherwise in-memory) and its `run` loop is spawned. A oneshot
+    // shutdown sender is kept so we can stop the loop gracefully on
+    // ctrl-c.
+    let consensus_runtime = if let Some(cons_cfg) = config.consensus.as_ref() {
+        Some(start_consensus(cons_cfg, &p2p_cmd_tx, &identity.node_id, &consensus_signer).await?)
+    } else {
+        info!("consensus: disabled (no [consensus] section in config)");
+        None
+    };
 
     let cleanup_handle = {
         let store = Arc::clone(&store);
@@ -276,16 +299,155 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let _ = shutdown_tx.send(true);
     drop(p2p_cmd_tx);
 
+    // Signal the consensus loop to exit before awaiting joins below.
+    let consensus_join = consensus_runtime.map(|(handle, sd)| {
+        let _ = sd.send(());
+        handle
+    });
+
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = manager_handle.await;
         let _ = engine_handle.await;
         let _ = cleanup_handle.await;
         let _ = api_handle.await;
         let _ = protocol_handle.await;
+        if let Some(h) = consensus_join {
+            let _ = h.await;
+        }
     })
     .await;
 
     Ok(())
+}
+
+// ── Consensus wiring ────────────────────────────────────────────────────────
+
+/// Start the HotStuff consensus protocol alongside gossip + ping.
+///
+/// Returns the run-loop join handle and the oneshot shutdown sender; the
+/// caller fires the sender on ctrl-c and awaits the handle for graceful
+/// exit.
+async fn start_consensus(
+    cons_cfg: &ConsensusConfig,
+    p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
+    self_id: &NodeId,
+    signer: &Arc<NodeSigner>,
+) -> anyhow::Result<(
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    oneshot::Sender<()>,
+)> {
+    let validator_set = build_validator_set(cons_cfg, self_id)?;
+    info!(
+        "consensus: validator_set has {} members",
+        validator_set.len()
+    );
+
+    let genesis = build_genesis(cons_cfg)?;
+    info!("consensus: genesis hash = {:?}", genesis.hash());
+
+    let (storage, wal): (Arc<dyn Storage>, Arc<dyn Wal>) = match &cons_cfg.storage_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                anyhow::anyhow!("creating consensus storage_dir {}: {e}", dir.display())
+            })?;
+            let storage = Arc::new(DiskStorage::open(dir.join("kv.redb"))?);
+            let wal = Arc::new(DiskWal::open(dir.join("wal.redb"))?);
+            info!("consensus: durable storage at {}", dir.display());
+            (storage, wal)
+        }
+        None => {
+            warn!("consensus: storage_dir unset — using in-memory storage (no crash recovery)");
+            (Arc::new(MemoryStorage::new()), Arc::new(MemoryWal::new()))
+        }
+    };
+
+    let node_cfg = NodeConfigForConsensus {
+        validator_set,
+        genesis,
+        propose_limit: cons_cfg.propose_limit,
+        timeout_base: Duration::from_millis(cons_cfg.timeout_base_ms),
+        timeout_max: Duration::from_millis(cons_cfg.timeout_max_ms),
+    };
+
+    let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
+        Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+    let mempool = Arc::new(InMemoryMempool::new(1024));
+
+    // Register the consensus protocol with the multiplexer and obtain the
+    // ProtocolHandle that the ConsensusNode reads/writes through.
+    let (reg_tx, reg_rx) = oneshot::channel();
+    p2p_cmd_tx
+        .send(p2p::PeerCommand::RegisterProtocol {
+            id: ambros_p2p::consensus::node::PROTOCOL_ID,
+            max_frame_bytes: Some(ambros_p2p::consensus::node::MAX_FRAME_BYTES),
+            reply: reg_tx,
+        })
+        .await?;
+    let consensus_handle = reg_rx.await?;
+
+    let node = ConsensusNode::recover(*self_id, node_cfg, state_machine, mempool, storage, wal)?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let signer = Arc::clone(signer) as Arc<dyn ambros_p2p::crypto::signed::Signer>;
+    let join = tokio::spawn(async move { node.run(consensus_handle, signer, shutdown_rx).await });
+    info!("consensus: event loop spawned");
+    Ok((join, shutdown_tx))
+}
+
+/// Build a [`ValidatorSet`] from base58-encoded NodeIds in the config,
+/// validating that this node's own ID is present.
+fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Result<ValidatorSet> {
+    if cfg.validators.is_empty() {
+        anyhow::bail!("[consensus.validators] must list at least one node");
+    }
+    let mut ids: Vec<NodeId> = Vec::with_capacity(cfg.validators.len());
+    for raw in &cfg.validators {
+        let id = base58_to_node_id(raw)
+            .map_err(|e| anyhow::anyhow!("decoding validator NodeId {raw:?}: {e}"))?;
+        ids.push(id);
+    }
+    if !ids.iter().any(|id| id == self_id) {
+        anyhow::bail!(
+            "[consensus.validators] does not include this node's own ID {}",
+            node_id_to_base58(self_id),
+        );
+    }
+    Ok(ValidatorSet::new(ids))
+}
+
+/// Build the genesis block from the optional `genesis_seed_hex` config
+/// field. Defaults to all-zeros when unset.
+fn build_genesis(cfg: &ConsensusConfig) -> anyhow::Result<Block> {
+    let mut seed = [0u8; 32];
+    if let Some(hex) = &cfg.genesis_seed_hex {
+        let bytes = decode_hex32(hex)
+            .ok_or_else(|| anyhow::anyhow!("genesis_seed_hex must be 64 hex chars (32 bytes)"))?;
+        seed = bytes;
+    }
+    Ok(Block::genesis(seed))
+}
+
+/// Decode 64 hex chars into 32 bytes; returns `None` on any error.
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let hi = hex_nibble(s.as_bytes()[2 * i])?;
+        let lo = hex_nibble(s.as_bytes()[2 * i + 1])?;
+        *byte = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ── `key` subcommand ────────────────────────────────────────────────────────
