@@ -29,8 +29,10 @@
 //! [`SimCluster::partition_node`] / [`heal_node`] toggle a shared
 //! "partitioned" set that the routing tasks check before forwarding any
 //! frame; a partitioned node neither sends nor receives. [`kill_node`]
-//! sends a shutdown signal to the node's run loop, permanently stopping
-//! it for that slot.
+//! sends a shutdown signal to the node's run loop, permanently removes
+//! the killed peer from routing, and dispatches `PeerDisconnected` to
+//! every surviving node — matching the production peer-crash semantics
+//! established by `src/p2p/manager.rs` when a TLS peer drops.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -78,6 +80,15 @@ pub struct SimCluster {
     /// neither node is in the global partition set. Used to simulate
     /// one-way faults (e.g. vote-withholding without full isolation).
     pub link_cuts: Arc<Mutex<HashSet<LinkCut>>>,
+    /// Set of permanently killed nodes. Routing tasks drop every frame
+    /// targeting a dead node (matching production, where the TLS peer
+    /// is absent from `manager.rs`'s `peers` map). Unlike `partitioned`
+    /// this set is append-only — `kill_node` is irreversible.
+    pub dead_nodes: Arc<Mutex<HashSet<NodeId>>>,
+    /// Inbound event senders, one per node, shared with the routing
+    /// tasks. `kill_node` uses this map to dispatch `PeerDisconnected`
+    /// to every survivor at kill time.
+    event_txs: Arc<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>,
     /// Shutdown senders; `None` after `kill_node` has been called for that slot.
     shutdown_txs: Vec<Option<oneshot::Sender<()>>>,
 }
@@ -117,6 +128,10 @@ impl SimCluster {
         let partitioned: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
         // Directed link cuts: messages from `src` to `dst` are dropped.
         let link_cuts: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
+        // Shared dead-node set: routing tasks drop every frame targeting
+        // a dead node and also short-circuit outbound frames from a node
+        // that has already been killed.
+        let dead_nodes: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
 
         // Per-node event channel: routing tasks write here; each node's
         // run() loop reads from its receiver.
@@ -162,69 +177,14 @@ impl SimCluster {
             let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
             let handle = ProtocolHandle { send_tx, event_rx };
 
-            // Routing task: translate each outbound frame into inbound events
-            // on the target node(s), honouring the partition set.
-            //
-            // Self-delivery is suppressed in both broadcast and send-to
-            // paths so the sim matches the production p2p semantics
-            // (`src/p2p/manager.rs`). The integration layer now loops
-            // self-addressed consensus actions back into the local
-            // safety core inside `ConsensusNode::apply_safety_actions`;
-            // duplicating the delivery here would double-feed the core
-            // and hide regressions of that loopback.
-            let route_txs = Arc::clone(&event_txs);
-            let part = Arc::clone(&partitioned);
-            let cuts = Arc::clone(&link_cuts);
-            let my_id = nid;
-            tokio::spawn(async move {
-                let mut send_rx = send_rx;
-                while let Some(outbound) = send_rx.recv().await {
-                    if part.lock().contains(&my_id) {
-                        // This node is partitioned — drop all outbound frames.
-                        continue;
-                    }
-                    match outbound {
-                        ProtocolOutbound::Broadcast(payload) => {
-                            for (target, tx) in route_txs.iter() {
-                                if *target == my_id {
-                                    continue;
-                                }
-                                if part.lock().contains(target) {
-                                    continue;
-                                }
-                                if cuts.lock().contains(&(my_id, *target)) {
-                                    continue;
-                                }
-                                let _ = tx
-                                    .send(ProtocolEvent::Message {
-                                        from: my_id,
-                                        payload: payload.clone(),
-                                    })
-                                    .await;
-                            }
-                        }
-                        ProtocolOutbound::SendTo { node_id, payload } => {
-                            if node_id == my_id {
-                                continue;
-                            }
-                            if part.lock().contains(&node_id) {
-                                continue;
-                            }
-                            if cuts.lock().contains(&(my_id, node_id)) {
-                                continue;
-                            }
-                            if let Some(tx) = route_txs.get(&node_id) {
-                                let _ = tx
-                                    .send(ProtocolEvent::Message {
-                                        from: my_id,
-                                        payload,
-                                    })
-                                    .await;
-                            }
-                        }
-                    }
-                }
-            });
+            spawn_route_task(
+                nid,
+                send_rx,
+                Arc::clone(&event_txs),
+                Arc::clone(&partitioned),
+                Arc::clone(&link_cuts),
+                Arc::clone(&dead_nodes),
+            );
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             shutdown_txs.push(Some(shutdown_tx));
@@ -239,6 +199,8 @@ impl SimCluster {
             node_ids,
             partitioned,
             link_cuts,
+            dead_nodes,
+            event_txs,
             shutdown_txs,
         }
     }
@@ -256,11 +218,68 @@ impl SimCluster {
         self.partitioned.lock().remove(&self.node_ids[idx]);
     }
 
-    /// Send a shutdown signal to node `idx`, stopping its event loop.
-    /// Subsequent calls for the same `idx` are no-ops.
+    /// Permanently kill node `idx`, matching the production peer-crash
+    /// semantics established by `src/p2p/manager.rs`:
+    ///
+    /// 1. Signals shutdown to the node's run loop (stopping its event loop).
+    /// 2. Inserts the killed peer into `dead_nodes` so subsequent
+    ///    `Broadcast` / `SendTo` from live nodes are dropped by the
+    ///    routing tasks (the killed node's mailbox is never written
+    ///    again after this call returns).
+    /// 3. Fans out `ProtocolEvent::PeerDisconnected { node_id: killed_id }`
+    ///    to every surviving node's inbound `event_rx`, iterating in
+    ///    sorted-[`NodeId`] order for deterministic replay.
+    ///
+    /// Fan-out is fire-and-forget via `try_send`: if a survivor's
+    /// inbound channel is full we log and continue rather than block
+    /// the kill.
+    ///
+    /// Contrast with [`partition_node`]: partitioning keeps the node
+    /// alive but cuts its wire (and is reversible via [`heal_node`]),
+    /// while kill is permanent and the node's run loop exits.
+    ///
+    /// Subsequent calls for the same `idx` are no-ops (gated by
+    /// `shutdown_txs[idx].take()`), so `PeerDisconnected` is dispatched
+    /// exactly once per kill.
+    ///
+    /// [`partition_node`]: SimCluster::partition_node
+    /// [`heal_node`]: SimCluster::heal_node
     pub fn kill_node(&mut self, idx: usize) {
-        if let Some(tx) = self.shutdown_txs[idx].take() {
-            let _ = tx.send(());
+        let Some(tx) = self.shutdown_txs[idx].take() else {
+            return;
+        };
+        let killed = self.node_ids[idx];
+
+        // Mark dead BEFORE signalling shutdown so any frame that races
+        // through the routing task between now and the run loop's exit
+        // is consistently dropped under the new dead-node semantics.
+        self.dead_nodes.lock().insert(killed);
+        let _ = tx.send(());
+
+        // Fan out `PeerDisconnected` to every surviving node. Iterate
+        // `node_ids` (sorted ascending) rather than the `HashMap` so
+        // delivery order is deterministic across runs — `sim_adversary`
+        // and proptest suites rely on byte-identical traces under the
+        // same seed.
+        for &nid in &self.node_ids {
+            if nid == killed {
+                continue;
+            }
+            let Some(event_tx) = self.event_txs.get(&nid) else {
+                continue;
+            };
+            if event_tx
+                .try_send(ProtocolEvent::PeerDisconnected { node_id: killed })
+                .is_err()
+            {
+                // Fire-and-forget: the survivor's mailbox is full or
+                // its receiver is closed. Log and continue — don't
+                // block the kill on a slow survivor.
+                tracing::warn!(
+                    "sim: failed to dispatch PeerDisconnected({killed:?}) to survivor {nid:?}: \
+                     channel full or closed",
+                );
+            }
         }
     }
 
@@ -313,6 +332,86 @@ impl Drop for SimCluster {
     }
 }
 
+/// Spawn the per-node routing task that translates each outbound frame
+/// from `send_rx` into inbound [`ProtocolEvent::Message`]s on the target
+/// node(s), honouring the `partitioned`, `link_cuts`, and `dead_nodes`
+/// fault-injection sets.
+///
+/// Self-delivery is suppressed in both broadcast and send-to paths so
+/// the sim matches the production p2p semantics (`src/p2p/manager.rs`).
+/// The integration layer loops self-addressed consensus actions back
+/// into the local safety core inside
+/// `ConsensusNode::apply_safety_actions`; duplicating the delivery here
+/// would double-feed the core and hide regressions of that loopback.
+fn spawn_route_task(
+    my_id: NodeId,
+    mut send_rx: mpsc::Receiver<ProtocolOutbound>,
+    route_txs: Arc<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>,
+    partitioned: Arc<Mutex<HashSet<NodeId>>>,
+    link_cuts: Arc<Mutex<HashSet<LinkCut>>>,
+    dead_nodes: Arc<Mutex<HashSet<NodeId>>>,
+) {
+    tokio::spawn(async move {
+        while let Some(outbound) = send_rx.recv().await {
+            if partitioned.lock().contains(&my_id) {
+                // This node is partitioned — drop all outbound frames.
+                continue;
+            }
+            if dead_nodes.lock().contains(&my_id) {
+                // This node has been killed — drop any in-flight outbound
+                // that was queued before shutdown took effect.
+                continue;
+            }
+            match outbound {
+                ProtocolOutbound::Broadcast(payload) => {
+                    for (target, tx) in route_txs.iter() {
+                        if *target == my_id {
+                            continue;
+                        }
+                        if partitioned.lock().contains(target) {
+                            continue;
+                        }
+                        if dead_nodes.lock().contains(target) {
+                            continue;
+                        }
+                        if link_cuts.lock().contains(&(my_id, *target)) {
+                            continue;
+                        }
+                        let _ = tx
+                            .send(ProtocolEvent::Message {
+                                from: my_id,
+                                payload: payload.clone(),
+                            })
+                            .await;
+                    }
+                }
+                ProtocolOutbound::SendTo { node_id, payload } => {
+                    if node_id == my_id {
+                        continue;
+                    }
+                    if partitioned.lock().contains(&node_id) {
+                        continue;
+                    }
+                    if dead_nodes.lock().contains(&node_id) {
+                        continue;
+                    }
+                    if link_cuts.lock().contains(&(my_id, node_id)) {
+                        continue;
+                    }
+                    if let Some(tx) = route_txs.get(&node_id) {
+                        let _ = tx
+                            .send(ProtocolEvent::Message {
+                                from: my_id,
+                                payload,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Produce a fresh [`NodeSigner`] from a newly-generated Ed25519 key pair.
 fn fresh_signer() -> NodeSigner {
     let kp = RcgenKeyPair::generate_for(&PKCS_ED25519).unwrap();
@@ -343,11 +442,111 @@ fn assert_no_conflicts(all_committed: &[Vec<Block>]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use bytes::Bytes;
+    use parking_lot::Mutex;
+    use tokio::sync::mpsc;
     use tokio::task::yield_now;
 
-    use super::{SimCluster, assert_no_conflicts};
+    use super::{LinkCut, SimCluster, assert_no_conflicts, fresh_signer, spawn_route_task};
+    use crate::consensus::validator_set::ValidatorSet;
+    use crate::crypto::signed::Signer;
+    use crate::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
+
+    /// Bare routing harness: spawns only the per-node routing tasks and
+    /// hands the caller the outbound sender + inbound receiver for each
+    /// node (no `ConsensusNode`). Used by the kill-semantics tests to
+    /// directly inject outbound frames and drain inbound events.
+    struct BareRouting {
+        node_ids: Vec<NodeId>,
+        send_txs: Vec<mpsc::Sender<ProtocolOutbound>>,
+        event_rxs: Vec<mpsc::Receiver<ProtocolEvent>>,
+        event_txs: Arc<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>,
+        dead_nodes: Arc<Mutex<HashSet<NodeId>>>,
+        #[allow(dead_code)]
+        partitioned: Arc<Mutex<HashSet<NodeId>>>,
+        #[allow(dead_code)]
+        link_cuts: Arc<Mutex<HashSet<LinkCut>>>,
+    }
+
+    impl BareRouting {
+        fn new(n: usize) -> Self {
+            let signers: Vec<_> = (0..n).map(|_| fresh_signer()).collect();
+            let unsorted: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
+            let vs = ValidatorSet::new(unsorted);
+            let node_ids: Vec<NodeId> = vs.iter().copied().collect();
+
+            let partitioned = Arc::new(Mutex::new(HashSet::new()));
+            let link_cuts = Arc::new(Mutex::new(HashSet::new()));
+            let dead_nodes = Arc::new(Mutex::new(HashSet::new()));
+
+            let mut event_tx_map: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
+            let mut event_rxs: Vec<mpsc::Receiver<ProtocolEvent>> = Vec::new();
+            for &nid in &node_ids {
+                let (tx, rx) = mpsc::channel(1024);
+                event_tx_map.insert(nid, tx);
+                event_rxs.push(rx);
+            }
+            let event_txs = Arc::new(event_tx_map);
+
+            let mut send_txs = Vec::new();
+            for &nid in &node_ids {
+                let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
+                send_txs.push(send_tx);
+                spawn_route_task(
+                    nid,
+                    send_rx,
+                    Arc::clone(&event_txs),
+                    Arc::clone(&partitioned),
+                    Arc::clone(&link_cuts),
+                    Arc::clone(&dead_nodes),
+                );
+            }
+
+            BareRouting {
+                node_ids,
+                send_txs,
+                event_rxs,
+                event_txs,
+                dead_nodes,
+                partitioned,
+                link_cuts,
+            }
+        }
+
+        /// Mirror of [`SimCluster::kill_node`]'s state-level actions
+        /// (without a run-loop shutdown signal, since there is no run
+        /// loop in the bare harness). The same `dead_nodes` insert +
+        /// sorted-order `PeerDisconnected` fan-out is exercised.
+        fn kill_node(&self, idx: usize) {
+            let killed = self.node_ids[idx];
+            if !self.dead_nodes.lock().insert(killed) {
+                return;
+            }
+            for &nid in &self.node_ids {
+                if nid == killed {
+                    continue;
+                }
+                if let Some(event_tx) = self.event_txs.get(&nid) {
+                    let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id: killed });
+                }
+            }
+        }
+    }
+
+    /// Drain every currently-buffered event from a receiver without
+    /// blocking. The routing tasks push asynchronously, so callers yield
+    /// beforehand to give sends a chance to land.
+    fn drain_events(rx: &mut mpsc::Receiver<ProtocolEvent>) -> Vec<ProtocolEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
 
     // ── F-series: happy path (PR5) ────────────────────────────────────────────
 
@@ -731,10 +930,22 @@ mod tests {
         // Very short timeout so the test completes quickly in sim time.
         let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
 
-        // Kill the view-1 leader immediately: the round-robin selector
-        // picks `validators[1 % 4] = index 1` as the view-1 leader
-        // (since validators are sorted ascending). Drop it before any
-        // proposal can be emitted.
+        // Let the survivors' run loops start and post-kill the view-1
+        // leader only after every node has observed the empty view and
+        // armed its timer. Without this yield, `kill_node` races the
+        // runtime's first schedule — under #120's stricter sim, the
+        // killed node's boot proposal is (correctly) dropped by the
+        // routing layer, and the test needs the survivors to have
+        // actually booted their pacemakers before we advance the clock.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Kill the view-1 leader: the round-robin selector picks
+        // `validators[1 % 4] = index 1` as the view-1 leader (since
+        // validators are sorted ascending). With #120's dead-node
+        // routing, no proposal from node 1 reaches the survivors —
+        // progress must come from the timeout-certificate path.
         cluster.kill_node(1);
 
         // Advance the virtual clock past several timeout intervals so
@@ -761,6 +972,220 @@ mod tests {
             survivor_commits > 0,
             "the TC liveness path must let the cluster make progress when the \
              view-1 leader is dead; survivors committed {survivor_commits} blocks",
+        );
+    }
+
+    // ── J-series: kill-node routing semantics (#120) ──────────────────────────
+
+    /// After `kill_node(idx)`, the killed peer is removed from routing:
+    /// any `SendTo(node_ids[idx], _)` or `Broadcast` from a live node
+    /// must not enqueue into the killed node's inbound mailbox.
+    ///
+    /// Drains everything that landed before the kill, then fires a
+    /// direct `SendTo(killed)` and a `Broadcast` from every survivor,
+    /// yields to let the routing tasks run, and asserts the killed
+    /// mailbox stays empty of `Message` events after the kill.
+    #[tokio::test]
+    async fn kill_node_removes_peer_from_routing() {
+        let mut routing = BareRouting::new(4);
+        let killed_idx = 0;
+        let killed_id = routing.node_ids[killed_idx];
+
+        // Drain any pre-kill chatter (there shouldn't be any — nobody
+        // has sent yet — but be defensive).
+        for _ in 0..10 {
+            yield_now().await;
+        }
+        let pre_kill = drain_events(&mut routing.event_rxs[killed_idx]);
+        assert!(
+            pre_kill.is_empty(),
+            "bare harness must have no pre-kill traffic, got {} events",
+            pre_kill.len(),
+        );
+
+        routing.kill_node(killed_idx);
+
+        // Every survivor both `SendTo(killed, …)` and `Broadcast(…)`
+        // after the kill. Under the new semantics neither should land
+        // in the killed node's inbound mailbox.
+        let payload = Bytes::from_static(b"post-kill ping");
+        for (idx, send_tx) in routing.send_txs.iter().enumerate() {
+            if idx == killed_idx {
+                continue;
+            }
+            send_tx
+                .send(ProtocolOutbound::SendTo {
+                    node_id: killed_id,
+                    payload: payload.clone(),
+                })
+                .await
+                .expect("survivor send_tx must still be open");
+            send_tx
+                .send(ProtocolOutbound::Broadcast(payload.clone()))
+                .await
+                .expect("survivor send_tx must still be open");
+        }
+
+        // Let the routing tasks process every outbound frame above.
+        for _ in 0..50 {
+            yield_now().await;
+        }
+
+        let killed_inbound = drain_events(&mut routing.event_rxs[killed_idx]);
+        let message_count = killed_inbound
+            .iter()
+            .filter(|ev| matches!(ev, ProtocolEvent::Message { .. }))
+            .count();
+        assert_eq!(
+            message_count, 0,
+            "killed node's mailbox must not receive any Message events after \
+             kill_node; got {message_count} messages (full events: {killed_inbound:?})",
+        );
+    }
+
+    /// After `kill_node(idx)`, every surviving node's `event_rx` must
+    /// receive exactly one `PeerDisconnected { node_id: node_ids[idx] }`,
+    /// and delivery order across survivors must follow sorted-`NodeId`
+    /// order (matching the `sim_adversary` / proptest determinism
+    /// requirement called out in the issue).
+    #[tokio::test]
+    async fn kill_node_dispatches_peer_disconnected_to_survivors() {
+        let mut routing = BareRouting::new(4);
+        let killed_idx = 2;
+        let killed_id = routing.node_ids[killed_idx];
+
+        routing.kill_node(killed_idx);
+
+        // `try_send` runs synchronously, but yield once anyway so the
+        // receivers observe the sent events as buffered.
+        yield_now().await;
+
+        for (idx, rx) in routing.event_rxs.iter_mut().enumerate() {
+            let events = drain_events(rx);
+            if idx == killed_idx {
+                // The killed node itself must not observe a
+                // `PeerDisconnected` for itself.
+                let self_disc = events
+                    .iter()
+                    .filter(|ev| {
+                        matches!(
+                            ev,
+                            ProtocolEvent::PeerDisconnected { node_id } if *node_id == killed_id
+                        )
+                    })
+                    .count();
+                assert_eq!(
+                    self_disc, 0,
+                    "killed node must not receive PeerDisconnected for itself",
+                );
+                continue;
+            }
+
+            let disc_events: Vec<_> = events
+                .iter()
+                .filter_map(|ev| match ev {
+                    ProtocolEvent::PeerDisconnected { node_id } => Some(*node_id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                disc_events.len(),
+                1,
+                "survivor {idx} must receive exactly one PeerDisconnected, got {disc_events:?}",
+            );
+            assert_eq!(
+                disc_events[0], killed_id,
+                "survivor {idx}'s PeerDisconnected must carry the killed node's id",
+            );
+        }
+    }
+
+    /// `kill_node` is idempotent: calling it twice on the same index
+    /// must not emit a second `PeerDisconnected` to any survivor. The
+    /// existing `shutdown_txs[idx].take()` guard is what makes the
+    /// second call a no-op.
+    #[tokio::test]
+    async fn kill_node_double_kill_is_idempotent() {
+        let mut routing = BareRouting::new(4);
+        let killed_idx = 1;
+
+        routing.kill_node(killed_idx);
+        yield_now().await;
+
+        // Drain the first kill's PeerDisconnected from every survivor.
+        for (idx, rx) in routing.event_rxs.iter_mut().enumerate() {
+            if idx == killed_idx {
+                continue;
+            }
+            let first = drain_events(rx);
+            assert_eq!(
+                first.len(),
+                1,
+                "first kill must deliver exactly one event to survivor {idx}",
+            );
+        }
+
+        // Second kill: under the `dead_nodes` guard, no new event fires.
+        routing.kill_node(killed_idx);
+        yield_now().await;
+
+        for (idx, rx) in routing.event_rxs.iter_mut().enumerate() {
+            if idx == killed_idx {
+                continue;
+            }
+            let second = drain_events(rx);
+            assert!(
+                second.is_empty(),
+                "double-kill must not re-dispatch PeerDisconnected to survivor {idx}; \
+                 got {second:?}",
+            );
+        }
+    }
+
+    /// Full end-to-end variant running against `SimCluster` (the real
+    /// spawn path with `ConsensusNode` consumers): after `kill_node`,
+    /// the killed peer must appear in `dead_nodes` and the routing
+    /// tasks must continue to drop frames targeting it — survivors
+    /// keep making progress despite the outage.
+    #[tokio::test]
+    async fn simcluster_kill_node_marks_dead_nodes_set() {
+        tokio::time::pause();
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+        let killed_idx = 3;
+        let killed_id = cluster.node_ids[killed_idx];
+
+        // Warm-up so the cluster has exchanged at least one round.
+        for _ in 0..200 {
+            yield_now().await;
+        }
+
+        assert!(
+            !cluster.dead_nodes.lock().contains(&killed_id),
+            "dead_nodes must be empty before kill_node",
+        );
+
+        cluster.kill_node(killed_idx);
+
+        assert!(
+            cluster.dead_nodes.lock().contains(&killed_id),
+            "kill_node must insert the killed peer into dead_nodes",
+        );
+
+        // Survivors continue to make progress after the kill.
+        for _ in 0..500 {
+            yield_now().await;
+        }
+        let commits = cluster.drain_commits();
+        assert_no_conflicts(&commits);
+        let survivor_commits: usize = commits
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != killed_idx)
+            .map(|(_, c)| c.len())
+            .sum();
+        assert!(
+            survivor_commits > 0,
+            "survivors must keep committing after kill_node; got {survivor_commits}",
         );
     }
 }
