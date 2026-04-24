@@ -1300,6 +1300,66 @@ mod tests {
     }
 
     #[test]
+    fn quorum_emits_high_qc_persist_then_broadcast_proposal() {
+        // self = nid(1), leader of view 4. Install `block_v3` into
+        // `pending_blocks` so the parent lookup at quorum time
+        // succeeds. Feed three votes at view 3 — the threshold over
+        // n=4 — and assert the third one emits, in order:
+        //   1. Persist(HighQc(formed_qc))
+        //   2. Broadcast(Proposal { block: new_v4, justify: formed_qc })
+        // where `new_v4` is what the `TestBlockBuilder` stamps over
+        // block_v3 at view 4.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
+        let block_v3_hash = block_v3.hash();
+        core.state.insert_pending(block_v3.clone());
+
+        // First two votes accumulate silently.
+        let step1 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
+        let step2 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3))));
+        assert!(step1.is_empty(), "first sub-quorum vote silent: {step1:?}");
+        assert!(step2.is_empty(), "second sub-quorum vote silent: {step2:?}");
+
+        // Third vote crosses the threshold. Reconstruct the expected
+        // QC by signing in the same (bitmap) order the dispatcher
+        // would — validator indices 1, 2, 3 for nid(2), nid(3), nid(4).
+        let mut expected_qc = QuorumCertificate::new(3, block_v3_hash, 4);
+        expected_qc.add_signature(1, [nid(2)[0]; 64]);
+        expected_qc.add_signature(2, [nid(3)[0]; 64]);
+        expected_qc.add_signature(3, [nid(4)[0]; 64]);
+
+        // The builder extends block_v3 (height 1) with an empty-commands
+        // child at height 2, view 4, proposer nid(1).
+        let expected_new_block = Block {
+            header: BlockHeader {
+                parent_hash: block_v3_hash,
+                height: block_v3.header.height + 1,
+                view: 4,
+                proposer: nid(1),
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: Vec::new(),
+        };
+
+        let step3 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4))));
+
+        assert_eq!(
+            step3,
+            vec![
+                Action::Persist(StateUpdate::HighQc(expected_qc.clone())),
+                Action::Broadcast(ConsensusMsg::Proposal(Proposal {
+                    block: expected_new_block,
+                    justify: expected_qc.clone(),
+                })),
+            ],
+            "quorum transition emits HighQc persist then Broadcast(Proposal)",
+        );
+        assert_eq!(core.state().high_qc.as_ref(), Some(&expected_qc));
+    }
+
+    #[test]
     fn vote_from_non_validator_signer_is_dropped() {
         // self = nid(1) is the leader of view 4 (4 % 4 = 0), so a
         // vote at view 3 would normally accumulate. But this vote
