@@ -531,8 +531,7 @@ mod tests {
                     continue;
                 }
                 if let Some(event_tx) = self.event_txs.get(&nid) {
-                    let _ = event_tx
-                        .try_send(ProtocolEvent::PeerDisconnected { node_id: killed });
+                    let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id: killed });
                 }
             }
         }
@@ -1068,10 +1067,12 @@ mod tests {
                 // `PeerDisconnected` for itself.
                 let self_disc = events
                     .iter()
-                    .filter(|ev| matches!(
-                        ev,
-                        ProtocolEvent::PeerDisconnected { node_id } if *node_id == killed_id
-                    ))
+                    .filter(|ev| {
+                        matches!(
+                            ev,
+                            ProtocolEvent::PeerDisconnected { node_id } if *node_id == killed_id
+                        )
+                    })
                     .count();
                 assert_eq!(
                     self_disc, 0,
