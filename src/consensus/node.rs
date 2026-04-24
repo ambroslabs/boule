@@ -722,8 +722,7 @@ impl ConsensusNode {
     ) -> anyhow::Result<()> {
         let high_qc = self.core.state().high_qc.clone();
         let payload = TimeoutVote { view, high_qc };
-        let signed = Signed::sign(payload, signer.as_ref())
-            .context("signing TimeoutVote")?;
+        let signed = Signed::sign(payload, signer.as_ref()).context("signing TimeoutVote")?;
 
         // Put the signed frame on the wire.
         let wire = WireMessage::TimeoutVote(signed.clone());
@@ -816,11 +815,11 @@ impl ConsensusNode {
             let nv = NewView { high_qc: qc };
             let self_signed =
                 Signed::sign(nv, signer.as_ref()).context("signing self-NewView for TC adopt")?;
-            let safety_actions = self
-                .core
-                .step(crate::consensus::hotstuff::step::Event::NewViewReceived(
-                    self_signed,
-                ));
+            let safety_actions =
+                self.core
+                    .step(crate::consensus::hotstuff::step::Event::NewViewReceived(
+                        self_signed,
+                    ));
             self.apply_safety_actions(safety_actions, send_tx, view_timer, signer)
                 .await?;
         }
