@@ -1961,20 +1961,51 @@ mod tests {
             }
         }
 
+        /// The safety invariant this whole milestone is built around:
+        /// for every pair of replicas `(i, j)` and every height `h`,
+        /// if both committed a block at height `h`, the blocks agree
+        /// byte-for-byte. Panics with a precise `(i, j, h)` message
+        /// on the first violation so a failed proptest shrinks to a
+        /// single offending height rather than a diff of two maps.
+        ///
+        /// "Commit at the same height" is the cross-replica analog of
+        /// HotStuff's `Theorem 2` ("conflicting nodes cannot both be
+        /// committed"): at any fixed height, there must be exactly
+        /// one committed block across the honest set.
+        pub(crate) fn assert_no_conflicting_commits(replicas: &ReplicaSet) {
+            let n = replicas.len();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    for (height, block_i) in &replicas.commits[i] {
+                        let Some(block_j) = replicas.commits[j].get(height) else {
+                            continue;
+                        };
+                        assert_eq!(
+                            block_i.hash(),
+                            block_j.hash(),
+                            "replicas {i} and {j} committed conflicting blocks at \
+                             height {height}: hash {:?} vs {:?}",
+                            block_i.hash(),
+                            block_j.hash(),
+                        );
+                    }
+                }
+            }
+        }
+
         #[test]
         fn four_honest_replicas_agree_on_a_commit() {
             // Smoke test: n = 3f + 1 for f = 1. Kick off view 1 by
             // broadcasting a hand-crafted proposal to every replica,
-            // run the bus to quiescence, and assert all four
-            // replicas record a commit. The committed block must be
-            // byte-identical across replicas — same hash on every
-            // history.
+            // run the bus for a bounded number of rounds, and assert
+            // (a) at least one commit per replica, (b) no pair of
+            // replicas has conflicting commits.
             //
             // This is the minimum proof that the bus correctly
             // relays `SendTo(leader, Vote)` and `Broadcast(Proposal)`
-            // between cores. If any action kind were mishandled, the
-            // run would either hang past `run_to_quiescence`'s
-            // bound or produce divergent commit sets.
+            // between cores, and that the invariant we'll actually
+            // check against Byzantine inputs in PR β holds trivially
+            // for honest inputs.
             let mut replicas = ReplicaSet::new(4);
             let kickoff = kickoff_proposal(&replicas);
             replicas.inject_all(Event::ProposalReceived(kickoff));
@@ -1992,6 +2023,8 @@ mod tests {
                     "replica {i} recorded no commits: did the bus hang?",
                 );
             }
+
+            assert_no_conflicting_commits(&replicas);
 
             // The first committed block (lowest height) must match
             // across replicas.
