@@ -207,7 +207,7 @@ impl HotStuffCore {
             Event::ProposalReceived(signed) => self.on_proposal_received(signed),
             Event::VoteReceived(signed) => self.on_vote_received(signed),
             Event::NewViewReceived(signed) => self.on_new_view_received(signed),
-            Event::PacemakerAdvance(_) => Vec::new(),
+            Event::PacemakerAdvance(v) => self.on_pacemaker_advance(v),
         }
     }
 
@@ -442,6 +442,67 @@ impl HotStuffCore {
         }
         self.state.high_qc = Some(qc.clone());
         vec![Action::Persist(StateUpdate::HighQc(qc))]
+    }
+
+    /// Handle a [`Event::PacemakerAdvance(v)`] signal from the outer
+    /// driver. Three things happen, in order:
+    ///
+    /// 1. Record the new view on `state.current_view`. The safety
+    ///    core never advances views on its own — this is the only
+    ///    path that writes `current_view`, so the pacemaker stays
+    ///    authoritative over liveness.
+    /// 2. Re-evaluate `parked_proposals`: any entry whose parent is
+    ///    now in `pending_blocks` gets its proposal re-dispatched
+    ///    through `on_proposal_received`. Nested re-parking is
+    ///    handled by `on_proposal_received`'s B1 branch.
+    /// 3. If we have a `high_qc` to advertise, emit
+    ///    `Broadcast(ConsensusMsg::NewView { high_qc })`. At startup
+    ///    before any proposal has landed, `high_qc` is `None` and we
+    ///    skip the broadcast — `NewView` has no `Option<QC>` to
+    ///    fall back on, and an all-zero synthesized QC would mislead
+    ///    anyone receiving it. In practice a real node sees the
+    ///    first proposal before the first pacemaker-driven view
+    ///    change, so this window is narrow.
+    ///
+    /// Emission order: un-park retry actions first (any
+    /// `Persist`/`SendTo`/`Broadcast` they produce), then the
+    /// `Broadcast(NewView)` sentinel last.
+    fn on_pacemaker_advance(&mut self, v: View) -> Vec<Action> {
+        self.state.current_view = v;
+
+        let mut actions = Vec::new();
+
+        // Un-park retries. Collect child hashes whose parent has since
+        // arrived, then drain-and-re-dispatch them one at a time. The
+        // two-step (collect, then remove+re-run) avoids holding an
+        // immutable borrow on `parked_proposals` while
+        // `on_proposal_received` mutates `self`.
+        let ready: Vec<BlockHash> = self
+            .parked_proposals
+            .iter()
+            .filter_map(|(child_hash, signed)| {
+                let parent_hash = signed.payload.block.header.parent_hash;
+                if self.state.pending_blocks.contains_key(&parent_hash) {
+                    Some(*child_hash)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for child_hash in ready {
+            if let Some(signed) = self.parked_proposals.remove(&child_hash) {
+                let retry_actions = self.on_proposal_received(signed);
+                actions.extend(retry_actions);
+            }
+        }
+
+        if let Some(high_qc) = self.state.high_qc.clone() {
+            actions.push(Action::Broadcast(ConsensusMsg::NewView(NewView {
+                high_qc,
+            })));
+        }
+
+        actions
     }
 
     /// Feed a trace of events through `step` in order, returning one
