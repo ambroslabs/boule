@@ -208,10 +208,17 @@ impl HotStuffCore {
 
     /// Directly set `high_qc` on the safety-core state.
     ///
-    /// Used exclusively by the simulation layer to bootstrap a fresh
-    /// cluster: a genesis QC (with dummy signatures) is pre-seeded so
-    /// the view-1 leader can call `become_leader` immediately without
-    /// waiting for a NewView round. Do not call this in production code.
+    /// Used at boot by the integration layer to seed a well-known
+    /// genesis QC (see [`super::qc::genesis_qc`]) so the view-1 leader
+    /// can call `become_leader` immediately without waiting for a
+    /// NewView round. The safety core does not re-verify embedded QC
+    /// signatures — the integration layer authenticates each
+    /// message's envelope — so a conventional genesis QC with
+    /// placeholder signatures is safe here.
+    ///
+    /// After bootstrap, `high_qc` is adopted through ordinary proposal
+    /// / vote / NewView / TimeoutVote paths; callers should prefer
+    /// those over calling this directly.
     pub fn set_high_qc(&mut self, qc: QuorumCertificate) {
         self.state.high_qc = Some(qc);
     }

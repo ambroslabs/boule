@@ -31,10 +31,12 @@
 //! case in a healthy network. A future PR will walk the not-yet-
 //! committed ancestor chain for the rare multi-block-in-flight case.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -42,10 +44,11 @@ use tokio::sync::{mpsc, oneshot};
 use crate::consensus::View;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
 use crate::consensus::hotstuff::Locked;
+use crate::consensus::hotstuff::qc::{TimeoutVote, quorum_size};
 use crate::consensus::hotstuff::step::{
     Action as SafetyAction, BlockBuilder, HotStuffCore, StateUpdate,
 };
-use crate::consensus::hotstuff::{HotStuffState, QuorumCertificate};
+use crate::consensus::hotstuff::{HotStuffState, NewView, QuorumCertificate, genesis_qc};
 use crate::consensus::pacemaker::Action as PacemakerAction;
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::pacemaker::leader::RoundRobinSelector;
@@ -106,6 +109,10 @@ pub enum WireMessage {
     Proposal(Signed<crate::consensus::hotstuff::Proposal>),
     Vote(Signed<crate::consensus::hotstuff::qc::Vote>),
     NewView(Signed<crate::consensus::hotstuff::NewView>),
+    /// A replica's signed notice that it is giving up on a view. A
+    /// quorum of these forms the timeout certificate that advances
+    /// `view + 1` even when the leader never proposes.
+    TimeoutVote(Signed<TimeoutVote>),
     /// Ask a peer for the block with this content-hash.
     BlockRequest(BlockHash),
     /// Reply to a `BlockRequest`. `None` means "I don't have it".
@@ -254,9 +261,28 @@ pub struct ConsensusNode {
     /// Configured view-timer behaviour; consulted by the timer helper
     /// in Phase D when arming/re-arming the view timer.
     pub timeout_policy: Arc<ExponentialBackoff>,
+    /// Partial timeout certificates this replica is accumulating,
+    /// keyed by the `View` the timeout pertains to. An entry is
+    /// dropped once its TC fires `OnTimeoutCert` into the pacemaker
+    /// so late-arriving timeout votes for past views are cheap no-ops.
+    timeout_buckets: HashMap<View, TimeoutBucket>,
     /// Optional channel to notify an observer (e.g. a test harness) of
     /// each committed block. `None` in production builds.
     commit_tx: Option<tokio::sync::mpsc::UnboundedSender<Block>>,
+}
+
+/// Accumulator for one view's timeout votes.
+///
+/// Tracks the set of distinct signers that have timed out at a view,
+/// and the freshest `high_qc` any of them reported. When `signers.len()`
+/// reaches `quorum_size(validator_set.len())` we fire
+/// [`pacemaker::Event::OnTimeoutCert`] — and we drop the bucket so
+/// further duplicate timeout votes for the same view don't re-enter
+/// the pacemaker.
+#[derive(Default)]
+struct TimeoutBucket {
+    signers: HashSet<NodeId>,
+    best_high_qc: Option<QuorumCertificate>,
 }
 
 impl ConsensusNode {
@@ -292,7 +318,14 @@ impl ConsensusNode {
             config.propose_limit,
         ));
 
-        let hs_state = HotStuffState::new(config.validator_set.clone(), config.genesis);
+        let validator_set_len = config.validator_set.len();
+        let boot_qc = genesis_qc(&config.genesis, validator_set_len);
+        let mut hs_state = HotStuffState::new(config.validator_set.clone(), config.genesis);
+        // Seed the cluster-agreed genesis QC so the view-1 leader can
+        // build a proposal on first boot without waiting for a QC-forming
+        // vote round. Every honest replica derives the same QC from the
+        // shared `(genesis, validator_set_len)` config.
+        hs_state.high_qc = Some(boot_qc);
         let core = HotStuffCore::new(self_id, hs_state, builder as Arc<dyn BlockBuilder>);
 
         Self {
@@ -305,6 +338,7 @@ impl ConsensusNode {
             wal,
             validator_set: config.validator_set,
             timeout_policy,
+            timeout_buckets: HashMap::new(),
             commit_tx: None,
         }
     }
@@ -319,14 +353,13 @@ impl ConsensusNode {
         self
     }
 
-    /// Pre-seed a `high_qc` into the safety-core state.
+    /// Replace the auto-seeded genesis QC with `qc`.
     ///
-    /// Used by the simulation layer to bootstrap a fresh cluster: without
-    /// a `high_qc` the view-1 leader cannot build a proposal (it would
-    /// have no parent block hash to use as justify). A genesis QC with
-    /// dummy signatures satisfies the safety-core's requirements because
-    /// the core does not re-verify QC signatures — that is the
-    /// integration layer's job at ingress.
+    /// [`ConsensusNode::new`] and [`ConsensusNode::recover`] already seed
+    /// the safety-core state with the canonical genesis QC derived from
+    /// `(genesis, validator_set_len)` via [`genesis_qc`]; this helper is
+    /// kept for tests and harnesses that need to inject a hand-built QC
+    /// (e.g. to start from a mid-chain state).
     pub fn with_genesis_qc(mut self, qc: QuorumCertificate) -> Self {
         self.core.set_high_qc(qc);
         self
@@ -389,6 +422,7 @@ impl ConsensusNode {
             wal,
             validator_set: config.validator_set,
             timeout_policy,
+            timeout_buckets: HashMap::new(),
             commit_tx: None,
         })
     }
@@ -574,6 +608,11 @@ impl ConsensusNode {
             Dispatch::ReceiveBlock { block: None, from } => {
                 tracing::debug!("consensus: block not found at peer {from:?}");
             }
+
+            Dispatch::TimeoutVote(signed) => {
+                self.on_timeout_vote(signed, send_tx, view_timer, signer)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -661,12 +700,140 @@ impl ConsensusNode {
                 }
 
                 PacemakerAction::SendTimeout(v) => {
-                    // Timeout certificates are not yet implemented (#24 Phase G).
-                    tracing::debug!("consensus: timeout for view {v} (TC not yet implemented)");
+                    self.send_timeout(v, send_tx, view_timer, signer).await?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Build, broadcast, and self-deliver a [`TimeoutVote`] for `view`.
+    ///
+    /// Self-delivery matters because production p2p broadcasts do not
+    /// loop back to the sender — without an explicit self-feed the
+    /// local bucket would be one short of quorum, and a leader-crash
+    /// scenario with exactly `quorum_size` live replicas would stall.
+    async fn send_timeout(
+        &mut self,
+        view: View,
+        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        view_timer: &mut ViewTimer,
+        signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        let high_qc = self.core.state().high_qc.clone();
+        let payload = TimeoutVote { view, high_qc };
+        let signed = Signed::sign(payload, signer.as_ref())
+            .context("signing TimeoutVote")?;
+
+        // Put the signed frame on the wire.
+        let wire = WireMessage::TimeoutVote(signed.clone());
+        let bytes = postcard::to_stdvec(&wire)
+            .map(Bytes::from)
+            .context("encoding TimeoutVote")?;
+        send_outbound(send_tx, Outbound::Broadcast(bytes)).await;
+
+        // Count our own timeout locally so we don't depend on
+        // broadcast-to-self semantics from the p2p layer.
+        self.on_timeout_vote(signed, send_tx, view_timer, signer)
+            .await
+    }
+
+    /// Feed a verified [`TimeoutVote`] into the local timeout-certificate
+    /// bucket.
+    ///
+    /// When a bucket's distinct-signer count crosses
+    /// `quorum_size(validator_set.len())`, the replica:
+    /// 1. Adopts the freshest `high_qc` reported by the timeout
+    ///    quorum via the safety core's NewView path — `high_qc`
+    ///    freshness is the standard HotStuff liveness trick that
+    ///    prevents a departing leader's QC from being lost.
+    /// 2. Feeds [`pacemaker::Event::OnTimeoutCert(view)`] into the
+    ///    pacemaker so the local view advances to `view + 1`.
+    ///
+    /// The bucket is dropped once fired, so late-arriving timeout
+    /// votes for the same view are silent no-ops.
+    async fn on_timeout_vote(
+        &mut self,
+        signed: Signed<TimeoutVote>,
+        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        view_timer: &mut ViewTimer,
+        signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        let view = signed.payload.view;
+
+        // Stale: we have already advanced past this view via some other
+        // path (QC or an earlier TC). Nothing to do.
+        if view < self.pacemaker.current_view() {
+            return Ok(());
+        }
+        // Defence-in-depth: ingress already rejected unknown signers,
+        // but asserting here lets tests hand-construct Signed<TimeoutVote>
+        // without going through ingress.
+        if !self.validator_set.contains(&signed.signer) {
+            return Ok(());
+        }
+
+        let quorum = quorum_size(self.validator_set.len());
+        let adopt_qc = {
+            let bucket = self.timeout_buckets.entry(view).or_default();
+            let is_new = bucket.signers.insert(signed.signer);
+            if !is_new {
+                return Ok(());
+            }
+            // Remember the freshest high_qc reported so far. `None`
+            // here means the sender had never seen a QC (rare after
+            // genesis-QC seeding); we just leave `best_high_qc` as-is.
+            if let Some(qc) = signed.payload.high_qc {
+                let fresher = match &bucket.best_high_qc {
+                    Some(cur) => qc.view > cur.view,
+                    None => true,
+                };
+                if fresher {
+                    bucket.best_high_qc = Some(qc);
+                }
+            }
+
+            if bucket.signers.len() < quorum {
+                return Ok(());
+            }
+            bucket.best_high_qc.clone()
+        };
+
+        // Drop the bucket: the TC has fired, further duplicates are
+        // stale and no additional accounting is needed.
+        self.timeout_buckets.remove(&view);
+        // Also prune any strictly-older buckets — they can never
+        // complete quorum into a future view that's still meaningful.
+        self.timeout_buckets.retain(|&v, _| v > view);
+
+        // Adopt the best high_qc observed via the NewView path so the
+        // safety core's own freshness check and persistence discipline
+        // applies. A round-trip through `Signed::sign(_, self)` keeps
+        // the existing NewView handler's `signed.signer` invariant
+        // (we trust our own envelope because ingress verified the
+        // originals that fed the bucket).
+        if let Some(qc) = adopt_qc {
+            let nv = NewView { high_qc: qc };
+            let self_signed =
+                Signed::sign(nv, signer.as_ref()).context("signing self-NewView for TC adopt")?;
+            let safety_actions = self
+                .core
+                .step(crate::consensus::hotstuff::step::Event::NewViewReceived(
+                    self_signed,
+                ));
+            self.apply_safety_actions(safety_actions, send_tx, view_timer, signer)
+                .await?;
+        }
+
+        // Feed the TC into the pacemaker so the view advances.
+        let pm_actions = self
+            .pacemaker
+            .step(crate::consensus::pacemaker::Event::OnTimeoutCert(view));
+        // NOTE: recursive-ish call through apply_pacemaker_actions is
+        // safe — that function handles `AdvanceToView` / `BecomeLeader` /
+        // `ResetTimer` / `SendTimeout`, and the pacemaker's reaction to
+        // `OnTimeoutCert` never re-emits `OnTimeoutCert` itself.
+        Box::pin(self.apply_pacemaker_actions(pm_actions, send_tx, view_timer, signer)).await
     }
 
     /// Commit `block` to the state machine and drain the committed commands
@@ -746,7 +913,14 @@ pub fn recover_state(
     validator_set: ValidatorSet,
     genesis: Block,
 ) -> anyhow::Result<HotStuffState> {
+    let vs_len = validator_set.len();
+    let boot_qc = genesis_qc(&genesis, vs_len);
     let mut state = HotStuffState::new(validator_set, genesis);
+    // Default every fresh replica to the cluster-agreed genesis QC so
+    // view-1 can proceed without waiting for a cross-cluster NewView
+    // round. If the replica previously persisted a fresher QC we
+    // overlay that below.
+    state.high_qc = Some(boot_qc);
 
     if let Some(raw) = storage
         .get(STORAGE_KEY_LAST_VOTED_VIEW)
@@ -935,6 +1109,38 @@ mod tests {
         let encoded = postcard::to_stdvec(&msg).unwrap();
         let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn wire_message_timeout_vote_roundtrip() {
+        use crate::consensus::hotstuff::qc::TimeoutVote;
+        let tv = TimeoutVote {
+            view: 9,
+            high_qc: Some(sample_qc()),
+        };
+        let msg = WireMessage::TimeoutVote(Signed {
+            payload: tv,
+            signer: nid(2),
+            sig: dummy_sig(),
+        });
+        let encoded = postcard::to_stdvec(&msg).unwrap();
+        let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+
+        // The `high_qc: None` variant must also roundtrip — it's the
+        // very-early-bootstrap encoding where no QC has been observed.
+        let tv_none = TimeoutVote {
+            view: 1,
+            high_qc: None,
+        };
+        let msg_none = WireMessage::TimeoutVote(Signed {
+            payload: tv_none,
+            signer: nid(3),
+            sig: dummy_sig(),
+        });
+        let encoded = postcard::to_stdvec(&msg_none).unwrap();
+        let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, msg_none);
     }
 
     #[test]
@@ -1127,13 +1333,17 @@ mod tests {
     }
 
     #[test]
-    fn recover_state_from_empty_storage_matches_fresh_new() {
+    fn recover_state_from_empty_storage_seeds_genesis_qc() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let state = recover_state(storage.as_ref(), four_validators(), genesis()).unwrap();
         assert_eq!(state.current_view, 0);
         assert_eq!(state.last_voted_view, 0);
         assert!(state.locked.is_none());
-        assert!(state.high_qc.is_none());
+        // Empty storage means no persisted high_qc, so the recovery path
+        // seeds the cluster-agreed genesis QC so the view-1 leader can
+        // propose on first boot.
+        let expected = genesis_qc(&genesis(), four_validators().len());
+        assert_eq!(state.high_qc.as_ref(), Some(&expected));
         assert!(state.pending_blocks.contains_key(&genesis().hash()));
     }
 
@@ -1303,9 +1513,10 @@ mod tests {
     }
 
     #[test]
-    fn recover_only_locked_preserves_default_voted_view_and_high_qc() {
+    fn recover_only_locked_preserves_default_voted_view_and_seeds_genesis_qc() {
         // Partial persistence: only `locked` was flushed. Recovery
-        // restores it and leaves the other two at their defaults.
+        // restores it, leaves `last_voted_view` at its default, and
+        // seeds the genesis QC since no `high_qc` was persisted.
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
         let cfg = test_config(four_validators());
@@ -1332,7 +1543,8 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.core.state().last_voted_view, 0);
         assert_eq!(recovered.core.state().locked, Some(sample_locked()));
-        assert!(recovered.core.state().high_qc.is_none());
+        let expected = genesis_qc(&genesis(), four_validators().len());
+        assert_eq!(recovered.core.state().high_qc.as_ref(), Some(&expected));
     }
 
     // ── D/E-series: event loop ────────────────────────────────────────────────
@@ -1365,11 +1577,25 @@ mod tests {
     }
 
     #[test]
-    fn become_leader_with_no_high_qc_returns_empty() {
-        let mut node = make_node(nid(1));
-        // Fresh node has no high_qc — become_leader should return nothing.
+    fn new_seeds_genesis_qc_so_view_one_leader_can_propose() {
+        // Regression for the bootstrap-deadlock bug (#116). A freshly
+        // constructed ConsensusNode must have `high_qc = Some(genesis_qc)`
+        // so the view-1 leader can immediately build a proposal on boot
+        // without waiting for a NewView round that only ever lands after
+        // somebody has already proposed.
+        let node = make_node(nid(1));
+        let expected = genesis_qc(&genesis(), four_validators().len());
+        assert_eq!(node.core.state().high_qc.as_ref(), Some(&expected));
+
+        // And `become_leader(1)` must now yield an Action::Broadcast(Proposal)
+        // rather than the empty Vec the pre-fix code returned.
+        let mut node = node;
         let actions = node.core.become_leader(1);
-        assert!(actions.is_empty());
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            SafetyAction::Broadcast(crate::consensus::hotstuff::ConsensusMsg::Proposal(_)),
+        ));
     }
 
     #[test]

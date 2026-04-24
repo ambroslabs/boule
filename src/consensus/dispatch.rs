@@ -34,6 +34,7 @@ use bytes::Bytes;
 
 use crate::consensus::View;
 use crate::consensus::hotstuff::ConsensusMsg;
+use crate::consensus::hotstuff::qc::TimeoutVote;
 use crate::consensus::hotstuff::step::Action as SafetyAction;
 use crate::consensus::node::WireMessage;
 use crate::consensus::pacemaker;
@@ -81,6 +82,10 @@ pub enum Dispatch {
     ServeBlock { hash: BlockHash, to: NodeId },
     /// Peer replied to our [`WireMessage::BlockRequest`].
     ReceiveBlock { block: Option<Block>, from: NodeId },
+    /// A signed [`TimeoutVote`] arrived. The integration layer feeds
+    /// it into its timeout-certificate bucket; on reaching quorum the
+    /// bucket emits [`pacemaker::Event::OnTimeoutCert`] directly.
+    TimeoutVote(Signed<TimeoutVote>),
 }
 
 // ── Outbound ─────────────────────────────────────────────────────────────────
@@ -198,6 +203,12 @@ pub fn ingress_wire(
                 // It ignores stale events, so this is always safe to emit.
                 Dispatch::Pacemaker(pacemaker::Event::OnQc(high_qc_view)),
             ])
+        }
+
+        WireMessage::TimeoutVote(signed) => {
+            verify_signer(signed.signer, vs)?;
+            verify_sig(&signed)?;
+            Ok(vec![Dispatch::TimeoutVote(signed)])
         }
 
         WireMessage::BlockRequest(hash) => Ok(vec![Dispatch::ServeBlock { hash, to: from }]),
@@ -456,6 +467,62 @@ mod tests {
             dispatches[1],
             Dispatch::Pacemaker(pacemaker::Event::OnQc(7))
         ));
+    }
+
+    // ── ingress: TimeoutVote ────────────────────────────────────────────────
+
+    #[test]
+    fn ingress_timeout_vote_happy_path() {
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+
+        let tv = TimeoutVote {
+            view: 7,
+            high_qc: Some(sample_qc()),
+        };
+        let signed = Signed::sign(tv, &signer).unwrap();
+        let wire = WireMessage::TimeoutVote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let dispatches = ingress(signer.node_id(), &bytes, &vs).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert!(matches!(dispatches[0], Dispatch::TimeoutVote(_)));
+    }
+
+    #[test]
+    fn ingress_timeout_vote_unknown_signer_rejected() {
+        let signer = fresh_signer();
+        let other = fresh_signer();
+        let vs = make_vs_with_signers(&[&other]);
+
+        let tv = TimeoutVote {
+            view: 3,
+            high_qc: None,
+        };
+        let signed = Signed::sign(tv, &signer).unwrap();
+        let wire = WireMessage::TimeoutVote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let err = ingress(signer.node_id(), &bytes, &vs).unwrap_err();
+        assert!(matches!(err, IngressError::UnknownSigner(_)));
+    }
+
+    #[test]
+    fn ingress_timeout_vote_bad_signature_rejected() {
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+
+        let tv = TimeoutVote {
+            view: 1,
+            high_qc: None,
+        };
+        let mut signed = Signed::sign(tv, &signer).unwrap();
+        signed.sig[0] ^= 0xFF;
+        let wire = WireMessage::TimeoutVote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let err = ingress(signer.node_id(), &bytes, &vs).unwrap_err();
+        assert!(matches!(err, IngressError::InvalidSignature(_)));
     }
 
     // ── ingress: BlockRequest / BlockResponse ────────────────────────────────
