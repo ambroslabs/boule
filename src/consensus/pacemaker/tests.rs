@@ -328,9 +328,7 @@ impl Bus {
                         self.record_timeout(j, v);
                     }
                 }
-                Action::AdvanceToView { .. }
-                | Action::BecomeLeader(_)
-                | Action::ResetTimer(_) => {
+                Action::AdvanceToView { .. } | Action::BecomeLeader(_) | Action::ResetTimer(_) => {
                     // No network effect in the sim. Each scenario
                     // manually bootstraps the first proposal / timeout
                     // it cares about, so cascading view advancement is
