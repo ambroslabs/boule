@@ -206,7 +206,8 @@ impl HotStuffCore {
         match event {
             Event::ProposalReceived(signed) => self.on_proposal_received(signed),
             Event::VoteReceived(signed) => self.on_vote_received(signed),
-            Event::NewViewReceived(_) | Event::PacemakerAdvance(_) => Vec::new(),
+            Event::NewViewReceived(signed) => self.on_new_view_received(signed),
+            Event::PacemakerAdvance(_) => Vec::new(),
         }
     }
 
@@ -421,6 +422,26 @@ impl HotStuffCore {
         }
 
         actions
+    }
+
+    /// Handle an inbound [`NewView`]. Other replicas' way of telling
+    /// us "here's the highest QC I've seen". If it beats our current
+    /// `high_qc`, adopt — emit `Persist(HighQc(..))`. Otherwise ignore.
+    ///
+    /// This is the out-of-band adoption path that's intentionally not
+    /// gated on `safe_to_vote` (unlike B3): we trust the sender
+    /// exactly as much as we trust any validator handing us a QC,
+    /// which is "as much as the integration layer verified the
+    /// envelope". The QC itself carries its own quorum proof;
+    /// `should_update_high_qc`'s strict view comparison prevents the
+    /// stalest-writes-win anti-pattern.
+    fn on_new_view_received(&mut self, signed: Signed<NewView>) -> Vec<Action> {
+        let qc = signed.payload.high_qc;
+        if !should_update_high_qc(&qc, &self.state) {
+            return Vec::new();
+        }
+        self.state.high_qc = Some(qc.clone());
+        vec![Action::Persist(StateUpdate::HighQc(qc))]
     }
 
     /// Feed a trace of events through `step` in order, returning one
