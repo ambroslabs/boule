@@ -206,6 +206,16 @@ impl HotStuffCore {
         self.state.insert_pending(block);
     }
 
+    /// Directly set `high_qc` on the safety-core state.
+    ///
+    /// Used exclusively by the simulation layer to bootstrap a fresh
+    /// cluster: a genesis QC (with dummy signatures) is pre-seeded so
+    /// the view-1 leader can call `become_leader` immediately without
+    /// waiting for a NewView round. Do not call this in production code.
+    pub fn set_high_qc(&mut self, qc: QuorumCertificate) {
+        self.state.high_qc = Some(qc);
+    }
+
     /// Leader path: build and return a `Broadcast(Proposal)` action for
     /// `view` using the current `high_qc` as the justify.
     ///

@@ -37,6 +37,9 @@ pub mod pacemaker;
 pub mod validator_set;
 pub mod view_timer;
 
+#[cfg(test)]
+pub mod sim;
+
 /// HotStuff view number.
 pub type View = u64;
 

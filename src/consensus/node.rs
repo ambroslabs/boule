@@ -254,6 +254,9 @@ pub struct ConsensusNode {
     /// Configured view-timer behaviour; consulted by the timer helper
     /// in Phase D when arming/re-arming the view timer.
     pub timeout_policy: Arc<ExponentialBackoff>,
+    /// Optional channel to notify an observer (e.g. a test harness) of
+    /// each committed block. `None` in production builds.
+    commit_tx: Option<tokio::sync::mpsc::UnboundedSender<Block>>,
 }
 
 impl ConsensusNode {
@@ -302,7 +305,31 @@ impl ConsensusNode {
             wal,
             validator_set: config.validator_set,
             timeout_policy,
+            commit_tx: None,
         }
+    }
+
+    /// Attach a commit observer.
+    ///
+    /// Every block committed by the event loop is sent on `tx`. Intended
+    /// for test harnesses (e.g. `SimCluster`); production callers leave
+    /// this unset (`None`) and observe commits via the state machine.
+    pub fn with_commit_observer(mut self, tx: tokio::sync::mpsc::UnboundedSender<Block>) -> Self {
+        self.commit_tx = Some(tx);
+        self
+    }
+
+    /// Pre-seed a `high_qc` into the safety-core state.
+    ///
+    /// Used by the simulation layer to bootstrap a fresh cluster: without
+    /// a `high_qc` the view-1 leader cannot build a proposal (it would
+    /// have no parent block hash to use as justify). A genesis QC with
+    /// dummy signatures satisfies the safety-core's requirements because
+    /// the core does not re-verify QC signatures — that is the
+    /// integration layer's job at ingress.
+    pub fn with_genesis_qc(mut self, qc: QuorumCertificate) -> Self {
+        self.core.set_high_qc(qc);
+        self
     }
 
     /// Construct a `ConsensusNode`, restoring any durable control-plane
@@ -362,6 +389,7 @@ impl ConsensusNode {
             wal,
             validator_set: config.validator_set,
             timeout_policy,
+            commit_tx: None,
         })
     }
 
@@ -662,6 +690,9 @@ impl ConsensusNode {
             block.header.height,
             block.header.view,
         );
+        if let Some(tx) = &self.commit_tx {
+            let _ = tx.send(block);
+        }
     }
 }
 
