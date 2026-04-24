@@ -206,7 +206,8 @@ impl HotStuffCore {
         match event {
             Event::ProposalReceived(signed) => self.on_proposal_received(signed),
             Event::VoteReceived(signed) => self.on_vote_received(signed),
-            Event::NewViewReceived(_) | Event::PacemakerAdvance(_) => Vec::new(),
+            Event::NewViewReceived(signed) => self.on_new_view_received(signed),
+            Event::PacemakerAdvance(v) => self.on_pacemaker_advance(v),
         }
     }
 
@@ -423,6 +424,87 @@ impl HotStuffCore {
         actions
     }
 
+    /// Handle an inbound [`NewView`]. Other replicas' way of telling
+    /// us "here's the highest QC I've seen". If it beats our current
+    /// `high_qc`, adopt — emit `Persist(HighQc(..))`. Otherwise ignore.
+    ///
+    /// This is the out-of-band adoption path that's intentionally not
+    /// gated on `safe_to_vote` (unlike B3): we trust the sender
+    /// exactly as much as we trust any validator handing us a QC,
+    /// which is "as much as the integration layer verified the
+    /// envelope". The QC itself carries its own quorum proof;
+    /// `should_update_high_qc`'s strict view comparison prevents the
+    /// stalest-writes-win anti-pattern.
+    fn on_new_view_received(&mut self, signed: Signed<NewView>) -> Vec<Action> {
+        let qc = signed.payload.high_qc;
+        if !should_update_high_qc(&qc, &self.state) {
+            return Vec::new();
+        }
+        self.state.high_qc = Some(qc.clone());
+        vec![Action::Persist(StateUpdate::HighQc(qc))]
+    }
+
+    /// Handle a [`Event::PacemakerAdvance(v)`] signal from the outer
+    /// driver. Three things happen, in order:
+    ///
+    /// 1. Record the new view on `state.current_view`. The safety
+    ///    core never advances views on its own — this is the only
+    ///    path that writes `current_view`, so the pacemaker stays
+    ///    authoritative over liveness.
+    /// 2. Re-evaluate `parked_proposals`: any entry whose parent is
+    ///    now in `pending_blocks` gets its proposal re-dispatched
+    ///    through `on_proposal_received`. Nested re-parking is
+    ///    handled by `on_proposal_received`'s B1 branch.
+    /// 3. If we have a `high_qc` to advertise, emit
+    ///    `Broadcast(ConsensusMsg::NewView { high_qc })`. At startup
+    ///    before any proposal has landed, `high_qc` is `None` and we
+    ///    skip the broadcast — `NewView` has no `Option<QC>` to
+    ///    fall back on, and an all-zero synthesized QC would mislead
+    ///    anyone receiving it. In practice a real node sees the
+    ///    first proposal before the first pacemaker-driven view
+    ///    change, so this window is narrow.
+    ///
+    /// Emission order: un-park retry actions first (any
+    /// `Persist`/`SendTo`/`Broadcast` they produce), then the
+    /// `Broadcast(NewView)` sentinel last.
+    fn on_pacemaker_advance(&mut self, v: View) -> Vec<Action> {
+        self.state.current_view = v;
+
+        let mut actions = Vec::new();
+
+        // Un-park retries. Collect child hashes whose parent has since
+        // arrived, then drain-and-re-dispatch them one at a time. The
+        // two-step (collect, then remove+re-run) avoids holding an
+        // immutable borrow on `parked_proposals` while
+        // `on_proposal_received` mutates `self`.
+        let ready: Vec<BlockHash> = self
+            .parked_proposals
+            .iter()
+            .filter_map(|(child_hash, signed)| {
+                let parent_hash = signed.payload.block.header.parent_hash;
+                if self.state.pending_blocks.contains_key(&parent_hash) {
+                    Some(*child_hash)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for child_hash in ready {
+            if let Some(signed) = self.parked_proposals.remove(&child_hash) {
+                let retry_actions = self.on_proposal_received(signed);
+                actions.extend(retry_actions);
+            }
+        }
+
+        if let Some(high_qc) = self.state.high_qc.clone() {
+            actions.push(Action::Broadcast(ConsensusMsg::NewView(NewView {
+                high_qc,
+            })));
+        }
+
+        actions
+    }
+
     /// Feed a trace of events through `step` in order, returning one
     /// `Vec<Action>` per event. Consumes `self` so callers can't
     /// accidentally keep a reference into the core across the replay.
@@ -493,6 +575,16 @@ mod tests {
             payload: Vote { view, block_hash },
             signer: sender,
             sig: [sender[0]; 64],
+        }
+    }
+
+    /// Build a [`Signed<NewView>`] from `sender` carrying `high_qc`.
+    /// Same zero-verification stance as the proposal/vote helpers.
+    pub(crate) fn signed_newview(high_qc: QuorumCertificate, sender: NodeId) -> Signed<NewView> {
+        Signed {
+            payload: NewView { high_qc },
+            signer: sender,
+            sig: [0u8; 64],
         }
     }
 
@@ -1359,6 +1451,85 @@ mod tests {
         assert_eq!(core.state().high_qc.as_ref(), Some(&expected_qc));
     }
 
+    // ── D8: PacemakerAdvance base contract ──────────────────────────
+
+    #[test]
+    fn pacemaker_advance_updates_view_and_broadcasts_new_view_when_high_qc_known() {
+        let mut core = make_core(1);
+        assert_eq!(core.state().current_view, 0);
+
+        // Early: no high_qc yet → view updates but we skip the
+        // broadcast. The skip window only exists between construction
+        // and the first proposal landing.
+        let early = core.step(Event::PacemakerAdvance(1));
+        assert!(
+            early.is_empty(),
+            "no high_qc yet → no NewView broadcast: {early:?}",
+        );
+        assert_eq!(core.state().current_view, 1);
+
+        // Seed a high_qc as if a proposal had adopted one.
+        let qc = dummy_qc(5, [0xAA; 32]);
+        core.state.high_qc = Some(qc.clone());
+
+        // Later PacemakerAdvance → view updates AND the broadcast
+        // carries the current high_qc.
+        let later = core.step(Event::PacemakerAdvance(7));
+        assert_eq!(
+            later,
+            vec![Action::Broadcast(ConsensusMsg::NewView(NewView {
+                high_qc: qc,
+            }))],
+        );
+        assert_eq!(core.state().current_view, 7);
+    }
+
+    // ── C3: NewViewReceived ────────────────────────────────────────
+
+    #[test]
+    fn newview_adopts_fresher_high_qc_and_ignores_stale() {
+        let mut core = make_core(1);
+        let block_hash: BlockHash = [0x11; 32];
+
+        // Empty `high_qc` → any incoming QC is strictly fresher and
+        // adopted. Emission: single `Persist(HighQc(qc))`.
+        let qc_v5 = dummy_qc(5, block_hash);
+        let fresh = core.step(Event::NewViewReceived(signed_newview(
+            qc_v5.clone(),
+            nid(2),
+        )));
+        assert_eq!(
+            fresh,
+            vec![Action::Persist(StateUpdate::HighQc(qc_v5.clone()))],
+        );
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+
+        // Same view — `should_update_high_qc` requires strictly
+        // greater, so no action, no state change.
+        let qc_v5_alt = dummy_qc(5, [0x22; 32]);
+        let same = core.step(Event::NewViewReceived(signed_newview(qc_v5_alt, nid(3))));
+        assert!(same.is_empty(), "same-view NewView is a no-op: {same:?}");
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+
+        // Strictly older — dropped.
+        let qc_v3 = dummy_qc(3, [0x33; 32]);
+        let stale = core.step(Event::NewViewReceived(signed_newview(qc_v3, nid(4))));
+        assert!(stale.is_empty(), "stale NewView is a no-op: {stale:?}");
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+
+        // Strictly newer — adopted, overwriting the previous.
+        let qc_v9 = dummy_qc(9, [0x99; 32]);
+        let newer = core.step(Event::NewViewReceived(signed_newview(
+            qc_v9.clone(),
+            nid(2),
+        )));
+        assert_eq!(
+            newer,
+            vec![Action::Persist(StateUpdate::HighQc(qc_v9.clone()))],
+        );
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v9));
+    }
+
     #[test]
     fn post_quorum_votes_do_not_rebroadcast() {
         // Form the QC with 3 votes as before, then feed two additional
@@ -1429,6 +1600,75 @@ mod tests {
         assert!(
             core.vote_bucket.is_empty(),
             "bucket must not grow on unknown signer",
+        );
+    }
+
+    // ── D7: parked proposal re-dispatch after parent arrives ────────
+
+    #[test]
+    fn parked_proposal_redispatches_on_pacemaker_advance_once_parent_is_present() {
+        // Phase 1: receive a proposal for v2 while its parent v1
+        // isn't in `pending_blocks` — B1 parks it and emits
+        // `RequestBlock(v1_hash, sender)`.
+        //
+        // Phase 2: simulate v1 arriving via some out-of-band path
+        // (e.g., a RequestBlock response handled by the integration
+        // layer) by inserting it directly into `pending_blocks`.
+        //
+        // Phase 3: `PacemakerAdvance(3)` finds v2's parent now
+        // present, re-dispatches v2 through `on_proposal_received`,
+        // and then broadcasts `NewView` carrying the just-adopted
+        // high_qc.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
+        let block_v1 = chain[0].clone();
+        let block_v2 = chain[1].clone();
+        let block_v2_hash = block_v2.hash();
+        let justify_v1 = dummy_qc(1, block_v1.hash());
+
+        // Phase 1 — parent missing, proposal parks.
+        let initial = core.step(Event::ProposalReceived(signed_proposal(
+            block_v2.clone(),
+            justify_v1.clone(),
+            nid(2),
+        )));
+        assert_eq!(initial, vec![Action::RequestBlock(block_v1.hash(), nid(2))],);
+        assert!(core.parked_proposals.contains_key(&block_v2_hash));
+
+        // Phase 2 — parent lands some other way.
+        core.state.insert_pending(block_v1.clone());
+
+        // Phase 3 — advance the view; un-park fires.
+        let advance = core.step(Event::PacemakerAdvance(3));
+
+        // Re-dispatch of v2 yields the normal B2/B3 actions:
+        // VotedInView + HighQc + SendTo(leader(3)=nid(4), Vote).
+        // B4/B5 skip (grandparent is genesis's sentinel).
+        // Then C4's trailing `Broadcast(NewView)` carries the just-
+        // adopted high_qc.
+        assert_eq!(
+            advance,
+            vec![
+                Action::Persist(StateUpdate::VotedInView { view: 2 }),
+                Action::Persist(StateUpdate::HighQc(justify_v1.clone())),
+                Action::SendTo(
+                    nid(4),
+                    ConsensusMsg::Vote(Vote {
+                        view: 2,
+                        block_hash: block_v2_hash,
+                    }),
+                ),
+                Action::Broadcast(ConsensusMsg::NewView(NewView {
+                    high_qc: justify_v1,
+                })),
+            ],
+            "un-park re-dispatch + NewView broadcast",
+        );
+        assert_eq!(core.state().current_view, 3);
+        assert!(
+            !core.parked_proposals.contains_key(&block_v2_hash),
+            "parked entry removed after successful re-dispatch",
         );
     }
 }
