@@ -517,6 +517,16 @@ mod tests {
         }
     }
 
+    /// Build a [`Signed<NewView>`] from `sender` carrying `high_qc`.
+    /// Same zero-verification stance as the proposal/vote helpers.
+    pub(crate) fn signed_newview(high_qc: QuorumCertificate, sender: NodeId) -> Signed<NewView> {
+        Signed {
+            payload: NewView { high_qc },
+            signer: sender,
+            sig: [0u8; 64],
+        }
+    }
+
     /// Build an all-zero-signature [`Signed<Proposal>`] from `sender`.
     /// The safety core never verifies the envelope; the `sig` bytes
     /// are deliberately meaningless so tests stay deterministic.
@@ -1378,6 +1388,52 @@ mod tests {
             "quorum transition emits HighQc persist then Broadcast(Proposal)",
         );
         assert_eq!(core.state().high_qc.as_ref(), Some(&expected_qc));
+    }
+
+    // ── C3: NewViewReceived ────────────────────────────────────────
+
+    #[test]
+    fn newview_adopts_fresher_high_qc_and_ignores_stale() {
+        let mut core = make_core(1);
+        let block_hash: BlockHash = [0x11; 32];
+
+        // Empty `high_qc` → any incoming QC is strictly fresher and
+        // adopted. Emission: single `Persist(HighQc(qc))`.
+        let qc_v5 = dummy_qc(5, block_hash);
+        let fresh = core.step(Event::NewViewReceived(signed_newview(
+            qc_v5.clone(),
+            nid(2),
+        )));
+        assert_eq!(
+            fresh,
+            vec![Action::Persist(StateUpdate::HighQc(qc_v5.clone()))],
+        );
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+
+        // Same view — `should_update_high_qc` requires strictly
+        // greater, so no action, no state change.
+        let qc_v5_alt = dummy_qc(5, [0x22; 32]);
+        let same = core.step(Event::NewViewReceived(signed_newview(qc_v5_alt, nid(3))));
+        assert!(same.is_empty(), "same-view NewView is a no-op: {same:?}");
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+
+        // Strictly older — dropped.
+        let qc_v3 = dummy_qc(3, [0x33; 32]);
+        let stale = core.step(Event::NewViewReceived(signed_newview(qc_v3, nid(4))));
+        assert!(stale.is_empty(), "stale NewView is a no-op: {stale:?}");
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+
+        // Strictly newer — adopted, overwriting the previous.
+        let qc_v9 = dummy_qc(9, [0x99; 32]);
+        let newer = core.step(Event::NewViewReceived(signed_newview(
+            qc_v9.clone(),
+            nid(2),
+        )));
+        assert_eq!(
+            newer,
+            vec![Action::Persist(StateUpdate::HighQc(qc_v9.clone()))],
+        );
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v9));
     }
 
     #[test]
