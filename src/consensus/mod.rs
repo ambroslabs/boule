@@ -27,11 +27,11 @@
 //! [`crate::replication::block`]. HotStuff relies on views being strictly
 //! increasing; the pacemaker is the only module allowed to advance it.
 
-// Types here are consumed by future milestones (#22.B/#22.C onward).
-// Allow dead code until then, matching `replication/mod.rs`.
+// Some items in sub-modules are consumed across PRs; allow until wired up.
 #![allow(dead_code)]
 
 pub mod hotstuff;
+pub mod node;
 pub mod pacemaker;
 pub mod validator_set;
 
