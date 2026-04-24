@@ -196,6 +196,39 @@ impl HotStuffCore {
         &self.state
     }
 
+    /// Insert a block into `pending_blocks` directly.
+    ///
+    /// Used by the integration layer when a `BlockResponse` arrives for
+    /// a block we requested: insert it, then re-drive the core via
+    /// `step(Event::PacemakerAdvance(current_view))` to un-park any
+    /// proposals that were waiting on this parent.
+    pub fn insert_pending_block(&mut self, block: Block) {
+        self.state.insert_pending(block);
+    }
+
+    /// Leader path: build and return a `Broadcast(Proposal)` action for
+    /// `view` using the current `high_qc` as the justify.
+    ///
+    /// Called by the integration layer when the pacemaker emits
+    /// `Action::BecomeLeader(view)`. Returns an empty `Vec` if:
+    /// - there is no `high_qc` yet (first ever view, waiting for NewViews), or
+    /// - the parent block the QC refers to is not in `pending_blocks`
+    ///   (block-sync not yet complete; the proposal will happen once
+    ///   the parent arrives via the `ReceiveBlock` path).
+    pub fn become_leader(&mut self, view: View) -> Vec<Action> {
+        let Some(high_qc) = self.state.high_qc.clone() else {
+            return Vec::new();
+        };
+        let Some(parent) = self.state.pending_blocks.get(&high_qc.block_hash).cloned() else {
+            return Vec::new();
+        };
+        let new_block = self.builder.build(&parent, view, &high_qc);
+        vec![Action::Broadcast(ConsensusMsg::Proposal(Proposal {
+            block: new_block,
+            justify: high_qc,
+        }))]
+    }
+
     /// React to `event` and return the [`Action`]s the integration
     /// layer must carry out, in emission order.
     ///
