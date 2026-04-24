@@ -1451,6 +1451,39 @@ mod tests {
         assert_eq!(core.state().high_qc.as_ref(), Some(&expected_qc));
     }
 
+    // ── D8: PacemakerAdvance base contract ──────────────────────────
+
+    #[test]
+    fn pacemaker_advance_updates_view_and_broadcasts_new_view_when_high_qc_known() {
+        let mut core = make_core(1);
+        assert_eq!(core.state().current_view, 0);
+
+        // Early: no high_qc yet → view updates but we skip the
+        // broadcast. The skip window only exists between construction
+        // and the first proposal landing.
+        let early = core.step(Event::PacemakerAdvance(1));
+        assert!(
+            early.is_empty(),
+            "no high_qc yet → no NewView broadcast: {early:?}",
+        );
+        assert_eq!(core.state().current_view, 1);
+
+        // Seed a high_qc as if a proposal had adopted one.
+        let qc = dummy_qc(5, [0xAA; 32]);
+        core.state.high_qc = Some(qc.clone());
+
+        // Later PacemakerAdvance → view updates AND the broadcast
+        // carries the current high_qc.
+        let later = core.step(Event::PacemakerAdvance(7));
+        assert_eq!(
+            later,
+            vec![Action::Broadcast(ConsensusMsg::NewView(NewView {
+                high_qc: qc,
+            }))],
+        );
+        assert_eq!(core.state().current_view, 7);
+    }
+
     // ── C3: NewViewReceived ────────────────────────────────────────
 
     #[test]
