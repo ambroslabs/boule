@@ -38,7 +38,10 @@ use crate::p2p::identity::NodeIdentity;
 /// Split out from the concrete [`NodeSigner`] so tests can substitute a
 /// fake and so a future non-exportable backend (HSM / TPM / TEE) can plug
 /// in without touching call sites.
-pub trait Signer {
+///
+/// The `Send + Sync` bounds allow `Arc<dyn Signer>` to be shared across
+/// threads and held across await points in the async event loop.
+pub trait Signer: Send + Sync {
     fn node_id(&self) -> NodeId;
     fn sign(&self, msg: &[u8]) -> [u8; 64];
 }
