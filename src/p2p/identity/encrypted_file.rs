@@ -121,6 +121,23 @@ impl KeyProvider for EncryptedFileKeyProvider {
         info!("provisioned encrypted node key at {}", self.path.display());
         Ok(())
     }
+
+    fn is_provisioning_capable(&self) -> bool {
+        true
+    }
+
+    fn try_load(&self) -> anyhow::Result<Option<NodeIdentity>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(&self.path).context("reading encrypted key")?;
+        let blob = decode_envelope(&raw).context("decoding encrypted key envelope")?;
+        let passphrase = self.passphrase(false)?;
+        let der = decrypt_blob(&blob, &passphrase)?;
+        let id = NodeIdentity { pkcs8_der: der };
+        id.validate().context("validating decrypted node key")?;
+        Ok(Some(id))
+    }
 }
 
 fn argon2_key(

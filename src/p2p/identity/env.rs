@@ -48,6 +48,16 @@ impl KeyProvider for EnvKeyProvider {
             .with_context(|| format!("validating key from {}", self.env_var))?;
         Ok(identity)
     }
+
+    fn try_load(&self) -> anyhow::Result<Option<NodeIdentity>> {
+        // Only attempt the actual decode if the env var is present —
+        // an unset var means "no key here" (the operator hasn't wired
+        // it up yet) and is the sentinel `init` looks for.
+        match std::env::var(&self.env_var) {
+            Ok(_) => Ok(Some(self.load_or_init()?)),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]

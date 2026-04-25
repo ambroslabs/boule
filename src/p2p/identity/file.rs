@@ -85,6 +85,22 @@ impl KeyProvider for FileKeyProvider {
         info!("provisioned node key at {}", self.path.display());
         Ok(())
     }
+
+    fn is_provisioning_capable(&self) -> bool {
+        true
+    }
+
+    fn try_load(&self) -> anyhow::Result<Option<NodeIdentity>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        check_permissions(&self.path, self.allow_insecure_perms)?;
+        let raw = fs::read(&self.path).context("reading node key")?;
+        let (der, _encoding) = decode_pkcs8(&raw).context("decoding node key")?;
+        let identity = NodeIdentity { pkcs8_der: der };
+        identity.validate().context("validating node key")?;
+        Ok(Some(identity))
+    }
 }
 
 fn atomic_write_pem(path: &Path, der: &[u8]) -> anyhow::Result<()> {
