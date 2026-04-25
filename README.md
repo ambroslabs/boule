@@ -123,6 +123,46 @@ Library directory on macOS, `%APPDATA%\ambros-p2p\config.toml` on
 Windows). Run `ambros-p2p init` to write a starter template at that path
 on first use.
 
+### Topology overlay (mesh vs. gossip)
+
+Consensus consumes a `Broadcaster` + `Discovery` pair (`src/p2p/overlay/`)
+so the underlying topology is a black box. Two implementations ship:
+
+- **`gossip`** (default) — each node keeps at most `target_degree`
+  direct TLS connections (default 8) and learns about the rest of the
+  validator set through periodic peer-list gossip. Add new operators
+  by pointing one or two seed addresses at any reachable validator;
+  no coordinated config rollouts when the validator set grows.
+- **`mesh`** — every node holds an explicit TLS connection to every
+  other node. Simple, predictable, and the right choice for a
+  single-operator testnet, but doesn't scale beyond a handful of
+  validators.
+
+Switch with the `[overlay]` table:
+
+```toml
+[overlay]
+mode = "gossip"                 # "gossip" (default) | "mesh"
+target_degree = 8               # gossip-only: max direct peers per node
+peer_gossip_interval_ms = 5000  # gossip-only: peer-list publish cadence
+mesh_check_interval_ms = 5000   # gossip-only: maintenance dial cadence
+bootstrap_addrs = ["10.0.0.1:7000"]  # gossip-only: TOFU seeds
+```
+
+The remaining knobs (`peer_gossip_fanout`, `dedup_capacity`,
+`dedup_ttl_ms`, `peer_table_capacity`) tune the gossip overlay's
+internals; defaults are sized for validator-set-scale clusters and
+most operators leave them alone. See `[OverlayConfig](src/config.rs)`
+for the full schema.
+
+`bootstrap_addrs` are TOFU dials — the gossip overlay accepts whatever
+TLS identity the peer presents on first contact and updates its
+peer-table entry from the peer's own self-advertised
+`(node_id, listen_addr)` on the next gossip tick. `[[peers]]` and
+`bootstrap_addrs` compose: anything in `[[peers]]` is dialed at boot
+with a verified `node_id`, and anything in `bootstrap_addrs` is
+dialed lazily in TOFU mode.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor representations,
