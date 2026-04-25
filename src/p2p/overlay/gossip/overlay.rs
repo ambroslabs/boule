@@ -74,7 +74,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::info;
 
 use crate::clock::Clock;
 use crate::p2p::ProtocolEvent;
@@ -396,7 +396,21 @@ impl GossipOverlay {
             // overlay does not route point-to-point, so a unicast to
             // a non-direct peer is a best-effort broadcast that may
             // reach the target through forwarding.
-            debug!("GossipOverlay::send_to to non-direct peer; falling back to broadcast");
+            //
+            // Issue #178 surfaced this fallback at INFO level: a
+            // `BlockRequest` aimed at the original proposer of an
+            // unknown-parent proposal lands here whenever the proposer
+            // isn't in our direct-peer set, which is the common case
+            // under sparse-mesh + restart. Operators correlate this
+            // with the matching `block_sync_request_emitted` line on
+            // the consensus side to confirm the request actually went
+            // out via a broadcast hop.
+            info!(
+                target: "ambros_p2p::p2p::overlay::gossip",
+                target_peer = %crate::p2p::tls::node_id_to_base58(&target),
+                direct_peer_count = direct.len(),
+                "send_to_broadcast_fallback",
+            );
             self.do_broadcast(payload);
         }
     }

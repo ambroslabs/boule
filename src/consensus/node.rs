@@ -745,6 +745,26 @@ impl ConsensusNode {
         let (timer_tx, mut timer_rx) = mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
+        // Boot-time snapshot of recovered durable state. Logged once
+        // per node start so operators can correlate "did we come up
+        // already behind the live cluster?" with downstream block-sync
+        // events. Issue #178 introduced this trace to disambiguate
+        // restart bootstrap from peer-disconnect / block-not-found
+        // stalls — the latter two only ever fire post-resume, so a
+        // missing `consensus_resumed` line means the run loop never
+        // started.
+        tracing::info!(
+            target: TRACE_TARGET,
+            self_id = %node_id_to_base58(&self.self_id),
+            last_committed_height = self.last_committed_height,
+            last_committed_view = self.last_committed_view,
+            high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view),
+            last_voted_view = self.core.state().last_voted_view,
+            locked_view = ?self.core.state().locked.as_ref().map(|l| l.view),
+            validator_set_size = self.validator_set.len(),
+            "consensus_resumed",
+        );
+
         // Publish an initial snapshot before doing anything else, so
         // the HTTP endpoint has a sane value available even if it's
         // queried in the tiny window before the boot actions fire.
@@ -866,8 +886,19 @@ impl ConsensusNode {
             // and re-drive parked proposals via PacemakerAdvance.
             Dispatch::ReceiveBlock {
                 block: Some(block),
-                from: _,
+                from,
             } => {
+                let block_hash = block.hash();
+                let block_view = block.header.view;
+                let block_height = block.header.height;
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    from = %node_id_to_base58(&from),
+                    hash = ?block_hash,
+                    view = block_view,
+                    height = block_height,
+                    "block_sync_response_received",
+                );
                 self.core.insert_pending_block(block);
                 let current = self.pacemaker.current_view();
                 let actions = self.step_safety(SafetyEvent::PacemakerAdvance(current));
@@ -876,7 +907,11 @@ impl ConsensusNode {
             }
 
             Dispatch::ReceiveBlock { block: None, from } => {
-                tracing::debug!("consensus: block not found at peer {from:?}");
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    from = %node_id_to_base58(&from),
+                    "block_sync_response_not_found",
+                );
             }
 
             Dispatch::TimeoutVote(signed) => {
@@ -984,14 +1019,16 @@ impl ConsensusNode {
                         tracing::debug!(
                             target: TRACE_TARGET,
                             hash = ?hash,
-                            "request_block_self_dropped",
+                            "block_sync_request_self_dropped",
                         );
                     } else {
-                        tracing::debug!(
+                        tracing::info!(
                             target: TRACE_TARGET,
                             dest = %node_id_to_base58(&peer),
                             hash = ?hash,
-                            "outbound_block_request",
+                            our_view = self.pacemaker.current_view(),
+                            our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view),
+                            "block_sync_request_emitted",
                         );
                         let out = dispatch::egress_block_request(hash, peer);
                         send_outbound(broadcaster, out).await;
@@ -1134,7 +1171,7 @@ impl ConsensusNode {
             }) => {
                 let voted = actions
                     .iter()
-                    .any(|a| matches!(a, SafetyAction::SendTo(_, ConsensusMsg::Vote(_))));
+                    .any(|a| matches!(a, SafetyAction::Broadcast(ConsensusMsg::Vote(_))));
                 let parked = actions
                     .iter()
                     .any(|a| matches!(a, SafetyAction::RequestBlock(_, _)));
@@ -1147,6 +1184,22 @@ impl ConsensusNode {
                     parked,
                     "proposal_received",
                 );
+                // Surface the missing-parent path at WARN so operators
+                // can see block-sync triggered without having to enable
+                // DEBUG-level logging on `ambros_p2p::consensus`. The
+                // matching `block_sync_request_emitted` event is logged
+                // at INFO from `apply_safety_actions` when the request
+                // actually leaves the node.
+                if parked {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        proposer = %node_id_to_base58(&proposer),
+                        view,
+                        height,
+                        request_block_emitted = true,
+                        "proposal_rejected_unknown_parent",
+                    );
+                }
             }
             Some(SafetyLogCtx::Vote { voter, view }) => {
                 let formed_qc = actions
