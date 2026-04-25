@@ -524,7 +524,7 @@ impl HotStuffCore {
     }
 
     /// Handle a [`Event::PacemakerAdvance(v)`] signal from the outer
-    /// driver. Three things happen, in order:
+    /// driver. Four things happen, in order:
     ///
     /// 1. Record the new view on `state.current_view`. The safety
     ///    core never advances views on its own — this is the only
@@ -534,7 +534,16 @@ impl HotStuffCore {
     ///    now in `pending_blocks` gets its proposal re-dispatched
     ///    through `on_proposal_received`. Nested re-parking is
     ///    handled by `on_proposal_received`'s B1 branch.
-    /// 3. If we have a `high_qc` to advertise, emit
+    /// 3. For each entry that is *still* parked (its parent has not
+    ///    arrived), re-emit `Action::RequestBlock(parent_hash, sender)`
+    ///    so the integration layer can retry the fetch. Without this,
+    ///    a `BlockRequest` that vanished on the wire (target peer
+    ///    crashed, gossip-fallback broadcast that didn't reach a
+    ///    server, …) would never be resent — a permanent liveness
+    ///    stall any time block-sync's first probe goes unanswered.
+    ///    See issue #178 for the sparse-mesh + restart symptom this
+    ///    branch unblocks.
+    /// 4. If we have a `high_qc` to advertise, emit
     ///    `Broadcast(ConsensusMsg::NewView { high_qc })`. At startup
     ///    before any proposal has landed, `high_qc` is `None` and we
     ///    skip the broadcast — `NewView` has no `Option<QC>` to
@@ -544,8 +553,9 @@ impl HotStuffCore {
     ///    change, so this window is narrow.
     ///
     /// Emission order: un-park retry actions first (any
-    /// `Persist`/`SendTo`/`Broadcast` they produce), then the
-    /// `Broadcast(NewView)` sentinel last.
+    /// `Persist`/`SendTo`/`Broadcast` they produce), then any
+    /// `RequestBlock` retries for still-parked proposals, then
+    /// the `Broadcast(NewView)` sentinel last.
     fn on_pacemaker_advance(&mut self, v: View) -> Vec<Action> {
         self.state.current_view = v;
 
@@ -573,6 +583,27 @@ impl HotStuffCore {
                 let retry_actions = self.on_proposal_received(signed);
                 actions.extend(retry_actions);
             }
+        }
+
+        // Block-sync retry. For each proposal still parked (its parent
+        // never arrived between the original `RequestBlock` emission
+        // and now), re-emit the request. Sorted by `child_hash` so
+        // replay/property tests stay byte-identical regardless of
+        // `HashMap` iteration order.
+        let mut still_parked: Vec<(BlockHash, BlockHash, NodeId)> = self
+            .parked_proposals
+            .iter()
+            .map(|(child_hash, signed)| {
+                (
+                    *child_hash,
+                    signed.payload.block.header.parent_hash,
+                    signed.signer,
+                )
+            })
+            .collect();
+        still_parked.sort_by_key(|(child_hash, _, _)| *child_hash);
+        for (_, parent_hash, sender) in still_parked {
+            actions.push(Action::RequestBlock(parent_hash, sender));
         }
 
         if let Some(high_qc) = self.state.high_qc.clone() {
@@ -1736,6 +1767,105 @@ mod tests {
             !core.parked_proposals.contains_key(&block_v2_hash),
             "parked entry removed after successful re-dispatch",
         );
+    }
+
+    /// Issue #178 regression. A proposal whose parent never arrived
+    /// stays parked across `PacemakerAdvance`. Each subsequent advance
+    /// must re-emit `Action::RequestBlock(parent_hash, sender)` so the
+    /// integration layer retries the fetch — without this, a single
+    /// dropped `BlockRequest` strands the proposal forever and any
+    /// further consensus progress on this node depends on a peer
+    /// happening to re-propose a descendant block.
+    #[test]
+    fn still_parked_proposal_re_emits_request_block_on_pacemaker_advance() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
+        let block_v1 = chain[0].clone();
+        let block_v2 = chain[1].clone();
+        let justify_v1 = dummy_qc(1, block_v1.hash());
+
+        // Phase 1 — parent missing, proposal parks. Initial RequestBlock fires.
+        let initial = core.step(Event::ProposalReceived(signed_proposal(
+            block_v2.clone(),
+            justify_v1,
+            nid(2),
+        )));
+        assert_eq!(initial, vec![Action::RequestBlock(block_v1.hash(), nid(2))]);
+
+        // Phase 2 — parent has NOT arrived yet. PacemakerAdvance must
+        // re-emit RequestBlock so the integration layer can retry.
+        // No high_qc set → no trailing Broadcast(NewView).
+        let advance = core.step(Event::PacemakerAdvance(2));
+        assert_eq!(
+            advance,
+            vec![Action::RequestBlock(block_v1.hash(), nid(2))],
+            "still-parked proposal must re-fire RequestBlock on PacemakerAdvance",
+        );
+        assert_eq!(core.state().current_view, 2);
+        assert!(
+            core.parked_proposals.contains_key(&block_v2.hash()),
+            "proposal stays parked until parent arrives",
+        );
+
+        // Phase 3 — parent lands. Next PacemakerAdvance un-parks (no
+        // RequestBlock retry, parent now resolved) and the un-parked
+        // proposal proceeds through the happy path.
+        core.state.insert_pending(block_v1.clone());
+        let advance = core.step(Event::PacemakerAdvance(3));
+        let has_request_block = advance
+            .iter()
+            .any(|a| matches!(a, Action::RequestBlock(_, _)));
+        assert!(
+            !has_request_block,
+            "no RequestBlock should fire once the parent has arrived; got {advance:?}",
+        );
+        let has_vote = advance
+            .iter()
+            .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Vote(_))));
+        assert!(
+            has_vote,
+            "un-parked proposal must vote on its newly-resolved parent",
+        );
+    }
+
+    /// When two proposals are parked at distinct parents, every
+    /// `PacemakerAdvance` re-emits one `RequestBlock` per still-parked
+    /// proposal. Sorted-by-`child_hash` iteration keeps replay
+    /// deterministic.
+    #[test]
+    fn multiple_still_parked_proposals_each_get_a_request_block_retry() {
+        let mut core = make_core(1);
+        let parent_a: BlockHash = [0xAA; 32];
+        let parent_b: BlockHash = [0xBB; 32];
+        let justify = dummy_qc(0, core.state().genesis_hash);
+
+        let _ = core.step(Event::ProposalReceived(signed_proposal(
+            orphan_child(parent_a, 1, nid(2)),
+            justify.clone(),
+            nid(3),
+        )));
+        let _ = core.step(Event::ProposalReceived(signed_proposal(
+            orphan_child(parent_b, 2, nid(2)),
+            justify,
+            nid(4),
+        )));
+        assert_eq!(core.parked_proposals.len(), 2);
+
+        let advance = core.step(Event::PacemakerAdvance(3));
+        let request_blocks: Vec<_> = advance
+            .iter()
+            .filter(|a| matches!(a, Action::RequestBlock(_, _)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            request_blocks.len(),
+            2,
+            "every still-parked proposal must get a retry RequestBlock; got {advance:?}",
+        );
+        // Both targets are present.
+        assert!(request_blocks.contains(&Action::RequestBlock(parent_a, nid(3))));
+        assert!(request_blocks.contains(&Action::RequestBlock(parent_b, nid(4))));
     }
 
     // ── D9: replay determinism ─────────────────────────────────────
