@@ -9,6 +9,54 @@ use super::manager::{AnyStream, ManagerMsg};
 use super::tls::{NodeId, TlsIdentity, TlsStream, extract_node_id, node_id_to_base58};
 use crate::clock::Clock;
 
+/// Bundle of per-node dialer dependencies — the parameters every
+/// invocation of [`reconnect_loop`] needs that are constant across the
+/// lifetime of a node.
+///
+/// Construct one once at startup and reuse it for every `(addr,
+/// expected_node_id)` pair that needs an outbound dialer (the static
+/// peers list at boot, plus runtime additions from the gossip
+/// overlay's `Discovery::add_bootstrap` and partial-mesh maintenance
+/// loop).
+#[derive(Clone)]
+pub struct DialerCtx {
+    /// Long-term TLS identity used for every outbound handshake.
+    pub identity: Arc<TlsIdentity>,
+    /// Channel into the peer manager for new connections.
+    pub internal_tx: mpsc::Sender<ManagerMsg>,
+    /// Broadcast that the manager fans out when a peer drops; the
+    /// reconnect loop uses it to trigger redials.
+    pub peer_gone_tx: broadcast::Sender<NodeId>,
+    /// Optional command channel into the manager. When supplied the
+    /// reconnect loop skips redials whose target is already directly
+    /// connected (issue #114).
+    pub peer_cmd_tx: Option<mpsc::Sender<PeerCommand>>,
+    /// Clock used for sleep / backoff between failed dials.
+    pub clock: Arc<dyn Clock>,
+}
+
+impl DialerCtx {
+    /// Spawn a [`reconnect_loop`] that maintains an outbound
+    /// connection to `addr` (asserting `expected_node_id` when set).
+    /// Returns the spawned [`JoinHandle`] so callers that want to
+    /// cancel on shutdown can hold it.
+    pub fn spawn(
+        &self,
+        addr: std::net::SocketAddr,
+        expected_node_id: Option<NodeId>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(reconnect_loop(
+            addr,
+            expected_node_id,
+            Arc::clone(&self.identity),
+            self.internal_tx.clone(),
+            self.peer_gone_tx.clone(),
+            self.peer_cmd_tx.clone(),
+            Arc::clone(&self.clock),
+        ))
+    }
+}
+
 /// Continuously attempts to maintain an outbound connection to `addr`.
 /// On success, waits for the connection to die (via the peer_gone broadcast)
 /// before retrying. Backs off exponentially on failure, capped at 60 s.

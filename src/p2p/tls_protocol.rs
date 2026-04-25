@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 
-use super::dialer;
+use super::dialer::DialerCtx;
 use super::listener;
 use super::manager::ManagerMsg;
 use super::tls::{TlsIdentity, base58_to_node_id};
@@ -35,6 +35,14 @@ impl ConnectionProtocol for TlsConnectionProtocol {
             manager_tx.clone(),
         ));
 
+        let dialer_ctx = DialerCtx {
+            identity: Arc::clone(&self.identity),
+            internal_tx: manager_tx,
+            peer_gone_tx,
+            peer_cmd_tx: self.peer_cmd_tx,
+            clock: Arc::clone(&self.clock),
+        };
+
         for peer in self.peers {
             let expected = peer
                 .node_id
@@ -42,15 +50,7 @@ impl ConnectionProtocol for TlsConnectionProtocol {
                 .map(base58_to_node_id)
                 .transpose()
                 .expect("invalid peer node_id in config");
-            tokio::spawn(dialer::reconnect_loop(
-                peer.addr,
-                expected,
-                Arc::clone(&self.identity),
-                manager_tx.clone(),
-                peer_gone_tx.clone(),
-                self.peer_cmd_tx.clone(),
-                Arc::clone(&self.clock),
-            ));
+            dialer_ctx.spawn(peer.addr, expected);
         }
     }
 }
