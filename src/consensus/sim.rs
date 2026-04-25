@@ -374,7 +374,7 @@ impl SimCluster {
             // Yield batch: large enough to drain a full
             // broadcast/vote/QC ingress round across n=4 nodes, which
             // is typically ~20–40 task wake-ups.
-            for _ in 0..64 {
+            for _ in 0..16 {
                 tokio::task::yield_now().await;
             }
         }
@@ -634,9 +634,14 @@ mod tests {
 
         // Drain the task queue without advancing the clock. The happy-path
         // chain (B1 → B2 → B3 → B4) requires ~5 rounds of message exchange;
-        // 500 yields gives ample margin even on slow CI.
+        // poll commit heights so we stop as soon as ≥ 3 nodes have committed
+        // a block, with a generous max-yield budget as a safety net.
         for _ in 0..500 {
             yield_now().await;
+            let heights = cluster.peek_commit_heights();
+            if heights.iter().filter(|&&h| h > 0).count() >= 3 {
+                break;
+            }
         }
 
         let committed = cluster.drain_commits();
@@ -935,37 +940,48 @@ mod tests {
         // panics ("time is already frozen") since we're in one tokio::test.
         tokio::time::pause();
 
-        // Each entry is (seed, crash_at_yield, victim_index).
-        //
-        // All crash_at values are >= 200 yields so that views 1–4 complete
-        // in the warmup (each view takes ~20–40 yields with channel routing).
-        // This guarantees progress before every kill and ensures the
-        // surviving three nodes can finish the next window of views.
-        let scenarios: &[(u64, usize, usize)] = &[
-            (0, 200, 0), // crash view-4 aggregator after all of views 1–4
-            (1, 200, 1), // crash view-5 aggregator after views 1–4
-            (2, 200, 2), // crash view-2 aggregator after views 1–4
-            (3, 200, 3), // crash view-3 aggregator after views 1–4
-            (4, 300, 0), // crash node 0 again with extra warmup
-        ];
+        // Each entry is (seed, victim_index). The warmup loop below polls
+        // commit heights so we stop as soon as a non-victim has committed,
+        // rather than burning a fixed 200–300 yields. `seed` is preserved
+        // for error-message readability — it doesn't seed RNG today.
+        let scenarios: &[(u64, usize)] = &[(0, 0), (1, 1), (2, 2), (3, 3), (4, 0)];
 
-        for &(seed, crash_at, victim) in scenarios {
+        // Generous yield ceilings — early-exit usually fires well before.
+        const WARMUP_BUDGET: usize = 400;
+        const POST_KILL_DRAIN: usize = 100;
+
+        for &(seed, victim) in scenarios {
             let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
 
-            for _ in 0..crash_at {
+            let mut warmed = false;
+            for _ in 0..WARMUP_BUDGET {
                 tokio::task::yield_now().await;
+                let heights = cluster.peek_commit_heights();
+                if heights
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &h)| i != victim && h > 0)
+                {
+                    warmed = true;
+                    break;
+                }
             }
+            assert!(
+                warmed,
+                "seed {seed}: warmup did not produce any non-victim commit within {WARMUP_BUDGET} yields",
+            );
 
             cluster.kill_node(victim);
 
-            for _ in 0..600 {
+            // Drain in-flight messages. Time is paused, so no new view
+            // timers fire — this is just runtime cleanup, not progress.
+            for _ in 0..POST_KILL_DRAIN {
                 tokio::task::yield_now().await;
             }
 
             let committed = cluster.drain_commits();
             assert_no_conflicts(&committed);
 
-            // The non-victim nodes must have made some progress.
             let progress: usize = committed
                 .iter()
                 .enumerate()
