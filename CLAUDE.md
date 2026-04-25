@@ -9,10 +9,14 @@ PR checklist live in [CONTRIBUTING.md](CONTRIBUTING.md). Read those first.
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
+cargo deny check
 ```
 
 CI runs `fmt`, `clippy`, `test`, and `cargo-deny`. All four must pass before a
-human reviews the PR.
+human reviews the PR. The SessionStart hook in `.claude/hooks/session-start.sh`
+installs `cargo-deny` for remote sessions; if `cargo deny` is missing locally,
+install it (e.g. `cargo install --locked cargo-deny`) rather than skipping the
+check.
 
 ## Workflow
 

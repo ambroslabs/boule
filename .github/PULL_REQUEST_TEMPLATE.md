@@ -16,6 +16,7 @@ restating the diff. -->
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --all-targets -- -D warnings`
 - [ ] `cargo test --locked`
+- [ ] `cargo deny check`
 
 <!--
 For bug-fix PRs, also consider:
