@@ -178,21 +178,24 @@ fn default_timeout_max_ms() -> u64 {
     10_000
 }
 
-/// Topology-overlay configuration. Selects between the legacy full-mesh
-/// implementation (`mode = "mesh"`, the default) and the partial-mesh
-/// gossip overlay (`mode = "gossip"`, issue #137).
+/// Topology-overlay configuration. Selects between the partial-mesh
+/// gossip overlay (`mode = "gossip"`, the default) and the legacy
+/// full-mesh implementation (`mode = "mesh"`, retained for fallback
+/// and for tests that want N–1 connectivity guarantees).
 ///
 /// Defaults are tuned to match the per-module `Default` impls in the
 /// gossip building blocks ([`crate::p2p::overlay::gossip::peer_list_task::PeerListGossipConfig`],
 /// [`crate::p2p::overlay::gossip::maintenance::MeshMaintenanceConfig`],
 /// [`crate::p2p::overlay::gossip::overlay::GossipOverlayConfig`]), so a
-/// node that opts in with just `[overlay] mode = "gossip"` behaves the
-/// same as the breakdown-comment defaults on issue #137.
+/// node that omits `[overlay]` entirely gets the breakdown-comment
+/// defaults from issue #137.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OverlayConfig {
-    /// Which overlay implementation to use. Defaults to `mesh`; the
-    /// cutover to `gossip` happens once the 25-node sim convergence is
-    /// green (the closing PR on issue #137).
+    /// Which overlay implementation to use. Defaults to `gossip`
+    /// after the 25-node sim convergence test landed in stack 8 of
+    /// issue #137. Operators who need the legacy full-mesh behaviour
+    /// (every node holds N–1 direct connections) can set
+    /// `mode = "mesh"`.
     #[serde(default)]
     pub mode: OverlayMode,
     /// Upper bound on direct peer count for the partial-mesh
@@ -248,11 +251,15 @@ impl Default for OverlayConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverlayMode {
-    /// Legacy full-mesh implementation. Default until the gossip overlay
-    /// is ready to take over (closing PR on issue #137).
-    #[default]
+    /// Legacy full-mesh implementation. Retained as an opt-in for
+    /// operators who need N–1 direct connectivity guarantees; the
+    /// gossip overlay is the default.
     Mesh,
-    /// Partial-mesh gossip overlay (issue #137).
+    /// Partial-mesh gossip overlay (issue #137). Default since
+    /// stack 9 of #137 — operators get bounded direct-peer count
+    /// (`target_degree`, default 8) without coordinated config
+    /// rollouts when the validator set grows.
+    #[default]
     Gossip,
 }
 
@@ -649,8 +656,9 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 "#,
         );
-        // Defaults match the breakdown-comment values on #137.
-        assert_eq!(c.overlay.mode, OverlayMode::Mesh);
+        // Defaults match the breakdown-comment values on #137,
+        // including `mode = "gossip"` after the stack-9 cutover.
+        assert_eq!(c.overlay.mode, OverlayMode::Gossip);
         assert_eq!(c.overlay.target_degree, 8);
         assert_eq!(c.overlay.peer_gossip_interval_ms, 5_000);
         assert_eq!(c.overlay.peer_gossip_fanout, 3);
@@ -659,6 +667,26 @@ listen_addr = "127.0.0.1:8080"
         assert_eq!(c.overlay.dedup_ttl_ms, 120_000);
         assert_eq!(c.overlay.peer_table_capacity, 1_024);
         assert!(c.overlay.bootstrap_addrs.is_empty());
+    }
+
+    #[test]
+    fn overlay_mode_mesh_parses_explicitly() {
+        // After the stack-9 cutover, `mode = "gossip"` is the default,
+        // so operators who want the legacy full-mesh behaviour must
+        // opt in explicitly.
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[overlay]
+mode = "mesh"
+"#,
+        );
+        assert_eq!(c.overlay.mode, OverlayMode::Mesh);
     }
 
     #[test]

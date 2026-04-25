@@ -8,13 +8,20 @@ cleanup_interval_secs = 60
 # [[peers]]
 # addr = "127.0.0.1:7001"
 
-# Topology-overlay configuration. The full-mesh implementation is the
-# default; flip `mode = "gossip"` to opt into the partial-mesh gossip
-# overlay (issue #137). All other knobs only apply in gossip mode and
-# default to the values shown below.
+# Topology-overlay configuration. The partial-mesh gossip overlay
+# (issue #137) is the default; pin `mode = "mesh"` if you need the
+# legacy N–1-direct-connections behaviour. All other knobs apply only
+# in gossip mode and default to the values shown below.
+#
+# In gossip mode each node maintains at most `target_degree` direct
+# TCP/TLS connections (default 8); the rest of the validator set is
+# learned through periodic peer-list pushes from those direct
+# neighbours. New operators populate `bootstrap_addrs` with one or two
+# seed addresses to reach the network on first boot — peer-list
+# gossip teaches them about everyone else within a few ticks.
 #
 # [overlay]
-# mode = "mesh"                 # "mesh" | "gossip"
+# mode = "gossip"               # "gossip" (default) | "mesh"
 # target_degree = 8             # max direct peers per node
 # peer_gossip_interval_ms = 5000
 # peer_gossip_fanout = 3
