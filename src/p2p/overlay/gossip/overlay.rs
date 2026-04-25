@@ -74,7 +74,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::clock::Clock;
 use crate::p2p::ProtocolEvent;
@@ -379,9 +379,28 @@ impl GossipOverlay {
         // looping the frame back to us is silently dropped.
         let _ = self.dedup.insert(msg_id, Instant::now());
         let bytes = encode_forward(msg_id, self.self_id, payload);
-        for target in DirectPeers::snapshot(&*self.direct) {
+        let targets = DirectPeers::snapshot(&*self.direct);
+        let fanout = targets.len();
+        for target in targets {
             self.sink.send_to(target, bytes.clone());
         }
+        // Issue #178 follow-up: per-call counter so an operator can
+        // compare `n2`'s emit rate (consensus side) against the actual
+        // broadcast fanout. A low `fanout` here vs. a high
+        // consensus-side emit count exposes a TLS-handshake or
+        // peer-table issue that's invisible from consensus alone.
+        // `cmd_channel_pending` lets us spot back-pressure on the
+        // OverlayCmd queue (a saturated cmd channel makes
+        // `Broadcaster::send_to` block, which the consensus event loop
+        // experiences as a stall).
+        debug!(
+            target: "ambros_p2p::p2p::overlay::gossip",
+            msg_id = ?msg_id,
+            fanout,
+            cmd_channel_pending = self.cmd_rx.len(),
+            event_channel_pending = self.event_rx.len(),
+            "gossip_broadcast_dispatched",
+        );
     }
 
     fn do_send_to(&mut self, target: NodeId, payload: Bytes) {
@@ -391,6 +410,21 @@ impl GossipOverlay {
             let _ = self.dedup.insert(msg_id, Instant::now());
             let bytes = encode_forward(msg_id, self.self_id, payload);
             self.sink.send_to(target, bytes);
+            // Issue #178 follow-up: pair with the consensus-side
+            // `block_sync_request_emitted` event to confirm the unicast
+            // actually reached the orchestrator's outbound sink. A
+            // missing `gossip_send_to_direct_dispatched` for a given
+            // emission means the OverlayCmd never landed on this side
+            // of the cmd channel — back-pressure or shutdown is
+            // swallowing it.
+            debug!(
+                target: "ambros_p2p::p2p::overlay::gossip",
+                target_peer = %crate::p2p::tls::node_id_to_base58(&target),
+                msg_id = ?msg_id,
+                cmd_channel_pending = self.cmd_rx.len(),
+                event_channel_pending = self.event_rx.len(),
+                "gossip_send_to_direct_dispatched",
+            );
         } else {
             // Per the breakdown comment on issue #137: the gossip
             // overlay does not route point-to-point, so a unicast to
@@ -458,11 +492,42 @@ impl GossipOverlay {
             }) => match self.dedup.insert(msg_id, Instant::now()) {
                 InsertOutcome::AlreadySeen => {
                     // Loop break — drop without surfacing or re-fanning.
+                    //
+                    // Issue #178 follow-up: an emitter logs every
+                    // outbound dispatch; comparing emitter counts
+                    // against `gossip_inbound_dispatched` on direct
+                    // neighbours pinpoints whether dropped requests
+                    // are being silently absorbed by dedup (this arm)
+                    // versus lost on the wire. `originator` lets the
+                    // analyzer correlate to the original sender.
+                    debug!(
+                        target: "ambros_p2p::p2p::overlay::gossip",
+                        from = %crate::p2p::tls::node_id_to_base58(&from),
+                        originator = %crate::p2p::tls::node_id_to_base58(&originator),
+                        msg_id = ?msg_id,
+                        "gossip_dedup_dropped",
+                    );
                 }
                 InsertOutcome::New => {
                     // Surface to consensus with `from = originator` so
                     // the consumer sees the broadcast originator
                     // regardless of how many hops the frame took.
+                    //
+                    // Issue #178 follow-up: this is the receive-side
+                    // counterpart to `gossip_send_to_direct_dispatched` /
+                    // `gossip_broadcast_dispatched`. A direct peer's
+                    // emit count vs. our `gossip_inbound_dispatched`
+                    // count exposes raw drop-on-the-wire (TLS reset,
+                    // queue overflow on the read side, etc.) before
+                    // any consensus-layer logic runs.
+                    debug!(
+                        target: "ambros_p2p::p2p::overlay::gossip",
+                        from = %crate::p2p::tls::node_id_to_base58(&from),
+                        originator = %crate::p2p::tls::node_id_to_base58(&originator),
+                        msg_id = ?msg_id,
+                        payload_bytes = payload.len(),
+                        "gossip_inbound_dispatched",
+                    );
                     let _ = self
                         .upstream_event_tx
                         .send(ProtocolEvent::Message {

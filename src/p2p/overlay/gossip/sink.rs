@@ -33,10 +33,11 @@
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::warn;
 
 use crate::p2p::ProtocolOutbound;
 use crate::p2p::tls::NodeId;
+use crate::p2p::tls::node_id_to_base58;
 
 use super::peer_list_task::OverlayUnicast;
 
@@ -59,6 +60,7 @@ impl OverlaySink {
 
 impl OverlayUnicast for OverlaySink {
     fn send_to(&self, target: NodeId, payload: Bytes) {
+        let payload_bytes = payload.len();
         match self.send_tx.try_send(ProtocolOutbound::SendTo {
             node_id: target,
             payload,
@@ -69,13 +71,33 @@ impl OverlayUnicast for OverlaySink {
                 // repeat at the next interval; overlay forwards take
                 // multiple paths through the partial mesh — one
                 // dropped enqueue is recoverable.
-                debug!("OverlaySink: outbound channel full, dropping send_to");
+                //
+                // Issue #178 follow-up: this drop is a leading suspect
+                // for the gossip-layer request loss the reproducer
+                // surfaced. Logging at warn with structured fields so
+                // a single grep over a wedged node's log surfaces the
+                // exact target whose outbound queue is overflowing.
+                // Repeated bursts here mean either the per-peer
+                // channel capacity is too small for the consensus
+                // emit rate (#163 back-pressure) or one specific
+                // peer's connection task has stalled.
+                warn!(
+                    target: "ambros_p2p::p2p::overlay::gossip",
+                    target_peer = %node_id_to_base58(&target),
+                    payload_bytes,
+                    channel_capacity = self.send_tx.capacity(),
+                    "overlay_sink_drop_full",
+                );
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 // Manager has shut down. The overlay loop will exit
                 // shortly after via its own shutdown path; nothing to
                 // do here.
-                debug!("OverlaySink: outbound channel closed, dropping send_to");
+                warn!(
+                    target: "ambros_p2p::p2p::overlay::gossip",
+                    target_peer = %node_id_to_base58(&target),
+                    "overlay_sink_drop_closed",
+                );
             }
         }
     }
