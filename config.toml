@@ -7,3 +7,19 @@ cleanup_interval_secs = 60
 
 # [[peers]]
 # addr = "127.0.0.1:7001"
+
+# Topology-overlay configuration. The full-mesh implementation is the
+# default; flip `mode = "gossip"` to opt into the partial-mesh gossip
+# overlay (issue #137). All other knobs only apply in gossip mode and
+# default to the values shown below.
+#
+# [overlay]
+# mode = "mesh"                 # "mesh" | "gossip"
+# target_degree = 8             # max direct peers per node
+# peer_gossip_interval_ms = 5000
+# peer_gossip_fanout = 3
+# mesh_check_interval_ms = 5000
+# dedup_capacity = 4096
+# dedup_ttl_ms = 120000
+# peer_table_capacity = 1024
+# bootstrap_addrs = []          # e.g. ["10.0.0.1:7000", "10.0.0.2:7000"]
