@@ -31,6 +31,7 @@
 //! peer-list pushes and forwarded payloads inside that channel.
 
 pub mod dedup;
+pub mod discovery;
 pub mod maintenance;
 pub mod peer_list_task;
 pub mod peer_table;
