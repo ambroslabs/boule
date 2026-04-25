@@ -18,7 +18,7 @@ pub async fn run(handle: ProtocolHandle, store: Arc<GossipStore>, clock: Arc<dyn
 
     while let Some(event) = event_rx.recv().await {
         match event {
-            ProtocolEvent::PeerConnected { node_id } => {
+            ProtocolEvent::PeerConnected { node_id, .. } => {
                 info!("peer connected: {}", node_id_to_base58(&node_id));
             }
             ProtocolEvent::PeerDisconnected { node_id } => {

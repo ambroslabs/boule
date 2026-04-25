@@ -1218,12 +1218,21 @@ mod tests {
             });
         }
 
+        // Sentinel address — the rpc test fixtures don't care about
+        // the addr field; using 0.0.0.0:0 makes that obvious to readers.
+        let unused_addr = "0.0.0.0:0".parse().unwrap();
         a_event_tx
-            .send(ProtocolEvent::PeerConnected { node_id: b })
+            .send(ProtocolEvent::PeerConnected {
+                node_id: b,
+                addr: unused_addr,
+            })
             .await
             .unwrap();
         b_event_tx
-            .send(ProtocolEvent::PeerConnected { node_id: a })
+            .send(ProtocolEvent::PeerConnected {
+                node_id: a,
+                addr: unused_addr,
+            })
             .await
             .unwrap();
 

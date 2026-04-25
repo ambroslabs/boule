@@ -969,6 +969,205 @@ async fn test_consensus_status_endpoint_reports_live_progress() {
     drop(key_dirs);
 }
 
+// ── Gossip-overlay smoke test (#137) ────────────────────────────────────────
+
+/// Spawn a consensus-running node with `[overlay] mode = "gossip"`.
+/// `[[peers]]` is left empty; reachability is driven by
+/// `bootstrap_addrs` which the gossip overlay's
+/// [`Discovery::add_bootstrap`](https://github.com/zrbecker/ambros-p2p/issues/137)
+/// dials as TOFU.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_consensus_node_gossip(
+    key_path: &str,
+    fixed_p2p_addr: &str,
+    bootstrap_addrs: &[String],
+    validators_toml: &str,
+    target_degree: usize,
+    peer_gossip_interval_ms: u64,
+    mesh_check_interval_ms: u64,
+) -> NodeGuard {
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+
+    let bootstrap_toml = if bootstrap_addrs.is_empty() {
+        "[]".to_string()
+    } else {
+        let inner = bootstrap_addrs
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{inner}]")
+    };
+
+    let config = format!(
+        "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [overlay]\nmode = \"gossip\"\ntarget_degree = {target_degree}\npeer_gossip_interval_ms = {peer_gossip_interval_ms}\nmesh_check_interval_ms = {mesh_check_interval_ms}\nbootstrap_addrs = {bootstrap_toml}\n\n\
+        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    run_init(config_file.path().to_str().unwrap());
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let child = Command::new(bin)
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn gossip-overlay consensus node");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let addrs = loop {
+        if Instant::now() > deadline {
+            panic!("gossip-overlay node did not write addr_file within 10s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break addrs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    NodeGuard {
+        child,
+        api_port,
+        p2p_addr: addrs.p2p_addr,
+        node_id: addrs.node_id,
+        _config: config_file,
+        _key_dir: tempfile::tempdir().unwrap(),
+        _addr_file: addr_file,
+    }
+}
+
+/// Boot an `n`-node consensus cluster running the partial-mesh gossip
+/// overlay. Each node `i > 0` lists node 0's P2P address in
+/// `bootstrap_addrs`; the peer-list publisher then teaches the rest of
+/// the cluster about everyone within a few ticks. `target_degree = 2`
+/// in the tests below — small enough that with `n = 3` each node
+/// holds a direct connection to every other node, big enough that the
+/// maintenance loop is exercised. `peer_gossip_interval_ms` and
+/// `mesh_check_interval_ms` are set to 250 ms so convergence is much
+/// faster than the test's 15 s wall-clock budget.
+async fn start_gossip_consensus_cluster(
+    n: usize,
+    target_degree: usize,
+) -> (Vec<NodeGuard>, Vec<tempfile::TempDir>) {
+    let key_dirs: Vec<tempfile::TempDir> = (0..n).map(|_| tempfile::tempdir().unwrap()).collect();
+    let key_paths: Vec<String> = key_dirs
+        .iter()
+        .map(|d| d.path().join("node.key").to_str().unwrap().to_owned())
+        .collect();
+
+    // Phase 1: discover addresses + node IDs (same two-phase pattern
+    // as the mesh helper).
+    let mut specs: Vec<ConsensusNodeSpec> = Vec::with_capacity(n);
+    for key_path in &key_paths {
+        let info = launch_once_for_discovery(key_path).await;
+        specs.push(ConsensusNodeSpec {
+            key_path: key_path.clone(),
+            p2p_addr: info.p2p_addr,
+            node_id: info.node_id,
+        });
+    }
+
+    let validators_toml = specs
+        .iter()
+        .map(|s| format!("\"{}\"", s.node_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Phase 2: relaunch with [overlay] + [consensus]. Node 0 has no
+    // bootstrap (others connect TO it); every other node uses node
+    // 0's address as the bootstrap.
+    let bootstrap_for_node_0: Vec<String> = Vec::new();
+    let bootstrap_via_node_0: Vec<String> = vec![specs[0].p2p_addr.clone()];
+
+    let mut guards: Vec<NodeGuard> = Vec::with_capacity(n);
+    for (i, spec) in specs.iter().enumerate() {
+        let bootstrap = if i == 0 {
+            &bootstrap_for_node_0
+        } else {
+            &bootstrap_via_node_0
+        };
+        guards.push(
+            spawn_consensus_node_gossip(
+                &spec.key_path,
+                &spec.p2p_addr,
+                bootstrap,
+                &validators_toml,
+                target_degree,
+                /* peer_gossip_interval_ms */ 250,
+                /* mesh_check_interval_ms  */ 250,
+            )
+            .await,
+        );
+    }
+
+    let ready_timeout = Duration::from_secs(10);
+    for g in &guards {
+        wait_until_ready(g, ready_timeout).await;
+    }
+
+    (guards, key_dirs)
+}
+
+/// 3-node smoke test for #137 stack 7: nodes 1 and 2 reach node 0
+/// via `bootstrap_addrs`, peer-list gossip teaches the cluster about
+/// the third member, and consensus commits at steady state.
+///
+/// Assertions (poll-with-budget within 15 s):
+///   1. Every node ends up with `n - 1` direct peers (a 3-node
+///      cluster at K=2 is a full mesh — exercises both the
+///      bootstrap path and the maintenance dial path).
+///   2. Every node reports `last_committed_height > 0`, proving the
+///      gossip overlay actually carries consensus traffic
+///      end-to-end.
+#[tokio::test]
+async fn test_gossip_overlay_3_node_smoke() {
+    const N: usize = 3;
+    let (guards, key_dirs) = start_gossip_consensus_cluster(N, /* target_degree */ 2).await;
+
+    // (1) Every node ends up with the other two as direct peers.
+    let peer_timeout = Duration::from_secs(15);
+    for g in &guards {
+        wait_for_peer_count(g, N - 1, peer_timeout).await;
+    }
+
+    // (2) Consensus commits — the gossip overlay relays consensus
+    // messages correctly.
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    'outer: loop {
+        if Instant::now() > deadline {
+            panic!("gossip-overlay cluster did not commit within 15s");
+        }
+        for g in &guards {
+            let resp = client.get(g.api_url("/consensus/status")).send().await;
+            let body: Value = match resp {
+                Ok(r) if r.status() == 200 => r.json().await.unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            let committed = body["last_committed_height"].as_u64().unwrap_or(0);
+            let current_view = body["current_view"].as_u64().unwrap_or(0);
+            if committed == 0 || current_view == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+
+    drop(guards);
+    drop(key_dirs);
+}
+
 #[tokio::test]
 async fn test_consensus_status_returns_404_on_gossip_only_node() {
     // A vanilla (no [consensus]) node must not expose the endpoint.

@@ -22,6 +22,7 @@
 //! would imply an entirely different deployment shape) we can
 //! revisit.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ use crate::clock::Clock;
 
 use super::super::super::tls::NodeId;
 use super::peer_table::PeerTable;
-use super::wire::OverlayFrame;
+use super::wire::{OverlayFrame, PeerEntry};
 
 /// Knobs the binary will eventually expose under `[overlay]` in
 /// `config.toml`. Defaults match the breakdown comment on issue #137.
@@ -84,11 +85,35 @@ pub trait DirectPeers: Send + Sync + 'static {
     fn snapshot(&self) -> Vec<NodeId>;
 }
 
+/// `(node_id, listen_addr)` injected into every published peer-list
+/// frame so receivers learn the publisher's listening address.
+///
+/// Without this, a node that learned about a peer only via an inbound
+/// connection would carry the peer's ephemeral source port in its
+/// `PeerTable` and gossip a non-dialable address. The remedy is for
+/// every node to self-advertise: each tick the publisher prepends its
+/// own `(node_id, listen_addr, now_unix_ms)` to the snapshot before
+/// encoding.
+#[derive(Debug, Clone, Copy)]
+pub struct SelfAdvertise {
+    /// Local NodeId.
+    pub node_id: NodeId,
+    /// Local listening address (post-`bind`, with the actual port).
+    pub addr: SocketAddr,
+}
+
 /// Build the postcard wire bytes for a peer-list push, optionally
-/// capped at `max_entries` freshest entries. Pulled out of the
-/// publisher so PR 4 can call it from the unified overlay loop.
-pub fn build_peer_list_frame(table: &PeerTable, max_entries: Option<usize>) -> Bytes {
+/// capped at `max_entries` freshest entries. When `self_entry` is
+/// provided, it's prepended to the snapshot — see [`SelfAdvertise`].
+pub fn build_peer_list_frame(
+    table: &PeerTable,
+    self_entry: Option<PeerEntry>,
+    max_entries: Option<usize>,
+) -> Bytes {
     let mut entries = table.snapshot();
+    if let Some(e) = self_entry {
+        entries.push(e);
+    }
     if let Some(cap) = max_entries
         && entries.len() > cap
     {
@@ -97,6 +122,14 @@ pub fn build_peer_list_frame(table: &PeerTable, max_entries: Option<usize>) -> B
     }
     let frame = OverlayFrame::PeerList(entries);
     Bytes::from(postcard::to_stdvec(&frame).expect("postcard encode of PeerList cannot fail"))
+}
+
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Decode a received overlay frame and, if it's a peer-list, merge
@@ -155,9 +188,10 @@ pub enum FrameOutcome {
 ///
 /// Generic over the unicast channel and the direct-peer source so
 /// tests can plug in mocks without spinning up the full p2p stack.
-/// In production, PR 4 will provide a struct backed by the per-protocol
-/// `mpsc::Sender<ProtocolOutbound>` and the `peer_table` of currently-
-/// connected nodes.
+/// When `self_advertise` is `Some`, every published frame includes a
+/// fresh `(node_id, addr, now)` self-entry — the canonical mechanism
+/// for teaching peers our listening address.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_peer_list_publisher(
     config: PeerListGossipConfig,
     table: PeerTable,
@@ -165,6 +199,7 @@ pub async fn run_peer_list_publisher(
     sink: Arc<dyn OverlayUnicast>,
     clock: Arc<dyn Clock>,
     rng_seed: u64,
+    self_advertise: Option<SelfAdvertise>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut rng = ChaCha20Rng::seed_from_u64(rng_seed);
@@ -181,7 +216,14 @@ pub async fn run_peer_list_publisher(
             biased;
             _ = &mut shutdown => return,
             _ = interval.tick() => {
-                tick_once(&config, &table, direct.as_ref(), sink.as_ref(), &mut rng);
+                tick_once(
+                    &config,
+                    &table,
+                    direct.as_ref(),
+                    sink.as_ref(),
+                    self_advertise,
+                    &mut rng,
+                );
             }
         }
     }
@@ -192,6 +234,7 @@ fn tick_once(
     table: &PeerTable,
     direct: &dyn DirectPeers,
     sink: &dyn OverlayUnicast,
+    self_advertise: Option<SelfAdvertise>,
     rng: &mut ChaCha20Rng,
 ) {
     let mut peers = direct.snapshot();
@@ -202,7 +245,12 @@ fn tick_once(
     peers.shuffle(rng);
     peers.truncate(config.fanout);
 
-    let frame = build_peer_list_frame(table, config.max_entries);
+    let self_entry = self_advertise.map(|s| PeerEntry {
+        node_id: s.node_id,
+        addr: s.addr,
+        last_seen_unix_ms: now_unix_ms(),
+    });
+    let frame = build_peer_list_frame(table, self_entry, config.max_entries);
     for target in peers {
         sink.send_to(target, frame.clone());
     }
@@ -282,7 +330,7 @@ mod tests {
         table.upsert(nid(1), addr(7001), 100);
         table.upsert(nid(2), addr(7002), 200);
 
-        let bytes = build_peer_list_frame(&table, None);
+        let bytes = build_peer_list_frame(&table, None, None);
         let decoded: OverlayFrame = postcard::from_bytes(&bytes).expect("decode");
         let OverlayFrame::PeerList(entries) = decoded else {
             panic!("expected PeerList variant");
@@ -299,7 +347,7 @@ mod tests {
         table.upsert(nid(2), addr(7002), 300);
         table.upsert(nid(3), addr(7003), 200);
 
-        let bytes = build_peer_list_frame(&table, Some(2));
+        let bytes = build_peer_list_frame(&table, None, Some(2));
         let decoded: OverlayFrame = postcard::from_bytes(&bytes).expect("decode");
         let OverlayFrame::PeerList(entries) = decoded else {
             panic!("expected PeerList variant");
@@ -394,7 +442,9 @@ mod tests {
             let sink = sink.clone() as Arc<dyn OverlayUnicast>;
             let table = table.clone();
             let clock = clock.clone();
-            run_peer_list_publisher(cfg, table, direct, sink, clock, /* seed */ 7, sd_rx)
+            run_peer_list_publisher(
+                cfg, table, direct, sink, clock, /* seed */ 7, None, sd_rx,
+            )
         });
 
         // Advance past the immediate-tick discard + first scheduled tick.
@@ -443,7 +493,9 @@ mod tests {
             let sink = sink.clone() as Arc<dyn OverlayUnicast>;
             let table = table.clone();
             let clock = clock.clone();
-            run_peer_list_publisher(cfg, table, direct, sink, clock, /* seed */ 7, sd_rx)
+            run_peer_list_publisher(
+                cfg, table, direct, sink, clock, /* seed */ 7, None, sd_rx,
+            )
         });
 
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -514,7 +566,7 @@ mod tests {
             let table = a.clone();
             let clock = clock.clone();
             let cfg = cfg.clone();
-            run_peer_list_publisher(cfg, table, direct, sink, clock, 1, sd_a_rx)
+            run_peer_list_publisher(cfg, table, direct, sink, clock, 1, None, sd_a_rx)
         });
         let task_b = tokio::spawn({
             let direct = b_direct.clone() as Arc<dyn DirectPeers>;
@@ -522,7 +574,7 @@ mod tests {
             let table = b.clone();
             let clock = clock.clone();
             let cfg = cfg.clone();
-            run_peer_list_publisher(cfg, table, direct, sink, clock, 2, sd_b_rx)
+            run_peer_list_publisher(cfg, table, direct, sink, clock, 2, None, sd_b_rx)
         });
 
         // A few ticks to converge.

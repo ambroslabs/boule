@@ -269,6 +269,7 @@ fn register_connection(
         for event_tx in protocols.values() {
             let _ = event_tx.try_send(ProtocolEvent::PeerConnected {
                 node_id: peer_node_id,
+                addr,
             });
         }
     }
@@ -461,7 +462,7 @@ mod tests {
             .expect("second handle times out")
             .expect("second handle closed");
         match saw_second {
-            ProtocolEvent::PeerConnected { node_id } => assert_eq!(node_id, nid(2)),
+            ProtocolEvent::PeerConnected { node_id, .. } => assert_eq!(node_id, nid(2)),
             other => panic!("expected PeerConnected, got {other:?}"),
         }
     }
@@ -665,7 +666,9 @@ mod tests {
             .await
             .expect("initial PeerConnected times out")
             .expect("event channel closed");
-        assert!(matches!(connected, ProtocolEvent::PeerConnected { node_id } if node_id == nid(1)));
+        assert!(
+            matches!(connected, ProtocolEvent::PeerConnected { node_id, .. } if node_id == nid(1))
+        );
 
         // Second connection for the same peer triggers the REPLACE path.
         // The old `_first` connection's write channel is dropped and the
@@ -733,7 +736,9 @@ mod tests {
             .await
             .expect("peer-connected times out")
             .expect("event channel closed");
-        assert!(matches!(connected, ProtocolEvent::PeerConnected { node_id } if node_id == nid(5)));
+        assert!(
+            matches!(connected, ProtocolEvent::PeerConnected { node_id, .. } if node_id == nid(5))
+        );
 
         // Helper: pack a length-delimited frame whose body is
         // `[protocol_id][payload...]`.

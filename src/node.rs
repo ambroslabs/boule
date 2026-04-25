@@ -14,14 +14,20 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 use crate::clock::{Clock, TokioClock};
-use crate::config::{Config, ConsensusConfig};
+use crate::config::{Config, ConsensusConfig, OverlayConfig, OverlayMode};
 use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::status::ConsensusStatus;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{NodeSigner, Signer};
 use crate::gossip;
+use crate::p2p::dialer::DialerCtx;
 use crate::p2p::identity::NodeIdentity;
 use crate::p2p::manager::ManagerMsg;
+use crate::p2p::overlay::gossip::overlay::{
+    DialerCtxAdapter, GossipOverlay, GossipOverlayConfig, SpawnArgs,
+};
+use crate::p2p::overlay::gossip::sink::OverlaySink;
+use crate::p2p::overlay::{self as overlay_traits};
 use crate::p2p::overlay::{Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery};
 use crate::p2p::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
 use crate::p2p::tls_protocol::TlsConnectionProtocol;
@@ -149,20 +155,47 @@ pub async fn run(
         .handler(ping::METHOD_PING, ping::echo)
         .spawn(ping_handle, Arc::clone(&clock));
 
+    // The gossip overlay needs an outbound dialer for both
+    // `Discovery::add_bootstrap` (TOFU dials of operator-supplied
+    // bootstrap addresses) and the partial-mesh maintenance loop
+    // (verified dials when the table has unconnected candidates).
+    // `DialerCtx` bundles everything `reconnect_loop` needs; we
+    // construct it once here and clone into the overlay.
+    let dialer_ctx = DialerCtx {
+        identity: Arc::clone(&identity),
+        internal_tx: internal_tx.clone(),
+        peer_gone_tx: peer_gone_tx.clone(),
+        peer_cmd_tx: Some(p2p_cmd_tx.clone()),
+        clock: Arc::clone(&clock),
+    };
+
+    // Bind the P2P listener up front so the gossip overlay can
+    // self-advertise the actual bound address (the publisher injects
+    // a `(self_id, listen_addr)` self-entry into every peer-list
+    // push so receivers can dial us back). Listener is consumed
+    // later when `TlsConnectionProtocol` is constructed.
+    let p2p_listener = TcpListener::bind(config.node.listen_addr).await?;
+    let p2p_actual_addr = p2p_listener.local_addr()?;
+    info!("P2P listening on {p2p_actual_addr}");
+
     // Optionally start consensus. When the [consensus] section is
     // present, the protocol is registered, the ConsensusNode is
     // constructed (with disk storage if configured, otherwise in-memory)
-    // and its `run` loop is spawned. A oneshot shutdown sender is kept
-    // so we can stop the loop gracefully on ctrl-c. The consensus layer
-    // self-identifies by *validator* pubkey, not network pubkey.
+    // and its `run` loop is spawned. The active overlay (mesh or gossip)
+    // is selected from `config.overlay.mode`; for gossip mode the
+    // bootstrap_addrs are dialed at boot via `Discovery::add_bootstrap`.
     let consensus_runtime = if let Some(cons_cfg) = config.consensus.as_ref() {
         Some(
             start_consensus(
                 cons_cfg,
+                &config.overlay,
                 &p2p_cmd_tx,
                 &discovery_tx,
                 &validator_node_id,
                 &consensus_signer,
+                dialer_ctx,
+                Arc::clone(&clock),
+                p2p_actual_addr,
             )
             .await?,
         )
@@ -191,20 +224,14 @@ pub async fn run(
                 Arc::clone(&clock),
             ))
             .merge(ping::router(ping_rpc));
-        if let Some((_, _, ref status_rx)) = consensus_runtime {
-            app = app.merge(crate::consensus::api::router(status_rx.clone()));
+        if let Some(rc) = consensus_runtime.as_ref() {
+            app = app.merge(crate::consensus::api::router(rc.status_rx.clone()));
         }
         tokio::spawn(async move {
             info!("HTTP API listening on {api_actual_addr}");
             axum::serve(api_listener, app).await.unwrap();
         })
     };
-
-    // Bind the P2P listener before spawning the protocol so the actual port is
-    // known before we write addr_file.
-    let p2p_listener = TcpListener::bind(config.node.listen_addr).await?;
-    let p2p_actual_addr = p2p_listener.local_addr()?;
-    info!("P2P listening on {p2p_actual_addr}");
 
     // Write bound addresses + node ID to addr_file if configured.
     // Tests use this to discover actual ports when listen_addr uses port 0.
@@ -231,10 +258,16 @@ pub async fn run(
     let _ = shutdown_tx.send(true);
     drop(p2p_cmd_tx);
 
-    let consensus_join = consensus_runtime.map(|(handle, sd, _status_rx)| {
-        let _ = sd.send(());
-        handle
-    });
+    let (consensus_join, overlay_joins) = match consensus_runtime {
+        Some(rc) => {
+            let _ = rc.consensus_shutdown.send(());
+            if let Some(overlay_sd) = rc.overlay_shutdown {
+                let _ = overlay_sd.send(());
+            }
+            (Some(rc.join), rc.overlay_joins)
+        }
+        None => (None, Vec::new()),
+    };
 
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = manager_handle.await;
@@ -245,28 +278,56 @@ pub async fn run(
         if let Some(h) = consensus_join {
             let _ = h.await;
         }
+        for h in overlay_joins {
+            let _ = h.await;
+        }
     })
     .await;
 
     Ok(())
 }
 
+/// Bundle returned by [`start_consensus`]. The overlay-related fields
+/// are populated when `[overlay] mode = "gossip"`; in mesh mode they
+/// are `None` / empty.
+struct RunningConsensus {
+    /// Consensus event-loop join handle.
+    join: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// Oneshot signal that gracefully stops the consensus event loop.
+    consensus_shutdown: oneshot::Sender<()>,
+    /// Snapshot of the consensus status, served by the HTTP API.
+    status_rx: watch::Receiver<Arc<ConsensusStatus>>,
+    /// Oneshot that gracefully stops the gossip overlay (the
+    /// orchestrator + publisher + maintenance tasks). `None` in mesh
+    /// mode.
+    overlay_shutdown: Option<oneshot::Sender<()>>,
+    /// Overlay sub-task joins (orchestrator + publisher + mesh
+    /// maintenance). Empty in mesh mode.
+    overlay_joins: Vec<tokio::task::JoinHandle<()>>,
+}
+
 /// Start the HotStuff consensus protocol alongside gossip + ping.
 ///
-/// Returns the run-loop join handle and the oneshot shutdown sender; the
-/// caller fires the sender on ctrl-c and awaits the handle for graceful
-/// exit.
+/// Branches on `overlay_cfg.mode`. In `Mesh` mode, registers
+/// `consensus::node::PROTOCOL_ID` and wraps the handle in
+/// [`MeshBroadcaster`] + [`MeshDiscovery`]. In `Gossip` mode,
+/// registers `crate::p2p::overlay::gossip::PROTOCOL_ID`, spawns a
+/// `GossipOverlay` over the handle, ingests
+/// `overlay_cfg.bootstrap_addrs` via `Discovery::add_bootstrap`, and
+/// uses `GossipBroadcaster` / `GossipDiscovery` in place of the mesh
+/// equivalents.
+#[allow(clippy::too_many_arguments)]
 async fn start_consensus(
     cons_cfg: &ConsensusConfig,
+    overlay_cfg: &OverlayConfig,
     p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
     discovery_tx: &broadcast::Sender<DiscoveryEvent>,
     self_id: &NodeId,
     signer: &Arc<NodeSigner>,
-) -> anyhow::Result<(
-    tokio::task::JoinHandle<anyhow::Result<()>>,
-    oneshot::Sender<()>,
-    watch::Receiver<Arc<ConsensusStatus>>,
-)> {
+    dialer_ctx: DialerCtx,
+    clock: Arc<dyn Clock>,
+    self_listen_addr: std::net::SocketAddr,
+) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     info!(
         "consensus: validator_set has {} members",
@@ -304,22 +365,24 @@ async fn start_consensus(
         Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
     let mempool = Arc::new(InMemoryMempool::new(1024));
 
-    // Register the consensus protocol with the multiplexer and obtain the
-    // ProtocolHandle whose `event_rx` feeds the consensus inbound loop and
-    // whose `send_tx` becomes the underlying channel of `MeshBroadcaster`.
-    let (reg_tx, reg_rx) = oneshot::channel();
-    p2p_cmd_tx
-        .send(p2p::PeerCommand::RegisterProtocol {
-            id: crate::consensus::node::PROTOCOL_ID,
-            max_frame_bytes: Some(crate::consensus::node::MAX_FRAME_BYTES),
-            reply: reg_tx,
-        })
-        .await?;
-    let consensus_handle = reg_rx.await?;
-    let broadcaster: Arc<dyn Broadcaster> =
-        Arc::new(MeshBroadcaster::new(consensus_handle.send_tx));
-    let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(discovery_tx.subscribe());
-    let event_rx = consensus_handle.event_rx;
+    // Wire the broadcaster + discovery + upstream event channel
+    // according to the configured overlay mode.
+    let OverlayWiring {
+        broadcaster,
+        discovery,
+        event_rx,
+        overlay_shutdown,
+        overlay_joins,
+    } = build_overlay_wiring(
+        overlay_cfg,
+        p2p_cmd_tx,
+        discovery_tx,
+        *self_id,
+        self_listen_addr,
+        dialer_ctx,
+        clock,
+    )
+    .await?;
 
     let node = ConsensusNode::recover(*self_id, node_cfg, state_machine, mempool, storage, wal)?;
 
@@ -334,7 +397,125 @@ async fn start_consensus(
             .await
     });
     info!("consensus: event loop spawned");
-    Ok((join, shutdown_tx, status_rx))
+    Ok(RunningConsensus {
+        join,
+        consensus_shutdown: shutdown_tx,
+        status_rx,
+        overlay_shutdown,
+        overlay_joins,
+    })
+}
+
+/// Result of [`build_overlay_wiring`]: the broadcaster + discovery +
+/// event-receiver triple consensus consumes, plus the overlay-side
+/// shutdown / joins (only populated in gossip mode).
+struct OverlayWiring {
+    broadcaster: Arc<dyn Broadcaster>,
+    discovery: Arc<dyn Discovery>,
+    event_rx: mpsc::Receiver<p2p::ProtocolEvent>,
+    overlay_shutdown: Option<oneshot::Sender<()>>,
+    overlay_joins: Vec<tokio::task::JoinHandle<()>>,
+}
+
+/// Branch on `overlay_cfg.mode` and assemble the consensus-facing
+/// overlay seam.
+#[allow(clippy::too_many_arguments)]
+async fn build_overlay_wiring(
+    overlay_cfg: &OverlayConfig,
+    p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
+    discovery_tx: &broadcast::Sender<DiscoveryEvent>,
+    self_id: NodeId,
+    self_listen_addr: std::net::SocketAddr,
+    dialer_ctx: DialerCtx,
+    clock: Arc<dyn Clock>,
+) -> anyhow::Result<OverlayWiring> {
+    match overlay_cfg.mode {
+        OverlayMode::Mesh => {
+            // Register the consensus protocol on its own ID; the mesh
+            // overlay routes consensus traffic through this channel
+            // directly.
+            let (reg_tx, reg_rx) = oneshot::channel();
+            p2p_cmd_tx
+                .send(p2p::PeerCommand::RegisterProtocol {
+                    id: crate::consensus::node::PROTOCOL_ID,
+                    max_frame_bytes: Some(crate::consensus::node::MAX_FRAME_BYTES),
+                    reply: reg_tx,
+                })
+                .await?;
+            let handle = reg_rx.await?;
+            info!("overlay: mesh");
+            Ok(OverlayWiring {
+                broadcaster: Arc::new(MeshBroadcaster::new(handle.send_tx)),
+                discovery: MeshDiscovery::spawn(discovery_tx.subscribe()),
+                event_rx: handle.event_rx,
+                overlay_shutdown: None,
+                overlay_joins: Vec::new(),
+            })
+        }
+        OverlayMode::Gossip => {
+            // Register the gossip overlay's protocol. Consensus
+            // traffic + overlay control frames share this channel
+            // (`OverlayFrame::Forward { .. }` vs
+            // `OverlayFrame::PeerList(..)`).
+            let (reg_tx, reg_rx) = oneshot::channel();
+            p2p_cmd_tx
+                .send(p2p::PeerCommand::RegisterProtocol {
+                    id: crate::p2p::overlay::gossip::PROTOCOL_ID,
+                    max_frame_bytes: Some(crate::p2p::overlay::gossip::MAX_FRAME_BYTES),
+                    reply: reg_tx,
+                })
+                .await?;
+            let handle = reg_rx.await?;
+
+            let sink = Arc::new(OverlaySink::new(handle.send_tx));
+            let dialer = Arc::new(DialerCtxAdapter::new(dialer_ctx));
+
+            // Mix self_id into the rng_seed so each node's RNG draws
+            // a different sequence. Take the first 8 bytes of the
+            // pubkey — sufficient entropy at validator-set scale.
+            let mut seed_bytes = [0u8; 8];
+            seed_bytes.copy_from_slice(&self_id[0..8]);
+            let rng_seed = u64::from_le_bytes(seed_bytes);
+            let cfg = GossipOverlayConfig::from_config(overlay_cfg, rng_seed);
+
+            let handles = GossipOverlay::spawn(SpawnArgs {
+                self_id,
+                self_listen_addr: Some(self_listen_addr),
+                event_rx: handle.event_rx,
+                sink,
+                dialer,
+                clock,
+                config: cfg,
+            });
+
+            // Boot-time bootstrap ingestion. Each `add_bootstrap`
+            // call triggers a TOFU dial via the Dialer plumbed into
+            // `GossipDiscovery`.
+            for addr in &overlay_cfg.bootstrap_addrs {
+                handles.discovery.add_bootstrap(*addr);
+            }
+
+            info!(
+                "overlay: gossip (target_degree={}, bootstrap_addrs={})",
+                overlay_cfg.target_degree,
+                overlay_cfg.bootstrap_addrs.len()
+            );
+
+            let broadcaster: Arc<dyn Broadcaster> = Arc::new(handles.broadcaster);
+            let discovery: Arc<dyn overlay_traits::Discovery> = handles.discovery;
+            Ok(OverlayWiring {
+                broadcaster,
+                discovery,
+                event_rx: handles.event_rx,
+                overlay_shutdown: Some(handles.shutdown),
+                overlay_joins: vec![
+                    handles.overlay_join,
+                    handles.publisher_join,
+                    handles.maintenance_join,
+                ],
+            })
+        }
+    }
 }
 
 /// Build a [`ValidatorSet`] from base58-encoded NodeIds in the config,

@@ -80,17 +80,27 @@ impl Default for MeshMaintenanceConfig {
     }
 }
 
-/// Object-safe wrapper for spawning an outbound dialer task. PR 5
-/// satisfies this with a struct that wraps
+/// Object-safe wrapper for spawning an outbound dialer task. The
+/// production impl wraps
 /// [`super::super::super::dialer::DialerCtx::spawn`]; tests satisfy
 /// it with a recording mock.
 pub trait Dialer: Send + Sync + 'static {
-    /// Start an outbound dial loop targeting `addr`, asserting that
-    /// the peer's TLS identity matches `expected` once handshaked.
+    /// Start an outbound dial loop targeting `addr`.
+    ///
+    /// When `expected` is `Some`, the dialer asserts the peer's TLS
+    /// identity matches that NodeId before announcing the connection
+    /// (the partial-mesh maintenance path: we know who we expect
+    /// because the `PeerEntry` came from a peer-list gossip frame).
+    ///
+    /// When `expected` is `None`, the dialer accepts whatever
+    /// identity the peer presents — TOFU semantics, used by the
+    /// bootstrap path where an operator points at an address without
+    /// pinning its node ID.
+    ///
     /// Best-effort — the dialer task is fire-and-forget; the
     /// maintenance loop tracks per-peer "we already started a dialer"
     /// state internally.
-    fn dial(&self, addr: SocketAddr, expected: NodeId);
+    fn dial(&self, addr: SocketAddr, expected: Option<NodeId>);
 }
 
 /// Run the partial-mesh maintenance loop until `shutdown` fires.
@@ -178,7 +188,10 @@ pub fn tick_once(
             entry.addr
         );
         already_dialing.insert(entry.node_id);
-        dialer.dial(entry.addr, entry.node_id);
+        // Maintenance path knows the expected NodeId (came from a
+        // peer-list gossip frame); pass it so the dialer can verify
+        // the TLS handshake.
+        dialer.dial(entry.addr, Some(entry.node_id));
     }
     spawned
 }
@@ -204,11 +217,11 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingDialer {
-        dialed: Mutex<Vec<(SocketAddr, NodeId)>>,
+        dialed: Mutex<Vec<(SocketAddr, Option<NodeId>)>>,
     }
 
     impl Dialer for RecordingDialer {
-        fn dial(&self, a: SocketAddr, expected: NodeId) {
+        fn dial(&self, a: SocketAddr, expected: Option<NodeId>) {
             self.dialed.lock().push((a, expected));
         }
     }
@@ -239,7 +252,11 @@ mod tests {
         // All dialed targets are valid candidates from the table and
         // distinct.
         let dialed = dialer.dialed.lock().clone();
-        let mut ids: Vec<_> = dialed.iter().map(|(_, id)| *id).collect();
+        // Maintenance path always passes Some(NodeId).
+        let mut ids: Vec<NodeId> = dialed
+            .iter()
+            .map(|(_, id)| id.expect("maintenance path passes Some"))
+            .collect();
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 8);
@@ -279,8 +296,9 @@ mod tests {
 
         let dialed = dialer.dialed.lock();
         for (_, id) in dialed.iter() {
+            let id = id.expect("maintenance path passes Some");
             assert!(
-                !direct.snapshot().contains(id),
+                !direct.snapshot().contains(&id),
                 "dialed an already-direct peer {id:?}"
             );
         }
@@ -356,7 +374,12 @@ mod tests {
         assert_eq!(first, 8);
 
         // Pretend every dialed peer connected.
-        let dialed_ids: Vec<NodeId> = dialer.dialed.lock().iter().map(|(_, id)| *id).collect();
+        let dialed_ids: Vec<NodeId> = dialer
+            .dialed
+            .lock()
+            .iter()
+            .map(|(_, id)| id.expect("maintenance path passes Some"))
+            .collect();
         direct.set(dialed_ids);
 
         // Subsequent ticks must be no-ops.
