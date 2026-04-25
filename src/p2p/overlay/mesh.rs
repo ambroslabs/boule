@@ -1,59 +1,9 @@
-//! Object-safe traits that abstract the full-mesh peer model so the
-//! consensus layer can treat the underlying topology as a black box.
+//! Full-mesh implementations of [`Broadcaster`] and [`Discovery`].
 //!
-//! The current peer manager (`super::manager`) keeps an explicit
-//! connection to every other validator and broadcasts by iterating that
-//! table. That model is fine for a single-operator testnet but doesn't
-//! fit the multi-operator deployment laid out in issue #131:
-//!
-//! - No operator wants to maintain N–1 explicit peering relationships.
-//! - Adding a validator shouldn't require a coordinated config push.
-//! - NAT-asymmetric operators need ways to be reached without being dialed.
-//! - New operators need a way to *find* the network beyond a few bootstrap
-//!   addresses.
-//!
-//! Two seams suffice to keep consensus topology-agnostic:
-//!
-//! - [`Broadcaster`] hides the *outbound* dispatch decision behind two
-//!   methods: `broadcast` (fan out to every "currently reachable" peer)
-//!   and `send_to` (a single named peer). The mesh implementation
-//!   ([`MeshBroadcaster`]) routes both through the existing peer-manager
-//!   channel; a future gossip implementation will pick a fanout subset
-//!   and rely on the receiver to forward.
-//! - [`Discovery`] hides the *peer-membership* surface behind
-//!   `known_peers` (snapshot), `add_bootstrap` (request a dial to a
-//!   freshly learned address), and `subscribe` (event stream of
-//!   add/remove deltas). The mesh implementation ([`MeshDiscovery`])
-//!   maintains a local cache fed by the manager's add/remove broadcast.
-//!
-//! # Delivery contract
-//!
-//! Implementations of [`Broadcaster`] guarantee **at-least-once**
-//! delivery on a best-effort basis: a frame may be delivered more than
-//! once under retries (e.g. when gossip lands and a frame is forwarded
-//! by two neighbours), and there is **no ordering guarantee** across
-//! distinct calls — even on the mesh today, broadcasting and
-//! send_to-ing concurrently can interleave on receivers in any order.
-//! Receivers are responsible for deduplication; consensus already does
-//! this via the per-view vote/proposal buckets in
-//! [`crate::consensus::hotstuff`].
-//!
-//! Both `broadcast` and `send_to` return a future so the caller can
-//! preserve the existing `await`-on-send backpressure. A successfully
-//! awaited send means the bytes have been handed to the underlying
-//! transport queue, not that any peer has decoded them.
-//!
-//! # Self-addressed traffic
-//!
-//! `send_to(self_id, …)` is dropped on the wire; the consensus layer
-//! handles self-loopback above this seam in
-//! `ConsensusNode::apply_safety_actions` (see issue #118).
-//!
-//! # Non-goals (deferred to follow-up issues)
-//!
-//! - Implementing gossip itself.
-//! - NAT traversal.
-//! - Dynamic membership / validator-set changes.
+//! These were the original implementations carved out when issue #131
+//! introduced the overlay traits. They are still the default while the
+//! gossip overlay (issue #137, see [`super::gossip`]) is under
+//! construction.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -66,94 +16,17 @@ use tracing::debug;
 
 use crate::clock::BoxFuture;
 
-use super::ProtocolOutbound;
-use super::tls::NodeId;
-
-// ── Broadcaster trait ────────────────────────────────────────────────────────
-
-/// Outbound dispatch surface for an application protocol.
-///
-/// See the [module-level docs](self) for the delivery contract.
-pub trait Broadcaster: Send + Sync {
-    /// Send `payload` to every currently reachable peer.
-    ///
-    /// On the mesh implementation this fans out to every entry in the
-    /// peer manager's connection table. On a future gossip
-    /// implementation it would push to a small fanout subset and rely
-    /// on receivers to forward.
-    ///
-    /// Awaiting the returned future blocks until the payload is queued
-    /// in the underlying transport — the standard backpressure point.
-    fn broadcast(&self, payload: Bytes) -> BoxFuture<'_, ()>;
-
-    /// Send `payload` to the single peer `target`.
-    ///
-    /// If `target` is not currently reachable the implementation may
-    /// silently drop the payload (the mesh today does so via the
-    /// manager's `SendTo unknown peer …` warn-log path). Self-addressed
-    /// sends are also dropped — see the module-level docs.
-    fn send_to(&self, target: NodeId, payload: Bytes) -> BoxFuture<'_, ()>;
-}
-
-// ── Discovery trait ──────────────────────────────────────────────────────────
-
-/// An add/remove delta in the peer set, published by [`Discovery::subscribe`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiscoveryEvent {
-    /// A peer just became reachable.
-    PeerAdded(NodeId),
-    /// A peer is no longer reachable.
-    PeerRemoved(NodeId),
-}
-
-/// Peer-membership and bootstrap surface.
-///
-/// Consensus consumes this for two purposes: a synchronous snapshot via
-/// [`Discovery::known_peers`] when reporting status, and an event
-/// stream via [`Discovery::subscribe`] to keep its own per-peer state
-/// (e.g. consensus-layer connectivity tracking) in sync.
-pub trait Discovery: Send + Sync {
-    /// Snapshot the currently reachable peer set.
-    ///
-    /// The returned vector is freshly allocated and the underlying
-    /// cache lock is released before this method returns; callers may
-    /// hold the result across `.await` points without risking
-    /// deadlocks.
-    ///
-    /// "Currently reachable" follows the implementation's own
-    /// definition. For the mesh implementation this is "the peer
-    /// manager has an open TLS connection". For a future gossip
-    /// implementation this would be "we have a routing entry for this
-    /// peer in the overlay".
-    fn known_peers(&self) -> Vec<NodeId>;
-
-    /// Hint that the implementation should attempt an outbound dial
-    /// to `addr` if it doesn't already have one.
-    ///
-    /// The mesh implementation today is no-op (the static peer list in
-    /// the config drives the dialer at boot — see #131 non-goals on
-    /// dynamic membership). Future gossip / Kademlia implementations
-    /// will use this for bootstrap-address ingestion.
-    fn add_bootstrap(&self, addr: SocketAddr);
-
-    /// Subscribe to the discovery event stream.
-    ///
-    /// Each subscriber receives every [`DiscoveryEvent`] published from
-    /// the moment of subscription onward; events that fired before the
-    /// subscriber existed are not replayed. Slow subscribers may lag
-    /// (per `tokio::sync::broadcast` semantics) and miss events; for an
-    /// always-current view of the peer set, combine `subscribe` with a
-    /// follow-up `known_peers` snapshot.
-    fn subscribe(&self) -> broadcast::Receiver<DiscoveryEvent>;
-}
+use super::super::ProtocolOutbound;
+use super::super::tls::NodeId;
+use super::traits::{Broadcaster, Discovery, DiscoveryEvent};
 
 // ── MeshBroadcaster ──────────────────────────────────────────────────────────
 
 /// [`Broadcaster`] backed by the full-mesh peer manager.
 ///
 /// Wraps a clone of the per-protocol `mpsc::Sender<ProtocolOutbound>`
-/// returned by [`super::PeerCommand::RegisterProtocol`]. Awaiting a
-/// `broadcast` / `send_to` is exactly equivalent to the previous
+/// returned by [`super::super::PeerCommand::RegisterProtocol`]. Awaiting
+/// a `broadcast` / `send_to` is exactly equivalent to the previous
 /// `send_tx.send(ProtocolOutbound::Broadcast(...)).await` call site —
 /// the manager fans it out across the peer table.
 pub struct MeshBroadcaster {
@@ -162,7 +35,7 @@ pub struct MeshBroadcaster {
 
 impl MeshBroadcaster {
     /// Wrap an outbound `send_tx` channel obtained from a
-    /// [`super::ProtocolHandle`] into a [`Broadcaster`].
+    /// [`super::super::ProtocolHandle`] into a [`Broadcaster`].
     pub fn new(send_tx: mpsc::Sender<ProtocolOutbound>) -> Self {
         Self { send_tx }
     }
