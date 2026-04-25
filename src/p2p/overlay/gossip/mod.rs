@@ -35,6 +35,7 @@ pub mod dedup;
 pub mod maintenance;
 pub mod peer_list_task;
 pub mod peer_table;
+pub mod sink;
 pub mod wire;
 
 /// Single-byte protocol identifier for the gossip overlay's control +
