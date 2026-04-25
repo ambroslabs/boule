@@ -10,58 +10,106 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Detect whether this change touches anything that affects build/test/lint
+  # output. Pushes to main always run everything; PRs that only touch docs,
+  # `.claude/**`, etc. short-circuit the heavy jobs to a no-op.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" != "pull_request" ]]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE_SHA"...HEAD)
+          echo "Changed files:"
+          echo "$changed"
+          if echo "$changed" | grep -E '(\.rs$|^Cargo\.(toml|lock)$|^rust-toolchain\.toml$|^clippy\.toml$|^deny\.toml$|^\.github/workflows/)' >/dev/null; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
   fmt:
     name: Format
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: actions/cache@v4
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - run: cargo clippy --all-targets -- -D warnings
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Test
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      - if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.rust == 'true'
+        uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-      - name: Build
-        run: cargo build --locked
-      - name: Test
-        run: cargo test --locked
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+      - if: needs.changes.outputs.rust == 'true'
+        name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo nextest run --locked --all-targets
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo test --locked --doc
 
   deny:
     name: Deny (licenses + advisories)
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: EmbarkStudios/cargo-deny-action@v2

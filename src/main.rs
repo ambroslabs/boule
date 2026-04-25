@@ -254,37 +254,20 @@ fn handle_init(args: &[String]) -> anyhow::Result<()> {
     // Step 3: resolve the identity backend. `init` does not need
     // production semantics — operators run it interactively to bootstrap.
     let identity_cfg = resolve_and_validate_identity(&config.node, false, false)?;
-    println!("identity backend: {}", identity_cfg.backend_name());
+    println!("network identity backend: {}", identity_cfg.backend_name());
 
-    // Step 4: provision the key (or report externally-managed).
+    // Step 4: provision the network key (or report externally-managed).
     let provider = config::build_provider(&identity_cfg)?;
-    match provider.try_load()? {
-        Some(id) => {
-            let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&id)?;
-            println!(
-                "node already provisioned: NodeId = {}",
-                node_id_to_base58(&tls.node_id)
-            );
-        }
-        None => {
-            if provider.is_provisioning_capable() {
-                // Backends that report `is_provisioning_capable()` mint
-                // a key inside `load_or_init` on first use. Encrypted
-                // backends prompt for a passphrase here.
-                let new_id = provider.load_or_init()?;
-                let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&new_id)?;
-                println!(
-                    "provisioned new node key: NodeId = {}",
-                    node_id_to_base58(&tls.node_id)
-                );
-            } else {
-                println!(
-                    "key backend `{}` is externally managed; provision the key out-of-band, \
-                     then re-run `init` to print the resulting NodeId.",
-                    identity_cfg.backend_name()
-                );
-            }
-        }
+    provision_or_report(&*provider, identity_cfg.backend_name(), "network")?;
+
+    // Step 4b: same flow for `[node.validator_identity]` if configured.
+    // When the table is absent, the network key is reused for consensus
+    // signing at start time (with a deprecation warning), so `init` has
+    // nothing extra to do here.
+    if let Some(val_cfg) = config::resolve_validator_identity(&config.node) {
+        println!("validator identity backend: {}", val_cfg.backend_name());
+        let val_provider = config::build_provider(&val_cfg)?;
+        provision_or_report(&*val_provider, val_cfg.backend_name(), "validator")?;
     }
 
     // Step 5: ensure consensus storage_dir exists. Doing this in init
@@ -308,6 +291,42 @@ fn handle_init(args: &[String]) -> anyhow::Result<()> {
         "init complete. Run `ambros-p2p start --config {}` to launch.",
         config_path.display()
     );
+    Ok(())
+}
+
+/// Bootstrap a single key slot: report idempotently if a key already
+/// exists, otherwise mint one for backends that can self-provision and
+/// print an externally-managed notice for the rest. `slot` distinguishes
+/// `network` vs `validator` in the printed messages.
+fn provision_or_report(
+    provider: &dyn KeyProvider,
+    backend_name: &str,
+    slot: &str,
+) -> anyhow::Result<()> {
+    match provider.try_load()? {
+        Some(id) => {
+            let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&id)?;
+            println!(
+                "{slot} key already provisioned: NodeId = {}",
+                node_id_to_base58(&tls.node_id)
+            );
+        }
+        None => {
+            if provider.is_provisioning_capable() {
+                let new_id = provider.load_or_init()?;
+                let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&new_id)?;
+                println!(
+                    "provisioned new {slot} key: NodeId = {}",
+                    node_id_to_base58(&tls.node_id)
+                );
+            } else {
+                println!(
+                    "{slot} key backend `{backend_name}` is externally managed; \
+                     provision the key out-of-band, then re-run `init` to print the resulting NodeId."
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -391,10 +410,10 @@ async fn handle_start(args: &[String]) -> anyhow::Result<()> {
     let production = is_production(args.production);
     let identity_cfg =
         resolve_and_validate_identity(&config.node, production, args.allow_insecure_perms)?;
-    info!("identity backend: {}", identity_cfg.backend_name());
+    info!("network identity backend: {}", identity_cfg.backend_name());
 
     let provider = config::build_provider(&identity_cfg)?;
-    let node_identity = provider.try_load()?.ok_or_else(|| {
+    let network_identity = provider.try_load()?.ok_or_else(|| {
         anyhow::anyhow!(
             "no node key found via the `{}` backend. Run `ambros-p2p init --config {}` \
              first (or provision the key out-of-band for read-only backends).",
@@ -403,7 +422,27 @@ async fn handle_start(args: &[String]) -> anyhow::Result<()> {
         )
     })?;
 
-    node::run(config, node_identity).await
+    // Optional separate validator (consensus signing) identity. If the
+    // table is present, it must already hold a key — `start` never
+    // mints one (that's `init`'s job).
+    let validator_identity = if let Some(val_cfg) = config::resolve_validator_identity(&config.node)
+    {
+        info!("validator identity backend: {}", val_cfg.backend_name());
+        let val_provider = config::build_provider(&val_cfg)?;
+        let val_id = val_provider.try_load()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no validator key found via the `{}` backend. Run `ambros-p2p init --config {}` \
+                 first (or provision the key out-of-band for read-only backends).",
+                val_cfg.backend_name(),
+                config_path.display(),
+            )
+        })?;
+        Some(val_id)
+    } else {
+        None
+    };
+
+    node::run(config, network_identity, validator_identity).await
 }
 
 // ── `key` subcommand (existing migrate flow) ────────────────────────────────

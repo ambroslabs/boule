@@ -18,7 +18,7 @@ use crate::config::{Config, ConsensusConfig};
 use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::status::ConsensusStatus;
 use crate::consensus::validator_set::ValidatorSet;
-use crate::crypto::signed::NodeSigner;
+use crate::crypto::signed::{NodeSigner, Signer};
 use crate::gossip;
 use crate::p2p::identity::NodeIdentity;
 use crate::p2p::manager::ManagerMsg;
@@ -31,14 +31,57 @@ use crate::replication::impls::{CounterStateMachine, InMemoryMempool};
 use crate::replication::state_machine::StateMachine;
 use crate::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
 
-/// Run a node from a fully-resolved configuration and an already-loaded
-/// identity. Blocks until ctrl-c, then drains tasks and returns.
-pub async fn run(config: Config, node_identity: NodeIdentity) -> anyhow::Result<()> {
-    let identity = Arc::new(TlsIdentity::from_identity(&node_identity)?);
-    let consensus_signer = Arc::new(NodeSigner::from_identity(&node_identity)?);
-    drop(node_identity);
+/// Run a node from a fully-resolved configuration plus the network and
+/// (optional) validator identities. When `validator_identity` is `None`,
+/// the network identity is reused for consensus signing — the historical
+/// single-key behavior — with a deprecation warning if consensus is
+/// enabled. Blocks until ctrl-c, then drains tasks and returns.
+pub async fn run(
+    config: Config,
+    network_identity: NodeIdentity,
+    validator_identity: Option<NodeIdentity>,
+) -> anyhow::Result<()> {
+    let identity = Arc::new(TlsIdentity::from_identity(&network_identity)?);
 
-    info!("node ID: {}", node_id_to_base58(&identity.node_id));
+    // Resolve the consensus-signing key. When `[node.validator_identity]`
+    // is configured, build a separate `NodeSigner` from that key.
+    // Otherwise reuse the network identity and warn loudly if consensus
+    // is actually enabled (gossip-only nodes never use the signer, so
+    // the warning would be noise there).
+    let consensus_signer = match validator_identity {
+        Some(ref val_id) => Arc::new(NodeSigner::from_identity(val_id)?),
+        None => {
+            if config.consensus.is_some() {
+                warn!(
+                    "[node.validator_identity] is unset — reusing the network identity for \
+                     consensus signing. Configure [node.validator_identity] to enable \
+                     independent rotation of the TLS key; this fallback will be removed \
+                     in a future release."
+                );
+            }
+            Arc::new(NodeSigner::from_identity(&network_identity)?)
+        }
+    };
+    drop(network_identity);
+    drop(validator_identity);
+
+    info!("network node ID: {}", node_id_to_base58(&identity.node_id));
+    let validator_node_id = consensus_signer.node_id();
+    if validator_node_id != identity.node_id {
+        info!(
+            "validator node ID: {}",
+            node_id_to_base58(&validator_node_id)
+        );
+        if config.consensus.is_some() {
+            warn!(
+                "validator pubkey differs from network pubkey — consensus dispatch routes \
+                 messages by validator pubkey, but the live p2p layer addresses peers by \
+                 their TLS pubkey. Until validator-set reconfiguration (issue #140) lands \
+                 and registers a (validator pubkey → network address) mapping, the cluster \
+                 cannot route consensus traffic across the split."
+            );
+        }
+    }
 
     let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
     let store = Arc::new(gossip::store::GossipStore::new());
@@ -98,9 +141,10 @@ pub async fn run(config: Config, node_identity: NodeIdentity) -> anyhow::Result<
     // present, the protocol is registered, the ConsensusNode is
     // constructed (with disk storage if configured, otherwise in-memory)
     // and its `run` loop is spawned. A oneshot shutdown sender is kept
-    // so we can stop the loop gracefully on ctrl-c.
+    // so we can stop the loop gracefully on ctrl-c. The consensus layer
+    // self-identifies by *validator* pubkey, not network pubkey.
     let consensus_runtime = if let Some(cons_cfg) = config.consensus.as_ref() {
-        Some(start_consensus(cons_cfg, &p2p_cmd_tx, &identity.node_id, &consensus_signer).await?)
+        Some(start_consensus(cons_cfg, &p2p_cmd_tx, &validator_node_id, &consensus_signer).await?)
     } else {
         info!("consensus: disabled (no [consensus] section in config)");
         None

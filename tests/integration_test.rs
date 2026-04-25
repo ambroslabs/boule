@@ -504,43 +504,51 @@ async fn test_four_node_full_mesh_is_stable_under_simultaneous_dials() {
         .map(|d| d.path().join("node.key").to_str().unwrap().to_owned())
         .collect();
 
-    let mut p2p_addrs: Vec<String> = Vec::with_capacity(N);
-    let mut node_ids: Vec<String> = Vec::with_capacity(N);
-    for key_path in &key_paths {
-        let info = launch_once_for_discovery(key_path).await;
-        p2p_addrs.push(info.p2p_addr);
-        node_ids.push(info.node_id);
-    }
+    // Phase 1: discover every node's address concurrently. The previous
+    // sequential loop paid per-node spawn + bind + shutdown latency four
+    // times in a row.
+    let discovered: Vec<DiscoveryInfo> =
+        futures_util::future::join_all(key_paths.iter().map(|p| launch_once_for_discovery(p)))
+            .await;
+    let p2p_addrs: Vec<String> = discovered.iter().map(|d| d.p2p_addr.clone()).collect();
+    let node_ids: Vec<String> = discovered.iter().map(|d| d.node_id.clone()).collect();
 
     // Phase 2: relaunch every node concurrently with the full peer list.
-    let mut guards: Vec<NodeGuard> = Vec::with_capacity(N);
-    for i in 0..N {
-        let peer_descs: Vec<PeerDesc<'_>> = (0..N)
-            .filter(|j| *j != i)
-            .map(|j| PeerDesc {
-                p2p_addr: &p2p_addrs[j],
-                node_id: &node_ids[j],
-            })
-            .collect();
-        guards.push(spawn_node_fixed_port(&key_paths[i], &p2p_addrs[i], &peer_descs).await);
-    }
+    let peer_lists: Vec<Vec<PeerDesc<'_>>> = (0..N)
+        .map(|i| {
+            (0..N)
+                .filter(|j| *j != i)
+                .map(|j| PeerDesc {
+                    p2p_addr: &p2p_addrs[j],
+                    node_id: &node_ids[j],
+                })
+                .collect()
+        })
+        .collect();
+    let guards: Vec<NodeGuard> = futures_util::future::join_all(
+        (0..N).map(|i| spawn_node_fixed_port(&key_paths[i], &p2p_addrs[i], &peer_lists[i])),
+    )
+    .await;
 
     let ready_timeout = Duration::from_secs(10);
-    for guard in &guards {
-        wait_until_ready(guard, ready_timeout).await;
-    }
+    futures_util::future::join_all(guards.iter().map(|g| wait_until_ready(g, ready_timeout))).await;
 
     // Every node must see every other node, within the 2s budget from the
     // issue's acceptance criteria (after the last node starts).
     let mesh_timeout = Duration::from_secs(10);
-    for guard in &guards {
-        wait_for_peer_count(guard, N - 1, mesh_timeout).await;
-    }
+    futures_util::future::join_all(
+        guards
+            .iter()
+            .map(|g| wait_for_peer_count(g, N - 1, mesh_timeout)),
+    )
+    .await;
 
-    // Mesh is up. Watch it for 5s and assert every node keeps reporting
-    // (N - 1) peers continuously — no flapping.
+    // Mesh is up. Watch it for 2s and assert every node keeps reporting
+    // (N - 1) peers continuously — no flapping. 8 polls at 250ms each
+    // are enough to catch the churn pattern from #114; the original 5s
+    // watch was over-budgeted.
     let client = reqwest::Client::new();
-    let watch_end = Instant::now() + Duration::from_secs(5);
+    let watch_end = Instant::now() + Duration::from_secs(2);
     while Instant::now() < watch_end {
         for guard in &guards {
             let peers: Value = client

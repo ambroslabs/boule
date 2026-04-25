@@ -78,6 +78,47 @@ location. A single-node deployment can omit `--config` entirely.
 for backward compatibility but has been superseded by the
 `[node.identity]` table — use the table form in new configs.)
 
+### Network identity vs. validator identity
+
+`[node.identity]` is the **network** key: it backs the TLS handshake and
+its base58 public key is the overlay `NodeId` other peers dial. When a
+node also runs HotStuff consensus it needs a second key — the
+**validator** key — to sign proposals, votes, and timeout messages.
+
+By default the validator key is the network key (single-key mode, the
+historical behavior; a deprecation warning fires at startup when
+consensus is enabled without an explicit validator slot). To split them,
+add a sibling `[node.validator_identity]` table that names any of the
+same backends:
+
+```toml
+[node.identity]
+backend = "file"
+path    = "./testnet/node1/node.key"
+
+[node.validator_identity]
+backend = "encrypted-file"
+path    = "./testnet/node1/validator.key"
+passphrase_env = "AMBROS_VALIDATOR_PASSPHRASE"
+```
+
+Splitting them lets you rotate the TLS key (via `key migrate` or out-of-
+band) without churning the validator's consensus identity, and lets the
+validator key live on a colder backend than the always-online network
+key. Both keys are minted on first start the same way as the single-key
+case — the binary logs `network node ID: ...` and (when distinct)
+`validator node ID: ...`. The values that go in `[consensus].validators`
+across the cluster are the **validator** node IDs.
+
+> **Live cluster routing.** The dispatch layer currently routes consensus
+> messages by validator pubkey, while the p2p layer addresses peers by
+> their TLS pubkey. As long as the two pubkeys match (single-key mode, or
+> a `[node.validator_identity]` that resolves to the same key bytes as
+> `[node.identity]`), routing works. Independently rotating the validator
+> key requires the validator-set reconfiguration runbook (issue #140) to
+> register a `(validator pubkey → network address)` mapping; until that
+> lands the binary warns at startup if the two pubkeys differ.
+
 ---
 
 ## 3. Lay out the testnet directory
@@ -776,6 +817,8 @@ Your node IDs will change after this, so remember to re-wire `[[peers]]`
 | Messages don't propagate | Mesh isn't formed — check `/peers` first. If peers are present but `/messages` diverges, check clocks: `expiry` comparisons use wall-clock time, and a very skewed laptop clock can make messages land already-expired. |
 | `no node key found via the '<backend>' backend` | The configured key backend is empty — run `ambros-p2p init --config <path>` (file/encrypted-file) or provision the key out-of-band (env/exec/keyring) before retrying `start`. |
 | `refusing to start in production without an explicit [node.identity]` | You set `AMBROS_ENV=production` or passed `--production`. For a laptop testnet, unset both and let the default file backend kick in. |
+| `[node.validator_identity] is unset — reusing the network identity for consensus signing` | Single-key fallback warning. Add a `[node.validator_identity]` table to silence it; or ignore it for laptop testnets (the fallback works as it always has). |
+| `validator pubkey differs from network pubkey — consensus dispatch routes messages by validator pubkey ...` | You set a `[node.validator_identity]` whose key bytes resolve to a different Ed25519 pubkey than the network key. Cross-pubkey routing requires validator-set reconfiguration (#140); until that lands, point both slots at the same key bytes (different backends are fine). |
 | Consensus nodes never commit | The committees don't match. Every replica's `[consensus].validators` list must be the exact same strings in the exact same order, and `genesis_seed_hex` must be identical. Check `/consensus/status` on every node — divergent `validator_set` arrays are the smoking gun. |
 | Consensus committing in steady state then stalls | A node went down and the cluster dropped below quorum. With `n = 3f + 1`, you need at least `2f + 1` live to make progress. `/consensus/status` shows `peers_connected` shrinking and `timeout_buckets` accumulating without firing. |
 | `/consensus/status` returns 404 | The `[consensus]` section is missing from that node's config, or the node was started without `--config`. |
