@@ -55,6 +55,15 @@ impl KeyProvider for ExecKeyProvider {
         id.validate().context("validating key from exec backend")?;
         Ok(id)
     }
+
+    fn try_load(&self) -> anyhow::Result<Option<NodeIdentity>> {
+        // The exec backend has no cheap "exists" check — running the
+        // command is the only way to know. Defer to load_or_init and
+        // report any failure as "no key here" so `init` can print the
+        // externally-managed notice rather than crashing on the
+        // operator's behalf.
+        Ok(self.load_or_init().ok())
+    }
 }
 
 #[cfg(all(test, unix))]
