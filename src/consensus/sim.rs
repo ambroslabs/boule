@@ -2669,6 +2669,108 @@ mod tests {
         assert_no_conflicts(&committed);
     }
 
+    /// Issue #178 regression. A node isolated from the cluster while
+    /// it's running on a sparse-mesh gossip overlay (`target_degree`
+    /// well below `n - 1`) loses sync — the live cluster commits
+    /// several blocks past the isolated node's high water mark while
+    /// it is partitioned. After healing, the previously-isolated node
+    /// must catch up via block-sync rather than wedging at its old
+    /// height.
+    ///
+    /// This is the in-sim analogue of `docs/testnet-local.md` §9b's
+    /// rotating-failure scenario: a partitioned node mirrors the
+    /// "behind the cluster" state of a freshly-restarted node, since
+    /// in both cases the lagger sees fresh proposals whose parents
+    /// it has never processed.
+    ///
+    /// The non-zero `frame_loss_rate` is the key knob that exercises
+    /// the issue #178 fix (re-emit `Action::RequestBlock` for still-
+    /// parked proposals on every `PacemakerAdvance`). Without lossy
+    /// frames the sim's first probe always succeeds and the retry
+    /// branch is never reached; with 25% loss a non-trivial fraction
+    /// of `BlockRequest`s and `BlockResponse`s drop, so liveness
+    /// depends on the safety core re-emitting requests for proposals
+    /// whose parent never arrived. Matches the real-world symptom:
+    /// the gossip-fallback unicast had no built-in retry, so a single
+    /// dropped probe wedged the lagger.
+    #[tokio::test]
+    async fn gossip_sparse_mesh_isolated_node_catches_up_via_block_sync() {
+        tokio::time::pause();
+        const N: usize = 7;
+        const K: usize = 4; // sparse-mesh ring (well below `N - 1 = 6`).
+        let mut cluster = SimCluster::spawn_gossip(
+            N,
+            Duration::from_millis(50),
+            K,
+            /* frame_loss_rate */ 0.25,
+            /* loss_seed       */ 0xD7B2,
+        )
+        .await;
+
+        // Phase 1 — warm-up. Every node commits at least one block so
+        // each has a non-trivial `pending_blocks` cache and a recovered
+        // `high_qc` to extend off of.
+        const WARM_CAP: Duration = Duration::from_secs(5);
+        let warmed = cluster
+            .advance_and_yield_until(WARM_CAP, |c| c.peek_commit_heights().iter().all(|&h| h > 0))
+            .await;
+        assert!(
+            warmed,
+            "warm-up failed: heights = {:?}",
+            cluster.peek_commit_heights()
+        );
+
+        // Phase 2 — partition node 0. The remaining 6 nodes still hold
+        // the n=7 quorum (5 of 7), so they continue committing blocks
+        // while node 0 sits silent. We hold the partition long enough
+        // for the live cluster to advance well past node 0's
+        // pre-partition height so the post-heal catch-up actually
+        // exercises the block-sync path (rather than just resuming
+        // off the same pending_blocks).
+        cluster.partition_node(0);
+        let height_before_partition = cluster.peek_commit_heights()[0];
+        const PARTITION_HOLD: Duration = Duration::from_secs(2);
+        cluster
+            .advance_and_yield_until(PARTITION_HOLD, |c| {
+                let h = c.peek_commit_heights();
+                // Wait until *some* live node has gained ≥ 5 commits
+                // past the partition point. The exact gap doesn't
+                // matter; the goal is that node 0 is provably behind.
+                (1..N).any(|i| h[i] >= height_before_partition + 5)
+            })
+            .await;
+
+        // Snapshot heights mid-partition. Node 0 must not have moved.
+        let heights_mid = cluster.peek_commit_heights();
+        assert_eq!(
+            heights_mid[0], height_before_partition,
+            "isolated node 0 must not advance while partitioned: heights = {heights_mid:?}",
+        );
+        assert!(
+            (1..N).any(|i| heights_mid[i] > height_before_partition),
+            "live cluster must keep committing while node 0 is partitioned: heights = {heights_mid:?}",
+        );
+
+        // Phase 3 — heal. Node 0 reconnects and must catch up via
+        // block-sync (its `pending_blocks` is missing every proposal
+        // committed during the partition, so each fresh proposal
+        // arriving at node 0 will park and emit `RequestBlock`).
+        cluster.heal_node(0);
+        const HEAL_CAP: Duration = Duration::from_secs(15);
+        let caught_up = cluster
+            .advance_and_yield_until(HEAL_CAP, |c| c.peek_commit_heights()[0] > heights_mid[0])
+            .await;
+        assert!(
+            caught_up,
+            "previously-isolated node 0 must catch up via block-sync after heal; \
+             heights = {:?}",
+            cluster.peek_commit_heights()
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
     /// `circulant_neighbors` produces a connected K-regular graph for
     /// the parameters the gossip-overlay sim uses.
     #[test]
