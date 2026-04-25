@@ -792,16 +792,19 @@ async fn build_gossip_node(ctx: SimNodeCtx) -> SimNode {
     let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(256);
     let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
     let (peer_gone_tx, _) = broadcast::channel::<NodeId>(64);
+    let (discovery_tx, _) = broadcast::channel::<crate::p2p::overlay::DiscoveryEvent>(64);
 
     let manager_handle = {
         let itx = internal_tx.clone();
         let pgt = peer_gone_tx.clone();
+        let dtx = discovery_tx.clone();
         tokio::spawn(crate::p2p::manager::run(
             our_id,
             cmd_rx,
             internal_rx,
             itx,
             pgt,
+            dtx,
         ))
     };
 
