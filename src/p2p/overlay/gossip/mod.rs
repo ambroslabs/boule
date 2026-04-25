@@ -32,6 +32,7 @@
 
 pub mod broadcaster;
 pub mod dedup;
+pub mod discovery;
 pub mod maintenance;
 pub mod peer_list_task;
 pub mod peer_table;
