@@ -144,6 +144,29 @@ pub const STORAGE_KEY_LOCKED: &[u8] = b"consensus/locked";
 /// justify on proposals and piggybacked on `NewView`.
 pub const STORAGE_KEY_HIGH_QC: &[u8] = b"consensus/high_qc";
 
+/// Storage-key prefix under which committed blocks are persisted by
+/// content-hash. Each block is written on commit so a peer can fetch
+/// it via the block-sync sub-protocol even after we have evicted it
+/// from the in-memory `pending_blocks` cache or restarted (which
+/// resets `pending_blocks` to just the genesis block).
+///
+/// Keys are formed as `{STORAGE_KEY_BLOCK_PREFIX}{hash}` (a 32-byte
+/// content hash appended to the prefix). See [`block_storage_key`].
+///
+/// Issue #178: a restarted replica with empty `pending_blocks` was
+/// unable to serve a `BlockRequest` for a block it had already
+/// committed, leaving its peers' block-sync stuck in a retry loop.
+/// Persisting on commit gives every committed block a durable home
+/// every replica can serve from.
+pub const STORAGE_KEY_BLOCK_PREFIX: &[u8] = b"consensus/block/";
+
+/// Storage key for the (height, view) of the most recently committed
+/// block. Restored at startup so [`ConsensusStatus::last_committed_height`]
+/// reflects the durable chain even before the run loop sees its first
+/// inbound proposal — fixing the post-restart `last_committed_height
+/// = 0` gap called out in #178's reopen comment.
+pub const STORAGE_KEY_LAST_COMMITTED: &[u8] = b"consensus/last_committed";
+
 /// Protocol ID registered with the p2p multiplexer for consensus traffic.
 /// Gossip uses `0x01`, ping-RPC uses `0x02`.
 pub const PROTOCOL_ID: u8 = 0x03;
@@ -608,6 +631,18 @@ impl ConsensusNode {
             config.genesis.clone(),
         )?;
 
+        // Restore the (height, view) status checkpoint so a freshly
+        // resumed replica reports its durable chain rather than `0` —
+        // see `STORAGE_KEY_LAST_COMMITTED` and the `consensus_resumed`
+        // gap called out in #178's reopen comment.
+        let last_committed = match storage
+            .get(STORAGE_KEY_LAST_COMMITTED)
+            .context("read last_committed from storage")?
+        {
+            Some(raw) => decode_last_committed(&raw)?,
+            None => LastCommitted { height: 0, view: 0 },
+        };
+
         let validator_set = Arc::new(config.validator_set.clone());
         let timeout_policy = Arc::new(ExponentialBackoff::new(
             config.timeout_base,
@@ -641,8 +676,8 @@ impl ConsensusNode {
             timeout_buckets: HashMap::new(),
             commit_tx: None,
             peers_connected: HashSet::new(),
-            last_committed_height: 0,
-            last_committed_view: 0,
+            last_committed_height: last_committed.height,
+            last_committed_view: last_committed.view,
             status_tx: None,
         })
     }
@@ -877,7 +912,58 @@ impl ConsensusNode {
             }
 
             Dispatch::ServeBlock { hash, to } => {
-                let block = self.core.state().pending_blocks.get(&hash).cloned();
+                // Look in the in-memory `pending_blocks` cache first;
+                // fall back to durable storage for blocks that were
+                // committed before this replica restarted (where the
+                // cache is rebuilt empty save for genesis) or in any
+                // future world where pending_blocks gets pruned.
+                // Issue #178: without the storage fallback, a restarted
+                // node could not serve any pre-restart block, leaving
+                // its peers' block-sync stuck.
+                let mut found_in_pending = false;
+                let mut found_in_storage = false;
+                let block = self
+                    .core
+                    .state()
+                    .pending_blocks
+                    .get(&hash)
+                    .cloned()
+                    .inspect(|_| {
+                        found_in_pending = true;
+                    })
+                    .or_else(|| {
+                        load_block_from_storage(self.storage.as_ref(), &hash)
+                            .inspect(|got| {
+                                found_in_storage = got.is_some();
+                            })
+                            .unwrap_or_else(|e| {
+                                tracing::error!(
+                                    target: TRACE_TARGET,
+                                    hash = ?hash,
+                                    error = %e,
+                                    "block_storage_lookup_failed",
+                                );
+                                None
+                            })
+                    });
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    from = %node_id_to_base58(&to),
+                    hash = ?hash,
+                    found_in_pending,
+                    found_in_storage,
+                    found = block.is_some(),
+                    "block_sync_request_received",
+                );
+                if block.is_none() {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        from = %node_id_to_base58(&to),
+                        hash = ?hash,
+                        pending_blocks_size = self.core.state().pending_blocks.len(),
+                        "block_sync_request_unfindable",
+                    );
+                }
                 let out = dispatch::egress_block_response(block, to);
                 send_outbound(broadcaster, out).await;
             }
@@ -1374,6 +1460,33 @@ impl ConsensusNode {
 
     /// Commit `block` to the state machine and drain the committed commands
     /// from the mempool.
+    ///
+    /// # Durability
+    ///
+    /// Every committed block is also written to durable storage under
+    /// `consensus/block/<hash>` together with an updated
+    /// `consensus/last_committed` checkpoint, applied as a single atomic
+    /// batch. Two reasons:
+    ///
+    /// 1. **Block-sync responder fallback.** A peer that requests a
+    ///    block we have already evicted from `pending_blocks` (or that
+    ///    we have not yet re-inserted post-restart, since the in-memory
+    ///    cache is rebuilt empty) must still be served. The
+    ///    [`Dispatch::ServeBlock`] arm consults storage when
+    ///    `pending_blocks` misses; without the put here, the lookup
+    ///    would return `None` and our peer would loop forever on its
+    ///    `RequestBlock` retries (#178 reopen).
+    /// 2. **Status accuracy after restart.** `last_committed_height`
+    ///    is otherwise an in-memory counter; `consensus_resumed` would
+    ///    report `0` post-restart even when storage attests to a long
+    ///    chain of commits. Persisting the checkpoint lets [`recover`]
+    ///    rebuild the counter at boot.
+    ///
+    /// Storage backend errors are logged at `error` and otherwise
+    /// swallowed: the safety-core contract is satisfied as long as
+    /// `last_voted_view` / `locked` / `high_qc` are flushed (which
+    /// happens through [`persist_updates`] before any outbound vote),
+    /// so a transient block-store hiccup must not stop liveness.
     fn apply_commit(&mut self, block: crate::replication::block::Block) {
         {
             let mut sm = self.state_machine.lock();
@@ -1395,6 +1508,34 @@ impl ConsensusNode {
         if block.header.height > self.last_committed_height {
             self.last_committed_height = block.header.height;
             self.last_committed_view = block.header.view;
+        }
+        // Persist (block, last_committed) atomically so the responder
+        // path and the status snapshot agree on durable state. See the
+        // doc-comment for the why.
+        let block_hash = block.hash();
+        let key = block_storage_key(&block_hash);
+        let last_committed = LastCommitted {
+            height: self.last_committed_height,
+            view: self.last_committed_view,
+        };
+        let put_result = (|| -> anyhow::Result<()> {
+            let block_bytes = encode_block(&block)?;
+            let last_committed_bytes = encode_last_committed(&last_committed)?;
+            self.storage.batch(|b| {
+                b.put(&key, &block_bytes);
+                b.put(STORAGE_KEY_LAST_COMMITTED, &last_committed_bytes);
+                Ok(())
+            })
+        })();
+        if let Err(e) = put_result {
+            tracing::error!(
+                target: TRACE_TARGET,
+                height = block.header.height,
+                view = block.header.view,
+                hash = ?block_hash,
+                error = %e,
+                "block_persist_failed",
+            );
         }
         tracing::info!(
             "consensus: committed block height={} view={}",
@@ -1440,16 +1581,58 @@ pub fn decode_high_qc(bytes: &[u8]) -> anyhow::Result<QuorumCertificate> {
     postcard::from_bytes(bytes).context("decode high_qc")
 }
 
+/// Compose the storage key for a committed block keyed by its
+/// content-hash: `STORAGE_KEY_BLOCK_PREFIX || hash`.
+pub fn block_storage_key(hash: &BlockHash) -> Vec<u8> {
+    let mut key = Vec::with_capacity(STORAGE_KEY_BLOCK_PREFIX.len() + hash.len());
+    key.extend_from_slice(STORAGE_KEY_BLOCK_PREFIX);
+    key.extend_from_slice(hash);
+    key
+}
+
+/// Serialize a committed [`Block`] for the durable block store. See
+/// [`STORAGE_KEY_BLOCK_PREFIX`].
+pub fn encode_block(block: &Block) -> anyhow::Result<Vec<u8>> {
+    postcard::to_stdvec(block).context("encode committed block")
+}
+
+/// Inverse of [`encode_block`].
+pub fn decode_block(bytes: &[u8]) -> anyhow::Result<Block> {
+    postcard::from_bytes(bytes).context("decode committed block")
+}
+
+/// Persisted `(height, view)` pair for the most recently committed
+/// block. Stored at [`STORAGE_KEY_LAST_COMMITTED`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastCommitted {
+    pub height: u64,
+    pub view: View,
+}
+
+/// Serialize the `(height, view)` checkpoint to its on-storage
+/// encoding.
+pub fn encode_last_committed(lc: &LastCommitted) -> anyhow::Result<Vec<u8>> {
+    postcard::to_stdvec(lc).context("encode last_committed")
+}
+
+/// Inverse of [`encode_last_committed`].
+pub fn decode_last_committed(bytes: &[u8]) -> anyhow::Result<LastCommitted> {
+    postcard::from_bytes(bytes).context("decode last_committed")
+}
+
 /// Recover a [`HotStuffState`] by reading the persisted control-plane
 /// keys from `storage`.
 ///
 /// A fresh node state (equivalent to `HotStuffState::new(vs, genesis)`)
 /// is the baseline; any of `last_voted_view`, `locked`, `high_qc` that
 /// were previously persisted by [`ConsensusNode::persist_updates`] are
-/// overlaid. The `pending_blocks` field is **not** recovered from the
-/// WAL yet — that is future work for the block-replay PR. Only the
-/// durable pieces of the safety-core contract (the ones that, if lost,
-/// would let a restarted replica double-vote) are restored here.
+/// overlaid. The `pending_blocks` field is intentionally **not**
+/// repopulated here — committed blocks live under
+/// [`STORAGE_KEY_BLOCK_PREFIX`] and are served on demand by the
+/// `Dispatch::ServeBlock` arm via [`load_block_from_storage`]. That
+/// keeps boot O(1) rather than O(committed-blocks) while preserving
+/// the issue #178 invariant that *some* replica will always serve a
+/// previously-committed block to a peer that asks for it.
 ///
 /// Missing keys are expected on a first startup and are not errors.
 pub fn recover_state(
@@ -1525,6 +1708,21 @@ async fn send_outbound(broadcaster: &dyn Broadcaster, out: Outbound) {
     match out {
         Outbound::Broadcast(b) => broadcaster.broadcast(b).await,
         Outbound::SendTo { to, payload } => broadcaster.send_to(to, payload).await,
+    }
+}
+
+/// Read a previously-committed block from durable storage by its
+/// content-hash. Returns `Ok(None)` when the key is absent (the block
+/// was never committed by this replica), `Err` only on backend errors
+/// or corrupt bytes. See [`STORAGE_KEY_BLOCK_PREFIX`].
+pub fn load_block_from_storage(
+    storage: &dyn Storage,
+    hash: &BlockHash,
+) -> anyhow::Result<Option<Block>> {
+    let key = block_storage_key(hash);
+    match storage.get(&key)? {
+        Some(raw) => Ok(Some(decode_block(&raw)?)),
+        None => Ok(None),
     }
 }
 
@@ -2233,6 +2431,217 @@ mod tests {
             0,
             "committed commands must be drained from mempool"
         );
+    }
+
+    // ── #178 follow-up: durable block store + ServeBlock fallback ────────────
+
+    /// `apply_commit` writes the block under `consensus/block/<hash>`
+    /// and refreshes `consensus/last_committed`. Without this a peer
+    /// asking for the block after we evicted (or restart-reset) it
+    /// from `pending_blocks` would get `BlockResponse(None)` and stall.
+    #[test]
+    fn apply_commit_persists_block_and_last_committed_to_storage() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let cfg = test_config(four_validators());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        let block = sample_block();
+        let hash = block.hash();
+        node.apply_commit(block.clone());
+
+        // Block stored at the expected key; round-trips through
+        // load_block_from_storage.
+        let loaded = load_block_from_storage(storage.as_ref(), &hash)
+            .expect("storage lookup must not error")
+            .expect("committed block must be persisted");
+        assert_eq!(loaded, block);
+
+        // last_committed checkpoint reflects the just-committed block.
+        let raw = storage
+            .get(STORAGE_KEY_LAST_COMMITTED)
+            .expect("storage")
+            .expect("last_committed must be present");
+        let lc = decode_last_committed(&raw).expect("decode");
+        assert_eq!(lc.height, block.header.height);
+        assert_eq!(lc.view, block.header.view);
+    }
+
+    /// `recover` rebuilds `last_committed_height`/`last_committed_view`
+    /// from the durable checkpoint so `consensus_resumed` reports the
+    /// real chain rather than `0` after a restart.
+    #[test]
+    fn recover_restores_last_committed_height_and_view() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let cfg = test_config(four_validators());
+
+        // Simulate a session that committed up to (height=42, view=57).
+        {
+            let mut node = ConsensusNode::new(
+                nid(1),
+                cfg.clone(),
+                make_sm(),
+                Arc::new(InMemoryMempool::new(64)),
+                Arc::clone(&storage),
+                Arc::new(MemoryWal::new()),
+            );
+            for h in 1..=42u64 {
+                use crate::replication::block::BlockHeader;
+                let parent_hash = if h == 1 {
+                    genesis().hash()
+                } else {
+                    [0u8; 32] // doesn't matter for this test — apply_commit only
+                    // reads (height, view, hash) and the SM
+                };
+                let block = Block {
+                    header: BlockHeader {
+                        parent_hash,
+                        height: h,
+                        view: if h == 42 { 57 } else { h },
+                        proposer: nid(1),
+                        state_commitment: [0u8; 32],
+                        commands_commitment: Block::commands_commitment(&[]),
+                    },
+                    commands: vec![],
+                };
+                node.apply_commit(block);
+            }
+            assert_eq!(node.last_committed_height, 42);
+            assert_eq!(node.last_committed_view, 57);
+        }
+
+        // New session: recover from the same storage and confirm the
+        // counters come back populated.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            storage,
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover");
+        assert_eq!(recovered.last_committed_height, 42);
+        assert_eq!(recovered.last_committed_view, 57);
+    }
+
+    /// `Dispatch::ServeBlock` must serve a block that lives only in
+    /// durable storage (the in-memory `pending_blocks` cache having
+    /// been reset by a restart). Without the fallback the responder
+    /// would emit `BlockResponse(None)` and the requester would loop
+    /// forever on retries — the bug #178's reopen comment described.
+    #[tokio::test]
+    async fn serve_block_falls_back_to_storage_when_pending_blocks_misses() {
+        // Step 1: a "first session" commits a block to storage.
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let cfg = test_config(four_validators());
+        let block = sample_block();
+        let hash = block.hash();
+        {
+            let mut node = ConsensusNode::new(
+                nid(1),
+                cfg.clone(),
+                make_sm(),
+                Arc::new(InMemoryMempool::new(64)),
+                Arc::clone(&storage),
+                Arc::new(MemoryWal::new()),
+            );
+            node.apply_commit(block.clone());
+        }
+
+        // Step 2: a fresh node ("restarted") shares the same storage
+        // but starts with an empty pending_blocks (save genesis).
+        let mut node = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover");
+        assert!(
+            !node.core.state().pending_blocks.contains_key(&hash),
+            "post-restart pending_blocks must not contain the committed block — \
+             this is the precondition the storage fallback exists to handle",
+        );
+
+        // Step 3: drive a ServeBlock dispatch and observe the
+        // outbound BlockResponse carries the block from storage.
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+        node.apply_dispatch(
+            Dispatch::ServeBlock { hash, to: nid(2) },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        // The outbound channel should now hold a SendTo with a
+        // BlockResponse(Some(block)) addressed to nid(2).
+        let outbound = outbound_rx
+            .recv()
+            .await
+            .expect("an outbound BlockResponse must be sent");
+        match outbound {
+            ProtocolOutbound::SendTo { node_id, payload } => {
+                assert_eq!(node_id, nid(2));
+                let wire: WireMessage =
+                    postcard::from_bytes(&payload).expect("decode BlockResponse");
+                match wire {
+                    WireMessage::BlockResponse(got) => {
+                        assert_eq!(got, Some(block));
+                    }
+                    other => panic!("expected BlockResponse, got {other:?}"),
+                }
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
+    }
+
+    /// `Dispatch::ServeBlock` for an unknown hash returns
+    /// `BlockResponse(None)` without erroring on storage. The peer's
+    /// `block_sync_response_not_found` arm handles the negative case.
+    #[tokio::test]
+    async fn serve_block_returns_none_when_neither_pending_nor_storage_has_it() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let unknown_hash: BlockHash = [0xEE; 32];
+        node.apply_dispatch(
+            Dispatch::ServeBlock {
+                hash: unknown_hash,
+                to: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        match outbound_rx.recv().await.expect("outbound") {
+            ProtocolOutbound::SendTo { node_id, payload } => {
+                assert_eq!(node_id, nid(2));
+                let wire: WireMessage =
+                    postcard::from_bytes(&payload).expect("decode BlockResponse");
+                assert!(matches!(wire, WireMessage::BlockResponse(None)));
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
     }
 
     #[tokio::test]
