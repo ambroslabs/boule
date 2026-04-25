@@ -270,7 +270,9 @@ pub fn egress_safety(
             }))
         }
 
-        SafetyAction::RequestBlock(hash, peer) => Ok(Some(egress_block_request(*hash, *peer))),
+        SafetyAction::RequestBlock { hash, peer, .. } => {
+            Ok(Some(egress_block_request(*hash, *peer)))
+        }
 
         // Non-wire actions: handled by the event loop directly.
         SafetyAction::Persist(_) | SafetyAction::Commit(_) => Ok(None),
@@ -688,7 +690,12 @@ mod tests {
         let signer = fresh_signer();
         let hash = [0xAAu8; 32];
         let peer: NodeId = [0x33u8; 32];
-        let action = SafetyAction::RequestBlock(hash, peer);
+        let action = SafetyAction::RequestBlock {
+            hash,
+            peer,
+            expected_height: 41,
+            reason: crate::consensus::hotstuff::step::BlockSyncReason::UnknownParentOnProposal,
+        };
         let out = egress_safety(&action, &signer).unwrap().unwrap();
         let Outbound::SendTo { to, payload } = out else {
             panic!("expected SendTo");
