@@ -1027,7 +1027,7 @@ impl ConsensusNode {
     /// dispatcher, mirroring what a peer would do on receipt. For
     /// `SendTo(target, msg)` where `target == self.self_id` we skip the
     /// wire and only feed locally; for any other target we wire-send
-    /// without a local feed. `RequestBlock(hash, peer)` where
+    /// without a local feed. `RequestBlock { peer, .. }` where
     /// `peer == self.self_id` is degenerate (we would be asking
     /// ourselves for a block we just asked about) and is dropped.
     async fn apply_safety_actions(
@@ -1097,7 +1097,12 @@ impl ConsensusNode {
                     }
                 }
 
-                SafetyAction::RequestBlock(hash, peer) => {
+                SafetyAction::RequestBlock {
+                    hash,
+                    peer,
+                    expected_height,
+                    reason,
+                } => {
                     if peer == self.self_id {
                         // Asking ourselves for a block is a no-op: if we
                         // don't already have it, the p2p layer can't
@@ -1105,6 +1110,8 @@ impl ConsensusNode {
                         tracing::debug!(
                             target: TRACE_TARGET,
                             hash = ?hash,
+                            requesting_height = expected_height,
+                            triggered_by = reason.as_str(),
                             "block_sync_request_self_dropped",
                         );
                     } else {
@@ -1112,6 +1119,8 @@ impl ConsensusNode {
                             target: TRACE_TARGET,
                             dest = %node_id_to_base58(&peer),
                             hash = ?hash,
+                            requesting_height = expected_height,
+                            triggered_by = reason.as_str(),
                             our_view = self.pacemaker.current_view(),
                             our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view),
                             "block_sync_request_emitted",
@@ -1260,7 +1269,7 @@ impl ConsensusNode {
                     .any(|a| matches!(a, SafetyAction::Broadcast(ConsensusMsg::Vote(_))));
                 let parked = actions
                     .iter()
-                    .any(|a| matches!(a, SafetyAction::RequestBlock(_, _)));
+                    .any(|a| matches!(a, SafetyAction::RequestBlock { .. }));
                 tracing::debug!(
                     target: TRACE_TARGET,
                     proposer = %node_id_to_base58(&proposer),
@@ -2897,7 +2906,12 @@ mod tests {
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
-        let action = SafetyAction::RequestBlock([0xCD; 32], self_id);
+        let action = SafetyAction::RequestBlock {
+            hash: [0xCD; 32],
+            peer: self_id,
+            expected_height: 7,
+            reason: crate::consensus::hotstuff::step::BlockSyncReason::UnknownParentOnProposal,
+        };
         node.apply_safety_actions(vec![action], broadcaster.as_ref(), &mut view_timer, &signer)
             .await
             .unwrap();

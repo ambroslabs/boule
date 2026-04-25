@@ -111,7 +111,47 @@ pub enum Action {
     /// Parent of a received proposal is not in `pending_blocks`; ask
     /// the named peer for the block identified by the hash. The peer is
     /// typically the sender of the proposal that couldn't be resolved.
-    RequestBlock(BlockHash, NodeId),
+    ///
+    /// `expected_height` is the height the safety core expects the
+    /// requested block to land at — `child.header.height - 1` for the
+    /// proposal whose parent is missing. `reason` carries the
+    /// originating decision (first probe vs. retry) so the integration
+    /// layer's structured logs can distinguish forward catch-up
+    /// requests from stuck-on-the-same-hash retry loops (#178).
+    RequestBlock {
+        hash: BlockHash,
+        peer: NodeId,
+        expected_height: u64,
+        reason: BlockSyncReason,
+    },
+}
+
+/// Why the safety core emitted [`Action::RequestBlock`]. Surfaced via
+/// the integration layer's `block_sync_request_emitted` event so an
+/// operator can tell whether a flood of requests is the first-probe
+/// burst (one per fresh proposal) or the retry loop re-emitting the
+/// same hashes (a sign that the responder side has nothing to
+/// return — or that the requester has fallen behind a different way
+/// than the safety core expects).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockSyncReason {
+    /// First emission: a proposal arrived whose parent is not yet in
+    /// `pending_blocks`. See [`HotStuffCore::on_proposal_received`].
+    UnknownParentOnProposal,
+    /// Retry emission: a `PacemakerAdvance` fired and at least one
+    /// proposal is still parked because its parent has not arrived.
+    /// See [`HotStuffCore::on_pacemaker_advance`].
+    StillParkedOnPacemakerAdvance,
+}
+
+impl BlockSyncReason {
+    /// Stable, human-readable tag suitable as a structured-log field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockSyncReason::UnknownParentOnProposal => "unknown_parent_on_proposal",
+            BlockSyncReason::StillParkedOnPacemakerAdvance => "still_parked_on_pacemaker_advance",
+        }
+    }
 }
 
 /// Integration-layer hook that turns "I am the leader and I have a
@@ -289,8 +329,18 @@ impl HotStuffCore {
         if !self.state.pending_blocks.contains_key(&parent_hash) {
             let child_hash = signed.payload.block.hash();
             let sender = signed.signer;
+            // The parent's height is the child's height minus one.
+            // saturating_sub guards against the (unreachable) genesis-
+            // child case so the field stays sane even if a malformed
+            // proposal claims height 0.
+            let expected_height = signed.payload.block.header.height.saturating_sub(1);
             self.parked_proposals.insert(child_hash, signed);
-            return vec![Action::RequestBlock(parent_hash, sender)];
+            return vec![Action::RequestBlock {
+                hash: parent_hash,
+                peer: sender,
+                expected_height,
+                reason: BlockSyncReason::UnknownParentOnProposal,
+            }];
         }
 
         // B2: insert the proposed block into `pending_blocks` so the
@@ -590,20 +640,27 @@ impl HotStuffCore {
         // and now), re-emit the request. Sorted by `child_hash` so
         // replay/property tests stay byte-identical regardless of
         // `HashMap` iteration order.
-        let mut still_parked: Vec<(BlockHash, BlockHash, NodeId)> = self
+        let mut still_parked: Vec<(BlockHash, BlockHash, NodeId, u64)> = self
             .parked_proposals
             .iter()
             .map(|(child_hash, signed)| {
+                let expected_height = signed.payload.block.header.height.saturating_sub(1);
                 (
                     *child_hash,
                     signed.payload.block.header.parent_hash,
                     signed.signer,
+                    expected_height,
                 )
             })
             .collect();
-        still_parked.sort_by_key(|(child_hash, _, _)| *child_hash);
-        for (_, parent_hash, sender) in still_parked {
-            actions.push(Action::RequestBlock(parent_hash, sender));
+        still_parked.sort_by_key(|(child_hash, _, _, _)| *child_hash);
+        for (_, parent_hash, sender, expected_height) in still_parked {
+            actions.push(Action::RequestBlock {
+                hash: parent_hash,
+                peer: sender,
+                expected_height,
+                reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
+            });
         }
 
         if let Some(high_qc) = self.state.high_qc.clone() {
@@ -830,7 +887,15 @@ mod tests {
         // Single RequestBlock aimed at the sender with the orphan
         // parent hash. The safety state is untouched: we have not
         // voted, not locked, not updated high_qc.
-        assert_eq!(actions, vec![Action::RequestBlock(orphan_parent, sender)]);
+        assert_eq!(
+            actions,
+            vec![Action::RequestBlock {
+                hash: orphan_parent,
+                peer: sender,
+                expected_height: 0,
+                reason: BlockSyncReason::UnknownParentOnProposal,
+            }],
+        );
         assert!(core.parked_proposals.contains_key(&child_hash));
         assert_eq!(core.state().last_voted_view, 0);
         assert!(core.state().locked.is_none());
@@ -855,7 +920,12 @@ mod tests {
 
         assert_eq!(
             second,
-            vec![Action::RequestBlock(orphan_parent, sender)],
+            vec![Action::RequestBlock {
+                hash: orphan_parent,
+                peer: sender,
+                expected_height: 0,
+                reason: BlockSyncReason::UnknownParentOnProposal,
+            }],
             "re-delivery must still produce a RequestBlock so the \
              driver can retry the fetch",
         );
@@ -1734,7 +1804,15 @@ mod tests {
             justify_v1.clone(),
             nid(2),
         )));
-        assert_eq!(initial, vec![Action::RequestBlock(block_v1.hash(), nid(2))],);
+        assert_eq!(
+            initial,
+            vec![Action::RequestBlock {
+                hash: block_v1.hash(),
+                peer: nid(2),
+                expected_height: 1,
+                reason: BlockSyncReason::UnknownParentOnProposal,
+            }],
+        );
         assert!(core.parked_proposals.contains_key(&block_v2_hash));
 
         // Phase 2 — parent lands some other way.
@@ -1791,7 +1869,15 @@ mod tests {
             justify_v1,
             nid(2),
         )));
-        assert_eq!(initial, vec![Action::RequestBlock(block_v1.hash(), nid(2))]);
+        assert_eq!(
+            initial,
+            vec![Action::RequestBlock {
+                hash: block_v1.hash(),
+                peer: nid(2),
+                expected_height: 1,
+                reason: BlockSyncReason::UnknownParentOnProposal,
+            }],
+        );
 
         // Phase 2 — parent has NOT arrived yet. PacemakerAdvance must
         // re-emit RequestBlock so the integration layer can retry.
@@ -1799,7 +1885,12 @@ mod tests {
         let advance = core.step(Event::PacemakerAdvance(2));
         assert_eq!(
             advance,
-            vec![Action::RequestBlock(block_v1.hash(), nid(2))],
+            vec![Action::RequestBlock {
+                hash: block_v1.hash(),
+                peer: nid(2),
+                expected_height: 1,
+                reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
+            }],
             "still-parked proposal must re-fire RequestBlock on PacemakerAdvance",
         );
         assert_eq!(core.state().current_view, 2);
@@ -1815,7 +1906,7 @@ mod tests {
         let advance = core.step(Event::PacemakerAdvance(3));
         let has_request_block = advance
             .iter()
-            .any(|a| matches!(a, Action::RequestBlock(_, _)));
+            .any(|a| matches!(a, Action::RequestBlock { .. }));
         assert!(
             !has_request_block,
             "no RequestBlock should fire once the parent has arrived; got {advance:?}",
@@ -1855,7 +1946,7 @@ mod tests {
         let advance = core.step(Event::PacemakerAdvance(3));
         let request_blocks: Vec<_> = advance
             .iter()
-            .filter(|a| matches!(a, Action::RequestBlock(_, _)))
+            .filter(|a| matches!(a, Action::RequestBlock { .. }))
             .cloned()
             .collect();
         assert_eq!(
@@ -1863,9 +1954,20 @@ mod tests {
             2,
             "every still-parked proposal must get a retry RequestBlock; got {advance:?}",
         );
-        // Both targets are present.
-        assert!(request_blocks.contains(&Action::RequestBlock(parent_a, nid(3))));
-        assert!(request_blocks.contains(&Action::RequestBlock(parent_b, nid(4))));
+        // Both targets are present. `orphan_child` produces height 1
+        // for both children, so both retries carry expected_height = 0.
+        assert!(request_blocks.contains(&Action::RequestBlock {
+            hash: parent_a,
+            peer: nid(3),
+            expected_height: 0,
+            reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
+        }));
+        assert!(request_blocks.contains(&Action::RequestBlock {
+            hash: parent_b,
+            peer: nid(4),
+            expected_height: 0,
+            reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
+        }));
     }
 
     // ── D9: replay determinism ─────────────────────────────────────
@@ -2126,7 +2228,7 @@ mod tests {
                         // Safety-core effects the harness doesn't
                         // model. `Persist` is durability, `RequestBlock`
                         // is sync; both are integration-layer jobs.
-                        Action::Persist(_) | Action::RequestBlock(_, _) => {}
+                        Action::Persist(_) | Action::RequestBlock { .. } => {}
                     }
                 }
             }
