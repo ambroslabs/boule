@@ -26,10 +26,21 @@ pub struct Config {
 #[derive(Debug, serde::Deserialize)]
 pub struct NodeConfig {
     pub listen_addr: SocketAddr,
-    /// Optional identity backend. If absent, falls back to the deprecated
-    /// `key_file` field or, failing that, a file backend at `./node.key`.
+    /// Network (TLS) identity backend. The Ed25519 public key loaded here
+    /// becomes the node's overlay [`crate::p2p::tls::NodeId`] and the
+    /// certificate the TLS handshake presents. If absent, falls back to
+    /// the deprecated `key_file` field or, failing that, a file backend
+    /// at `./node.key`.
     #[serde(default)]
     pub identity: Option<IdentityConfig>,
+    /// Optional validator (consensus signing) identity backend. When set,
+    /// the consensus layer signs proposals/votes/timeouts with this key
+    /// instead of the network identity. When unset, the network identity
+    /// is reused for consensus signing — the historical single-key
+    /// behavior — with a deprecation warning at startup if consensus is
+    /// enabled. Both slots accept any of the same backends.
+    #[serde(default)]
+    pub validator_identity: Option<IdentityConfig>,
     /// Deprecated alias for `[node.identity] backend = "file" path = ...`.
     /// Retained for backward compatibility; emits a warning at startup.
     #[serde(default)]
@@ -184,6 +195,14 @@ pub fn resolve_identity(node: &NodeConfig) -> Option<IdentityConfig> {
         });
     }
     None
+}
+
+/// Resolve the validator-signing identity. Returns `None` when the
+/// `[node.validator_identity]` table is absent; callers should then fall
+/// back to the network identity for consensus signing (with a deprecation
+/// warning), preserving the historical single-key behavior.
+pub fn resolve_validator_identity(node: &NodeConfig) -> Option<IdentityConfig> {
+    node.validator_identity.clone()
 }
 
 /// Build a `KeyProvider` for the given identity config.
@@ -424,6 +443,87 @@ listen_addr = "127.0.0.1:8080"
 "#,
         );
         assert!(c.consensus.is_none());
+    }
+
+    #[test]
+    fn validator_identity_absent_returns_none() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[node.identity]
+backend = "file"
+path = "/tmp/net.key"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+"#,
+        );
+        assert!(resolve_validator_identity(&c.node).is_none());
+    }
+
+    #[test]
+    fn validator_identity_parses_independently() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[node.identity]
+backend = "file"
+path = "/tmp/net.key"
+
+[node.validator_identity]
+backend = "file"
+path = "/tmp/val.key"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+"#,
+        );
+        let net = resolve_identity(&c.node).expect("network identity");
+        let val = resolve_validator_identity(&c.node).expect("validator identity");
+        match net {
+            IdentityConfig::File { path, .. } => assert_eq!(path, PathBuf::from("/tmp/net.key")),
+            _ => panic!("expected file backend"),
+        }
+        match val {
+            IdentityConfig::File { path, .. } => assert_eq!(path, PathBuf::from("/tmp/val.key")),
+            _ => panic!("expected file backend"),
+        }
+    }
+
+    #[test]
+    fn validator_identity_can_use_distinct_backend() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[node.identity]
+backend = "file"
+path = "/tmp/net.key"
+
+[node.validator_identity]
+backend = "encrypted-file"
+path = "/tmp/val.enc"
+passphrase_env = "VAL_PW"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+"#,
+        );
+        match resolve_validator_identity(&c.node).unwrap() {
+            IdentityConfig::EncryptedFile {
+                path,
+                passphrase_env,
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/val.enc"));
+                assert_eq!(passphrase_env.as_deref(), Some("VAL_PW"));
+            }
+            other => panic!("expected encrypted-file backend, got {other:?}"),
+        }
     }
 
     #[test]

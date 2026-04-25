@@ -12,7 +12,7 @@ use ambros_p2p::config::{self, ConsensusConfig, IdentityConfig, NodeConfig};
 use ambros_p2p::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use ambros_p2p::consensus::status::ConsensusStatus;
 use ambros_p2p::consensus::validator_set::ValidatorSet;
-use ambros_p2p::crypto::signed::NodeSigner;
+use ambros_p2p::crypto::signed::{NodeSigner, Signer};
 use ambros_p2p::gossip;
 use ambros_p2p::p2p::manager::ManagerMsg;
 use ambros_p2p::p2p::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
@@ -194,13 +194,51 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let provider = config::build_provider(&identity_cfg)?;
     let node_identity = provider.load_or_init()?;
     let identity = Arc::new(TlsIdentity::from_identity(&node_identity)?);
-    // Build the consensus signer here as well so we can drop the raw
-    // key material from this scope; both `TlsIdentity` and `NodeSigner`
-    // now hold their own internal copies of the parsed key.
-    let consensus_signer = Arc::new(NodeSigner::from_identity(&node_identity)?);
+
+    // Resolve the consensus-signing identity. When `[node.validator_identity]`
+    // is configured, build a separate `NodeSigner` from that key. Otherwise
+    // reuse the network identity — the historical single-key behavior — and
+    // emit a deprecation warning when consensus is actually enabled (gossip-
+    // only nodes never use the signer, so the warning would be noise there).
+    let validator_cfg = config::resolve_validator_identity(&config.node);
+    let consensus_signer = match &validator_cfg {
+        Some(cfg) => {
+            info!("validator-identity backend: {}", cfg.backend_name());
+            let val_provider = config::build_provider(cfg)?;
+            let val_identity = val_provider.load_or_init()?;
+            Arc::new(NodeSigner::from_identity(&val_identity)?)
+        }
+        None => {
+            if config.consensus.is_some() {
+                warn!(
+                    "[node.validator_identity] is unset — reusing the network identity for \
+                     consensus signing. Configure [node.validator_identity] to enable \
+                     independent rotation of the TLS key; this fallback will be removed \
+                     in a future release."
+                );
+            }
+            Arc::new(NodeSigner::from_identity(&node_identity)?)
+        }
+    };
     drop(node_identity);
 
-    info!("node ID: {}", node_id_to_base58(&identity.node_id));
+    info!("network node ID: {}", node_id_to_base58(&identity.node_id));
+    let validator_node_id = consensus_signer.node_id();
+    if validator_node_id != identity.node_id {
+        info!(
+            "validator node ID: {}",
+            node_id_to_base58(&validator_node_id)
+        );
+        if config.consensus.is_some() {
+            warn!(
+                "validator pubkey differs from network pubkey — consensus dispatch routes \
+                 messages by validator pubkey, but the live p2p layer addresses peers by \
+                 their TLS pubkey. Until validator-set reconfiguration (issue #140) lands \
+                 and registers a (validator pubkey → network address) mapping, the cluster \
+                 cannot route consensus traffic across the split."
+            );
+        }
+    }
 
     let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
     let store = Arc::new(gossip::store::GossipStore::new());
@@ -257,7 +295,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     // shutdown sender is kept so we can stop the loop gracefully on
     // ctrl-c.
     let consensus_runtime = if let Some(cons_cfg) = config.consensus.as_ref() {
-        Some(start_consensus(cons_cfg, &p2p_cmd_tx, &identity.node_id, &consensus_signer).await?)
+        Some(start_consensus(cons_cfg, &p2p_cmd_tx, &validator_node_id, &consensus_signer).await?)
     } else {
         info!("consensus: disabled (no [consensus] section in config)");
         None
