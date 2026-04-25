@@ -263,6 +263,14 @@ pub enum ProtocolEvent {
     PeerConnected {
         /// The peer that just connected.
         node_id: NodeId,
+        /// Remote address the peer is reachable at.
+        ///
+        /// On outbound connections this is the dial target; on
+        /// inbound connections it is whatever the listener saw on
+        /// `accept`. The gossip overlay (issue #137) uses this field
+        /// to seed its `PeerTable` so peer-list gossip has something
+        /// to publish; protocols that don't care can ignore it.
+        addr: std::net::SocketAddr,
     },
     /// A peer disconnected (network failure, explicit `Disconnect`, or
     /// peer-side teardown). Delivered to every registered protocol.

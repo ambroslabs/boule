@@ -25,11 +25,13 @@
 //!
 //! # `add_bootstrap`
 //!
-//! Currently a debug-log no-op. The bootstrap-address ingestion path
-//! requires plumbing a [`super::maintenance::Dialer`] through; that
-//! happens in the binary-wiring PR (PR5b), where the overlay receives
-//! a constructed dialer at boot. Logging at debug means future call
-//! sites see they hit the placeholder.
+//! Triggers an outbound dial through the [`super::maintenance::Dialer`]
+//! the constructor was given, with `expected = None` (TOFU — accept
+//! whatever identity the peer presents on the handshake). The dial
+//! is fire-and-forget: the dialer task retries on failure with
+//! exponential backoff and the manager fans out a `PeerConnected`
+//! event once the handshake completes, which the overlay
+//! orchestrator then turns into a `DiscoveryEvent::PeerAdded`.
 //!
 //! # Subscribe semantics
 //!
@@ -45,10 +47,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
-use tracing::debug;
 
 use super::super::super::tls::NodeId;
 use super::super::traits::{Discovery, DiscoveryEvent};
+use super::maintenance::Dialer;
 use super::peer_list_task::{DirectPeers, LockedVec};
 
 /// Broadcast channel depth for re-published `DiscoveryEvent`s.
@@ -72,18 +74,28 @@ pub struct GossipDiscovery {
     /// holds a clone of the sender and calls [`Self::publish`] on
     /// observed peer add/remove transitions.
     events: broadcast::Sender<DiscoveryEvent>,
+    /// Dialer used by [`Discovery::add_bootstrap`] to start an
+    /// outbound dial loop targeting a fresh address. Shared with the
+    /// partial-mesh maintenance loop.
+    dialer: Arc<dyn Dialer>,
 }
 
 impl GossipDiscovery {
     /// Build a new discovery instance plus its companion event
     /// sender (for the run loop's use). The discovery shares
     /// ownership of `direct` with whoever else mutates the LockedVec
-    /// (currently the run loop, exclusively).
-    pub fn new(direct: Arc<LockedVec>) -> (Self, broadcast::Sender<DiscoveryEvent>) {
+    /// (currently the run loop, exclusively); `dialer` is used by
+    /// [`Discovery::add_bootstrap`] to start a TOFU dial against a
+    /// freshly-learned address.
+    pub fn new(
+        direct: Arc<LockedVec>,
+        dialer: Arc<dyn Dialer>,
+    ) -> (Self, broadcast::Sender<DiscoveryEvent>) {
         let (events_tx, _) = broadcast::channel::<DiscoveryEvent>(DISCOVERY_CHANNEL_DEPTH);
         let me = Self {
             direct,
             events: events_tx.clone(),
+            dialer,
         };
         (me, events_tx)
     }
@@ -97,11 +109,14 @@ impl Discovery for GossipDiscovery {
         DirectPeers::snapshot(&*self.direct)
     }
 
-    fn add_bootstrap(&self, _addr: SocketAddr) {
-        // Real impl lands in PR5b alongside the binary wiring (the
-        // dialer needs to be constructed there). Logging at debug so
-        // call sites can see they hit the placeholder.
-        debug!("GossipDiscovery::add_bootstrap is currently a no-op (wiring lands in PR5b)");
+    fn add_bootstrap(&self, addr: SocketAddr) {
+        // TOFU dial — accept whatever identity the peer presents on
+        // the handshake. The reconnect loop the dialer spawns retries
+        // on failure with exponential backoff and the manager fans
+        // out a `PeerConnected` event once handshake succeeds, which
+        // the orchestrator translates into the
+        // `DiscoveryEvent::PeerAdded` subscribers see.
+        self.dialer.dial(addr, None);
     }
 
     fn subscribe(&self) -> broadcast::Receiver<DiscoveryEvent> {
@@ -111,6 +126,8 @@ impl Discovery for GossipDiscovery {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
+
     use super::*;
 
     fn nid(byte: u8) -> NodeId {
@@ -119,10 +136,35 @@ mod tests {
         id
     }
 
+    /// No-op `Dialer` used by tests that don't care about the
+    /// `add_bootstrap` plumbing.
+    struct NullDialer;
+
+    impl Dialer for NullDialer {
+        fn dial(&self, _: SocketAddr, _: Option<NodeId>) {}
+    }
+
+    fn null_dialer() -> Arc<dyn Dialer> {
+        Arc::new(NullDialer)
+    }
+
+    /// Recording `Dialer` used by the `add_bootstrap` test below to
+    /// assert that `add_bootstrap(addr)` triggers a TOFU dial.
+    #[derive(Default)]
+    struct RecordingDialer {
+        dialed: Mutex<Vec<(SocketAddr, Option<NodeId>)>>,
+    }
+
+    impl Dialer for RecordingDialer {
+        fn dial(&self, addr: SocketAddr, expected: Option<NodeId>) {
+            self.dialed.lock().push((addr, expected));
+        }
+    }
+
     #[tokio::test]
     async fn known_peers_reflects_locked_vec_snapshot() {
         let direct = Arc::new(LockedVec::new());
-        let (disc, _events_tx) = GossipDiscovery::new(direct.clone());
+        let (disc, _events_tx) = GossipDiscovery::new(direct.clone(), null_dialer());
 
         assert!(disc.known_peers().is_empty());
 
@@ -141,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_receives_subsequent_events_from_run_loop_sender() {
         let direct = Arc::new(LockedVec::new());
-        let (disc, events_tx) = GossipDiscovery::new(direct);
+        let (disc, events_tx) = GossipDiscovery::new(direct, null_dialer());
 
         let mut sub = disc.subscribe();
 
@@ -162,7 +204,7 @@ mod tests {
     #[tokio::test]
     async fn subscribe_does_not_replay_pre_subscription_events() {
         let direct = Arc::new(LockedVec::new());
-        let (disc, events_tx) = GossipDiscovery::new(direct);
+        let (disc, events_tx) = GossipDiscovery::new(direct, null_dialer());
 
         // Pre-subscription event is dropped (no subscribers yet).
         let _ = events_tx.send(DiscoveryEvent::PeerAdded(nid(99)));
@@ -186,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_subscribers_each_receive_every_event() {
         let direct = Arc::new(LockedVec::new());
-        let (disc, events_tx) = GossipDiscovery::new(direct);
+        let (disc, events_tx) = GossipDiscovery::new(direct, null_dialer());
 
         let mut sub_a = disc.subscribe();
         let mut sub_b = disc.subscribe();
@@ -202,20 +244,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_bootstrap_is_a_noop() {
+    async fn add_bootstrap_triggers_tofu_dial() {
         let direct = Arc::new(LockedVec::new());
-        let (disc, _events_tx) = GossipDiscovery::new(direct);
+        let dialer = Arc::new(RecordingDialer::default());
+        let (disc, _events_tx) =
+            GossipDiscovery::new(direct.clone(), dialer.clone() as Arc<dyn Dialer>);
 
-        // Just exercises the placeholder path — must not panic and
-        // must not affect known_peers.
-        disc.add_bootstrap("127.0.0.1:9".parse().unwrap());
+        let target: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        disc.add_bootstrap(target);
+
+        // `Dialer::dial` is sync — recording mock captures the call
+        // immediately even though the underlying dialer task is
+        // fire-and-forget in production.
+        let dialed = dialer.dialed.lock().clone();
+        assert_eq!(dialed.len(), 1);
+        assert_eq!(dialed[0].0, target);
+        assert_eq!(dialed[0].1, None, "bootstrap dials use TOFU semantics");
+
+        // Direct-peer set is unaffected until the manager reports a
+        // PeerConnected event (out of scope for this unit test).
         assert!(disc.known_peers().is_empty());
     }
 
     #[tokio::test]
     async fn cloned_discovery_shares_underlying_state() {
         let direct = Arc::new(LockedVec::new());
-        let (disc_a, events_tx) = GossipDiscovery::new(direct.clone());
+        let (disc_a, events_tx) = GossipDiscovery::new(direct.clone(), null_dialer());
         let disc_b = disc_a.clone();
 
         direct.set(vec![nid(1)]);

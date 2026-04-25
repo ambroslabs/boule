@@ -78,6 +78,7 @@ use tracing::debug;
 
 use crate::clock::Clock;
 use crate::p2p::ProtocolEvent;
+use crate::p2p::dialer::DialerCtx;
 use crate::p2p::tls::NodeId;
 
 use super::super::traits::DiscoveryEvent;
@@ -86,7 +87,7 @@ use super::dedup::{InsertOutcome, MsgIdRing};
 use super::discovery::GossipDiscovery;
 use super::maintenance::{Dialer, MeshMaintenanceConfig, run_mesh_maintenance};
 use super::peer_list_task::{
-    DirectPeers, FrameOutcome, LockedVec, OverlayUnicast, PeerListGossipConfig,
+    DirectPeers, FrameOutcome, LockedVec, OverlayUnicast, PeerListGossipConfig, SelfAdvertise,
     apply_overlay_frame, run_peer_list_publisher,
 };
 use super::peer_table::PeerTable;
@@ -141,11 +142,50 @@ impl Default for GossipOverlayConfig {
     }
 }
 
+impl GossipOverlayConfig {
+    /// Build a [`GossipOverlayConfig`] from the operator-facing
+    /// [`crate::config::OverlayConfig`]. The two structs have separate
+    /// vocabularies — config-side knobs are flat `_ms` durations for
+    /// TOML readability; the runtime-side struct uses real
+    /// `Duration`s and bundles per-task knobs into their owners
+    /// (`PeerListGossipConfig`, `MeshMaintenanceConfig`).
+    ///
+    /// `rng_seed` is taken as a parameter so the binary can derive it
+    /// from a per-node source (e.g. the node id) rather than baking
+    /// it into `[overlay]`. Sim tests pass an explicit seed.
+    pub fn from_config(cfg: &crate::config::OverlayConfig, rng_seed: u64) -> Self {
+        Self {
+            peer_list: PeerListGossipConfig {
+                interval: Duration::from_millis(cfg.peer_gossip_interval_ms),
+                fanout: cfg.peer_gossip_fanout,
+                max_entries: None,
+            },
+            maintenance: MeshMaintenanceConfig {
+                interval: Duration::from_millis(cfg.mesh_check_interval_ms),
+                target_degree: cfg.target_degree,
+            },
+            dedup_capacity: cfg.dedup_capacity,
+            dedup_ttl: Duration::from_millis(cfg.dedup_ttl_ms),
+            peer_table_capacity: cfg.peer_table_capacity,
+            cmd_channel_depth: 256,
+            event_channel_depth: 256,
+            rng_seed,
+        }
+    }
+}
+
 /// Inputs for [`GossipOverlay::spawn`].
 pub struct SpawnArgs {
     /// Local NodeId. Used as `originator` on outbound `Forward`
     /// frames and as the self-filter on the peer table.
     pub self_id: NodeId,
+    /// Local listening address. When `Some`, the publisher injects a
+    /// `(self_id, listen_addr, now)` self-entry into every published
+    /// peer-list frame so peers can learn our listening port even
+    /// when they only ever saw us via an inbound connection (whose
+    /// source port is ephemeral). `None` only in unit tests that
+    /// don't exercise peer-list propagation.
+    pub self_listen_addr: Option<std::net::SocketAddr>,
     /// Inbound `ProtocolEvent` stream from
     /// [`crate::p2p::PeerCommand::RegisterProtocol`].
     pub event_rx: mpsc::Receiver<ProtocolEvent>,
@@ -214,6 +254,7 @@ impl GossipOverlay {
     pub fn spawn(args: SpawnArgs) -> GossipOverlayHandles {
         let SpawnArgs {
             self_id,
+            self_listen_addr,
             event_rx,
             sink,
             dialer,
@@ -230,7 +271,10 @@ impl GossipOverlay {
         let dedup = MsgIdRing::new(config.dedup_capacity, config.dedup_ttl);
 
         let broadcaster = GossipBroadcaster::new(cmd_tx);
-        let (discovery, discovery_tx) = GossipDiscovery::new(direct.clone());
+        // Discovery shares the same `Dialer` the maintenance loop
+        // uses so a `Discovery::add_bootstrap` call hits the same
+        // `reconnect_loop` machinery the binary already trusts.
+        let (discovery, discovery_tx) = GossipDiscovery::new(direct.clone(), dialer.clone());
         let discovery = Arc::new(discovery);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -245,6 +289,10 @@ impl GossipOverlay {
 
         let direct_dyn: Arc<dyn DirectPeers> = direct.clone();
 
+        let self_advertise = self_listen_addr.map(|addr| SelfAdvertise {
+            node_id: self_id,
+            addr,
+        });
         let publisher_join = tokio::spawn(run_peer_list_publisher(
             config.peer_list.clone(),
             peer_table.clone(),
@@ -252,6 +300,7 @@ impl GossipOverlay {
             sink.clone(),
             clock.clone(),
             publisher_seed,
+            self_advertise,
             publisher_sd_rx,
         ));
 
@@ -357,7 +406,18 @@ impl GossipOverlay {
             ProtocolEvent::Message { from, payload } => {
                 self.handle_inbound_message(from, payload).await;
             }
-            ProtocolEvent::PeerConnected { node_id } => {
+            ProtocolEvent::PeerConnected { node_id, addr: _ } => {
+                // Note: `addr` from `PeerConnected` is unreliable for
+                // populating the peer table. On inbound connections
+                // it's the peer's ephemeral source port, not their
+                // listening port — advertising it via peer-list
+                // gossip would teach downstream nodes a non-dialable
+                // address. Instead, every peer self-advertises its
+                // listening address through the peer-list publisher
+                // (see `SelfAdvertise` plumbed into
+                // `run_peer_list_publisher`); the receiver path
+                // populates the table from those self-advertised
+                // entries.
                 self.add_direct_peer(node_id);
                 let _ = self.discovery_tx.send(DiscoveryEvent::PeerAdded(node_id));
             }
@@ -439,6 +499,37 @@ fn encode_forward(msg_id: MsgId, originator: NodeId, payload: Bytes) -> Bytes {
     Bytes::from(postcard::to_stdvec(&frame).expect("postcard encode of Forward cannot fail"))
 }
 
+/// Production [`Dialer`] impl that delegates to
+/// [`DialerCtx::spawn`].
+///
+/// `DialerCtx` already encapsulates the TLS identity, the manager
+/// channel, the peer-gone broadcast, and the clock — everything
+/// `reconnect_loop` needs. This adapter just bridges the trait shape.
+///
+/// Cheap to clone (the underlying `DialerCtx` clones via `Arc`s and
+/// `Sender`s).
+#[derive(Clone)]
+pub struct DialerCtxAdapter {
+    ctx: DialerCtx,
+}
+
+impl DialerCtxAdapter {
+    /// Wrap a constructed [`DialerCtx`].
+    pub fn new(ctx: DialerCtx) -> Self {
+        Self { ctx }
+    }
+}
+
+impl Dialer for DialerCtxAdapter {
+    fn dial(&self, addr: std::net::SocketAddr, expected: Option<NodeId>) {
+        // `DialerCtx::spawn` returns a `JoinHandle`; we drop it
+        // intentionally — the reconnect loop is fire-and-forget. The
+        // task exits when the manager closes its `internal_tx` on
+        // shutdown.
+        std::mem::drop(self.ctx.spawn(addr, expected));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -485,7 +576,7 @@ mod tests {
     struct NullDialer;
 
     impl Dialer for NullDialer {
-        fn dial(&self, _: SocketAddr, _: NodeId) {}
+        fn dial(&self, _: SocketAddr, _: Option<NodeId>) {}
     }
 
     struct Setup {
@@ -501,6 +592,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
         let handles = GossipOverlay::spawn(SpawnArgs {
             self_id,
+            self_listen_addr: None,
             event_rx,
             sink: sink.clone() as Arc<dyn OverlayUnicast>,
             dialer,
@@ -553,7 +645,10 @@ mod tests {
 
         // Connect a relay so events flow.
         s.event_tx
-            .send(ProtocolEvent::PeerConnected { node_id: nid(2) })
+            .send(ProtocolEvent::PeerConnected {
+                node_id: nid(2),
+                addr: addr(7002),
+            })
             .await
             .unwrap();
 
@@ -615,7 +710,10 @@ mod tests {
 
         for i in 2..=4u8 {
             s.event_tx
-                .send(ProtocolEvent::PeerConnected { node_id: nid(i) })
+                .send(ProtocolEvent::PeerConnected {
+                    node_id: nid(i),
+                    addr: addr(7000 + i as u16),
+                })
                 .await
                 .unwrap();
         }
@@ -676,7 +774,10 @@ mod tests {
 
         // Connect a relay so events flow.
         s.event_tx
-            .send(ProtocolEvent::PeerConnected { node_id: nid(2) })
+            .send(ProtocolEvent::PeerConnected {
+                node_id: nid(2),
+                addr: addr(7002),
+            })
             .await
             .unwrap();
 
@@ -722,7 +823,10 @@ mod tests {
         let mut sub = s.handles.discovery.subscribe();
 
         s.event_tx
-            .send(ProtocolEvent::PeerConnected { node_id: nid(2) })
+            .send(ProtocolEvent::PeerConnected {
+                node_id: nid(2),
+                addr: addr(7002),
+            })
             .await
             .unwrap();
         let ev = tokio::time::timeout(Duration::from_secs(1), sub.recv())
@@ -789,6 +893,7 @@ mod tests {
         };
         let mut handles = GossipOverlay::spawn(SpawnArgs {
             self_id: nid(1),
+            self_listen_addr: None,
             event_rx,
             sink: sink.clone() as Arc<dyn OverlayUnicast>,
             dialer,
@@ -802,7 +907,10 @@ mod tests {
         // prefers cmds, so a Broadcast queued before PeerConnected is
         // processed could fan out to zero peers).
         event_tx
-            .send(ProtocolEvent::PeerConnected { node_id: nid(2) })
+            .send(ProtocolEvent::PeerConnected {
+                node_id: nid(2),
+                addr: addr(7002),
+            })
             .await
             .unwrap();
         drain_runtime().await;
