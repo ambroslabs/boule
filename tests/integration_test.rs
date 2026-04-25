@@ -81,6 +81,24 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::proces
     }
 }
 
+/// Synchronously run `ambros-p2p init --config <path>` so the file
+/// backend mints a key before `start` is invoked. `start` refuses to
+/// run before `init`, so every spawn helper threads through this.
+fn run_init(config_path: &str) {
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let output = Command::new(bin)
+        .args(["init", "--config", config_path])
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("failed to spawn `init` binary");
+    assert!(
+        output.status.success(),
+        "`init` exited non-zero: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Peer descriptor used when configuring a node's `[[peers]]` list.
 struct PeerDesc<'a> {
     p2p_addr: &'a str,
@@ -137,9 +155,11 @@ async fn spawn_node_with_schema(peers: &[PeerDesc<'_>], schema: IdentitySchema) 
     config_file.write_all(config.as_bytes()).unwrap();
     config_file.flush().unwrap();
 
+    run_init(config_file.path().to_str().unwrap());
+
     let bin = env!("CARGO_BIN_EXE_ambros-p2p");
     let child = Command::new(bin)
-        .args(["--config", config_file.path().to_str().unwrap()])
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
         .spawn()
         .expect("failed to spawn node binary");
@@ -579,9 +599,11 @@ async fn launch_once_for_discovery(key_path: &str) -> DiscoveryInfo {
     config_file.write_all(config.as_bytes()).unwrap();
     config_file.flush().unwrap();
 
+    run_init(config_file.path().to_str().unwrap());
+
     let bin = env!("CARGO_BIN_EXE_ambros-p2p");
     let mut child = Command::new(bin)
-        .args(["--config", config_file.path().to_str().unwrap()])
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
         .spawn()
         .expect("failed to spawn node binary");
@@ -642,9 +664,11 @@ async fn spawn_node_fixed_port(
     config_file.write_all(config.as_bytes()).unwrap();
     config_file.flush().unwrap();
 
+    run_init(config_file.path().to_str().unwrap());
+
     let bin = env!("CARGO_BIN_EXE_ambros-p2p");
     let child = Command::new(bin)
-        .args(["--config", config_file.path().to_str().unwrap()])
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
         .spawn()
         .expect("failed to spawn node binary");
@@ -811,9 +835,11 @@ async fn spawn_consensus_node(
     config_file.write_all(config.as_bytes()).unwrap();
     config_file.flush().unwrap();
 
+    run_init(config_file.path().to_str().unwrap());
+
     let bin = env!("CARGO_BIN_EXE_ambros-p2p");
     let child = Command::new(bin)
-        .args(["--config", config_file.path().to_str().unwrap()])
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
         .spawn()
         .expect("failed to spawn consensus node binary");

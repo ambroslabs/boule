@@ -1,34 +1,15 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
-use parking_lot::Mutex;
-use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
-use ambros_p2p::clock::{Clock, TokioClock};
-use ambros_p2p::config::{self, ConsensusConfig, IdentityConfig, NodeConfig};
-use ambros_p2p::consensus::node::{ConsensusNode, NodeConfigForConsensus};
-use ambros_p2p::consensus::status::ConsensusStatus;
-use ambros_p2p::consensus::validator_set::ValidatorSet;
-use ambros_p2p::crypto::signed::{NodeSigner, Signer};
-use ambros_p2p::gossip;
-use ambros_p2p::p2p::manager::ManagerMsg;
-use ambros_p2p::p2p::overlay::{
-    Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery,
-};
-use ambros_p2p::p2p::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
-use ambros_p2p::p2p::tls_protocol::TlsConnectionProtocol;
-use ambros_p2p::p2p::{self, ConnectionProtocol};
-use ambros_p2p::ping;
-use ambros_p2p::replication::block::Block;
-use ambros_p2p::replication::impls::{CounterStateMachine, InMemoryMempool};
-use ambros_p2p::replication::state_machine::StateMachine;
-use ambros_p2p::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
+use ambros_p2p::config::{self, Config, IdentityConfig, NodeConfig};
+use ambros_p2p::node;
+use ambros_p2p::p2p::identity::KeyProvider;
+use ambros_p2p::p2p::tls::node_id_to_base58;
+use ambros_p2p::paths;
 
 const ENV_PRODUCTION: &str = "AMBROS_ENV";
-const DEFAULT_KEY_FILE: &str = "node.key";
 
 /// Initialize the tracing subscriber.
 ///
@@ -63,82 +44,138 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(first) = args.first() {
-        if first == "key" {
-            return handle_key_subcommand(&args[1..]);
-        }
-        if first == "--help" || first == "-h" {
-            print_help();
-            return Ok(());
+    match dispatch(&args).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
         }
     }
-
-    let cli = CliArgs::parse(&args)?;
-    run_node(cli).await
 }
 
-fn print_help() {
-    println!("Usage: ambros-p2p [--config <path>] [--production] [--allow-insecure-key-perms]");
-    println!("       ambros-p2p key migrate --to <backend> [backend flags]");
-    println!();
-    println!("Options:");
-    println!("  -c, --config <path>          Path to TOML config file [default: config.toml]");
-    println!(
-        "      --production             Fail closed if no identity backend is explicitly configured"
-    );
-    println!("      --allow-insecure-key-perms");
-    println!(
-        "                               Skip the 0o077 permission check on the node key file (dev only)"
-    );
+async fn dispatch(args: &[String]) -> anyhow::Result<()> {
+    let first = match args.first().map(String::as_str) {
+        Some(s) => s,
+        None => {
+            print_usage();
+            anyhow::bail!("missing subcommand");
+        }
+    };
+    match first {
+        "init" => handle_init(&args[1..]),
+        "start" => handle_start(&args[1..]).await,
+        "key" => handle_key_subcommand(&args[1..]),
+        "--help" | "-h" | "help" => {
+            print_usage();
+            Ok(())
+        }
+        other => {
+            print_usage();
+            anyhow::bail!("unknown subcommand '{other}'");
+        }
+    }
+}
+
+fn print_usage() {
+    println!("Usage: ambros-p2p <subcommand> [options]");
     println!();
     println!("Subcommands:");
-    println!("  key migrate --to file             --path <path>");
-    println!("  key migrate --to encrypted-file   --path <path> [--passphrase-env <var>]");
-    println!("  key migrate --to keyring          [--service <name>] [--account <name>]");
-    println!("     (reads the current [node.identity] from --config; use --delete-source to");
-    println!("      zeroize and remove a file-backed source after a successful migration)");
+    println!("  init [--config <path>]");
+    println!("      Bootstrap a node: write a starter config if missing,");
+    println!("      provision the node key (file/encrypted-file backends),");
+    println!("      ensure storage_dir exists, and print the resulting NodeId.");
+    println!();
+    println!("  start [--config <path>] [--production] [--allow-insecure-key-perms]");
+    println!("      Run the node. Refuses to start if no key has been provisioned.");
+    println!();
+    println!("  key migrate --to <backend> [backend flags]");
+    println!("      Migrate the node key between identity backends. Backends:");
+    println!("        --to file             --path <path>");
+    println!("        --to encrypted-file   --path <path> [--passphrase-env <var>]");
+    println!("        --to keyring          [--service <name>] [--account <name>]");
+    println!("      Reads the current [node.identity] from --config; pass");
+    println!("      --delete-source to zeroize and remove a file-backed source.");
+    println!();
+    println!("If --config is omitted, the platform-specific default is used:");
+    if let Some(p) = paths::default_config_path() {
+        println!("  default: {}", p.display());
+    } else {
+        println!("  default: <unavailable on this host; pass --config explicitly>");
+    }
 }
 
-#[derive(Debug)]
-struct CliArgs {
-    config_path: PathBuf,
+// ── Shared CLI parsing ──────────────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+struct InitArgs {
+    config_path: Option<PathBuf>,
+}
+
+fn parse_init_args(args: &[String]) -> anyhow::Result<InitArgs> {
+    let mut out = InitArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" | "-c" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
+                out.config_path = Some(PathBuf::from(p));
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("unknown init flag: {other}"),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Default)]
+struct StartArgs {
+    config_path: Option<PathBuf>,
     production: bool,
     allow_insecure_perms: bool,
 }
 
-impl CliArgs {
-    fn parse(args: &[String]) -> anyhow::Result<Self> {
-        let mut config_path = PathBuf::from("config.toml");
-        let mut production = false;
-        let mut allow_insecure_perms = false;
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--config" | "-c" => {
-                    i += 1;
-                    let p = args
-                        .get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--config requires a path argument"))?;
-                    config_path = PathBuf::from(p);
-                }
-                "--production" => production = true,
-                "--allow-insecure-key-perms" => allow_insecure_perms = true,
-                "--help" | "-h" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                other => {
-                    anyhow::bail!("unknown argument '{other}'; run with --help");
-                }
+fn parse_start_args(args: &[String]) -> anyhow::Result<StartArgs> {
+    let mut out = StartArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" | "-c" => {
+                i += 1;
+                let p = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
+                out.config_path = Some(PathBuf::from(p));
             }
-            i += 1;
+            "--production" => out.production = true,
+            "--allow-insecure-key-perms" => out.allow_insecure_perms = true,
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("unknown start flag: {other}"),
         }
-        Ok(Self {
-            config_path,
-            production,
-            allow_insecure_perms,
-        })
+        i += 1;
     }
+    Ok(out)
+}
+
+fn resolve_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p);
+    }
+    paths::default_config_path().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no --config given and the platform default could not be resolved \
+             (HOME / APPDATA unset?). Pass --config <path> explicitly."
+        )
+    })
 }
 
 fn is_production(cli_flag: bool) -> bool {
@@ -158,7 +195,6 @@ fn resolve_and_validate_identity(
 ) -> anyhow::Result<IdentityConfig> {
     match config::resolve_identity(node) {
         Some(mut cfg) => {
-            // Propagate the CLI flag into the file backend variant.
             if let IdentityConfig::File {
                 allow_insecure_perms: ref mut a,
                 ..
@@ -174,391 +210,242 @@ fn resolve_and_validate_identity(
             if production {
                 anyhow::bail!(
                     "refusing to start in production without an explicit [node.identity] backend. \
-                     Configure one of: file, env, keyring, encrypted-file, exec. See --help."
+                     Configure one of: file, env, keyring, encrypted-file, exec."
                 );
             }
+            // The starter config written by `init` always sets
+            // [node.identity], so the only way to land here is an
+            // operator-edited config that dropped the table. Default to
+            // a file backend in the platform-specific data dir so
+            // operators don't end up with `./node.key` polluting cwd.
+            let path = paths::default_data_dir()
+                .map(|d| d.join("node.key"))
+                .unwrap_or_else(|| PathBuf::from("node.key"));
+            warn!(
+                "no [node.identity] in config; defaulting to file backend at {}",
+                path.display()
+            );
             Ok(IdentityConfig::File {
-                path: PathBuf::from(DEFAULT_KEY_FILE),
+                path,
                 allow_insecure_perms,
             })
         }
     }
 }
 
-async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
-    let config = config::load(&cli.config_path)?;
-    info!("loaded config from {}", cli.config_path.display());
+// ── `init` subcommand ───────────────────────────────────────────────────────
 
-    let production = is_production(cli.production);
-    let identity_cfg =
-        resolve_and_validate_identity(&config.node, production, cli.allow_insecure_perms)?;
-    info!("identity backend: {}", identity_cfg.backend_name());
+fn handle_init(args: &[String]) -> anyhow::Result<()> {
+    let args = parse_init_args(args)?;
+    let config_path = resolve_config_path(args.config_path)?;
 
-    let provider = config::build_provider(&identity_cfg)?;
-    let node_identity = provider.load_or_init()?;
-    let identity = Arc::new(TlsIdentity::from_identity(&node_identity)?);
-
-    // Resolve the consensus-signing identity. When `[node.validator_identity]`
-    // is configured, build a separate `NodeSigner` from that key. Otherwise
-    // reuse the network identity — the historical single-key behavior — and
-    // emit a deprecation warning when consensus is actually enabled (gossip-
-    // only nodes never use the signer, so the warning would be noise there).
-    let validator_cfg = config::resolve_validator_identity(&config.node);
-    let consensus_signer = match &validator_cfg {
-        Some(cfg) => {
-            info!("validator-identity backend: {}", cfg.backend_name());
-            let val_provider = config::build_provider(cfg)?;
-            let val_identity = val_provider.load_or_init()?;
-            Arc::new(NodeSigner::from_identity(&val_identity)?)
-        }
-        None => {
-            if config.consensus.is_some() {
-                warn!(
-                    "[node.validator_identity] is unset — reusing the network identity for \
-                     consensus signing. Configure [node.validator_identity] to enable \
-                     independent rotation of the TLS key; this fallback will be removed \
-                     in a future release."
-                );
-            }
-            Arc::new(NodeSigner::from_identity(&node_identity)?)
-        }
-    };
-    drop(node_identity);
-
-    info!("network node ID: {}", node_id_to_base58(&identity.node_id));
-    let validator_node_id = consensus_signer.node_id();
-    if validator_node_id != identity.node_id {
-        info!(
-            "validator node ID: {}",
-            node_id_to_base58(&validator_node_id)
-        );
-        if config.consensus.is_some() {
-            warn!(
-                "validator pubkey differs from network pubkey — consensus dispatch routes \
-                 messages by validator pubkey, but the live p2p layer addresses peers by \
-                 their TLS pubkey. Until validator-set reconfiguration (issue #140) lands \
-                 and registers a (validator pubkey → network address) mapping, the cluster \
-                 cannot route consensus traffic across the split."
-            );
-        }
-    }
-
-    let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-    let store = Arc::new(gossip::store::GossipStore::new());
-
-    let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
-    let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (peer_gone_tx, _) = broadcast::channel::<p2p::NodeId>(64);
-    // Discovery deltas (`PeerAdded`/`PeerRemoved`) feed `MeshDiscovery`
-    // and any other consumer that wants a topology-change event stream.
-    let (discovery_tx, _) = broadcast::channel::<DiscoveryEvent>(64);
-
-    let manager_handle = {
-        let itx = internal_tx.clone();
-        let pgt = peer_gone_tx.clone();
-        let dtx = discovery_tx.clone();
-        let our_id = identity.node_id;
-        tokio::spawn(p2p::manager::run(
-            our_id,
-            p2p_cmd_rx,
-            internal_rx,
-            itx,
-            pgt,
-            dtx,
-        ))
-    };
-
-    // Register the gossip protocol before spawning TlsConnectionProtocol so
-    // PeerConnected events are never missed.
-    let (reg_tx, reg_rx) = oneshot::channel();
-    p2p_cmd_tx
-        .send(p2p::PeerCommand::RegisterProtocol {
-            id: gossip::PROTOCOL_ID,
-            max_frame_bytes: Some(gossip::MAX_FRAME_BYTES),
-            reply: reg_tx,
-        })
-        .await?;
-    let gossip_handle = reg_rx.await?;
-    let gossip_send_tx = gossip_handle.send_tx.clone();
-
-    let engine_handle = {
-        let store = Arc::clone(&store);
-        let clock = Arc::clone(&clock);
-        tokio::spawn(gossip::engine::run(gossip_handle, store, clock))
-    };
-
-    // Register the ping RPC protocol on its own ID and build an Rpc client
-    // with the echo handler registered for incoming calls.
-    let (ping_reg_tx, ping_reg_rx) = oneshot::channel();
-    p2p_cmd_tx
-        .send(p2p::PeerCommand::RegisterProtocol {
-            id: ping::PROTOCOL_ID,
-            max_frame_bytes: Some(ping::MAX_FRAME_BYTES),
-            reply: ping_reg_tx,
-        })
-        .await?;
-    let ping_handle = ping_reg_rx.await?;
-    let ping_rpc = p2p::rpc::RpcBuilder::new()
-        .handler(ping::METHOD_PING, ping::echo)
-        .spawn(ping_handle, Arc::clone(&clock));
-
-    // Optionally start consensus. The protocol is registered, the
-    // ConsensusNode is constructed (with disk storage if configured,
-    // otherwise in-memory) and its `run` loop is spawned. A oneshot
-    // shutdown sender is kept so we can stop the loop gracefully on
-    // ctrl-c.
-    let consensus_runtime = if let Some(cons_cfg) = config.consensus.as_ref() {
-        Some(
-            start_consensus(
-                cons_cfg,
-                &p2p_cmd_tx,
-                &discovery_tx,
-                &validator_node_id,
-                &consensus_signer,
-            )
-            .await?,
-        )
+    // Step 1: write the starter template if the config doesn't exist.
+    if !config_path.exists() {
+        write_starter_config(&config_path)?;
+        println!("wrote starter config to {}", config_path.display());
     } else {
-        info!("consensus: disabled (no [consensus] section in config)");
-        None
-    };
-
-    let cleanup_handle = {
-        let store = Arc::clone(&store);
-        let interval = config.api.cleanup_interval_secs;
-        let srx = shutdown_rx.clone();
-        let clock = Arc::clone(&clock);
-        tokio::spawn(gossip::cleanup::run(store, interval, srx, clock))
-    };
-
-    // Bind the API listener here so we know the actual port before writing addr_file.
-    let api_listener = TcpListener::bind(config.api.listen_addr).await?;
-    let api_actual_addr = api_listener.local_addr()?;
-    let api_handle = {
-        let mut app = axum::Router::new()
-            .merge(p2p::api::router(p2p_cmd_tx.clone()))
-            .merge(gossip::api::router(
-                Arc::clone(&store),
-                gossip_send_tx,
-                Arc::clone(&clock),
-            ))
-            .merge(ping::router(ping_rpc));
-        // Mount the consensus admin routes only when consensus is
-        // running — on a gossip-only node, hitting `/consensus/status`
-        // naturally returns 404, matching the design-issue acceptance
-        // criterion.
-        if let Some((_, _, ref status_rx)) = consensus_runtime {
-            app = app.merge(ambros_p2p::consensus::api::router(status_rx.clone()));
-        }
-        tokio::spawn(async move {
-            info!("HTTP API listening on {api_actual_addr}");
-            axum::serve(api_listener, app).await.unwrap();
-        })
-    };
-
-    // Bind the P2P listener before spawning the protocol so the actual port is
-    // known before we write addr_file.
-    let p2p_listener = TcpListener::bind(config.node.listen_addr).await?;
-    let p2p_actual_addr = p2p_listener.local_addr()?;
-    info!("P2P listening on {p2p_actual_addr}");
-
-    // Write bound addresses + node ID to addr_file if configured.
-    // Tests use this to discover actual ports when listen_addr uses port 0.
-    if let Some(ref path) = config.node.addr_file {
-        let content = serde_json::json!({
-            "p2p_addr": p2p_actual_addr.to_string(),
-            "api_addr": api_actual_addr.to_string(),
-            "node_id": node_id_to_base58(&identity.node_id),
-        });
-        std::fs::write(path, content.to_string())?;
+        println!("config already exists at {}", config_path.display());
     }
 
-    let protocol = TlsConnectionProtocol {
-        identity: Arc::clone(&identity),
-        peers: config.peers.clone(),
-        listener: p2p_listener,
-        clock: Arc::clone(&clock),
-        peer_cmd_tx: Some(p2p_cmd_tx.clone()),
-    };
-    let protocol_handle = tokio::spawn(protocol.run(internal_tx.clone(), peer_gone_tx.clone()));
+    // Step 2: load + validate.
+    let config = config::load(&config_path)?;
+    info!("loaded config from {}", config_path.display());
 
-    tokio::signal::ctrl_c().await?;
-    info!("shutting down...");
-    let _ = shutdown_tx.send(true);
-    drop(p2p_cmd_tx);
+    // Step 3: resolve the identity backend. `init` does not need
+    // production semantics — operators run it interactively to bootstrap.
+    let identity_cfg = resolve_and_validate_identity(&config.node, false, false)?;
+    println!("network identity backend: {}", identity_cfg.backend_name());
 
-    // Signal the consensus loop to exit before awaiting joins below.
-    let consensus_join = consensus_runtime.map(|(handle, sd, _status_rx)| {
-        let _ = sd.send(());
-        handle
-    });
+    // Step 4: provision the network key (or report externally-managed).
+    let provider = config::build_provider(&identity_cfg)?;
+    provision_or_report(&*provider, identity_cfg.backend_name(), "network")?;
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = manager_handle.await;
-        let _ = engine_handle.await;
-        let _ = cleanup_handle.await;
-        let _ = api_handle.await;
-        let _ = protocol_handle.await;
-        if let Some(h) = consensus_join {
-            let _ = h.await;
-        }
-    })
-    .await;
+    // Step 4b: same flow for `[node.validator_identity]` if configured.
+    // When the table is absent, the network key is reused for consensus
+    // signing at start time (with a deprecation warning), so `init` has
+    // nothing extra to do here.
+    if let Some(val_cfg) = config::resolve_validator_identity(&config.node) {
+        println!("validator identity backend: {}", val_cfg.backend_name());
+        let val_provider = config::build_provider(&val_cfg)?;
+        provision_or_report(&*val_provider, val_cfg.backend_name(), "validator")?;
+    }
 
-    Ok(())
-}
-
-// ── Consensus wiring ────────────────────────────────────────────────────────
-
-/// Start the HotStuff consensus protocol alongside gossip + ping.
-///
-/// Returns the run-loop join handle and the oneshot shutdown sender; the
-/// caller fires the sender on ctrl-c and awaits the handle for graceful
-/// exit.
-async fn start_consensus(
-    cons_cfg: &ConsensusConfig,
-    p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
-    discovery_tx: &broadcast::Sender<DiscoveryEvent>,
-    self_id: &NodeId,
-    signer: &Arc<NodeSigner>,
-) -> anyhow::Result<(
-    tokio::task::JoinHandle<anyhow::Result<()>>,
-    oneshot::Sender<()>,
-    watch::Receiver<Arc<ConsensusStatus>>,
-)> {
-    let validator_set = build_validator_set(cons_cfg, self_id)?;
-    info!(
-        "consensus: validator_set has {} members",
-        validator_set.len()
-    );
-
-    let genesis = build_genesis(cons_cfg)?;
-    info!("consensus: genesis hash = {:?}", genesis.hash());
-
-    let (storage, wal): (Arc<dyn Storage>, Arc<dyn Wal>) = match &cons_cfg.storage_dir {
-        Some(dir) => {
+    // Step 5: ensure consensus storage_dir exists. Doing this in init
+    // (rather than lazily on first start) lets operators verify the
+    // path is writable before going live.
+    if let Some(cons) = config.consensus.as_ref() {
+        if let Some(dir) = cons.storage_dir.as_ref() {
             std::fs::create_dir_all(dir).map_err(|e| {
                 anyhow::anyhow!("creating consensus storage_dir {}: {e}", dir.display())
             })?;
-            let storage = Arc::new(DiskStorage::open(dir.join("kv.redb"))?);
-            let wal = Arc::new(DiskWal::open(dir.join("wal.redb"))?);
-            info!("consensus: durable storage at {}", dir.display());
-            (storage, wal)
+            println!("consensus storage_dir ready at {}", dir.display());
+        }
+    }
+
+    // Step 6: pre-flight validation of the rest of the config so init
+    // is the natural moment to surface typos in peer addresses or
+    // validator IDs.
+    preflight_validate(&config)?;
+
+    println!(
+        "init complete. Run `ambros-p2p start --config {}` to launch.",
+        config_path.display()
+    );
+    Ok(())
+}
+
+/// Bootstrap a single key slot: report idempotently if a key already
+/// exists, otherwise mint one for backends that can self-provision and
+/// print an externally-managed notice for the rest. `slot` distinguishes
+/// `network` vs `validator` in the printed messages.
+fn provision_or_report(
+    provider: &dyn KeyProvider,
+    backend_name: &str,
+    slot: &str,
+) -> anyhow::Result<()> {
+    match provider.try_load()? {
+        Some(id) => {
+            let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&id)?;
+            println!(
+                "{slot} key already provisioned: NodeId = {}",
+                node_id_to_base58(&tls.node_id)
+            );
         }
         None => {
-            warn!("consensus: storage_dir unset — using in-memory storage (no crash recovery)");
-            (Arc::new(MemoryStorage::new()), Arc::new(MemoryWal::new()))
+            if provider.is_provisioning_capable() {
+                let new_id = provider.load_or_init()?;
+                let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&new_id)?;
+                println!(
+                    "provisioned new {slot} key: NodeId = {}",
+                    node_id_to_base58(&tls.node_id)
+                );
+            } else {
+                println!(
+                    "{slot} key backend `{backend_name}` is externally managed; \
+                     provision the key out-of-band, then re-run `init` to print the resulting NodeId."
+                );
+            }
         }
+    }
+    Ok(())
+}
+
+fn write_starter_config(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                anyhow::anyhow!("creating config directory {}: {e}", parent.display())
+            })?;
+        }
+    }
+
+    let data_dir = paths::default_data_dir().unwrap_or_else(|| PathBuf::from("./ambros-p2p"));
+    let key_path = data_dir.join("node.key");
+    let storage_dir = data_dir.join("consensus");
+
+    // The starter ships gossip-only so a fresh `init` followed by
+    // `start` works out of the box for single-node smoke tests.
+    // Uncomment the [consensus] block (and fill in `validators` with
+    // the node IDs your `init` prints across the cluster) to turn on
+    // HotStuff. See docs/testnet-local.md.
+    let template = format!(
+        "# ambros-p2p starter config — generated by `ambros-p2p init`.\n\
+         # See docs/testnet-local.md for a fuller walkthrough.\n\n\
+         [node]\n\
+         listen_addr = \"127.0.0.1:7000\"\n\n\
+         [node.identity]\n\
+         backend = \"file\"\n\
+         path    = \"{key_path}\"\n\n\
+         [api]\n\
+         listen_addr = \"127.0.0.1:8000\"\n\
+         cleanup_interval_secs = 60\n\n\
+         # [[peers]]\n\
+         # addr    = \"127.0.0.1:7001\"\n\
+         # node_id = \"<peer NodeId from their `init` output>\"\n\n\
+         # [consensus]\n\
+         # validators       = [\"<node1-id>\", \"<node2-id>\", \"<node3-id>\", \"<node4-id>\"]\n\
+         # storage_dir      = \"{storage_dir}\"\n\
+         # timeout_base_ms  = 500\n\
+         # timeout_max_ms   = 5000\n",
+        key_path = key_path.display(),
+        storage_dir = storage_dir.display(),
+    );
+
+    std::fs::write(path, template)
+        .map_err(|e| anyhow::anyhow!("writing starter config to {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn preflight_validate(config: &Config) -> anyhow::Result<()> {
+    // Peer addresses are SocketAddr-typed at parse time; nothing more
+    // to do there. Validate consensus inputs if present.
+    if let Some(cons) = config.consensus.as_ref() {
+        if !cons.validators.is_empty() {
+            for raw in &cons.validators {
+                ambros_p2p::p2p::tls::base58_to_node_id(raw).map_err(|e| {
+                    anyhow::anyhow!(
+                        "[consensus.validators] entry {raw:?} is not a valid NodeId: {e}"
+                    )
+                })?;
+            }
+        }
+        if let Some(seed) = cons.genesis_seed_hex.as_ref() {
+            if seed.len() != 64 || !seed.chars().all(|c| c.is_ascii_hexdigit()) {
+                anyhow::bail!("[consensus].genesis_seed_hex must be 64 hex chars");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── `start` subcommand ──────────────────────────────────────────────────────
+
+async fn handle_start(args: &[String]) -> anyhow::Result<()> {
+    let args = parse_start_args(args)?;
+    let config_path = resolve_config_path(args.config_path)?;
+
+    let config = config::load(&config_path)?;
+    info!("loaded config from {}", config_path.display());
+
+    let production = is_production(args.production);
+    let identity_cfg =
+        resolve_and_validate_identity(&config.node, production, args.allow_insecure_perms)?;
+    info!("network identity backend: {}", identity_cfg.backend_name());
+
+    let provider = config::build_provider(&identity_cfg)?;
+    let network_identity = provider.try_load()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no node key found via the `{}` backend. Run `ambros-p2p init --config {}` \
+             first (or provision the key out-of-band for read-only backends).",
+            identity_cfg.backend_name(),
+            config_path.display(),
+        )
+    })?;
+
+    // Optional separate validator (consensus signing) identity. If the
+    // table is present, it must already hold a key — `start` never
+    // mints one (that's `init`'s job).
+    let validator_identity = if let Some(val_cfg) = config::resolve_validator_identity(&config.node)
+    {
+        info!("validator identity backend: {}", val_cfg.backend_name());
+        let val_provider = config::build_provider(&val_cfg)?;
+        let val_id = val_provider.try_load()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no validator key found via the `{}` backend. Run `ambros-p2p init --config {}` \
+                 first (or provision the key out-of-band for read-only backends).",
+                val_cfg.backend_name(),
+                config_path.display(),
+            )
+        })?;
+        Some(val_id)
+    } else {
+        None
     };
 
-    let node_cfg = NodeConfigForConsensus {
-        validator_set,
-        genesis,
-        propose_limit: cons_cfg.propose_limit,
-        timeout_base: Duration::from_millis(cons_cfg.timeout_base_ms),
-        timeout_max: Duration::from_millis(cons_cfg.timeout_max_ms),
-    };
-
-    let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
-        Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
-    let mempool = Arc::new(InMemoryMempool::new(1024));
-
-    // Register the consensus protocol with the multiplexer and obtain the
-    // ProtocolHandle whose `event_rx` feeds the consensus inbound loop and
-    // whose `send_tx` becomes the underlying channel of `MeshBroadcaster`.
-    let (reg_tx, reg_rx) = oneshot::channel();
-    p2p_cmd_tx
-        .send(p2p::PeerCommand::RegisterProtocol {
-            id: ambros_p2p::consensus::node::PROTOCOL_ID,
-            max_frame_bytes: Some(ambros_p2p::consensus::node::MAX_FRAME_BYTES),
-            reply: reg_tx,
-        })
-        .await?;
-    let consensus_handle = reg_rx.await?;
-    let broadcaster: Arc<dyn Broadcaster> =
-        Arc::new(MeshBroadcaster::new(consensus_handle.send_tx));
-    let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(discovery_tx.subscribe());
-    let event_rx = consensus_handle.event_rx;
-
-    let node = ConsensusNode::recover(*self_id, node_cfg, state_machine, mempool, storage, wal)?;
-
-    // Seed the status watch-channel with an initial snapshot before
-    // the event loop starts, so callers hitting /consensus/status in
-    // the tiny window between `start_consensus` returning and the
-    // first event-loop tick see a sane all-zero state rather than a
-    // blocked read.
-    let initial_status = Arc::new(node.build_status());
-    let (status_tx, status_rx) = watch::channel(initial_status);
-    let node = node.with_status_publisher(status_tx);
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let signer = Arc::clone(signer) as Arc<dyn ambros_p2p::crypto::signed::Signer>;
-    let join = tokio::spawn(async move {
-        node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
-            .await
-    });
-    info!("consensus: event loop spawned");
-    Ok((join, shutdown_tx, status_rx))
+    node::run(config, network_identity, validator_identity).await
 }
 
-/// Build a [`ValidatorSet`] from base58-encoded NodeIds in the config,
-/// validating that this node's own ID is present.
-fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Result<ValidatorSet> {
-    if cfg.validators.is_empty() {
-        anyhow::bail!("[consensus.validators] must list at least one node");
-    }
-    let mut ids: Vec<NodeId> = Vec::with_capacity(cfg.validators.len());
-    for raw in &cfg.validators {
-        let id = base58_to_node_id(raw)
-            .map_err(|e| anyhow::anyhow!("decoding validator NodeId {raw:?}: {e}"))?;
-        ids.push(id);
-    }
-    if !ids.iter().any(|id| id == self_id) {
-        anyhow::bail!(
-            "[consensus.validators] does not include this node's own ID {}",
-            node_id_to_base58(self_id),
-        );
-    }
-    Ok(ValidatorSet::new(ids))
-}
-
-/// Build the genesis block from the optional `genesis_seed_hex` config
-/// field. Defaults to all-zeros when unset.
-fn build_genesis(cfg: &ConsensusConfig) -> anyhow::Result<Block> {
-    let mut seed = [0u8; 32];
-    if let Some(hex) = &cfg.genesis_seed_hex {
-        let bytes = decode_hex32(hex)
-            .ok_or_else(|| anyhow::anyhow!("genesis_seed_hex must be 64 hex chars (32 bytes)"))?;
-        seed = bytes;
-    }
-    Ok(Block::genesis(seed))
-}
-
-/// Decode 64 hex chars into 32 bytes; returns `None` on any error.
-fn decode_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        let hi = hex_nibble(s.as_bytes()[2 * i])?;
-        let lo = hex_nibble(s.as_bytes()[2 * i + 1])?;
-        *byte = (hi << 4) | lo;
-    }
-    Some(out)
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-// ── `key` subcommand ────────────────────────────────────────────────────────
+// ── `key` subcommand (existing migrate flow) ────────────────────────────────
 
 fn handle_key_subcommand(args: &[String]) -> anyhow::Result<()> {
     let sub = args
@@ -572,7 +459,7 @@ fn handle_key_subcommand(args: &[String]) -> anyhow::Result<()> {
 
 #[derive(Debug, Default)]
 struct MigrateArgs {
-    config_path: PathBuf,
+    config_path: Option<PathBuf>,
     to: Option<String>,
     path: Option<PathBuf>,
     passphrase_env: Option<String>,
@@ -582,19 +469,17 @@ struct MigrateArgs {
 }
 
 fn parse_migrate_args(args: &[String]) -> anyhow::Result<MigrateArgs> {
-    let mut out = MigrateArgs {
-        config_path: PathBuf::from("config.toml"),
-        ..Default::default()
-    };
+    let mut out = MigrateArgs::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--config" | "-c" => {
                 i += 1;
-                out.config_path = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--config needs a value"))?
-                    .into();
+                out.config_path = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--config needs a value"))?
+                        .into(),
+                );
             }
             "--to" => {
                 i += 1;
@@ -650,12 +535,13 @@ fn handle_key_migrate(args: &[String]) -> anyhow::Result<()> {
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("key migrate requires --to <backend>"))?;
+    let config_path = resolve_config_path(args.config_path.clone())?;
 
-    let config = config::load(&args.config_path)?;
+    let config = config::load(&config_path)?;
     let source_cfg = config::resolve_identity(&config.node).ok_or_else(|| {
         anyhow::anyhow!(
             "config {} has no [node.identity] or key_file; nothing to migrate from",
-            args.config_path.display()
+            config_path.display()
         )
     })?;
     info!("migrating from {} to {}", source_cfg.backend_name(), to);
@@ -688,14 +574,13 @@ fn handle_key_migrate(args: &[String]) -> anyhow::Result<()> {
         other => anyhow::bail!("unsupported --to backend: {other}"),
     };
 
-    let dest_provider = config::build_provider(&dest_cfg)?;
+    let dest_provider: Arc<dyn KeyProvider> = config::build_provider(&dest_cfg)?;
     dest_provider.provision(&node_identity)?;
 
     if args.delete_source {
         if let IdentityConfig::File { path, .. } = &source_cfg {
             use std::io::Write as _;
             if path.exists() {
-                // Best-effort shred: overwrite with zeros before unlink.
                 if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
                     let len = std::fs::metadata(path)
                         .map(|m| m.len() as usize)
