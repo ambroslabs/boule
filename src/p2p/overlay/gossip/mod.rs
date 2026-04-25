@@ -30,6 +30,7 @@
 //! [`wire::OverlayFrame`](wire::OverlayFrame) enum disambiguates between
 //! peer-list pushes and forwarded payloads inside that channel.
 
+pub mod broadcaster;
 pub mod dedup;
 pub mod maintenance;
 pub mod peer_list_task;
