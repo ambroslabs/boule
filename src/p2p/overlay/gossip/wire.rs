@@ -49,6 +49,12 @@ pub enum OverlayFrame {
     Forward {
         /// Per-broadcast identifier. See [`MsgId`].
         msg_id: MsgId,
+        /// The original sender — preserved across re-broadcasts so the
+        /// receiving consumer (e.g. consensus's `dispatch::ingress`)
+        /// sees the broadcast originator's NodeId rather than whichever
+        /// neighbour happened to relay the frame on the last hop. See
+        /// the gossip overlay module docs for the rationale.
+        originator: NodeId,
         /// Opaque application payload. The overlay does not interpret
         /// these bytes; they are surfaced verbatim to the consensus /
         /// gossip consumer on the receiving side.
@@ -97,6 +103,7 @@ mod tests {
     fn forward_roundtrips_via_postcard() {
         let original = OverlayFrame::Forward {
             msg_id: [7u8; 16],
+            originator: nid(42),
             payload: Bytes::from_static(b"hello consensus"),
         };
         let bytes = postcard::to_stdvec(&original).expect("encode");
@@ -147,6 +154,7 @@ mod tests {
         // first two variants that's a single zero/one byte.
         let forward = OverlayFrame::Forward {
             msg_id: [0; 16],
+            originator: [0; 32],
             payload: Bytes::new(),
         };
         let peer_list = OverlayFrame::PeerList(Vec::new());

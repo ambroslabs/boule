@@ -118,7 +118,15 @@ pub fn apply_overlay_frame(table: &PeerTable, raw: &[u8]) -> Result<Vec<NodeId>,
     };
     match frame {
         OverlayFrame::PeerList(entries) => Ok(table.merge(entries)),
-        OverlayFrame::Forward { msg_id, payload } => Err(FrameOutcome::Forward { msg_id, payload }),
+        OverlayFrame::Forward {
+            msg_id,
+            originator,
+            payload,
+        } => Err(FrameOutcome::Forward {
+            msg_id,
+            originator,
+            payload,
+        }),
     }
 }
 
@@ -133,6 +141,10 @@ pub enum FrameOutcome {
     Forward {
         /// Per-broadcast id; the dedup ring keys on this.
         msg_id: super::wire::MsgId,
+        /// Original sender of the broadcast. Surfaced upstream as the
+        /// `from` field of the delivered [`crate::p2p::ProtocolEvent::Message`]
+        /// regardless of how many gossip hops the frame traversed.
+        originator: NodeId,
         /// Application payload to surface upstream if the dedup
         /// check passes.
         payload: bytes::Bytes,
@@ -328,14 +340,21 @@ mod tests {
     fn apply_overlay_frame_returns_forward_to_caller() {
         let table = PeerTable::new(nid(0), 16);
         let id: MsgId = [9u8; 16];
+        let orig = nid(42);
         let frame = OverlayFrame::Forward {
             msg_id: id,
+            originator: orig,
             payload: Bytes::from_static(b"hello"),
         };
         let bytes = postcard::to_stdvec(&frame).unwrap();
         match apply_overlay_frame(&table, &bytes) {
-            Err(FrameOutcome::Forward { msg_id, payload }) => {
+            Err(FrameOutcome::Forward {
+                msg_id,
+                originator,
+                payload,
+            }) => {
                 assert_eq!(msg_id, id);
+                assert_eq!(originator, orig);
                 assert_eq!(&payload[..], b"hello");
             }
             other => panic!("expected Forward, got {other:?}"),
