@@ -80,6 +80,11 @@ pub mod listener;
 /// demultiplexer that routes framed messages to the right [`ProtocolHandle`].
 #[allow(missing_docs)]
 pub mod manager;
+/// Object-safe traits ([`overlay::Broadcaster`] / [`overlay::Discovery`])
+/// that abstract the full-mesh peer model so the consensus layer treats
+/// the underlying topology as a black box. See the module docs for the
+/// delivery contract.
+pub mod overlay;
 /// Matched request/response RPC built on top of [`ProtocolHandle`]. Opt-in
 /// per protocol ID; see [`rpc`] for the frame layout and cancellation model.
 pub mod rpc;

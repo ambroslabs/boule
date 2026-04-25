@@ -85,9 +85,10 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(16);
         let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(64);
         let (peer_gone_tx, mut peer_gone_rx) = broadcast::channel::<NodeId>(16);
+        let (discovery_tx, _) = broadcast::channel::<crate::p2p::overlay::DiscoveryEvent>(16);
         let itx = internal_tx.clone();
         tokio::spawn(async move {
-            manager::run(nid(1), cmd_rx, internal_rx, itx, peer_gone_tx).await;
+            manager::run(nid(1), cmd_rx, internal_rx, itx, peer_gone_tx, discovery_tx).await;
         });
 
         // Register gossip with its declared cap so the connection task

@@ -39,7 +39,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::consensus::View;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
@@ -63,8 +63,9 @@ use crate::consensus::view_timer::ViewTimer;
 use crate::crypto::signed::Signed;
 use crate::crypto::signed::Signer;
 use crate::p2p::NodeId;
+use crate::p2p::ProtocolEvent;
+use crate::p2p::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use crate::p2p::tls::node_id_to_base58;
-use crate::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 use crate::replication::block::{Block, BlockHash, BlockHeader};
 use crate::replication::mempool::Mempool;
 use crate::replication::state_machine::StateMachine;
@@ -330,11 +331,10 @@ pub struct ConsensusNode {
     /// Optional channel to notify an observer (e.g. a test harness) of
     /// each committed block. `None` in production builds.
     commit_tx: Option<tokio::sync::mpsc::UnboundedSender<Block>>,
-    /// Peers the consensus layer has observed as connected via
-    /// `ProtocolEvent::PeerConnected`. This is the consensus-layer
-    /// notion of connectivity, which may diverge from the p2p
-    /// manager's raw peer map (the safety core only acts on peers it
-    /// has seen through its own protocol channel).
+    /// Peer-membership snapshot used by [`ConsensusNode::build_status`].
+    /// Populated from [`Discovery`] events inside [`ConsensusNode::run`];
+    /// before `run` starts (or in tests that bypass it) the set is empty
+    /// and the status snapshot reports zero connected peers.
     peers_connected: HashSet<NodeId>,
     /// Height of the most recently committed block, updated in
     /// [`ConsensusNode::apply_commit`]. Zero before the first commit.
@@ -703,7 +703,8 @@ impl ConsensusNode {
 
     // ── Event loop ───────────────────────────────────────────────────────────
 
-    /// Run the consensus event loop until `shutdown` fires or `handle` closes.
+    /// Run the consensus event loop until `shutdown` fires or the
+    /// inbound channel closes.
     ///
     /// # Startup
     ///
@@ -719,16 +720,27 @@ impl ConsensusNode {
     /// guarantees that a crash between "write persist" and "send vote" is
     /// safe: the replica restarts with the vote view recorded, so it cannot
     /// double-vote when it re-enters the view.
+    ///
+    /// # Topology abstraction
+    ///
+    /// Outbound traffic flows through `broadcaster` (a [`Broadcaster`]
+    /// trait object) and peer-membership deltas through `discovery`'s
+    /// event stream. The mesh is the only implementation today; gossip
+    /// and dynamic-membership backends drop in here without touching
+    /// the event loop. See [`crate::p2p::overlay`] for the contract.
     pub async fn run(
         mut self,
-        handle: ProtocolHandle,
+        broadcaster: Arc<dyn Broadcaster>,
+        discovery: Arc<dyn Discovery>,
+        mut event_rx: mpsc::Receiver<ProtocolEvent>,
         signer: Arc<dyn Signer>,
         mut shutdown: oneshot::Receiver<()>,
     ) -> anyhow::Result<()> {
-        let ProtocolHandle {
-            send_tx,
-            mut event_rx,
-        } = handle;
+        let mut discovery_events = discovery.subscribe();
+        // Seed `peers_connected` from a snapshot so any peer that
+        // connected before our subscription is still reflected. Discovery
+        // events from the subscription point onward keep it in sync.
+        self.peers_connected = discovery.known_peers().into_iter().collect();
 
         let (timer_tx, mut timer_rx) = mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
@@ -741,7 +753,7 @@ impl ConsensusNode {
         // Boot: advance pacemaker from 0 → 1, arm the view timer, and
         // broadcast NewView (if we have a high_qc from a prior session).
         let boot_actions = self.step_pacemaker(PacemakerEvent::OnQc(0));
-        self.apply_pacemaker_actions(boot_actions, &send_tx, &mut view_timer, &signer)
+        self.apply_pacemaker_actions(boot_actions, broadcaster.as_ref(), &mut view_timer, &signer)
             .await?;
         self.publish_status();
 
@@ -753,8 +765,33 @@ impl ConsensusNode {
 
                 Some(view) = timer_rx.recv() => {
                     let pm_actions = self.step_pacemaker(PacemakerEvent::OnTimeout(view));
-                    self.apply_pacemaker_actions(pm_actions, &send_tx, &mut view_timer, &signer)
+                    self.apply_pacemaker_actions(pm_actions, broadcaster.as_ref(), &mut view_timer, &signer)
                         .await?;
+                }
+
+                disc = discovery_events.recv() => {
+                    match disc {
+                        Ok(DiscoveryEvent::PeerAdded(node_id)) => {
+                            tracing::debug!("consensus: peer added {node_id:?}");
+                            self.peers_connected.insert(node_id);
+                        }
+                        Ok(DiscoveryEvent::PeerRemoved(node_id)) => {
+                            tracing::debug!("consensus: peer removed {node_id:?}");
+                            self.peers_connected.remove(&node_id);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // Resync from the snapshot — the cache is the
+                            // authoritative source, and `Discovery` only
+                            // publishes deltas for forward-progress in the
+                            // common case.
+                            self.peers_connected = discovery.known_peers().into_iter().collect();
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Discovery shut down. Don't tear consensus
+                            // down with it — peer tracking just freezes
+                            // until restart.
+                        }
+                    }
                 }
 
                 Some(event) = event_rx.recv() => {
@@ -763,7 +800,7 @@ impl ConsensusNode {
                             match dispatch::ingress(from, &payload, &self.validator_set) {
                                 Ok(dispatches) => {
                                     for d in dispatches {
-                                        self.apply_dispatch(d, &send_tx, &mut view_timer, &signer)
+                                        self.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
                                             .await?;
                                     }
                                 }
@@ -772,14 +809,14 @@ impl ConsensusNode {
                                 }
                             }
                         }
-                        ProtocolEvent::PeerConnected { node_id } => {
-                            tracing::debug!("consensus: peer connected {node_id:?}");
-                            self.peers_connected.insert(node_id);
-                        }
-                        ProtocolEvent::PeerDisconnected { node_id } => {
-                            tracing::debug!("consensus: peer disconnected {node_id:?}");
-                            self.peers_connected.remove(&node_id);
-                        }
+                        // Peer connectivity is tracked through the
+                        // Discovery event stream above; the protocol
+                        // multiplexer still fans these out to every
+                        // protocol handle (used by the RPC layer for
+                        // request cancellation), so we just observe and
+                        // move on at this layer.
+                        ProtocolEvent::PeerConnected { .. }
+                        | ProtocolEvent::PeerDisconnected { .. } => {}
                     }
                 }
 
@@ -802,27 +839,27 @@ impl ConsensusNode {
     async fn apply_dispatch(
         &mut self,
         d: Dispatch,
-        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
         match d {
             Dispatch::Safety(ev) => {
                 let actions = self.step_safety(ev);
-                self.apply_safety_actions(actions, send_tx, view_timer, signer)
+                self.apply_safety_actions(actions, broadcaster, view_timer, signer)
                     .await?;
             }
 
             Dispatch::Pacemaker(ev) => {
                 let pm_actions = self.step_pacemaker(ev);
-                self.apply_pacemaker_actions(pm_actions, send_tx, view_timer, signer)
+                self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)
                     .await?;
             }
 
             Dispatch::ServeBlock { hash, to } => {
                 let block = self.core.state().pending_blocks.get(&hash).cloned();
                 let out = dispatch::egress_block_response(block, to);
-                send_outbound(send_tx, out).await;
+                send_outbound(broadcaster, out).await;
             }
 
             // Block arrived in response to an earlier RequestBlock; insert it
@@ -834,7 +871,7 @@ impl ConsensusNode {
                 self.core.insert_pending_block(block);
                 let current = self.pacemaker.current_view();
                 let actions = self.step_safety(SafetyEvent::PacemakerAdvance(current));
-                self.apply_safety_actions(actions, send_tx, view_timer, signer)
+                self.apply_safety_actions(actions, broadcaster, view_timer, signer)
                     .await?;
             }
 
@@ -843,7 +880,7 @@ impl ConsensusNode {
             }
 
             Dispatch::TimeoutVote(signed) => {
-                self.on_timeout_vote(signed, send_tx, view_timer, signer)
+                self.on_timeout_vote(signed, broadcaster, view_timer, signer)
                     .await?;
             }
         }
@@ -875,7 +912,7 @@ impl ConsensusNode {
     async fn apply_safety_actions(
         &mut self,
         actions: Vec<SafetyAction>,
-        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
@@ -903,8 +940,8 @@ impl ConsensusNode {
                     );
                     let (payload, loopback) =
                         dispatch::egress_consensus_msg_with_loopback(&msg, signer.as_ref())?;
-                    send_outbound(send_tx, Outbound::Broadcast(payload)).await;
-                    self.deliver_loopback(loopback, send_tx, view_timer, signer)
+                    send_outbound(broadcaster, Outbound::Broadcast(payload)).await;
+                    self.deliver_loopback(loopback, broadcaster, view_timer, signer)
                         .await?;
                 }
 
@@ -919,7 +956,7 @@ impl ConsensusNode {
                         );
                         // Self-addressed: deliver locally; do not put bytes
                         // on the wire (the p2p layer would drop them).
-                        self.deliver_loopback(loopback, send_tx, view_timer, signer)
+                        self.deliver_loopback(loopback, broadcaster, view_timer, signer)
                             .await?;
                     } else {
                         tracing::debug!(
@@ -929,7 +966,7 @@ impl ConsensusNode {
                             "outbound_send_to",
                         );
                         send_outbound(
-                            send_tx,
+                            broadcaster,
                             Outbound::SendTo {
                                 to: target,
                                 payload,
@@ -957,7 +994,7 @@ impl ConsensusNode {
                             "outbound_block_request",
                         );
                         let out = dispatch::egress_block_request(hash, peer);
-                        send_outbound(send_tx, out).await;
+                        send_outbound(broadcaster, out).await;
                     }
                 }
 
@@ -985,12 +1022,12 @@ impl ConsensusNode {
     async fn deliver_loopback(
         &mut self,
         loopback: Vec<Dispatch>,
-        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
         for d in loopback {
-            Box::pin(self.apply_dispatch(d, send_tx, view_timer, signer)).await?;
+            Box::pin(self.apply_dispatch(d, broadcaster, view_timer, signer)).await?;
         }
         Ok(())
     }
@@ -1000,7 +1037,7 @@ impl ConsensusNode {
     async fn apply_pacemaker_actions(
         &mut self,
         actions: Vec<PacemakerAction>,
-        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
@@ -1023,13 +1060,13 @@ impl ConsensusNode {
                     // Feed PacemakerAdvance into the safety core so it updates
                     // current_view and un-parks pending proposals.
                     let safety_actions = self.step_safety(SafetyEvent::PacemakerAdvance(v));
-                    self.apply_safety_actions(safety_actions, send_tx, view_timer, signer)
+                    self.apply_safety_actions(safety_actions, broadcaster, view_timer, signer)
                         .await?;
                 }
 
                 PacemakerAction::BecomeLeader(v) => {
                     let safety_actions = self.core.become_leader(v);
-                    self.apply_safety_actions(safety_actions, send_tx, view_timer, signer)
+                    self.apply_safety_actions(safety_actions, broadcaster, view_timer, signer)
                         .await?;
                 }
 
@@ -1039,7 +1076,8 @@ impl ConsensusNode {
                 }
 
                 PacemakerAction::SendTimeout(v) => {
-                    self.send_timeout(v, send_tx, view_timer, signer).await?;
+                    self.send_timeout(v, broadcaster, view_timer, signer)
+                        .await?;
                 }
             }
         }
@@ -1148,7 +1186,7 @@ impl ConsensusNode {
     async fn send_timeout(
         &mut self,
         view: View,
-        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
@@ -1161,11 +1199,11 @@ impl ConsensusNode {
         let bytes = postcard::to_stdvec(&wire)
             .map(Bytes::from)
             .context("encoding TimeoutVote")?;
-        send_outbound(send_tx, Outbound::Broadcast(bytes)).await;
+        send_outbound(broadcaster, Outbound::Broadcast(bytes)).await;
 
         // Count our own timeout locally so we don't depend on
         // broadcast-to-self semantics from the p2p layer.
-        self.on_timeout_vote(signed, send_tx, view_timer, signer)
+        self.on_timeout_vote(signed, broadcaster, view_timer, signer)
             .await
     }
 
@@ -1186,7 +1224,7 @@ impl ConsensusNode {
     async fn on_timeout_vote(
         &mut self,
         signed: Signed<TimeoutVote>,
-        send_tx: &mpsc::Sender<ProtocolOutbound>,
+        broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
@@ -1268,7 +1306,7 @@ impl ConsensusNode {
             let self_signed =
                 Signed::sign(nv, signer.as_ref()).context("signing self-NewView for TC adopt")?;
             let safety_actions = self.step_safety(SafetyEvent::NewViewReceived(self_signed));
-            self.apply_safety_actions(safety_actions, send_tx, view_timer, signer)
+            self.apply_safety_actions(safety_actions, broadcaster, view_timer, signer)
                 .await?;
         }
 
@@ -1278,7 +1316,7 @@ impl ConsensusNode {
         // safe — that function handles `AdvanceToView` / `BecomeLeader` /
         // `ResetTimer` / `SendTimeout`, and the pacemaker's reaction to
         // `OnTimeoutCert` never re-emits `OnTimeoutCert` itself.
-        Box::pin(self.apply_pacemaker_actions(pm_actions, send_tx, view_timer, signer)).await
+        Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
     }
 
     /// Commit `block` to the state machine and drain the committed commands
@@ -1426,18 +1464,15 @@ fn self_role_string(validator_set: &ValidatorSet, self_id: &NodeId, view: View) 
 
 // ── Internal send helper ─────────────────────────────────────────────────────
 
-/// Convert an [`Outbound`] from the dispatch layer into a [`ProtocolOutbound`]
-/// and send it. The send is best-effort: if the channel is closed (shutdown in
-/// progress) the error is silently dropped.
-async fn send_outbound(send_tx: &mpsc::Sender<ProtocolOutbound>, out: Outbound) {
-    let proto_out = match out {
-        Outbound::Broadcast(b) => ProtocolOutbound::Broadcast(b),
-        Outbound::SendTo { to, payload } => ProtocolOutbound::SendTo {
-            node_id: to,
-            payload,
-        },
-    };
-    let _ = send_tx.send(proto_out).await;
+/// Dispatch an [`Outbound`] from the dispatch layer through the
+/// [`Broadcaster`] trait object. The trait's implementations decide
+/// whether to drop on backpressure; today's `MeshBroadcaster` preserves
+/// the previous "send-and-await" semantics by awaiting an mpsc send.
+async fn send_outbound(broadcaster: &dyn Broadcaster, out: Outbound) {
+    match out {
+        Outbound::Broadcast(b) => broadcaster.broadcast(b).await,
+        Outbound::SendTo { to, payload } => broadcaster.send_to(to, payload).await,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2029,7 +2064,7 @@ mod tests {
 
     use crate::crypto::signed::NodeSigner;
     use crate::p2p::identity::NodeIdentity;
-    use crate::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
+    use crate::p2p::{ProtocolEvent, ProtocolOutbound};
     use rcgen::KeyPair as RcgenKeyPair;
     use rcgen::PKCS_ED25519;
     use zeroize::Zeroizing;
@@ -2042,16 +2077,31 @@ mod tests {
         NodeSigner::from_identity(&identity).unwrap()
     }
 
-    /// Build a ProtocolHandle backed by in-memory channels for testing.
-    fn make_protocol_handle() -> (
-        ProtocolHandle,
+    /// Build an inbound `event_rx` for [`ConsensusNode::run`] backed by
+    /// an in-memory channel; the returned sender lets tests inject
+    /// arbitrary [`ProtocolEvent`]s.
+    fn make_test_event_channel() -> (
         tokio::sync::mpsc::Sender<ProtocolEvent>,
+        tokio::sync::mpsc::Receiver<ProtocolEvent>,
+    ) {
+        tokio::sync::mpsc::channel(16)
+    }
+
+    /// Build a [`Broadcaster`] backed by an in-memory channel and return
+    /// the receiver so the test can inspect outbound traffic.
+    fn make_test_broadcaster() -> (
+        Arc<dyn Broadcaster>,
         tokio::sync::mpsc::Receiver<ProtocolOutbound>,
     ) {
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
-        let (send_tx, send_rx) = tokio::sync::mpsc::channel(16);
-        let handle = ProtocolHandle { send_tx, event_rx };
-        (handle, event_tx, send_rx)
+        let (send_tx, send_rx) = tokio::sync::mpsc::channel::<ProtocolOutbound>(16);
+        let bc: Arc<dyn Broadcaster> = Arc::new(crate::p2p::overlay::MeshBroadcaster::new(send_tx));
+        (bc, send_rx)
+    }
+
+    /// Build a [`Discovery`] with no peers and a never-firing source.
+    fn make_test_discovery() -> Arc<dyn Discovery> {
+        let (_tx, rx) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
+        crate::p2p::overlay::MeshDiscovery::spawn(rx)
     }
 
     #[test]
@@ -2136,11 +2186,21 @@ mod tests {
     async fn run_shuts_down_cleanly_on_signal() {
         let node = make_node(nid(1));
         let signer = fresh_signer();
-        let (handle, _event_tx, _send_rx) = make_protocol_handle();
+        let (_event_tx, event_rx) = make_test_event_channel();
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let discovery = make_test_discovery();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let run_handle =
-            tokio::spawn(async move { node.run(handle, Arc::new(signer), shutdown_rx).await });
+        let run_handle = tokio::spawn(async move {
+            node.run(
+                broadcaster,
+                discovery,
+                event_rx,
+                Arc::new(signer),
+                shutdown_rx,
+            )
+            .await
+        });
 
         shutdown_tx.send(()).unwrap();
         let result = run_handle.await.unwrap();
@@ -2158,11 +2218,21 @@ mod tests {
         // dispatch tests); we just confirm the loop boots and sends.
         let node = make_node(nid(1));
         let signer = fresh_signer();
-        let (handle, _event_tx, _send_rx) = make_protocol_handle();
+        let (_event_tx, event_rx) = make_test_event_channel();
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let discovery = make_test_discovery();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         tokio::spawn(async move {
-            let _ = node.run(handle, Arc::new(signer), shutdown_rx).await;
+            let _ = node
+                .run(
+                    broadcaster,
+                    discovery,
+                    event_rx,
+                    Arc::new(signer),
+                    shutdown_rx,
+                )
+                .await;
         });
 
         // Give the loop a tick to run its boot sequence.
@@ -2224,8 +2294,7 @@ mod tests {
         let (mut node, vs) = make_node_with_signer(&ns, 1);
         let signer: Arc<dyn Signer> = Arc::new(ns);
 
-        let (handle, _event_tx, mut send_rx) = make_protocol_handle();
-        let ProtocolHandle { send_tx, .. } = handle;
+        let (broadcaster, mut send_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
@@ -2235,7 +2304,7 @@ mod tests {
         let actions = node.core.become_leader(1);
         assert_eq!(actions.len(), 1);
 
-        node.apply_safety_actions(actions, &send_tx, &mut view_timer, &signer)
+        node.apply_safety_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer)
             .await
             .unwrap();
 
@@ -2285,8 +2354,7 @@ mod tests {
         let self_id = node.self_id;
         let signer: Arc<dyn Signer> = Arc::new(ns);
 
-        let (handle, _event_tx, mut send_rx) = make_protocol_handle();
-        let ProtocolHandle { send_tx, .. } = handle;
+        let (broadcaster, mut send_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
@@ -2301,7 +2369,7 @@ mod tests {
             crate::consensus::hotstuff::ConsensusMsg::Vote(vote),
         );
 
-        node.apply_safety_actions(vec![action], &send_tx, &mut view_timer, &signer)
+        node.apply_safety_actions(vec![action], broadcaster.as_ref(), &mut view_timer, &signer)
             .await
             .unwrap();
 
@@ -2324,8 +2392,7 @@ mod tests {
         let peer = *vs.get(1).unwrap();
         assert_ne!(peer, node.self_id);
 
-        let (handle, _event_tx, mut send_rx) = make_protocol_handle();
-        let ProtocolHandle { send_tx, .. } = handle;
+        let (broadcaster, mut send_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
@@ -2336,7 +2403,7 @@ mod tests {
         let action =
             SafetyAction::SendTo(peer, crate::consensus::hotstuff::ConsensusMsg::Vote(vote));
 
-        node.apply_safety_actions(vec![action], &send_tx, &mut view_timer, &signer)
+        node.apply_safety_actions(vec![action], broadcaster.as_ref(), &mut view_timer, &signer)
             .await
             .unwrap();
 
@@ -2364,13 +2431,12 @@ mod tests {
         let self_id = node.self_id;
         let signer: Arc<dyn Signer> = Arc::new(ns);
 
-        let (handle, _event_tx, mut send_rx) = make_protocol_handle();
-        let ProtocolHandle { send_tx, .. } = handle;
+        let (broadcaster, mut send_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
         let action = SafetyAction::RequestBlock([0xCD; 32], self_id);
-        node.apply_safety_actions(vec![action], &send_tx, &mut view_timer, &signer)
+        node.apply_safety_actions(vec![action], broadcaster.as_ref(), &mut view_timer, &signer)
             .await
             .unwrap();
         assert!(send_rx.try_recv().is_err());
@@ -2467,8 +2533,7 @@ mod tests {
         let (mut node, _vs) = make_node_with_signer(&ns, 1);
         let signer: Arc<dyn Signer> = Arc::new(ns);
 
-        let (handle, _event_tx, _send_rx) = make_protocol_handle();
-        let ProtocolHandle { send_tx, .. } = handle;
+        let (broadcaster, _send_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
@@ -2478,7 +2543,7 @@ mod tests {
         // safety core sees the view jump — so outbound_broadcast and
         // new_view_received appear as part of the same flow.
         let boot_actions = node.step_pacemaker(PacemakerEvent::OnQc(0));
-        node.apply_pacemaker_actions(boot_actions, &send_tx, &mut view_timer, &signer)
+        node.apply_pacemaker_actions(boot_actions, broadcaster.as_ref(), &mut view_timer, &signer)
             .await
             .unwrap();
 
@@ -2486,9 +2551,14 @@ mod tests {
         // broadcast + self-loopback vote emission is deterministic
         // regardless of sort-order-dependent leader selection.
         let proposal_actions = node.core.become_leader(1);
-        node.apply_safety_actions(proposal_actions, &send_tx, &mut view_timer, &signer)
-            .await
-            .unwrap();
+        node.apply_safety_actions(
+            proposal_actions,
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .unwrap();
 
         drop(_guard);
 

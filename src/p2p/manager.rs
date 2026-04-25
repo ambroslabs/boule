@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use super::connection;
 use super::connection::ProtocolCaps;
+use super::overlay::DiscoveryEvent;
 use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 
@@ -66,6 +67,7 @@ pub async fn run(
     mut internal_rx: mpsc::Receiver<ManagerMsg>,
     internal_tx: mpsc::Sender<ManagerMsg>,
     peer_gone_tx: broadcast::Sender<NodeId>,
+    discovery_tx: broadcast::Sender<DiscoveryEvent>,
 ) {
     // `BTreeMap` so broadcast and event-fan-out iteration is deterministic;
     // the sim's byte-identical-trace determinism test relies on this, and
@@ -100,6 +102,7 @@ pub async fn run(
                             &protocols,
                             internal_tx.clone(),
                             Arc::clone(&protocol_caps),
+                            &discovery_tx,
                         );
                     }
                     Some(ManagerMsg::PeerGone { node_id, connection_id }) => {
@@ -114,6 +117,7 @@ pub async fn run(
                         if is_current {
                             peers.remove(&node_id);
                             let _ = peer_gone_tx.send(node_id);
+                            let _ = discovery_tx.send(DiscoveryEvent::PeerRemoved(node_id));
                             for event_tx in protocols.values() {
                                 let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id });
                             }
@@ -198,6 +202,7 @@ pub async fn run(
                             // the slot's `write_tx` still closes the write
                             // channel and lets the connection task exit.
                             let _ = peer_gone_tx.send(node_id);
+                            let _ = discovery_tx.send(DiscoveryEvent::PeerRemoved(node_id));
                             for event_tx in protocols.values() {
                                 let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id });
                             }
@@ -231,6 +236,7 @@ fn register_connection(
     protocols: &BTreeMap<u8, mpsc::Sender<ProtocolEvent>>,
     internal_tx: mpsc::Sender<ManagerMsg>,
     protocol_caps: ProtocolCaps,
+    discovery_tx: &broadcast::Sender<DiscoveryEvent>,
 ) {
     let id = node_id_to_base58(&peer_node_id);
 
@@ -259,6 +265,7 @@ fn register_connection(
     // firing an extra PeerConnected (without a matching PeerDisconnected)
     // would confuse any protocol that tracks per-peer state.
     if !is_replacement {
+        let _ = discovery_tx.send(DiscoveryEvent::PeerAdded(peer_node_id));
         for event_tx in protocols.values() {
             let _ = event_tx.try_send(ProtocolEvent::PeerConnected {
                 node_id: peer_node_id,
@@ -334,9 +341,18 @@ mod tests {
             let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(16);
             let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(64);
             let (peer_gone_tx, peer_gone_rx) = broadcast::channel::<NodeId>(16);
+            let (discovery_tx, _) = broadcast::channel::<DiscoveryEvent>(16);
             let itx = internal_tx.clone();
             let join = tokio::spawn(async move {
-                run(our_node_id, cmd_rx, internal_rx, itx, peer_gone_tx).await;
+                run(
+                    our_node_id,
+                    cmd_rx,
+                    internal_rx,
+                    itx,
+                    peer_gone_tx,
+                    discovery_tx,
+                )
+                .await;
             });
             Self {
                 cmd_tx,

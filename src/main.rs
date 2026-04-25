@@ -15,6 +15,9 @@ use ambros_p2p::consensus::validator_set::ValidatorSet;
 use ambros_p2p::crypto::signed::{NodeSigner, Signer};
 use ambros_p2p::gossip;
 use ambros_p2p::p2p::manager::ManagerMsg;
+use ambros_p2p::p2p::overlay::{
+    Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery,
+};
 use ambros_p2p::p2p::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
 use ambros_p2p::p2p::tls_protocol::TlsConnectionProtocol;
 use ambros_p2p::p2p::{self, ConnectionProtocol};
@@ -247,12 +250,23 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (peer_gone_tx, _) = broadcast::channel::<p2p::NodeId>(64);
+    // Discovery deltas (`PeerAdded`/`PeerRemoved`) feed `MeshDiscovery`
+    // and any other consumer that wants a topology-change event stream.
+    let (discovery_tx, _) = broadcast::channel::<DiscoveryEvent>(64);
 
     let manager_handle = {
         let itx = internal_tx.clone();
         let pgt = peer_gone_tx.clone();
+        let dtx = discovery_tx.clone();
         let our_id = identity.node_id;
-        tokio::spawn(p2p::manager::run(our_id, p2p_cmd_rx, internal_rx, itx, pgt))
+        tokio::spawn(p2p::manager::run(
+            our_id,
+            p2p_cmd_rx,
+            internal_rx,
+            itx,
+            pgt,
+            dtx,
+        ))
     };
 
     // Register the gossip protocol before spawning TlsConnectionProtocol so
@@ -295,7 +309,16 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
     // shutdown sender is kept so we can stop the loop gracefully on
     // ctrl-c.
     let consensus_runtime = if let Some(cons_cfg) = config.consensus.as_ref() {
-        Some(start_consensus(cons_cfg, &p2p_cmd_tx, &validator_node_id, &consensus_signer).await?)
+        Some(
+            start_consensus(
+                cons_cfg,
+                &p2p_cmd_tx,
+                &discovery_tx,
+                &validator_node_id,
+                &consensus_signer,
+            )
+            .await?,
+        )
     } else {
         info!("consensus: disabled (no [consensus] section in config)");
         None
@@ -396,6 +419,7 @@ async fn run_node(cli: CliArgs) -> anyhow::Result<()> {
 async fn start_consensus(
     cons_cfg: &ConsensusConfig,
     p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
+    discovery_tx: &broadcast::Sender<DiscoveryEvent>,
     self_id: &NodeId,
     signer: &Arc<NodeSigner>,
 ) -> anyhow::Result<(
@@ -441,7 +465,8 @@ async fn start_consensus(
     let mempool = Arc::new(InMemoryMempool::new(1024));
 
     // Register the consensus protocol with the multiplexer and obtain the
-    // ProtocolHandle that the ConsensusNode reads/writes through.
+    // ProtocolHandle whose `event_rx` feeds the consensus inbound loop and
+    // whose `send_tx` becomes the underlying channel of `MeshBroadcaster`.
     let (reg_tx, reg_rx) = oneshot::channel();
     p2p_cmd_tx
         .send(p2p::PeerCommand::RegisterProtocol {
@@ -451,6 +476,10 @@ async fn start_consensus(
         })
         .await?;
     let consensus_handle = reg_rx.await?;
+    let broadcaster: Arc<dyn Broadcaster> =
+        Arc::new(MeshBroadcaster::new(consensus_handle.send_tx));
+    let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(discovery_tx.subscribe());
+    let event_rx = consensus_handle.event_rx;
 
     let node = ConsensusNode::recover(*self_id, node_cfg, state_machine, mempool, storage, wal)?;
 
@@ -465,7 +494,10 @@ async fn start_consensus(
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let signer = Arc::clone(signer) as Arc<dyn ambros_p2p::crypto::signed::Signer>;
-    let join = tokio::spawn(async move { node.run(consensus_handle, signer, shutdown_rx).await });
+    let join = tokio::spawn(async move {
+        node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
+            .await
+    });
     info!("consensus: event loop spawned");
     Ok((join, shutdown_tx, status_rx))
 }

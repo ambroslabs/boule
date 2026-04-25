@@ -45,7 +45,8 @@ use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{NodeSigner, Signer};
 use crate::p2p::identity::NodeIdentity;
-use crate::p2p::{NodeId, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
+use crate::p2p::overlay::{Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery};
+use crate::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
 use crate::replication::block::{Block, BlockHash};
 use crate::replication::impls::{CounterStateMachine, InMemoryMempool};
 use crate::replication::state_machine::StateMachine;
@@ -179,9 +180,21 @@ impl SimCluster {
             let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
                 .with_commit_observer(commit_tx);
 
-            // Per-node outbound channel: node writes here; routing task reads.
+            // Per-node outbound channel: node writes here through its
+            // `Broadcaster`; the routing task reads on the other side.
             let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
-            let handle = ProtocolHandle { send_tx, event_rx };
+            let broadcaster: Arc<dyn Broadcaster> = Arc::new(MeshBroadcaster::new(send_tx));
+            // The sim's existing topology never published PeerConnected
+            // / PeerDisconnected events into ProtocolEvent for ordinary
+            // mesh edges (only `kill_node` did, for survivors). Mirroring
+            // that for the new `Discovery` trait keeps the sim's
+            // observable behavior identical: consensus's `peers_connected`
+            // stays empty in the sim, just as it did before this seam
+            // existed. A future sim PR can publish PeerAdded for the
+            // initial topology if status-snapshot fidelity matters.
+            let (_disco_src_tx, disco_src_rx) =
+                tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
+            let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(disco_src_rx);
 
             spawn_route_task(
                 nid,
@@ -196,7 +209,9 @@ impl SimCluster {
             shutdown_txs.push(Some(shutdown_tx));
 
             tokio::spawn(async move {
-                let _ = node.run(handle, signer, shutdown_rx).await;
+                let _ = node
+                    .run(broadcaster, discovery, event_rx, signer, shutdown_rx)
+                    .await;
             });
         }
 
