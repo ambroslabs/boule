@@ -31,6 +31,8 @@
 //! peer-list pushes and forwarded payloads inside that channel.
 
 pub mod dedup;
+pub mod peer_list_task;
+pub mod peer_table;
 pub mod wire;
 
 /// Single-byte protocol identifier for the gossip overlay's control +
