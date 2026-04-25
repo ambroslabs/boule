@@ -79,4 +79,24 @@ impl KeyProvider for KeyringKeyProvider {
         );
         Ok(())
     }
+
+    fn try_load(&self) -> anyhow::Result<Option<NodeIdentity>> {
+        let entry = self.entry()?;
+        match entry.get_password() {
+            Ok(b64) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim().as_bytes())
+                    .context("decoding keyring secret")?;
+                let (der, _) = decode_pkcs8(&bytes)?;
+                let id = NodeIdentity { pkcs8_der: der };
+                id.validate().context("validating key from keyring")?;
+                Ok(Some(id))
+            }
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "reading keyring entry {}/{}",
+                self.service, self.account
+            ))),
+        }
+    }
 }

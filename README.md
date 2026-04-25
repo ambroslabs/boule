@@ -1,14 +1,10 @@
 # ambros-p2p
 
-A peer-to-peer runtime written in Rust, built as the foundation for a
-HotStuff-style BFT consensus layer. Every subsystem below consensus — TLS
-transport, gossip, signed envelopes, clock, durable storage — lives behind
-an object-safe seam so the consensus state machine can slot in without
-rewriting the plumbing, and so the whole stack can be driven by a
-deterministic in-process simulator during tests.
-
-Consensus itself is not yet implemented; the roadmap is tracked in issues
-[#21–#24](https://github.com/zrbecker/ambros-p2p/issues).
+A peer-to-peer runtime written in Rust, hosting a HotStuff-style BFT
+consensus layer. Every subsystem below consensus — TLS transport, gossip,
+signed envelopes, clock, durable storage — lives behind an object-safe
+seam so the whole stack can be driven by a deterministic in-process
+simulator during tests.
 
 ## Quickstart
 
@@ -19,8 +15,12 @@ in the repo root pins the toolchain; `rustup` will pick it up automatically.
 # Build
 cargo build
 
-# Run a single node using the checked-in config
-cargo run -- --config config.toml
+# Bootstrap a single node (writes a starter config at the platform
+# default location if --config is omitted; see docs/testnet-local.md)
+cargo run -- init --config config.toml
+
+# Run that node
+cargo run -- start --config config.toml
 
 # Unit tests (includes the deterministic simulator)
 cargo test --lib
@@ -52,7 +52,7 @@ cargo clippy --all-targets -- -D warnings
 
 ```text
              ┌────────────────────────────────────┐
-             │             consensus              │   (future; see #21–#24)
+             │             consensus              │   HotStuff-style BFT
              └─────────────────┬──────────────────┘
    signed envelopes            │            durable state
               ┌────────────────┴────────────────┐
@@ -116,6 +116,12 @@ The node's long-term Ed25519 identity can be sourced from a file, an
 environment variable, an encrypted file, an OS keyring, or an external
 command; see the `[node.identity]` table and the `key migrate` subcommand
 (`cargo run -- --help`).
+
+When `--config` is omitted, `ambros-p2p` reads from the platform-specific
+default (`$XDG_CONFIG_HOME/ambros-p2p/config.toml` on Linux, the standard
+Library directory on macOS, `%APPDATA%\ambros-p2p\config.toml` on
+Windows). Run `ambros-p2p init` to write a starter template at that path
+on first use.
 
 ## Contributing
 

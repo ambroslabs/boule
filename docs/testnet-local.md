@@ -42,9 +42,9 @@ A node's long-term identity is an Ed25519 keypair. The base58 encoding of
 its public key *is* the node's overlay address (the `NodeId`). Two facts
 follow:
 
-1. A node's `NodeId` is not known until the first time it runs and
-   generates (or loads) its key. So the workflow is: **start once to mint
-   the key → copy the printed `NodeId` into peers' configs → restart.**
+1. A node's `NodeId` is not known until the first time `ambros-p2p init`
+   runs and provisions its key. So the workflow is: **`init` mints the key
+   and prints the `NodeId` → paste it into peers' configs → `start`.**
 2. Peers can be configured in trust-on-first-use mode (`addr` only), or
    pinned by expected `NodeId`. Pinning is strongly recommended even on a
    laptop — it catches config mix-ups immediately.
@@ -63,10 +63,20 @@ path    = "./testnet/node1/node.key"
 listen_addr = "127.0.0.1:8000"
 ```
 
-Everything below builds on that. (The legacy `key_file = "..."` scalar
-inside `[node]` is still accepted for backward compatibility but has been
-superseded by the `[node.identity]` table — use the table form in new
-configs.)
+When `--config` is omitted, `ambros-p2p` reads from the platform default:
+
+| Resource | Linux | macOS | Windows |
+| --- | --- | --- | --- |
+| Config | `$XDG_CONFIG_HOME/ambros-p2p/config.toml` (default `~/.config/ambros-p2p/config.toml`) | `~/Library/Application Support/ambros-p2p/config.toml` | `%APPDATA%\ambros-p2p\config.toml` |
+| State / WAL / storage | `$XDG_DATA_HOME/ambros-p2p/` (default `~/.local/share/ambros-p2p/`) | `~/Library/Application Support/ambros-p2p/` | `%LOCALAPPDATA%\ambros-p2p\` |
+
+The walkthroughs below pass `--config` explicitly because every node
+runs on the same host and would otherwise collide on the default
+location. A single-node deployment can omit `--config` entirely.
+
+(The legacy `key_file = "..."` scalar inside `[node]` is still accepted
+for backward compatibility but has been superseded by the
+`[node.identity]` table — use the table form in new configs.)
 
 ---
 
@@ -131,12 +141,12 @@ cleanup_interval_secs = 60
 
 ## 4. Mint each node's identity
 
-Start each node once so it generates its key, then stop it and grab the
-printed `NodeId`. `RUST_LOG=info` makes the `node ID: ...` line visible.
+`ambros-p2p init` provisions the on-disk key for the file backend and
+prints the resulting `NodeId` to stdout. Run it once per node:
 
 ```sh
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node1/config.toml
-# look for: "node ID: <base58…>"  — copy it, then Ctrl-C
+./target/release/ambros-p2p init --config testnet/node1/config.toml
+# stdout includes: "provisioned new node key: NodeId = <base58…>"
 ```
 
 Repeat for `node2` and `node3`. Record the three IDs somewhere you can
@@ -150,9 +160,11 @@ node3: 2bC8…hK1
 
 (Your values will be different — every fresh key mints a fresh ID.)
 
-Tip: if typing `RUST_LOG=info` gets tedious, it is equivalent to running
-the binary with the default tracing filter `ambros_p2p=info` inherited
-from `main.rs`, so you can just `export RUST_LOG=info` for the session.
+`init` is idempotent: re-running it on an already-provisioned node
+prints `node already provisioned: NodeId = <…>` instead of minting a
+new key. For read-only key backends (`env`, `exec`, `keyring`), `init`
+does not generate a key — it prints an "externally managed" notice and
+asks you to provision the key out-of-band before re-running.
 
 ---
 
@@ -198,17 +210,21 @@ Open three terminals (or use `tmux`). In each one:
 
 ```sh
 # Terminal 1
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node1/config.toml
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node1/config.toml
 
 # Terminal 2 (after node1 is up)
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node2/config.toml
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node2/config.toml
 
 # Terminal 3 (after node2 is up)
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node3/config.toml
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node3/config.toml
 ```
 
 You should see log lines on each side announcing the P2P listener, the
 HTTP API listener, and (on node2/node3) the outbound dials succeeding.
+
+If `start` exits immediately with `no node key found via the 'file'
+backend`, the config points at a key path that hasn't been minted yet
+— run `ambros-p2p init --config <path>` first.
 
 ---
 
@@ -303,8 +319,8 @@ cleanup_interval_secs = 60
 Mint its identity the same way you did for nodes 1–3:
 
 ```sh
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node4/config.toml
-# look for "node ID: <base58…>" — copy it, then Ctrl-C
+./target/release/ambros-p2p init --config testnet/node4/config.toml
+# stdout includes: "provisioned new node key: NodeId = <base58…>"
 ```
 
 ### Wire all four nodes peer-to-peer
@@ -367,13 +383,13 @@ Start each node in its own terminal (or `tmux` pane). A small startup
 stagger lets the dialer tasks settle, but isn't required:
 
 ```sh
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node1/config.toml &
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node1/config.toml &
 sleep 0.3
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node2/config.toml &
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node2/config.toml &
 sleep 0.3
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node3/config.toml &
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node3/config.toml &
 sleep 0.3
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node4/config.toml &
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node4/config.toml &
 ```
 
 Within a few seconds each node's log should show:
@@ -491,7 +507,7 @@ For the scripts below, redirect each node's logs to a file so you can
 post-process them. The pattern is:
 
 ```sh
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/node1/config.toml \
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node1/config.toml \
   > testnet/node1/log 2>&1 &
 PID1=$!
 # ... etc per node, recording PID1, PID2, PID3, PID4
@@ -547,13 +563,12 @@ following helper to mint keys and write configs:
 ```sh
 mkdir -p testnet7
 
-# Step 1: bootstrap each node briefly so it generates its key.
+# Step 1: write the per-node config and provision its key with `init`.
 for i in 1 2 3 4 5 6 7; do
   mkdir -p testnet7/node$i
   cat > testnet7/node$i/config.toml <<EOF
 [node]
 listen_addr = "127.0.0.1:$((27000 + i))"
-addr_file   = "testnet7/node$i.addr"
 
 [node.identity]
 backend = "file"
@@ -563,13 +578,15 @@ path    = "testnet7/node$i/node.key"
 listen_addr = "127.0.0.1:$((28000 + i))"
 cleanup_interval_secs = 60
 EOF
-  timeout 2 ./target/release/ambros-p2p --config testnet7/node$i/config.toml \
-    > /dev/null 2>&1
+  ./target/release/ambros-p2p init --config testnet7/node$i/config.toml \
+    > testnet7/node$i/init.log
 done
 
-# Step 2: collect node IDs and write final configs with [consensus] + peers.
+# Step 2: collect node IDs (parsed from each `init` log) and write
+# final configs with [consensus] + peers.
 NODE_IDS=$(for i in 1 2 3 4 5 6 7; do
-  jq -r .node_id testnet7/node$i.addr
+  grep -oE 'NodeId = [^ ]+' testnet7/node$i/init.log \
+    | head -1 | awk '{print $3}'
 done)
 VALIDATORS=$(echo "$NODE_IDS" | sed 's/^/"/; s/$/"/' | paste -sd ',' -)
 
@@ -587,7 +604,6 @@ node_id = \"$NJ\"
   cat > testnet7/node$i/config.toml <<EOF
 [node]
 listen_addr = "127.0.0.1:$((27000 + i))"
-addr_file   = "testnet7/node$i.addr"
 
 [node.identity]
 backend = "file"
@@ -613,7 +629,7 @@ Define a small launcher and snapshot helper, then run the scenario:
 
 ```sh
 launch() {
-  RUST_LOG=info ./target/release/ambros-p2p --config testnet7/node$1/config.toml \
+  RUST_LOG=info ./target/release/ambros-p2p start --config testnet7/node$1/config.toml \
     >> testnet7/node$1/log 2>&1 &
   eval "PID$1=\$!"
 }
@@ -758,6 +774,7 @@ Your node IDs will change after this, so remember to re-wire `[[peers]]`
 | `/peers` returns `[]` on every node | One or more `[[peers]].node_id` values don't match the actual node IDs (typo or stale copy). Re-check the printed `node ID: ...` lines. |
 | `Address already in use` on start | Something else is bound to the P2P or API port. Edit `listen_addr` to use another port, or kill the stale process. |
 | Messages don't propagate | Mesh isn't formed — check `/peers` first. If peers are present but `/messages` diverges, check clocks: `expiry` comparisons use wall-clock time, and a very skewed laptop clock can make messages land already-expired. |
+| `no node key found via the '<backend>' backend` | The configured key backend is empty — run `ambros-p2p init --config <path>` (file/encrypted-file) or provision the key out-of-band (env/exec/keyring) before retrying `start`. |
 | `refusing to start in production without an explicit [node.identity]` | You set `AMBROS_ENV=production` or passed `--production`. For a laptop testnet, unset both and let the default file backend kick in. |
 | Consensus nodes never commit | The committees don't match. Every replica's `[consensus].validators` list must be the exact same strings in the exact same order, and `genesis_seed_hex` must be identical. Check `/consensus/status` on every node — divergent `validator_set` arrays are the smoking gun. |
 | Consensus committing in steady state then stalls | A node went down and the cluster dropped below quorum. With `n = 3f + 1`, you need at least `2f + 1` live to make progress. `/consensus/status` shows `peers_connected` shrinking and `timeout_buckets` accumulating without firing. |
@@ -773,10 +790,14 @@ Your node IDs will change after this, so remember to re-wire `[[peers]]`
 # Build
 cargo build --release
 
-# Start a node
-RUST_LOG=info ./target/release/ambros-p2p --config testnet/nodeN/config.toml
+# Bootstrap a node (idempotent; mints the file/encrypted-file key,
+# creates the consensus storage_dir, prints the NodeId)
+./target/release/ambros-p2p init --config testnet/nodeN/config.toml
 
-# Print help (shows the `key migrate` subcommand too)
+# Start a node
+RUST_LOG=info ./target/release/ambros-p2p start --config testnet/nodeN/config.toml
+
+# Print help (shows all subcommands including `key migrate`)
 ./target/release/ambros-p2p --help
 
 # Admin API — gossip-only fields

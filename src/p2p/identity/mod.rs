@@ -76,6 +76,20 @@ pub trait KeyProvider: Send + Sync {
     fn provision(&self, _identity: &NodeIdentity) -> anyhow::Result<()> {
         anyhow::bail!("backend {} is read-only; cannot provision", self.name())
     }
+
+    /// Whether this backend can autonomously create a fresh key on first
+    /// use. Backends that wrap externally-managed key material (`env`,
+    /// `exec`, OS keyring) return `false`; the `init` subcommand then
+    /// prints an "externally managed" notice instead of generating one.
+    fn is_provisioning_capable(&self) -> bool {
+        false
+    }
+
+    /// Load the existing key without ever creating one. Returns `None`
+    /// if the backing store does not yet hold a key. Used by both `init`
+    /// (to detect first-time provisioning) and `start` (to refuse to
+    /// run before `init` has been called).
+    fn try_load(&self) -> anyhow::Result<Option<NodeIdentity>>;
 }
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
