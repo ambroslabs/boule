@@ -21,6 +21,12 @@ pub struct Config {
     /// is started alongside the gossip and ping protocols.
     #[serde(default)]
     pub consensus: Option<ConsensusConfig>,
+    /// Topology overlay configuration. Selects between the legacy
+    /// full-mesh implementation and the partial-mesh gossip overlay
+    /// (issue #137). When absent, defaults — including
+    /// `mode = "mesh"` — apply.
+    #[serde(default)]
+    pub overlay: OverlayConfig,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -170,6 +176,112 @@ fn default_timeout_base_ms() -> u64 {
 
 fn default_timeout_max_ms() -> u64 {
     10_000
+}
+
+/// Topology-overlay configuration. Selects between the legacy full-mesh
+/// implementation (`mode = "mesh"`, the default) and the partial-mesh
+/// gossip overlay (`mode = "gossip"`, issue #137).
+///
+/// Defaults are tuned to match the per-module `Default` impls in the
+/// gossip building blocks ([`crate::p2p::overlay::gossip::peer_list_task::PeerListGossipConfig`],
+/// [`crate::p2p::overlay::gossip::maintenance::MeshMaintenanceConfig`],
+/// [`crate::p2p::overlay::gossip::overlay::GossipOverlayConfig`]), so a
+/// node that opts in with just `[overlay] mode = "gossip"` behaves the
+/// same as the breakdown-comment defaults on issue #137.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OverlayConfig {
+    /// Which overlay implementation to use. Defaults to `mesh`; the
+    /// cutover to `gossip` happens once the 25-node sim convergence is
+    /// green (the closing PR on issue #137).
+    #[serde(default)]
+    pub mode: OverlayMode,
+    /// Upper bound on direct peer count for the partial-mesh
+    /// maintenance loop. Used in `mode = "gossip"` only.
+    #[serde(default = "default_target_degree")]
+    pub target_degree: usize,
+    /// Peer-list publisher tick interval, milliseconds. Used in
+    /// `mode = "gossip"` only.
+    #[serde(default = "default_peer_gossip_interval_ms")]
+    pub peer_gossip_interval_ms: u64,
+    /// Maximum number of direct neighbours to push our peer-table
+    /// snapshot to per tick. Used in `mode = "gossip"` only.
+    #[serde(default = "default_peer_gossip_fanout")]
+    pub peer_gossip_fanout: usize,
+    /// Mesh-maintenance loop tick interval, milliseconds. Used in
+    /// `mode = "gossip"` only.
+    #[serde(default = "default_mesh_check_interval_ms")]
+    pub mesh_check_interval_ms: u64,
+    /// Maximum live entries in the dedup ring.
+    #[serde(default = "default_dedup_capacity")]
+    pub dedup_capacity: usize,
+    /// How long an inserted msg_id is treated as "seen" before being
+    /// lazily forgotten, milliseconds.
+    #[serde(default = "default_dedup_ttl_ms")]
+    pub dedup_ttl_ms: u64,
+    /// Maximum entries the peer table holds.
+    #[serde(default = "default_peer_table_capacity")]
+    pub peer_table_capacity: usize,
+    /// Bootstrap addresses dialed at startup. Each is a TOFU dial — the
+    /// peer's TLS identity is whatever it presents on the handshake.
+    /// Used in `mode = "gossip"` only.
+    #[serde(default)]
+    pub bootstrap_addrs: Vec<SocketAddr>,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            mode: OverlayMode::default(),
+            target_degree: default_target_degree(),
+            peer_gossip_interval_ms: default_peer_gossip_interval_ms(),
+            peer_gossip_fanout: default_peer_gossip_fanout(),
+            mesh_check_interval_ms: default_mesh_check_interval_ms(),
+            dedup_capacity: default_dedup_capacity(),
+            dedup_ttl_ms: default_dedup_ttl_ms(),
+            peer_table_capacity: default_peer_table_capacity(),
+            bootstrap_addrs: Vec::new(),
+        }
+    }
+}
+
+/// Which topology overlay implementation to drive consensus with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverlayMode {
+    /// Legacy full-mesh implementation. Default until the gossip overlay
+    /// is ready to take over (closing PR on issue #137).
+    #[default]
+    Mesh,
+    /// Partial-mesh gossip overlay (issue #137).
+    Gossip,
+}
+
+fn default_target_degree() -> usize {
+    8
+}
+
+fn default_peer_gossip_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_peer_gossip_fanout() -> usize {
+    3
+}
+
+fn default_mesh_check_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_dedup_capacity() -> usize {
+    4_096
+}
+
+fn default_dedup_ttl_ms() -> u64 {
+    120_000
+}
+
+fn default_peer_table_capacity() -> usize {
+    1_024
 }
 
 pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -524,6 +636,123 @@ listen_addr = "127.0.0.1:8080"
             }
             other => panic!("expected encrypted-file backend, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn overlay_section_absent_applies_defaults() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+"#,
+        );
+        // Defaults match the breakdown-comment values on #137.
+        assert_eq!(c.overlay.mode, OverlayMode::Mesh);
+        assert_eq!(c.overlay.target_degree, 8);
+        assert_eq!(c.overlay.peer_gossip_interval_ms, 5_000);
+        assert_eq!(c.overlay.peer_gossip_fanout, 3);
+        assert_eq!(c.overlay.mesh_check_interval_ms, 5_000);
+        assert_eq!(c.overlay.dedup_capacity, 4_096);
+        assert_eq!(c.overlay.dedup_ttl_ms, 120_000);
+        assert_eq!(c.overlay.peer_table_capacity, 1_024);
+        assert!(c.overlay.bootstrap_addrs.is_empty());
+    }
+
+    #[test]
+    fn overlay_mode_gossip_parses() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[overlay]
+mode = "gossip"
+"#,
+        );
+        assert_eq!(c.overlay.mode, OverlayMode::Gossip);
+        // Section-present, knob-absent: defaults still apply.
+        assert_eq!(c.overlay.target_degree, 8);
+    }
+
+    #[test]
+    fn overlay_individual_knob_overrides_take_effect() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[overlay]
+mode = "gossip"
+target_degree = 12
+peer_gossip_interval_ms = 2500
+peer_gossip_fanout = 5
+mesh_check_interval_ms = 7500
+dedup_capacity = 16384
+dedup_ttl_ms = 30000
+peer_table_capacity = 4096
+bootstrap_addrs = ["127.0.0.1:7100", "127.0.0.1:7200"]
+"#,
+        );
+        assert_eq!(c.overlay.mode, OverlayMode::Gossip);
+        assert_eq!(c.overlay.target_degree, 12);
+        assert_eq!(c.overlay.peer_gossip_interval_ms, 2_500);
+        assert_eq!(c.overlay.peer_gossip_fanout, 5);
+        assert_eq!(c.overlay.mesh_check_interval_ms, 7_500);
+        assert_eq!(c.overlay.dedup_capacity, 16_384);
+        assert_eq!(c.overlay.dedup_ttl_ms, 30_000);
+        assert_eq!(c.overlay.peer_table_capacity, 4_096);
+        assert_eq!(c.overlay.bootstrap_addrs.len(), 2);
+        assert_eq!(c.overlay.bootstrap_addrs[0].port(), 7_100);
+        assert_eq!(c.overlay.bootstrap_addrs[1].port(), 7_200);
+    }
+
+    #[test]
+    fn overlay_malformed_mode_is_rejected() {
+        let raw = r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[overlay]
+mode = "not-a-real-mode"
+"#;
+        let err = toml::from_str::<Config>(raw).expect_err("malformed mode must fail to parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not-a-real-mode") || msg.contains("variant"),
+            "expected variant-rejection diagnostic, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn overlay_bootstrap_addrs_round_trip() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[overlay]
+mode = "gossip"
+bootstrap_addrs = ["10.0.0.1:7000", "[::1]:7000"]
+"#,
+        );
+        assert_eq!(c.overlay.bootstrap_addrs.len(), 2);
+        assert_eq!(c.overlay.bootstrap_addrs[0].port(), 7000);
+        assert!(c.overlay.bootstrap_addrs[1].is_ipv6());
     }
 
     #[test]
