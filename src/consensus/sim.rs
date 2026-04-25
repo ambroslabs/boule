@@ -380,6 +380,42 @@ impl SimCluster {
         }
     }
 
+    /// Like [`advance_and_yield`], but stops as soon as `done(self)`
+    /// returns `true` — typically a check on `peek_commit_heights`. Use
+    /// this in liveness tests whose assertion is "every survivor gained
+    /// at least N commits": once the floor is met, more simulated time
+    /// just inflates wall-clock without exercising the invariant.
+    ///
+    /// Returns `true` if the predicate fired, `false` if the full
+    /// `max_total` budget was exhausted (the caller usually asserts the
+    /// return value).
+    ///
+    /// Prefer [`advance_and_yield`] for negative-space tests that must
+    /// observe a quiet window for its full duration (e.g. "no commits
+    /// happened in the next 2s").
+    ///
+    /// [`advance_and_yield`]: SimCluster::advance_and_yield
+    pub async fn advance_and_yield_until(
+        &mut self,
+        max_total: Duration,
+        mut done: impl FnMut(&mut Self) -> bool,
+    ) -> bool {
+        let chunk = Duration::from_millis(50);
+        let mut remaining = max_total;
+        while !remaining.is_zero() {
+            let step = remaining.min(chunk);
+            tokio::time::advance(step).await;
+            remaining -= step;
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+                if done(self) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Drain both receivers into the per-node cache. Shared by
     /// [`SimCluster::drain_commits`] and [`SimCluster::peek_commit_heights`].
     fn flush_into_cache(&mut self) {
@@ -1449,8 +1485,22 @@ mod tests {
 
         let heights_before_partition = cluster.peek_commit_heights();
 
-        // 2 simulated seconds with one node partitioned.
-        cluster.advance_and_yield(Duration::from_secs(2)).await;
+        // Drive simulated time until each survivor has gained at least
+        // 10 commits, with a 5s simulated cap as a safety net.
+        let baseline = heights_before_partition.clone();
+        let n = baseline.len();
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                let h = c.peek_commit_heights();
+                (0..n)
+                    .filter(|&i| i != partitioned_idx)
+                    .all(|i| h[i] >= baseline[i] + 10)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "partition phase: survivors did not all gain >= 10 commits within 5s simulated"
+        );
 
         let heights_mid = cluster.peek_commit_heights();
         assert_each_gained_at_least(
@@ -1461,19 +1511,29 @@ mod tests {
             "partition_phase",
         );
 
-        // Heal and give the cluster another 2 simulated seconds so
-        // the previously partitioned node catches up on the chain via
-        // post-heal proposal/justify propagation.
+        // Heal and give the cluster simulated time so the previously
+        // partitioned node catches up on the chain via post-heal
+        // proposal/justify propagation. Stop as soon as every node
+        // (including the healed one) has gained >= 5 commits.
         cluster.heal_node(partitioned_idx);
-        cluster.advance_and_yield(Duration::from_secs(2)).await;
+        let mid = heights_mid.clone();
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                let h = c.peek_commit_heights();
+                (0..n).all(|i| h[i] >= mid[i] + 5)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "post-heal phase: not every node gained >= 5 commits within 5s simulated"
+        );
 
         let heights_after_heal = cluster.peek_commit_heights();
         let committed = cluster.drain_commits();
         assert_no_conflicts(&committed);
 
-        // Now the healed node must gain too — ≥ 5 additional commits
-        // since the mid-point. Connected nodes keep going at the same
-        // rate, so they should also gain ≥ 5.
+        // Connected nodes keep going at the same rate, so they should
+        // also gain ≥ 5.
         assert_each_gained_at_least(&heights_mid, &heights_after_heal, 5, &[], "post_heal_phase");
     }
 }
