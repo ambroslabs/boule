@@ -49,22 +49,34 @@
 //! [`cut_link`]: SimCluster::cut_link
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::clock::{Clock, TokioClock};
 use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{NodeSigner, Signer};
 use crate::p2p::identity::NodeIdentity;
+use crate::p2p::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
+use crate::p2p::overlay::gossip::overlay::{
+    GossipOverlay, GossipOverlayConfig, GossipOverlayHandles, SpawnArgs,
+};
+use crate::p2p::overlay::gossip::peer_list_task::{OverlayUnicast, PeerListGossipConfig};
+use crate::p2p::overlay::gossip::sink::OverlaySink;
 use crate::p2p::overlay::{Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery};
 use crate::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
 use crate::replication::block::{Block, BlockHash};
 use crate::replication::impls::{CounterStateMachine, InMemoryMempool};
 use crate::replication::state_machine::StateMachine;
 use crate::storage::{MemoryStorage, MemoryWal};
+use bytes::Bytes;
+use rand::Rng;
 use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
 use zeroize::Zeroizing;
 
@@ -120,6 +132,11 @@ pub struct SimCluster {
     commit_cache: Vec<Vec<Block>>,
     /// Shutdown senders; `None` after `kill_node` has been called for that slot.
     shutdown_txs: Vec<Option<oneshot::Sender<()>>>,
+    /// Per-orchestrator shutdown senders (gossip-mode clusters only).
+    /// Held for the lifetime of the cluster so the orchestrator's
+    /// `select!` shutdown arm stays pending; dropped together on
+    /// [`SimCluster::drop`]. Empty for mesh-mode clusters.
+    overlay_shutdowns: Vec<oneshot::Sender<()>>,
 }
 
 impl SimCluster {
@@ -254,6 +271,7 @@ impl SimCluster {
             event_txs,
             commit_cache,
             shutdown_txs,
+            overlay_shutdowns: Vec::new(),
         }
     }
 
@@ -653,6 +671,368 @@ fn spawn_route_task(
             }
         }
     });
+}
+
+// ── Gossip-overlay sim mode (issue #137) ─────────────────────────────────────
+
+/// Build adjacency lists for an undirected K-regular circulant ring on
+/// `n` vertices.
+///
+/// Each vertex `i` is connected to `i ± 1, i ± 2, …, i ± k/2` (mod
+/// `n`). For the gossip-overlay sim this is a cheap way to get a
+/// connected K-regular graph without rolling a random regular graph.
+///
+/// # Panics
+///
+/// Panics if `k` is odd (circulant rings are even-degree only) or if
+/// `k >= n` (would self-loop).
+pub fn circulant_neighbors(n: usize, k: usize) -> Vec<Vec<usize>> {
+    assert!(k % 2 == 0, "circulant K must be even (got {k})");
+    assert!(k < n, "K ({k}) must be < n ({n}) for a simple graph");
+
+    let half = k / 2;
+    let mut out = vec![Vec::with_capacity(k); n];
+    for (i, slot) in out.iter_mut().enumerate() {
+        for j in 1..=half {
+            let lo = (i + n - j) % n;
+            let hi = (i + j) % n;
+            slot.push(lo);
+            slot.push(hi);
+        }
+    }
+    out
+}
+
+/// Synthetic socket address used as the gossip overlay's
+/// `self_listen_addr` for sim-cluster node `idx`. The publisher
+/// embeds it in self-advertised peer-list entries; receivers merge
+/// it into their `PeerTable` (they never actually dial these
+/// addresses in the sim — the topology is fixed at construction).
+fn sim_addr_for(idx: usize) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 7000_u16.saturating_add(idx as u16)))
+}
+
+/// Per-frame loss configuration installed by [`SimCluster::set_frame_loss`].
+struct LossConfig {
+    /// Probability in `[0.0, 1.0]` that any given delivery is dropped.
+    rate: f64,
+}
+
+/// `Dialer` impl that records calls but never opens a connection.
+///
+/// In the sim, the partial-mesh topology is fixed at construction
+/// (every node receives `PeerConnected` events for its topological
+/// neighbours and only those). The maintenance loop's dial requests
+/// — driven by entries the peer-list gossip eventually populates in
+/// `PeerTable` — would otherwise try to expand the mesh; the no-op
+/// dialer keeps the topology stable and lets us assert the partial
+/// mesh's behaviour deterministically.
+struct SimNoopDialer;
+
+impl Dialer for SimNoopDialer {
+    fn dial(&self, _addr: SocketAddr, _expected: Option<NodeId>) {}
+}
+
+/// `OverlayUnicast` wrapper that drops a fraction of outbound frames
+/// before forwarding to the inner sink. The underlying RNG is seeded
+/// per-instance for deterministic replay.
+///
+/// Used by [`SimCluster::set_frame_loss`] to model the random-loss
+/// liveness scenario from the issue #137 acceptance criteria.
+struct LossySink {
+    inner: Arc<dyn OverlayUnicast>,
+    rng: Mutex<ChaCha20Rng>,
+    rate: f64,
+}
+
+impl LossySink {
+    fn new(inner: Arc<dyn OverlayUnicast>, rate: f64, seed: u64) -> Self {
+        Self {
+            inner,
+            rng: Mutex::new(ChaCha20Rng::seed_from_u64(seed)),
+            rate,
+        }
+    }
+}
+
+impl OverlayUnicast for LossySink {
+    fn send_to(&self, target: NodeId, payload: Bytes) {
+        let drop = {
+            let mut rng = self.rng.lock();
+            rng.random::<f64>() < self.rate
+        };
+        if drop {
+            return;
+        }
+        self.inner.send_to(target, payload);
+    }
+}
+
+impl SimCluster {
+    /// Spawn `n` honest nodes wired together with a per-node
+    /// [`GossipOverlay`] so consensus traffic flows through
+    /// `OverlayFrame::Forward` framing instead of the legacy mesh.
+    /// The topology is a `target_degree`-regular circulant ring (each
+    /// node has exactly `target_degree` direct neighbours); the
+    /// orchestrator's `direct` set is seeded by dispatching
+    /// [`ProtocolEvent::PeerConnected`] to each neighbour at boot,
+    /// matching how the production `PeerCommand::RegisterProtocol`
+    /// path would feed real handshake events.
+    ///
+    /// The maintenance dialer is a no-op
+    /// ([`SimNoopDialer`]), so the topology stays exactly as
+    /// constructed — peer-list gossip still propagates self-entries,
+    /// but no new direct connections are formed in the sim.
+    ///
+    /// `frame_loss_rate` is applied via a [`LossySink`] wrapper around
+    /// each node's [`OverlaySink`]; pass `0.0` to disable loss.
+    /// `loss_seed` seeds the ChaCha RNG that decides per-frame drops.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n < 4`, if `target_degree` is odd, or if
+    /// `target_degree >= n`.
+    pub async fn spawn_gossip(
+        n: usize,
+        timeout_base: Duration,
+        target_degree: usize,
+        frame_loss_rate: f64,
+        loss_seed: u64,
+    ) -> Self {
+        assert!(n >= 4, "BFT requires at least 4 nodes (3f+1 with f=1)");
+        let topology = circulant_neighbors(n, target_degree);
+
+        let signers: Vec<NodeSigner> = (0..n).map(|_| fresh_signer()).collect();
+        let node_ids_unsorted: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
+        let vs = ValidatorSet::new(node_ids_unsorted);
+        let genesis = Block::genesis([0u8; 32]);
+
+        let mut signer_map: HashMap<NodeId, Arc<dyn Signer>> = HashMap::new();
+        for s in signers {
+            signer_map.insert(s.node_id(), Arc::new(s) as Arc<dyn Signer>);
+        }
+
+        let partitioned: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let link_cuts: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
+        let partition_blocks: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
+        let dead_nodes: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
+
+        // Per-node raw event channels — sim's route tasks deliver
+        // `ProtocolEvent`s to the orchestrator's input here.
+        let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
+        let mut event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
+        for &nid in vs.iter() {
+            let (tx, rx) = mpsc::channel(1024);
+            event_txs.insert(nid, tx);
+            event_rxs.push((nid, rx));
+        }
+        let event_txs = Arc::new(event_txs);
+
+        // Resolve sorted-index ordering so we can map NodeId → topology
+        // index. ValidatorSet sorts ascending; circulant_neighbors uses
+        // those indices directly.
+        let node_ids: Vec<NodeId> = vs.iter().copied().collect();
+
+        let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
+        let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
+        // Hold the overlay shutdown senders for the lifetime of the
+        // SimCluster — dropping them eagerly wakes the orchestrator's
+        // `_ = &mut self.shutdown` select arm and tears the run loop
+        // down before the test even starts. We leak them via the
+        // returned cluster so the orchestrators stay alive; on
+        // `SimCluster::drop` they're released and the orchestrators
+        // exit through their normal shutdown path.
+        let mut overlay_shutdowns: Vec<oneshot::Sender<()>> = Vec::with_capacity(n);
+
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+
+        // Phase A: spawn orchestrators only. We delay `ConsensusNode::run`
+        // until the topology has been seeded (otherwise the view-1
+        // leader broadcasts to an empty `direct` set on first boot).
+        struct PendingNode {
+            nid: NodeId,
+            broadcaster: Arc<dyn Broadcaster>,
+            discovery: Arc<dyn Discovery>,
+            consensus_event_rx: mpsc::Receiver<ProtocolEvent>,
+            signer: Arc<dyn Signer>,
+            node: ConsensusNode,
+        }
+        let mut pending: Vec<PendingNode> = Vec::with_capacity(n);
+
+        for (idx, (nid, raw_event_rx)) in event_rxs.into_iter().enumerate() {
+            let signer = signer_map[&nid].clone();
+            let config = NodeConfigForConsensus {
+                validator_set: vs.clone(),
+                genesis: genesis.clone(),
+                propose_limit: 16,
+                timeout_base,
+                timeout_max: Duration::from_secs(30),
+            };
+            let sm: Arc<Mutex<Box<dyn StateMachine>>> =
+                Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+            let mempool = Arc::new(InMemoryMempool::new(256));
+            let storage = Arc::new(MemoryStorage::new());
+            let wal = Arc::new(MemoryWal::new());
+
+            let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
+            commit_rxs.push(commit_rx);
+
+            let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
+                .with_commit_observer(commit_tx);
+
+            // Per-node outbound channel: orchestrator's OverlaySink writes
+            // here; the route task reads on the other side.
+            let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
+
+            // Wrap in `LossySink` if frame-loss is enabled. The inner
+            // `OverlaySink` is what touches the per-node send channel;
+            // the wrapper short-circuits a fraction of frames before
+            // they reach it.
+            let base_sink: Arc<dyn OverlayUnicast> = Arc::new(OverlaySink::new(send_tx));
+            let sink: Arc<dyn OverlayUnicast> = if frame_loss_rate > 0.0 {
+                let per_node_seed = loss_seed.wrapping_mul(31).wrapping_add(idx as u64);
+                Arc::new(LossySink::new(base_sink, frame_loss_rate, per_node_seed))
+            } else {
+                base_sink
+            };
+
+            // Tighter knobs than production defaults so sim convergence
+            // is fast in paused-time runs.
+            let overlay_cfg = GossipOverlayConfig {
+                peer_list: PeerListGossipConfig {
+                    interval: Duration::from_millis(50),
+                    fanout: target_degree,
+                    max_entries: None,
+                },
+                maintenance: MeshMaintenanceConfig {
+                    interval: Duration::from_secs(1),
+                    target_degree,
+                },
+                dedup_capacity: 4096,
+                dedup_ttl: Duration::from_secs(60),
+                peer_table_capacity: 256,
+                cmd_channel_depth: 256,
+                event_channel_depth: 1024,
+                rng_seed: idx as u64,
+            };
+
+            let GossipOverlayHandles {
+                broadcaster,
+                discovery,
+                event_rx: consensus_event_rx,
+                shutdown: overlay_shutdown,
+                ..
+            } = GossipOverlay::spawn(SpawnArgs {
+                self_id: nid,
+                self_listen_addr: Some(sim_addr_for(idx)),
+                event_rx: raw_event_rx,
+                sink,
+                dialer: Arc::new(SimNoopDialer),
+                clock: Arc::clone(&clock),
+                config: overlay_cfg,
+            });
+            // Hold the overlay shutdown sender; dropping it now
+            // would wake `_ = &mut self.shutdown` in the orchestrator
+            // and tear it down before the topology is seeded. Stored
+            // in `overlay_shutdowns`; dropped on `SimCluster::drop`.
+            overlay_shutdowns.push(overlay_shutdown);
+
+            let broadcaster: Arc<dyn Broadcaster> = Arc::new(broadcaster);
+            let discovery: Arc<dyn Discovery> = discovery;
+
+            spawn_route_task(
+                nid,
+                send_rx,
+                Arc::clone(&event_txs),
+                Arc::clone(&partitioned),
+                Arc::clone(&link_cuts),
+                Arc::clone(&partition_blocks),
+                Arc::clone(&dead_nodes),
+            );
+
+            pending.push(PendingNode {
+                nid,
+                broadcaster,
+                discovery,
+                consensus_event_rx,
+                signer,
+                node,
+            });
+        }
+
+        // Phase B: seed the partial-mesh topology by dispatching
+        // `ProtocolEvent::PeerConnected` for each (node, neighbour)
+        // pair listed in `topology`. This populates each
+        // orchestrator's `direct` set; outbound traffic from consensus
+        // (started in phase C below) naturally flows along these
+        // edges.
+        for (i, neighbours) in topology.iter().enumerate() {
+            let nid_i = node_ids[i];
+            let event_tx_i = &event_txs[&nid_i];
+            for &j in neighbours {
+                let nid_j = node_ids[j];
+                if event_tx_i
+                    .try_send(ProtocolEvent::PeerConnected {
+                        node_id: nid_j,
+                        addr: sim_addr_for(j),
+                    })
+                    .is_err()
+                {
+                    panic!("sim_gossip: PeerConnected dispatch failed for {i} → {j}");
+                }
+            }
+        }
+
+        // Yield enough to give every orchestrator's run loop a
+        // chance to pull all PeerConnected events out of its
+        // raw `event_rx` and into the `direct` set. Without this
+        // the view-1 leader spawned in phase C would broadcast to
+        // an empty direct set on its first boot tick.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        // Phase C: spawn consensus.run for each node. The view-1
+        // leader's first broadcast now has a populated direct set.
+        for pn in pending {
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            shutdown_txs.push(Some(shutdown_tx));
+            let PendingNode {
+                broadcaster,
+                discovery,
+                consensus_event_rx,
+                signer,
+                node,
+                ..
+            } = pn;
+            tokio::spawn(async move {
+                let _ = node
+                    .run(
+                        broadcaster,
+                        discovery,
+                        consensus_event_rx,
+                        signer,
+                        shutdown_rx,
+                    )
+                    .await;
+            });
+        }
+
+        let commit_cache: Vec<Vec<Block>> = (0..n).map(|_| Vec::new()).collect();
+
+        SimCluster {
+            commit_rxs,
+            node_ids,
+            partitioned,
+            link_cuts,
+            partition_blocks,
+            dead_nodes,
+            event_txs,
+            commit_cache,
+            shutdown_txs,
+            overlay_shutdowns,
+        }
+    }
 }
 
 /// Produce a fresh [`NodeSigner`] from a newly-generated Ed25519 key pair.
@@ -2115,5 +2495,208 @@ mod tests {
         cluster.heal_partition();
         let committed = cluster.drain_commits();
         assert_no_conflicts(&committed);
+    }
+
+    // ── G-series: gossip-overlay scenarios (issue #137 stack 8) ──────────────
+
+    /// Smallest viable gossip-overlay sim test. 4 nodes, K=2 ring, no
+    /// loss. If this fails the larger 25-node convergence is doomed —
+    /// useful as an isolation step when debugging scale issues.
+    #[tokio::test]
+    async fn gossip_4_node_basic_cluster_commits() {
+        tokio::time::pause();
+        let mut cluster = SimCluster::spawn_gossip(
+            4,
+            Duration::from_millis(50),
+            /* target_degree */ 2,
+            /* loss_rate     */ 0.0,
+            /* loss_seed     */ 0,
+        )
+        .await;
+        let committed = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                c.peek_commit_heights().iter().all(|&h| h > 0)
+            })
+            .await;
+        assert!(
+            committed,
+            "4-node K=2 gossip cluster did not commit: heights = {:?}",
+            cluster.peek_commit_heights()
+        );
+    }
+
+    /// Issue #137 acceptance criterion: a 25-node cluster running the
+    /// partial-mesh gossip overlay with `target_degree = 8` reaches
+    /// steady-state consensus commits. Validates the orchestrator
+    /// scales to validator-set size and that consensus traffic flows
+    /// correctly through `OverlayFrame::Forward` framing + dedup +
+    /// re-fanout.
+    #[tokio::test]
+    async fn gossip_25_node_cluster_commits_at_steady_state() {
+        tokio::time::pause();
+        const N: usize = 25;
+        const K: usize = 8;
+        let mut cluster = SimCluster::spawn_gossip(
+            N,
+            Duration::from_millis(50),
+            K,
+            /* frame_loss_rate */ 0.0,
+            /* loss_seed       */ 0,
+        )
+        .await;
+
+        // Generous budget — first commit must land within 5 s of
+        // virtual time. In practice it lands in well under 1 s; the
+        // wider cap absorbs the extra channel overhead at N=25 vs
+        // the existing 4-node tests.
+        const COMMIT_CAP: Duration = Duration::from_secs(5);
+        let everyone_commits = cluster
+            .advance_and_yield_until(COMMIT_CAP, |c| {
+                c.peek_commit_heights().iter().all(|&h| h > 0)
+            })
+            .await;
+        assert!(
+            everyone_commits,
+            "every node must commit at least one block under gossip overlay; heights: {:?}",
+            cluster.peek_commit_heights()
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
+    /// Issue #137 acceptance criterion: liveness holds under random
+    /// gossip-layer message loss. Drops 20% of overlay sink writes
+    /// (split roughly evenly across `Forward` and `PeerList` frames
+    /// — the wrapper drops indiscriminately) and asserts every node
+    /// still commits within the budget. With consensus's pacemaker
+    /// timeouts a few hundred milliseconds of view duration absorb
+    /// occasional message loss.
+    #[tokio::test]
+    async fn gossip_25_node_cluster_preserves_liveness_under_random_loss() {
+        tokio::time::pause();
+        const N: usize = 25;
+        const K: usize = 8;
+        let mut cluster = SimCluster::spawn_gossip(
+            N,
+            Duration::from_millis(50),
+            K,
+            /* frame_loss_rate */ 0.20,
+            /* loss_seed       */ 17,
+        )
+        .await;
+
+        // Wider cap than the no-loss test: ChaCha-driven 20% drop
+        // forces multi-round vote/proposal retries, so first
+        // cluster-wide commit takes longer in virtual time.
+        const COMMIT_CAP: Duration = Duration::from_secs(15);
+        let everyone_commits = cluster
+            .advance_and_yield_until(COMMIT_CAP, |c| {
+                c.peek_commit_heights().iter().all(|&h| h > 0)
+            })
+            .await;
+        assert!(
+            everyone_commits,
+            "liveness must hold under 20% frame loss; heights: {:?}",
+            cluster.peek_commit_heights()
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
+    /// Issue #137 acceptance criterion: partition-and-heal preserves
+    /// liveness. Splits 25 nodes into [13, 12] (neither half holds a
+    /// `2f+1 = 17` quorum, so neither commits during the partition),
+    /// holds for several views, heals, and asserts both halves catch
+    /// up to fresh post-heal commits.
+    #[tokio::test]
+    async fn gossip_25_node_cluster_partition_and_heal_resumes_commits() {
+        tokio::time::pause();
+        const N: usize = 25;
+        const K: usize = 8;
+        let mut cluster = SimCluster::spawn_gossip(
+            N,
+            Duration::from_millis(50),
+            K,
+            /* frame_loss_rate */ 0.0,
+            /* loss_seed       */ 0,
+        )
+        .await;
+
+        // Phase 1: warm up — all 25 nodes commit at least one block
+        // before we partition.
+        const WARM_CAP: Duration = Duration::from_secs(5);
+        let warmed = cluster
+            .advance_and_yield_until(WARM_CAP, |c| c.peek_commit_heights().iter().all(|&h| h > 0))
+            .await;
+        assert!(
+            warmed,
+            "warm-up phase failed: heights = {:?}",
+            cluster.peek_commit_heights()
+        );
+        let heights_pre = cluster.peek_commit_heights();
+
+        // Phase 2: split [0..13] from [13..25]. Each half is below
+        // the 2f+1 = 17 quorum so neither side can advance.
+        let group_a: Vec<usize> = (0..13).collect();
+        cluster.partition_into_two(&group_a);
+
+        // Hold the partition for a few views — long enough that any
+        // mid-flight quorum opportunities are flushed.
+        cluster.advance_and_yield(Duration::from_millis(500)).await;
+
+        // Phase 3: heal and require every node to advance past its
+        // pre-partition commit height. We don't care which post-heal
+        // height each node lands on; only that it's strictly past
+        // `heights_pre` (proves consensus resumed after the heal).
+        cluster.heal_partition();
+        const HEAL_CAP: Duration = Duration::from_secs(10);
+        let resumed = cluster
+            .advance_and_yield_until(HEAL_CAP, |c| {
+                let h = c.peek_commit_heights();
+                (0..N).all(|i| h[i] > heights_pre[i])
+            })
+            .await;
+        assert!(
+            resumed,
+            "every node must advance after heal; pre = {:?}, post = {:?}",
+            heights_pre,
+            cluster.peek_commit_heights()
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
+    /// `circulant_neighbors` produces a connected K-regular graph for
+    /// the parameters the gossip-overlay sim uses.
+    #[test]
+    fn circulant_neighbors_is_k_regular_and_symmetric() {
+        let n = 25usize;
+        let k = 8usize;
+        let adj = super::circulant_neighbors(n, k);
+        assert_eq!(adj.len(), n);
+        for nbrs in &adj {
+            assert_eq!(nbrs.len(), k, "every vertex must have degree {k}");
+            let mut sorted = nbrs.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                k,
+                "neighbours must be distinct and not contain self"
+            );
+            assert!(!sorted.contains(&n), "neighbour index out of range");
+        }
+        // Symmetry: i ∈ adj[j] iff j ∈ adj[i].
+        for i in 0..n {
+            for &j in &adj[i] {
+                assert!(
+                    adj[j].contains(&i),
+                    "circulant ring must be symmetric: {i} → {j} but not back"
+                );
+            }
+        }
     }
 }
