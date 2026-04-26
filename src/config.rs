@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tracing::warn;
 
+use crate::cli::OutputFormat;
 use crate::p2p::identity::KeyProvider;
 use crate::p2p::identity::encrypted_file::EncryptedFileKeyProvider;
 use crate::p2p::identity::env::EnvKeyProvider;
@@ -32,6 +33,11 @@ pub struct Config {
     /// Defaults apply when the section is omitted.
     #[serde(default)]
     pub p2p: P2pConfig,
+    /// Operator-facing UI knobs — currently just the global default for
+    /// CLI structured-output formatting (issue #149). Per-invocation
+    /// `--format` flags on individual subcommands override this.
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -588,6 +594,23 @@ pub enum OverlayMode {
     /// rollouts when the validator set grows.
     #[default]
     Gossip,
+}
+
+/// Operator-facing UI defaults. Currently a single knob: the default
+/// output format for CLI subcommands that emit structured payloads
+/// (e.g. `config`). Per-invocation `--format` flags override this.
+///
+/// Subcommands with inherently free-form output (`init`'s status
+/// messages, `start`'s logs) ignore this — see [`crate::cli`].
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct UiConfig {
+    /// Default for `--format` on subcommands with structured output.
+    /// `human` (the default) means "let each subcommand pick a sensible
+    /// representation for terminal reading" — for `config`, that's
+    /// TOML; future subcommands may pick differently. `toml` and `json`
+    /// are for piping / scripting (e.g. `... | jq`).
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 fn default_target_degree() -> usize {

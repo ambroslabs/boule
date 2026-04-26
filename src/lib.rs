@@ -81,6 +81,7 @@
 //! and `docs/testnet-local.md` for a walkthrough of the
 //! `ambros-p2p init` → `ambros-p2p start` flow.
 
+pub mod cli;
 pub mod clock;
 pub mod config;
 pub mod consensus;
