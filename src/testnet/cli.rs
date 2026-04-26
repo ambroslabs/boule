@@ -441,8 +441,9 @@ async fn cmd_info(args: &[String]) -> anyhow::Result<()> {
         }
         if let Some(h) = &s.high_qc {
             println!(
-                "  high_qc              view={} height={:?}",
-                h.view, h.height
+                "  high_qc              view={} height={}",
+                h.view,
+                fmt_opt(h.height)
             );
         }
         println!("  peers_connected      {}", s.peers_connected.len());
