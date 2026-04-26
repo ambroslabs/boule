@@ -58,13 +58,20 @@
 //! than whichever neighbour relayed it on the last hop), and
 //! re-broadcast to direct peers other than the relay sender.
 //!
-//! # `SendTo` fallback
+//! # `SendTo` semantics
 //!
-//! [`super::super::traits::Broadcaster::send_to`] for a `target` that
-//! is not a current direct neighbour falls back to a broadcast — the
-//! gossip overlay does not route point-to-point. Documented on
-//! [`super::super::traits::Broadcaster::send_to`] too. See the
-//! breakdown comment on issue #137 for the rationale.
+//! [`super::super::traits::Broadcaster::send_to`] is implemented by
+//! emitting an [`OverlayFrame::Forward`] with `target = Some(peer)` and
+//! fanning that frame out to every direct neighbour — same wire path as
+//! a regular broadcast, just with the recipient pinned. Each receiver
+//! decodes the frame, dedups on `msg_id`, re-fanouts to its own direct
+//! neighbours, and surfaces the payload upstream **only if** the frame
+//! is targeted at it (`target == Some(self_id)`) or is a true broadcast
+//! (`target == None`). This guarantees that point-to-point sends
+//! traverse the same proven-healthy gossip propagation as broadcasts —
+//! the alternative (a real direct unicast to a non-direct peer) wedged
+//! sparse-mesh deployments because the unicast frame never made it to
+//! the consensus dispatch on the receiving side. See issue #182.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,7 +81,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::clock::Clock;
 use crate::p2p::ProtocolEvent;
@@ -378,7 +385,7 @@ impl GossipOverlay {
         // Insert our own broadcast into the dedup ring so a peer
         // looping the frame back to us is silently dropped.
         let _ = self.dedup.insert(msg_id, Instant::now());
-        let bytes = encode_forward(msg_id, self.self_id, payload);
+        let bytes = encode_forward(msg_id, self.self_id, None, payload);
         let targets = DirectPeers::snapshot(&*self.direct);
         let fanout = targets.len();
         for target in targets {
@@ -404,49 +411,45 @@ impl GossipOverlay {
     }
 
     fn do_send_to(&mut self, target: NodeId, payload: Bytes) {
+        // Issue #182: SendTo flows through the same Forward path as a
+        // broadcast, just with `target = Some(peer)` so non-target
+        // receivers re-fanout but don't surface the payload upstream.
+        // The previous direct-unicast optimization (sink.send_to to
+        // exactly the target when it was a direct neighbour) wedged
+        // sparse-mesh deployments because the resulting frame never
+        // surfaced to the consensus dispatch on the receiving side.
+        // Always-broadcasting costs a small bandwidth premium (the
+        // unicast traverses the gossip mesh redundantly) in exchange
+        // for delivery semantics that match the rest of consensus
+        // traffic.
+        let msg_id = self.fresh_msg_id();
+        let _ = self.dedup.insert(msg_id, Instant::now());
+        let bytes = encode_forward(msg_id, self.self_id, Some(target), payload);
         let direct = DirectPeers::snapshot(&*self.direct);
-        if direct.contains(&target) {
-            let msg_id = self.fresh_msg_id();
-            let _ = self.dedup.insert(msg_id, Instant::now());
-            let bytes = encode_forward(msg_id, self.self_id, payload);
-            self.sink.send_to(target, bytes);
-            // Issue #178 follow-up: pair with the consensus-side
-            // `block_sync_request_emitted` event to confirm the unicast
-            // actually reached the orchestrator's outbound sink. A
-            // missing `gossip_send_to_direct_dispatched` for a given
-            // emission means the OverlayCmd never landed on this side
-            // of the cmd channel — back-pressure or shutdown is
-            // swallowing it.
-            debug!(
-                target: "ambros_p2p::p2p::overlay::gossip",
-                target_peer = %crate::p2p::tls::node_id_to_base58(&target),
-                msg_id = ?msg_id,
-                cmd_channel_pending = self.cmd_rx.len(),
-                event_channel_pending = self.event_rx.len(),
-                "gossip_send_to_direct_dispatched",
-            );
-        } else {
-            // Per the breakdown comment on issue #137: the gossip
-            // overlay does not route point-to-point, so a unicast to
-            // a non-direct peer is a best-effort broadcast that may
-            // reach the target through forwarding.
-            //
-            // Issue #178 surfaced this fallback at INFO level: a
-            // `BlockRequest` aimed at the original proposer of an
-            // unknown-parent proposal lands here whenever the proposer
-            // isn't in our direct-peer set, which is the common case
-            // under sparse-mesh + restart. Operators correlate this
-            // with the matching `block_sync_request_emitted` line on
-            // the consensus side to confirm the request actually went
-            // out via a broadcast hop.
-            info!(
-                target: "ambros_p2p::p2p::overlay::gossip",
-                target_peer = %crate::p2p::tls::node_id_to_base58(&target),
-                direct_peer_count = direct.len(),
-                "send_to_broadcast_fallback",
-            );
-            self.do_broadcast(payload);
+        let fanout = direct.len();
+        let target_is_direct = direct.contains(&target);
+        for peer in direct {
+            self.sink.send_to(peer, bytes.clone());
         }
+        // Issue #178/#182 follow-up: pair with the consensus-side
+        // `block_sync_request_emitted` event to confirm the unicast
+        // actually reached the orchestrator's outbound sink. A missing
+        // `gossip_send_to_dispatched` for a given emission means the
+        // OverlayCmd never landed on this side of the cmd channel —
+        // back-pressure or shutdown is swallowing it. `target_is_direct`
+        // distinguishes the fast (single-hop) path from the
+        // multi-hop-via-mesh path so operators can see how often a
+        // unicast had to traverse the mesh to reach its target.
+        debug!(
+            target: "ambros_p2p::p2p::overlay::gossip",
+            target_peer = %crate::p2p::tls::node_id_to_base58(&target),
+            msg_id = ?msg_id,
+            fanout,
+            target_is_direct,
+            cmd_channel_pending = self.cmd_rx.len(),
+            event_channel_pending = self.event_rx.len(),
+            "gossip_send_to_dispatched",
+        );
     }
 
     async fn handle_event(&mut self, event: ProtocolEvent) {
@@ -488,6 +491,7 @@ impl GossipOverlay {
             Err(FrameOutcome::Forward {
                 msg_id,
                 originator,
+                target,
                 payload,
             }) => match self.dedup.insert(msg_id, Instant::now()) {
                 InsertOutcome::AlreadySeen => {
@@ -511,39 +515,54 @@ impl GossipOverlay {
                 InsertOutcome::New => {
                     // Surface to consensus with `from = originator` so
                     // the consumer sees the broadcast originator
-                    // regardless of how many hops the frame took.
+                    // regardless of how many hops the frame took. For
+                    // a unicast Forward (target = Some(peer)) we only
+                    // surface upstream when this node is the target —
+                    // non-target receivers still re-fanout below so
+                    // the frame can reach the target through the
+                    // mesh, but they don't deliver to consensus. See
+                    // issue #182.
                     //
                     // Issue #178 follow-up: this is the receive-side
-                    // counterpart to `gossip_send_to_direct_dispatched` /
+                    // counterpart to `gossip_send_to_dispatched` /
                     // `gossip_broadcast_dispatched`. A direct peer's
                     // emit count vs. our `gossip_inbound_dispatched`
                     // count exposes raw drop-on-the-wire (TLS reset,
                     // queue overflow on the read side, etc.) before
                     // any consensus-layer logic runs.
+                    let surfaced = target.is_none() || target == Some(self.self_id);
                     debug!(
                         target: "ambros_p2p::p2p::overlay::gossip",
                         from = %crate::p2p::tls::node_id_to_base58(&from),
                         originator = %crate::p2p::tls::node_id_to_base58(&originator),
                         msg_id = ?msg_id,
                         payload_bytes = payload.len(),
+                        is_unicast = target.is_some(),
+                        surfaced,
                         "gossip_inbound_dispatched",
                     );
-                    let _ = self
-                        .upstream_event_tx
-                        .send(ProtocolEvent::Message {
-                            from: originator,
-                            payload: payload.clone(),
-                        })
-                        .await;
+                    if surfaced {
+                        let _ = self
+                            .upstream_event_tx
+                            .send(ProtocolEvent::Message {
+                                from: originator,
+                                payload: payload.clone(),
+                            })
+                            .await;
+                    }
 
                     // Re-fanout to direct peers other than the relay
-                    // sender.
-                    let bytes = encode_forward(msg_id, originator, payload);
-                    for target in DirectPeers::snapshot(&*self.direct) {
-                        if target == from {
+                    // sender. Always re-fanout — even when this node
+                    // is the unicast target — so the gossip mesh has
+                    // multiple paths to deliver the frame in case
+                    // some links lose it. Dedup at downstream peers
+                    // handles the redundancy.
+                    let bytes = encode_forward(msg_id, originator, target, payload);
+                    for peer in DirectPeers::snapshot(&*self.direct) {
+                        if peer == from {
                             continue;
                         }
-                        self.sink.send_to(target, bytes.clone());
+                        self.sink.send_to(peer, bytes.clone());
                     }
                 }
             },
@@ -569,10 +588,16 @@ impl GossipOverlay {
     }
 }
 
-fn encode_forward(msg_id: MsgId, originator: NodeId, payload: Bytes) -> Bytes {
+fn encode_forward(
+    msg_id: MsgId,
+    originator: NodeId,
+    target: Option<NodeId>,
+    payload: Bytes,
+) -> Bytes {
     let frame = OverlayFrame::Forward {
         msg_id,
         originator,
+        target,
         payload,
     };
     Bytes::from(postcard::to_stdvec(&frame).expect("postcard encode of Forward cannot fail"))
@@ -695,9 +720,19 @@ mod tests {
     }
 
     fn make_forward_bytes(msg_id: MsgId, originator: NodeId, payload: &'static [u8]) -> Bytes {
+        make_forward_bytes_with_target(msg_id, originator, None, payload)
+    }
+
+    fn make_forward_bytes_with_target(
+        msg_id: MsgId,
+        originator: NodeId,
+        target: Option<NodeId>,
+        payload: &'static [u8],
+    ) -> Bytes {
         let frame = OverlayFrame::Forward {
             msg_id,
             originator,
+            target,
             payload: Bytes::from_static(payload),
         };
         Bytes::from(postcard::to_stdvec(&frame).expect("encode"))
@@ -830,20 +865,188 @@ mod tests {
         );
 
         // Every re-fanouted frame preserves originator = nid(99) and
-        // re-uses the same msg_id.
+        // re-uses the same msg_id; broadcast carries `target = None`.
         for (_, payload) in &sent {
             match postcard::from_bytes::<OverlayFrame>(payload).unwrap() {
                 OverlayFrame::Forward {
                     msg_id: m,
                     originator,
+                    target,
                     ..
                 } => {
                     assert_eq!(m, msg_id);
                     assert_eq!(originator, nid(99));
+                    assert_eq!(target, None);
                 }
                 other => panic!("expected Forward, got {other:?}"),
             }
         }
+    }
+
+    // Issue #182 (a): a unicast `OverlayCmd::SendTo` reaches a direct
+    // peer as a `Forward` with `target = Some(peer)` AND fans out to
+    // every direct peer (so the unicast can traverse the gossip mesh
+    // even when `target` is not direct on this hop).
+    #[tokio::test]
+    async fn send_to_emits_forward_with_target_to_every_direct_peer() {
+        let mut s = setup(nid(1));
+
+        for i in 2..=4u8 {
+            s.event_tx
+                .send(ProtocolEvent::PeerConnected {
+                    node_id: nid(i),
+                    addr: addr(7000 + i as u16),
+                })
+                .await
+                .unwrap();
+        }
+        drain_runtime().await;
+        s.sink.clear();
+
+        s.handles
+            .broadcaster
+            .send_to(nid(3), Bytes::from_static(b"unicast-payload"))
+            .await;
+        drain_runtime().await;
+
+        let sent = s.sink.snapshot();
+        // Fan-out reaches every direct peer (3 of them: nid(2), nid(3), nid(4)).
+        let mut targets: Vec<NodeId> = sent.iter().map(|(t, _)| *t).collect();
+        targets.sort();
+        assert_eq!(
+            targets,
+            vec![nid(2), nid(3), nid(4)],
+            "send_to fans out to every direct peer so the mesh can reach the target"
+        );
+
+        // Every emitted frame is a Forward with target = Some(nid(3)).
+        for (_, bytes) in &sent {
+            match postcard::from_bytes::<OverlayFrame>(bytes).unwrap() {
+                OverlayFrame::Forward {
+                    originator,
+                    target,
+                    payload,
+                    ..
+                } => {
+                    assert_eq!(originator, nid(1));
+                    assert_eq!(target, Some(nid(3)));
+                    assert_eq!(&payload[..], b"unicast-payload");
+                }
+                other => panic!("expected Forward, got {other:?}"),
+            }
+        }
+        // SendTo is purely outbound — nothing surfaces upstream on the
+        // sender side.
+        assert!(s.handles.event_rx.try_recv().is_err());
+
+        // Drop the cluster so its background tasks exit before the
+        // tokio runtime is torn down.
+        let _ = s.handles.shutdown.send(());
+    }
+
+    // Issue #182 (b): when a Forward arrives and `target == self_id`,
+    // the receiver surfaces it upstream to consensus (this is the bug
+    // the original implementation missed for direct unicasts).
+    #[tokio::test]
+    async fn unicast_forward_targeted_at_us_surfaces_upstream() {
+        let mut s = setup(nid(1));
+
+        // Connect a relay so events flow.
+        s.event_tx
+            .send(ProtocolEvent::PeerConnected {
+                node_id: nid(2),
+                addr: addr(7002),
+            })
+            .await
+            .unwrap();
+
+        let msg_id: MsgId = [13; 16];
+        s.event_tx
+            .send(ProtocolEvent::Message {
+                from: nid(2),
+                payload: make_forward_bytes_with_target(msg_id, nid(99), Some(nid(1)), b"for-us"),
+            })
+            .await
+            .unwrap();
+
+        match await_upstream_message(&mut s.handles.event_rx).await {
+            ProtocolEvent::Message { from, payload } => {
+                assert_eq!(from, nid(99));
+                assert_eq!(&payload[..], b"for-us");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+
+        let _ = s.handles.shutdown.send(());
+    }
+
+    // Issue #182 (c): when a Forward arrives and `target` is a different
+    // peer, the receiver does **not** surface upstream — but it still
+    // re-fanouts the frame so the target can reach it through the mesh.
+    #[tokio::test]
+    async fn unicast_forward_targeted_elsewhere_does_not_surface_but_refanouts() {
+        let mut s = setup(nid(1));
+
+        // Connect a relay (nid(2)) and another direct peer (nid(3))
+        // so we have somewhere to refanout to.
+        for &peer in &[nid(2), nid(3)] {
+            s.event_tx
+                .send(ProtocolEvent::PeerConnected {
+                    node_id: peer,
+                    addr: addr(7000 + peer[0] as u16),
+                })
+                .await
+                .unwrap();
+        }
+        drain_runtime().await;
+        s.sink.clear();
+
+        // A Forward arrives targeted at nid(99) — not us. We should
+        // refanout to nid(3) (the other direct peer, excluding the
+        // relay) but not surface upstream.
+        let msg_id: MsgId = [21; 16];
+        s.event_tx
+            .send(ProtocolEvent::Message {
+                from: nid(2),
+                payload: make_forward_bytes_with_target(
+                    msg_id,
+                    nid(7),
+                    Some(nid(99)),
+                    b"not-for-us",
+                ),
+            })
+            .await
+            .unwrap();
+        drain_runtime().await;
+
+        // Nothing surfaces upstream.
+        assert!(
+            s.handles.event_rx.try_recv().is_err(),
+            "frame targeted at someone else must not surface upstream"
+        );
+
+        // But it IS refanouted to nid(3) (the other direct peer,
+        // excluding the relay sender nid(2)) so the mesh can deliver
+        // to the target.
+        let sent = s.sink.snapshot();
+        assert_eq!(
+            sent.len(),
+            1,
+            "non-target receiver should refanout to direct peers other than the relay"
+        );
+        let (refan_to, refan_bytes) = &sent[0];
+        assert_eq!(*refan_to, nid(3));
+        match postcard::from_bytes::<OverlayFrame>(refan_bytes).unwrap() {
+            OverlayFrame::Forward {
+                originator, target, ..
+            } => {
+                assert_eq!(originator, nid(7), "originator preserved across refanout");
+                assert_eq!(target, Some(nid(99)), "target preserved across refanout");
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
+
+        let _ = s.handles.shutdown.send(());
     }
 
     // (d) PeerList frames update the peer table.
@@ -1004,14 +1207,21 @@ mod tests {
         let sent = sink.snapshot();
         assert_eq!(sent.len(), 1, "broadcast fanned out to one direct peer");
         let (_target, bytes) = sent.into_iter().next().unwrap();
-        let (looped_msg_id, looped_originator) =
+        let (looped_msg_id, looped_originator, looped_target) =
             match postcard::from_bytes::<OverlayFrame>(&bytes).unwrap() {
                 OverlayFrame::Forward {
-                    msg_id, originator, ..
-                } => (msg_id, originator),
+                    msg_id,
+                    originator,
+                    target,
+                    ..
+                } => (msg_id, originator, target),
                 other => panic!("expected Forward, got {other:?}"),
             };
         assert_eq!(looped_originator, nid(1));
+        assert_eq!(
+            looped_target, None,
+            "broadcast Forwards carry target = None"
+        );
 
         // Now feign that the same Forward bounced back from the relay.
         event_tx
