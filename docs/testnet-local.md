@@ -782,8 +782,8 @@ A healthy run produces output like:
 > in the `t=23s` snapshot is still well below the survivors', it's
 > still mid-catch-up: bump the `sleep 15` after the relaunch and
 > rerun. Block-sync currently walks back one parent per pacemaker
-> tick (see issue tracker for the planned bulk-range RPC), so the
-> wait scales with how many blocks were missed.
+> tick (issue #185 tracks the planned bulk-range RPC + dedicated
+> retry timer), so the wait scales with how many blocks were missed.
 
 Three properties to verify:
 
