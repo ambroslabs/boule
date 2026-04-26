@@ -207,6 +207,31 @@ new key. For read-only key backends (`env`, `exec`, `keyring`), `init`
 does not generate a key — it prints an "externally managed" notice and
 asks you to provision the key out-of-band before re-running.
 
+### Inspect the resolved config
+
+`ambros-p2p config` prints the **fully-resolved** view: the file
+contents *plus* every default the node would fill in if started right
+now. It's the answer to questions like "what timeout is this node
+actually using?" without remembering the schema:
+
+```sh
+./target/release/ambros-p2p config --config testnet/node1/config.toml | grep timeout
+# timeout_base_ms = 200
+# timeout_max_ms = 10000
+```
+
+For programmatic access, `--format json` pipes cleanly into `jq`:
+
+```sh
+./target/release/ambros-p2p config --config testnet/node1/config.toml --format json \
+    | jq '.consensus.timeout_base_ms'
+```
+
+Other modes: `--raw` prints the file as-written (skipping default
+expansion), `--path` prints the resolved config path and exits, and
+`--edit` opens the file in `$EDITOR` / `$VISUAL` and validates the
+result on save.
+
 ---
 
 ## 5. Wire the peers together
@@ -851,6 +876,16 @@ cargo build --release
 
 # Start a node
 RUST_LOG=info ./target/release/ambros-p2p start --config testnet/nodeN/config.toml
+
+# Print the fully-resolved config (file + defaults). `--format json |
+# jq` is the field-selection escape hatch; `--raw` prints the file
+# unchanged; `--path` prints just the resolved file path; `--edit`
+# opens $EDITOR / $VISUAL and validates on save.
+./target/release/ambros-p2p config --config testnet/nodeN/config.toml
+./target/release/ambros-p2p config --config testnet/nodeN/config.toml --format json \
+    | jq '.consensus.timeout_base_ms'
+./target/release/ambros-p2p config --config testnet/nodeN/config.toml --path
+./target/release/ambros-p2p config --config testnet/nodeN/config.toml --edit
 
 # Print help (shows all subcommands including `key migrate`)
 ./target/release/ambros-p2p --help
