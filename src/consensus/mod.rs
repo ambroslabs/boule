@@ -43,6 +43,9 @@ pub mod view_timer;
 #[cfg(test)]
 pub mod sim;
 
+#[cfg(test)]
+mod wire_fuzz;
+
 /// HotStuff view number.
 pub type View = u64;
 
