@@ -49,6 +49,21 @@ pub const fn quorum_size(n: usize) -> usize {
     (2 * n) / 3 + 1
 }
 
+/// Honesty threshold: any set of `n/3 + 1` distinct signers
+/// includes at least one honest signer (under the standard `n = 3f + 1`
+/// BFT assumption: at most `f = n/3` faulty replicas, so `f + 1` is the
+/// smallest set guaranteed to contain an honest member).
+///
+/// Used by the round-sync hint (`OnRoundSync`) so a single Byzantine
+/// `TimeoutVote` cannot drag honest replicas' `current_view` forward —
+/// see issue #218.
+///
+/// `honesty_threshold(0)` returns `1` (mirrors [`quorum_size`]'s
+/// degenerate-default behaviour).
+pub const fn honesty_threshold(n: usize) -> usize {
+    n / 3 + 1
+}
+
 /// Compact signer set, indexed over a [`ValidatorSet`]'s sorted order.
 ///
 /// Internally: little-endian-packed bits in a `Vec<u8>`, with the bit
