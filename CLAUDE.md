@@ -26,6 +26,13 @@ check.
 - Do **not** merge. Wait for human review and let the human merge.
 - If CI fails, fix it on the same branch and push again.
 
+## Issue labels
+
+Every new issue must have exactly one `priority: <low|medium|high>` and one
+`size: <small|medium|large>` label. Propose both when filing and confirm with
+the user if the call isn't obvious. Do **not** add other labels (`enhancement`,
+`bug`, topical labels like `research`, etc.) unless the user explicitly asks.
+
 ## Test performance
 
 No single test may exceed **15 seconds** of wall-clock on a default
