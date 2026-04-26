@@ -4,6 +4,15 @@
 //! the sender, redirect the receiver, drop the event, or split it into
 //! duplicates. These tests cover the headline cases plus the determinism
 //! guarantee that the mutator path remains byte-identical across runs.
+//!
+//! # See also
+//!
+//! Protocol-level Byzantine adversaries (equivocation, vote
+//! withholding, stale replays, forged QCs, timeout-vote spam) live in
+//! [`crate::consensus::sim_byzantine`]. That module sits at the
+//! `HotStuffCore` action boundary rather than the network byte
+//! boundary; together the two cover the full BFT-input surface called
+//! out in #132.
 
 use std::sync::Arc;
 use std::time::Duration;
