@@ -102,7 +102,11 @@ fn print_usage() {
     println!("  scenario [--workdir DIR] [--ambros-bin PATH] [--seed S] (");
     println!("    rotating-failure --f F");
     println!("    | rotating-failure-7n-f2");
-    println!("    | disconnect-random --count N --restart-after Ns");
+    println!("    | disconnect-random --count N --liveness-window Ns");
+    println!("        ('--restart-after Ns' is accepted as a deprecated alias for");
+    println!("         '--liveness-window'; the killed nodes stay killed — the flag");
+    println!("         only sizes the post-kill liveness window. Use `scenario reconnect`");
+    println!("         to bring nodes back.)");
     println!("    | reconnect <node>");
     println!("    | --file PATH");
     println!("  )");
@@ -728,7 +732,7 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
     let mut kind: Option<String> = None;
     let mut f_count: Option<usize> = None;
     let mut count: Option<usize> = None;
-    let mut restart_after_secs: u64 = 5;
+    let mut liveness_window_secs: u64 = 5;
     let mut node: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
@@ -737,9 +741,25 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
             "--file" => file = Some(PathBuf::from(pop_value(&rest, &mut i, "--file")?)),
             "--f" => f_count = Some(pop_value(&rest, &mut i, "--f")?.parse()?),
             "--count" => count = Some(pop_value(&rest, &mut i, "--count")?.parse()?),
+            "--liveness-window" => {
+                let v = pop_value(&rest, &mut i, "--liveness-window")?;
+                liveness_window_secs = parse_secs(v)?;
+            }
+            // Deprecated alias for --liveness-window. The original
+            // name implied the killed nodes would come back up after
+            // N seconds, which the scenario engine never actually
+            // did — the flag has only ever sized the post-kill
+            // commit-progress window. Kept working so existing
+            // walkthroughs don't break, with a one-line stderr
+            // notice steering operators to the new name.
             "--restart-after" => {
                 let v = pop_value(&rest, &mut i, "--restart-after")?;
-                restart_after_secs = parse_secs(v)?;
+                liveness_window_secs = parse_secs(v)?;
+                eprintln!(
+                    "warning: --restart-after is deprecated and does NOT trigger a node restart; \
+                     use --liveness-window <Ns> instead. (Use `scenario reconnect <node>` to \
+                     bring killed nodes back.)"
+                );
             }
             other if !other.starts_with("--") => {
                 if kind.is_none() {
@@ -772,7 +792,7 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
             "disconnect-random" => {
                 let count = count
                     .ok_or_else(|| anyhow::anyhow!("disconnect-random requires --count <N>"))?;
-                scenario::disconnect_random(count, restart_after_secs, seed)
+                scenario::disconnect_random(count, liveness_window_secs, seed)
             }
             "reconnect" => {
                 let node =

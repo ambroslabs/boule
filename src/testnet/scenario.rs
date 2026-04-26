@@ -292,9 +292,10 @@ pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
     }
 }
 
-/// Built-in: `disconnect-random --count N --restart-after Ns`.
+/// Built-in: `disconnect-random --count N --liveness-window Ns`.
 /// Kills `count` random live nodes, then asserts the survivors keep
-/// committing, and finally verifies safety.
+/// committing for the duration of the liveness window, and finally
+/// verifies safety.
 ///
 /// The pre-kill `WaitAllHealthy` is load-bearing: with the default
 /// 7-node ring (`bootstrap_peers = [i-1, i+1]` mod n), some seeds
@@ -306,19 +307,21 @@ pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
 /// `n - 1` consensus peers, which guarantees each survivor still has
 /// quorum-many connections after any `count`-sized kill subset.
 ///
-/// `restart_after_secs` was originally meant to gate "restart the
-/// dead nodes after N seconds", but the scenario format has no way
-/// to propagate the seed-chosen kill targets to a subsequent `up`
-/// step, so the param now just sizes the post-kill liveness window.
-/// Run a follow-up `testnet scenario reconnect-with-catchup <node>`
-/// (or a TOML file referencing each restart target by name) to
-/// exercise the bring-back path.
-pub fn disconnect_random(count: usize, restart_after_secs: u64, seed: u64) -> Scenario {
+/// The CLI flag was historically called `--restart-after`, which
+/// implied the dead nodes would come back up after N seconds. The
+/// scenario format has no way to propagate the seed-chosen kill
+/// targets to a subsequent `up` step, so the value has only ever
+/// sized the post-kill liveness window. The flag is now spelled
+/// `--liveness-window` (with `--restart-after` accepted as a
+/// deprecated alias). Run a follow-up `testnet scenario reconnect
+/// <node>` (or a TOML file referencing each restart target by name)
+/// to exercise the bring-back path.
+pub fn disconnect_random(count: usize, liveness_window_secs: u64, seed: u64) -> Scenario {
     // Survivors must commit at least this many *additional* blocks
-    // after the kill. Sized off `restart_after_secs` so longer-running
-    // scenarios get a proportionally bigger liveness window.
-    let post_kill_delta = (restart_after_secs * 2).max(10);
-    let timeout = restart_after_secs * 2 + 30;
+    // after the kill. Sized off the liveness window so longer-running
+    // scenarios get a proportionally bigger commit-progress budget.
+    let post_kill_delta = (liveness_window_secs * 2).max(10);
+    let timeout = liveness_window_secs * 2 + 30;
     Scenario {
         scenario: ScenarioMeta {
             seed: Some(seed),
@@ -439,6 +442,58 @@ op = "verify_safety"
             s.steps[2]
         );
         assert!(matches!(s.steps.last(), Some(Step::VerifySafety)));
+    }
+
+    /// The TOML example in `docs/testnet-local.md` (under "Composing
+    /// custom scenarios") must parse, and its first step must be
+    /// `wait_all_healthy` — that gate is what keeps the docs example
+    /// from deterministically wedging on the ring-bootstrap topology
+    /// for unlucky seeds (issue #216, item 3).
+    #[test]
+    fn docs_custom_scenario_example_parses_and_gates_kill_random() {
+        let toml_text = r#"
+[scenario]
+seed = 42
+
+[[steps]]
+op = "wait_all_healthy"
+within = 5
+
+[[steps]]
+op = "wait_all_reach_height"
+height = 30
+
+[[steps]]
+op = "kill_random"
+count = 2
+
+[[steps]]
+op = "wait_all_reach_height"
+height = 50
+
+[[steps]]
+op = "verify_safety"
+"#;
+        let s: Scenario = toml::from_str(toml_text).unwrap();
+        assert!(
+            matches!(s.steps[0], Step::WaitAllHealthy { .. }),
+            "docs example must lead with wait_all_healthy, got {:?}",
+            s.steps[0]
+        );
+        let kill_idx = s
+            .steps
+            .iter()
+            .position(|st| matches!(st, Step::KillRandom { .. }))
+            .expect("docs example must include kill_random");
+        let healthy_idx = s
+            .steps
+            .iter()
+            .position(|st| matches!(st, Step::WaitAllHealthy { .. }))
+            .expect("docs example must include wait_all_healthy");
+        assert!(
+            healthy_idx < kill_idx,
+            "wait_all_healthy must precede kill_random in the docs example"
+        );
     }
 
     #[test]
