@@ -49,14 +49,15 @@ use crate::consensus::hotstuff::step::{
     Action as SafetyAction, BlockBuilder, Event as SafetyEvent, HotStuffCore, StateUpdate,
 };
 use crate::consensus::hotstuff::{HotStuffState, NewView, QuorumCertificate, genesis_qc};
+use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
 use crate::consensus::pacemaker::Action as PacemakerAction;
 use crate::consensus::pacemaker::Event as PacemakerEvent;
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::pacemaker::leader::RoundRobinSelector;
 use crate::consensus::pacemaker::timeout::ExponentialBackoff;
 use crate::consensus::status::{
-    BUCKET_VIEW_WINDOW, ConsensusStatus, LockedStatus, ParkedProposalStatus, QcStatus,
-    TimeoutBucketStatus, VoteBucketStatus,
+    BUCKET_VIEW_WINDOW, CacheEvictionStatus, ConsensusStatus, LockedStatus, ParkedProposalStatus,
+    QcStatus, TimeoutBucketStatus, VoteBucketStatus,
 };
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::view_timer::ViewTimer;
@@ -226,6 +227,12 @@ pub struct NodeConfigForConsensus {
     pub timeout_base: Duration,
     /// View-timer ceiling: backoff saturates here.
     pub timeout_max: Duration,
+    /// Per-cache caps for the safety-core's `vote_bucket`,
+    /// `parked_proposals`, `pending_blocks` and the integration
+    /// layer's `timeout_buckets`. See
+    /// [`crate::consensus::limits::CacheLimits`] for the policy
+    /// documentation.
+    pub limits: CacheLimits,
 }
 
 impl NodeConfigForConsensus {
@@ -237,6 +244,13 @@ impl NodeConfigForConsensus {
             propose_limit: 64,
             timeout_base: Duration::from_millis(200),
             timeout_max: Duration::from_secs(10),
+            // Tests should not see eviction unless they explicitly
+            // construct a tight-cap config; honest-only proptests in
+            // particular fail loudly under spurious eviction. The
+            // production wiring in `src/node.rs` substitutes
+            // `CacheLimits::production_defaults` (or the operator's
+            // override).
+            limits: CacheLimits::unbounded_for_tests(),
         }
     }
 }
@@ -351,6 +365,15 @@ pub struct ConsensusNode {
     /// dropped once its TC fires `OnTimeoutCert` into the pacemaker
     /// so late-arriving timeout votes for past views are cheap no-ops.
     timeout_buckets: HashMap<View, TimeoutBucket>,
+    /// Cap on `timeout_buckets`. When at cap, the lowest-`view`
+    /// bucket is dropped so a flood of timeout votes for far-future
+    /// views can never grow the map without bound. See
+    /// [`CacheLimits::timeout_buckets_capacity`].
+    timeout_buckets_capacity: usize,
+    /// Shared eviction-counter handle. The same `Arc` is bound into
+    /// the [`HotStuffCore`] at construction so all four caches feed
+    /// into one consistent set of cumulative counts.
+    eviction_counters: CacheEvictionCounters,
     /// Optional channel to notify an observer (e.g. a test harness) of
     /// each committed block. `None` in production builds.
     commit_tx: Option<tokio::sync::mpsc::UnboundedSender<Block>>,
@@ -429,7 +452,14 @@ impl ConsensusNode {
         // vote round. Every honest replica derives the same QC from the
         // shared `(genesis, validator_set_len)` config.
         hs_state.high_qc = Some(boot_qc);
-        let core = HotStuffCore::new(self_id, hs_state, builder as Arc<dyn BlockBuilder>);
+        let eviction_counters = CacheEvictionCounters::default();
+        let core = HotStuffCore::with_limits(
+            self_id,
+            hs_state,
+            builder as Arc<dyn BlockBuilder>,
+            config.limits,
+            eviction_counters.clone(),
+        );
 
         Self {
             self_id,
@@ -442,6 +472,8 @@ impl ConsensusNode {
             validator_set: config.validator_set,
             timeout_policy,
             timeout_buckets: HashMap::new(),
+            timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
+            eviction_counters,
             commit_tx: None,
             peers_connected: HashSet::new(),
             last_committed_height: 0,
@@ -591,6 +623,12 @@ impl ConsensusNode {
             peers_connected,
             validator_set,
             mempool_size: self.mempool.len(),
+            cache_evictions: CacheEvictionStatus {
+                vote_buckets: self.eviction_counters.vote_bucket(),
+                parked_proposals: self.eviction_counters.parked_proposals(),
+                pending_blocks: self.eviction_counters.pending_blocks(),
+                timeout_buckets: self.eviction_counters.timeout_buckets(),
+            },
         }
     }
 
@@ -661,7 +699,14 @@ impl ConsensusNode {
             Arc::clone(&state_machine),
             config.propose_limit,
         ));
-        let core = HotStuffCore::new(self_id, hs_state, builder as Arc<dyn BlockBuilder>);
+        let eviction_counters = CacheEvictionCounters::default();
+        let core = HotStuffCore::with_limits(
+            self_id,
+            hs_state,
+            builder as Arc<dyn BlockBuilder>,
+            config.limits,
+            eviction_counters.clone(),
+        );
 
         Ok(Self {
             self_id,
@@ -674,6 +719,8 @@ impl ConsensusNode {
             validator_set: config.validator_set,
             timeout_policy,
             timeout_buckets: HashMap::new(),
+            timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
+            eviction_counters,
             commit_tx: None,
             peers_connected: HashSet::new(),
             last_committed_height: last_committed.height,
@@ -1393,6 +1440,15 @@ impl ConsensusNode {
         let quorum = quorum_size(self.validator_set.len());
         let signer_id = signed.signer;
         let is_local = signer_id == self.self_id;
+        // Cap-based eviction. A genuinely new view triggers the
+        // check; an entry update (same view, different signer) does
+        // not grow the map, so we skip the check on the existing-key
+        // path. Without this guard a Byzantine peer could fan out
+        // timeout votes across distinct future views (each with no
+        // hope of forming a TC) and pin memory until restart.
+        if !self.timeout_buckets.contains_key(&view) {
+            self.evict_timeout_buckets_to_fit_one();
+        }
         let adopt_qc = {
             let bucket = self.timeout_buckets.entry(view).or_default();
             let is_new = bucket.signers.insert(signed.signer);
@@ -1465,6 +1521,41 @@ impl ConsensusNode {
         // `ResetTimer` / `SendTimeout`, and the pacemaker's reaction to
         // `OnTimeoutCert` never re-emits `OnTimeoutCert` itself.
         Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
+    }
+
+    /// Borrow the eviction counters this node aggregates across the
+    /// safety-core and timeout-vote caches. Exposed for tests and
+    /// for [`build_status`](Self::build_status) to project into the
+    /// JSON snapshot.
+    pub fn eviction_counters(&self) -> &CacheEvictionCounters {
+        &self.eviction_counters
+    }
+
+    /// Drop the lowest-`view` `timeout_buckets` entry if the map is
+    /// at cap. The on-TC-formation prune
+    /// (`timeout_buckets.retain(|&v, _| v > view)`) handles the
+    /// happy-path cleanup; this helper handles the flood path where
+    /// no TC ever fires because the attacker addresses each fake
+    /// timeout vote at a distinct future view.
+    fn evict_timeout_buckets_to_fit_one(&mut self) {
+        if self.timeout_buckets.len() < self.timeout_buckets_capacity {
+            return;
+        }
+        let Some(victim_view) = self.timeout_buckets.keys().min().copied() else {
+            return;
+        };
+        if self.timeout_buckets.remove(&victim_view).is_some() {
+            self.eviction_counters.inc_timeout_buckets(1);
+            tracing::info!(
+                target: TRACE_TARGET,
+                cache = "timeout_buckets",
+                policy = "cap",
+                evicted_view = victim_view,
+                cap = self.timeout_buckets_capacity,
+                size_after = self.timeout_buckets.len(),
+                "consensus_cache_evicted",
+            );
+        }
     }
 
     /// Commit `block` to the state machine and drain the committed commands
@@ -2890,6 +2981,105 @@ mod tests {
             other => panic!("expected SendTo to peer, got {other:?}"),
         }
         assert!(send_rx.try_recv().is_err());
+    }
+
+    // ── Bounded-cache eviction (#135) ─────────────────────────────────────
+    //
+    // The safety-core caches are tested in `consensus::hotstuff::step`;
+    // the integration layer owns `timeout_buckets`, so the cap-driven
+    // eviction lives here. We exercise the cap by feeding distinct
+    // future-view timeout votes from one signer (well below quorum, so
+    // no TC ever fires and the on-TC `retain(v > view)` cleanup never
+    // kicks in — the cap is the ONLY thing keeping the map bounded).
+
+    /// Build a node whose timeout_buckets cap is `cap`; otherwise
+    /// identical to [`make_node_with_signer`]. Other caches stay at
+    /// their permissive test defaults so unrelated cap evictions
+    /// don't pollute the assertion.
+    fn make_node_with_timeout_cap(
+        signer: &NodeSigner,
+        self_idx: usize,
+        cap: usize,
+    ) -> (ConsensusNode, ValidatorSet) {
+        assert!(self_idx < 4);
+        let self_id = signer.node_id();
+        let placeholders = [nid(0xA1), nid(0xA2), nid(0xA3)];
+        let mut ids: Vec<NodeId> = Vec::with_capacity(4);
+        let mut ph = placeholders.iter();
+        for i in 0..4 {
+            if i == self_idx {
+                ids.push(self_id);
+            } else {
+                ids.push(*ph.next().unwrap());
+            }
+        }
+        let vs = ValidatorSet::new(ids);
+        let mut limits = CacheLimits::unbounded_for_tests();
+        limits.timeout_buckets_capacity = cap;
+        let mut cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        cfg.limits = limits;
+        let node = ConsensusNode::new(
+            self_id,
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+        (node, vs)
+    }
+
+    /// Insert 2× the cap of distinct-view sub-quorum timeout votes
+    /// from a single signer — the cap holds, the counter records
+    /// every drop, and the lowest-view buckets are the ones evicted.
+    #[tokio::test]
+    async fn timeout_buckets_inserting_twice_the_cap_evicts_to_cap() {
+        let cap = 4usize;
+        let ns = fresh_signer();
+        let (mut node, vs) = make_node_with_timeout_cap(&ns, 0, cap);
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+
+        let (broadcaster, _send_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Use a non-self placeholder validator as the signer so we
+        // exercise the foreign-vote ingress path and never trip the
+        // self-loopback shortcut. View 0 must be skipped — `view <
+        // current_view` would short-circuit before the bucket insert.
+        let voter = *vs.get(1).unwrap();
+        let n = (2 * cap) as View;
+        for view in 1..=n {
+            let payload = TimeoutVote {
+                view,
+                high_qc: None,
+            };
+            let signed = Signed {
+                payload,
+                signer: voter,
+                sig: [0u8; 64],
+            };
+            node.on_timeout_vote(signed, broadcaster.as_ref(), &mut view_timer, &signer)
+                .await
+                .unwrap();
+            assert!(
+                node.timeout_buckets.len() <= cap,
+                "timeout_buckets grew past cap after view {view}: len={}",
+                node.timeout_buckets.len(),
+            );
+        }
+        assert_eq!(node.timeout_buckets.len(), cap);
+        // n - cap inserts triggered eviction (n inserts past the
+        // cap-fill point of `cap`).
+        assert_eq!(
+            node.eviction_counters().timeout_buckets(),
+            (n as u64) - (cap as u64),
+        );
+        // Lowest-view-first: surviving views are the cap most recent.
+        let mut surviving: Vec<View> = node.timeout_buckets.keys().copied().collect();
+        surviving.sort();
+        let expected: Vec<View> = ((n - cap as View + 1)..=n).collect();
+        assert_eq!(surviving, expected);
     }
 
     /// A self-addressed `RequestBlock` is degenerate — we can't service

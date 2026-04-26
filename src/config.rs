@@ -164,6 +164,77 @@ pub struct ConsensusConfig {
     /// If unset, in-memory storage is used (no crash recovery).
     #[serde(default)]
     pub storage_dir: Option<PathBuf>,
+    /// Bounded-cache caps for the safety core and the integration
+    /// layer's timeout-vote handler. See [`ConsensusLimits`] for the
+    /// per-cache documentation; defaults match
+    /// [`crate::consensus::limits::CacheLimits::production_defaults`].
+    #[serde(default)]
+    pub limits: ConsensusLimits,
+}
+
+/// Per-cache capacity caps and an in-memory mempool cap. Parsed from
+/// the `[consensus.limits]` TOML sub-table; defaults apply when the
+/// table — or any individual field — is omitted.
+///
+/// Eviction policy and rationale are documented on
+/// [`crate::consensus::limits::CacheLimits`]; this struct is the
+/// configuration shape, the runtime shape lives in that module so the
+/// safety core can stay free of `serde` dependencies.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ConsensusLimits {
+    /// Cap on the safety core's `vote_bucket` map. Defaults to
+    /// [`crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY`].
+    #[serde(default = "default_vote_bucket_capacity")]
+    pub vote_bucket_capacity: usize,
+    /// Cap on the safety core's `parked_proposals` map. Defaults to
+    /// [`crate::consensus::limits::DEFAULT_PARKED_PROPOSALS_CAPACITY`].
+    #[serde(default = "default_parked_proposals_capacity")]
+    pub parked_proposals_capacity: usize,
+    /// Cap on the safety core's `pending_blocks` map. Defaults to
+    /// [`crate::consensus::limits::DEFAULT_PENDING_BLOCKS_CAPACITY`].
+    #[serde(default = "default_pending_blocks_capacity")]
+    pub pending_blocks_capacity: usize,
+    /// Cap on the integration layer's `timeout_buckets` map. Defaults
+    /// to [`crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY`].
+    #[serde(default = "default_timeout_buckets_capacity")]
+    pub timeout_buckets_capacity: usize,
+    /// Maximum entries the bundled in-memory mempool will accept.
+    /// Inserts past the cap surface as `Err` to the caller (see
+    /// [`crate::replication::impls::mem_mempool::InMemoryMempool`]),
+    /// rather than silently dropping. The application layer that
+    /// will eventually replace this implementation is free to ignore
+    /// the field; consensus only consults it when constructing the
+    /// default `InMemoryMempool` at startup.
+    #[serde(default = "default_mempool_capacity")]
+    pub mempool_capacity: usize,
+}
+
+impl Default for ConsensusLimits {
+    fn default() -> Self {
+        Self {
+            vote_bucket_capacity: default_vote_bucket_capacity(),
+            parked_proposals_capacity: default_parked_proposals_capacity(),
+            pending_blocks_capacity: default_pending_blocks_capacity(),
+            timeout_buckets_capacity: default_timeout_buckets_capacity(),
+            mempool_capacity: default_mempool_capacity(),
+        }
+    }
+}
+
+impl ConsensusLimits {
+    /// Project the safety-core / integration-layer caps into the
+    /// runtime [`crate::consensus::limits::CacheLimits`] shape. The
+    /// `mempool_capacity` field is consumed independently by the
+    /// startup wiring in `src/node.rs` and does not appear in
+    /// `CacheLimits`.
+    pub fn to_cache_limits(&self) -> crate::consensus::limits::CacheLimits {
+        crate::consensus::limits::CacheLimits {
+            vote_bucket_capacity: self.vote_bucket_capacity,
+            parked_proposals_capacity: self.parked_proposals_capacity,
+            pending_blocks_capacity: self.pending_blocks_capacity,
+            timeout_buckets_capacity: self.timeout_buckets_capacity,
+        }
+    }
 }
 
 fn default_propose_limit() -> usize {
@@ -176,6 +247,26 @@ fn default_timeout_base_ms() -> u64 {
 
 fn default_timeout_max_ms() -> u64 {
     10_000
+}
+
+fn default_vote_bucket_capacity() -> usize {
+    crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY
+}
+
+fn default_parked_proposals_capacity() -> usize {
+    crate::consensus::limits::DEFAULT_PARKED_PROPOSALS_CAPACITY
+}
+
+fn default_pending_blocks_capacity() -> usize {
+    crate::consensus::limits::DEFAULT_PENDING_BLOCKS_CAPACITY
+}
+
+fn default_timeout_buckets_capacity() -> usize {
+    crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY
+}
+
+fn default_mempool_capacity() -> usize {
+    1024
 }
 
 /// Topology-overlay configuration. Selects between the partial-mesh
@@ -548,6 +639,88 @@ validators = ["a"]
         assert_eq!(cons.timeout_max_ms, 10_000);
         assert!(cons.storage_dir.is_none());
         assert!(cons.genesis_seed_hex.is_none());
+        // Limits sub-table default — see ConsensusLimits::default().
+        let runtime = cons.limits.to_cache_limits();
+        assert_eq!(
+            runtime.vote_bucket_capacity,
+            crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY,
+        );
+        assert_eq!(
+            runtime.parked_proposals_capacity,
+            crate::consensus::limits::DEFAULT_PARKED_PROPOSALS_CAPACITY,
+        );
+        assert_eq!(
+            runtime.pending_blocks_capacity,
+            crate::consensus::limits::DEFAULT_PENDING_BLOCKS_CAPACITY,
+        );
+        assert_eq!(
+            runtime.timeout_buckets_capacity,
+            crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
+        );
+        assert_eq!(cons.limits.mempool_capacity, 1024);
+    }
+
+    #[test]
+    fn consensus_limits_subtable_overrides_defaults() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+
+[consensus.limits]
+vote_bucket_capacity = 32
+parked_proposals_capacity = 16
+pending_blocks_capacity = 64
+timeout_buckets_capacity = 8
+mempool_capacity = 2048
+"#,
+        );
+        let cons = c.consensus.expect("consensus section");
+        let runtime = cons.limits.to_cache_limits();
+        assert_eq!(runtime.vote_bucket_capacity, 32);
+        assert_eq!(runtime.parked_proposals_capacity, 16);
+        assert_eq!(runtime.pending_blocks_capacity, 64);
+        assert_eq!(runtime.timeout_buckets_capacity, 8);
+        assert_eq!(cons.limits.mempool_capacity, 2048);
+    }
+
+    #[test]
+    fn consensus_limits_partial_override_keeps_other_defaults() {
+        // Operators commonly override one knob (a tighter mempool
+        // for a memory-constrained host, say) and expect the rest to
+        // fall back to safe defaults.
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+
+[consensus.limits]
+mempool_capacity = 64
+"#,
+        );
+        let cons = c.consensus.expect("consensus section");
+        let runtime = cons.limits.to_cache_limits();
+        assert_eq!(cons.limits.mempool_capacity, 64);
+        assert_eq!(
+            runtime.vote_bucket_capacity,
+            crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY,
+        );
+        assert_eq!(
+            runtime.timeout_buckets_capacity,
+            crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
+        );
     }
 
     #[test]

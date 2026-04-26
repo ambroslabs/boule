@@ -411,6 +411,25 @@ storage_dir      = "./testnet/node1/consensus"   # change per-node
 fault-tolerance experiments below). If omitted, an in-memory backend is
 used — acceptable for a throwaway demo but no crash recovery.
 
+Optional: bounded-cache caps live under a `[consensus.limits]`
+sub-table. The defaults are sized for a 4–dozen-validator cluster
+under steady-state load, so omit the table unless you have a specific
+memory or stress-test reason to override:
+
+```toml
+[consensus.limits]
+vote_bucket_capacity      = 1024   # default
+parked_proposals_capacity = 256    # default
+pending_blocks_capacity   = 1024   # default
+timeout_buckets_capacity  = 1024   # default
+mempool_capacity          = 1024   # default — bundled InMemoryMempool
+```
+
+Forced evictions are reported in `/consensus/status` under
+`cache_evictions` (one counter per cache, monotonic per-process) and
+emit a structured INFO trace tagged `cache=<name>` so a flood
+targeting one specific cache is easy to grep out of the logs.
+
 > **Bootstrapping notes.** Adding a fifth validator later requires
 > editing and restarting every existing replica with the new committee
 > list. Dynamic membership changes are out of scope for v1. The
