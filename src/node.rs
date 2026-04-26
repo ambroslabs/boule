@@ -50,6 +50,14 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let identity = Arc::new(TlsIdentity::from_identity(&network_identity)?);
 
+    // Reject configurations that would self-dial: a static [[peers]]
+    // entry whose `node_id` matches the local TLS identity loops the
+    // dialer back into our own listener and surfaces in /peers as a
+    // real peer. Done here (rather than at parse time) so the check
+    // can compare against the loaded local NodeId. TOFU bootstrap_addrs
+    // are checked instead by the dialer / listener handshake guards.
+    config.validate(&identity.node_id)?;
+
     // Resolve the consensus-signing key. When `[node.validator_identity]`
     // is configured, build a separate `NodeSigner` from that key.
     // Otherwise reuse the network identity and warn loudly if consensus

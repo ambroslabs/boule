@@ -1437,3 +1437,141 @@ fn test_config_edit_errors_when_file_missing() {
         "expected init pointer, got: {stderr}"
     );
 }
+
+// ── Self-dial guards (#188) ─────────────────────────────────────────────────
+
+/// A static `[[peers]]` entry whose `node_id` matches the local TLS
+/// identity must fail at boot via `Config::validate`. Catches the
+/// "every node ships with the same canned peer list" deployment
+/// footgun before the dialer ever runs.
+#[tokio::test]
+async fn test_self_id_in_peers_list_fails_to_start() {
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_path = key_dir.path().join("node.key").to_str().unwrap().to_owned();
+
+    // Phase 1: discover this node's NodeId so we can name it as a self-
+    // peer in phase 2.
+    let info = launch_once_for_discovery(&key_path).await;
+
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+    let config = format!(
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [[peers]]\naddr = \"127.0.0.1:9999\"\nnode_id = \"{}\"\n",
+        info.node_id,
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let output = Command::new(bin)
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("failed to spawn node binary");
+
+    assert!(
+        !output.status.success(),
+        "node must refuse to start when [[peers]] contains its own NodeId; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("self-dial") || stderr.contains("own NodeId"),
+        "stderr must explain the self-dial reason; got: {stderr}",
+    );
+    assert!(
+        stderr.contains(&info.node_id) || stderr.contains("[[peers]]"),
+        "stderr must point at the offending entry; got: {stderr}",
+    );
+}
+
+/// A TOFU `[[peers]]` entry (no `node_id`) that resolves to our own
+/// listener can't be caught at config-validation time — the peer's
+/// identity is only known after the handshake. The dialer's
+/// handshake-time guard (and the listener's symmetric guard on the
+/// inbound side) must drop the resulting self-loopback so it never
+/// shows up in `/peers`.
+#[tokio::test]
+async fn test_self_loopback_dial_is_refused_at_handshake() {
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_path = key_dir.path().join("node.key").to_str().unwrap().to_owned();
+
+    // Phase 1: discover the listen addr so phase 2 can re-bind on it.
+    let info = launch_once_for_discovery(&key_path).await;
+
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+    let p2p_addr = info.p2p_addr.clone();
+    // [[peers]] has no `node_id` — config validation can't tell this
+    // is self. The dialer must catch it at TLS-handshake time.
+    let config = format!(
+        "[node]\nlisten_addr = \"{p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [[peers]]\naddr = \"{p2p_addr}\"\n",
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let child = Command::new(bin)
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn node binary");
+
+    // Wait for the node to bind both listeners.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let addrs = loop {
+        if Instant::now() > deadline {
+            panic!("self-loopback node did not write addr_file within 10s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break addrs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let guard = NodeGuard {
+        child,
+        api_port,
+        p2p_addr: addrs.p2p_addr,
+        node_id: addrs.node_id,
+        _config: config_file,
+        _key_dir: key_dir,
+        _addr_file: addr_file,
+    };
+
+    wait_until_ready(&guard, Duration::from_secs(10)).await;
+
+    // Watch /peers for ~2s — long enough for at least two dialer
+    // attempts (initial backoff is 1s) plus a maintenance tick. The
+    // count must stay zero: any successful self-dial would surface
+    // here immediately.
+    let client = reqwest::Client::new();
+    let watch_end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < watch_end {
+        let peers: Value = client
+            .get(guard.api_url("/peers"))
+            .send()
+            .await
+            .expect("/peers request failed")
+            .json()
+            .await
+            .expect("/peers returned non-JSON");
+        let count = peers.as_array().map(|a| a.len()).unwrap_or(0);
+        assert_eq!(
+            count, 0,
+            "self-loopback peer surfaced in /peers — handshake guard failed",
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
