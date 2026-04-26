@@ -1438,6 +1438,140 @@ fn test_config_edit_errors_when_file_missing() {
     );
 }
 
+// ── `[ui] output_format` config + override (issue #149) ─────────────────────
+//
+// These tests pin the contract: `[ui] output_format` in the config sets the
+// default for subcommands with structured output, and the per-invocation
+// `--format` flag overrides it. Today only `config` honours it; future
+// subcommands (`status`, `peers list`, ...) will inherit the convention via
+// the `ambros_p2p::cli` helpers.
+
+const CONFIG_WITH_UI_JSON: &str = r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[node.identity]
+backend = "file"
+path    = "/tmp/ambros-p2p-config-test/node.key"
+
+[api]
+listen_addr = "127.0.0.1:8000"
+
+[ui]
+output_format = "json"
+"#;
+
+const CONFIG_WITH_UI_HUMAN: &str = r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[node.identity]
+backend = "file"
+path    = "/tmp/ambros-p2p-config-test/node.key"
+
+[api]
+listen_addr = "127.0.0.1:8000"
+
+[ui]
+output_format = "human"
+"#;
+
+fn write_config(dir: &std::path::Path, contents: &str) -> std::path::PathBuf {
+    let path = dir.join("config.toml");
+    std::fs::write(&path, contents).expect("write config");
+    path
+}
+
+#[test]
+fn test_config_ui_output_format_json_is_the_default() {
+    // `[ui] output_format = "json"` with no `--format` → JSON output.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), CONFIG_WITH_UI_JSON);
+    let out = run_config(&["--config", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "config (with [ui] output_format = json) failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let parsed: Value = serde_json::from_str(&stdout)
+        .expect("[ui] output_format = json must produce JSON by default");
+    assert_eq!(parsed["node"]["listen_addr"], json!("127.0.0.1:7000"));
+    assert_eq!(parsed["ui"]["output_format"], json!("json"));
+}
+
+#[test]
+fn test_config_cli_format_overrides_ui_default() {
+    // `[ui] output_format = "json"` + `--format toml` → TOML wins.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), CONFIG_WITH_UI_JSON);
+    let out = run_config(&["--config", path.to_str().unwrap(), "--format", "toml"]);
+    assert!(
+        out.status.success(),
+        "config --format toml override failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[node]"), "expected TOML, got: {stdout}");
+    assert!(stdout.contains("[ui]"), "expected TOML, got: {stdout}");
+    // Sanity: TOML, not JSON.
+    assert!(
+        serde_json::from_str::<Value>(&stdout).is_err(),
+        "override must produce TOML, but it parsed as JSON"
+    );
+}
+
+#[test]
+fn test_config_ui_output_format_human_falls_back_to_toml() {
+    // `[ui] output_format = "human"` is the global default; for the
+    // `config` subcommand specifically, `human` falls back to TOML
+    // since that mirrors the source schema.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), CONFIG_WITH_UI_HUMAN);
+    let out = run_config(&["--config", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "config (with [ui] output_format = human) failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[node]"));
+    assert!(stdout.contains("output_format = \"human\""));
+}
+
+#[test]
+fn test_config_cli_format_human_falls_back_to_toml_for_config() {
+    // Operator passes `--format human` explicitly with no `[ui]`
+    // section in the file. `config`'s human fallback is TOML, so we
+    // still get TOML.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap(), "--format", "human"]);
+    assert!(
+        out.status.success(),
+        "config --format human failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[node]"), "expected TOML, got: {stdout}");
+}
+
+#[test]
+fn test_config_rejects_unknown_format_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap(), "--format", "yaml"]);
+    assert!(
+        !out.status.success(),
+        "unknown --format value must be rejected"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("yaml") || stderr.contains("expected"),
+        "expected diagnostic naming the bad value, got: {stderr}"
+    );
+}
+
 // ── Self-dial guards (#188) ─────────────────────────────────────────────────
 
 /// A static `[[peers]]` entry whose `node_id` matches the local TLS
