@@ -40,12 +40,27 @@ impl DialerCtx {
     /// connection to `addr` (asserting `expected_node_id` when set).
     /// Returns the spawned [`JoinHandle`] so callers that want to
     /// cancel on shutdown can hold it.
+    ///
+    /// Returns `None` when `expected_node_id` equals our own NodeId —
+    /// belt-and-suspenders against an in-process self-entry that
+    /// slipped past the boot-time `Config::validate` check (e.g. a
+    /// gossip-discovered candidate echoed back from a misbehaving
+    /// peer). The caller treats this as "no dialer started" and moves
+    /// on; the handshake-time guard in `dial` is the final backstop.
     pub fn spawn(
         &self,
         addr: std::net::SocketAddr,
         expected_node_id: Option<NodeId>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(reconnect_loop(
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if matches!(expected_node_id, Some(id) if id == self.identity.node_id) {
+            warn!(
+                "self-dial refused at dialer spawn: addr {addr} expected our own NodeId {} — \
+                 skipping",
+                node_id_to_base58(&self.identity.node_id),
+            );
+            return None;
+        }
+        Some(tokio::spawn(reconnect_loop(
             addr,
             expected_node_id,
             Arc::clone(&self.identity),
@@ -53,7 +68,7 @@ impl DialerCtx {
             self.peer_gone_tx.clone(),
             self.peer_cmd_tx.clone(),
             Arc::clone(&self.clock),
-        ))
+        )))
     }
 }
 
@@ -184,6 +199,15 @@ async fn dial(
         .first()
         .ok_or_else(|| anyhow::anyhow!("empty peer certificate chain"))?;
     let node_id = extract_node_id(cert)?;
+
+    if node_id == identity.node_id {
+        anyhow::bail!(
+            "self-dial refused: peer at {addr} presented our own NodeId {} — \
+             a static [[peers]] entry or gossip-discovered candidate is \
+             pointing at our own listener",
+            node_id_to_base58(&node_id),
+        );
+    }
 
     if let Some(expected) = expected_node_id {
         if node_id != expected {

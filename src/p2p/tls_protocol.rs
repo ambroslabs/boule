@@ -32,6 +32,7 @@ impl ConnectionProtocol for TlsConnectionProtocol {
         tokio::spawn(listener::run(
             self.listener,
             self.identity.acceptor.clone(),
+            self.identity.node_id,
             manager_tx.clone(),
         ));
 
