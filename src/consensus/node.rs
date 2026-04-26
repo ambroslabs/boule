@@ -3304,6 +3304,8 @@ mod tests {
     /// rely on the pacemaker picking `self` as the view-1 leader.
     #[tokio::test]
     async fn tracing_emits_expected_events_for_proposal_and_vote_flow() {
+        use tracing::instrument::WithSubscriber as _;
+
         let capture = CaptureBuf::new();
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(
@@ -3312,8 +3314,13 @@ mod tests {
             .with_writer(capture.clone())
             .json()
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
 
+        // Bind the subscriber to the test future via `with_subscriber`
+        // rather than installing it as a thread-local default. Under
+        // parallel `cargo test` workers, `set_default` raced with other
+        // tests using the same OS thread (~80% flake), so the first few
+        // synchronous events fell through to the global `NoSubscriber`
+        // before the local default attached. Issue #192.
         let ns = fresh_signer();
         let (mut node, _vs) = make_node_with_signer(&ns, 1);
         let signer: Arc<dyn Signer> = Arc::new(ns);
@@ -3322,30 +3329,37 @@ mod tests {
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
-        // Phase 1: OnQc(0) through the pacemaker. Covers pacemaker_event,
-        // pacemaker_action, view_advanced (cause=qc), plus the
-        // Broadcast(NewView) that on_pacemaker_advance emits once the
-        // safety core sees the view jump — so outbound_broadcast and
-        // new_view_received appear as part of the same flow.
-        let boot_actions = node.step_pacemaker(PacemakerEvent::OnQc(0));
-        node.apply_pacemaker_actions(boot_actions, broadcaster.as_ref(), &mut view_timer, &signer)
+        async {
+            // Phase 1: OnQc(0) through the pacemaker. Covers pacemaker_event,
+            // pacemaker_action, view_advanced (cause=qc), plus the
+            // Broadcast(NewView) that on_pacemaker_advance emits once the
+            // safety core sees the view jump — so outbound_broadcast and
+            // new_view_received appear as part of the same flow.
+            let boot_actions = node.step_pacemaker(PacemakerEvent::OnQc(0));
+            node.apply_pacemaker_actions(
+                boot_actions,
+                broadcaster.as_ref(),
+                &mut view_timer,
+                &signer,
+            )
             .await
             .unwrap();
 
-        // Phase 2: directly drive the view-1 leader path so the proposal
-        // broadcast + self-loopback vote emission is deterministic
-        // regardless of sort-order-dependent leader selection.
-        let proposal_actions = node.core.become_leader(1);
-        node.apply_safety_actions(
-            proposal_actions,
-            broadcaster.as_ref(),
-            &mut view_timer,
-            &signer,
-        )
-        .await
-        .unwrap();
-
-        drop(_guard);
+            // Phase 2: directly drive the view-1 leader path so the proposal
+            // broadcast + self-loopback vote emission is deterministic
+            // regardless of sort-order-dependent leader selection.
+            let proposal_actions = node.core.become_leader(1);
+            node.apply_safety_actions(
+                proposal_actions,
+                broadcaster.as_ref(),
+                &mut view_timer,
+                &signer,
+            )
+            .await
+            .unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
 
         let captured = capture.take_string();
         let events = trace_messages(&captured);
