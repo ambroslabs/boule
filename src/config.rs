@@ -11,16 +11,16 @@ use crate::p2p::identity::exec::ExecKeyProvider;
 use crate::p2p::identity::file::FileKeyProvider;
 use crate::p2p::tls::{NodeId, base58_to_node_id, node_id_to_base58};
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
     pub node: NodeConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerConfig>,
     pub api: ApiConfig,
     /// Optional HotStuff consensus configuration. When absent the node
     /// runs gossip-only; when present a [`crate::consensus::node::ConsensusNode`]
     /// is started alongside the gossip and ping protocols.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consensus: Option<ConsensusConfig>,
     /// Topology overlay configuration. Selects between the legacy
     /// full-mesh implementation and the partial-mesh gossip overlay
@@ -30,7 +30,7 @@ pub struct Config {
     pub overlay: OverlayConfig,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct NodeConfig {
     pub listen_addr: SocketAddr,
     /// Network (TLS) identity backend. The Ed25519 public key loaded here
@@ -38,7 +38,7 @@ pub struct NodeConfig {
     /// certificate the TLS handshake presents. If absent, falls back to
     /// the deprecated `key_file` field or, failing that, a file backend
     /// at `./node.key`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityConfig>,
     /// Optional validator (consensus signing) identity backend. When set,
     /// the consensus layer signs proposals/votes/timeouts with this key
@@ -46,20 +46,20 @@ pub struct NodeConfig {
     /// is reused for consensus signing — the historical single-key
     /// behavior — with a deprecation warning at startup if consensus is
     /// enabled. Both slots accept any of the same backends.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator_identity: Option<IdentityConfig>,
     /// Deprecated alias for `[node.identity] backend = "file" path = ...`.
     /// Retained for backward compatibility; emits a warning at startup.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_file: Option<PathBuf>,
     /// If set, the node writes its actual bound addresses and node ID to this file
     /// as JSON once both listeners are ready. Used by tests to discover dynamic ports.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr_file: Option<PathBuf>,
 }
 
 /// Where the node's long-term Ed25519 identity lives.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "backend", rename_all = "kebab-case")]
 pub enum IdentityConfig {
     /// PKCS#8 PEM on disk, mode 0600. Default for development.
@@ -80,14 +80,14 @@ pub enum IdentityConfig {
         #[serde(default = "default_keyring_service")]
         service: String,
         #[cfg_attr(not(feature = "keyring-backend"), allow(dead_code))]
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
     },
     /// Passphrase-encrypted file (XChaCha20-Poly1305 + Argon2id).
     EncryptedFile {
         path: PathBuf,
         /// Env var to read the passphrase from. If omitted, prompts the TTY.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         passphrase_env: Option<String>,
     },
     /// Run an operator-provided command; read PKCS#8 from its stdout.
@@ -116,17 +116,17 @@ fn default_keyring_service() -> String {
     "ambros-p2p".to_string()
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PeerConfig {
     pub addr: SocketAddr,
     /// Expected base58-encoded Ed25519 node ID of this peer.
     /// If set, the connection is rejected when the peer presents a different identity.
     /// Omit for trust-on-first-use (e.g. in development).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ApiConfig {
     pub listen_addr: SocketAddr,
     #[serde(default = "default_cleanup_interval")]
@@ -143,14 +143,14 @@ fn default_cleanup_interval() -> u64 {
 /// The `validators` list must contain this node's own base58 NodeId
 /// and must be byte-identical across every replica in the cluster
 /// (validator-set ordering determines round-robin leader rotation).
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ConsensusConfig {
     /// Base58-encoded NodeIds of every validator in the committee.
     /// Must include this node's own ID.
     pub validators: Vec<String>,
     /// 32-byte hex string used as the genesis block's `state_commitment`.
     /// Must match across all replicas. Defaults to all zeros.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_seed_hex: Option<String>,
     /// Maximum commands the leader pulls from the mempool per proposal.
     #[serde(default = "default_propose_limit")]
@@ -163,7 +163,7 @@ pub struct ConsensusConfig {
     pub timeout_max_ms: u64,
     /// Directory holding the consensus KV store and WAL on disk.
     /// If unset, in-memory storage is used (no crash recovery).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_dir: Option<PathBuf>,
     /// Bounded-cache caps for the safety core and the integration
     /// layer's timeout-vote handler. See [`ConsensusLimits`] for the
@@ -181,7 +181,7 @@ pub struct ConsensusConfig {
 /// [`crate::consensus::limits::CacheLimits`]; this struct is the
 /// configuration shape, the runtime shape lives in that module so the
 /// safety core can stay free of `serde` dependencies.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ConsensusLimits {
     /// Cap on the safety core's `vote_bucket` map. Defaults to
     /// [`crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY`].
@@ -281,7 +281,7 @@ fn default_mempool_capacity() -> usize {
 /// [`crate::p2p::overlay::gossip::overlay::GossipOverlayConfig`]), so a
 /// node that omits `[overlay]` entirely gets the breakdown-comment
 /// defaults from issue #137.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct OverlayConfig {
     /// Which overlay implementation to use. Defaults to `gossip`
     /// after the 25-node sim convergence test landed in stack 8 of
@@ -319,7 +319,7 @@ pub struct OverlayConfig {
     /// Bootstrap addresses dialed at startup. Each is a TOFU dial — the
     /// peer's TLS identity is whatever it presents on the handshake.
     /// Used in `mode = "gossip"` only.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bootstrap_addrs: Vec<SocketAddr>,
 }
 
@@ -340,7 +340,7 @@ impl Default for OverlayConfig {
 }
 
 /// Which topology overlay implementation to drive consensus with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverlayMode {
     /// Legacy full-mesh implementation. Retained as an opt-in for

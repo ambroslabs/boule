@@ -1189,6 +1189,255 @@ async fn test_consensus_status_returns_404_on_gossip_only_node() {
     );
 }
 
+// ── `config` subcommand tests (issue #148) ──────────────────────────────────
+//
+// These tests exercise the binary directly — no node is spawned, since the
+// subcommand reads/edits config files synchronously and never opens
+// listeners. Every test writes a self-contained config in a temp dir and
+// invokes `cargo`-built `ambros-p2p config ...`.
+
+const SAMPLE_CONFIG: &str = r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[node.identity]
+backend = "file"
+path    = "/tmp/ambros-p2p-config-test/node.key"
+
+[api]
+listen_addr = "127.0.0.1:8000"
+
+[consensus]
+validators = ["abc", "def"]
+"#;
+
+fn write_sample_config(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("config.toml");
+    std::fs::write(&path, SAMPLE_CONFIG).expect("write sample config");
+    path
+}
+
+fn run_config(args: &[&str]) -> std::process::Output {
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    Command::new(bin)
+        .arg("config")
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn `ambros-p2p config`")
+}
+
+#[test]
+fn test_config_path_prints_resolved_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap(), "--path"]);
+    assert!(
+        out.status.success(),
+        "config --path failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.trim(), path.to_str().unwrap());
+}
+
+#[test]
+fn test_config_default_resolved_toml_round_trips() {
+    // The acceptance criterion is that `--format toml` (the default)
+    // produces output that re-parses to the same logical config — i.e.,
+    // the resolved view is a valid config the node could load.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "config (default) failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[node]"));
+    assert!(stdout.contains("[node.identity]"));
+    assert!(stdout.contains("[consensus]"));
+    // Defaults filled in: timeout_base_ms is in [consensus] even
+    // though the source file omitted it.
+    assert!(stdout.contains("timeout_base_ms"));
+    // [overlay] is fully synthesized from defaults — the source had
+    // no [overlay] section at all.
+    assert!(stdout.contains("[overlay]"));
+    assert!(stdout.contains("mode = \"gossip\""));
+
+    // Round-trip: write the resolved output to a new file and re-run
+    // `config`. Output must match byte-for-byte.
+    let round1 = dir.path().join("round1.toml");
+    std::fs::write(&round1, &stdout).unwrap();
+    let out2 = run_config(&["--config", round1.to_str().unwrap()]);
+    assert!(
+        out2.status.success(),
+        "round-trip parse failed: stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let stdout2 = String::from_utf8(out2.stdout).unwrap();
+    assert_eq!(stdout, stdout2, "TOML output must round-trip identically");
+}
+
+#[test]
+fn test_config_format_json_emits_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap(), "--format", "json"]);
+    assert!(
+        out.status.success(),
+        "config --format json failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let parsed: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    // Sanity-check the JSON document the documented `... | jq` recipe
+    // would target.
+    assert_eq!(parsed["node"]["listen_addr"], json!("127.0.0.1:7000"));
+    assert_eq!(parsed["consensus"]["timeout_base_ms"], json!(200));
+    assert_eq!(parsed["overlay"]["mode"], json!("gossip"));
+}
+
+#[test]
+fn test_config_raw_prints_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap(), "--raw"]);
+    assert!(
+        out.status.success(),
+        "config --raw failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout, SAMPLE_CONFIG);
+}
+
+#[test]
+fn test_config_raw_with_format_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&[
+        "--config",
+        path.to_str().unwrap(),
+        "--raw",
+        "--format",
+        "json",
+    ]);
+    assert!(!out.status.success(), "--raw + --format must be rejected");
+}
+
+#[test]
+fn test_config_edit_with_noop_editor_succeeds() {
+    // `EDITOR=true` exits 0 immediately without modifying the file —
+    // the most basic happy-path: editor opens, user makes no change.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let out = Command::new(bin)
+        .args(["config", "--config", path.to_str().unwrap(), "--edit"])
+        .env("EDITOR", "true")
+        .env_remove("VISUAL")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn config --edit");
+    assert!(
+        out.status.success(),
+        "config --edit (noop editor) must succeed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("config validated"),
+        "expected validation message, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_edit_aborts_on_nonzero_editor_exit() {
+    // `EDITOR=false` always exits 1 — the convention for "editor
+    // aborted, do not save". `vim :cq` produces the same.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let out = Command::new(bin)
+        .args(["config", "--config", path.to_str().unwrap(), "--edit"])
+        .env("EDITOR", "false")
+        .env_remove("VISUAL")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn config --edit");
+    assert!(
+        !out.status.success(),
+        "config --edit must propagate editor failure"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("exited"),
+        "expected editor-exit diagnostic, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_edit_rejects_invalid_save() {
+    // Use a tiny shell script as the "editor" that overwrites the
+    // file with garbage TOML, then exits 0 (mimicking an operator who
+    // saved a typo). The post-edit re-parse must fail.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let editor_script = dir.path().join("bad-editor.sh");
+    std::fs::write(
+        &editor_script,
+        "#!/bin/sh\nprintf 'this = is = not = toml\\n' > \"$1\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&editor_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&editor_script, perms).unwrap();
+    }
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let out = Command::new(bin)
+        .args(["config", "--config", path.to_str().unwrap(), "--edit"])
+        .env("EDITOR", editor_script.to_str().unwrap())
+        .env_remove("VISUAL")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn config --edit");
+    assert!(
+        !out.status.success(),
+        "config --edit must reject an invalid post-edit file"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("no longer valid") || stderr.contains("error"),
+        "expected validation diagnostic, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_edit_errors_when_file_missing() {
+    // `--edit` requires an existing file — there's nothing to open
+    // otherwise. Operators are pointed at `init` instead.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist.toml");
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let out = Command::new(bin)
+        .args(["config", "--config", missing.to_str().unwrap(), "--edit"])
+        .env("EDITOR", "true")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn config --edit");
+    assert!(!out.status.success(), "missing file must be an error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("init") || stderr.contains("no config"),
+        "expected init pointer, got: {stderr}"
+    );
+}
+
 // ── Self-dial guards (#188) ─────────────────────────────────────────────────
 
 /// A static `[[peers]]` entry whose `node_id` matches the local TLS
