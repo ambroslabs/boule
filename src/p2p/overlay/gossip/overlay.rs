@@ -87,7 +87,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::clock::Clock;
 use crate::p2p::ProtocolEvent;
@@ -446,7 +446,13 @@ impl GossipOverlay {
         for peer in direct {
             self.sink.send_to(peer, bytes.clone());
         }
-        debug!(
+        // Logged at INFO so the diagnostic chain documented above
+        // (block_sync_request_emitted → gossip_send_to_dispatched →
+        // gossip_inbound_dispatched → block_sync_request_received) is
+        // visible in the default RUST_LOG=info child processes spawned
+        // by `testnet`. Frequency is one line per unicast SendTo,
+        // which is bounded by block-sync request volume.
+        info!(
             target: "ambros_p2p::p2p::overlay::gossip",
             target_peer = %crate::p2p::tls::node_id_to_base58(&target),
             msg_id = ?msg_id,

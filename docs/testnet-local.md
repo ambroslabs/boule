@@ -767,6 +767,20 @@ accepts a TOML scenario file:
 seed = 42
 
 [[steps]]
+# Mesh-warmup gate: every kill_random on the default ring topology
+# (`bootstrap_peers = [i-1, i+1] mod n`) must be preceded by
+# wait_all_healthy, NOT wait_all_reach_height. Some seeds pick two
+# ring-neighbours of the same node — e.g. seed=7 + count=2 on a
+# 7-node cluster kills the only two bootstrap peers of node2 — and
+# `wait_all_reach_height` is satisfied before gossip has expanded
+# past the bootstrap pairs, so the survivor isolates and the cluster
+# wedges. `wait_all_healthy` waits until every live node has at
+# least `n - 1` consensus peers, which is the load-bearing
+# precondition the built-in `disconnect-random` scenario also uses.
+op = "wait_all_healthy"
+within = 5
+
+[[steps]]
 op = "wait_all_reach_height"
 height = 30
 
