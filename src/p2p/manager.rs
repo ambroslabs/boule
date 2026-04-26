@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use super::connection;
 use super::connection::ProtocolCaps;
+use super::limits::{ConnectionLimiter, Direction};
 use super::overlay::DiscoveryEvent;
 use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
@@ -21,10 +22,15 @@ pub type ConnectionId = u64;
 
 /// What the manager stores for each currently-connected peer: the id of the
 /// specific connection that owns the peer slot plus the channel that writes
-/// bytes onto it.
+/// bytes onto it. `direction` and `addr` are kept on the slot so the
+/// manager can release the matching [`ConnectionLimiter`] bucket on
+/// [`ManagerMsg::PeerGone`] without re-asking the (closed) connection
+/// task what direction it was.
 struct PeerSlot {
     conn_id: ConnectionId,
     write_tx: mpsc::Sender<Bytes>,
+    direction: Direction,
+    addr: SocketAddr,
 }
 
 /// Combined async I/O trait used as a protocol-agnostic stream type.
@@ -40,6 +46,10 @@ pub enum ManagerMsg {
     NewConnection {
         node_id: NodeId,
         addr: SocketAddr,
+        /// Whether this connection arrived via the inbound listener or
+        /// the outbound dialer. Charged against the matching
+        /// [`ConnectionLimiter`] bucket.
+        direction: Direction,
         stream: AnyStream,
     },
     /// Emitted by a connection task when its read/write loop exits. The
@@ -68,6 +78,7 @@ pub async fn run(
     internal_tx: mpsc::Sender<ManagerMsg>,
     peer_gone_tx: broadcast::Sender<NodeId>,
     discovery_tx: broadcast::Sender<DiscoveryEvent>,
+    connection_limiter: Option<Arc<ConnectionLimiter>>,
 ) {
     // `BTreeMap` so broadcast and event-fan-out iteration is deterministic;
     // the sim's byte-identical-trace determinism test relies on this, and
@@ -90,12 +101,34 @@ pub async fn run(
             biased;
             msg = internal_rx.recv() => {
                 match msg {
-                    Some(ManagerMsg::NewConnection { node_id, addr, stream }) => {
+                    Some(ManagerMsg::NewConnection { node_id, addr, direction, stream }) => {
+                        // Check the connection cap *before* allocating a
+                        // conn_id so a rejected attempt does not perturb
+                        // the monotonic id sequence (which other tests
+                        // rely on for tie-breaker replays).
+                        if let Some(limiter) = connection_limiter.as_ref() {
+                            if let Err(reason) = limiter.try_admit(direction, addr.ip()) {
+                                warn!(
+                                    peer = %node_id_to_base58(&node_id),
+                                    addr = %addr,
+                                    direction = ?direction,
+                                    reason = reason.label(),
+                                    "connection refused: cap reached",
+                                );
+                                // Drop `stream`. The TCP/TLS connection
+                                // closes when the underlying socket is
+                                // dropped — peer sees this as RST/EOF on
+                                // their next read or write.
+                                drop(stream);
+                                continue;
+                            }
+                        }
                         next_conn_id += 1;
-                        register_connection(
+                        let outcome = register_connection(
                             our_node_id,
                             node_id,
                             addr,
+                            direction,
                             stream,
                             next_conn_id,
                             &mut peers,
@@ -104,6 +137,17 @@ pub async fn run(
                             Arc::clone(&protocol_caps),
                             &discovery_tx,
                         );
+                        if let Some(limiter) = connection_limiter.as_ref() {
+                            match outcome {
+                                RegisterOutcome::Admitted => {}
+                                RegisterOutcome::Rejected => {
+                                    limiter.release(direction, addr.ip());
+                                }
+                                RegisterOutcome::Replaced { prev_direction, prev_addr } => {
+                                    limiter.release(prev_direction, prev_addr.ip());
+                                }
+                            }
+                        }
                     }
                     Some(ManagerMsg::PeerGone { node_id, connection_id }) => {
                         // Only treat this as a disconnect if the registered
@@ -115,7 +159,10 @@ pub async fn run(
                             .get(&node_id)
                             .is_some_and(|slot| slot.conn_id == connection_id);
                         if is_current {
-                            peers.remove(&node_id);
+                            let slot = peers.remove(&node_id).expect("just verified present");
+                            if let Some(limiter) = connection_limiter.as_ref() {
+                                limiter.release(slot.direction, slot.addr.ip());
+                            }
                             let _ = peer_gone_tx.send(node_id);
                             let _ = discovery_tx.send(DiscoveryEvent::PeerRemoved(node_id));
                             for event_tx in protocols.values() {
@@ -194,7 +241,10 @@ pub async fn run(
                     }
                     Some(PeerCommand::Disconnect { node_id }) => {
                         let id = node_id_to_base58(&node_id);
-                        if peers.remove(&node_id).is_some() {
+                        if let Some(slot) = peers.remove(&node_id) {
+                            if let Some(limiter) = connection_limiter.as_ref() {
+                                limiter.release(slot.direction, slot.addr.ip());
+                            }
                             // Broadcast the disconnect immediately instead
                             // of waiting for the connection task's PeerGone
                             // to land — that stale PeerGone will now see a
@@ -225,11 +275,29 @@ pub async fn run(
     }
 }
 
+/// Outcome of a [`register_connection`] call. The manager loop uses
+/// this to release the right [`ConnectionLimiter`] slot when the
+/// tie-breaker rejects or replaces a connection.
+enum RegisterOutcome {
+    /// Brand-new peer registered; nothing to release.
+    Admitted,
+    /// Tie-breaker preferred the existing connection; release the
+    /// freshly-charged slot.
+    Rejected,
+    /// Tie-breaker replaced the existing connection; release the
+    /// *prior* slot's charge so only the surviving connection counts.
+    Replaced {
+        prev_direction: Direction,
+        prev_addr: SocketAddr,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 fn register_connection(
     our_node_id: NodeId,
     peer_node_id: NodeId,
     addr: SocketAddr,
+    direction: Direction,
     stream: AnyStream,
     conn_id: ConnectionId,
     peers: &mut BTreeMap<NodeId, PeerSlot>,
@@ -237,44 +305,98 @@ fn register_connection(
     internal_tx: mpsc::Sender<ManagerMsg>,
     protocol_caps: ProtocolCaps,
     discovery_tx: &broadcast::Sender<DiscoveryEvent>,
-) {
+) -> RegisterOutcome {
     let id = node_id_to_base58(&peer_node_id);
 
-    let is_replacement = peers.contains_key(&peer_node_id);
-    if is_replacement {
+    let prior = peers
+        .get(&peer_node_id)
+        .map(|slot| (slot.direction, slot.addr));
+    if let Some((prev_direction, prev_addr)) = prior {
         // Tie-breaker: the node with the lexicographically lower ID keeps the
         // existing connection; the higher-ID node accepts the new one instead.
         if our_node_id < peer_node_id {
             info!("tie-breaker: keeping existing connection to {id} (we have lower ID)");
-            return;
+            return RegisterOutcome::Rejected;
         }
         info!("tie-breaker: replacing existing connection to {id} (we have higher ID)");
         // Overwriting the slot below drops the old `write_tx`, closing the
         // old connection task's write channel so it exits. Because the slot
         // now has a new `conn_id`, the old task's PeerGone is recognised as
         // stale and no spurious peer-gone event fires (see #114).
-    } else {
-        info!("registering new peer {id} at {addr}");
+        let (write_tx, write_rx) = mpsc::channel::<Bytes>(64);
+        peers.insert(
+            peer_node_id,
+            PeerSlot {
+                conn_id,
+                write_tx,
+                direction,
+                addr,
+            },
+        );
+        spawn_connection_task(
+            peer_node_id,
+            stream,
+            write_rx,
+            conn_id,
+            internal_tx,
+            protocol_caps,
+        );
+        return RegisterOutcome::Replaced {
+            prev_direction,
+            prev_addr,
+        };
     }
+    info!("registering new peer {id} at {addr}");
 
     let (write_tx, write_rx) = mpsc::channel::<Bytes>(64);
-    peers.insert(peer_node_id, PeerSlot { conn_id, write_tx });
+    peers.insert(
+        peer_node_id,
+        PeerSlot {
+            conn_id,
+            write_tx,
+            direction,
+            addr,
+        },
+    );
 
-    // Only notify protocols on a fresh connection. Replacing the underlying
-    // stream doesn't change the logical "is this peer reachable" answer, so
-    // firing an extra PeerConnected (without a matching PeerDisconnected)
-    // would confuse any protocol that tracks per-peer state.
-    if !is_replacement {
-        let _ = discovery_tx.send(DiscoveryEvent::PeerAdded(peer_node_id));
-        for event_tx in protocols.values() {
-            let _ = event_tx.try_send(ProtocolEvent::PeerConnected {
-                node_id: peer_node_id,
-                addr,
-            });
-        }
+    // Notify protocols on this fresh connection. (The REPLACE branch
+    // above intentionally suppresses these events: replacing the
+    // underlying stream doesn't change the logical "is this peer
+    // reachable" answer, so firing an extra PeerConnected without a
+    // matching PeerDisconnected would confuse protocols that track
+    // per-peer state.)
+    let _ = discovery_tx.send(DiscoveryEvent::PeerAdded(peer_node_id));
+    for event_tx in protocols.values() {
+        let _ = event_tx.try_send(ProtocolEvent::PeerConnected {
+            node_id: peer_node_id,
+            addr,
+        });
     }
 
+    spawn_connection_task(
+        peer_node_id,
+        stream,
+        write_rx,
+        conn_id,
+        internal_tx,
+        protocol_caps,
+    );
+    RegisterOutcome::Admitted
+}
+
+/// Spawn the per-connection framing task, which reads/writes through
+/// `stream` and notifies the manager with [`ManagerMsg::PeerGone`]
+/// when it exits.
+fn spawn_connection_task(
+    peer_node_id: NodeId,
+    stream: AnyStream,
+    write_rx: mpsc::Receiver<Bytes>,
+    conn_id: ConnectionId,
+    internal_tx: mpsc::Sender<ManagerMsg>,
+    protocol_caps: ProtocolCaps,
+) {
     let conn_tx = internal_tx.clone();
+    let id = node_id_to_base58(&peer_node_id);
     tokio::spawn(async move {
         connection::run(peer_node_id, stream, write_rx, conn_tx, protocol_caps).await;
         if internal_tx
@@ -339,6 +461,13 @@ mod tests {
 
     impl TestManager {
         fn start(our_node_id: NodeId) -> Self {
+            Self::start_with_limiter(our_node_id, None)
+        }
+
+        fn start_with_limiter(
+            our_node_id: NodeId,
+            connection_limiter: Option<Arc<ConnectionLimiter>>,
+        ) -> Self {
             let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(16);
             let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(64);
             let (peer_gone_tx, peer_gone_rx) = broadcast::channel::<NodeId>(16);
@@ -352,6 +481,7 @@ mod tests {
                     itx,
                     peer_gone_tx,
                     discovery_tx,
+                    connection_limiter,
                 )
                 .await;
             });
@@ -411,11 +541,24 @@ mod tests {
     /// will receive anything the manager sends to this peer; its reader half
     /// is where the test can push framed inbound messages.
     async fn add_peer(mgr: &TestManager, peer: NodeId) -> DuplexStream {
+        add_peer_with(mgr, peer, addr(), Direction::Inbound).await
+    }
+
+    /// Variant of [`add_peer`] that lets a test pick the source address
+    /// and direction (used by the [`ConnectionLimiter`] tests below to
+    /// drive per-IP and per-direction caps).
+    async fn add_peer_with(
+        mgr: &TestManager,
+        peer: NodeId,
+        addr: SocketAddr,
+        direction: Direction,
+    ) -> DuplexStream {
         let (local, remote) = duplex(64 * 1024);
         mgr.internal_tx
             .send(ManagerMsg::NewConnection {
                 node_id: peer,
-                addr: addr(),
+                addr,
+                direction,
                 stream: Box::new(local),
             })
             .await
@@ -820,5 +963,109 @@ mod tests {
             ProtocolEvent::Message { payload, .. } => assert_eq!(payload.len(), 100 * 1024),
             other => panic!("expected Message, got {other:?}"),
         }
+    }
+
+    // ── ConnectionLimiter integration ──────────────────────────────────────
+
+    use crate::p2p::limits::ConnectionLimitsConfig;
+
+    fn sa(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        SocketAddr::from(([a, b, c, d], port))
+    }
+
+    /// Issue #134 acceptance: opening more than `max_inbound`
+    /// connections is refused with a clear, observable error (the
+    /// limiter's reject counter, mirrored in WARN logs).
+    #[tokio::test]
+    async fn excess_inbound_connections_are_refused() {
+        let limiter = Arc::new(ConnectionLimiter::new(ConnectionLimitsConfig {
+            max_inbound: 2,
+            max_outbound: 99,
+            max_per_ip: 99,
+        }));
+        let mgr = TestManager::start_with_limiter(nid(1), Some(Arc::clone(&limiter)));
+        let _h = mgr.register(0x01).await;
+
+        // Two legitimate inbound connections from distinct peers + IPs
+        // are admitted.
+        let _a = add_peer_with(&mgr, nid(10), sa(10, 0, 0, 1, 7000), Direction::Inbound).await;
+        let _b = add_peer_with(&mgr, nid(11), sa(10, 0, 0, 2, 7000), Direction::Inbound).await;
+        assert_eq!(mgr.list_peers().await.len(), 2);
+
+        // Third connection past the cap is rejected. The manager
+        // logs WARN and increments the reject counter; the peer
+        // table stays at 2.
+        let _c = add_peer_with(&mgr, nid(12), sa(10, 0, 0, 3, 7000), Direction::Inbound).await;
+        assert_eq!(
+            mgr.list_peers().await.len(),
+            2,
+            "third connection must be refused"
+        );
+        assert!(limiter.rejects() >= 1);
+    }
+
+    /// Per-IP cap fires before the global cap: a single noisy peer can
+    /// open at most `max_per_ip` connections regardless of overall
+    /// inbound headroom.
+    #[tokio::test]
+    async fn per_ip_cap_blocks_a_single_noisy_source() {
+        let limiter = Arc::new(ConnectionLimiter::new(ConnectionLimitsConfig {
+            max_inbound: 99,
+            max_outbound: 99,
+            max_per_ip: 2,
+        }));
+        let mgr = TestManager::start_with_limiter(nid(1), Some(Arc::clone(&limiter)));
+        let _h = mgr.register(0x01).await;
+
+        // Three connections from the same IP, distinct node IDs.
+        // Only the first two should land in the peer table.
+        let _a = add_peer_with(&mgr, nid(10), sa(10, 0, 0, 1, 7001), Direction::Inbound).await;
+        let _b = add_peer_with(&mgr, nid(11), sa(10, 0, 0, 1, 7002), Direction::Inbound).await;
+        let _c = add_peer_with(&mgr, nid(12), sa(10, 0, 0, 1, 7003), Direction::Inbound).await;
+        assert_eq!(mgr.list_peers().await.len(), 2);
+        assert!(limiter.rejects() >= 1);
+
+        // A connection from a different IP is still admitted — the
+        // per-IP cap is per-source, not a global side effect.
+        let _d = add_peer_with(&mgr, nid(13), sa(10, 0, 0, 2, 7004), Direction::Inbound).await;
+        assert_eq!(mgr.list_peers().await.len(), 3);
+    }
+
+    /// `Disconnect` releases the connection-limiter slot so a fresh
+    /// dial from the same IP can be admitted again.
+    #[tokio::test]
+    async fn disconnect_releases_connection_limiter_slot() {
+        let limiter = Arc::new(ConnectionLimiter::new(ConnectionLimitsConfig {
+            max_inbound: 1,
+            max_outbound: 99,
+            max_per_ip: 99,
+        }));
+        let mgr = TestManager::start_with_limiter(nid(1), Some(Arc::clone(&limiter)));
+        let _h = mgr.register(0x01).await;
+
+        let _a = add_peer_with(&mgr, nid(10), sa(10, 0, 0, 1, 7000), Direction::Inbound).await;
+        assert_eq!(limiter.inbound(), 1);
+
+        mgr.cmd_tx
+            .send(PeerCommand::Disconnect { node_id: nid(10) })
+            .await
+            .unwrap();
+        // Wait for the manager to observe the disconnect and release.
+        for _ in 0..50 {
+            if limiter.inbound() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            limiter.inbound(),
+            0,
+            "disconnect must free the limiter slot"
+        );
+
+        // After release a fresh inbound from any IP fits within the
+        // (now-empty) cap.
+        let _b = add_peer_with(&mgr, nid(11), sa(10, 0, 0, 2, 7000), Direction::Inbound).await;
+        assert!(mgr.has_peer(nid(11)).await);
     }
 }

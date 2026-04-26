@@ -27,6 +27,10 @@ pub struct Config {
     /// `mode = "mesh"` — apply.
     #[serde(default)]
     pub overlay: OverlayConfig,
+    /// Per-peer rate limiting and global connection caps (issue #134).
+    /// Defaults apply when the section is omitted.
+    #[serde(default)]
+    pub p2p: P2pConfig,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -267,6 +271,194 @@ fn default_timeout_buckets_capacity() -> usize {
 
 fn default_mempool_capacity() -> usize {
     1024
+}
+
+/// Configuration for the p2p layer that is independent of the overlay
+/// mode and consensus wiring. Currently exposes only the rate-limiting
+/// and connection-cap knobs introduced in issue #134.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct P2pConfig {
+    /// `[p2p.limits]` sub-table. Optional: when absent, no rate
+    /// limiting or connection caps are installed (matches the pre-#134
+    /// behaviour, suitable for closed-network test deployments). When
+    /// present, sub-fields default to
+    /// [`P2pLimitsConfig::production_defaults`].
+    #[serde(default)]
+    pub limits: Option<P2pLimitsConfig>,
+}
+
+/// Per-peer rate limits + connection caps. Surfaced as the
+/// `[p2p.limits]` TOML table. Sub-fields fall back to
+/// [`P2pLimitsConfig::production_defaults`] when omitted, so an
+/// operator can override one knob (e.g. tighter `max_per_ip`) without
+/// re-spelling the rest.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct P2pLimitsConfig {
+    /// Maximum concurrent inbound connections.
+    #[serde(default = "default_max_inbound_connections")]
+    pub max_inbound_connections: usize,
+    /// Maximum concurrent outbound connections.
+    #[serde(default = "default_max_outbound_connections")]
+    pub max_outbound_connections: usize,
+    /// Maximum concurrent connections from a single source IP.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+    /// Per-message-type and bytes/sec rate buckets.
+    #[serde(default)]
+    pub rate: P2pRateLimitsConfig,
+    /// Violation-window / max-violations parameters that drive the
+    /// per-peer disconnect decision.
+    #[serde(default)]
+    pub violations: P2pViolationsConfig,
+}
+
+impl Default for P2pLimitsConfig {
+    fn default() -> Self {
+        Self::production_defaults()
+    }
+}
+
+impl P2pLimitsConfig {
+    /// Defaults sized for a healthy 4-validator cluster with 1× RTT
+    /// margin; the rate buckets sit well above honest steady-state
+    /// (see issue #134 for the calculation).
+    pub fn production_defaults() -> Self {
+        Self {
+            max_inbound_connections: default_max_inbound_connections(),
+            max_outbound_connections: default_max_outbound_connections(),
+            max_connections_per_ip: default_max_connections_per_ip(),
+            rate: P2pRateLimitsConfig::default(),
+            violations: P2pViolationsConfig::default(),
+        }
+    }
+
+    /// Project the connection-cap fields into the runtime
+    /// [`crate::p2p::limits::ConnectionLimitsConfig`] shape.
+    pub fn connection_limits(&self) -> crate::p2p::limits::ConnectionLimitsConfig {
+        crate::p2p::limits::ConnectionLimitsConfig {
+            max_inbound: self.max_inbound_connections,
+            max_outbound: self.max_outbound_connections,
+            max_per_ip: self.max_connections_per_ip,
+        }
+    }
+
+    /// Project the rate + violation fields into the runtime
+    /// [`crate::p2p::limits::RateLimitsConfig`] shape.
+    pub fn rate_limits(&self) -> crate::p2p::limits::RateLimitsConfig {
+        crate::p2p::limits::RateLimitsConfig {
+            proposal_per_sec: self.rate.proposal_per_sec,
+            vote_per_sec: self.rate.vote_per_sec,
+            timeout_vote_per_sec: self.rate.timeout_vote_per_sec,
+            new_view_per_sec: self.rate.new_view_per_sec,
+            request_block_per_sec: self.rate.request_block_per_sec,
+            receive_block_per_sec: self.rate.receive_block_per_sec,
+            bytes_per_sec: self.rate.bytes_per_sec,
+            burst_seconds: self.rate.burst_seconds,
+            violation_window: std::time::Duration::from_secs(self.violations.window_secs),
+            max_violations: self.violations.max_violations,
+        }
+    }
+}
+
+/// Per-message-type token-bucket rates and the wire-bytes/sec ceiling.
+/// All rates are units-per-second.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct P2pRateLimitsConfig {
+    #[serde(default = "default_proposal_per_sec")]
+    pub proposal_per_sec: f64,
+    #[serde(default = "default_vote_per_sec")]
+    pub vote_per_sec: f64,
+    #[serde(default = "default_timeout_vote_per_sec")]
+    pub timeout_vote_per_sec: f64,
+    #[serde(default = "default_new_view_per_sec")]
+    pub new_view_per_sec: f64,
+    #[serde(default = "default_request_block_per_sec")]
+    pub request_block_per_sec: f64,
+    #[serde(default = "default_receive_block_per_sec")]
+    pub receive_block_per_sec: f64,
+    #[serde(default = "default_bytes_per_sec")]
+    pub bytes_per_sec: f64,
+    /// Burst capacity = `rate × burst_seconds`. A 1.0s burst window is
+    /// large enough that a leader's view-change recovery flurry stays
+    /// within budget without admitting sustained over-rate.
+    #[serde(default = "default_burst_seconds")]
+    pub burst_seconds: f64,
+}
+
+impl Default for P2pRateLimitsConfig {
+    fn default() -> Self {
+        Self {
+            proposal_per_sec: default_proposal_per_sec(),
+            vote_per_sec: default_vote_per_sec(),
+            timeout_vote_per_sec: default_timeout_vote_per_sec(),
+            new_view_per_sec: default_new_view_per_sec(),
+            request_block_per_sec: default_request_block_per_sec(),
+            receive_block_per_sec: default_receive_block_per_sec(),
+            bytes_per_sec: default_bytes_per_sec(),
+            burst_seconds: default_burst_seconds(),
+        }
+    }
+}
+
+/// Sliding-window parameters for the per-peer disconnect decision.
+/// After `max_violations` rate-limit drops within `window_secs`, the
+/// limiter returns `Decision::Disconnect` once and the consensus layer
+/// tears down the connection.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct P2pViolationsConfig {
+    #[serde(default = "default_violation_window_secs")]
+    pub window_secs: u64,
+    #[serde(default = "default_max_violations")]
+    pub max_violations: u32,
+}
+
+impl Default for P2pViolationsConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: default_violation_window_secs(),
+            max_violations: default_max_violations(),
+        }
+    }
+}
+
+fn default_max_inbound_connections() -> usize {
+    64
+}
+fn default_max_outbound_connections() -> usize {
+    64
+}
+fn default_max_connections_per_ip() -> usize {
+    4
+}
+fn default_proposal_per_sec() -> f64 {
+    16.0
+}
+fn default_vote_per_sec() -> f64 {
+    256.0
+}
+fn default_timeout_vote_per_sec() -> f64 {
+    64.0
+}
+fn default_new_view_per_sec() -> f64 {
+    64.0
+}
+fn default_request_block_per_sec() -> f64 {
+    8.0
+}
+fn default_receive_block_per_sec() -> f64 {
+    8.0
+}
+fn default_bytes_per_sec() -> f64 {
+    1024.0 * 1024.0
+}
+fn default_burst_seconds() -> f64 {
+    1.0
+}
+fn default_violation_window_secs() -> u64 {
+    10
+}
+fn default_max_violations() -> u32 {
+    100
 }
 
 /// Topology-overlay configuration. Selects between the partial-mesh
@@ -954,6 +1146,107 @@ bootstrap_addrs = ["10.0.0.1:7000", "[::1]:7000"]
         assert_eq!(c.overlay.bootstrap_addrs.len(), 2);
         assert_eq!(c.overlay.bootstrap_addrs[0].port(), 7000);
         assert!(c.overlay.bootstrap_addrs[1].is_ipv6());
+    }
+
+    #[test]
+    fn p2p_section_absent_means_no_limits() {
+        // Pre-#134 behaviour preserved: a config that omits the
+        // `[p2p]` table entirely runs without any rate limiting or
+        // connection caps. (The runtime treats `limits = None` as
+        // "do not install a limiter".)
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+"#,
+        );
+        assert!(c.p2p.limits.is_none());
+    }
+
+    #[test]
+    fn p2p_limits_subtable_uses_production_defaults_when_partial() {
+        // Section present but every field omitted: production defaults
+        // apply.
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[p2p.limits]
+"#,
+        );
+        let limits = c.p2p.limits.expect("limits section");
+        assert_eq!(limits.max_inbound_connections, 64);
+        assert_eq!(limits.max_outbound_connections, 64);
+        assert_eq!(limits.max_connections_per_ip, 4);
+        assert_eq!(limits.rate.proposal_per_sec, 16.0);
+        assert_eq!(limits.violations.window_secs, 10);
+        assert_eq!(limits.violations.max_violations, 100);
+    }
+
+    #[test]
+    fn p2p_limits_partial_override_keeps_other_defaults() {
+        // Operators commonly want to tighten one knob (e.g.
+        // `max_per_ip` for an exposed deployment) and expect the
+        // rest to fall back to production defaults.
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[p2p.limits]
+max_connections_per_ip = 1
+
+[p2p.limits.rate]
+vote_per_sec = 1024.0
+"#,
+        );
+        let limits = c.p2p.limits.expect("limits section");
+        assert_eq!(limits.max_connections_per_ip, 1);
+        assert_eq!(limits.max_inbound_connections, 64); // default kept
+        assert_eq!(limits.rate.vote_per_sec, 1024.0);
+        assert_eq!(limits.rate.proposal_per_sec, 16.0); // default kept
+        // Round-trip into the runtime shapes consensus consumes.
+        let conn = limits.connection_limits();
+        assert_eq!(conn.max_per_ip, 1);
+        assert_eq!(conn.max_inbound, 64);
+        let rate = limits.rate_limits();
+        assert_eq!(rate.vote_per_sec, 1024.0);
+        assert_eq!(rate.proposal_per_sec, 16.0);
+        assert_eq!(rate.violation_window, std::time::Duration::from_secs(10));
+        assert_eq!(rate.max_violations, 100);
+    }
+
+    #[test]
+    fn p2p_limits_violations_override_takes_effect() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[p2p.limits.violations]
+window_secs = 5
+max_violations = 20
+"#,
+        );
+        let limits = c.p2p.limits.expect("limits section");
+        assert_eq!(limits.violations.window_secs, 5);
+        assert_eq!(limits.violations.max_violations, 20);
+        let rate = limits.rate_limits();
+        assert_eq!(rate.violation_window, std::time::Duration::from_secs(5));
+        assert_eq!(rate.max_violations, 20);
     }
 
     #[test]
