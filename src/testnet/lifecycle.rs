@@ -119,7 +119,14 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
         .map(|n| n.node_id.clone().expect("node_id populated in phase 1"))
         .collect();
     for n in &nodes {
-        write_final_config(n, &nodes, &validator_ids, timeout_base_ms, timeout_max_ms)?;
+        write_final_config(
+            n,
+            &nodes,
+            &validator_ids,
+            spec.target_degree,
+            timeout_base_ms,
+            timeout_max_ms,
+        )?;
     }
 
     let state = State {
@@ -181,6 +188,7 @@ fn write_final_config(
     n: &NodeLayout,
     all: &[NodeLayout],
     validators: &[String],
+    target_degree: usize,
     timeout_base_ms: u64,
     timeout_max_ms: u64,
 ) -> anyhow::Result<()> {
@@ -232,7 +240,8 @@ fn write_final_config(
          cleanup_interval_secs = 60\n\
          \n\
          [overlay]\n\
-         mode = \"gossip\"\n\
+         mode          = \"gossip\"\n\
+         target_degree = {target_degree}\n\
          \n\
          [consensus]\n\
          validators       = [{validators_toml}]\n\

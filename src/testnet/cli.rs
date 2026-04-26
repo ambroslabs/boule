@@ -216,7 +216,12 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
         i += 1;
     }
     let nodes = nodes.ok_or_else(|| anyhow::anyhow!("`new` requires --nodes <N>"))?;
-    let target_degree = target_degree.unwrap_or_else(|| seed_extra + 3);
+    // Match `OverlayConfig::default().target_degree` when --target-degree
+    // is omitted. The issue's k+3 minimum applies only when the operator
+    // is sweeping a sparse-mesh preset; the default for casual `new`
+    // invocations should keep enough redundancy that killing 2 nodes in
+    // a 7-node cluster doesn't partition the survivors.
+    let target_degree = target_degree.unwrap_or(8);
     let spec = TopologySpec {
         nodes,
         seed_extra,
@@ -344,9 +349,18 @@ async fn cmd_ls(args: &[String]) -> anyhow::Result<()> {
         anyhow::bail!("`ls` takes no positional args; got {:?}", rest);
     }
     let state = State::load(&workdir)?;
+    // Columns:
+    //   - boot: number of `[[peers]]` bootstrap entries written by `new`
+    //   - peers: realized direct-peer count from /peers (live nodes only;
+    //     "-" when the node is down, "?" when the API is unreachable).
+    //
+    // The bootstrap count is what gets configured at boot; the realized
+    // count is what the gossip overlay actually maintains. Showing both
+    // makes it obvious whether `target_degree` is being honored without
+    // chasing down /peers per-node.
     println!(
-        "{:>7}  {:<46}  {:<22}  {:<22}  {:<8}  peers",
-        "node", "node_id", "p2p", "api", "status"
+        "{:>7}  {:<46}  {:<22}  {:<22}  {:<10}  {:>4}  {:>5}",
+        "node", "node_id", "p2p", "api", "status", "boot", "peers"
     );
     for n in &state.nodes {
         let pid = lifecycle::pid_alive(n);
@@ -367,19 +381,22 @@ async fn cmd_ls(args: &[String]) -> anyhow::Result<()> {
             .api_addr
             .map(|a| a.to_string())
             .unwrap_or_else(|| "?".into());
-        let peers: Vec<String> = n
-            .bootstrap_peers
-            .iter()
-            .map(|i| super::workdir::node_dir_name(*i))
-            .collect();
+        let live_peers = match (pid, n.api_addr) {
+            (Some(_), Some(addr)) => match admin::maybe_peers(addr).await? {
+                Some(v) => v.len().to_string(),
+                None => "?".into(),
+            },
+            _ => "-".into(),
+        };
         println!(
-            "{:>7}  {:<46}  {:<22}  {:<22}  {:<8}  {}",
+            "{:>7}  {:<46}  {:<22}  {:<22}  {:<10}  {:>4}  {:>5}",
             n.display_name(),
             id_short,
             p2p,
             api,
             status,
-            peers.join(",")
+            n.bootstrap_peers.len(),
+            live_peers,
         );
     }
     Ok(())
