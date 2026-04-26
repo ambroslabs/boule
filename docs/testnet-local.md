@@ -331,128 +331,139 @@ consensus. The 3-node setup you just built is fine for gossip but is a
 degenerate consensus committee — `n = 3f + 1` means `f = 0` at three
 nodes, so any single failure halts the cluster. The smallest meaningful
 HotStuff committee is **four nodes**, where `f = 1` and the cluster
-tolerates one fault. We'll spin up a fourth node here, then enable
-consensus on all four.
+tolerates one fault.
 
-### Add node4
+Spinning a four-node cluster up by hand — minting four keys, copying
+four IDs, threading each into the other three configs, appending
+byte-identical `[consensus]` blocks — is enough ceremony that we ship
+a workspace binary, `testnet`, that does it for you. The §9b
+fault-tolerance walkthrough also drives the cluster through this
+binary; the same one handles steady-state setup here. Operators who
+need to write configs by hand can model after the schema in
+[§3 Lay out the testnet directory](#3-lay-out-the-testnet-directory)
+and the annotated block under
+[§8 What the driver writes](#what-the-driver-writes) below.
 
-Add a `node4` directory and config alongside the existing three:
+### Build the driver
+
+`cargo build --release` builds both binaries; if you ran it in §1 you
+already have them:
 
 ```sh
-mkdir -p testnet/node4
+cargo build --release
+ls target/release/ambros-p2p target/release/testnet
 ```
 
-`testnet/node4/config.toml`:
+### Generate the cluster
+
+`testnet new` lays out a per-node workdir, mints each node's identity,
+and writes final configs with the validator list, peer list, and
+consensus tuning baked in. It refuses to clobber an existing layout
+— if `state.json` already exists, `new` exits with an error and asks
+you to pick a fresh `--workdir` or delete the old one:
+
+```sh
+./target/release/testnet new --nodes 4 --seed 1 --workdir testnet4 \
+    --ambros-bin ./target/release/ambros-p2p
+```
+
+This produces:
+
+```
+testnet4/
+├── state.json              # driver bookkeeping (node IDs, addresses, PIDs)
+├── events.jsonl            # append-only log of every driver action
+├── node1/
+│   ├── config.toml         # full config — schema below
+│   ├── node.key            # minted by `ambros-p2p init`
+│   ├── addr.json           # `addr_file` written on bind, read by the driver
+│   ├── consensus/          # WAL + block store (storage_dir)
+│   ├── pid                 # written by `up`, removed by `down`
+│   └── log                 # captured stderr (driver redirects)
+├── node2/ ...
+├── node3/ ...
+└── node4/ ...
+```
+
+<a id="what-the-driver-writes"></a>
+
+#### What the driver writes
+
+Each per-node `config.toml` is the same shape you'd write by hand:
 
 ```toml
 [node]
-listen_addr = "127.0.0.1:7003"
+listen_addr = "127.0.0.1:<auto>"
+addr_file   = "testnet4/node1/addr.json"
 
 [node.identity]
 backend = "file"
-path    = "./testnet/node4/node.key"
+path    = "testnet4/node1/node.key"
 
 [api]
-listen_addr = "127.0.0.1:8003"
+listen_addr = "127.0.0.1:<auto>"
 cleanup_interval_secs = 60
-```
 
-Mint its identity the same way you did for nodes 1–3:
+[overlay]
+mode          = "gossip"
+target_degree = 8
 
-```sh
-./target/release/ambros-p2p init --config testnet/node4/config.toml
-# stdout includes: "provisioned new node key: NodeId = <base58…>"
-```
-
-### Wire all four nodes peer-to-peer
-
-For consensus you want a **full mesh** so the round-robin leader can
-broadcast proposals to every other replica without depending on gossip
-hops. Each node's config gets `[[peers]]` entries for the other three.
-Append to each config (substituting the four node IDs you recorded):
-
-```toml
-# testnet/node1/config.toml — add the other three peers
-[[peers]]
-addr    = "127.0.0.1:7001"
-node_id = "<node2-id>"
-
-[[peers]]
-addr    = "127.0.0.1:7002"
-node_id = "<node3-id>"
-
-[[peers]]
-addr    = "127.0.0.1:7003"
-node_id = "<node4-id>"
-```
-
-Repeat the equivalent block on each of the other three configs (each
-node lists the other three peers, never itself).
-
-### Append the consensus section
-
-Append the same `[consensus]` block to all four configs. The
-`validators` list must be **byte-identical across every replica** — the
-list's ordering determines round-robin leader rotation, and a mismatch
-means the committee doesn't agree on whose turn it is. Every node's own
-ID must appear in the list.
-
-```toml
 [consensus]
-validators       = ["<node1-id>", "<node2-id>", "<node3-id>", "<node4-id>"]
-genesis_seed_hex = "0000000000000000000000000000000000000000000000000000000000000000"
-propose_limit    = 64
-timeout_base_ms  = 500
-timeout_max_ms   = 5000
-storage_dir      = "./testnet/node1/consensus"   # change per-node
+validators      = ["<node1-id>", "<node2-id>", "<node3-id>", "<node4-id>"]
+storage_dir     = "testnet4/node1/consensus"
+timeout_base_ms = 200
+timeout_max_ms  = 2000
+
+[[peers]]
+addr    = "127.0.0.1:<node2-p2p>"
+node_id = "<node2-id>"
+# … one [[peers]] block per bootstrap neighbour
 ```
 
-`storage_dir` makes consensus state durable across restarts (used in the
-fault-tolerance experiments below). If omitted, an in-memory backend is
-used — acceptable for a throwaway demo but no crash recovery.
+Notes worth knowing:
 
-Optional: bounded-cache caps live under a `[consensus.limits]`
-sub-table. The defaults are sized for a 4–dozen-validator cluster
-under steady-state load, so omit the table unless you have a specific
-memory or stress-test reason to override:
-
-```toml
-[consensus.limits]
-vote_bucket_capacity      = 1024   # default
-parked_proposals_capacity = 256    # default
-pending_blocks_capacity   = 1024   # default
-timeout_buckets_capacity  = 1024   # default
-mempool_capacity          = 1024   # default — bundled InMemoryMempool
-```
-
-Forced evictions are reported in `/consensus/status` under
-`cache_evictions` (one counter per cache, monotonic per-process) and
-emit a structured INFO trace tagged `cache=<name>` so a flood
-targeting one specific cache is easy to grep out of the logs.
+- The `validators` list is **byte-identical across every replica**. The
+  list's ordering determines round-robin leader rotation, and a
+  mismatch means the committee doesn't agree on whose turn it is.
+- `storage_dir` makes consensus state durable across restarts (used in
+  the fault-tolerance experiments below). Omitting it falls back to an
+  in-memory backend — fine for a throwaway demo but with no crash
+  recovery.
+- `[overlay].target_degree` is the partial-mesh fan-out the gossip
+  overlay maintains. The driver bootstraps each node with a small
+  ring-neighbour `[[peers]]` block; gossip discovers the rest. Pass
+  `--target-degree T` to override.
+- `genesis_seed_hex` and `propose_limit` are omitted — every replica
+  picks up the same defaults, which is sufficient for a laptop
+  cluster. Set them by hand when reproducing a specific genesis or
+  when stress-testing the proposer.
+- Bounded-cache caps live under a `[consensus.limits]` sub-table
+  (`vote_bucket_capacity`, `parked_proposals_capacity`,
+  `pending_blocks_capacity`, `timeout_buckets_capacity`,
+  `mempool_capacity`, all default 1024 except `parked_proposals_capacity`
+  which defaults to 256). Forced evictions are reported in
+  `/consensus/status` under `cache_evictions` and emit a structured
+  INFO trace tagged `cache=<name>`. The driver doesn't write the
+  table; add it to `testnet4/nodeN/config.toml` post-`new` if you
+  need to override.
 
 > **Bootstrapping notes.** Adding a fifth validator later requires
 > editing and restarting every existing replica with the new committee
 > list. Dynamic membership changes are out of scope for v1. The
-> `genesis_seed_hex` field is a 32-byte hex string — pick a throwaway
-> value and make sure every replica uses the same one, or they will
+> `genesis_seed_hex` field is a 32-byte hex string — when you do set
+> one, make sure every replica uses the same one, or they will
 > disagree on the genesis block and refuse to make progress.
 
-### Start the cluster
-
-Start each node in its own terminal (or `tmux` pane). A small startup
-stagger lets the dialer tasks settle, but isn't required:
+### Bring the cluster up
 
 ```sh
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node1/config.toml &
-sleep 0.3
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node2/config.toml &
-sleep 0.3
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node3/config.toml &
-sleep 0.3
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node4/config.toml &
+./target/release/testnet up --workdir testnet4
 ```
 
-Within a few seconds each node's log should show:
+The driver spawns each node in the background, captures stderr to
+`testnet4/nodeN/log`, records each PID in `testnet4/nodeN/pid`, and
+returns once the four processes are running. Within a few seconds
+each log file should contain:
 
 ```
 INFO ambros_p2p: consensus: event loop spawned
@@ -468,74 +479,57 @@ making progress, not just exchanging messages.
 
 Three checks, in order from cheapest to most thorough.
 
-**1. Are all four nodes connected?** `/peers` should report 3 entries on
-every node:
+**1. Snapshot.** `testnet snap` reads `/consensus/status` on every node
+and tabulates the answer — connectivity, current view, last committed
+height, role:
 
 ```sh
-for p in 8000 8001 8002 8003; do
-  echo "node on :$p sees:"
-  curl -s http://127.0.0.1:$p/peers | jq -r '.[] | .node_id'
-done
+./target/release/testnet snap --workdir testnet4
 ```
 
-**2. Is each node committing?** The `/consensus/status` endpoint
-publishes a JSON snapshot of consensus-internal state on every event-loop
-iteration. `last_committed_height` should be growing on every node:
+```
+   node  status        view   height  peers  role
+  node1  up(54320)       28       27      3  replica
+  node2  up(54321)       28       27      3  leader(view=28)
+  node3  up(54322)       27       26      3  replica
+  node4  up(54323)       28       27      3  replica
+```
+
+`self_role` reads `"leader(view=N)"` on whichever node is the
+round-robin proposer for the current view, `"replica"` on the others.
+After a few seconds, `height` should be ≥ 1 on every node and
+`peers` should be 3 (the other three replicas).
+
+**2. Per-node detail.** `testnet info <node>` prints the full
+`/consensus/status` payload, and `testnet info <node> peers` lists
+that node's direct gossip peers:
 
 ```sh
-for p in 8000 8001 8002 8003; do
-  echo "node on :$p:"
-  curl -s http://127.0.0.1:$p/consensus/status \
-    | jq '{current_view, last_committed_height, self_role, peers_connected}'
-done
+./target/release/testnet info node1 --workdir testnet4
+./target/release/testnet info node1 peers --workdir testnet4
 ```
 
-`self_role` reads `"leader(view=N)"` on whichever node is the round-robin
-proposer for the current view, `"replica"` on the others. After a few
-seconds, `last_committed_height` should be ≥ 1 on every node.
-
-**3. Do all nodes agree on the chain (safety)?** Extract every
-`(height, view)` pair each node has committed and confirm any height
-that two nodes both committed is at the same view:
+**3. Safety.** `testnet verify-safety` extracts every `(height, view)`
+commit pair from every node's log and reports any height where two
+nodes recorded different views — the smoking gun for a safety
+violation. Exits non-zero on a violation, so it composes into CI:
 
 ```sh
-mkdir -p /tmp/ambros-check
-for i in 1 2 3 4; do
-  port=$((7999 + i))
-  # Pull each node's commit log from its tracing output.
-  # Assumes you redirected each node's stderr to testnet/nodeN/log.
-  grep -oE "height=[0-9]+ view=[0-9]+" testnet/node$i/log \
-    | sed -E 's/height=([0-9]+) view=([0-9]+)/\1 \2/' \
-    | sort -n -k1 -u > /tmp/ambros-check/n$i.hv
-done
-
-violations=0
-for h in $(cat /tmp/ambros-check/n*.hv | cut -d' ' -f1 | sort -n -u); do
-  views=$(for i in 1 2 3 4; do
-    grep "^$h " /tmp/ambros-check/n$i.hv | head -1 | cut -d' ' -f2
-  done | sort -u)
-  count=$(echo "$views" | wc -w)
-  if [ "$count" -gt 1 ]; then
-    echo "SAFETY VIOLATION at height=$h: views=$views"
-    violations=$((violations+1))
-  fi
-done
-echo "checked $(cat /tmp/ambros-check/n*.hv | wc -l) commit records, $violations violations"
+./target/release/testnet verify-safety --workdir testnet4
+# verify-safety: 0 violations
 ```
 
-A healthy cluster reports `0 violations`. The (height, view) pair is
-sufficient to detect a safety violation because two distinct blocks at
+The (height, view) pair is sufficient because two distinct blocks at
 the same height would have been proposed in different views, and the
-commit log records both.
-
-> The above one-liner assumes you redirected each node's logs to a file
-> via `&>> testnet/nodeN/log` or similar. If you ran them inline in
-> separate terminals, save the output first or use the `/consensus/status`
-> snapshot which exposes the same `last_committed_height` per node.
+commit log records both. The parser tolerates the ANSI color codes
+that `tracing-subscriber`'s pretty formatter emits, so a passing run
+actually means consistency, not "grep happened to miss a colored
+field".
 
 ### Reading `/consensus/status`
 
-The full status payload is intended for live debugging. The fields:
+The full status payload (`testnet info <node>`, or `curl` directly)
+is intended for live debugging. The fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -559,53 +553,41 @@ consensus is even configured.
 ## 9. Fault-tolerance experiments
 
 The point of HotStuff is that it keeps committing under faults. These
-experiments stress the cluster you just built and the bigger one in §9b,
-and verify that **safety holds** (no two nodes commit different blocks
-at the same height) and **liveness holds** (survivors keep committing).
-
-For the scripts below, redirect each node's logs to a file so you can
-post-process them. The pattern is:
-
-```sh
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node1/config.toml \
-  > testnet/node1/log 2>&1 &
-PID1=$!
-# ... etc per node, recording PID1, PID2, PID3, PID4
-```
+experiments stress the four-node cluster from §8 and the bigger one in
+§9b, and verify that **safety holds** (no two nodes commit different
+blocks at the same height) and **liveness holds** (survivors keep
+committing). The driver handles log capture, PID tracking, and the
+safety check, so the experiments collapse to a handful of subcommands.
 
 ### 9a. f = 1: kill one node, verify survivors
 
-With the four-node cluster from §8 running, snapshot the survivors'
-commit counts, kill one node, then check that the other three keep
-committing:
+With the four-node cluster from §8 still up, snapshot the cluster,
+SIGKILL one node, wait for the survivors to keep committing past a
+new height, then re-snapshot and re-verify safety:
 
 ```sh
-# Cluster is running; PID2 is the node we'll kill.
-sleep 3   # let the cluster reach steady state
-echo "before kill:"
-for i in 1 3 4; do
-  echo "  n$i: $(grep -c 'committed block' testnet/node$i/log) commits"
-done
-echo "killing n2 (pid=$PID2)"
-kill -9 $PID2
-sleep 6
-echo "after kill (survivors should have grown):"
-for i in 1 3 4; do
-  c=$(grep -c "committed block" testnet/node$i/log)
-  last=$(grep "committed block" testnet/node$i/log | tail -1 | grep -oE 'height=[0-9]+')
-  echo "  n$i: $c commits, $last"
-done
+./target/release/testnet snap --workdir testnet4
+./target/release/testnet kill node2 --workdir testnet4
+./target/release/testnet wait --all-reach-height 30 --workdir testnet4
+./target/release/testnet snap --workdir testnet4
+./target/release/testnet verify-safety --workdir testnet4
 ```
 
-You should see each survivor's commit count higher than its pre-kill
-snapshot. The post-kill rate is significantly slower than steady state
-— with `timeout_base_ms = 500` and one of four leaders dead, every
-fourth view eats a timeout-certificate round (~500ms). Expect roughly
-one commit per second post-kill versus tens per second on the happy path.
+`snap` after the kill should report `node2` as `down` and the other
+three nodes' `height` higher than the pre-kill snapshot. The post-kill
+commit rate is significantly slower than steady state — with
+`timeout_base_ms = 200` and one of four leaders dead, every fourth view
+eats a timeout-certificate round. Expect roughly one commit per
+hundreds of milliseconds post-kill versus tens of commits per second on
+the happy path; pick a `--all-reach-height` target that gives the
+survivors enough headroom over the pre-kill height to actually exercise
+the dead-leader rotation.
 
-Re-run the safety verifier from §8 to confirm no two survivors disagree
-on any committed height. After a single-node kill it should still report
-zero violations.
+`verify-safety` should still report zero violations: a single-node kill
+in an `f = 1` cluster is exactly within the fault budget, so no two
+survivors will commit different blocks at the same height. Bring `node2`
+back with `testnet up node2 --workdir testnet4` once you're done — the
+restart triggers the block-sync catch-up path covered in §9b.
 
 ### 9b. f = 2: rotating failures with seven nodes
 
@@ -615,16 +597,10 @@ be the same two nodes for all time: a node can crash, recover, and
 participate while a different node fails. HotStuff's fault tolerance is
 **per-snapshot**, not per-identity.
 
-This walkthrough used to be a hand-rolled shell script (PID-tracking
-env vars, fixed `sleep`s, log scraping with `grep`). Issue #189 replaced
-it with a workspace binary, `testnet`, that does the same dance through
-typed primitives: it spawns nodes, waits on the admin API instead of
-polling clocks, kills processes by index, and runs the §8 safety check
-against ANSI-tolerant log parsing. Build it once:
-
-```sh
-cargo build --release --bin testnet --bin ambros-p2p
-```
+The driver scales the §8 recipe to any committee size. `testnet new
+--nodes 7` lays out a seven-node ring and writes final configs the
+same way it did for the four-node cluster, and the same fault-injection
+primitives (`scenario`, `kill`, `wait`, `verify-safety`) apply.
 
 #### One-shot rotating-failure run
 
@@ -636,12 +612,10 @@ cargo build --release --bin testnet --bin ambros-p2p
 ./target/release/testnet down --workdir testnet7
 ```
 
-`new` lays out a seven-node ring under `testnet7/` (per-node config,
-key, `consensus/` storage, log file), mints each node's identity, and
-writes final configs with the full `[consensus].validators` list and
-sparse `[[peers]]` block (only the two ring neighbours `i ± 1 mod 7`
-per node, since the gossip overlay discovers the rest through
-peer-list gossip).
+`new` lays out a seven-node ring under `testnet7/` the same way it did
+in §8, except that with `n = 7` the bootstrap `[[peers]]` block per node
+is just the two ring neighbours `i ± 1 mod 7` (the gossip overlay
+discovers the rest through peer-list gossip).
 
 `scenario rotating-failure-7n-f2 --seed 1` brings the cluster up if
 it isn't already, waits for every node to commit through height 5,
@@ -668,8 +642,8 @@ While the cluster is up:
 ./target/release/testnet verify-safety --workdir testnet7
 ```
 
-`snap` is the §9b shell script's `snap` helper, but reading the admin
-API instead of grepping logs:
+`snap` reads `/consensus/status` on every node and tabulates the
+result:
 
 ```
    node  status        view   height  peers  role
@@ -679,23 +653,21 @@ API instead of grepping logs:
   ...
 ```
 
-`telemetry` tallies the consensus / block-sync counters that used to
-require ad-hoc grep over each log: `consensus_resumed`,
+`telemetry` tallies the consensus / block-sync counters that would
+otherwise require ad-hoc grep over each log: `consensus_resumed`,
 `block_sync_request_emitted`, `block_sync_response_received`,
 `proposal_rejected_unknown_parent`, `gossip_send_to_dispatched`.
 
-`verify-safety` is the §8 cross-node `(height, view)` consistency
-check. It exits non-zero on a violation and prints the divergent
-views per node. Unlike the shell version, the parser tolerates the
-ANSI color codes that `tracing-subscriber`'s pretty formatter emits —
-the original `grep -oE "height=[0-9]+ view=[0-9]+"` silently dropped
-matches when the field was wrapped in a color escape.
+`verify-safety` is the same §8 cross-node `(height, view)` consistency
+check. Running it after a scenario re-verifies that the fault window
+didn't introduce a divergent commit; it exits non-zero on a violation
+and prints the divergent views per node.
 
 #### Crash recovery
 
-The legacy walkthrough also exercised "kill, wait, restart, observe
-catch-up via block-sync, kill different nodes". The driver supports
-the same, expressed as scenario steps:
+A common follow-up to "kill one node" is "bring it back, watch it
+catch up, then kill a different one". The driver expresses that as a
+sequence of `kill` / `up` / `wait` calls:
 
 ```sh
 ./target/release/testnet kill node2  --workdir testnet7
@@ -710,16 +682,14 @@ The `wait --catch-up-to-cluster` predicate is the answer to "how
 long do I sleep after a restart?" — it polls
 `last_committed_height` on the restarted node and the rest of the
 live cluster, and returns when the gap closes within `--tolerance`.
-This replaces the §9b script's `sleep 15` after a relaunch (a fixed
-guess that scaled badly with how many blocks were missed). Block-sync
-walks back one parent per pacemaker tick, so the underlying wait time
+Block-sync walks back one parent per pacemaker tick, so the wait time
 is still bounded by the gap (issue #185 tracks the planned bulk-range
 RPC + dedicated retry timer), but the driver no longer
-under-or-overshoots.
+under-or-overshoots a fixed sleep.
 
-The block-sync round-trip is visible at `RUST_LOG=info` — same
-events as before, the driver just exposes `telemetry` as a tabular
-summary rather than asking operators to grep:
+The block-sync round-trip is visible at `RUST_LOG=info`; `telemetry`
+exposes the same events as a tabular summary rather than asking
+operators to grep:
 
 - `consensus_resumed` (once, on a node's restart) — reports the
   recovered `last_committed_height`, `last_voted_view`, and
@@ -818,19 +788,31 @@ The available `op =` values match the CLI: `wait_all_reach_height`,
 
 ## 10. Shut down and clean up
 
-Ctrl-C each node. The binary traps `SIGINT`, drains connections (flushing
+For nodes you started by hand (the §1–§7 gossip walkthrough), Ctrl-C
+each terminal. The binary traps `SIGINT`, drains connections (flushing
 TLS `close_notify` so peers don't log an ugly unclean-shutdown error),
 then exits within a few seconds.
 
-To reset state entirely — fresh keys, empty stores — remove the testnet
-directory:
+For driver-managed clusters (§8 onwards), `testnet down` SIGTERMs every
+live node, escalates to SIGKILL after a 3s grace, and reaps the per-node
+`pid` files. It's idempotent — safe to run after a `Ctrl-C` interrupted
+scenario, or twice in a row:
 
 ```sh
-rm -rf testnet testnet7
+./target/release/testnet down --workdir testnet4
+./target/release/testnet down --workdir testnet7
 ```
 
-Your node IDs will change after this, so remember to re-wire `[[peers]]`
-(and `[consensus].validators`, if enabled) after minting fresh keys.
+To reset state entirely — fresh keys, empty stores — remove the testnet
+directories:
+
+```sh
+rm -rf testnet testnet4 testnet7
+```
+
+Node IDs will change after this. The driver mints fresh ones on the
+next `testnet new`; for the manual gossip walkthrough, remember to
+re-wire each `[[peers]]` block after re-running `ambros-p2p init`.
 
 ---
 
@@ -856,9 +838,10 @@ Your node IDs will change after this, so remember to re-wire `[[peers]]`
 ## Reference: commands used above
 
 ```sh
-# Build
+# Build (produces target/release/{ambros-p2p,testnet})
 cargo build --release
 
+# ── Manual gossip walkthrough (§3–§7) ───────────────────────────────────────
 # Bootstrap a node (idempotent; mints the file/encrypted-file key,
 # creates the consensus storage_dir, prints the NodeId)
 ./target/release/ambros-p2p init --config testnet/nodeN/config.toml
@@ -869,7 +852,25 @@ RUST_LOG=info ./target/release/ambros-p2p start --config testnet/nodeN/config.to
 # Print help (shows all subcommands including `key migrate`)
 ./target/release/ambros-p2p --help
 
-# Admin API — gossip-only fields
+# ── Driver-managed consensus cluster (§8 onwards) ───────────────────────────
+./target/release/testnet new --nodes 4 --workdir testnet4 \
+    --ambros-bin ./target/release/ambros-p2p
+./target/release/testnet up            --workdir testnet4
+./target/release/testnet ls            --workdir testnet4   # static topology
+./target/release/testnet snap          --workdir testnet4   # live commit/view/peers
+./target/release/testnet info node1    --workdir testnet4
+./target/release/testnet logs node1    --workdir testnet4 --tail 80
+./target/release/testnet telemetry     --workdir testnet4
+./target/release/testnet verify-safety --workdir testnet4
+./target/release/testnet kill node2    --workdir testnet4
+./target/release/testnet up   node2    --workdir testnet4
+./target/release/testnet wait --node node2 --catch-up-to-cluster --tolerance 2 \
+    --workdir testnet4
+./target/release/testnet scenario rotating-failure-7n-f2 --seed 1 \
+    --workdir testnet7 --ambros-bin ./target/release/ambros-p2p
+./target/release/testnet down          --workdir testnet4
+
+# ── Admin API — gossip-only fields ──────────────────────────────────────────
 curl -s http://127.0.0.1:8000/peers
 curl -s http://127.0.0.1:8000/messages
 curl -s -X POST http://127.0.0.1:8000/messages \
@@ -879,10 +880,10 @@ curl -s -X POST http://127.0.0.1:8000/rpc/ping/<peer-node-id> \
      -H 'content-type: application/json' \
      -d '{"payload":"ping"}'
 
-# Admin API — consensus (only when [consensus] is enabled)
+# ── Admin API — consensus (only when [consensus] is enabled) ────────────────
 curl -s http://127.0.0.1:8000/consensus/status | jq
 
-# Cluster sizing
+# ── Cluster sizing ──────────────────────────────────────────────────────────
 #   n = 3f + 1  →  4 nodes tolerates 1 fault, 7 nodes tolerates 2.
 #   Quorum = 2f + 1 of n.
 ```
