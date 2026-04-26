@@ -774,6 +774,13 @@ proptest! {
             parked_proposals_capacity: FUZZ_PARKED_PROPOSALS_CAP,
             pending_blocks_capacity: FUZZ_PENDING_BLOCKS_CAP,
             timeout_buckets_capacity: usize::MAX,
+            // Block-sync retry knobs match `unbounded_for_tests`: no
+            // backoff, no rotation, no drop budget. The fuzz harness
+            // tests cap-based eviction, not the #196 rotate/drop path.
+            block_sync_initial_backoff_views: 0,
+            block_sync_max_backoff_views: 0,
+            block_sync_per_peer_attempts: u32::MAX,
+            block_sync_max_attempts: u32::MAX,
         };
         let counters = CacheEvictionCounters::default();
         let builder = Arc::new(TestBlockBuilder { proposer: self_id });

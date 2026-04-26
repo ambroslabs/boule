@@ -73,6 +73,26 @@ pub struct CacheLimits {
     /// place; this cap protects against flooding that never reaches
     /// quorum.
     pub timeout_buckets_capacity: usize,
+    /// Initial views to wait between successive `RequestBlock` retries
+    /// for the same parent hash. Backoff doubles each attempt up to
+    /// [`Self::block_sync_max_backoff_views`]. A value of `0` disables
+    /// backoff (every `PacemakerAdvance` re-emits, matching the
+    /// pre-#196 behaviour preserved by [`Self::unbounded_for_tests`]).
+    pub block_sync_initial_backoff_views: u64,
+    /// Cap on the per-parent-hash retry gap in views. The exponential
+    /// schedule saturates here so a long-stuck parent doesn't push
+    /// the next retry arbitrarily far into the future.
+    pub block_sync_max_backoff_views: u64,
+    /// How many `RequestBlock` retries the safety core sends to the
+    /// same peer before rotating to the next validator in the ring.
+    /// `0` is treated as `1` (one attempt per peer before rotating).
+    pub block_sync_per_peer_attempts: u32,
+    /// Total `RequestBlock` retries the safety core will issue for a
+    /// single parent hash before dropping every parked proposal that
+    /// depends on it. `u32::MAX` disables the budget; eviction then
+    /// only fires under the cap-based [`Self::parked_proposals_capacity`]
+    /// path.
+    pub block_sync_max_attempts: u32,
 }
 
 impl CacheLimits {
@@ -87,6 +107,19 @@ impl CacheLimits {
             parked_proposals_capacity: usize::MAX,
             pending_blocks_capacity: usize::MAX,
             timeout_buckets_capacity: usize::MAX,
+            // Backoff disabled (0/0) so every `PacemakerAdvance` fires
+            // a retry, `per_peer_attempts = u32::MAX` so retries
+            // always go to the original sender (no rotation), and
+            // `max_attempts = u32::MAX` so block-sync never gives
+            // up — preserves the pre-#196 "ask the same peer
+            // forever" behaviour the property tests and wire-fuzz
+            // harness assume. The rotate-and-drop path is opt-in:
+            // only tests that explicitly set bounded values
+            // exercise it.
+            block_sync_initial_backoff_views: 0,
+            block_sync_max_backoff_views: 0,
+            block_sync_per_peer_attempts: u32::MAX,
+            block_sync_max_attempts: u32::MAX,
         }
     }
 
@@ -100,6 +133,10 @@ impl CacheLimits {
             parked_proposals_capacity: DEFAULT_PARKED_PROPOSALS_CAPACITY,
             pending_blocks_capacity: DEFAULT_PENDING_BLOCKS_CAPACITY,
             timeout_buckets_capacity: DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
+            block_sync_initial_backoff_views: DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
+            block_sync_max_backoff_views: DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
+            block_sync_per_peer_attempts: DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
+            block_sync_max_attempts: DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
         }
     }
 }
@@ -118,6 +155,27 @@ pub const DEFAULT_PARKED_PROPOSALS_CAPACITY: usize = 256;
 pub const DEFAULT_PENDING_BLOCKS_CAPACITY: usize = 1024;
 /// Default cap on the integration layer's timeout-vote buckets.
 pub const DEFAULT_TIMEOUT_BUCKETS_CAPACITY: usize = 1024;
+/// Default initial views between successive `RequestBlock` retries on
+/// the same parent hash. The first retry is eligible after one
+/// `PacemakerAdvance`; subsequent retries double the gap up to
+/// [`DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS`].
+pub const DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS: u64 = 1;
+/// Default ceiling on the per-parent-hash retry gap in views. With the
+/// default initial of `1` and the doubling schedule, the gap saturates
+/// here after roughly four attempts.
+pub const DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS: u64 = 8;
+/// Default attempts at the same peer before rotating to the next
+/// validator in the ring. Two gives the original sender a brief retry
+/// window (one redelivery in case the first probe was lost in flight)
+/// before fanning out.
+pub const DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS: u32 = 2;
+/// Default total `RequestBlock` budget per parent hash. With the
+/// default `per_peer = 2`, eight attempts cover the original sender
+/// plus three rotation rounds, which exhausts the four-validator
+/// ring twice. After this, the parked proposals depending on the
+/// missing parent are dropped and the
+/// [`CacheEvictionCounters::block_sync_dropped`] counter ticks.
+pub const DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS: u32 = 8;
 
 /// Atomic counters tracking forced evictions across the consensus
 /// caches. Cheap to clone (each inner counter is an `Arc<AtomicU64>`)
@@ -134,6 +192,7 @@ struct CacheEvictionCountersInner {
     parked_proposals: AtomicU64,
     pending_blocks: AtomicU64,
     timeout_buckets: AtomicU64,
+    block_sync_dropped: AtomicU64,
 }
 
 impl CacheEvictionCounters {
@@ -165,6 +224,14 @@ impl CacheEvictionCounters {
     pub fn timeout_buckets(&self) -> u64 {
         self.inner.timeout_buckets.load(Ordering::Relaxed)
     }
+    /// Cumulative number of parked proposals dropped after the
+    /// `RequestBlock` retry budget was exhausted (see
+    /// [`CacheLimits::block_sync_max_attempts`]). Distinct from
+    /// [`Self::parked_proposals`], which only counts cap-based
+    /// evictions: this counter measures stuck-block-sync drops.
+    pub fn block_sync_dropped(&self) -> u64 {
+        self.inner.block_sync_dropped.load(Ordering::Relaxed)
+    }
 
     pub(crate) fn inc_vote_bucket(&self, n: u64) {
         if n > 0 {
@@ -186,6 +253,13 @@ impl CacheEvictionCounters {
             self.inner.timeout_buckets.fetch_add(n, Ordering::Relaxed);
         }
     }
+    pub(crate) fn inc_block_sync_dropped(&self, n: u64) {
+        if n > 0 {
+            self.inner
+                .block_sync_dropped
+                .fetch_add(n, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -201,6 +275,9 @@ mod tests {
         assert!(l.parked_proposals_capacity > 0);
         assert!(l.pending_blocks_capacity > 0);
         assert!(l.timeout_buckets_capacity > 0);
+        assert!(l.block_sync_per_peer_attempts >= 1);
+        assert!(l.block_sync_max_attempts >= l.block_sync_per_peer_attempts);
+        assert!(l.block_sync_initial_backoff_views <= l.block_sync_max_backoff_views);
     }
 
     #[test]
@@ -210,6 +287,15 @@ mod tests {
         assert_eq!(l.parked_proposals_capacity, usize::MAX);
         assert_eq!(l.pending_blocks_capacity, usize::MAX);
         assert_eq!(l.timeout_buckets_capacity, usize::MAX);
+        // No backoff, no rotation, and no drop budget: every
+        // PacemakerAdvance fires a retry to the original sender and
+        // `block_sync_inflight` never auto-drops parked proposals —
+        // preserves pre-#196 semantics for the property tests and
+        // the wire-fuzz harness.
+        assert_eq!(l.block_sync_initial_backoff_views, 0);
+        assert_eq!(l.block_sync_max_backoff_views, 0);
+        assert_eq!(l.block_sync_per_peer_attempts, u32::MAX);
+        assert_eq!(l.block_sync_max_attempts, u32::MAX);
     }
 
     #[test]
@@ -224,10 +310,12 @@ mod tests {
         c.inc_parked_proposals(3);
         c.inc_pending_blocks(5);
         c.inc_timeout_buckets(7);
+        c.inc_block_sync_dropped(11);
         assert_eq!(c.vote_bucket(), 2);
         assert_eq!(c.parked_proposals(), 3);
         assert_eq!(c.pending_blocks(), 5);
         assert_eq!(c.timeout_buckets(), 7);
+        assert_eq!(c.block_sync_dropped(), 11);
 
         // Clone shares state — handing a counter handle to two
         // subsystems must aggregate, not split.
@@ -243,9 +331,11 @@ mod tests {
         c.inc_parked_proposals(0);
         c.inc_pending_blocks(0);
         c.inc_timeout_buckets(0);
+        c.inc_block_sync_dropped(0);
         assert_eq!(c.vote_bucket(), 0);
         assert_eq!(c.parked_proposals(), 0);
         assert_eq!(c.pending_blocks(), 0);
         assert_eq!(c.timeout_buckets(), 0);
+        assert_eq!(c.block_sync_dropped(), 0);
     }
 }
