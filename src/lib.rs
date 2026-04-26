@@ -94,3 +94,4 @@ pub mod replication;
 #[cfg(test)]
 mod sim;
 pub mod storage;
+pub mod testnet;
