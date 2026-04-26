@@ -114,6 +114,11 @@ pub async fn run(
         let pgt = peer_gone_tx.clone();
         let dtx = discovery_tx.clone();
         let our_id = identity.node_id;
+        let connection_limiter = config
+            .p2p
+            .limits
+            .as_ref()
+            .map(|l| Arc::new(p2p::limits::ConnectionLimiter::new(l.connection_limits())));
         tokio::spawn(p2p::manager::run(
             our_id,
             p2p_cmd_rx,
@@ -121,6 +126,7 @@ pub async fn run(
             itx,
             pgt,
             dtx,
+            connection_limiter,
         ))
     };
 
@@ -193,6 +199,16 @@ pub async fn run(
     // is selected from `config.overlay.mode`; for gossip mode the
     // bootstrap_addrs are dialed at boot via `Discovery::add_bootstrap`.
     let consensus_runtime = if let Some(cons_cfg) = config.consensus.as_ref() {
+        // Build the rate limiter alongside consensus when `[p2p.limits]`
+        // is present in the config; the limiter is plumbed into the
+        // ConsensusNode below so ingress is gated before
+        // `dispatch::ingress` ever runs.
+        let rate_limiter = config.p2p.limits.as_ref().map(|l| {
+            Arc::new(p2p::limits::RateLimiter::new(
+                l.rate_limits(),
+                Arc::clone(&clock),
+            ))
+        });
         Some(
             start_consensus(
                 cons_cfg,
@@ -204,6 +220,7 @@ pub async fn run(
                 dialer_ctx,
                 Arc::clone(&clock),
                 p2p_actual_addr,
+                rate_limiter,
             )
             .await?,
         )
@@ -335,6 +352,7 @@ async fn start_consensus(
     dialer_ctx: DialerCtx,
     clock: Arc<dyn Clock>,
     self_listen_addr: std::net::SocketAddr,
+    rate_limiter: Option<Arc<p2p::limits::RateLimiter>>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     info!(
@@ -397,7 +415,10 @@ async fn start_consensus(
 
     let initial_status = Arc::new(node.build_status());
     let (status_tx, status_rx) = watch::channel(initial_status);
-    let node = node.with_status_publisher(status_tx);
+    let mut node = node.with_status_publisher(status_tx);
+    if let Some(limiter) = rate_limiter {
+        node = node.with_rate_limiter(limiter, Some(p2p_cmd_tx.clone()));
+    }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let signer = Arc::clone(signer) as Arc<dyn crate::crypto::signed::Signer>;

@@ -5,6 +5,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{info, warn};
 
 use super::PeerCommand;
+use super::limits::Direction;
 use super::manager::{AnyStream, ManagerMsg};
 use super::tls::{NodeId, TlsIdentity, TlsStream, extract_node_id, node_id_to_base58};
 use crate::clock::Clock;
@@ -116,6 +117,7 @@ pub async fn reconnect_loop(
                     .send(ManagerMsg::NewConnection {
                         node_id,
                         addr,
+                        direction: Direction::Outbound,
                         stream,
                     })
                     .await

@@ -155,6 +155,31 @@ impl SimCluster {
     ///
     /// Panics if `n < 4` (minimum BFT cluster size for `f = 1`).
     pub async fn spawn(n: usize, timeout_base: Duration) -> Self {
+        Self::spawn_inner(n, timeout_base, None).await.0
+    }
+
+    /// Same as [`SimCluster::spawn`] but installs a per-node rate
+    /// limiter (issue #134) built from `rate_limits`. The returned
+    /// `Vec<Arc<RateLimiter>>` is in the same order as
+    /// [`SimCluster::node_ids`], so a test can read each peer's
+    /// drop / disconnect counters independently. Uses a [`TokioClock`]
+    /// for the limiter — sufficient for honest-traffic acceptance
+    /// tests because the production-default per-second rates leave
+    /// orders of magnitude of wall-time headroom for any sim that
+    /// finishes in seconds.
+    pub async fn spawn_with_rate_limits(
+        n: usize,
+        timeout_base: Duration,
+        rate_limits: crate::p2p::limits::RateLimitsConfig,
+    ) -> (Self, Vec<Arc<crate::p2p::limits::RateLimiter>>) {
+        Self::spawn_inner(n, timeout_base, Some(rate_limits)).await
+    }
+
+    async fn spawn_inner(
+        n: usize,
+        timeout_base: Duration,
+        rate_limits: Option<crate::p2p::limits::RateLimitsConfig>,
+    ) -> (Self, Vec<Arc<crate::p2p::limits::RateLimiter>>) {
         assert!(n >= 4, "BFT requires at least 4 nodes (3f+1 with f=1)");
 
         // Create N fresh signers and collect their node IDs.
@@ -198,6 +223,7 @@ impl SimCluster {
         let node_ids: Vec<NodeId> = vs.iter().copied().collect();
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
+        let mut limiters: Vec<Arc<crate::p2p::limits::RateLimiter>> = Vec::new();
 
         for (nid, event_rx) in event_rxs {
             let signer = signer_map[&nid].clone();
@@ -222,8 +248,22 @@ impl SimCluster {
 
             // ConsensusNode::new already auto-seeds the cluster-agreed
             // genesis QC; no explicit with_genesis_qc override here.
-            let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
+            let mut node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
                 .with_commit_observer(commit_tx);
+
+            // Optional rate-limiter (issue #134). The sim has no real
+            // peer manager so we plumb `peer_cmd_tx = None`; tests
+            // observe the disconnect-decision via the limiter's own
+            // counters. The cluster's clock here is a TokioClock —
+            // sufficient under tokio::time::pause + advance because
+            // wall time still ticks for the limiter and the production
+            // defaults leave orders-of-magnitude of headroom.
+            if let Some(rl_cfg) = rate_limits.as_ref() {
+                let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+                let limiter = Arc::new(crate::p2p::limits::RateLimiter::new(rl_cfg.clone(), clock));
+                limiters.push(Arc::clone(&limiter));
+                node = node.with_rate_limiter(limiter, None);
+            }
 
             // Per-node outbound channel: node writes here through its
             // `Broadcaster`; the routing task reads on the other side.
@@ -263,7 +303,7 @@ impl SimCluster {
 
         let commit_cache: Vec<Vec<Block>> = (0..n).map(|_| Vec::new()).collect();
 
-        SimCluster {
+        let cluster = SimCluster {
             commit_rxs,
             node_ids,
             partitioned,
@@ -274,7 +314,8 @@ impl SimCluster {
             commit_cache,
             shutdown_txs,
             overlay_shutdowns: Vec::new(),
-        }
+        };
+        (cluster, limiters)
     }
 
     /// Add node `idx` to the partition set. The routing tasks will drop all
@@ -2802,6 +2843,70 @@ mod tests {
                     "circulant ring must be symmetric: {i} → {j} but not back"
                 );
             }
+        }
+    }
+
+    // ── Rate-limit acceptance (issue #134) ──────────────────────────────────
+
+    /// Issue #134 acceptance: a healthy 4-node cluster running with
+    /// the production-default `[p2p.limits]` rates must never drop a
+    /// frame and must never trigger a disconnect-decision. The issue
+    /// text calls for "1k blocks honest sim → zero drops"; we run a
+    /// scaled-down version that gains at least 50 commits per node
+    /// inside the 15s test budget while still exercising every
+    /// per-kind bucket (Proposal, Vote, NewView via the boot flurry,
+    /// and TimeoutVote on any view rotation).
+    #[tokio::test]
+    async fn honest_steady_state_does_not_drop_under_default_rates() {
+        tokio::time::pause();
+
+        let (mut cluster, limiters) = SimCluster::spawn_with_rate_limits(
+            4,
+            Duration::from_millis(50),
+            crate::p2p::limits::RateLimitsConfig::production_defaults(),
+        )
+        .await;
+
+        // Floor of 50 commits per node — well below the per-kind
+        // caps (vote: 256/s × 1.0s burst → 256 tokens) but enough
+        // to exercise repeated proposal/vote/QC cycles.
+        const TARGET_COMMITS: u64 = 50;
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(10), |c| {
+                c.peek_commit_heights().iter().all(|&h| h >= TARGET_COMMITS)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "honest cluster must reach {TARGET_COMMITS} commits per node within 10s simulated; \
+             heights = {:?}",
+            cluster.peek_commit_heights()
+        );
+
+        // No drops, no disconnects on any node's limiter. Use a
+        // structured assertion so a regression points at the
+        // offending kind directly.
+        for (idx, limiter) in limiters.iter().enumerate() {
+            let counters = limiter.counters();
+            assert_eq!(
+                counters.total_drops(),
+                0,
+                "node {idx} unexpectedly dropped frames; per-kind: \
+                 Proposal={} Vote={} NewView={} TimeoutVote={} \
+                 RequestBlock={} ReceiveBlock={} bytes={}",
+                counters.drops(crate::p2p::limits::MessageKind::Proposal),
+                counters.drops(crate::p2p::limits::MessageKind::Vote),
+                counters.drops(crate::p2p::limits::MessageKind::NewView),
+                counters.drops(crate::p2p::limits::MessageKind::TimeoutVote),
+                counters.drops(crate::p2p::limits::MessageKind::RequestBlock),
+                counters.drops(crate::p2p::limits::MessageKind::ReceiveBlock),
+                counters.bytes_drops(),
+            );
+            assert_eq!(
+                counters.disconnects(),
+                0,
+                "node {idx} unexpectedly issued a disconnect-decision",
+            );
         }
     }
 }

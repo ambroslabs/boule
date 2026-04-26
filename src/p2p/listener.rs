@@ -4,6 +4,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use super::limits::Direction;
 use super::manager::ManagerMsg;
 use super::tls::{NodeId, TlsStream, extract_node_id, node_id_to_base58};
 use tokio_rustls::TlsAcceptor;
@@ -74,6 +75,7 @@ async fn handshake_inbound(
         .send(ManagerMsg::NewConnection {
             node_id,
             addr,
+            direction: Direction::Inbound,
             stream: Box::new(TlsStream::Server(tls_stream)),
         })
         .await;

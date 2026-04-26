@@ -548,6 +548,7 @@ impl SimDriver {
                     .send(ManagerMsg::NewConnection {
                         node_id: id,
                         addr: sim_addr(idx),
+                        direction: crate::p2p::limits::Direction::Inbound,
                         stream: Box::new(peer_side) as AnyStream,
                     })
                     .await;
@@ -798,6 +799,9 @@ async fn build_gossip_node(ctx: SimNodeCtx) -> SimNode {
         let itx = internal_tx.clone();
         let pgt = peer_gone_tx.clone();
         let dtx = discovery_tx.clone();
+        // Sim runs without per-connection caps so tests do not need
+        // to thread limits config through every harness; production
+        // wires this via `[p2p.limits]` in `src/node.rs`.
         tokio::spawn(crate::p2p::manager::run(
             our_id,
             cmd_rx,
@@ -805,6 +809,7 @@ async fn build_gossip_node(ctx: SimNodeCtx) -> SimNode {
             itx,
             pgt,
             dtx,
+            None,
         ))
     };
 

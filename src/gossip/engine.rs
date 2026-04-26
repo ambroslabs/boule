@@ -88,7 +88,16 @@ mod tests {
         let (discovery_tx, _) = broadcast::channel::<crate::p2p::overlay::DiscoveryEvent>(16);
         let itx = internal_tx.clone();
         tokio::spawn(async move {
-            manager::run(nid(1), cmd_rx, internal_rx, itx, peer_gone_tx, discovery_tx).await;
+            manager::run(
+                nid(1),
+                cmd_rx,
+                internal_rx,
+                itx,
+                peer_gone_tx,
+                discovery_tx,
+                None,
+            )
+            .await;
         });
 
         // Register gossip with its declared cap so the connection task
@@ -110,6 +119,7 @@ mod tests {
             .send(ManagerMsg::NewConnection {
                 node_id: nid(5),
                 addr: addr(),
+                direction: crate::p2p::limits::Direction::Inbound,
                 stream: Box::new(local),
             })
             .await

@@ -65,6 +65,7 @@ use crate::crypto::signed::Signed;
 use crate::crypto::signed::Signer;
 use crate::p2p::NodeId;
 use crate::p2p::ProtocolEvent;
+use crate::p2p::limits::{Decision, MessageKind, RateLimiter};
 use crate::p2p::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use crate::p2p::tls::node_id_to_base58;
 use crate::replication::block::{Block, BlockHash, BlockHeader};
@@ -395,6 +396,21 @@ pub struct ConsensusNode {
     /// `main.rs` can attach a channel built around the initial
     /// snapshot.
     status_tx: Option<watch::Sender<Arc<ConsensusStatus>>>,
+    /// Per-peer rate limiter (issue #134). When set, every inbound
+    /// frame is classified by its postcard variant tag and admitted /
+    /// dropped / disconnected per the configured token buckets. When
+    /// `None`, ingress runs unfiltered — matches the historical
+    /// pre-#134 behaviour and is the default in the simulator's
+    /// happy-path tests.
+    rate_limiter: Option<Arc<RateLimiter>>,
+    /// Channel into the peer manager. When set together with
+    /// `rate_limiter`, a [`Decision::Disconnect`] from the limiter
+    /// drives a [`crate::p2p::PeerCommand::Disconnect`] so the
+    /// offending peer's TCP/TLS connection is torn down. `None` in
+    /// the simulator (which has no real manager); the limiter still
+    /// records the disconnect-decision in its own counter so tests
+    /// can observe the decision.
+    peer_cmd_tx: Option<mpsc::Sender<crate::p2p::PeerCommand>>,
 }
 
 /// Accumulator for one view's timeout votes.
@@ -479,6 +495,8 @@ impl ConsensusNode {
             last_committed_height: 0,
             last_committed_view: 0,
             status_tx: None,
+            rate_limiter: None,
+            peer_cmd_tx: None,
         }
     }
 
@@ -501,6 +519,23 @@ impl ConsensusNode {
     /// (e.g. to start from a mid-chain state).
     pub fn with_genesis_qc(mut self, qc: QuorumCertificate) -> Self {
         self.core.set_high_qc(qc);
+        self
+    }
+
+    /// Attach a per-peer rate limiter (issue #134) and the optional
+    /// peer-command channel used to issue
+    /// [`crate::p2p::PeerCommand::Disconnect`] when the limiter
+    /// returns [`Decision::Disconnect`] for a peer. Pass `peer_cmd_tx
+    /// = None` in the simulator: the limiter will still classify and
+    /// drop, and tests can observe the disconnect decision via
+    /// [`RateLimiter::counters`].
+    pub fn with_rate_limiter(
+        mut self,
+        limiter: Arc<RateLimiter>,
+        peer_cmd_tx: Option<mpsc::Sender<crate::p2p::PeerCommand>>,
+    ) -> Self {
+        self.rate_limiter = Some(limiter);
+        self.peer_cmd_tx = peer_cmd_tx;
         self
     }
 
@@ -726,6 +761,8 @@ impl ConsensusNode {
             last_committed_height: last_committed.height,
             last_committed_view: last_committed.view,
             status_tx: None,
+            rate_limiter: None,
+            peer_cmd_tx: None,
         })
     }
 
@@ -899,6 +936,20 @@ impl ConsensusNode {
                 Some(event) = event_rx.recv() => {
                     match event {
                         ProtocolEvent::Message { from, payload } => {
+                            // Rate-limit at the consensus integration
+                            // boundary, before the postcard decode in
+                            // `dispatch::ingress` (issue #134). The
+                            // limiter peeks at the first byte (the
+                            // postcard variant tag) and decides admit /
+                            // drop / disconnect; on Disconnect we ask
+                            // the manager to tear the peer's
+                            // connection down. The limiter is
+                            // optional, so this stays a no-op for any
+                            // embedding that has not configured one
+                            // (notably the sim's happy-path harness).
+                            if !self.admit_inbound(from, &payload).await {
+                                continue;
+                            }
                             match dispatch::ingress(from, &payload, &self.validator_set) {
                                 Ok(dispatches) => {
                                     for d in dispatches {
@@ -916,9 +967,17 @@ impl ConsensusNode {
                         // multiplexer still fans these out to every
                         // protocol handle (used by the RPC layer for
                         // request cancellation), so we just observe and
-                        // move on at this layer.
-                        ProtocolEvent::PeerConnected { .. }
-                        | ProtocolEvent::PeerDisconnected { .. } => {}
+                        // move on at this layer. The one exception is
+                        // the rate limiter: a disconnect should clear
+                        // the per-peer state so a future reconnect
+                        // starts with a fresh budget (#134 non-goal:
+                        // no cross-reconnect reputation).
+                        ProtocolEvent::PeerConnected { .. } => {}
+                        ProtocolEvent::PeerDisconnected { node_id } => {
+                            if let Some(limiter) = self.rate_limiter.as_ref() {
+                                limiter.forget_peer(node_id);
+                            }
+                        }
                     }
                 }
 
@@ -934,6 +993,66 @@ impl ConsensusNode {
 
         view_timer.cancel();
         Ok(())
+    }
+
+    // ── Rate limiting (issue #134) ──────────────────────────────────────────
+
+    /// Classify `payload` and consult the rate limiter (if any).
+    /// Returns `true` if the frame should be dispatched, `false` if
+    /// the limiter dropped it. On a Disconnect decision, fires a
+    /// best-effort [`crate::p2p::PeerCommand::Disconnect`] for `from`.
+    async fn admit_inbound(&self, from: NodeId, payload: &[u8]) -> bool {
+        let Some(limiter) = self.rate_limiter.as_ref() else {
+            return true;
+        };
+        // Empty frames will fall through to `dispatch::ingress` which
+        // returns IngressError::Decode — let the existing path handle
+        // that consistently rather than silently dropping here.
+        let Some(&first) = payload.first() else {
+            return true;
+        };
+        let Some(kind) = MessageKind::from_wire_tag(first) else {
+            // Unknown tag: pass through so the postcard decode error
+            // surfaces in the existing log path. Treating it as a
+            // rate-limited drop would mask malformed-frame bugs.
+            return true;
+        };
+        match limiter.admit(from, kind, payload.len()) {
+            Decision::Allow => true,
+            Decision::Drop => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    peer = %node_id_to_base58(&from),
+                    msg_type = kind.label(),
+                    bytes = payload.len(),
+                    "rate_limit_drop",
+                );
+                false
+            }
+            Decision::Disconnect => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    peer = %node_id_to_base58(&from),
+                    msg_type = kind.label(),
+                    "rate_limit_disconnect",
+                );
+                if let Some(cmd_tx) = self.peer_cmd_tx.as_ref() {
+                    // Fire-and-forget: if the channel is full or
+                    // closed (manager shut down), the limiter has
+                    // already recorded the disconnect-decision.
+                    let _ = cmd_tx.try_send(crate::p2p::PeerCommand::Disconnect { node_id: from });
+                }
+                // Don't `forget_peer` here: the peer state's
+                // `disconnect_dispatched` latch silences any frames
+                // already queued from this peer before the manager
+                // tears the connection down. The `PeerDisconnected`
+                // arm below clears the state when the connection
+                // actually goes away, so a future reconnect starts
+                // fresh — matching the "no cross-reconnect
+                // reputation" non-goal in #134.
+                false
+            }
+        }
     }
 
     // ── Internal action dispatchers ──────────────────────────────────────────
@@ -3259,5 +3378,228 @@ mod tests {
             has_qc_view_advanced,
             "view_advanced must carry cause=\"qc\"; got: {captured}",
         );
+    }
+
+    // ── RateLimiter integration (issue #134) ────────────────────────────────
+
+    use crate::clock::{Clock, TokioClock};
+    use crate::p2p::PeerCommand;
+    use crate::p2p::limits::{RateLimiter, RateLimitsConfig};
+
+    /// Build a `WireMessage::BlockRequest([0; 32])` postcard frame.
+    /// Cheap to construct (no signing required) and decodes cleanly
+    /// through `dispatch::ingress` so an honest frame survives the
+    /// `Decision::Allow` path. Wire tag = 4.
+    fn block_request_frame() -> bytes::Bytes {
+        let msg = WireMessage::BlockRequest([0u8; 32]);
+        bytes::Bytes::from(postcard::to_allocvec(&msg).expect("encode"))
+    }
+
+    /// Issue #134 acceptance criterion: a peer that floods at 10× the
+    /// configured rate has its excess frames dropped *and* gets
+    /// disconnected after K violations. We measure both outcomes —
+    /// the drop counter rises and a `PeerCommand::Disconnect` lands
+    /// on the manager-side channel.
+    #[tokio::test]
+    async fn flooding_peer_is_dropped_and_disconnected() {
+        // Build a config with a tight per-kind bucket and a low
+        // K so the test finishes quickly.
+        let cfg = RateLimitsConfig {
+            proposal_per_sec: 1.0,
+            vote_per_sec: 1.0,
+            timeout_vote_per_sec: 1.0,
+            new_view_per_sec: 1.0,
+            request_block_per_sec: 1.0,
+            receive_block_per_sec: 1.0,
+            bytes_per_sec: 1024.0 * 1024.0, // generous, isolate the test on per-kind
+            burst_seconds: 1.0,
+            violation_window: std::time::Duration::from_secs(60),
+            max_violations: 5,
+        };
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+        let limiter = Arc::new(RateLimiter::new(cfg, Arc::clone(&clock)));
+
+        let node = make_node(nid(1));
+        let (peer_cmd_tx, mut peer_cmd_rx) = tokio::sync::mpsc::channel::<PeerCommand>(8);
+        let node = node.with_rate_limiter(Arc::clone(&limiter), Some(peer_cmd_tx));
+
+        let signer = fresh_signer();
+        let (event_tx, event_rx) = make_test_event_channel();
+        let (broadcaster, mut _outbound_rx) = make_test_broadcaster();
+        let discovery = make_test_discovery();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let _join = tokio::spawn(async move {
+            let _ = node
+                .run(
+                    broadcaster,
+                    discovery,
+                    event_rx,
+                    Arc::new(signer),
+                    shutdown_rx,
+                )
+                .await;
+        });
+
+        // Drain occasional outbound traffic so the broadcaster channel
+        // doesn't backpressure the run loop.
+        let drain = tokio::spawn(async move { while _outbound_rx.recv().await.is_some() {} });
+
+        // Flood ~50 BlockRequests from a single peer. The first ~1 fits
+        // in the bucket, the rest become violations; after
+        // max_violations the limiter returns Decision::Disconnect once
+        // and the run loop forwards a PeerCommand::Disconnect.
+        let attacker = nid(99);
+        let frame = block_request_frame();
+        for _ in 0..50 {
+            event_tx
+                .send(ProtocolEvent::Message {
+                    from: attacker,
+                    payload: frame.clone(),
+                })
+                .await
+                .expect("event_rx alive");
+        }
+
+        // Wait for the disconnect command. 1s is generous — the run
+        // loop processes the flood without any I/O.
+        let cmd = tokio::time::timeout(Duration::from_secs(1), peer_cmd_rx.recv())
+            .await
+            .expect("disconnect command must fire within 1s")
+            .expect("peer_cmd_tx closed");
+        match cmd {
+            PeerCommand::Disconnect { node_id } => {
+                assert_eq!(
+                    node_id, attacker,
+                    "disconnect must target the flooding peer"
+                );
+            }
+            other => panic!("expected Disconnect, got {other:?}"),
+        }
+
+        // The limiter's per-kind drop counter and disconnect counter
+        // also reflect the flood.
+        assert!(
+            limiter.counters().drops(MessageKind::RequestBlock) > 0,
+            "BlockRequest drops must accumulate"
+        );
+        assert_eq!(limiter.counters().disconnects(), 1);
+
+        drain.abort();
+    }
+
+    /// Honest steady-state with the production-default rate limits
+    /// installed must never drop a frame. Mirrors the issue's
+    /// "1k-block sim → zero drops" criterion in miniature: we feed
+    /// a small steady stream that stays well below the per-kind
+    /// caps and assert zero drops.
+    #[tokio::test]
+    async fn honest_steady_state_does_not_trip_default_limits() {
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+        let limiter = Arc::new(RateLimiter::new(
+            RateLimitsConfig::production_defaults(),
+            Arc::clone(&clock),
+        ));
+
+        let node = make_node(nid(1));
+        let (peer_cmd_tx, _peer_cmd_rx) = tokio::sync::mpsc::channel::<PeerCommand>(8);
+        let node = node.with_rate_limiter(Arc::clone(&limiter), Some(peer_cmd_tx));
+
+        let signer = fresh_signer();
+        let (event_tx, event_rx) = make_test_event_channel();
+        let (broadcaster, mut _outbound_rx) = make_test_broadcaster();
+        let discovery = make_test_discovery();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let _ = node
+                .run(
+                    broadcaster,
+                    discovery,
+                    event_rx,
+                    Arc::new(signer),
+                    shutdown_rx,
+                )
+                .await;
+        });
+        let drain = tokio::spawn(async move { while _outbound_rx.recv().await.is_some() {} });
+
+        // Send 8 BlockRequests/sec equivalent (the default cap is 8/s).
+        // We push 4 per peer in one burst — well within the 8-token
+        // capacity. With four peers the per-peer counter never trips
+        // because each peer has its own bucket.
+        let frame = block_request_frame();
+        for peer_byte in 1..=4u8 {
+            let peer = [peer_byte; 32];
+            for _ in 0..4 {
+                event_tx
+                    .send(ProtocolEvent::Message {
+                        from: peer,
+                        payload: frame.clone(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        // Give the run loop a few ticks to drain the queue.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            limiter.counters().total_drops(),
+            0,
+            "honest steady-state below the per-kind cap must not drop"
+        );
+        assert_eq!(limiter.counters().disconnects(), 0);
+
+        drain.abort();
+    }
+
+    /// A peer flooding `RequestBlock` does not affect another peer's
+    /// `Vote` budget — the per-type, per-peer buckets are
+    /// independent. Issue #134 acceptance: "saturating one type doesn't
+    /// starve another".
+    #[tokio::test]
+    async fn one_peer_saturating_one_type_does_not_starve_another() {
+        let cfg = RateLimitsConfig {
+            proposal_per_sec: 4.0,
+            vote_per_sec: 4.0,
+            timeout_vote_per_sec: 4.0,
+            new_view_per_sec: 4.0,
+            request_block_per_sec: 4.0,
+            receive_block_per_sec: 4.0,
+            bytes_per_sec: 1024.0 * 1024.0,
+            burst_seconds: 1.0,
+            violation_window: std::time::Duration::from_secs(60),
+            max_violations: 1_000_000, // never disconnect in this test
+        };
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+        let limiter = Arc::new(RateLimiter::new(cfg, Arc::clone(&clock)));
+
+        // Saturate Peer A's RequestBlock bucket.
+        let peer_a = nid(0xAA);
+        let frame = block_request_frame();
+        for _ in 0..20 {
+            let _ = limiter.admit(peer_a, MessageKind::RequestBlock, frame.len());
+        }
+        assert!(limiter.counters().drops(MessageKind::RequestBlock) > 0);
+
+        // Peer B's Vote bucket is unaffected.
+        let peer_b = nid(0xBB);
+        for _ in 0..4 {
+            assert_eq!(
+                limiter.admit(peer_b, MessageKind::Vote, 64),
+                crate::p2p::limits::Decision::Allow
+            );
+        }
+        // And Peer A's Vote bucket is unaffected too — distinct
+        // bucket per (peer, kind).
+        for _ in 0..4 {
+            assert_eq!(
+                limiter.admit(peer_a, MessageKind::Vote, 64),
+                crate::p2p::limits::Decision::Allow
+            );
+        }
     }
 }

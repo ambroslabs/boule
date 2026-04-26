@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 
 use tokio::sync::{broadcast, mpsc};
 
+use crate::p2p::limits::Direction;
 use crate::p2p::manager::{AnyStream, ManagerMsg};
 use crate::p2p::{ConnectionProtocol, NodeId};
 
@@ -30,6 +31,7 @@ impl ConnectionProtocol for SimConnectionProtocol {
                 .send(ManagerMsg::NewConnection {
                     node_id,
                     addr,
+                    direction: Direction::Inbound,
                     stream,
                 })
                 .await

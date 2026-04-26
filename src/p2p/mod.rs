@@ -72,6 +72,8 @@ pub mod connection;
 pub mod dialer;
 /// Pluggable long-term identity (Ed25519) storage backends.
 pub mod identity;
+/// Per-peer rate limiting and global connection caps (issue #134).
+pub mod limits;
 /// Inbound TLS listener task. Accepts mutually authenticated connections and
 /// hands them to the manager.
 #[allow(missing_docs)]
