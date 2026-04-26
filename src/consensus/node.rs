@@ -106,6 +106,7 @@ fn pacemaker_event_kind(ev: &PacemakerEvent) -> &'static str {
         PacemakerEvent::OnTimeoutCert(_) => "OnTimeoutCert",
         PacemakerEvent::OnTimeout(_) => "OnTimeout",
         PacemakerEvent::OnProposalReceived(_) => "OnProposalReceived",
+        PacemakerEvent::OnRoundSync(_) => "OnRoundSync",
     }
 }
 
@@ -1602,7 +1603,9 @@ impl ConsensusNode {
         if !self.timeout_buckets.contains_key(&view) {
             self.evict_timeout_buckets_to_fit_one();
         }
-        let adopt_qc = {
+        let honesty_threshold =
+            crate::consensus::hotstuff::qc::honesty_threshold(self.validator_set.len());
+        let (adopt_qc, fired_round_sync) = {
             let bucket = self.timeout_buckets.entry(view).or_default();
             let is_new = bucket.signers.insert(signed.signer);
             if !is_new {
@@ -1632,11 +1635,38 @@ impl ConsensusNode {
                 "timeout_vote",
             );
 
+            // Round-sync hint (issue #218): the bucket has reached
+            // `f + 1` distinct signers, so at least one honest peer
+            // reports being at view `view`. We can advance our
+            // pacemaker to `view` even before quorum gives us a TC.
+            // Crucially, a single Byzantine signer can't fire this —
+            // it needs at least one honest co-signer — which is what
+            // keeps the `TimeoutSpammer` adversary from dragging
+            // honest views to `u64::MAX`.
+            //
+            // Fire on the exact crossing so we don't re-emit on every
+            // subsequent vote into the same bucket.
+            let fire_round_sync = bucket_size == honesty_threshold;
+
             if bucket_size < quorum {
-                return Ok(());
+                return if fire_round_sync {
+                    self.fire_round_sync(view, broadcaster, view_timer, signer)
+                        .await
+                } else {
+                    Ok(())
+                };
             }
-            bucket.best_high_qc.clone()
+            (bucket.best_high_qc.clone(), fire_round_sync)
         };
+
+        // We've also crossed full quorum — but if we passed the
+        // honesty threshold on this same vote, surface the round-sync
+        // hint first so the pacemaker has the latest view recorded
+        // before the OnTimeoutCert flow runs.
+        if fired_round_sync {
+            self.fire_round_sync(view, broadcaster, view_timer, signer)
+                .await?;
+        }
 
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1673,6 +1703,29 @@ impl ConsensusNode {
         // safe — that function handles `AdvanceToView` / `BecomeLeader` /
         // `ResetTimer` / `SendTimeout`, and the pacemaker's reaction to
         // `OnTimeoutCert` never re-emits `OnTimeoutCert` itself.
+        Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
+    }
+
+    /// Surface a [`PacemakerEvent::OnRoundSync(view)`] hint to the
+    /// pacemaker, then apply the resulting actions. Called from
+    /// [`Self::on_timeout_vote`] when a per-view bucket reaches the
+    /// honesty threshold (`f + 1` distinct signers — see issue #218
+    /// for the wedge this prevents and the Byzantine-bound rationale
+    /// for the threshold choice).
+    async fn fire_round_sync(
+        &mut self,
+        view: View,
+        broadcaster: &dyn Broadcaster,
+        view_timer: &mut ViewTimer,
+        signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        tracing::debug!(
+            target: TRACE_TARGET,
+            view,
+            current = self.pacemaker.current_view(),
+            "round_sync_fired",
+        );
+        let pm_actions = self.step_pacemaker(PacemakerEvent::OnRoundSync(view));
         Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
     }
 
@@ -3144,6 +3197,141 @@ mod tests {
         // but the timer IS armed. We verify the loop at least processed the
         // boot sequence without panicking: if the task panicked, the test
         // harness would surface it on the next await or drop.
+    }
+
+    // ── #218: TimeoutVote round-sync hint ───────────────────────────────────
+
+    /// A signed `TimeoutVote(view=N)` from a single peer must NOT
+    /// drag the local pacemaker forward — that would let a Byzantine
+    /// `TimeoutSpammer` set our `current_view` to `u64::MAX` with one
+    /// frame. The hint only fires once the local bucket reaches
+    /// `f + 1` distinct signers (the honesty threshold), guaranteeing
+    /// at least one honest peer agrees.
+    ///
+    /// This test verifies the bound: a single TimeoutVote leaves
+    /// `current_view` untouched even though it's bucketed.
+    #[tokio::test]
+    async fn timeout_vote_single_signer_does_not_advance_pacemaker_view() {
+        let self_signer = fresh_signer();
+        let peer_signer = fresh_signer();
+        let mut ids = vec![
+            self_signer.node_id(),
+            peer_signer.node_id(),
+            nid(0xA1),
+            nid(0xA2),
+        ];
+        ids.sort();
+        let vs = ValidatorSet::new(ids);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        let mut node = ConsensusNode::new(
+            self_signer.node_id(),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+
+        let view_before = node.pacemaker.current_view();
+        let tv = crate::consensus::hotstuff::qc::TimeoutVote {
+            view: 42,
+            high_qc: None,
+        };
+        let signed =
+            crate::crypto::signed::Signed::sign(tv, &peer_signer).expect("sign TimeoutVote");
+        let wire = WireMessage::TimeoutVote(signed);
+        let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
+
+        let dispatches = crate::consensus::dispatch::ingress(peer_signer.node_id(), &payload, &vs)
+            .expect("ingress");
+        let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+        for d in dispatches {
+            node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
+                .await
+                .expect("apply_dispatch");
+        }
+
+        // 1 distinct signer < f + 1 = 2 (n = 4, f = 1) → no hint
+        // fires, the pacemaker stays put.
+        assert_eq!(
+            node.pacemaker.current_view(),
+            view_before,
+            "single-signer TimeoutVote must not advance the pacemaker — that's \
+             the Byzantine bound that keeps a TimeoutSpammer adversary from \
+             dragging honest views (see #218)",
+        );
+    }
+
+    /// Two distinct signers' `TimeoutVote(view=N)` is the honesty
+    /// threshold for `n = 4` (`f + 1 = 2`): at least one must be
+    /// honest. The pacemaker fast-jumps *to* `N` (not `N + 1`)
+    /// without promoting `high_qc_view`. This is the path that closes
+    /// the post-restart view-skew wedge in #218 — distinct resume
+    /// views (e.g. 28 vs 29) leave each replica bucketing only at the
+    /// view it itself is on, never reaching quorum, never emitting a
+    /// TC; the round-sync hint at `f + 1` is what unsticks them.
+    #[tokio::test]
+    async fn two_distinct_timeout_votes_fire_round_sync_and_advance_pacemaker() {
+        let self_signer = fresh_signer();
+        let peer_a = fresh_signer();
+        let peer_b = fresh_signer();
+        let mut ids = vec![
+            self_signer.node_id(),
+            peer_a.node_id(),
+            peer_b.node_id(),
+            nid(0xA1),
+        ];
+        ids.sort();
+        let vs = ValidatorSet::new(ids);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        let mut node = ConsensusNode::new(
+            self_signer.node_id(),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+
+        let high_qc_view_before = node.pacemaker.high_qc_view();
+        let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Feed two distinct signers' TimeoutVote(42) through the same
+        // ingress + dispatch path the live event loop uses.
+        for peer in [&peer_a, &peer_b] {
+            let tv = crate::consensus::hotstuff::qc::TimeoutVote {
+                view: 42,
+                high_qc: None,
+            };
+            let signed = crate::crypto::signed::Signed::sign(tv, peer).expect("sign TimeoutVote");
+            let wire = WireMessage::TimeoutVote(signed);
+            let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
+            let dispatches = crate::consensus::dispatch::ingress(peer.node_id(), &payload, &vs)
+                .expect("ingress");
+            for d in dispatches {
+                node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
+                    .await
+                    .expect("apply_dispatch");
+            }
+        }
+
+        assert_eq!(
+            node.pacemaker.current_view(),
+            42,
+            "OnRoundSync at f+1 honesty threshold jumps to v, not v+1",
+        );
+        assert_eq!(
+            node.pacemaker.high_qc_view(),
+            high_qc_view_before,
+            "OnRoundSync must not promote high_qc_view — round sync is a \
+             liveness hint, not a QC witness",
+        );
     }
 
     // ── Self-addressed loopback (#118) ───────────────────────────────────────

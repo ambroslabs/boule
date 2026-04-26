@@ -207,6 +207,76 @@ fn proposal_received_resets_timer_at_current_backoff() {
     assert_eq!(pm.consecutive_failures(), 1);
 }
 
+// ── #218: OnRoundSync ─────────────────────────────────────────────────────
+
+/// Round sync jumps the pacemaker *to* `v` (not `v + 1` like
+/// `OnQc`/`OnTimeoutCert`) when `v` is strictly ahead of the current
+/// view. The `cause` field surfaces `RoundSync` so an operator
+/// reading the trace can distinguish single-signer round-sync from
+/// quorum-of-evidence advances.
+#[test]
+fn round_sync_jumps_to_v_not_v_plus_one_for_future_view() {
+    let mut pm = make_pm(1);
+    let actions = pm.step(Event::OnRoundSync(7));
+    assert_eq!(pm.current_view(), 7, "advance is *to* v, not to v + 1");
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            Action::AdvanceToView {
+                view: 7,
+                cause: AdvanceCause::RoundSync
+            }
+        )),
+        "expected AdvanceToView(7, RoundSync), got {actions:?}",
+    );
+    assert_eq!(pm.consecutive_failures(), 0, "advance resets failures");
+}
+
+/// Round-sync hints for the current view or older views are no-ops:
+/// the only way to advance is strict `>`. Same idempotency contract as
+/// `OnQc` / `OnTimeoutCert` for stale events.
+#[test]
+fn round_sync_for_current_or_stale_view_is_noop() {
+    let mut pm = make_pm(1);
+    let _ = pm.step(Event::OnQc(4));
+    assert_eq!(pm.current_view(), 5);
+
+    // Stale.
+    let actions = pm.step(Event::OnRoundSync(3));
+    assert!(
+        actions.is_empty(),
+        "stale round-sync is a no-op: {actions:?}"
+    );
+    assert_eq!(pm.current_view(), 5);
+
+    // Current.
+    let actions = pm.step(Event::OnRoundSync(5));
+    assert!(
+        actions.is_empty(),
+        "current-view round-sync is a no-op: {actions:?}"
+    );
+    assert_eq!(pm.current_view(), 5);
+}
+
+/// Round sync must not promote `high_qc_view` — the whole point of
+/// keeping `OnRoundSync` distinct from `OnQc` is that a single signer
+/// is enough evidence for "I should be at this view too" but is *not*
+/// enough evidence to claim a QC was assembled at the prior view.
+#[test]
+fn round_sync_does_not_advance_high_qc_view() {
+    let mut pm = make_pm(1);
+    let _ = pm.step(Event::OnQc(2));
+    assert_eq!(pm.high_qc_view(), 2);
+
+    let _ = pm.step(Event::OnRoundSync(7));
+    assert_eq!(pm.current_view(), 7);
+    assert_eq!(
+        pm.high_qc_view(),
+        2,
+        "round-sync must leave high_qc_view untouched — only OnQc moves it",
+    );
+}
+
 #[test]
 fn tc_resets_failures_so_next_timeout_uses_base() {
     let mut pm = make_pm(1);

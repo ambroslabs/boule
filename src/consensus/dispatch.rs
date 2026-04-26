@@ -208,6 +208,16 @@ pub fn ingress_wire(
         WireMessage::TimeoutVote(signed) => {
             verify_signer(signed.signer, vs)?;
             verify_sig(&signed)?;
+            // The round-sync hint that closes the #218 wedge fires
+            // at the integration layer (`on_timeout_vote`), not here:
+            // it only kicks in once the local timeout bucket has
+            // accumulated `f + 1` distinct signers for the same view,
+            // ensuring at least one honest peer agrees. A
+            // single-signer hint at this layer would let a Byzantine
+            // `TimeoutSpammer` (see `sim_byzantine`) drag honest
+            // replicas' `current_view` arbitrarily forward by
+            // broadcasting `TimeoutVote(view = u64::MAX)`. The
+            // bucket-driven path keeps the trust gradient honest.
             Ok(vec![Dispatch::TimeoutVote(signed)])
         }
 
