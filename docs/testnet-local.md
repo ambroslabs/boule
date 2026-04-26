@@ -796,11 +796,12 @@ Three properties to verify:
      whether the requested peer was a current direct neighbour;
      under the sparse-mesh `[[peers]]` setup above it's commonly
      `false` because the proposer of an unknown-parent proposal
-     usually isn't directly connected. Either way, since the unicast
-     is wrapped in an `OverlayFrame::Forward { target: Some(peer),
-     .. }` and fanned out to every direct neighbour (issue #182),
-     the request reaches the target via the gossip mesh — the
-     same proven path that delivers consensus broadcasts.
+     usually isn't directly connected. Either way, the request is
+     fanned out as a `Forward` frame to every direct neighbour
+     (issue #182) and every receiver surfaces the payload to its
+     consensus dispatch — the responders independently look up the
+     block and reply, the requester deduplicates by hash, and the
+     wire path is the same proven one consensus broadcasts use.
 3. **Safety is preserved across rotating failures.** Run the §8 safety
    verifier against `testnet7/node*/log` after the run completes:
 

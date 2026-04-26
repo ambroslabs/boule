@@ -154,12 +154,10 @@ pub fn apply_overlay_frame(table: &PeerTable, raw: &[u8]) -> Result<Vec<NodeId>,
         OverlayFrame::Forward {
             msg_id,
             originator,
-            target,
             payload,
         } => Err(FrameOutcome::Forward {
             msg_id,
             originator,
-            target,
             payload,
         }),
     }
@@ -180,12 +178,6 @@ pub enum FrameOutcome {
         /// `from` field of the delivered [`crate::p2p::ProtocolEvent::Message`]
         /// regardless of how many gossip hops the frame traversed.
         originator: NodeId,
-        /// Intended unicast recipient, if any. `None` means broadcast
-        /// (every receiver surfaces); `Some(peer)` means only `peer`
-        /// surfaces upstream — other receivers still re-fanout so the
-        /// frame can reach `peer` through the gossip mesh. See
-        /// [`OverlayFrame::Forward`] and issue #182.
-        target: Option<NodeId>,
         /// Application payload to surface upstream if the dedup
         /// check passes.
         payload: bytes::Bytes,
@@ -400,7 +392,6 @@ mod tests {
         let frame = OverlayFrame::Forward {
             msg_id: id,
             originator: orig,
-            target: None,
             payload: Bytes::from_static(b"hello"),
         };
         let bytes = postcard::to_stdvec(&frame).unwrap();
@@ -408,37 +399,11 @@ mod tests {
             Err(FrameOutcome::Forward {
                 msg_id,
                 originator,
-                target,
                 payload,
             }) => {
                 assert_eq!(msg_id, id);
                 assert_eq!(originator, orig);
-                assert_eq!(target, None);
                 assert_eq!(&payload[..], b"hello");
-            }
-            other => panic!("expected Forward, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn apply_overlay_frame_forwards_target_through_to_caller() {
-        let table = PeerTable::new(nid(0), 16);
-        let id: MsgId = [11u8; 16];
-        let orig = nid(1);
-        let tgt = nid(7);
-        let frame = OverlayFrame::Forward {
-            msg_id: id,
-            originator: orig,
-            target: Some(tgt),
-            payload: Bytes::from_static(b"unicast"),
-        };
-        let bytes = postcard::to_stdvec(&frame).unwrap();
-        match apply_overlay_frame(&table, &bytes) {
-            Err(FrameOutcome::Forward {
-                target, payload, ..
-            }) => {
-                assert_eq!(target, Some(tgt));
-                assert_eq!(&payload[..], b"unicast");
             }
             other => panic!("expected Forward, got {other:?}"),
         }
