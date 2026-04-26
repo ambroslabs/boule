@@ -75,7 +75,7 @@ use crate::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
 use crate::replication::block::{Block, BlockHash};
 use crate::replication::impls::{CounterStateMachine, InMemoryMempool};
 use crate::replication::state_machine::StateMachine;
-use crate::storage::{MemoryStorage, MemoryWal};
+use crate::storage::{MemoryStorage, MemoryWal, Storage, Wal};
 use bytes::Bytes;
 use rand::Rng;
 use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
@@ -191,6 +191,26 @@ pub struct SimCluster {
     /// `select!` shutdown arm stays pending; dropped together on
     /// [`SimCluster::drop`]. Empty for mesh-mode clusters.
     overlay_shutdowns: Vec<oneshot::Sender<()>>,
+    /// Per-node signers, captured so [`SimCluster::restart_all_with_recover`]
+    /// can re-spawn the cluster with the same identities. In the same
+    /// `node_ids` order. `None` for clusters that don't support
+    /// restart (e.g. the gossip-mode cluster).
+    signers: Option<Vec<Arc<dyn Signer>>>,
+    /// Per-node durable storage handles, captured so
+    /// [`SimCluster::restart_all_with_recover`] can resume against the
+    /// same on-disk state. Same order as [`Self::signers`].
+    storages: Option<Vec<Arc<dyn Storage>>>,
+    /// Per-node WAL handles, captured for the same reason as
+    /// [`Self::storages`].
+    wals: Option<Vec<Arc<dyn Wal>>>,
+    /// Captured `ValidatorSet`. Stable across restarts (issue #23 has
+    /// not landed yet).
+    validator_set: ValidatorSet,
+    /// Captured genesis block. Stable across restarts.
+    genesis: Block,
+    /// Captured view-timer base, re-used by restart so the post-restart
+    /// behaviour matches the pre-restart cadence.
+    timeout_base: Duration,
 }
 
 impl SimCluster {
@@ -329,12 +349,20 @@ impl SimCluster {
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut limiters: Vec<Arc<crate::p2p::limits::RateLimiter>> = Vec::new();
+        // Captured for [`SimCluster::restart_all_with_recover`] (#206).
+        // Each Vec is in the same `node_ids` (sorted ascending) order
+        // as `commit_rxs` / `shutdown_txs`, so a `take`/`recover`
+        // round-trip stays index-consistent.
+        let mut signers_for_restart: Vec<Arc<dyn Signer>> = Vec::new();
+        let mut storages_for_restart: Vec<Arc<dyn Storage>> = Vec::new();
+        let mut wals_for_restart: Vec<Arc<dyn Wal>> = Vec::new();
 
         for (idx, (nid, event_rx)) in event_rxs.into_iter().enumerate() {
             let signer = signer_map[&nid].clone();
             let adversary_for_node: Option<Arc<dyn Adversary>> = adversaries
                 .as_ref()
                 .and_then(|slots| slots.get(idx).cloned().flatten());
+            signers_for_restart.push(Arc::clone(&signer));
 
             let config = NodeConfigForConsensus {
                 validator_set: vs.clone(),
@@ -348,8 +376,10 @@ impl SimCluster {
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
             let mempool = Arc::new(InMemoryMempool::new(256));
-            let storage = Arc::new(MemoryStorage::new());
-            let wal = Arc::new(MemoryWal::new());
+            let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+            let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+            storages_for_restart.push(Arc::clone(&storage));
+            wals_for_restart.push(Arc::clone(&wal));
 
             let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
             commit_rxs.push(commit_rx);
@@ -432,6 +462,12 @@ impl SimCluster {
             commit_cache,
             shutdown_txs,
             overlay_shutdowns: Vec::new(),
+            signers: Some(signers_for_restart),
+            storages: Some(storages_for_restart),
+            wals: Some(wals_for_restart),
+            validator_set: vs,
+            genesis,
+            timeout_base,
         };
         (cluster, limiters)
     }
@@ -724,6 +760,169 @@ impl SimCluster {
             }
         }
         false
+    }
+
+    /// Tear down every live node and re-spawn the cluster against the
+    /// same on-disk state via [`ConsensusNode::recover`].
+    ///
+    /// This is the SimCluster analog of `kill -9` + restart on every
+    /// replica simultaneously: each node's `(signer, storage, wal)`
+    /// triple is preserved across the call, so recovery sees the
+    /// previous session's `last_voted_view`, `locked`, `high_qc`, the
+    /// committed-block store, and (post-#206) the locked / high_qc
+    /// blocks too. Pacemaker, mempool, state-machine, partition state,
+    /// and dead-node set are *not* preserved — they're re-created
+    /// fresh, mirroring what happens when a real replica's process
+    /// restarts.
+    ///
+    /// Used by issue #206's regression test: a 4-node cluster that
+    /// committed a few blocks then restarted all replicas would
+    /// permanently stall, because every leader's
+    /// [`HotStuffCore::become_leader`] returned an empty action set
+    /// when the high_qc's parent block was missing from
+    /// `pending_blocks`. The fix landed in `persist_updates` /
+    /// `recover_state`; this helper exists so the regression test can
+    /// exercise the post-restart liveness end-to-end.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cluster doesn't carry the per-node state required
+    /// to restart (currently only the mesh-mode constructors do —
+    /// see [`SimCluster::spawn`]). Gossip-mode clusters
+    /// ([`SimCluster::spawn_gossip`]) cannot be restarted today.
+    pub async fn restart_all_with_recover(&mut self) {
+        let signers = self
+            .signers
+            .clone()
+            .expect("restart_all_with_recover requires a mesh-mode SimCluster");
+        let storages = self
+            .storages
+            .clone()
+            .expect("restart_all_with_recover requires captured storages");
+        let wals = self
+            .wals
+            .clone()
+            .expect("restart_all_with_recover requires captured WALs");
+        let n = self.node_ids.len();
+        assert_eq!(signers.len(), n);
+        assert_eq!(storages.len(), n);
+        assert_eq!(wals.len(), n);
+
+        // Phase 1: shutdown every live node. Drop the existing
+        // broadcaster/discovery channels by signalling shutdown — the
+        // run loop exits, the broadcaster's send half drops, the
+        // routing task's `send_rx.recv()` returns `None`, and the task
+        // ends. Old commit_rx senders die with the nodes.
+        for opt in &mut self.shutdown_txs {
+            if let Some(tx) = opt.take() {
+                let _ = tx.send(());
+            }
+        }
+        // Yield enough rounds for each run loop to observe shutdown,
+        // emit any final actions, and drop its broadcaster (which lets
+        // the routing task see send_rx close and exit). 32 yields is
+        // comfortably more than the longest action-flush chain in the
+        // current code.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        // Phase 2: rebuild routing. Reset partition / dead-node sets
+        // so post-restart wiring is "all four nodes alive, no cuts" —
+        // matching how production would come back up after a fleet
+        // restart.
+        self.dead_nodes.lock().clear();
+        self.partitioned.lock().clear();
+        self.link_cuts.lock().clear();
+        self.partition_blocks.lock().clear();
+
+        let mut new_event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
+        let mut new_event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
+        for &nid in &self.node_ids {
+            let (tx, rx) = mpsc::channel::<ProtocolEvent>(1024);
+            new_event_txs.insert(nid, tx);
+            new_event_rxs.push((nid, rx));
+        }
+        let new_event_txs = Arc::new(new_event_txs);
+        // Replace the public-facing event_txs handle so any test that
+        // dispatches via it after the restart hits the live nodes,
+        // not the dead ones.
+        self.event_txs = Arc::clone(&new_event_txs);
+
+        // Phase 3: re-spawn each node via `recover`. Same per-index
+        // order as the captured signers / storages / wals so node N
+        // post-restart inherits node N's pre-restart on-disk state.
+        let mut new_commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
+        let mut new_shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
+
+        for ((nid, event_rx), idx) in new_event_rxs.into_iter().zip(0..n) {
+            let signer = Arc::clone(&signers[idx]);
+            let storage = Arc::clone(&storages[idx]);
+            let wal = Arc::clone(&wals[idx]);
+
+            let config = NodeConfigForConsensus {
+                validator_set: self.validator_set.clone(),
+                genesis: self.genesis.clone(),
+                propose_limit: 16,
+                timeout_base: self.timeout_base,
+                timeout_max: Duration::from_secs(30),
+                limits: CacheLimits::unbounded_for_tests(),
+            };
+            // Fresh state machine and mempool — the previous session's
+            // state machine doesn't survive a process restart in
+            // production either; what survives is the durable
+            // `(last_voted_view, locked, high_qc, committed-blocks)`
+            // tuple in storage, which `recover` consumes below.
+            let sm: Arc<Mutex<Box<dyn StateMachine>>> =
+                Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+            let mempool = Arc::new(InMemoryMempool::new(256));
+
+            let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
+            new_commit_rxs.push(commit_rx);
+
+            let node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)
+                .expect("recover must succeed against the same storage that just persisted")
+                .with_commit_observer(commit_tx);
+
+            let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
+            let broadcaster: Arc<dyn Broadcaster> = Arc::new(MeshBroadcaster::new(send_tx));
+            let (_disco_src_tx, disco_src_rx) =
+                tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
+            let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(disco_src_rx);
+
+            // No adversary on restart: the adversary trait binds to a
+            // single session's `AdversaryCtx`; replaying it across a
+            // restart is out of scope for the issue #206 scenario,
+            // which is about honest-only liveness recovery.
+            spawn_route_task(
+                nid,
+                send_rx,
+                Arc::clone(&new_event_txs),
+                Arc::clone(&self.partitioned),
+                Arc::clone(&self.link_cuts),
+                Arc::clone(&self.partition_blocks),
+                Arc::clone(&self.dead_nodes),
+                None,
+            );
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            new_shutdown_txs.push(Some(shutdown_tx));
+
+            tokio::spawn(async move {
+                let _ = node
+                    .run(broadcaster, discovery, event_rx, signer, shutdown_rx)
+                    .await;
+            });
+        }
+
+        self.commit_rxs = new_commit_rxs;
+        self.shutdown_txs = new_shutdown_txs;
+        // Reset the per-node commit cache since the new commit_rxs
+        // replace the old ones; any blocks not yet drained from the
+        // pre-restart receivers are intentionally lost — this matches
+        // the production semantics where in-flight commit observers
+        // also disappear on restart.
+        self.commit_cache = (0..n).map(|_| Vec::new()).collect();
     }
 
     /// Drain both receivers into the per-node cache. Shared by
@@ -1235,6 +1434,15 @@ impl SimCluster {
             commit_cache,
             shutdown_txs,
             overlay_shutdowns,
+            // Restart-from-disk is mesh-cluster only for now; the
+            // gossip overlay's orchestrator wiring isn't trivially
+            // re-spawnable.
+            signers: None,
+            storages: None,
+            wals: None,
+            validator_set: vs,
+            genesis,
+            timeout_base,
         }
     }
 }
@@ -2263,6 +2471,289 @@ mod tests {
         // Connected nodes keep going at the same rate, so they should
         // also gain ≥ 5.
         assert_each_gained_at_least(&heights_mid, &heights_after_heal, 5, &[], "post_heal_phase");
+    }
+
+    // ── #206: divergent on-disk state recovery ───────────────────────────────
+    //
+    // Pre-#206, a 4-node cluster that committed a few blocks then
+    // restarted every replica simultaneously (or with `last_committed`
+    // diverging across replicas) would permanently stall: each
+    // replica's recovered `high_qc` referenced a block that was no
+    // longer in `pending_blocks` (the in-memory cache resets to
+    // genesis-only on restart, and uncommitted blocks weren't on disk
+    // either), so every leader's `become_leader` returned an empty
+    // action set and no proposal — and therefore no block-sync
+    // request — ever fired. The fix pairs each persisted
+    // `Locked` / `HighQc` with the block it references so
+    // `recover_state` can re-seed `pending_blocks` enough for the
+    // post-restart leader to propose. These tests pin that behaviour
+    // end-to-end.
+
+    /// Restarting every replica from disk after a few commits must
+    /// resume liveness: the post-restart cluster must commit at least
+    /// 10 additional blocks within 5s of simulated time.
+    ///
+    /// Pre-#206, this test would hang forever — `current_view` kept
+    /// climbing via timeouts but no proposal was ever broadcast and
+    /// `block_sync_request_emitted` stayed at zero on every replica.
+    #[tokio::test]
+    async fn restart_all_with_recover_resumes_liveness() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Phase 1: warm up so each replica persists a real
+        // `(last_voted_view, locked, high_qc)` and the on-disk block
+        // store contains at least one committed block.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(2), |c| {
+                let h = c.peek_commit_heights();
+                h.iter().all(|&v| v >= 3)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "warm-up: every replica must commit at least 3 blocks before the restart test \
+             is meaningful (heights: {:?})",
+            cluster.peek_commit_heights(),
+        );
+
+        let heights_before_restart = cluster.peek_commit_heights();
+
+        // Phase 2: simulate `kill -9` + restart on every replica.
+        // The same on-disk storage is handed to `ConsensusNode::recover`
+        // for each node, so the post-restart cluster sees exactly what a
+        // fleet-wide reboot would have seen.
+        cluster.restart_all_with_recover().await;
+
+        // Phase 3: drive simulated time until every replica has
+        // committed at least 10 more blocks. With the issue #206 fix
+        // in place this completes well within seconds; without the fix
+        // the cluster never makes progress.
+        let baseline = heights_before_restart.clone();
+        let n = baseline.len();
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                let h = c.peek_commit_heights();
+                (0..n).all(|i| h[i] >= baseline[i] + 10)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "post-restart: cluster did not commit 10 more blocks per replica within 5s \
+             simulated. heights={:?}, baseline={:?}",
+            cluster.peek_commit_heights(),
+            baseline,
+        );
+
+        let heights_after_restart = cluster.peek_commit_heights();
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+        assert_each_gained_at_least(
+            &heights_before_restart,
+            &heights_after_restart,
+            10,
+            &[],
+            "restart_all_with_recover",
+        );
+    }
+
+    /// Divergent restart: kill one replica early so its on-disk state
+    /// lags far behind the survivors, let the survivors progress
+    /// further, then restart every replica from disk and assert the
+    /// reunified cluster makes progress. This is the issue #206
+    /// reproducer in its strongest form — the `last_committed_height`
+    /// values across the four replicas span a wide distribution at
+    /// the moment of the global restart.
+    ///
+    /// The lagging replica catches up via the existing block-sync
+    /// path once the post-restart leader (who now has the high_qc's
+    /// parent block in `pending_blocks` thanks to #206) starts
+    /// proposing again.
+    #[tokio::test]
+    async fn divergent_restart_with_lagging_replica_resumes_liveness() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Warm up just enough that node 0 persists a non-trivial
+        // `(last_voted_view, locked, high_qc)` triple before we
+        // partition it.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(2), |c| {
+                let h = c.peek_commit_heights();
+                h.iter().all(|&v| v >= 2)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "warm-up: every replica must commit at least 2 blocks before partition. \
+             heights: {:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        // Isolate node 0 so it stops advancing — its on-disk state
+        // freezes while the surviving three keep committing.
+        let lagging_idx = 0;
+        cluster.partition_node(lagging_idx);
+
+        let heights_after_partition = cluster.peek_commit_heights();
+        let baseline_for_survivors = heights_after_partition.clone();
+        let n = baseline_for_survivors.len();
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                let h = c.peek_commit_heights();
+                (0..n)
+                    .filter(|&i| i != lagging_idx)
+                    .all(|i| h[i] >= baseline_for_survivors[i] + 8)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "survivors did not gain >= 8 commits while node {lagging_idx} was isolated. \
+             heights={:?}, baseline={:?}",
+            cluster.peek_commit_heights(),
+            baseline_for_survivors,
+        );
+
+        let heights_before_restart = cluster.peek_commit_heights();
+        // Sanity: the lagging replica's persisted height is strictly
+        // below at least one survivor, otherwise the test isn't
+        // exercising divergent on-disk state.
+        let max_survivor = (0..n)
+            .filter(|&i| i != lagging_idx)
+            .map(|i| heights_before_restart[i])
+            .max()
+            .unwrap();
+        assert!(
+            heights_before_restart[lagging_idx] < max_survivor,
+            "divergent setup failed: lagging={}, survivors max={}",
+            heights_before_restart[lagging_idx],
+            max_survivor,
+        );
+
+        // Restart every replica from disk. This also clears the
+        // partition (the helper resets every fault set so the
+        // post-restart wiring matches a real fleet reboot).
+        cluster.restart_all_with_recover().await;
+
+        // Assert progress: every replica — including the previously
+        // lagging one — must commit at least 10 more blocks within
+        // 10s of simulated time. The lagging replica catches up via
+        // block-sync once its peers' post-restart leader proposes.
+        let baseline = heights_before_restart.clone();
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(10), |c| {
+                let h = c.peek_commit_heights();
+                (0..n).all(|i| h[i] >= baseline[i] + 10)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "post-restart: not every replica gained >= 10 commits within 10s simulated. \
+             heights={:?}, baseline={:?}",
+            cluster.peek_commit_heights(),
+            baseline,
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
+    /// Stress variant of the divergent restart: open a much wider
+    /// `last_committed_height` gap (lagging replica at <10, survivors
+    /// at >40) before restarting every replica from disk. Mirrors the
+    /// wire reproducer in #206 where node2's pre-kill state lagged
+    /// the survivors by ~40 blocks and the post-restart cluster
+    /// permanently stalled.
+    ///
+    /// **Currently expected to fail** in the testnet/wire repro per
+    /// reviewer feedback on PR #215; this sim test pins the same
+    /// "give me a wide gap, restart, demand catch-up" shape so we
+    /// can see whether the sim and the wire diverge here. If the
+    /// sim test passes while the wire repro stalls, the next PR's
+    /// job is to find the missing piece (most likely something the
+    /// in-memory routing happens to do for free that real TLS
+    /// transport doesn't, e.g. faster post-restart `PeerAdded`
+    /// delivery that lets block-sync requests find a target).
+    #[tokio::test]
+    async fn divergent_restart_wide_gap_resumes_liveness() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Warm up so node 0 has a non-trivial pre-partition state.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(2), |c| {
+                let h = c.peek_commit_heights();
+                h.iter().all(|&v| v >= 2)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "warm-up: heights={:?}",
+            cluster.peek_commit_heights()
+        );
+
+        let lagging_idx = 0;
+        cluster.partition_node(lagging_idx);
+
+        let baseline = cluster.peek_commit_heights();
+        let n = baseline.len();
+        // Open a deep gap: survivors must gain 30+ commits while
+        // node 0 stays frozen at its pre-partition height.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(15), |c| {
+                let h = c.peek_commit_heights();
+                (0..n)
+                    .filter(|&i| i != lagging_idx)
+                    .all(|i| h[i] >= baseline[i] + 30)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "survivors did not gain >= 30 commits in 15s simulated. heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let heights_before_restart = cluster.peek_commit_heights();
+        let max_survivor = (0..n)
+            .filter(|&i| i != lagging_idx)
+            .map(|i| heights_before_restart[i])
+            .max()
+            .unwrap();
+        let gap = max_survivor - heights_before_restart[lagging_idx];
+        assert!(
+            gap >= 25,
+            "test setup expects >= 25-block gap; got lagging={} survivors_max={}",
+            heights_before_restart[lagging_idx],
+            max_survivor,
+        );
+
+        cluster.restart_all_with_recover().await;
+
+        // Demand each replica gains ≥ 10 commits within a generous
+        // simulated window. Per reviewer comment on #215, this is
+        // exactly the "post-restart liveness must resume" assertion
+        // the testnet `wait --all-reach-height 50` is checking on
+        // the wire path.
+        let baseline = heights_before_restart.clone();
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(15), |c| {
+                let h = c.peek_commit_heights();
+                (0..n).all(|i| h[i] >= baseline[i] + 10)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "post-restart wide-gap: not every replica gained >= 10 commits in 15s simulated. \
+             heights={:?}, baseline={:?}",
+            cluster.peek_commit_heights(),
+            baseline,
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
     }
 
     // ── L-series: network partition + heal proptests (#133) ──────────────────

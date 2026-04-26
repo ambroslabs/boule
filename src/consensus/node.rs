@@ -783,9 +783,39 @@ impl ConsensusNode {
     /// safety requires — a crash between "send vote" and "write
     /// `last_voted_view`" would otherwise let a restarted replica vote
     /// twice at the same view.
+    ///
+    /// In addition to the metadata write, every persisted `Locked` /
+    /// `HighQc` carries the *block* it references into durable storage
+    /// (under [`STORAGE_KEY_BLOCK_PREFIX`]) when that block is currently
+    /// in the safety core's `pending_blocks`. Without this, a divergent
+    /// resume could leave the cluster permanently stalled: the leader
+    /// would have a `high_qc` but no parent block in `pending_blocks`,
+    /// so [`HotStuffCore::become_leader`] would silently return an
+    /// empty action set and no proposal would ever fire — preventing
+    /// even the block-sync request that would otherwise repopulate the
+    /// chain. Persisting the block alongside its referencing QC closes
+    /// that gap so [`recover_state`] can re-seed `pending_blocks` with
+    /// exactly the blocks the safety walks need to terminate. See
+    /// issue #206.
     pub fn persist_updates(&self, updates: &[StateUpdate]) -> anyhow::Result<()> {
         if updates.is_empty() {
             return Ok(());
+        }
+        // Pre-encode the block writes for any `Locked` / `HighQc` whose
+        // referenced block is still in `pending_blocks`. Done outside
+        // the storage batch so a `?` on encoding doesn't poison the
+        // batch closure.
+        let mut block_writes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for u in updates {
+            let hash = match u {
+                StateUpdate::HighQc(qc) => qc.block_hash,
+                StateUpdate::Locked(locked) => locked.block_hash,
+                StateUpdate::VotedInView { .. } => continue,
+            };
+            if let Some(block) = self.core.state().pending_blocks.get(&hash) {
+                let bytes = encode_block(block)?;
+                block_writes.push((block_storage_key(&hash), bytes));
+            }
         }
         self.storage.batch(|b| {
             for u in updates {
@@ -804,12 +834,16 @@ impl ConsensusNode {
                     }
                 }
             }
+            for (key, bytes) in &block_writes {
+                b.put(key, bytes);
+            }
             Ok(())
         })?;
         let kinds: Vec<&'static str> = updates.iter().map(update_kind).collect();
         tracing::debug!(
             target: TRACE_TARGET,
             kinds = ?kinds,
+            blocks_persisted = block_writes.len(),
             "persisted",
         );
         Ok(())
@@ -1845,13 +1879,21 @@ pub fn decode_last_committed(bytes: &[u8]) -> anyhow::Result<LastCommitted> {
 /// A fresh node state (equivalent to `HotStuffState::new(vs, genesis)`)
 /// is the baseline; any of `last_voted_view`, `locked`, `high_qc` that
 /// were previously persisted by [`ConsensusNode::persist_updates`] are
-/// overlaid. The `pending_blocks` field is intentionally **not**
-/// repopulated here — committed blocks live under
-/// [`STORAGE_KEY_BLOCK_PREFIX`] and are served on demand by the
-/// `Dispatch::ServeBlock` arm via [`load_block_from_storage`]. That
-/// keeps boot O(1) rather than O(committed-blocks) while preserving
-/// the issue #178 invariant that *some* replica will always serve a
-/// previously-committed block to a peer that asks for it.
+/// overlaid.
+///
+/// `pending_blocks` is re-seeded with the blocks referenced by the
+/// recovered `locked` and `high_qc` (when those blocks are present in
+/// durable storage — `persist_updates` writes them alongside their
+/// metadata for exactly this reason). Without this, a 4-node cluster
+/// whose replicas resume with divergent on-disk state can permanently
+/// stall: every leader's [`HotStuffCore::become_leader`] short-circuits
+/// because the high-QC's parent block isn't in `pending_blocks`, so no
+/// proposal ever fires and the block-sync request that would otherwise
+/// fetch the missing block is never triggered (issue #206). Older
+/// committed blocks remain on-demand-only — they live under
+/// [`STORAGE_KEY_BLOCK_PREFIX`] and are served by the
+/// `Dispatch::ServeBlock` arm via [`load_block_from_storage`] — so boot
+/// stays O(1) rather than O(committed-blocks).
 ///
 /// Missing keys are expected on a first startup and are not errors.
 pub fn recover_state(
@@ -1887,6 +1929,24 @@ pub fn recover_state(
         .context("read high_qc from storage")?
     {
         state.high_qc = Some(decode_high_qc(&raw)?);
+    }
+
+    // Re-seed `pending_blocks` with the locked / high_qc blocks so the
+    // safety-rule walks (extension via locked, become_leader's parent
+    // lookup) terminate without first having to round-trip through
+    // block-sync. Genesis is already in `pending_blocks`. Any block
+    // missing from storage (e.g. an older snapshot adopted via NewView
+    // before the persist-with-block pairing landed) is silently
+    // skipped — the existing block-sync paths still cover that case.
+    if let Some(qc) = state.high_qc.as_ref().cloned()
+        && let Some(block) = load_block_from_storage(storage, &qc.block_hash)?
+    {
+        state.insert_pending(block);
+    }
+    if let Some(locked) = state.locked
+        && let Some(block) = load_block_from_storage(storage, &locked.block_hash)?
+    {
+        state.insert_pending(block);
     }
 
     Ok(state)
@@ -2446,6 +2506,166 @@ mod tests {
         );
         // `recover` does not reset the pacemaker — it always starts at 0.
         assert_eq!(recovered.current_view(), 0);
+    }
+
+    /// Issue #206 regression: persisting a `Locked` / `HighQc` whose
+    /// referenced block is in `pending_blocks` writes the block to
+    /// durable storage so [`recover_state`] can re-seed
+    /// `pending_blocks` post-restart. Without this, every replica's
+    /// [`HotStuffCore::become_leader`] silently returns an empty action
+    /// set after a divergent resume — no proposal ever fires and the
+    /// cluster permanently stalls.
+    #[test]
+    fn persist_writes_locked_and_high_qc_blocks_recover_seeds_pending() {
+        use crate::replication::block::BlockHeader;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        // Build two distinct uncommitted blocks: `b_locked` at height 1
+        // / view 18 (the locked block from the issue), and `b_high_qc`
+        // at height 2 / view 19 (the high_qc block). Hashes differ
+        // because the headers do.
+        let g = genesis();
+        let b_locked = Block {
+            header: BlockHeader {
+                parent_hash: g.hash(),
+                height: 1,
+                view: 18,
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: vec![],
+        };
+        let b_high_qc = Block {
+            header: BlockHeader {
+                parent_hash: b_locked.hash(),
+                height: 2,
+                view: 19,
+                proposer: nid(2),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: vec![],
+        };
+
+        let locked = Locked {
+            view: 18,
+            height: 1,
+            block_hash: b_locked.hash(),
+        };
+        let mut qc = QuorumCertificate::new(19, b_high_qc.hash(), 4);
+        qc.add_signature(0, [0x11u8; 64]);
+        qc.add_signature(1, [0x22u8; 64]);
+        qc.add_signature(2, [0x33u8; 64]);
+
+        // Session 1: seed the safety core's `pending_blocks` with both
+        // uncommitted blocks (mirroring what `on_proposal_received`
+        // does in production), then persist the lock and high_qc.
+        {
+            let mut node = ConsensusNode::new(
+                nid(1),
+                cfg.clone(),
+                make_sm(),
+                Arc::new(InMemoryMempool::new(64)),
+                Arc::clone(&storage),
+                Arc::clone(&wal),
+            );
+            node.core.insert_pending_block(b_locked.clone());
+            node.core.insert_pending_block(b_high_qc.clone());
+            node.persist_updates(&[StateUpdate::Locked(locked), StateUpdate::HighQc(qc.clone())])
+                .unwrap();
+            // Both blocks are durable under the block-storage prefix.
+            assert!(
+                load_block_from_storage(storage.as_ref(), &b_locked.hash())
+                    .unwrap()
+                    .is_some(),
+                "persist_updates must write the locked block",
+            );
+            assert!(
+                load_block_from_storage(storage.as_ref(), &b_high_qc.hash())
+                    .unwrap()
+                    .is_some(),
+                "persist_updates must write the high_qc block",
+            );
+        }
+
+        // Session 2: recover. `pending_blocks` must contain genesis
+        // plus both uncommitted blocks so the post-restart leader can
+        // build a proposal extending high_qc.block_hash and the
+        // safe_to_vote extension walk can terminate at locked.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(recovered.core.state().locked, Some(locked));
+        assert_eq!(recovered.core.state().high_qc.as_ref(), Some(&qc));
+        assert!(
+            recovered
+                .core
+                .state()
+                .pending_blocks
+                .contains_key(&b_locked.hash()),
+            "recover must re-seed the locked block into pending_blocks",
+        );
+        assert!(
+            recovered
+                .core
+                .state()
+                .pending_blocks
+                .contains_key(&b_high_qc.hash()),
+            "recover must re-seed the high_qc block into pending_blocks",
+        );
+        // And the resumed leader can build a proposal — the parent
+        // lookup that previously short-circuited is now resolved.
+        assert!(
+            recovered
+                .core
+                .state()
+                .pending_blocks
+                .contains_key(&qc.block_hash),
+        );
+    }
+
+    /// Persisting `HighQc` whose block is *not* in `pending_blocks` —
+    /// the rare NewView-only adoption path — still records the QC
+    /// metadata, but no block write fires (the safety core's
+    /// in-memory state is the authority for that case).
+    #[test]
+    fn persist_skips_block_write_when_referenced_block_absent() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        let node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        );
+        // sample_full_qc references a hash that was never inserted.
+        let qc = sample_full_qc();
+        node.persist_updates(&[StateUpdate::HighQc(qc.clone())])
+            .unwrap();
+
+        // Metadata is on disk so liveness state survives the restart.
+        let raw = storage.get(STORAGE_KEY_HIGH_QC).unwrap().unwrap();
+        assert_eq!(decode_high_qc(&raw).unwrap(), qc);
+        // But there is no block write for an unknown hash.
+        assert!(
+            load_block_from_storage(storage.as_ref(), &qc.block_hash)
+                .unwrap()
+                .is_none(),
+        );
     }
 
     #[test]
