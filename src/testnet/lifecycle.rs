@@ -56,6 +56,12 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
     spec.validate()?;
     std::fs::create_dir_all(&workdir)
         .with_context(|| format!("creating workdir {}", workdir.display()))?;
+    // Canonicalize so every per-node path written to state.json is
+    // absolute. Otherwise `testnet new --workdir testnetN` records
+    // cwd-relative paths and any subsequent subcommand from a
+    // different cwd fails to open the log/key/addr files.
+    let workdir = std::fs::canonicalize(&workdir)
+        .with_context(|| format!("canonicalizing workdir {}", workdir.display()))?;
 
     if workdir.join(super::workdir::STATE_FILE).exists() {
         anyhow::bail!(

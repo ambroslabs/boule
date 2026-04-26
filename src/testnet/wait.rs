@@ -4,6 +4,7 @@
 //! into the same driver loop the CLI's `wait` subcommand and the
 //! scenario runner share.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::admin;
@@ -52,6 +53,93 @@ pub async fn all_reach_height(state: &State, height: u64, timeout: Duration) -> 
         Ok(true)
     })
     .await
+}
+
+/// `--all-advance-by N`: snapshot every live node's current
+/// `last_committed_height`, then wait until every still-live node has
+/// committed at least `delta` blocks beyond its baseline.
+///
+/// Unlike [`all_reach_height`], which is satisfied as soon as a target
+/// height is met (and is therefore vacuous if the cluster already
+/// reached the target before the wait started), this gates on *new*
+/// progress relative to the moment the wait began. That's what the
+/// `§9a` manual-reconnect recipe and post-kill liveness checks really
+/// want — "did the survivors keep advancing?".
+///
+/// Nodes that go down during the wait are dropped from the gating
+/// set (matching `live_nodes`'s pid_alive filter). Nodes that come
+/// back from the dead during the wait are skipped — they have no
+/// baseline to compare against.
+pub async fn all_advance_by(state: &State, delta: u64, timeout: Duration) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let mut targets: Option<HashMap<usize, u64>> = None;
+    loop {
+        if started.elapsed() > timeout {
+            anyhow::bail!("wait advance_by({delta}) timed out after {timeout:?}");
+        }
+        let live = live_nodes(state);
+        if live.is_empty() {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        if targets.is_none() {
+            // Try to capture a baseline. Skip and retry if any live
+            // node refuses the connection or is missing api_addr —
+            // we want every gated node to have a baseline.
+            let mut snap: HashMap<usize, u64> = HashMap::new();
+            let mut all_reachable = true;
+            for n in &live {
+                let api = match n.api_addr {
+                    Some(a) => a,
+                    None => {
+                        all_reachable = false;
+                        break;
+                    }
+                };
+                match admin::maybe_consensus_status(api).await? {
+                    Some(s) => {
+                        snap.insert(n.index, s.last_committed_height.saturating_add(delta));
+                    }
+                    None => {
+                        all_reachable = false;
+                        break;
+                    }
+                }
+            }
+            if all_reachable {
+                targets = Some(snap);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        let targets_ref = targets.as_ref().unwrap();
+        let mut all_advanced = true;
+        for n in &live {
+            // Nodes that weren't live at snapshot time aren't gated.
+            let target = match targets_ref.get(&n.index) {
+                Some(t) => *t,
+                None => continue,
+            };
+            let api = match n.api_addr {
+                Some(a) => a,
+                None => {
+                    all_advanced = false;
+                    break;
+                }
+            };
+            match admin::maybe_consensus_status(api).await? {
+                Some(s) if s.last_committed_height >= target => continue,
+                _ => {
+                    all_advanced = false;
+                    break;
+                }
+            }
+        }
+        if all_advanced {
+            return Ok(());
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// `--all-healthy --within N`: every live node is on a `current_view`
