@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
+use ambros_p2p::cli::{self, OutputFormat};
 use ambros_p2p::config::{self, Config, IdentityConfig, NodeConfig};
 use ambros_p2p::node;
 use ambros_p2p::p2p::identity::KeyProvider;
@@ -97,12 +98,14 @@ fn print_usage() {
     println!("      Reads the current [node.identity] from --config; pass");
     println!("      --delete-source to zeroize and remove a file-backed source.");
     println!();
-    println!("  config [--config <path>] [--format toml|json] [--raw|--edit|--path]");
+    println!("  config [--config <path>] [--format human|json|toml] [--raw|--edit|--path]");
     println!("      Print or edit the node's effective configuration. Default");
     println!("      prints the fully-resolved config (file contents + filled-in");
-    println!("      defaults) as TOML. `--format json` emits JSON suitable for");
+    println!("      defaults). `--format` overrides the per-config default set by");
+    println!("      `[ui] output_format`; for `config`, both `human` (the global");
+    println!("      default) and `toml` render TOML, while `json` emits JSON");
     println!(
-        "      piping (e.g. `ambros-p2p config --format json | jq '.consensus.timeout_base_ms'`)."
+        "      suitable for piping (e.g. `ambros-p2p config --format json | jq '.consensus.timeout_base_ms'`)."
     );
     println!("      `--raw` prints the file as-written. `--edit` opens the file");
     println!("      in $EDITOR / $VISUAL and validates the result. `--path` prints");
@@ -624,12 +627,6 @@ fn handle_key_migrate(args: &[String]) -> anyhow::Result<()> {
 
 // ── `config` subcommand ─────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
-enum OutputFormat {
-    Toml,
-    Json,
-}
-
 #[derive(Debug, Default)]
 struct ConfigArgs {
     config_path: Option<PathBuf>,
@@ -656,7 +653,7 @@ fn parse_config_args(args: &[String]) -> anyhow::Result<ConfigArgs> {
                 let v = args
                     .get(i)
                     .ok_or_else(|| anyhow::anyhow!("--format requires a value"))?;
-                out.format = Some(parse_output_format(v)?);
+                out.format = Some(OutputFormat::parse(v)?);
             }
             "--raw" => out.raw = true,
             "--edit" => out.edit = true,
@@ -670,14 +667,6 @@ fn parse_config_args(args: &[String]) -> anyhow::Result<ConfigArgs> {
         i += 1;
     }
     Ok(out)
-}
-
-fn parse_output_format(s: &str) -> anyhow::Result<OutputFormat> {
-    match s.to_ascii_lowercase().as_str() {
-        "toml" => Ok(OutputFormat::Toml),
-        "json" => Ok(OutputFormat::Json),
-        other => anyhow::bail!("unknown --format value '{other}' (expected: toml, json)"),
-    }
 }
 
 fn handle_config(args: &[String]) -> anyhow::Result<()> {
@@ -717,13 +706,14 @@ fn handle_config(args: &[String]) -> anyhow::Result<()> {
     }
 
     let config = config::load(&config_path)?;
-    let format = args.format.unwrap_or(OutputFormat::Toml);
-    let rendered = match format {
-        OutputFormat::Toml => toml::to_string_pretty(&config)
-            .map_err(|e| anyhow::anyhow!("serializing config as TOML: {e}"))?,
-        OutputFormat::Json => serde_json::to_string_pretty(&config)
-            .map_err(|e| anyhow::anyhow!("serializing config as JSON: {e}"))?,
-    };
+    // The `config` subcommand has no natural human-readable rendering
+    // (the underlying data IS the TOML config file), so we fall back
+    // to TOML when the resolved format is `human`. The CLI override
+    // wins; otherwise [`UiConfig::output_format`] from the loaded
+    // config is the default — see issue #149.
+    let format =
+        cli::resolve_structured_format(args.format, config.ui.output_format, OutputFormat::Toml);
+    let rendered = cli::render_structured(&config, format)?;
     print!("{rendered}");
     if !rendered.ends_with('\n') {
         println!();

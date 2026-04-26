@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tracing::warn;
 
+use crate::cli::OutputFormat;
 use crate::p2p::identity::KeyProvider;
 use crate::p2p::identity::encrypted_file::EncryptedFileKeyProvider;
 use crate::p2p::identity::env::EnvKeyProvider;
@@ -32,6 +33,11 @@ pub struct Config {
     /// Defaults apply when the section is omitted.
     #[serde(default)]
     pub p2p: P2pConfig,
+    /// Operator-facing UI knobs — currently just the global default for
+    /// CLI structured-output formatting (issue #149). Per-invocation
+    /// `--format` flags on individual subcommands override this.
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -203,6 +209,25 @@ pub struct ConsensusLimits {
     /// to [`crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY`].
     #[serde(default = "default_timeout_buckets_capacity")]
     pub timeout_buckets_capacity: usize,
+    /// Initial views to wait between successive `RequestBlock` retries
+    /// for the same parent hash. See
+    /// [`crate::consensus::limits::CacheLimits::block_sync_initial_backoff_views`].
+    #[serde(default = "default_block_sync_initial_backoff_views")]
+    pub block_sync_initial_backoff_views: u64,
+    /// Cap on the per-parent-hash retry gap. See
+    /// [`crate::consensus::limits::CacheLimits::block_sync_max_backoff_views`].
+    #[serde(default = "default_block_sync_max_backoff_views")]
+    pub block_sync_max_backoff_views: u64,
+    /// Same-peer attempts before the safety core rotates to the next
+    /// validator on `RequestBlock` retries. See
+    /// [`crate::consensus::limits::CacheLimits::block_sync_per_peer_attempts`].
+    #[serde(default = "default_block_sync_per_peer_attempts")]
+    pub block_sync_per_peer_attempts: u32,
+    /// Total `RequestBlock` budget per parent hash before parked
+    /// proposals are dropped. See
+    /// [`crate::consensus::limits::CacheLimits::block_sync_max_attempts`].
+    #[serde(default = "default_block_sync_max_attempts")]
+    pub block_sync_max_attempts: u32,
     /// Maximum entries the bundled in-memory mempool will accept.
     /// Inserts past the cap surface as `Err` to the caller (see
     /// [`crate::replication::impls::mem_mempool::InMemoryMempool`]),
@@ -221,6 +246,10 @@ impl Default for ConsensusLimits {
             parked_proposals_capacity: default_parked_proposals_capacity(),
             pending_blocks_capacity: default_pending_blocks_capacity(),
             timeout_buckets_capacity: default_timeout_buckets_capacity(),
+            block_sync_initial_backoff_views: default_block_sync_initial_backoff_views(),
+            block_sync_max_backoff_views: default_block_sync_max_backoff_views(),
+            block_sync_per_peer_attempts: default_block_sync_per_peer_attempts(),
+            block_sync_max_attempts: default_block_sync_max_attempts(),
             mempool_capacity: default_mempool_capacity(),
         }
     }
@@ -238,6 +267,10 @@ impl ConsensusLimits {
             parked_proposals_capacity: self.parked_proposals_capacity,
             pending_blocks_capacity: self.pending_blocks_capacity,
             timeout_buckets_capacity: self.timeout_buckets_capacity,
+            block_sync_initial_backoff_views: self.block_sync_initial_backoff_views,
+            block_sync_max_backoff_views: self.block_sync_max_backoff_views,
+            block_sync_per_peer_attempts: self.block_sync_per_peer_attempts,
+            block_sync_max_attempts: self.block_sync_max_attempts,
         }
     }
 }
@@ -268,6 +301,22 @@ fn default_pending_blocks_capacity() -> usize {
 
 fn default_timeout_buckets_capacity() -> usize {
     crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY
+}
+
+fn default_block_sync_initial_backoff_views() -> u64 {
+    crate::consensus::limits::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS
+}
+
+fn default_block_sync_max_backoff_views() -> u64 {
+    crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS
+}
+
+fn default_block_sync_per_peer_attempts() -> u32 {
+    crate::consensus::limits::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS
+}
+
+fn default_block_sync_max_attempts() -> u32 {
+    crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS
 }
 
 fn default_mempool_capacity() -> usize {
@@ -545,6 +594,23 @@ pub enum OverlayMode {
     /// rollouts when the validator set grows.
     #[default]
     Gossip,
+}
+
+/// Operator-facing UI defaults. Currently a single knob: the default
+/// output format for CLI subcommands that emit structured payloads
+/// (e.g. `config`). Per-invocation `--format` flags override this.
+///
+/// Subcommands with inherently free-form output (`init`'s status
+/// messages, `start`'s logs) ignore this — see [`crate::cli`].
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct UiConfig {
+    /// Default for `--format` on subcommands with structured output.
+    /// `human` (the default) means "let each subcommand pick a sensible
+    /// representation for terminal reading" — for `config`, that's
+    /// TOML; future subcommands may pick differently. `toml` and `json`
+    /// are for piping / scripting (e.g. `... | jq`).
+    #[serde(default)]
+    pub output_format: OutputFormat,
 }
 
 fn default_target_degree() -> usize {
@@ -889,6 +955,22 @@ validators = ["a"]
             runtime.timeout_buckets_capacity,
             crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
         );
+        assert_eq!(
+            runtime.block_sync_initial_backoff_views,
+            crate::consensus::limits::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
+        );
+        assert_eq!(
+            runtime.block_sync_max_backoff_views,
+            crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
+        );
+        assert_eq!(
+            runtime.block_sync_per_peer_attempts,
+            crate::consensus::limits::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
+        );
+        assert_eq!(
+            runtime.block_sync_max_attempts,
+            crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
+        );
         assert_eq!(cons.limits.mempool_capacity, 1024);
     }
 
@@ -910,6 +992,10 @@ vote_bucket_capacity = 32
 parked_proposals_capacity = 16
 pending_blocks_capacity = 64
 timeout_buckets_capacity = 8
+block_sync_initial_backoff_views = 4
+block_sync_max_backoff_views = 32
+block_sync_per_peer_attempts = 5
+block_sync_max_attempts = 25
 mempool_capacity = 2048
 "#,
         );
@@ -919,6 +1005,10 @@ mempool_capacity = 2048
         assert_eq!(runtime.parked_proposals_capacity, 16);
         assert_eq!(runtime.pending_blocks_capacity, 64);
         assert_eq!(runtime.timeout_buckets_capacity, 8);
+        assert_eq!(runtime.block_sync_initial_backoff_views, 4);
+        assert_eq!(runtime.block_sync_max_backoff_views, 32);
+        assert_eq!(runtime.block_sync_per_peer_attempts, 5);
+        assert_eq!(runtime.block_sync_max_attempts, 25);
         assert_eq!(cons.limits.mempool_capacity, 2048);
     }
 

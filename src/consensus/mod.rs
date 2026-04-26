@@ -44,6 +44,9 @@ pub mod view_timer;
 pub mod sim;
 
 #[cfg(test)]
+mod sim_byzantine;
+
+#[cfg(test)]
 mod wire_fuzz;
 
 /// HotStuff view number.
