@@ -11,10 +11,25 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
+use crate::consensus::limits::CacheEvictionCounters;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::replication::block::{Block, BlockHash};
 
 use super::qc::QuorumCertificate;
+
+/// Tracing target for eviction logs. Same string as
+/// [`crate::consensus::node::TRACE_TARGET`] so a single
+/// `RUST_LOG=ambros_p2p::consensus=info` filter catches every cache
+/// drop the consensus layer emits.
+const TRACE_TARGET: &str = "ambros_p2p::consensus";
+
+/// How many parent links above `high_qc.block_hash` to protect from
+/// cap-based eviction. The two-chain lock-promotion walk reaches one
+/// block past `high_qc`, the three-chain commit walk reaches two —
+/// keeping the QC's grandparent chain pinned guarantees those walks
+/// always find what they need even if the safety core is otherwise
+/// thrashing under flood.
+const PROTECTED_HIGH_QC_DEPTH: usize = 4;
 
 /// The block this replica has promised (via the two-chain rule) not to
 /// diverge from.
@@ -83,6 +98,18 @@ pub struct HotStuffState {
     /// convenience — walking `parent_hash` links lands at this value
     /// once, and its parent is `[0; 32]`.
     pub genesis_hash: BlockHash,
+
+    /// Cap on `pending_blocks`. `usize::MAX` (the default) disables
+    /// cap-based eviction entirely, matching pre-#135 behaviour. The
+    /// integration layer overrides via
+    /// [`HotStuffState::set_pending_blocks_limit`].
+    pending_blocks_capacity: usize,
+
+    /// Counter handle bumped on each cap-based eviction. Shared with
+    /// the [`crate::consensus::hotstuff::step::HotStuffCore`] that
+    /// owns this state so the integration layer surfaces a single
+    /// aggregate count.
+    eviction_counters: CacheEvictionCounters,
 }
 
 impl HotStuffState {
@@ -102,18 +129,120 @@ impl HotStuffState {
             validator_set,
             pending_blocks: pending,
             genesis_hash,
+            // Default to "unbounded" so unit tests in
+            // [`super::safety_rules`] and [`super::step`] keep their
+            // pre-#135 behaviour. The integration layer flips this to
+            // a finite cap via [`Self::set_pending_blocks_limit`] in
+            // [`super::step::HotStuffCore::with_limits`].
+            pending_blocks_capacity: usize::MAX,
+            eviction_counters: CacheEvictionCounters::default(),
         }
+    }
+
+    /// Wire a finite cap and a shared counter handle into the
+    /// `pending_blocks` map. Called by
+    /// [`super::step::HotStuffCore::with_limits`] at construction so
+    /// the safety state shares a single counter with the safety
+    /// core's own caches.
+    pub(crate) fn set_pending_blocks_limit(
+        &mut self,
+        capacity: usize,
+        counters: CacheEvictionCounters,
+    ) {
+        self.pending_blocks_capacity = capacity;
+        self.eviction_counters = counters;
     }
 
     /// Insert (or overwrite) a pending block. The key is `block.hash()`
     /// so re-inserting the same block is a cheap no-op.
+    ///
+    /// Cap-aware: when the map is at
+    /// [`Self::pending_blocks_capacity`], the lowest-`height`
+    /// non-protected block is dropped before the new entry lands.
+    /// Protected blocks are the genesis block and the `high_qc`
+    /// chain (up to [`PROTECTED_HIGH_QC_DEPTH`] parent hops); these
+    /// are exactly the blocks the two-chain and three-chain safety
+    /// walks need to terminate.
     pub fn insert_pending(&mut self, block: Block) {
-        self.pending_blocks.insert(block.hash(), block);
+        let hash = block.hash();
+        if !self.pending_blocks.contains_key(&hash) {
+            self.evict_pending_to_fit_one();
+        }
+        self.pending_blocks.insert(hash, block);
     }
 
     /// Lookup a pending block by its header hash.
     pub fn get_pending(&self, hash: &BlockHash) -> Option<&Block> {
         self.pending_blocks.get(hash)
+    }
+
+    /// Drop the lowest-`height` non-protected entry if `pending_blocks`
+    /// is at cap. No-op when the cap is `usize::MAX` (unit-test
+    /// default) or when there is space for one more block.
+    fn evict_pending_to_fit_one(&mut self) {
+        if self.pending_blocks.len() < self.pending_blocks_capacity {
+            return;
+        }
+        let protected = self.protected_block_hashes();
+        // Eviction key: `(height, hash)`. Tie-break on hash so two
+        // forks at the same height pick the same victim across
+        // replicas — useful when reasoning about deterministic
+        // replays under flood, even though the safety core itself
+        // never depends on `pending_blocks` ordering.
+        let Some((victim_hash, victim_height)) = self
+            .pending_blocks
+            .iter()
+            .filter(|(hash, _)| !protected.contains(*hash))
+            .map(|(hash, block)| (*hash, block.header.height))
+            .min_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)))
+        else {
+            // Every block is protected (genesis + the full high_qc
+            // chain reaches the cap). The new insert is allowed
+            // anyway; the cap is a soft target, not a hard ceiling
+            // when honoring it would compromise safety walks.
+            tracing::info!(
+                target: TRACE_TARGET,
+                cache = "pending_blocks",
+                policy = "cap_skipped_all_protected",
+                cap = self.pending_blocks_capacity,
+                size = self.pending_blocks.len(),
+                "consensus_cache_evicted",
+            );
+            return;
+        };
+        if self.pending_blocks.remove(&victim_hash).is_some() {
+            self.eviction_counters.inc_pending_blocks(1);
+            tracing::info!(
+                target: TRACE_TARGET,
+                cache = "pending_blocks",
+                policy = "cap",
+                evicted_height = victim_height,
+                cap = self.pending_blocks_capacity,
+                size_after = self.pending_blocks.len(),
+                "consensus_cache_evicted",
+            );
+        }
+    }
+
+    /// Set of hashes that must NOT be evicted: genesis, plus up to
+    /// [`PROTECTED_HIGH_QC_DEPTH`] blocks reachable via `parent_hash`
+    /// links from `high_qc.block_hash`.
+    fn protected_block_hashes(&self) -> std::collections::HashSet<BlockHash> {
+        let mut out = std::collections::HashSet::new();
+        out.insert(self.genesis_hash);
+        if let Some(qc) = &self.high_qc {
+            let mut cursor = qc.block_hash;
+            for _ in 0..PROTECTED_HIGH_QC_DEPTH {
+                if !out.insert(cursor) {
+                    break;
+                }
+                let Some(b) = self.pending_blocks.get(&cursor) else {
+                    break;
+                };
+                cursor = b.header.parent_hash;
+            }
+        }
+        out
     }
 }
 

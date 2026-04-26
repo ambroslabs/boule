@@ -91,6 +91,35 @@ pub struct ParkedProposalStatus {
     pub view: u64,
 }
 
+/// Cumulative count of cap- or `gc_below`-driven evictions across the
+/// four bounded consensus caches (`vote_bucket`, `parked_proposals`,
+/// `pending_blocks`, `timeout_buckets`). Surfaced so an operator
+/// watching the status endpoint can spot a sustained flood pressuring
+/// any one cache without having to grep tracing logs.
+///
+/// Counters are monotonic for the lifetime of the node — they reset on
+/// restart but never decrement during a run. A non-zero value is not
+/// itself a fault: eviction under load is the intended behaviour and
+/// is logged at INFO, not WARN. Sustained growth (especially
+/// concentrated on one cache) does indicate either a Byzantine flood
+/// or a misconfigured cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CacheEvictionStatus {
+    /// `vote_bucket` entries dropped — both cap-based on insert and
+    /// `gc_below` sweeps on `PacemakerAdvance` contribute.
+    pub vote_buckets: u64,
+    /// `parked_proposals` entries dropped under cap pressure.
+    pub parked_proposals: u64,
+    /// `pending_blocks` entries dropped under cap pressure. The
+    /// on-commit `retain(height > committed)` prune does not
+    /// contribute — only forced cap evictions.
+    pub pending_blocks: u64,
+    /// `timeout_buckets` entries dropped under cap pressure. The
+    /// on-TC-formation `retain(v > view)` prune does not
+    /// contribute — only forced cap evictions.
+    pub timeout_buckets: u64,
+}
+
 /// A snapshot of a consensus node's live state, returned by
 /// `GET /consensus/status`.
 ///
@@ -125,6 +154,10 @@ pub struct ConsensusStatus {
     /// the order used for round-robin leader rotation.
     pub validator_set: Vec<String>,
     pub mempool_size: usize,
+    /// Cumulative cache-eviction counters across the four bounded
+    /// consensus caches. See [`CacheEvictionStatus`].
+    #[serde(default)]
+    pub cache_evictions: CacheEvictionStatus,
 }
 
 /// How far on either side of `current_view` to include in the bucket
@@ -181,6 +214,12 @@ mod tests {
                 "DmX44PdK8JNVZUkbLTpD3W5ngmVnWBGyYrmFhh2Mkdb4".to_string(),
             ],
             mempool_size: 0,
+            cache_evictions: CacheEvictionStatus {
+                vote_buckets: 7,
+                parked_proposals: 3,
+                pending_blocks: 1,
+                timeout_buckets: 0,
+            },
         }
     }
 
@@ -226,6 +265,12 @@ mod tests {
         // Peers + validator set.
         assert_eq!(json["peers_connected"].as_array().unwrap().len(), 2);
         assert_eq!(json["validator_set"].as_array().unwrap().len(), 3);
+
+        // Cache-eviction counters surface as a nested object.
+        assert_eq!(json["cache_evictions"]["vote_buckets"], 7);
+        assert_eq!(json["cache_evictions"]["parked_proposals"], 3);
+        assert_eq!(json["cache_evictions"]["pending_blocks"], 1);
+        assert_eq!(json["cache_evictions"]["timeout_buckets"], 0);
     }
 
     #[test]
@@ -280,11 +325,16 @@ mod tests {
             peers_connected: Vec::new(),
             validator_set: Vec::new(),
             mempool_size: 0,
+            cache_evictions: CacheEvictionStatus::default(),
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["current_view"], 0);
         assert_eq!(json["last_committed_height"], 0);
         assert!(json["locked"].is_null());
         assert!(json["vote_buckets"].as_array().unwrap().is_empty());
+        assert_eq!(json["cache_evictions"]["vote_buckets"], 0);
+        assert_eq!(json["cache_evictions"]["parked_proposals"], 0);
+        assert_eq!(json["cache_evictions"]["pending_blocks"], 0);
+        assert_eq!(json["cache_evictions"]["timeout_buckets"], 0);
     }
 }

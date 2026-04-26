@@ -359,11 +359,12 @@ async fn start_consensus(
         propose_limit: cons_cfg.propose_limit,
         timeout_base: Duration::from_millis(cons_cfg.timeout_base_ms),
         timeout_max: Duration::from_millis(cons_cfg.timeout_max_ms),
+        limits: cons_cfg.limits.to_cache_limits(),
     };
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
         Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
-    let mempool = Arc::new(InMemoryMempool::new(1024));
+    let mempool = Arc::new(InMemoryMempool::new(cons_cfg.limits.mempool_capacity));
 
     // Wire the broadcaster + discovery + upstream event channel
     // according to the configured overlay mode.

@@ -80,6 +80,7 @@ mod tests {
             peers_connected: Vec::new(),
             validator_set: Vec::new(),
             mempool_size: 0,
+            cache_evictions: crate::consensus::status::CacheEvictionStatus::default(),
         }
     }
 

@@ -59,6 +59,7 @@ use rand_chacha::ChaCha20Rng;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, TokioClock};
+use crate::consensus::limits::CacheLimits;
 use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{NodeSigner, Signer};
@@ -207,6 +208,7 @@ impl SimCluster {
                 propose_limit: 16,
                 timeout_base,
                 timeout_max: Duration::from_secs(30),
+                limits: CacheLimits::unbounded_for_tests(),
             };
 
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -867,6 +869,7 @@ impl SimCluster {
                 propose_limit: 16,
                 timeout_base,
                 timeout_max: Duration::from_secs(30),
+                limits: CacheLimits::unbounded_for_tests(),
             };
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));

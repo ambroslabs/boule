@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::consensus::View;
+use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
 use crate::crypto::signed::Signed;
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
@@ -37,6 +38,11 @@ use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
 use super::safety_rules::{safe_to_vote, should_update_high_qc, three_chain_commit};
 use super::state::{HotStuffState, Locked};
 use crate::consensus::validator_set::ValidatorSet;
+
+/// Tracing target shared with the integration layer; lifted here so
+/// safety-core eviction logs flow through the same `RUST_LOG` filter
+/// (see `crate::consensus::node::TRACE_TARGET`).
+const TRACE_TARGET: &str = "ambros_p2p::consensus";
 
 /// Inputs the safety core reacts to.
 ///
@@ -208,19 +214,66 @@ pub struct HotStuffCore {
     /// re-evaluate every parked child whose parent has since arrived.
     parked_proposals: HashMap<BlockHash, Signed<Proposal>>,
     builder: Arc<dyn BlockBuilder>,
+    /// Per-cache caps. Forced evictions fire when an `insert` would
+    /// otherwise grow a cache past its cap; see
+    /// [`CacheLimits`]. Tests pass [`CacheLimits::unbounded_for_tests`]
+    /// to disable eviction entirely.
+    limits: CacheLimits,
+    /// Cumulative eviction counts surfaced via the consensus status
+    /// snapshot. Cloned into the integration layer so the
+    /// timeout-bucket handler can share a single counter handle.
+    eviction_counters: CacheEvictionCounters,
 }
 
 impl HotStuffCore {
     /// Build a fresh core around `state`, with `builder` supplying
-    /// block contents when this replica is the leader.
+    /// block contents when this replica is the leader. Uses
+    /// [`CacheLimits::unbounded_for_tests`] — the production wiring in
+    /// [`crate::consensus::node::ConsensusNode`] uses
+    /// [`HotStuffCore::with_limits`] to plumb the operator-configured
+    /// caps through.
     pub fn new(self_id: NodeId, state: HotStuffState, builder: Arc<dyn BlockBuilder>) -> Self {
+        Self::with_limits(
+            self_id,
+            state,
+            builder,
+            CacheLimits::unbounded_for_tests(),
+            CacheEvictionCounters::default(),
+        )
+    }
+
+    /// Build a fresh core with explicit per-cache caps and a
+    /// counter handle. Production callers (the integration layer) use
+    /// this constructor; the `new` shorthand exists for unit tests
+    /// that don't care about cap behaviour.
+    pub fn with_limits(
+        self_id: NodeId,
+        mut state: HotStuffState,
+        builder: Arc<dyn BlockBuilder>,
+        limits: CacheLimits,
+        eviction_counters: CacheEvictionCounters,
+    ) -> Self {
+        // Bind the same cap and counter handle into the safety state
+        // so its `insert_pending` path can evict under flood without
+        // the dispatcher having to thread the caps in by hand on
+        // every call.
+        state.set_pending_blocks_limit(limits.pending_blocks_capacity, eviction_counters.clone());
         Self {
             self_id,
             state,
             vote_bucket: HashMap::new(),
             parked_proposals: HashMap::new(),
             builder,
+            limits,
+            eviction_counters,
         }
+    }
+
+    /// Borrow the eviction counters this core increments. The
+    /// integration layer hands the same handle to the timeout-vote
+    /// path so all four caches' counters live behind one `Arc`.
+    pub fn eviction_counters(&self) -> &CacheEvictionCounters {
+        &self.eviction_counters
     }
 
     /// The local node's identity, as supplied at construction.
@@ -334,6 +387,12 @@ impl HotStuffCore {
             // child case so the field stays sane even if a malformed
             // proposal claims height 0.
             let expected_height = signed.payload.block.header.height.saturating_sub(1);
+            // Make room before insert: idempotent re-park of an
+            // already-known child_hash doesn't grow the map, so the
+            // cap check only fires on genuinely new entries.
+            if !self.parked_proposals.contains_key(&child_hash) {
+                self.evict_parked_to_fit_one();
+            }
             self.parked_proposals.insert(child_hash, signed);
             return vec![Action::RequestBlock {
                 hash: parent_hash,
@@ -507,6 +566,14 @@ impl HotStuffCore {
         // no-ops.
         let key = (vote.view, vote.block_hash);
         let validator_set_len = self.state.validator_set.len();
+        // Make room before insert. Updating an existing bucket
+        // doesn't grow the map, so the cap check only fires on
+        // genuinely new (view, block_hash) tuples — exactly the
+        // shape a Byzantine flood of distinct `block_hash` values
+        // would take.
+        if !self.vote_bucket.contains_key(&key) {
+            self.evict_vote_buckets_to_fit_one();
+        }
         let qc = self.vote_bucket.entry(key).or_insert_with(|| {
             QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len)
         });
@@ -609,6 +676,14 @@ impl HotStuffCore {
     fn on_pacemaker_advance(&mut self, v: View) -> Vec<Action> {
         self.state.current_view = v;
 
+        // gc_below sweep: a vote bucket whose `view < current_view`
+        // can no longer feed a freshly-formed QC into our high_qc
+        // (any QC formed at view < v would lose to anything we'd
+        // adopt next). Drop them all immediately so a Byzantine peer
+        // cannot pin memory by spraying low-view votes for distinct
+        // block_hash values.
+        self.evict_vote_buckets_below(v);
+
         let mut actions = Vec::new();
 
         // Un-park retries. Collect child hashes whose parent has since
@@ -677,6 +752,97 @@ impl HotStuffCore {
     /// accidentally keep a reference into the core across the replay.
     pub fn replay(mut self, events: impl IntoIterator<Item = Event>) -> Vec<Vec<Action>> {
         events.into_iter().map(|e| self.step(e)).collect()
+    }
+
+    // ── Cache-eviction helpers ──────────────────────────────────────────────
+    //
+    // These run on the cold path (eviction only fires when a cache is at
+    // its configured cap, or on a `gc_below` advance). Each helper
+    // increments the matching counter on
+    // [`CacheEvictionCounters`] and emits a single INFO trace for the
+    // batch — per the issue, eviction under load is expected behaviour
+    // and should not be a WARN.
+
+    /// Drop every `vote_bucket` entry whose `view < gc_below`.
+    /// Invoked on `PacemakerAdvance` so a stale-vote flood on long-past
+    /// views cannot accumulate indefinitely.
+    fn evict_vote_buckets_below(&mut self, gc_below: View) {
+        let before = self.vote_bucket.len();
+        self.vote_bucket.retain(|(view, _), _| *view >= gc_below);
+        let dropped = (before - self.vote_bucket.len()) as u64;
+        if dropped > 0 {
+            self.eviction_counters.inc_vote_bucket(dropped);
+            tracing::info!(
+                target: TRACE_TARGET,
+                cache = "vote_bucket",
+                policy = "gc_below",
+                gc_below,
+                dropped,
+                size_after = self.vote_bucket.len(),
+                "consensus_cache_evicted",
+            );
+        }
+    }
+
+    /// Drop the lowest-`view` `vote_bucket` entry if the map is at cap.
+    /// No-op when the cap is `usize::MAX` (the test default) or when
+    /// the map has free slots.
+    fn evict_vote_buckets_to_fit_one(&mut self) {
+        if self.vote_bucket.len() < self.limits.vote_bucket_capacity {
+            return;
+        }
+        // The lowest `(view, block_hash)` is the most stale: a vote at
+        // a low view is the least likely to ever feed a fresher
+        // high_qc than the one we already have. Tie-break on
+        // block_hash so the choice is deterministic across runs.
+        let Some(victim_key) = self.vote_bucket.keys().min().copied() else {
+            return;
+        };
+        let removed = self.vote_bucket.remove(&victim_key);
+        if removed.is_some() {
+            self.eviction_counters.inc_vote_bucket(1);
+            tracing::info!(
+                target: TRACE_TARGET,
+                cache = "vote_bucket",
+                policy = "cap",
+                evicted_view = victim_key.0,
+                cap = self.limits.vote_bucket_capacity,
+                size_after = self.vote_bucket.len(),
+                "consensus_cache_evicted",
+            );
+        }
+    }
+
+    /// Drop the lowest-`view` `parked_proposals` entry if the map is
+    /// at cap. The view of the *parked proposal itself* (not its
+    /// missing parent) is the eviction key: an attacker minting many
+    /// forged proposals at distinct future views still gets bounded
+    /// memory pressure, while honest proposals at the current view
+    /// stay parked.
+    fn evict_parked_to_fit_one(&mut self) {
+        if self.parked_proposals.len() < self.limits.parked_proposals_capacity {
+            return;
+        }
+        let Some((victim_hash, victim_view)) = self
+            .parked_proposals
+            .iter()
+            .map(|(hash, signed)| (*hash, signed.payload.block.header.view))
+            .min_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)))
+        else {
+            return;
+        };
+        if self.parked_proposals.remove(&victim_hash).is_some() {
+            self.eviction_counters.inc_parked_proposals(1);
+            tracing::info!(
+                target: TRACE_TARGET,
+                cache = "parked_proposals",
+                policy = "cap",
+                evicted_view = victim_view,
+                cap = self.limits.parked_proposals_capacity,
+                size_after = self.parked_proposals.len(),
+                "consensus_cache_evicted",
+            );
+        }
     }
 }
 
@@ -2797,6 +2963,336 @@ mod tests {
 
                 assert_no_conflicting_commits(&replicas);
             }
+        }
+    }
+
+    // ── Bounded-cache eviction (#135) ──────────────────────────────────
+    //
+    // The four caches the safety core owns directly are
+    // `vote_bucket` and `parked_proposals` (the integration layer's
+    // `timeout_buckets` lives in `consensus::node` and is tested
+    // there). `pending_blocks` lives on `HotStuffState` but its cap
+    // and counter are seeded by `HotStuffCore::with_limits`, so its
+    // eviction tests live here too. Each cache is exercised at two
+    // scales: insert exactly 2× its cap, and a policy-specific
+    // assertion (lowest-view victim, gc_below sweep, high_qc chain
+    // protection) that pins down which entries survive.
+
+    mod eviction {
+        use super::*;
+        use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
+
+        /// Build a tight-cap core. Validators are still the canonical
+        /// four; cap fields are passed as a literal so each test can
+        /// scale them independently.
+        fn make_core_with_limits(self_byte: u8, limits: CacheLimits) -> HotStuffCore {
+            let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let builder = Arc::new(TestBlockBuilder {
+                proposer: nid(self_byte),
+            });
+            HotStuffCore::with_limits(
+                nid(self_byte),
+                state,
+                builder,
+                limits,
+                CacheEvictionCounters::default(),
+            )
+        }
+
+        fn cap_only_vote_bucket(cap: usize) -> CacheLimits {
+            let mut l = CacheLimits::unbounded_for_tests();
+            l.vote_bucket_capacity = cap;
+            l
+        }
+
+        fn cap_only_parked(cap: usize) -> CacheLimits {
+            let mut l = CacheLimits::unbounded_for_tests();
+            l.parked_proposals_capacity = cap;
+            l
+        }
+
+        fn cap_only_pending_blocks(cap: usize) -> CacheLimits {
+            let mut l = CacheLimits::unbounded_for_tests();
+            l.pending_blocks_capacity = cap;
+            l
+        }
+
+        // ── vote_bucket ────────────────────────────────────────────────
+
+        /// Insert 2× the cap of distinct `(view, block_hash)` votes —
+        /// the cap holds and the counter records every drop.
+        #[test]
+        fn vote_bucket_inserting_twice_the_cap_evicts_to_cap() {
+            let cap = 4usize;
+            let mut core = make_core_with_limits(1, cap_only_vote_bucket(cap));
+            // Distinct (view, block_hash) tuples so each vote lands
+            // in its own bucket. We use the first three validators
+            // as signers; the fourth is `self_id` so its votes would
+            // be ignored as our own. Each tuple's signer is rotated
+            // so no two votes collide on the same (view, block_hash,
+            // signer) idempotency key.
+            let signers = [nid(2), nid(3), nid(4)];
+            for i in 0..(2 * cap) {
+                let view = i as View;
+                let block_hash: BlockHash = [i as u8 + 1; 32];
+                let signer = signers[i % signers.len()];
+                let signed = signed_vote(view, block_hash, signer);
+                core.step(Event::VoteReceived(signed));
+                assert!(
+                    core.vote_bucket.len() <= cap,
+                    "vote_bucket grew past cap after insert {i}: len={}",
+                    core.vote_bucket.len(),
+                );
+            }
+            // Final state: exactly cap entries, and the counter
+            // recorded `cap` evictions (one per insert past the cap).
+            assert_eq!(core.vote_bucket.len(), cap);
+            assert_eq!(core.eviction_counters().vote_bucket(), cap as u64);
+            // Lowest-view-first eviction: the surviving views are
+            // the cap most recent ones (cap..2*cap-1).
+            let mut surviving_views: Vec<View> = core.vote_bucket.keys().map(|(v, _)| *v).collect();
+            surviving_views.sort();
+            let expected: Vec<View> = (cap as View..(2 * cap) as View).collect();
+            assert_eq!(surviving_views, expected);
+        }
+
+        /// `gc_below` — driving `PacemakerAdvance(N)` drops every
+        /// `vote_bucket` entry with `view < N` immediately.
+        #[test]
+        fn vote_bucket_pacemaker_advance_evicts_below_gc_floor() {
+            // Loose cap — exercise only the gc_below path.
+            let mut core = make_core_with_limits(1, cap_only_vote_bucket(1024));
+            let signer = nid(2);
+            for view in 0..10 {
+                let block_hash: BlockHash = [view as u8 + 1; 32];
+                core.step(Event::VoteReceived(signed_vote(view, block_hash, signer)));
+            }
+            assert_eq!(core.vote_bucket.len(), 10);
+            assert_eq!(core.eviction_counters().vote_bucket(), 0);
+
+            // Advance the pacemaker to view 7 — buckets for views
+            // 0..7 must be dropped; 7..10 survive.
+            let _ = core.step(Event::PacemakerAdvance(7));
+            assert_eq!(core.vote_bucket.len(), 3);
+            assert_eq!(core.eviction_counters().vote_bucket(), 7);
+            let mut surviving: Vec<View> = core.vote_bucket.keys().map(|(v, _)| *v).collect();
+            surviving.sort();
+            assert_eq!(surviving, vec![7, 8, 9]);
+        }
+
+        /// Repeat votes for the same `(view, block_hash)` from
+        /// distinct signers must NOT trigger eviction — the cap only
+        /// trims genuinely-new buckets.
+        #[test]
+        fn vote_bucket_repeat_inserts_for_same_key_do_not_evict() {
+            let cap = 2usize;
+            let mut core = make_core_with_limits(1, cap_only_vote_bucket(cap));
+            // Fill to cap with two distinct tuples first.
+            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(2))));
+            let _ = core.step(Event::VoteReceived(signed_vote(1, [2; 32], nid(2))));
+            assert_eq!(core.vote_bucket.len(), cap);
+            assert_eq!(core.eviction_counters().vote_bucket(), 0);
+
+            // Three more votes on the SAME (view, block_hash) tuples
+            // from different signers — bucket-update path, no growth.
+            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(3))));
+            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(4))));
+            let _ = core.step(Event::VoteReceived(signed_vote(1, [2; 32], nid(3))));
+            assert_eq!(core.vote_bucket.len(), cap);
+            assert_eq!(core.eviction_counters().vote_bucket(), 0);
+        }
+
+        // ── parked_proposals ──────────────────────────────────────────
+
+        /// Insert 2× the cap of distinct orphan proposals — cap
+        /// holds, counter records every drop, and the lowest-view
+        /// proposals are the ones evicted.
+        #[test]
+        fn parked_proposals_inserting_twice_the_cap_evicts_to_cap() {
+            let cap = 3usize;
+            let mut core = make_core_with_limits(1, cap_only_parked(cap));
+            let sender = nid(2);
+            let orphan_parent: BlockHash = [0xFF; 32];
+            for i in 0..(2 * cap) {
+                let view = i as View;
+                // Distinct view per child guarantees a distinct
+                // child block hash AND lets us assert which views
+                // survive eviction.
+                let mut child = orphan_child(orphan_parent, view, nid(3));
+                // Vary state_commitment so even at the same view two
+                // children would hash differently — defensive.
+                child.header.state_commitment = [i as u8 + 1; 32];
+                let dummy = dummy_qc(0, core.state().genesis_hash);
+                let _ = core.step(Event::ProposalReceived(signed_proposal(
+                    child, dummy, sender,
+                )));
+                assert!(
+                    core.parked_proposals.len() <= cap,
+                    "parked_proposals grew past cap after insert {i}",
+                );
+            }
+            assert_eq!(core.parked_proposals.len(), cap);
+            assert_eq!(core.eviction_counters().parked_proposals(), cap as u64);
+            // Lowest-view-first eviction: the surviving views are
+            // the cap most recent ones (cap..2*cap-1).
+            let mut surviving_views: Vec<View> = core
+                .parked_proposals
+                .values()
+                .map(|s| s.payload.block.header.view)
+                .collect();
+            surviving_views.sort();
+            let expected: Vec<View> = (cap as View..(2 * cap) as View).collect();
+            assert_eq!(surviving_views, expected);
+        }
+
+        /// Re-parking the same `child_hash` (e.g. a duplicate
+        /// retransmission) must not grow the map and so must not
+        /// trigger eviction.
+        #[test]
+        fn parked_proposals_idempotent_repark_does_not_evict() {
+            let cap = 1usize;
+            let mut core = make_core_with_limits(1, cap_only_parked(cap));
+            let sender = nid(2);
+            let orphan_parent: BlockHash = [0xAA; 32];
+            let child = orphan_child(orphan_parent, 1, nid(3));
+            let dummy = dummy_qc(0, core.state().genesis_hash);
+
+            // Two identical inserts — second is a no-op overwrite.
+            let _ = core.step(Event::ProposalReceived(signed_proposal(
+                child.clone(),
+                dummy.clone(),
+                sender,
+            )));
+            let _ = core.step(Event::ProposalReceived(signed_proposal(
+                child, dummy, sender,
+            )));
+            assert_eq!(core.parked_proposals.len(), 1);
+            assert_eq!(core.eviction_counters().parked_proposals(), 0);
+        }
+
+        // ── pending_blocks ────────────────────────────────────────────
+
+        /// Insert 2× the cap of pending blocks (above genesis) and
+        /// observe the lowest-height entries getting trimmed. Genesis
+        /// must always survive — the safety walks rest on it.
+        #[test]
+        fn pending_blocks_inserting_twice_the_cap_evicts_to_cap_protecting_genesis() {
+            // cap = 4 means the map can hold genesis + 3 others.
+            let cap = 4usize;
+            let mut core = make_core_with_limits(1, cap_only_pending_blocks(cap));
+            let genesis_hash = core.state().genesis_hash;
+
+            // No high_qc set so only genesis is "protected"; every
+            // other insert is fair game for eviction.
+            let chain = chain_from_genesis(
+                core.state().pending_blocks.get(&genesis_hash).unwrap(),
+                &(1..=(2 * cap as View)).collect::<Vec<_>>(),
+                nid(2),
+            );
+            for block in &chain {
+                core.state.insert_pending(block.clone());
+                assert!(
+                    core.state.pending_blocks.len() <= cap,
+                    "pending_blocks grew past cap; len={}",
+                    core.state.pending_blocks.len(),
+                );
+            }
+            assert_eq!(core.state.pending_blocks.len(), cap);
+            // Genesis must survive every eviction round.
+            assert!(core.state.pending_blocks.contains_key(&genesis_hash));
+            // Lowest-height-first eviction: surviving non-genesis
+            // entries are the most-recent cap-1 heights of the chain.
+            let mut surviving_heights: Vec<u64> = core
+                .state
+                .pending_blocks
+                .values()
+                .filter(|b| b.hash() != genesis_hash)
+                .map(|b| b.header.height)
+                .collect();
+            surviving_heights.sort();
+            let expected_low = (2 * cap as u64) - (cap as u64 - 1) + 1;
+            let expected: Vec<u64> = (expected_low..=(2 * cap as u64)).collect();
+            assert_eq!(surviving_heights, expected);
+            // Counter recorded one drop per evicted block.
+            let inserted = chain.len() as u64;
+            let surviving_non_genesis = (cap as u64) - 1;
+            assert_eq!(
+                core.eviction_counters().pending_blocks(),
+                inserted - surviving_non_genesis,
+            );
+        }
+
+        /// The high_qc chain is protected: when the map is at cap,
+        /// the safety core picks a non-protected victim rather than
+        /// evicting any block reachable from `high_qc.block_hash`
+        /// within `PROTECTED_HIGH_QC_DEPTH` parent links. Without
+        /// this protection, the two-chain and three-chain walks
+        /// would lose their footing under a fork flood.
+        #[test]
+        fn pending_blocks_high_qc_ancestors_are_protected_from_eviction() {
+            // Pick a cap that comfortably holds genesis + the
+            // 3-block high_qc chain *and* leaves room for a couple
+            // of forks: genesis + 3 chain = 4 protected, plus 2
+            // fork slots → cap = 6. Inserting 5 forks then forces
+            // eviction, and every eviction must pick a fork (never
+            // a protected block).
+            let cap = 6usize;
+            let mut core = make_core_with_limits(1, cap_only_pending_blocks(cap));
+            let genesis_hash = core.state().genesis_hash;
+            let genesis = core
+                .state()
+                .pending_blocks
+                .get(&genesis_hash)
+                .unwrap()
+                .clone();
+
+            // Build a chain genesis -> b1 -> b2 -> b3 at heights 1,2,3
+            // and pin high_qc on the tip so the whole chain (plus
+            // genesis) sits in the protected set.
+            let chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
+            for block in &chain {
+                core.state.insert_pending(block.clone());
+            }
+            let tip_hash = chain.last().unwrap().hash();
+            core.state.high_qc = Some(dummy_qc(3, tip_hash));
+            assert_eq!(core.state.pending_blocks.len(), 4);
+            assert_eq!(core.eviction_counters().pending_blocks(), 0);
+
+            // Insert 5 forks off genesis at height 1. With cap=6, only
+            // (cap - 4 protected) = 2 fork slots are free, so forks 3,
+            // 4, 5 each evict the previously-inserted lowest-height
+            // non-protected entry — i.e. another fork.
+            let n_forks = 5usize;
+            for i in 0..n_forks {
+                let header = crate::replication::block::BlockHeader {
+                    parent_hash: genesis_hash,
+                    height: 1,
+                    view: 100 + i as View,
+                    proposer: nid(3),
+                    state_commitment: [0xC0 + i as u8; 32],
+                    commands_commitment: Block::commands_commitment(&[]),
+                };
+                let fork = Block {
+                    header,
+                    commands: Vec::new(),
+                };
+                core.state.insert_pending(fork);
+            }
+
+            // Every protected block must still be present.
+            assert!(core.state.pending_blocks.contains_key(&genesis_hash));
+            for b in &chain {
+                assert!(
+                    core.state.pending_blocks.contains_key(&b.hash()),
+                    "high_qc chain block at height {} must survive eviction",
+                    b.header.height,
+                );
+            }
+            // Cap is hard now that protected ≤ cap: total stays ≤ cap.
+            assert_eq!(core.state.pending_blocks.len(), cap);
+            // Counter incremented once per evicted fork (5 inserted,
+            // 2 surviving fork slots → 3 evictions).
+            assert_eq!(core.eviction_counters().pending_blocks(), 3);
         }
     }
 }
