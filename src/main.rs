@@ -260,6 +260,15 @@ fn handle_init(args: &[String]) -> anyhow::Result<()> {
     let provider = config::build_provider(&identity_cfg)?;
     provision_or_report(&*provider, identity_cfg.backend_name(), "network")?;
 
+    // Step 4a: cross-validate `[[peers]]` against the local NodeId now
+    // that the network key has been loaded. Catches a self-id in the
+    // static peers list at `init` time so operators don't ship a config
+    // that only fails at `start`.
+    if let Some(net_id) = provider.try_load()? {
+        let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&net_id)?;
+        config.validate(&tls.node_id)?;
+    }
+
     // Step 4b: same flow for `[node.validator_identity]` if configured.
     // When the table is absent, the network key is reused for consensus
     // signing at start time (with a deprecation warning), so `init` has
