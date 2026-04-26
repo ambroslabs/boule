@@ -231,8 +231,16 @@ pub fn load(path: &Path) -> anyhow::Result<Scenario> {
 }
 
 /// Built-in: `rotating-failure --f F`. Mirrors §9b's rotating-failure
-/// script, but with the first kill round picking exactly `f` random
-/// nodes from a seeded RNG. Requires the cluster to be up already.
+/// script: bring the cluster to steady state, SIGKILL `f` random nodes,
+/// confirm survivors keep committing, then verify safety. Requires the
+/// cluster to be up already.
+///
+/// Notably absent: a `wait_quiescent` step. With `n - f >= 2f + 1`
+/// survivors, the cluster has quorum and *should* keep committing —
+/// quiescence would never be reached. We use a second
+/// `wait_all_reach_height` instead, which both proves liveness post-
+/// kill and gives the survivors enough head-room for safety to be
+/// meaningful.
 pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
     let timeout = 30;
     Scenario {
@@ -247,11 +255,7 @@ pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
             },
             Step::KillRandom { count: f },
             Step::WaitAllReachHeight {
-                height: 10,
-                timeout_secs: timeout,
-            },
-            Step::WaitQuiescent {
-                for_secs: 2,
+                height: 15,
                 timeout_secs: timeout,
             },
             Step::VerifySafety,
@@ -260,12 +264,20 @@ pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
 }
 
 /// Built-in: `disconnect-random --count N --restart-after Ns`.
-/// Synthesises a kill -> wait -> bring-back sequence. Restart targets
-/// the *same* nodes that were killed, so `node` arguments interpolate
-/// the seed-chosen indices at run time. The current encoding kills
-/// random nodes, waits, and emits `up` for every dead node before
-/// re-verifying safety.
+/// Kills `count` random live nodes, then asserts the survivors reach
+/// some hight above `5 + restart_after_secs * 2` (a coarse proxy for
+/// "kept committing for that long"), and finally verifies safety.
+///
+/// `restart_after_secs` was originally meant to gate "restart the
+/// dead nodes after N seconds", but the scenario format has no way
+/// to propagate the seed-chosen kill targets to a subsequent `up`
+/// step, so the param now just sizes the post-kill liveness window.
+/// Run a follow-up `testnet scenario reconnect-with-catchup <node>`
+/// (or a TOML file referencing each restart target by name) to
+/// exercise the bring-back path.
 pub fn disconnect_random(count: usize, restart_after_secs: u64, seed: u64) -> Scenario {
+    let post_kill_height = 5 + (restart_after_secs * 2).max(5);
+    let timeout = restart_after_secs * 2 + 30;
     Scenario {
         scenario: ScenarioMeta {
             seed: Some(seed),
@@ -277,9 +289,9 @@ pub fn disconnect_random(count: usize, restart_after_secs: u64, seed: u64) -> Sc
                 timeout_secs: 30,
             },
             Step::KillRandom { count },
-            Step::WaitQuiescent {
-                for_secs: restart_after_secs,
-                timeout_secs: restart_after_secs * 2 + 30,
+            Step::WaitAllReachHeight {
+                height: post_kill_height,
+                timeout_secs: timeout,
             },
             Step::VerifySafety,
         ],

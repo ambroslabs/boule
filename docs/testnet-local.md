@@ -596,248 +596,193 @@ be the same two nodes for all time: a node can crash, recover, and
 participate while a different node fails. HotStuff's fault tolerance is
 **per-snapshot**, not per-identity.
 
-#### Setup
-
-A seven-node cluster is too tedious to bootstrap by hand. Use the
-following helper to mint keys and write configs.
-
-The `[[peers]]` block intentionally lists **only the two ring
-neighbours** (`i ± 1 mod 7`) for each node rather than the full N − 1
-list — the gossip overlay (the default since #137 stack 9) discovers
-the rest of the cluster through peer-list gossip and the
-partial-mesh maintenance loop, so an operator-supplied bootstrap of
-the immediate neighbours is enough. Setting `[overlay].target_degree
-= 4` keeps each node at 4 direct connections without coordinated
-config changes when the validator set grows. This sparse-mesh layout
-is what the issue #178 regression test pinned: every committed
-block-sync probe traverses the gossip-fallback broadcast at least
-once because the proposer is not always a direct peer of the
-restarted node.
+This walkthrough used to be a hand-rolled shell script (PID-tracking
+env vars, fixed `sleep`s, log scraping with `grep`). Issue #189 replaced
+it with a workspace binary, `testnet`, that does the same dance through
+typed primitives: it spawns nodes, waits on the admin API instead of
+polling clocks, kills processes by index, and runs the §8 safety check
+against ANSI-tolerant log parsing. Build it once:
 
 ```sh
-mkdir -p testnet7
-
-# Step 1: write the per-node config and provision its key with `init`.
-for i in 1 2 3 4 5 6 7; do
-  mkdir -p testnet7/node$i
-  cat > testnet7/node$i/config.toml <<EOF
-[node]
-listen_addr = "127.0.0.1:$((27000 + i))"
-
-[node.identity]
-backend = "file"
-path    = "testnet7/node$i/node.key"
-
-[api]
-listen_addr = "127.0.0.1:$((28000 + i))"
-cleanup_interval_secs = 60
-EOF
-  ./target/release/ambros-p2p init --config testnet7/node$i/config.toml \
-    > testnet7/node$i/init.log
-done
-
-# Step 2: collect node IDs (parsed from each `init` log) and write
-# final configs with [consensus] + sparse [[peers]].
-NODE_IDS=$(for i in 1 2 3 4 5 6 7; do
-  grep -oE 'NodeId = [^ ]+' testnet7/node$i/init.log \
-    | head -1 | awk '{print $3}'
-done)
-VALIDATORS=$(echo "$NODE_IDS" | sed 's/^/"/; s/$/"/' | paste -sd ',' -)
-
-for i in 1 2 3 4 5 6 7; do
-  prev=$(( (i - 2 + 7) % 7 + 1 ))
-  next=$(( i % 7 + 1 ))
-  N_PREV=$(sed -n "${prev}p" <<< "$NODE_IDS")
-  N_NEXT=$(sed -n "${next}p" <<< "$NODE_IDS")
-  cat > testnet7/node$i/config.toml <<EOF
-[node]
-listen_addr = "127.0.0.1:$((27000 + i))"
-
-[node.identity]
-backend = "file"
-path    = "testnet7/node$i/node.key"
-
-[api]
-listen_addr = "127.0.0.1:$((28000 + i))"
-cleanup_interval_secs = 60
-
-[overlay]
-mode          = "gossip"
-target_degree = 4
-
-[consensus]
-validators       = [$VALIDATORS]
-storage_dir      = "testnet7/node$i/consensus"
-timeout_base_ms  = 500
-timeout_max_ms   = 5000
-
-[[peers]]
-addr    = "127.0.0.1:$((27000 + prev))"
-node_id = "$N_PREV"
-
-[[peers]]
-addr    = "127.0.0.1:$((27000 + next))"
-node_id = "$N_NEXT"
-EOF
-done
+cargo build --release --bin testnet --bin ambros-p2p
 ```
 
-> **Operator workaround for older builds.** If you're on a build that
-> predates the issue #178 / #182 fixes (commits landing the
-> `RequestBlock` retry on `PacemakerAdvance` and the unicast-via-mesh
-> rework, respectively), you can either set `[overlay].mode = "mesh"`
-> to fall back to the legacy full-mesh path, or list every peer in
-> `[[peers]]` so each node holds N − 1 direct connections. The
-> sparse-ring layout above only catches up reliably with both fixes
-> in place.
-
-#### The rotating-failure scenario
-
-Define a small launcher and snapshot helper, then run the scenario:
+#### One-shot rotating-failure run
 
 ```sh
-launch() {
-  RUST_LOG=info ./target/release/ambros-p2p start --config testnet7/node$1/config.toml \
-    >> testnet7/node$1/log 2>&1 &
-  eval "PID$1=\$!"
-}
-
-snap() {
-  echo "== $1 =="
-  for i in 1 2 3 4 5 6 7; do
-    if [ -f testnet7/node$i/log ]; then
-      c=$(grep -c "committed block" testnet7/node$i/log 2>/dev/null || echo 0)
-      h=$(grep "committed block" testnet7/node$i/log 2>/dev/null \
-        | tail -1 | grep -oE "height=[0-9]+" || echo "-")
-      echo "  n$i: $c commits, $h"
-    fi
-  done
-}
-
-# t=0: launch all 7
-for i in 1 2 3 4 5 6 7; do launch $i; sleep 0.2; done
-sleep 3
-snap "t=3s, all healthy"
-
-# t=3s: kill n2 and n5 (at the f=2 boundary)
-kill -9 $PID2 $PID5
-sleep 5
-snap "t=8s, n2 + n5 dead (5 honest)"
-
-# t=8s: restart n2 (it has on-disk state and recovers via block sync).
-# Block-sync walks back one parent per pacemaker tick, so the post-restart
-# wait scales with the gap (here ~30 blocks at timeout_base_ms=500). If the
-# next snapshot still shows n2 mid-catch-up, bump this sleep.
-launch 2
-sleep 15
-snap "t=23s, n2 healed, only n5 dead"
-
-# t=23s: kill n4 (now the dead set is {n4, n5} — different from before)
-kill -9 $PID4
-sleep 8
-snap "t=31s, n4 + n5 dead, n2 fully participating"
-
-# Shut down survivors
-for i in 1 2 3 6 7; do
-  pid_var="PID$i"
-  kill -TERM ${!pid_var} 2>/dev/null
-done
-wait 2>/dev/null
+./target/release/testnet new --nodes 7 --seed 1 --workdir testnet7 \
+    --ambros-bin ./target/release/ambros-p2p
+./target/release/testnet scenario rotating-failure-7n-f2 --seed 1 \
+    --workdir testnet7 --ambros-bin ./target/release/ambros-p2p
+./target/release/testnet down --workdir testnet7
 ```
 
-#### What to look for
+`new` lays out a seven-node ring under `testnet7/` (per-node config,
+key, `consensus/` storage, log file), mints each node's identity, and
+writes final configs with the full `[consensus].validators` list and
+sparse `[[peers]]` block (only the two ring neighbours `i ± 1 mod 7`
+per node, since the gossip overlay discovers the rest through
+peer-list gossip).
 
-A healthy run produces output like:
+`scenario rotating-failure-7n-f2 --seed 1` brings the cluster up if
+it isn't already, waits for every node to commit through height 5,
+SIGKILLs two random nodes (the `--seed 1` choice is reproducible),
+waits for the survivors to commit through height 15, then runs the
+§8 safety verifier across every per-node log. The seed is recorded
+in `testnet7/events.jsonl` so a failing run can be replayed verbatim.
+
+`down` SIGTERMs every live node (escalating to SIGKILL after a 3s
+grace) and reaps the per-node `pid` files. It's idempotent — safe to
+run after a `Ctrl-C` interrupted scenario, or twice in a row.
+
+#### Inspecting the cluster
+
+While the cluster is up:
+
+```sh
+./target/release/testnet ls          --workdir testnet7   # static topology
+./target/release/testnet snap        --workdir testnet7   # live commit/view/peers
+./target/release/testnet info node3  --workdir testnet7   # full /consensus/status
+./target/release/testnet info node3 peers --workdir testnet7
+./target/release/testnet logs node3  --workdir testnet7 --tail 80
+./target/release/testnet telemetry   --workdir testnet7
+./target/release/testnet verify-safety --workdir testnet7
+```
+
+`snap` is the §9b shell script's `snap` helper, but reading the admin
+API instead of grepping logs:
 
 ```
-== t=3s, all healthy ==
-  n1: 78 commits, height=78
-  n2: 78 commits, height=78
-  ... (all within 1-2 of each other)
-
-== t=8s, n2 + n5 dead (5 honest) ==
-  n1: 86 commits, height=86       ← survivors gained ~8
-  n2: 78 commits, height=78       ← frozen at pre-kill
-  n5: 78 commits, height=78       ← frozen
-  n3: 86 commits, height=86
-  ...
-
-== t=23s, n2 healed, only n5 dead ==
-  n2: 220 commits, height=220     ← caught up to live chain via block sync
-  n1: 222 commits, height=222     ← rate accelerated (only 1 dead)
-  ...
-
-== t=31s, n4 + n5 dead, n2 fully participating ==
-  n1: 260 commits, height=265     ← survivors progressed past kill
-  n2: 260 commits, height=265     ← formerly dead, now contributing
-  n4: 222 commits, height=222     ← frozen at second kill
-  n5: 78 commits, height=78       ← still frozen
+   node  status        view   height  peers  role
+  node1  up(54320)       28       27      6  replica
+  node2  up(54321)       28       27      6  leader(view=28)
+  node3  up(54322)       27       26      6  replica
   ...
 ```
 
-> The exact numbers will vary per run — what matters is the relative
-> shape: survivors advance across both faulty windows, n2 reaches
-> parity with the live chain by the second snapshot, and the two
-> killed nodes stay frozen at their pre-kill heights. If n2's height
-> in the `t=23s` snapshot is still well below the survivors', it's
-> still mid-catch-up: bump the `sleep 15` after the relaunch and
-> rerun. Block-sync currently walks back one parent per pacemaker
-> tick (issue #185 tracks the planned bulk-range RPC + dedicated
-> retry timer), so the wait scales with how many blocks were missed.
+`telemetry` tallies the consensus / block-sync counters that used to
+require ad-hoc grep over each log: `consensus_resumed`,
+`block_sync_request_emitted`, `block_sync_response_received`,
+`proposal_rejected_unknown_parent`, `gossip_send_to_dispatched`.
 
-Three properties to verify:
+`verify-safety` is the §8 cross-node `(height, view)` consistency
+check. It exits non-zero on a violation and prints the divergent
+views per node. Unlike the shell version, the parser tolerates the
+ANSI color codes that `tracing-subscriber`'s pretty formatter emits —
+the original `grep -oE "height=[0-9]+ view=[0-9]+"` silently dropped
+matches when the field was wrapped in a color escape.
 
-1. **Liveness across both faulty windows.** Survivors gain commits in
-   both the t=3→8s window (n2+n5 down) and the t=23→31s window (n4+n5
-   down). Both are `f = 2` configurations.
-2. **Recovery and re-participation.** n2 was dead for ~5 seconds, missed
-   ~30 blocks, restarted, caught up to the live chain via block sync,
-   and then fully participated in committing past the second kill point.
-   The block-sync round-trip is visible at `RUST_LOG=info`:
-   - `consensus_resumed` (once, on n2's restart) — reports the recovered
-     `last_committed_height`, `last_voted_view`, and `high_qc_view`.
-   - `proposal_rejected_unknown_parent` and `block_sync_request_emitted`
-     (one pair per fresh proposal arriving at n2 while it's still
-     missing intermediate ancestors) — confirms n2 is asking peers
-     for the missing parents rather than silently dropping the
-     proposal.
-   - `block_sync_response_received` (one per parent the cluster
-     serves back) — confirms the round-trip completed.
-   - On the gossip side, `gossip_send_to_dispatched` (at
-     `target=ambros_p2p::p2p::overlay::gossip`) fires once per
-     emitted `BlockRequest`. The `target_is_direct` field reports
-     whether the requested peer was a current direct neighbour;
-     under the sparse-mesh `[[peers]]` setup above it's commonly
-     `false` because the proposer of an unknown-parent proposal
-     usually isn't directly connected. Either way, the request is
-     fanned out as a `Forward` frame to every direct neighbour
-     (issue #182) and every receiver surfaces the payload to its
-     consensus dispatch — the responders independently look up the
-     block and reply, the requester deduplicates by hash, and the
-     wire path is the same proven one consensus broadcasts use.
-3. **Safety is preserved across rotating failures.** Run the §8 safety
-   verifier against `testnet7/node*/log` after the run completes:
+#### Crash recovery
 
-   ```sh
-   for i in 1 2 3 4 5 6 7; do
-     grep -oE "height=[0-9]+ view=[0-9]+" testnet7/node$i/log \
-       | sed -E 's/height=([0-9]+) view=([0-9]+)/\1 \2/' \
-       | sort -n -k1 -u > /tmp/n$i.hv
-   done
-   violations=0
-   for h in $(cat /tmp/n*.hv | cut -d' ' -f1 | sort -n -u); do
-     views=$(for i in 1 2 3 4 5 6 7; do
-       grep "^$h " /tmp/n$i.hv | head -1 | cut -d' ' -f2
-     done | sort -u | tr '\n' ' ')
-     count=$(echo "$views" | wc -w)
-     [ "$count" -gt 1 ] && { echo "VIOLATION h=$h views=$views"; violations=$((violations+1)); }
-   done
-   echo "violations: $violations"
-   ```
+The legacy walkthrough also exercised "kill, wait, restart, observe
+catch-up via block-sync, kill different nodes". The driver supports
+the same, expressed as scenario steps:
 
-   Expect zero violations across the union of every committed height.
-   No two nodes ever committed different blocks at the same height,
-   even though the down-set rotated mid-run.
+```sh
+./target/release/testnet kill node2  --workdir testnet7
+./target/release/testnet wait --node node2 --catch-up-to-cluster --tolerance 2 \
+    --workdir testnet7    # only meaningful after a subsequent `up node2`
+./target/release/testnet up node2    --workdir testnet7
+./target/release/testnet wait --node node2 --catch-up-to-cluster --tolerance 2 \
+    --workdir testnet7
+```
+
+The `wait --catch-up-to-cluster` predicate is the answer to "how
+long do I sleep after a restart?" — it polls
+`last_committed_height` on the restarted node and the rest of the
+live cluster, and returns when the gap closes within `--tolerance`.
+This replaces the §9b script's `sleep 15` after a relaunch (a fixed
+guess that scaled badly with how many blocks were missed). Block-sync
+walks back one parent per pacemaker tick, so the underlying wait time
+is still bounded by the gap (issue #185 tracks the planned bulk-range
+RPC + dedicated retry timer), but the driver no longer
+under-or-overshoots.
+
+The block-sync round-trip is visible at `RUST_LOG=info` — same
+events as before, the driver just exposes `telemetry` as a tabular
+summary rather than asking operators to grep:
+
+- `consensus_resumed` (once, on a node's restart) — reports the
+  recovered `last_committed_height`, `last_voted_view`, and
+  `high_qc_view`.
+- `proposal_rejected_unknown_parent` + `block_sync_request_emitted`
+  (one pair per fresh proposal arriving at the restarted node while
+  it's still missing intermediate ancestors) — confirms it's asking
+  peers for the missing parents rather than silently dropping the
+  proposal.
+- `block_sync_response_received` (one per parent the cluster serves
+  back) — confirms the round-trip completed.
+- `gossip_send_to_dispatched` (one per emitted `BlockRequest`,
+  `target_is_direct` reporting whether the requested peer was a
+  current direct neighbour). Under the sparse-mesh `[[peers]]` layout
+  the driver writes, this is commonly `false` because the proposer
+  of an unknown-parent proposal usually isn't directly connected.
+  Either way the request is fanned out as a `Forward` frame to every
+  direct neighbour (issue #182) and every receiver surfaces the
+  payload to its consensus dispatch — the responders look up the
+  block and reply independently, the requester deduplicates by hash,
+  and the wire path is the same proven one consensus broadcasts use.
+
+#### What `rotating-failure-7n-f2` proves
+
+Three properties end-to-end:
+
+1. **Liveness across the faulty window.** Survivors keep committing
+   while two nodes are dead — `wait --all-reach-height 15` after the
+   `kill_random` step succeeds with three live nodes wedged would
+   time out and fail the scenario.
+2. **No false positives in safety checks.** The verifier runs over
+   the union of every node's log; ANSI-tolerant `(height, view)`
+   parsing means a passing run actually means consistency, not
+   "grep happened to miss a colored field".
+3. **Reproducibility.** Same `--seed` ⇒ same picked nodes for
+   `kill_random` ⇒ identical scenario across runs. Failing scenarios
+   print the seed in their error message so they can be replayed
+   bit-for-bit.
+
+#### Composing custom scenarios
+
+For runs that the built-in subcommands don't cover, the driver also
+accepts a TOML scenario file:
+
+```toml
+[scenario]
+seed = 42
+
+[[steps]]
+op = "wait_all_reach_height"
+height = 30
+
+[[steps]]
+op = "kill_random"
+count = 2
+
+[[steps]]
+op = "wait_all_reach_height"
+height = 50
+
+[[steps]]
+op = "verify_safety"
+```
+
+```sh
+./target/release/testnet scenario --file my-scenario.toml --workdir testnet7
+```
+
+The available `op =` values match the CLI: `wait_all_reach_height`,
+`wait_all_healthy`, `wait_quiescent`, `wait_catch_up`, `kill_random`,
+`kill`, `up`, `verify_safety`. Step indices and seed are recorded in
+`workdir/events.jsonl` for post-mortem analysis.
+
+> **Why no fixed-mesh fallback in the driver.** The driver always
+> writes `[overlay].mode = "gossip"` because that's the default since
+> issue #137 stack 9 / commit 5b05aa3, and because the §9b sparse-ring
+> layout depends on issue #178 (`RequestBlock` retry on
+> `PacemakerAdvance`) and issue #182 (unicast routed through the
+> gossip mesh) to converge reliably. Operators on builds that
+> predate those fixes need to write configs by hand with
+> `[overlay].mode = "mesh"` or a full N − 1 `[[peers]]` list — the
+> driver does not paper over those older topologies.
 
 > **What this isn't.** "Kill the process" simulates **fail-stop**: a
 > node simply stops sending and receiving. True Byzantine behavior

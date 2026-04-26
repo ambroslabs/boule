@@ -70,20 +70,39 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
     // Phase 1: lay out per-node directories + minimal configs (no
     // peers, no consensus), run `init`, and start the binary briefly
     // to discover the bound P2P address + node_id from the addr_file.
-    let mut nodes: Vec<NodeLayout> = Vec::with_capacity(spec.nodes);
+    //
+    // The `init` step is sequential (cheap; no I/O contention worth
+    // parallelizing). The discovery launch is parallelized — each node
+    // is independent, has no peers configured, and the bottleneck is
+    // process spawn + a short addr_file poll. Running them concurrently
+    // turns N × ~100ms into max(~100ms) on small clusters and is the
+    // difference between fitting and not fitting in the integration
+    // test budget.
+    let mut layouts: Vec<NodeLayout> = Vec::with_capacity(spec.nodes);
     for nt in &topo {
         let layout = node_layout(&workdir, nt.index, nt.bootstrap_peers.clone());
         std::fs::create_dir_all(layout.config_path.parent().unwrap())
             .with_context(|| format!("creating dir for {}", layout.display_name()))?;
         std::fs::create_dir_all(&layout.consensus_dir)
             .with_context(|| format!("creating {}", layout.consensus_dir.display()))?;
-
         write_minimal_config(&layout)?;
         run_init(&binary, &layout.config_path)
             .with_context(|| format!("init failed for {}", layout.display_name()))?;
-        let info = launch_once_for_discovery(&binary, &layout)
-            .await
-            .with_context(|| format!("discovering addrs for {}", layout.display_name()))?;
+        layouts.push(layout);
+    }
+    let bin_clone = binary.clone();
+    let discoveries = futures_util::future::try_join_all(layouts.iter().cloned().map(|layout| {
+        let bin = bin_clone.clone();
+        async move {
+            let info = launch_once_for_discovery(&bin, &layout)
+                .await
+                .with_context(|| format!("discovering addrs for {}", layout.display_name()))?;
+            Ok::<_, anyhow::Error>((layout, info))
+        }
+    }))
+    .await?;
+    let mut nodes: Vec<NodeLayout> = Vec::with_capacity(discoveries.len());
+    for (layout, info) in discoveries {
         nodes.push(NodeLayout {
             node_id: Some(info.node_id),
             p2p_addr: Some(info.p2p_addr.parse()?),
@@ -91,6 +110,7 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
             ..layout
         });
     }
+    nodes.sort_by_key(|n| n.index);
 
     // Phase 2: write the final per-node config with the full
     // [consensus] section + sparse [[peers]] block.
@@ -191,6 +211,13 @@ fn write_final_config(
         .unwrap();
     }
 
+    // Bake the api_addr discovered in phase 1 into the final config
+    // (rather than re-binding to port 0). Otherwise `up` would land on
+    // a fresh dynamic port and the api_addr in `state.json` would be
+    // stale until the driver re-read each addr_file post-spawn.
+    let api = n
+        .api_addr
+        .ok_or_else(|| anyhow::anyhow!("missing api_addr for {}", n.display_name()))?;
     let body = format!(
         "[node]\n\
          listen_addr = \"{p2p}\"\n\
@@ -201,7 +228,7 @@ fn write_final_config(
          path    = \"{key}\"\n\
          \n\
          [api]\n\
-         listen_addr = \"127.0.0.1:0\"\n\
+         listen_addr = \"{api}\"\n\
          cleanup_interval_secs = 60\n\
          \n\
          [overlay]\n\
@@ -287,12 +314,13 @@ async fn launch_once_for_discovery(
     };
 
     // Tear the discovery process down — we relaunch with the final
-    // config in `up`. SIGINT first so close_notify fires; SIGKILL if
-    // the node ignores us.
-    if !signal_then_wait(&mut child, libc_sigint(), TERM_GRACE) {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    // config in `up`. SIGKILL is fine: no peers are connected (this
+    // node was started with an empty `[[peers]]` block) so there's no
+    // close_notify path to flush, and the node's `tokio::signal::ctrl_c`
+    // graceful path waits up to 5s on join handles which dominates an
+    // otherwise sub-100ms launch.
+    let _ = child.kill();
+    let _ = child.wait();
 
     Ok(DiscoveryInfo {
         node_id: info.node_id,
@@ -380,19 +408,37 @@ pub fn pid_alive(layout: &NodeLayout) -> Option<u32> {
 
 #[cfg(unix)]
 fn pid_is_running(pid: u32) -> bool {
-    // SAFETY: kill(pid, 0) is a probe — it sends no signal and returns
-    // 0 if the caller has permission to signal the target.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    // We `mem::forget` spawned children, so a SIGKILL'd or SIGTERM'd
+    // node becomes a zombie until reaped — and `kill(pid, 0)` happily
+    // reports zombies as "alive". Reap with `waitpid(WNOHANG)` first;
+    // it succeeds only for our own children, returns the pid when the
+    // process is gone, returns 0 when it's still actually running, and
+    // returns -1 (ECHILD) for processes spawned by a different driver
+    // invocation. Fall back to `kill(pid, 0)` for the latter case so
+    // re-invoked drivers can still observe nodes from prior `up`s.
+    //
+    // SAFETY: both syscalls are safe to invoke with arbitrary pid_t —
+    // invalid pids surface as -1 with errno set rather than UB.
+    unsafe {
+        let mut status: libc::c_int = 0;
+        let r = libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG);
+        if r == pid as libc::pid_t {
+            return false;
+        }
+        if r > 0 {
+            return false;
+        }
+        if r == 0 {
+            return true;
+        }
+        // r == -1: ECHILD (not our child) or another error. Fall through.
+        libc::kill(pid as libc::pid_t, 0) == 0
+    }
 }
 
 #[cfg(not(unix))]
 fn pid_is_running(_pid: u32) -> bool {
     false
-}
-
-#[cfg(unix)]
-fn libc_sigint() -> libc::c_int {
-    libc::SIGINT
 }
 
 #[cfg(unix)]
@@ -403,11 +449,6 @@ fn libc_sigterm() -> libc::c_int {
 #[cfg(unix)]
 fn libc_sigkill() -> libc::c_int {
     libc::SIGKILL
-}
-
-#[cfg(not(unix))]
-fn libc_sigint() -> i32 {
-    0
 }
 
 #[cfg(not(unix))]
@@ -525,29 +566,6 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(25));
     }
     !pid_is_running(pid)
-}
-
-/// Send `signal` to `child`'s PID and wait up to `timeout` for it to
-/// exit. Returns `true` if the child exited cleanly. Used by the
-/// discovery launcher to bring the short-lived process down.
-fn signal_then_wait(
-    child: &mut std::process::Child,
-    signal: libc::c_int,
-    timeout: Duration,
-) -> bool {
-    let pid = child.id();
-    if !send_signal(pid, signal) {
-        return false;
-    }
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return true,
-            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(_) => return false,
-        }
-    }
-    false
 }
 
 #[cfg(test)]
