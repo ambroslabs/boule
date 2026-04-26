@@ -1188,3 +1188,390 @@ async fn test_consensus_status_returns_404_on_gossip_only_node() {
         "gossip-only node must return 404 on /consensus/status",
     );
 }
+
+// ── `config` subcommand tests (issue #148) ──────────────────────────────────
+//
+// These tests exercise the binary directly — no node is spawned, since the
+// subcommand reads/edits config files synchronously and never opens
+// listeners. Every test writes a self-contained config in a temp dir and
+// invokes `cargo`-built `ambros-p2p config ...`.
+
+const SAMPLE_CONFIG: &str = r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[node.identity]
+backend = "file"
+path    = "/tmp/ambros-p2p-config-test/node.key"
+
+[api]
+listen_addr = "127.0.0.1:8000"
+
+[consensus]
+validators = ["abc", "def"]
+"#;
+
+fn write_sample_config(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("config.toml");
+    std::fs::write(&path, SAMPLE_CONFIG).expect("write sample config");
+    path
+}
+
+fn run_config(args: &[&str]) -> std::process::Output {
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    Command::new(bin)
+        .arg("config")
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn `ambros-p2p config`")
+}
+
+#[test]
+fn test_config_path_prints_resolved_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap(), "--path"]);
+    assert!(
+        out.status.success(),
+        "config --path failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.trim(), path.to_str().unwrap());
+}
+
+#[test]
+fn test_config_default_resolved_toml_round_trips() {
+    // The acceptance criterion is that `--format toml` (the default)
+    // produces output that re-parses to the same logical config — i.e.,
+    // the resolved view is a valid config the node could load.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "config (default) failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[node]"));
+    assert!(stdout.contains("[node.identity]"));
+    assert!(stdout.contains("[consensus]"));
+    // Defaults filled in: timeout_base_ms is in [consensus] even
+    // though the source file omitted it.
+    assert!(stdout.contains("timeout_base_ms"));
+    // [overlay] is fully synthesized from defaults — the source had
+    // no [overlay] section at all.
+    assert!(stdout.contains("[overlay]"));
+    assert!(stdout.contains("mode = \"gossip\""));
+
+    // Round-trip: write the resolved output to a new file and re-run
+    // `config`. Output must match byte-for-byte.
+    let round1 = dir.path().join("round1.toml");
+    std::fs::write(&round1, &stdout).unwrap();
+    let out2 = run_config(&["--config", round1.to_str().unwrap()]);
+    assert!(
+        out2.status.success(),
+        "round-trip parse failed: stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    let stdout2 = String::from_utf8(out2.stdout).unwrap();
+    assert_eq!(stdout, stdout2, "TOML output must round-trip identically");
+}
+
+#[test]
+fn test_config_format_json_emits_valid_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap(), "--format", "json"]);
+    assert!(
+        out.status.success(),
+        "config --format json failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let parsed: Value = serde_json::from_str(&stdout).expect("valid JSON");
+    // Sanity-check the JSON document the documented `... | jq` recipe
+    // would target.
+    assert_eq!(parsed["node"]["listen_addr"], json!("127.0.0.1:7000"));
+    assert_eq!(parsed["consensus"]["timeout_base_ms"], json!(200));
+    assert_eq!(parsed["overlay"]["mode"], json!("gossip"));
+}
+
+#[test]
+fn test_config_raw_prints_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&["--config", path.to_str().unwrap(), "--raw"]);
+    assert!(
+        out.status.success(),
+        "config --raw failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout, SAMPLE_CONFIG);
+}
+
+#[test]
+fn test_config_raw_with_format_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let out = run_config(&[
+        "--config",
+        path.to_str().unwrap(),
+        "--raw",
+        "--format",
+        "json",
+    ]);
+    assert!(!out.status.success(), "--raw + --format must be rejected");
+}
+
+#[test]
+fn test_config_edit_with_noop_editor_succeeds() {
+    // `EDITOR=true` exits 0 immediately without modifying the file —
+    // the most basic happy-path: editor opens, user makes no change.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let out = Command::new(bin)
+        .args(["config", "--config", path.to_str().unwrap(), "--edit"])
+        .env("EDITOR", "true")
+        .env_remove("VISUAL")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn config --edit");
+    assert!(
+        out.status.success(),
+        "config --edit (noop editor) must succeed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("config validated"),
+        "expected validation message, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_config_edit_aborts_on_nonzero_editor_exit() {
+    // `EDITOR=false` always exits 1 — the convention for "editor
+    // aborted, do not save". `vim :cq` produces the same.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let out = Command::new(bin)
+        .args(["config", "--config", path.to_str().unwrap(), "--edit"])
+        .env("EDITOR", "false")
+        .env_remove("VISUAL")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn config --edit");
+    assert!(
+        !out.status.success(),
+        "config --edit must propagate editor failure"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("exited"),
+        "expected editor-exit diagnostic, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_edit_rejects_invalid_save() {
+    // Use a tiny shell script as the "editor" that overwrites the
+    // file with garbage TOML, then exits 0 (mimicking an operator who
+    // saved a typo). The post-edit re-parse must fail.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_sample_config(dir.path());
+    let editor_script = dir.path().join("bad-editor.sh");
+    std::fs::write(
+        &editor_script,
+        "#!/bin/sh\nprintf 'this = is = not = toml\\n' > \"$1\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&editor_script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&editor_script, perms).unwrap();
+    }
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let out = Command::new(bin)
+        .args(["config", "--config", path.to_str().unwrap(), "--edit"])
+        .env("EDITOR", editor_script.to_str().unwrap())
+        .env_remove("VISUAL")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn config --edit");
+    assert!(
+        !out.status.success(),
+        "config --edit must reject an invalid post-edit file"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("no longer valid") || stderr.contains("error"),
+        "expected validation diagnostic, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_edit_errors_when_file_missing() {
+    // `--edit` requires an existing file — there's nothing to open
+    // otherwise. Operators are pointed at `init` instead.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist.toml");
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let out = Command::new(bin)
+        .args(["config", "--config", missing.to_str().unwrap(), "--edit"])
+        .env("EDITOR", "true")
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn config --edit");
+    assert!(!out.status.success(), "missing file must be an error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("init") || stderr.contains("no config"),
+        "expected init pointer, got: {stderr}"
+    );
+}
+
+// ── Self-dial guards (#188) ─────────────────────────────────────────────────
+
+/// A static `[[peers]]` entry whose `node_id` matches the local TLS
+/// identity must fail at boot via `Config::validate`. Catches the
+/// "every node ships with the same canned peer list" deployment
+/// footgun before the dialer ever runs.
+#[tokio::test]
+async fn test_self_id_in_peers_list_fails_to_start() {
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_path = key_dir.path().join("node.key").to_str().unwrap().to_owned();
+
+    // Phase 1: discover this node's NodeId so we can name it as a self-
+    // peer in phase 2.
+    let info = launch_once_for_discovery(&key_path).await;
+
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+    let config = format!(
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [[peers]]\naddr = \"127.0.0.1:9999\"\nnode_id = \"{}\"\n",
+        info.node_id,
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let output = Command::new(bin)
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("failed to spawn node binary");
+
+    assert!(
+        !output.status.success(),
+        "node must refuse to start when [[peers]] contains its own NodeId; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("self-dial") || stderr.contains("own NodeId"),
+        "stderr must explain the self-dial reason; got: {stderr}",
+    );
+    assert!(
+        stderr.contains(&info.node_id) || stderr.contains("[[peers]]"),
+        "stderr must point at the offending entry; got: {stderr}",
+    );
+}
+
+/// A TOFU `[[peers]]` entry (no `node_id`) that resolves to our own
+/// listener can't be caught at config-validation time — the peer's
+/// identity is only known after the handshake. The dialer's
+/// handshake-time guard (and the listener's symmetric guard on the
+/// inbound side) must drop the resulting self-loopback so it never
+/// shows up in `/peers`.
+#[tokio::test]
+async fn test_self_loopback_dial_is_refused_at_handshake() {
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_path = key_dir.path().join("node.key").to_str().unwrap().to_owned();
+
+    // Phase 1: discover the listen addr so phase 2 can re-bind on it.
+    let info = launch_once_for_discovery(&key_path).await;
+
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+    let p2p_addr = info.p2p_addr.clone();
+    // [[peers]] has no `node_id` — config validation can't tell this
+    // is self. The dialer must catch it at TLS-handshake time.
+    let config = format!(
+        "[node]\nlisten_addr = \"{p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [[peers]]\naddr = \"{p2p_addr}\"\n",
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let child = Command::new(bin)
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn node binary");
+
+    // Wait for the node to bind both listeners.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let addrs = loop {
+        if Instant::now() > deadline {
+            panic!("self-loopback node did not write addr_file within 10s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break addrs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    let guard = NodeGuard {
+        child,
+        api_port,
+        p2p_addr: addrs.p2p_addr,
+        node_id: addrs.node_id,
+        _config: config_file,
+        _key_dir: key_dir,
+        _addr_file: addr_file,
+    };
+
+    wait_until_ready(&guard, Duration::from_secs(10)).await;
+
+    // Watch /peers for ~2s — long enough for at least two dialer
+    // attempts (initial backoff is 1s) plus a maintenance tick. The
+    // count must stay zero: any successful self-dial would surface
+    // here immediately.
+    let client = reqwest::Client::new();
+    let watch_end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < watch_end {
+        let peers: Value = client
+            .get(guard.api_url("/peers"))
+            .send()
+            .await
+            .expect("/peers request failed")
+            .json()
+            .await
+            .expect("/peers returned non-JSON");
+        let count = peers.as_array().map(|a| a.len()).unwrap_or(0);
+        assert_eq!(
+            count, 0,
+            "self-loopback peer surfaced in /peers — handshake guard failed",
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}

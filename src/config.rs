@@ -9,17 +9,18 @@ use crate::p2p::identity::encrypted_file::EncryptedFileKeyProvider;
 use crate::p2p::identity::env::EnvKeyProvider;
 use crate::p2p::identity::exec::ExecKeyProvider;
 use crate::p2p::identity::file::FileKeyProvider;
+use crate::p2p::tls::{NodeId, base58_to_node_id, node_id_to_base58};
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
     pub node: NodeConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<PeerConfig>,
     pub api: ApiConfig,
     /// Optional HotStuff consensus configuration. When absent the node
     /// runs gossip-only; when present a [`crate::consensus::node::ConsensusNode`]
     /// is started alongside the gossip and ping protocols.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consensus: Option<ConsensusConfig>,
     /// Topology overlay configuration. Selects between the legacy
     /// full-mesh implementation and the partial-mesh gossip overlay
@@ -33,7 +34,7 @@ pub struct Config {
     pub p2p: P2pConfig,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct NodeConfig {
     pub listen_addr: SocketAddr,
     /// Network (TLS) identity backend. The Ed25519 public key loaded here
@@ -41,7 +42,7 @@ pub struct NodeConfig {
     /// certificate the TLS handshake presents. If absent, falls back to
     /// the deprecated `key_file` field or, failing that, a file backend
     /// at `./node.key`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityConfig>,
     /// Optional validator (consensus signing) identity backend. When set,
     /// the consensus layer signs proposals/votes/timeouts with this key
@@ -49,20 +50,20 @@ pub struct NodeConfig {
     /// is reused for consensus signing — the historical single-key
     /// behavior — with a deprecation warning at startup if consensus is
     /// enabled. Both slots accept any of the same backends.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator_identity: Option<IdentityConfig>,
     /// Deprecated alias for `[node.identity] backend = "file" path = ...`.
     /// Retained for backward compatibility; emits a warning at startup.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_file: Option<PathBuf>,
     /// If set, the node writes its actual bound addresses and node ID to this file
     /// as JSON once both listeners are ready. Used by tests to discover dynamic ports.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr_file: Option<PathBuf>,
 }
 
 /// Where the node's long-term Ed25519 identity lives.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "backend", rename_all = "kebab-case")]
 pub enum IdentityConfig {
     /// PKCS#8 PEM on disk, mode 0600. Default for development.
@@ -83,14 +84,14 @@ pub enum IdentityConfig {
         #[serde(default = "default_keyring_service")]
         service: String,
         #[cfg_attr(not(feature = "keyring-backend"), allow(dead_code))]
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         account: Option<String>,
     },
     /// Passphrase-encrypted file (XChaCha20-Poly1305 + Argon2id).
     EncryptedFile {
         path: PathBuf,
         /// Env var to read the passphrase from. If omitted, prompts the TTY.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         passphrase_env: Option<String>,
     },
     /// Run an operator-provided command; read PKCS#8 from its stdout.
@@ -119,17 +120,17 @@ fn default_keyring_service() -> String {
     "ambros-p2p".to_string()
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct PeerConfig {
     pub addr: SocketAddr,
     /// Expected base58-encoded Ed25519 node ID of this peer.
     /// If set, the connection is rejected when the peer presents a different identity.
     /// Omit for trust-on-first-use (e.g. in development).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ApiConfig {
     pub listen_addr: SocketAddr,
     #[serde(default = "default_cleanup_interval")]
@@ -146,14 +147,14 @@ fn default_cleanup_interval() -> u64 {
 /// The `validators` list must contain this node's own base58 NodeId
 /// and must be byte-identical across every replica in the cluster
 /// (validator-set ordering determines round-robin leader rotation).
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ConsensusConfig {
     /// Base58-encoded NodeIds of every validator in the committee.
     /// Must include this node's own ID.
     pub validators: Vec<String>,
     /// 32-byte hex string used as the genesis block's `state_commitment`.
     /// Must match across all replicas. Defaults to all zeros.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_seed_hex: Option<String>,
     /// Maximum commands the leader pulls from the mempool per proposal.
     #[serde(default = "default_propose_limit")]
@@ -166,7 +167,7 @@ pub struct ConsensusConfig {
     pub timeout_max_ms: u64,
     /// Directory holding the consensus KV store and WAL on disk.
     /// If unset, in-memory storage is used (no crash recovery).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_dir: Option<PathBuf>,
     /// Bounded-cache caps for the safety core and the integration
     /// layer's timeout-vote handler. See [`ConsensusLimits`] for the
@@ -184,7 +185,7 @@ pub struct ConsensusConfig {
 /// [`crate::consensus::limits::CacheLimits`]; this struct is the
 /// configuration shape, the runtime shape lives in that module so the
 /// safety core can stay free of `serde` dependencies.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ConsensusLimits {
     /// Cap on the safety core's `vote_bucket` map. Defaults to
     /// [`crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY`].
@@ -276,7 +277,7 @@ fn default_mempool_capacity() -> usize {
 /// Configuration for the p2p layer that is independent of the overlay
 /// mode and consensus wiring. Currently exposes only the rate-limiting
 /// and connection-cap knobs introduced in issue #134.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct P2pConfig {
     /// `[p2p.limits]` sub-table. Optional: when absent, no rate
     /// limiting or connection caps are installed (matches the pre-#134
@@ -292,7 +293,7 @@ pub struct P2pConfig {
 /// [`P2pLimitsConfig::production_defaults`] when omitted, so an
 /// operator can override one knob (e.g. tighter `max_per_ip`) without
 /// re-spelling the rest.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct P2pLimitsConfig {
     /// Maximum concurrent inbound connections.
     #[serde(default = "default_max_inbound_connections")]
@@ -362,7 +363,7 @@ impl P2pLimitsConfig {
 
 /// Per-message-type token-bucket rates and the wire-bytes/sec ceiling.
 /// All rates are units-per-second.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct P2pRateLimitsConfig {
     #[serde(default = "default_proposal_per_sec")]
     pub proposal_per_sec: f64,
@@ -404,7 +405,7 @@ impl Default for P2pRateLimitsConfig {
 /// After `max_violations` rate-limit drops within `window_secs`, the
 /// limiter returns `Decision::Disconnect` once and the consensus layer
 /// tears down the connection.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct P2pViolationsConfig {
     #[serde(default = "default_violation_window_secs")]
     pub window_secs: u64,
@@ -472,7 +473,7 @@ fn default_max_violations() -> u32 {
 /// [`crate::p2p::overlay::gossip::overlay::GossipOverlayConfig`]), so a
 /// node that omits `[overlay]` entirely gets the breakdown-comment
 /// defaults from issue #137.
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct OverlayConfig {
     /// Which overlay implementation to use. Defaults to `gossip`
     /// after the 25-node sim convergence test landed in stack 8 of
@@ -510,7 +511,7 @@ pub struct OverlayConfig {
     /// Bootstrap addresses dialed at startup. Each is a TOFU dial — the
     /// peer's TLS identity is whatever it presents on the handshake.
     /// Used in `mode = "gossip"` only.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bootstrap_addrs: Vec<SocketAddr>,
 }
 
@@ -531,7 +532,7 @@ impl Default for OverlayConfig {
 }
 
 /// Which topology overlay implementation to drive consensus with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverlayMode {
     /// Legacy full-mesh implementation. Retained as an opt-in for
@@ -578,6 +579,45 @@ pub fn load(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&text)?;
     Ok(config)
+}
+
+impl Config {
+    /// Cross-validate the parsed config against the local TLS identity.
+    ///
+    /// Rejects any static `[[peers]]` entry whose `node_id` matches the
+    /// local node — a self-dial would loop back to our own listener,
+    /// count against `target_degree`, and surface as a real peer in
+    /// `/peers`. TOFU `bootstrap_addrs` carry no `node_id`, so the
+    /// equivalent check there is deferred to the dialer / listener
+    /// handshake guards (see `src/p2p/dialer.rs` and
+    /// `src/p2p/listener.rs`).
+    ///
+    /// Also surfaces malformed `node_id` strings here so operators see
+    /// a clean error before `start` panics on the same string deeper
+    /// in the stack.
+    pub fn validate(&self, self_id: &NodeId) -> anyhow::Result<()> {
+        for (idx, peer) in self.peers.iter().enumerate() {
+            let Some(raw) = peer.node_id.as_deref() else {
+                continue;
+            };
+            let pid = base58_to_node_id(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "[[peers]][{idx}] (addr = {}) has malformed node_id {raw:?}: {e}",
+                    peer.addr,
+                )
+            })?;
+            if &pid == self_id {
+                anyhow::bail!(
+                    "[[peers]][{idx}] (addr = {}) lists this node's own NodeId {} — \
+                     a self-dial would loop back to our own listener; remove this \
+                     entry from the static peers list.",
+                    peer.addr,
+                    node_id_to_base58(self_id),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the effective identity configuration, honoring the deprecated
@@ -1247,6 +1287,118 @@ max_violations = 20
         let rate = limits.rate_limits();
         assert_eq!(rate.violation_window, std::time::Duration::from_secs(5));
         assert_eq!(rate.max_violations, 20);
+    }
+
+    #[test]
+    fn validate_rejects_self_id_in_peers_list() {
+        // A static [[peers]] entry whose node_id matches the local TLS
+        // identity is a configuration footgun: the dialer would TLS-
+        // handshake against its own listener (we hold both keys),
+        // count the loopback against target_degree, and surface it in
+        // /peers. validate() rejects it at boot with a clear pointer
+        // to the offending entry.
+        let self_id: NodeId = [7u8; 32];
+        let raw = node_id_to_base58(&self_id);
+        let toml_str = format!(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[[peers]]
+addr = "127.0.0.1:7001"
+node_id = "{raw}"
+"#,
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        let err = cfg.validate(&self_id).expect_err("self-id must reject");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("self-dial") || msg.contains("own NodeId"),
+            "diagnostic must explain the self-dial reason; got: {msg}",
+        );
+        assert!(
+            msg.contains("127.0.0.1:7001"),
+            "diagnostic must point at the offending addr; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_distinct_peer_ids() {
+        let self_id: NodeId = [1u8; 32];
+        let other_id: NodeId = [2u8; 32];
+        let toml_str = format!(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[[peers]]
+addr = "127.0.0.1:7001"
+node_id = "{}"
+"#,
+            node_id_to_base58(&other_id),
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        cfg.validate(&self_id).expect("distinct id must pass");
+    }
+
+    #[test]
+    fn validate_accepts_tofu_peer_without_node_id() {
+        // TOFU entries (no `node_id`) cannot be checked at config
+        // validation time — the peer's identity is whatever it
+        // presents on the handshake. validate() lets these through;
+        // the dialer and listener handshake guards catch the self
+        // case at runtime.
+        let self_id: NodeId = [3u8; 32];
+        let cfg: Config = toml::from_str(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[[peers]]
+addr = "127.0.0.1:7001"
+"#,
+        )
+        .unwrap();
+        cfg.validate(&self_id).expect("TOFU entry must pass");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_peer_node_id() {
+        // Surfacing malformed base58 here means operators see a clean
+        // diagnostic at config-validation time, instead of the
+        // `expect("invalid peer node_id in config")` panic that the
+        // dialer wiring in `tls_protocol.rs` would otherwise hit.
+        let self_id: NodeId = [4u8; 32];
+        let cfg: Config = toml::from_str(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[[peers]]
+addr = "127.0.0.1:7001"
+node_id = "0OIl"
+"#,
+        )
+        .unwrap();
+        let err = cfg
+            .validate(&self_id)
+            .expect_err("malformed base58 must reject");
+        assert!(
+            format!("{err:#}").contains("malformed node_id"),
+            "got: {err:#}",
+        );
     }
 
     #[test]
