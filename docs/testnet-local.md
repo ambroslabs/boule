@@ -645,9 +645,12 @@ discovers the rest through peer-list gossip).
 `scenario rotating-failure-7n-f2 --seed 1` brings the cluster up if
 it isn't already, waits for every node to commit through height 5,
 SIGKILLs two random nodes (the `--seed 1` choice is reproducible),
-waits for the survivors to commit through height 15, then runs the
-§8 safety verifier across every per-node log. The seed is recorded
-in `testnet7/events.jsonl` so a failing run can be replayed verbatim.
+waits for the survivors to commit *ten more* blocks beyond their
+pre-kill heights (an honest "did the survivors keep advancing?"
+predicate, not just a height target the cluster might have already
+crossed before the kill), then runs the §8 safety verifier across
+every per-node log. The seed is recorded in `testnet7/events.jsonl`
+so a failing run can be replayed verbatim.
 
 `down` SIGTERMs every live node (escalating to SIGKILL after a 3s
 grace) and reaps the per-node `pid` files. It's idempotent — safe to

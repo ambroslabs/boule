@@ -44,6 +44,16 @@ pub enum Step {
         #[serde(default = "default_timeout_secs")]
         timeout_secs: u64,
     },
+    /// Snapshot every live node's `last_committed_height` and wait until
+    /// each has advanced by at least `delta` blocks. The post-kill
+    /// liveness check `WaitAllReachHeight` can't honestly express,
+    /// because that one is satisfied immediately if the cluster
+    /// already reached the target before the kill.
+    WaitAllAdvanceBy {
+        delta: u64,
+        #[serde(default = "default_timeout_secs")]
+        timeout_secs: u64,
+    },
     /// Wait until every live node is healthy and within `within` views.
     WaitAllHealthy {
         #[serde(default = "default_within")]
@@ -141,6 +151,7 @@ pub async fn run(
 fn step_label(s: &Step) -> String {
     match s {
         Step::WaitAllReachHeight { height, .. } => format!("wait_all_reach_height({height})"),
+        Step::WaitAllAdvanceBy { delta, .. } => format!("wait_all_advance_by({delta})"),
         Step::WaitAllHealthy { within, .. } => format!("wait_all_healthy(within={within})"),
         Step::WaitQuiescent { for_secs, .. } => format!("wait_quiescent({for_secs}s)"),
         Step::WaitCatchUp {
@@ -167,6 +178,13 @@ async fn run_step(
         } => {
             wait::all_reach_height(state, *height, Duration::from_secs(*timeout_secs)).await?;
             Ok(format!("height>={height}"))
+        }
+        Step::WaitAllAdvanceBy {
+            delta,
+            timeout_secs,
+        } => {
+            wait::all_advance_by(state, *delta, Duration::from_secs(*timeout_secs)).await?;
+            Ok(format!("delta>={delta}"))
         }
         Step::WaitAllHealthy {
             within,
@@ -211,6 +229,15 @@ async fn run_step(
         }
         Step::Up { node } => {
             let n = state.node(node)?.clone();
+            // Mirror `cmd_up`'s "already running" no-op so the step is
+            // composable: `cmd_scenario` calls `up_all` before running
+            // steps, which means a scenario whose first step is `Up`
+            // (e.g. `reconnect_with_catchup`) would otherwise always
+            // fail on a re-spawned node. Treat an already-live node as
+            // success.
+            if lifecycle::pid_alive(&n).is_some() {
+                return Ok(format!("up={node} (already running)"));
+            }
             lifecycle::up_one(workdir, binary, &n).await?;
             Ok(format!("up={node}"))
         }
@@ -235,12 +262,14 @@ pub fn load(path: &Path) -> anyhow::Result<Scenario> {
 /// confirm survivors keep committing, then verify safety. Requires the
 /// cluster to be up already.
 ///
-/// Notably absent: a `wait_quiescent` step. With `n - f >= 2f + 1`
-/// survivors, the cluster has quorum and *should* keep committing —
-/// quiescence would never be reached. We use a second
-/// `wait_all_reach_height` instead, which both proves liveness post-
-/// kill and gives the survivors enough head-room for safety to be
-/// meaningful.
+/// The post-kill liveness check is `WaitAllAdvanceBy`, *not*
+/// `WaitAllReachHeight`. The latter is satisfied immediately when the
+/// cluster already passed the target before the kill, which makes it
+/// a vacuous predicate on a cluster that commits 40+ blocks per
+/// second. `WaitAllAdvanceBy` snapshots heights at the start of the
+/// step and waits for the survivors to commit `delta` *more* blocks —
+/// which is what "did the survivors keep making progress?" actually
+/// means.
 pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
     let timeout = 30;
     Scenario {
@@ -254,8 +283,8 @@ pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
                 timeout_secs: timeout,
             },
             Step::KillRandom { count: f },
-            Step::WaitAllReachHeight {
-                height: 15,
+            Step::WaitAllAdvanceBy {
+                delta: 10,
                 timeout_secs: timeout,
             },
             Step::VerifySafety,
@@ -264,9 +293,18 @@ pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
 }
 
 /// Built-in: `disconnect-random --count N --restart-after Ns`.
-/// Kills `count` random live nodes, then asserts the survivors reach
-/// some hight above `5 + restart_after_secs * 2` (a coarse proxy for
-/// "kept committing for that long"), and finally verifies safety.
+/// Kills `count` random live nodes, then asserts the survivors keep
+/// committing, and finally verifies safety.
+///
+/// The pre-kill `WaitAllHealthy` is load-bearing: with the default
+/// 7-node ring (`bootstrap_peers = [i-1, i+1]` mod n), some seeds
+/// pick two ring-neighbours of the same node — e.g. seed=7 + count=2
+/// kills node1 + node3, both of which are bootstrap peers of node2.
+/// If we kill before the gossip overlay has expanded past the
+/// bootstrap pairs, node2 ends up with zero peers and the cluster
+/// stalls. `WaitAllHealthy` waits until every live node has at least
+/// `n - 1` consensus peers, which guarantees each survivor still has
+/// quorum-many connections after any `count`-sized kill subset.
 ///
 /// `restart_after_secs` was originally meant to gate "restart the
 /// dead nodes after N seconds", but the scenario format has no way
@@ -276,7 +314,10 @@ pub fn rotating_failure(f: usize, seed: u64) -> Scenario {
 /// (or a TOML file referencing each restart target by name) to
 /// exercise the bring-back path.
 pub fn disconnect_random(count: usize, restart_after_secs: u64, seed: u64) -> Scenario {
-    let post_kill_height = 5 + (restart_after_secs * 2).max(5);
+    // Survivors must commit at least this many *additional* blocks
+    // after the kill. Sized off `restart_after_secs` so longer-running
+    // scenarios get a proportionally bigger liveness window.
+    let post_kill_delta = (restart_after_secs * 2).max(10);
     let timeout = restart_after_secs * 2 + 30;
     Scenario {
         scenario: ScenarioMeta {
@@ -284,13 +325,13 @@ pub fn disconnect_random(count: usize, restart_after_secs: u64, seed: u64) -> Sc
             name: Some("disconnect-random".into()),
         },
         steps: vec![
-            Step::WaitAllReachHeight {
-                height: 5,
+            Step::WaitAllHealthy {
+                within: 5,
                 timeout_secs: 30,
             },
             Step::KillRandom { count },
-            Step::WaitAllReachHeight {
-                height: post_kill_height,
+            Step::WaitAllAdvanceBy {
+                delta: post_kill_delta,
                 timeout_secs: timeout,
             },
             Step::VerifySafety,
@@ -388,6 +429,58 @@ op = "verify_safety"
         let s = rotating_failure(2, 1);
         assert!(matches!(s.steps[0], Step::WaitAllReachHeight { .. }));
         assert!(matches!(s.steps[1], Step::KillRandom { count: 2 }));
+        // Post-kill liveness must be `WaitAllAdvanceBy`, not
+        // `WaitAllReachHeight`; the latter is satisfied immediately if
+        // the cluster already passed the target, which makes it a
+        // vacuous predicate (issue #205, item 3).
+        assert!(
+            matches!(s.steps[2], Step::WaitAllAdvanceBy { delta: 10, .. }),
+            "expected post-kill WaitAllAdvanceBy, got {:?}",
+            s.steps[2]
+        );
         assert!(matches!(s.steps.last(), Some(Step::VerifySafety)));
+    }
+
+    #[test]
+    fn disconnect_random_has_pre_kill_mesh_warmup() {
+        let s = disconnect_random(2, 5, 7);
+        // First step must be the mesh-warmup gate: with the default
+        // ring topology, killing two ring-neighbours of the same node
+        // before gossip expands the mesh isolates the survivor (issue
+        // #205, item 4).
+        assert!(
+            matches!(s.steps[0], Step::WaitAllHealthy { .. }),
+            "expected pre-kill WaitAllHealthy, got {:?}",
+            s.steps[0]
+        );
+        assert!(matches!(s.steps[1], Step::KillRandom { count: 2 }));
+        assert!(matches!(s.steps[2], Step::WaitAllAdvanceBy { .. }));
+        assert!(matches!(s.steps.last(), Some(Step::VerifySafety)));
+    }
+
+    #[test]
+    fn wait_all_advance_by_round_trips_through_toml() {
+        let s = Scenario {
+            scenario: ScenarioMeta {
+                seed: Some(0),
+                name: None,
+            },
+            steps: vec![Step::WaitAllAdvanceBy {
+                delta: 7,
+                timeout_secs: 20,
+            }],
+        };
+        let serialized = toml::to_string_pretty(&s).unwrap();
+        let back: Scenario = toml::from_str(&serialized).unwrap();
+        match &back.steps[0] {
+            Step::WaitAllAdvanceBy {
+                delta,
+                timeout_secs,
+            } => {
+                assert_eq!(*delta, 7);
+                assert_eq!(*timeout_secs, 20);
+            }
+            other => panic!("expected WaitAllAdvanceBy, got {other:?}"),
+        }
     }
 }
