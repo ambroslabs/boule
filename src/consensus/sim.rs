@@ -88,6 +88,59 @@ use zeroize::Zeroizing;
 /// (outbound links from a Byzantine replica cut, inbound intact).
 type LinkCut = (NodeId, NodeId);
 
+// ── Byzantine adversary hook (issue #132) ────────────────────────────────────
+
+/// Per-node context handed to an [`Adversary`] on every intercept call.
+///
+/// The signer is the same `Arc<dyn Signer>` that the node's own
+/// `ConsensusNode::run` uses, so any [`crate::crypto::signed::Signed`]
+/// envelope the adversary crafts will pass the cluster's signature
+/// checks (the point of issue #132 is to test that honest replicas
+/// reject *protocol-level* misbehaviour, not that they detect crypto
+/// forgery — that's covered by the wire-fuzz suite, #198).
+#[derive(Clone)]
+pub struct AdversaryCtx {
+    pub my_id: NodeId,
+    /// Validator set in sorted ascending order — same order as
+    /// [`SimCluster::node_ids`] and the round-robin leader rotation.
+    pub validators: Arc<Vec<NodeId>>,
+    pub signer: Arc<dyn Signer>,
+    /// Cluster-agreed genesis block. Useful for adversaries that
+    /// craft synthetic blocks and need a stable parent reference
+    /// (e.g. the equivocator's fork blocks share the genesis hash
+    /// as their initial parent).
+    pub genesis: Block,
+}
+
+/// Hook installed on a single node's routing task that lets a Byzantine
+/// implementation intercept every [`ProtocolOutbound`] the consensus
+/// core would emit and replace it with arbitrary wire frames. Returning
+/// `vec![outbound]` preserves honest semantics; returning `vec![]` drops
+/// the frame; returning multiple frames replaces or augments.
+///
+/// The returned frames pass through the same partition / dead-node /
+/// link-cut filters as honest frames, so the adversary cannot bypass
+/// the sim's network controls.
+///
+/// Adversaries use [`AdversaryCtx::signer`] to produce signed payloads
+/// that look authentic to the rest of the cluster — the point of the
+/// suite is to verify that honest replicas reject malicious *content*
+/// (equivocation, stale replays, forged certificates, …) not that they
+/// detect crypto forgery.
+pub trait Adversary: Send + Sync {
+    fn intercept(&self, ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound>;
+}
+
+/// Internal bundle of optional features for [`SimCluster::spawn_inner`]
+/// so the public callers stay flat.
+#[derive(Default)]
+struct SpawnExtras {
+    rate_limits: Option<crate::p2p::limits::RateLimitsConfig>,
+    /// Per-node adversary hooks (issue #132). Indexed by sorted node
+    /// order; `None` slots run the honest protocol unchanged.
+    adversaries: Option<Vec<Option<Arc<dyn Adversary>>>>,
+}
+
 /// An in-memory cluster of N consensus nodes connected by channel-backed
 /// protocol handles.
 ///
@@ -155,7 +208,43 @@ impl SimCluster {
     ///
     /// Panics if `n < 4` (minimum BFT cluster size for `f = 1`).
     pub async fn spawn(n: usize, timeout_base: Duration) -> Self {
-        Self::spawn_inner(n, timeout_base, None).await.0
+        Self::spawn_inner(n, timeout_base, SpawnExtras::default())
+            .await
+            .0
+    }
+
+    /// Spawn `n` honest nodes plus a per-node Byzantine [`Adversary`]
+    /// hook (issue #132). `adversaries` must have length `n`; entries
+    /// indexed in [`SimCluster::node_ids`] order. `None` slots run the
+    /// honest protocol unchanged.
+    ///
+    /// The hook intercepts every [`ProtocolOutbound`] emitted by the
+    /// node's consensus core and may drop it, replace it, or emit
+    /// additional frames. See [`Adversary`] for the contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `adversaries.len() != n` or `n < 4`.
+    pub async fn spawn_with_adversaries(
+        n: usize,
+        timeout_base: Duration,
+        adversaries: Vec<Option<Arc<dyn Adversary>>>,
+    ) -> Self {
+        assert_eq!(
+            adversaries.len(),
+            n,
+            "spawn_with_adversaries: adversaries.len() must equal n",
+        );
+        Self::spawn_inner(
+            n,
+            timeout_base,
+            SpawnExtras {
+                rate_limits: None,
+                adversaries: Some(adversaries),
+            },
+        )
+        .await
+        .0
     }
 
     /// Same as [`SimCluster::spawn`] but installs a per-node rate
@@ -172,14 +261,29 @@ impl SimCluster {
         timeout_base: Duration,
         rate_limits: crate::p2p::limits::RateLimitsConfig,
     ) -> (Self, Vec<Arc<crate::p2p::limits::RateLimiter>>) {
-        Self::spawn_inner(n, timeout_base, Some(rate_limits)).await
+        Self::spawn_inner(
+            n,
+            timeout_base,
+            SpawnExtras {
+                rate_limits: Some(rate_limits),
+                adversaries: None,
+            },
+        )
+        .await
     }
 
     async fn spawn_inner(
         n: usize,
         timeout_base: Duration,
-        rate_limits: Option<crate::p2p::limits::RateLimitsConfig>,
+        extras: SpawnExtras,
     ) -> (Self, Vec<Arc<crate::p2p::limits::RateLimiter>>) {
+        let SpawnExtras {
+            rate_limits,
+            adversaries,
+        } = extras;
+        if let Some(adv) = adversaries.as_ref() {
+            assert_eq!(adv.len(), n, "adversary slots must equal n");
+        }
         assert!(n >= 4, "BFT requires at least 4 nodes (3f+1 with f=1)");
 
         // Create N fresh signers and collect their node IDs.
@@ -221,12 +325,16 @@ impl SimCluster {
         let event_txs = Arc::new(event_txs);
 
         let node_ids: Vec<NodeId> = vs.iter().copied().collect();
+        let node_ids_arc: Arc<Vec<NodeId>> = Arc::new(node_ids.clone());
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut limiters: Vec<Arc<crate::p2p::limits::RateLimiter>> = Vec::new();
 
-        for (nid, event_rx) in event_rxs {
+        for (idx, (nid, event_rx)) in event_rxs.into_iter().enumerate() {
             let signer = signer_map[&nid].clone();
+            let adversary_for_node: Option<Arc<dyn Adversary>> = adversaries
+                .as_ref()
+                .and_then(|slots| slots.get(idx).cloned().flatten());
 
             let config = NodeConfigForConsensus {
                 validator_set: vs.clone(),
@@ -281,6 +389,15 @@ impl SimCluster {
                 tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
             let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(disco_src_rx);
 
+            let route_adv = adversary_for_node.map(|adv| {
+                let ctx = AdversaryCtx {
+                    my_id: nid,
+                    validators: Arc::clone(&node_ids_arc),
+                    signer: Arc::clone(&signer),
+                    genesis: genesis.clone(),
+                };
+                (adv, ctx)
+            });
             spawn_route_task(
                 nid,
                 send_rx,
@@ -289,6 +406,7 @@ impl SimCluster {
                 Arc::clone(&link_cuts),
                 Arc::clone(&partition_blocks),
                 Arc::clone(&dead_nodes),
+                route_adv,
             );
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -640,6 +758,7 @@ impl Drop for SimCluster {
 /// into the local safety core inside
 /// `ConsensusNode::apply_safety_actions`; duplicating the delivery here
 /// would double-feed the core and hide regressions of that loopback.
+#[allow(clippy::too_many_arguments)]
 fn spawn_route_task(
     my_id: NodeId,
     mut send_rx: mpsc::Receiver<ProtocolOutbound>,
@@ -648,6 +767,7 @@ fn spawn_route_task(
     link_cuts: Arc<Mutex<HashSet<LinkCut>>>,
     partition_blocks: Arc<Mutex<HashSet<LinkCut>>>,
     dead_nodes: Arc<Mutex<HashSet<NodeId>>>,
+    adversary: Option<(Arc<dyn Adversary>, AdversaryCtx)>,
 ) {
     tokio::spawn(async move {
         while let Some(outbound) = send_rx.recv().await {
@@ -660,60 +780,99 @@ fn spawn_route_task(
                 // that was queued before shutdown took effect.
                 continue;
             }
-            match outbound {
-                ProtocolOutbound::Broadcast(payload) => {
-                    for (target, tx) in route_txs.iter() {
-                        if *target == my_id {
-                            continue;
-                        }
-                        if partitioned.lock().contains(target) {
-                            continue;
-                        }
-                        if dead_nodes.lock().contains(target) {
-                            continue;
-                        }
-                        if link_cuts.lock().contains(&(my_id, *target)) {
-                            continue;
-                        }
-                        if partition_blocks.lock().contains(&(my_id, *target)) {
-                            continue;
-                        }
-                        let _ = tx
-                            .send(ProtocolEvent::Message {
-                                from: my_id,
-                                payload: payload.clone(),
-                            })
-                            .await;
-                    }
-                }
-                ProtocolOutbound::SendTo { node_id, payload } => {
-                    if node_id == my_id {
-                        continue;
-                    }
-                    if partitioned.lock().contains(&node_id) {
-                        continue;
-                    }
-                    if dead_nodes.lock().contains(&node_id) {
-                        continue;
-                    }
-                    if link_cuts.lock().contains(&(my_id, node_id)) {
-                        continue;
-                    }
-                    if partition_blocks.lock().contains(&(my_id, node_id)) {
-                        continue;
-                    }
-                    if let Some(tx) = route_txs.get(&node_id) {
-                        let _ = tx
-                            .send(ProtocolEvent::Message {
-                                from: my_id,
-                                payload,
-                            })
-                            .await;
-                    }
-                }
+
+            // Apply the per-node Byzantine adversary hook (issue #132)
+            // *after* the my_id partition / dead checks: a Byzantine
+            // node that's been partitioned still doesn't get its frames
+            // out, matching honest semantics.
+            let frames: Vec<ProtocolOutbound> = match &adversary {
+                Some((adv, ctx)) => adv.intercept(ctx, outbound),
+                None => vec![outbound],
+            };
+
+            for outbound in frames {
+                route_one_frame(
+                    my_id,
+                    outbound,
+                    &route_txs,
+                    &partitioned,
+                    &link_cuts,
+                    &partition_blocks,
+                    &dead_nodes,
+                )
+                .await;
             }
         }
     });
+}
+
+/// Deliver a single `ProtocolOutbound` (either as Broadcast or SendTo)
+/// honouring the partition / link-cut / dead-node sets. Extracted from
+/// [`spawn_route_task`]'s match so that the adversary's possibly-multi
+/// frame return value can be looped over without nesting `match` blocks
+/// inside the channel-recv loop.
+#[allow(clippy::too_many_arguments)]
+async fn route_one_frame(
+    my_id: NodeId,
+    outbound: ProtocolOutbound,
+    route_txs: &HashMap<NodeId, mpsc::Sender<ProtocolEvent>>,
+    partitioned: &Mutex<HashSet<NodeId>>,
+    link_cuts: &Mutex<HashSet<LinkCut>>,
+    partition_blocks: &Mutex<HashSet<LinkCut>>,
+    dead_nodes: &Mutex<HashSet<NodeId>>,
+) {
+    match outbound {
+        ProtocolOutbound::Broadcast(payload) => {
+            for (target, tx) in route_txs.iter() {
+                if *target == my_id {
+                    continue;
+                }
+                if partitioned.lock().contains(target) {
+                    continue;
+                }
+                if dead_nodes.lock().contains(target) {
+                    continue;
+                }
+                if link_cuts.lock().contains(&(my_id, *target)) {
+                    continue;
+                }
+                if partition_blocks.lock().contains(&(my_id, *target)) {
+                    continue;
+                }
+                let _ = tx
+                    .send(ProtocolEvent::Message {
+                        from: my_id,
+                        payload: payload.clone(),
+                    })
+                    .await;
+            }
+        }
+        ProtocolOutbound::SendTo { node_id, payload } => {
+            if node_id == my_id {
+                return;
+            }
+            if partitioned.lock().contains(&node_id) {
+                return;
+            }
+            if dead_nodes.lock().contains(&node_id) {
+                return;
+            }
+            if link_cuts.lock().contains(&(my_id, node_id)) {
+                return;
+            }
+            if partition_blocks.lock().contains(&(my_id, node_id)) {
+                return;
+            }
+            if let Some(tx) = route_txs.get(&node_id) {
+                let _ = tx
+                    .send(ProtocolEvent::Message {
+                        from: my_id,
+                        payload,
+                    })
+                    .await;
+            }
+        }
+    }
 }
 
 // ── Gossip-overlay sim mode (issue #137) ─────────────────────────────────────
@@ -992,6 +1151,7 @@ impl SimCluster {
                 Arc::clone(&link_cuts),
                 Arc::clone(&partition_blocks),
                 Arc::clone(&dead_nodes),
+                None,
             );
 
             pending.push(PendingNode {
@@ -1090,7 +1250,7 @@ fn fresh_signer() -> NodeSigner {
 
 /// Check that all blocks committed across all nodes are consistent:
 /// every height must map to exactly one block hash. Panics on violation.
-fn assert_no_conflicts(all_committed: &[Vec<Block>]) {
+pub fn assert_no_conflicts(all_committed: &[Vec<Block>]) {
     let mut canonical: HashMap<u64, BlockHash> = HashMap::new();
     for node_commits in all_committed {
         for block in node_commits {
@@ -1174,6 +1334,7 @@ mod tests {
                     Arc::clone(&link_cuts),
                     Arc::clone(&partition_blocks),
                     Arc::clone(&dead_nodes),
+                    None,
                 );
             }
 
