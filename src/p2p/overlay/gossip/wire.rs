@@ -55,6 +55,21 @@ pub enum OverlayFrame {
         /// neighbour happened to relay the frame on the last hop. See
         /// the gossip overlay module docs for the rationale.
         originator: NodeId,
+        /// When `Some(peer)`, this frame is a unicast intended for
+        /// `peer` — non-target receivers re-fanout the frame so it
+        /// propagates through the partial mesh, but only the target
+        /// surfaces the payload upstream to the consensus dispatch.
+        /// When `None`, every receiver surfaces (true broadcast).
+        ///
+        /// Issue #182: routing point-to-point sends through the same
+        /// Forward path as broadcasts (rather than a separate direct
+        /// unicast) ensures the unicast frame reaches the target via
+        /// the same gossip propagation that delivers consensus
+        /// broadcasts. Without this, sparse-mesh deployments wedged
+        /// because direct unicasts to non-direct peers (and, per the
+        /// diagnosis, sometimes even to direct peers) failed to
+        /// surface to the consensus dispatch on the receiving side.
+        target: Option<NodeId>,
         /// Opaque application payload. The overlay does not interpret
         /// these bytes; they are surfaced verbatim to the consensus /
         /// gossip consumer on the receiving side.
@@ -104,7 +119,21 @@ mod tests {
         let original = OverlayFrame::Forward {
             msg_id: [7u8; 16],
             originator: nid(42),
+            target: None,
             payload: Bytes::from_static(b"hello consensus"),
+        };
+        let bytes = postcard::to_stdvec(&original).expect("encode");
+        let back: OverlayFrame = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn forward_with_target_roundtrips_via_postcard() {
+        let original = OverlayFrame::Forward {
+            msg_id: [3u8; 16],
+            originator: nid(1),
+            target: Some(nid(2)),
+            payload: Bytes::from_static(b"unicast"),
         };
         let bytes = postcard::to_stdvec(&original).expect("encode");
         let back: OverlayFrame = postcard::from_bytes(&bytes).expect("decode");
@@ -155,6 +184,7 @@ mod tests {
         let forward = OverlayFrame::Forward {
             msg_id: [0; 16],
             originator: [0; 32],
+            target: None,
             payload: Bytes::new(),
         };
         let peer_list = OverlayFrame::PeerList(Vec::new());

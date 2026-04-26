@@ -683,12 +683,13 @@ done
 ```
 
 > **Operator workaround for older builds.** If you're on a build that
-> predates the issue #178 fix (commit landing the `RequestBlock`
-> retry on `PacemakerAdvance`), you can either set `[overlay].mode =
-> "mesh"` to fall back to the legacy full-mesh path, or list every
-> peer in `[[peers]]` so each node holds N − 1 direct connections.
-> The sparse-ring layout above only catches up reliably with the
-> retry branch in place.
+> predates the issue #178 / #182 fixes (commits landing the
+> `RequestBlock` retry on `PacemakerAdvance` and the unicast-via-mesh
+> rework, respectively), you can either set `[overlay].mode = "mesh"`
+> to fall back to the legacy full-mesh path, or list every peer in
+> `[[peers]]` so each node holds N − 1 direct connections. The
+> sparse-ring layout above only catches up reliably with both fixes
+> in place.
 
 #### The rotating-failure scenario
 
@@ -789,12 +790,17 @@ Three properties to verify:
      proposal.
    - `block_sync_response_received` (one per parent the cluster
      serves back) — confirms the round-trip completed.
-   - On the gossip side, `send_to_broadcast_fallback` (at
-     `target=ambros_p2p::p2p::overlay::gossip`) fires every time a
-     `BlockRequest` lands here because the proposer of an unknown-
-     parent proposal is not in n2's direct-peer set. That's expected
-     under the sparse-mesh `[[peers]]` setup above; the request
-     still reaches a holder via the gossip fan-out.
+   - On the gossip side, `gossip_send_to_dispatched` (at
+     `target=ambros_p2p::p2p::overlay::gossip`) fires once per
+     emitted `BlockRequest`. The `target_is_direct` field reports
+     whether the requested peer was a current direct neighbour;
+     under the sparse-mesh `[[peers]]` setup above it's commonly
+     `false` because the proposer of an unknown-parent proposal
+     usually isn't directly connected. Either way, since the unicast
+     is wrapped in an `OverlayFrame::Forward { target: Some(peer),
+     .. }` and fanned out to every direct neighbour (issue #182),
+     the request reaches the target via the gossip mesh — the
+     same proven path that delivers consensus broadcasts.
 3. **Safety is preserved across rotating failures.** Run the §8 safety
    verifier against `testnet7/node*/log` after the run completes:
 
@@ -865,7 +871,7 @@ Your node IDs will change after this, so remember to re-wire `[[peers]]`
 | Consensus committing in steady state then stalls | A node went down and the cluster dropped below quorum. With `n = 3f + 1`, you need at least `2f + 1` live to make progress. `/consensus/status` shows `peers_connected` shrinking and `timeout_buckets` accumulating without firing. |
 | `/consensus/status` returns 404 | The `[consensus]` section is missing from that node's config, or the node was started without `--config`. |
 | `last_committed_height` stays at 0 while `current_view` keeps rising | The cluster is forming TCs but no QC chain is reaching the 3-chain commit rule. Common causes: mismatched `validators` or `genesis_seed_hex`, or a permanent network partition among a subset. |
-| A restarted node sits at an old `last_committed_height` | Block-sync is in flight; give it a few seconds. Confirm with `grep -E 'block_sync_request_emitted\|block_sync_response_received' nodeN/log`: each unknown parent should produce a request, and each response should land. If the request log fires but no response ever arrives, the responder either doesn't have the block (rare in steady state), or the `BlockResponse`'s `Outbound::SendTo` is hitting the `send_to_broadcast_fallback` and being dropped on the way back. The `RequestBlock` retry on every `PacemakerAdvance` (issue #178) covers single-probe loss; if the lagging node has been silent for tens of seconds, also check `peers_connected` and the `storage_dir` path. |
+| A restarted node sits at an old `last_committed_height` | Block-sync is in flight; give it a few seconds. Confirm with `grep -E 'block_sync_request_emitted\|block_sync_response_received' nodeN/log`: each unknown parent should produce a request, and each response should land. On the responder side, look for `block_sync_request_received` and `gossip_send_to_dispatched` (the `BlockResponse` going back). The `RequestBlock` retry on every `PacemakerAdvance` (issue #178) covers single-probe loss; the `OverlayFrame::Forward { target, .. }` rework (issue #182) ensures the unicast actually reaches the requester via the gossip mesh. If the lagging node has been silent for tens of seconds, also check `peers_connected` and the `storage_dir` path. |
 
 ---
 
