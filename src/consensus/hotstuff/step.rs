@@ -213,6 +213,17 @@ pub struct HotStuffCore {
     /// proposal's own block hash so a later `PacemakerAdvance` can
     /// re-evaluate every parked child whose parent has since arrived.
     parked_proposals: HashMap<BlockHash, Signed<Proposal>>,
+    /// In-flight `RequestBlock` retry state, keyed by the missing
+    /// parent hash so cross-round re-emissions deduplicate. Issue
+    /// #196: a parked proposal whose first probe was lost in flight
+    /// would otherwise re-ask the original sender on every
+    /// `PacemakerAdvance` until the heat-death of the cluster, even
+    /// if that peer has crashed or never had the block. Tracking
+    /// `(attempts, last_asked_view)` lets the safety core throttle
+    /// re-emissions, rotate to other validators after the per-peer
+    /// budget is exhausted, and finally drop the parked proposal
+    /// once the total attempt budget is spent.
+    block_sync_inflight: HashMap<BlockHash, BlockSyncInflight>,
     builder: Arc<dyn BlockBuilder>,
     /// Per-cache caps. Forced evictions fire when an `insert` would
     /// otherwise grow a cache past its cap; see
@@ -223,6 +234,29 @@ pub struct HotStuffCore {
     /// snapshot. Cloned into the integration layer so the
     /// timeout-bucket handler can share a single counter handle.
     eviction_counters: CacheEvictionCounters,
+}
+
+/// Per-parent-hash retry accounting for `RequestBlock`. See
+/// [`HotStuffCore::block_sync_inflight`].
+#[derive(Debug, Clone, Copy)]
+struct BlockSyncInflight {
+    /// Signer of the proposal that originally triggered the request.
+    /// Round 0 of the rotation re-asks this peer; round 1 onward steps
+    /// through the validator ring (skipping `self_id`).
+    original_sender: NodeId,
+    /// Number of `RequestBlock` actions emitted for this parent so
+    /// far, including the initial probe. Compared against
+    /// [`CacheLimits::block_sync_max_attempts`] to decide whether the
+    /// parked proposals depending on this parent should be dropped.
+    attempts: u32,
+    /// View at which the most recent retry was emitted. The next
+    /// retry is gated on `current_view - last_asked_view >= backoff(attempts)`.
+    last_asked_view: View,
+    /// Parent height (= child header height − 1) carried verbatim into
+    /// every retry's `expected_height` field. Cached here so the
+    /// retry loop doesn't have to re-walk `parked_proposals` to
+    /// reassemble the action.
+    expected_height: u64,
 }
 
 impl HotStuffCore {
@@ -263,6 +297,7 @@ impl HotStuffCore {
             state,
             vote_bucket: HashMap::new(),
             parked_proposals: HashMap::new(),
+            block_sync_inflight: HashMap::new(),
             builder,
             limits,
             eviction_counters,
@@ -311,8 +346,15 @@ impl HotStuffCore {
     /// a block we requested: insert it, then re-drive the core via
     /// `step(Event::PacemakerAdvance(current_view))` to un-park any
     /// proposals that were waiting on this parent.
+    ///
+    /// As a side effect, any in-flight `RequestBlock` retry tracking
+    /// for the inserted block's hash is cleared — the parent has
+    /// arrived, so the next pacemaker advance must not waste a
+    /// rotation slot on a parent we already have. See #196.
     pub fn insert_pending_block(&mut self, block: Block) {
+        let hash = block.hash();
         self.state.insert_pending(block);
+        self.block_sync_inflight.remove(&hash);
     }
 
     /// Directly set `high_qc` on the safety-core state.
@@ -375,10 +417,9 @@ impl HotStuffCore {
     fn on_proposal_received(&mut self, signed: Signed<Proposal>) -> Vec<Action> {
         let parent_hash = signed.payload.block.header.parent_hash;
         // B1: parent isn't in `pending_blocks` — we can't evaluate
-        // extension against our locked block without it. Ask the
-        // sender for the missing block and park the child so a later
-        // `PacemakerAdvance` (or explicit re-drive) can re-run
-        // dispatch once the parent arrives.
+        // extension against our locked block without it. Park the
+        // child and (depending on the in-flight retry tracker) emit a
+        // RequestBlock so the integration layer can fetch the parent.
         if !self.state.pending_blocks.contains_key(&parent_hash) {
             let child_hash = signed.payload.block.hash();
             let sender = signed.signer;
@@ -394,17 +435,27 @@ impl HotStuffCore {
                 self.evict_parked_to_fit_one();
             }
             self.parked_proposals.insert(child_hash, signed);
-            return vec![Action::RequestBlock {
-                hash: parent_hash,
-                peer: sender,
+
+            // First sighting of this parent hash → start the in-flight
+            // tracker and emit the initial probe. Re-deliveries (same
+            // parent_hash, same or different child) are gated on the
+            // backoff: within the window we suppress, beyond it we
+            // promote to a full retry through the same rotation logic
+            // the pacemaker-driven retry loop uses.
+            return self.try_emit_block_sync_retry(
+                parent_hash,
+                sender,
                 expected_height,
-                reason: BlockSyncReason::UnknownParentOnProposal,
-            }];
+                BlockSyncReason::UnknownParentOnProposal,
+            );
         }
 
         // B2: insert the proposed block into `pending_blocks` so the
         // `safe_to_vote` extension walk has something to follow, then
-        // run the predicate.
+        // run the predicate. Also clear any in-flight RequestBlock
+        // tracker keyed on this block's hash — the parent has arrived.
+        self.block_sync_inflight
+            .remove(&signed.payload.block.hash());
         self.state.insert_pending(signed.payload.block.clone());
 
         let mut actions = Vec::new();
@@ -652,14 +703,16 @@ impl HotStuffCore {
     ///    through `on_proposal_received`. Nested re-parking is
     ///    handled by `on_proposal_received`'s B1 branch.
     /// 3. For each entry that is *still* parked (its parent has not
-    ///    arrived), re-emit `Action::RequestBlock(parent_hash, sender)`
-    ///    so the integration layer can retry the fetch. Without this,
-    ///    a `BlockRequest` that vanished on the wire (target peer
-    ///    crashed, gossip-fallback broadcast that didn't reach a
-    ///    server, …) would never be resent — a permanent liveness
-    ///    stall any time block-sync's first probe goes unanswered.
-    ///    See issue #178 for the sparse-mesh + restart symptom this
-    ///    branch unblocks.
+    ///    arrived), re-emit `Action::RequestBlock(parent_hash, peer)`
+    ///    so the integration layer can retry the fetch. The peer is
+    ///    chosen by [`HotStuffCore::block_sync_inflight`]'s rotation
+    ///    schedule, throttled by the per-parent backoff, and capped
+    ///    by [`CacheLimits::block_sync_max_attempts`]. Once a parent's
+    ///    retry budget is exhausted the parked proposals depending on
+    ///    it are dropped and
+    ///    [`CacheEvictionCounters::block_sync_dropped`] ticks. See
+    ///    #178 (the dropped-probe regression this branch was added
+    ///    for) and #196 (per-peer fallback + budget).
     /// 4. If we have a `high_qc` to advertise, emit
     ///    `Broadcast(ConsensusMsg::NewView { high_qc })`. At startup
     ///    before any proposal has landed, `high_qc` is `None` and we
@@ -705,37 +758,35 @@ impl HotStuffCore {
             .collect();
         for child_hash in ready {
             if let Some(signed) = self.parked_proposals.remove(&child_hash) {
+                // Parent already in `pending_blocks` → in-flight
+                // tracker is no longer load-bearing. Clear before
+                // re-dispatch so a re-parked grandchild starts with a
+                // fresh attempt counter rather than inheriting the
+                // (resolved) parent's exhausted budget.
+                let parent_hash = signed.payload.block.header.parent_hash;
+                self.block_sync_inflight.remove(&parent_hash);
                 let retry_actions = self.on_proposal_received(signed);
                 actions.extend(retry_actions);
             }
         }
 
-        // Block-sync retry. For each proposal still parked (its parent
-        // never arrived between the original `RequestBlock` emission
-        // and now), re-emit the request. Sorted by `child_hash` so
-        // replay/property tests stay byte-identical regardless of
-        // `HashMap` iteration order.
-        let mut still_parked: Vec<(BlockHash, BlockHash, NodeId, u64)> = self
-            .parked_proposals
-            .iter()
-            .map(|(child_hash, signed)| {
-                let expected_height = signed.payload.block.header.height.saturating_sub(1);
-                (
-                    *child_hash,
-                    signed.payload.block.header.parent_hash,
-                    signed.signer,
-                    expected_height,
-                )
-            })
-            .collect();
-        still_parked.sort_by_key(|(child_hash, _, _, _)| *child_hash);
-        for (_, parent_hash, sender, expected_height) in still_parked {
-            actions.push(Action::RequestBlock {
-                hash: parent_hash,
-                peer: sender,
-                expected_height,
-                reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
-            });
+        // Block-sync retry. Group still-parked proposals by their
+        // parent_hash so a single in-flight tracker drives one retry
+        // (or one drop) per missing parent, regardless of how many
+        // distinct children we hold for it. Iteration order is
+        // sorted-by-parent so replay/property tests stay byte-
+        // identical regardless of `HashMap` ordering.
+        let mut parent_to_children: std::collections::BTreeMap<BlockHash, Vec<BlockHash>> =
+            std::collections::BTreeMap::new();
+        for (child_hash, signed) in &self.parked_proposals {
+            let parent_hash = signed.payload.block.header.parent_hash;
+            parent_to_children
+                .entry(parent_hash)
+                .or_default()
+                .push(*child_hash);
+        }
+        for parent_hash in parent_to_children.keys() {
+            actions.extend(self.run_block_sync_retry_for_parent(*parent_hash));
         }
 
         if let Some(high_qc) = self.state.high_qc.clone() {
@@ -752,6 +803,159 @@ impl HotStuffCore {
     /// accidentally keep a reference into the core across the replay.
     pub fn replay(mut self, events: impl IntoIterator<Item = Event>) -> Vec<Vec<Action>> {
         events.into_iter().map(|e| self.step(e)).collect()
+    }
+
+    // ── Block-sync retry plumbing (#196) ────────────────────────────────────
+    //
+    // These helpers own [`HotStuffCore::block_sync_inflight`] and the
+    // per-parent-hash retry policy: insert on first probe, throttle
+    // re-emissions on backoff, rotate to other validators after the
+    // per-peer budget is spent, and drop parked proposals whose total
+    // attempt budget is exhausted.
+
+    /// Decide whether to emit a `RequestBlock` for `parent_hash` right
+    /// now and update the in-flight tracker accordingly. Returns the
+    /// resulting `Action`s (zero or one) — empty when the call is
+    /// suppressed by backoff or when the per-parent attempt budget is
+    /// already exhausted (in which case the caller is expected to
+    /// drop the corresponding parked proposals).
+    ///
+    /// `original_sender` and `expected_height` are the values from the
+    /// proposal that triggered the call. They are stored in the
+    /// in-flight entry on first sighting and ignored on subsequent
+    /// re-deliveries — re-deliveries of the same parent_hash inherit
+    /// whatever the first probe recorded, so the rotation order
+    /// stays anchored to the first seen sender.
+    fn try_emit_block_sync_retry(
+        &mut self,
+        parent_hash: BlockHash,
+        original_sender: NodeId,
+        expected_height: u64,
+        reason: BlockSyncReason,
+    ) -> Vec<Action> {
+        // First sighting: install the tracker and emit the initial
+        // probe to the sender. attempts is incremented to 1 to
+        // reflect "we have asked once".
+        if !self.block_sync_inflight.contains_key(&parent_hash) {
+            self.block_sync_inflight.insert(
+                parent_hash,
+                BlockSyncInflight {
+                    original_sender,
+                    attempts: 1,
+                    last_asked_view: self.state.current_view,
+                    expected_height,
+                },
+            );
+            return vec![Action::RequestBlock {
+                hash: parent_hash,
+                peer: original_sender,
+                expected_height,
+                reason,
+            }];
+        }
+
+        // Re-delivery (or retry) of an already-tracked parent hash.
+        // Snapshot the entry, decide outside the borrow, then mutate.
+        let snapshot = *self.block_sync_inflight.get(&parent_hash).unwrap();
+        if snapshot.attempts >= self.limits.block_sync_max_attempts {
+            // Budget exhausted — leave the entry in place; the
+            // pacemaker-advance loop will see this on its next pass
+            // and drop the parked proposals.
+            return Vec::new();
+        }
+        let backoff = block_sync_backoff_views(
+            snapshot.attempts,
+            self.limits.block_sync_initial_backoff_views,
+            self.limits.block_sync_max_backoff_views,
+        );
+        let elapsed = self
+            .state
+            .current_view
+            .saturating_sub(snapshot.last_asked_view);
+        if elapsed < backoff {
+            return Vec::new();
+        }
+        let peer = pick_block_sync_peer(
+            snapshot.original_sender,
+            snapshot.attempts,
+            self.limits.block_sync_per_peer_attempts,
+            &self.state.validator_set,
+            self.self_id,
+        );
+        let entry = self.block_sync_inflight.get_mut(&parent_hash).unwrap();
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.last_asked_view = self.state.current_view;
+        vec![Action::RequestBlock {
+            hash: parent_hash,
+            peer,
+            expected_height: snapshot.expected_height,
+            reason,
+        }]
+    }
+
+    /// Pacemaker-driven retry path: emit one `RequestBlock` for
+    /// `parent_hash` if the in-flight tracker says it is time, or
+    /// drop every parked proposal depending on this parent if the
+    /// retry budget is exhausted. Always returns the actions to
+    /// append to the pacemaker step output.
+    fn run_block_sync_retry_for_parent(&mut self, parent_hash: BlockHash) -> Vec<Action> {
+        let snapshot = match self.block_sync_inflight.get(&parent_hash) {
+            Some(e) => *e,
+            // Defensive: every still-parked proposal should have an
+            // in-flight entry. Missing entry = a parent that landed
+            // between our two iterations of `parked_proposals` (or
+            // an internal bug). Either way, no action.
+            None => return Vec::new(),
+        };
+        if snapshot.attempts >= self.limits.block_sync_max_attempts {
+            self.drop_parked_for_parent(parent_hash);
+            return Vec::new();
+        }
+        // Reuse the same throttle-and-rotate logic as on-proposal
+        // re-delivery. The parent_hash and original_sender lookups
+        // come from the in-flight entry, so the call is idempotent
+        // with respect to the parked_proposals state.
+        self.try_emit_block_sync_retry(
+            parent_hash,
+            snapshot.original_sender,
+            snapshot.expected_height,
+            BlockSyncReason::StillParkedOnPacemakerAdvance,
+        )
+    }
+
+    /// Drop every parked proposal whose `parent_hash` matches and tear
+    /// down the in-flight tracker. Increments
+    /// [`CacheEvictionCounters::block_sync_dropped`] and emits a
+    /// single WARN trace per drop so an operator can correlate the
+    /// drop with the missing parent that caused it. Eviction here is
+    /// a real liveness signal (we gave up on a parent we couldn't
+    /// fetch despite N validators), so the WARN level is intentional —
+    /// unlike the cap-based parked_proposals eviction (INFO), which
+    /// is expected steady-state behaviour under flood.
+    fn drop_parked_for_parent(&mut self, parent_hash: BlockHash) {
+        let victims: Vec<BlockHash> = self
+            .parked_proposals
+            .iter()
+            .filter(|(_, signed)| signed.payload.block.header.parent_hash == parent_hash)
+            .map(|(child_hash, _)| *child_hash)
+            .collect();
+        for child_hash in &victims {
+            self.parked_proposals.remove(child_hash);
+        }
+        let dropped = victims.len() as u64;
+        if dropped > 0 {
+            self.eviction_counters.inc_block_sync_dropped(dropped);
+            tracing::warn!(
+                target: TRACE_TARGET,
+                cache = "block_sync_inflight",
+                policy = "max_attempts_exhausted",
+                parent_hash = ?parent_hash,
+                dropped,
+                attempts = self.limits.block_sync_max_attempts,
+                "block_sync_request_dropped",
+            );
+        }
+        self.block_sync_inflight.remove(&parent_hash);
     }
 
     // ── Cache-eviction helpers ──────────────────────────────────────────────
@@ -857,6 +1061,76 @@ fn round_robin_leader(vs: &ValidatorSet, view: View) -> NodeId {
     debug_assert!(len > 0, "validator set must be non-empty");
     *vs.get((view as usize) % len)
         .expect("validator set is non-empty")
+}
+
+/// Compute the view-gap to wait before the next `RequestBlock` retry
+/// on a parent hash that has already been asked `attempts` times.
+///
+/// The schedule is `min(initial << (attempts - 1), max)` — exponential
+/// doubling capped at `max`. `attempts == 0` returns `0` (no probe has
+/// fired yet, so there is nothing to wait for); `initial == 0` short-
+/// circuits to `0` for every input, which preserves the pre-#196
+/// "retry every advance" behaviour used by the property tests under
+/// [`CacheLimits::unbounded_for_tests`].
+fn block_sync_backoff_views(attempts: u32, initial: u64, max: u64) -> u64 {
+    if attempts == 0 || initial == 0 {
+        return 0;
+    }
+    let shift = (attempts - 1).min(63);
+    let raw = initial.checked_shl(shift).unwrap_or(u64::MAX);
+    raw.min(max)
+}
+
+/// Pick the validator that should receive the `attempts`-th
+/// `RequestBlock` retry for a parent hash. Round 0 (the initial probe
+/// and any retries within the per-peer budget) re-asks
+/// `original_sender`; subsequent rounds step through the validator
+/// set in sorted order, skipping `self_id`.
+///
+/// `per_peer_attempts == 0` is treated as `1` — at minimum we ask
+/// the sender once before rotating.
+fn pick_block_sync_peer(
+    original_sender: NodeId,
+    attempts: u32,
+    per_peer_attempts: u32,
+    validator_set: &ValidatorSet,
+    self_id: NodeId,
+) -> NodeId {
+    let per_peer = per_peer_attempts.max(1);
+    // `attempts` counts probes already emitted. The probe we're about
+    // to send is attempt #(attempts + 1). Map (attempts + 1) onto a
+    // 1-indexed slot, then bucket into rounds of `per_peer`.
+    let next_attempt = attempts.saturating_add(1);
+    let round = ((next_attempt - 1) / per_peer) as usize;
+    if round == 0 {
+        return original_sender;
+    }
+    let len = validator_set.len();
+    if len == 0 {
+        return original_sender;
+    }
+    let sender_idx = validator_set.index_of(&original_sender).unwrap_or(0);
+    // Build the rotation ring: every validator after `sender_idx`
+    // (wrapping), skipping `self_id`. The ring is small (validator
+    // sets are O(10s)), so a Vec is cheap and keeps the rotation
+    // index arithmetic obvious.
+    let mut ring: Vec<NodeId> = Vec::with_capacity(len);
+    for offset in 1..=len {
+        let candidate = *validator_set
+            .get((sender_idx + offset) % len)
+            .expect("validator_set indexing in bounds");
+        if candidate != self_id {
+            ring.push(candidate);
+        }
+    }
+    if ring.is_empty() {
+        // Self is the only validator — there is no peer to rotate to.
+        // Fall back to the original sender so the action is well-
+        // formed; the integration layer will short-circuit a
+        // self-addressed RequestBlock at apply time.
+        return original_sender;
+    }
+    ring[(round - 1) % ring.len()]
 }
 
 #[cfg(test)]
@@ -2134,6 +2408,413 @@ mod tests {
             expected_height: 0,
             reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
         }));
+    }
+
+    // ── #196: block-sync per-peer fallback + budget ────────────────────
+    //
+    // The pacemaker-advance retry loop has its own retry-state
+    // (`block_sync_inflight`) that lives separately from the
+    // unbounded "ask the same peer forever" behaviour exercised in
+    // the tests above. These tests explicitly enable the rotation
+    // and drop knobs and pin behaviour for the four scenarios
+    // called out in #196's acceptance criteria.
+
+    mod block_sync {
+        use super::*;
+        use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
+
+        /// Build a core that exercises the #196 retry knobs explicitly.
+        /// `per_peer_attempts` and `max_attempts` are the only fields
+        /// that vary across these tests; backoff is disabled (0/0)
+        /// so each `PacemakerAdvance` is eligible to fire a retry.
+        fn make_rotation_core(
+            self_byte: u8,
+            per_peer_attempts: u32,
+            max_attempts: u32,
+        ) -> HotStuffCore {
+            let mut limits = CacheLimits::unbounded_for_tests();
+            limits.block_sync_per_peer_attempts = per_peer_attempts;
+            limits.block_sync_max_attempts = max_attempts;
+            // Backoff stays at 0/0: rotation cadence is the focus.
+            let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let builder = Arc::new(TestBlockBuilder {
+                proposer: nid(self_byte),
+            });
+            HotStuffCore::with_limits(
+                nid(self_byte),
+                state,
+                builder,
+                limits,
+                CacheEvictionCounters::default(),
+            )
+        }
+
+        /// Acceptance criterion #1: park a proposal, advance the
+        /// pacemaker N times with the original sender silent, assert
+        /// the request rotates to a different peer by the Kth
+        /// advance.
+        ///
+        /// `per_peer_attempts = 2` means the original sender gets the
+        /// initial probe + one retry, then we rotate. With backoff
+        /// disabled, the rotation point is the third RequestBlock
+        /// emission — i.e. the 2nd `PacemakerAdvance` after parking.
+        #[test]
+        fn rotates_to_different_peer_after_per_peer_budget_exhausted() {
+            // self = nid(1); validators are [nid(1), nid(2), nid(3), nid(4)].
+            // sender = nid(2). Round 1 in the rotation ring (sorted,
+            // skipping self) starts at the validator immediately
+            // after sender → nid(3).
+            let mut core = make_rotation_core(1, /* per_peer = */ 2, /* max = */ 8);
+            let parent: BlockHash = [0xAA; 32];
+            let child = orphan_child(parent, 1, nid(3));
+            let justify = dummy_qc(0, core.state().genesis_hash);
+            let sender = nid(2);
+
+            // Initial probe: attempts = 1, peer = sender.
+            let initial = core.step(Event::ProposalReceived(signed_proposal(
+                child, justify, sender,
+            )));
+            assert_eq!(
+                initial,
+                vec![Action::RequestBlock {
+                    hash: parent,
+                    peer: sender,
+                    expected_height: 0,
+                    reason: BlockSyncReason::UnknownParentOnProposal,
+                }],
+            );
+
+            // Advance #1: attempts = 1 → 2, still round 0, peer = sender.
+            let advance_one = core.step(Event::PacemakerAdvance(1));
+            let req_one = advance_one
+                .iter()
+                .find_map(|a| match a {
+                    Action::RequestBlock { peer, .. } => Some(*peer),
+                    _ => None,
+                })
+                .expect("retry must fire on the first advance");
+            assert_eq!(
+                req_one, sender,
+                "the per-peer budget hasn't been spent yet; retry must still go to the original sender",
+            );
+
+            // Advance #2: attempts = 2 → 3, round transitions to 1 →
+            // peer rotates to the next validator (nid(3)).
+            let advance_two = core.step(Event::PacemakerAdvance(2));
+            let req_two = advance_two
+                .iter()
+                .find_map(|a| match a {
+                    Action::RequestBlock { peer, .. } => Some(*peer),
+                    _ => None,
+                })
+                .expect("retry must fire on the second advance");
+            assert_ne!(
+                req_two, sender,
+                "by the K-th advance (per_peer_attempts = 2), the retry must rotate off the original sender",
+            );
+            assert_eq!(
+                req_two,
+                nid(3),
+                "rotation steps through the validator ring sorted-and-skipping-self; nid(3) is next after nid(2)",
+            );
+        }
+
+        /// Acceptance criterion #2: park a proposal, parent arrives,
+        /// assert the in-flight retry entry is cleared. Two arrival
+        /// paths must both clear: `insert_pending_block` (the
+        /// integration-layer hand-off after a `BlockResponse`) and
+        /// the un-parking branch of `on_pacemaker_advance` (when the
+        /// parent landed via a freshly-arrived proposal).
+        #[test]
+        fn parent_arrival_via_insert_pending_block_clears_inflight_entry() {
+            let mut core = make_rotation_core(1, 2, 8);
+            let genesis = Block::genesis([0; 32]);
+            let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
+            let parent_block = chain[0].clone();
+            let child_block = chain[1].clone();
+            let justify_v1 = dummy_qc(1, parent_block.hash());
+
+            let _ = core.step(Event::ProposalReceived(signed_proposal(
+                child_block,
+                justify_v1,
+                nid(2),
+            )));
+            assert!(
+                core.block_sync_inflight.contains_key(&parent_block.hash()),
+                "in-flight entry must be installed on the initial probe",
+            );
+
+            // Integration-layer hand-off: BlockResponse arrives.
+            core.insert_pending_block(parent_block.clone());
+            assert!(
+                !core.block_sync_inflight.contains_key(&parent_block.hash()),
+                "in-flight entry must be cleared once the parent has landed in pending_blocks",
+            );
+        }
+
+        /// The same clearing must happen when the parent arrives via
+        /// a freshly-received proposal of its own (so the un-parking
+        /// branch of `on_pacemaker_advance` walks the parked map and
+        /// re-dispatches). The test parks a grandchild whose
+        /// grandparent arrives first, then the parent: the parent's
+        /// in-flight entry must clear when its proposal is processed
+        /// (B2 path), not just when `PacemakerAdvance` re-runs.
+        #[test]
+        fn parent_arrival_via_proposal_clears_inflight_entry() {
+            let mut core = make_rotation_core(1, 2, 8);
+            let genesis = Block::genesis([0; 32]);
+            let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
+            let parent_block = chain[0].clone();
+            let child_block = chain[1].clone();
+            let justify_v0 = dummy_qc(0, genesis.hash());
+            let justify_v1 = dummy_qc(1, parent_block.hash());
+
+            // Park the child; in-flight entry installed for the
+            // missing parent_block hash.
+            let _ = core.step(Event::ProposalReceived(signed_proposal(
+                child_block.clone(),
+                justify_v1,
+                nid(2),
+            )));
+            assert!(core.block_sync_inflight.contains_key(&parent_block.hash()));
+
+            // The parent itself arrives (via proposal, not via
+            // BlockResponse). It traverses the B2 happy-path branch,
+            // which inserts the block into pending_blocks and clears
+            // the corresponding in-flight entry.
+            let _ = core.step(Event::ProposalReceived(signed_proposal(
+                parent_block.clone(),
+                justify_v0,
+                nid(2),
+            )));
+            assert!(
+                !core.block_sync_inflight.contains_key(&parent_block.hash()),
+                "in-flight entry must clear when the parent's own proposal is processed",
+            );
+        }
+
+        /// Total budget exhaustion: after `max_attempts`
+        /// `RequestBlock`s, the next pacemaker advance drops every
+        /// parked proposal whose parent is exhausted, ticks
+        /// `block_sync_dropped`, and tears down the in-flight entry.
+        #[test]
+        fn drops_parked_proposal_after_max_attempts_exhausted() {
+            // per_peer = 2, max = 4 → after 4 RequestBlock emissions
+            // the budget is spent. With backoff disabled, that's the
+            // initial probe + 3 PacemakerAdvances.
+            let mut core = make_rotation_core(1, 2, 4);
+            let parent: BlockHash = [0xAA; 32];
+            let child = orphan_child(parent, 1, nid(3));
+            let child_hash = child.hash();
+            let justify = dummy_qc(0, core.state().genesis_hash);
+            let sender = nid(2);
+
+            // Initial probe (attempt 1).
+            let _ = core.step(Event::ProposalReceived(signed_proposal(
+                child, justify, sender,
+            )));
+            assert_eq!(core.block_sync_inflight.len(), 1);
+
+            // Advances 1..=3 fire attempts 2..=4.
+            for v in 1..=3 {
+                let advance = core.step(Event::PacemakerAdvance(v));
+                let request_count = advance
+                    .iter()
+                    .filter(|a| matches!(a, Action::RequestBlock { .. }))
+                    .count();
+                assert_eq!(
+                    request_count, 1,
+                    "advance {v} must fire one retry while the budget is unspent",
+                );
+            }
+            assert!(
+                core.parked_proposals.contains_key(&child_hash),
+                "parked proposal must still be present while budget is unspent",
+            );
+            assert_eq!(core.eviction_counters().block_sync_dropped(), 0);
+
+            // Advance 4: attempts has reached `max_attempts (=4)`.
+            // The retry loop must drop the parked proposal and tick
+            // the counter; no RequestBlock emission this round.
+            let drop_advance = core.step(Event::PacemakerAdvance(4));
+            assert!(
+                !drop_advance
+                    .iter()
+                    .any(|a| matches!(a, Action::RequestBlock { .. })),
+                "exhausted-budget advance must not emit another RequestBlock; got {drop_advance:?}",
+            );
+            assert!(
+                !core.parked_proposals.contains_key(&child_hash),
+                "parked proposal whose parent's retry budget is exhausted must be dropped",
+            );
+            assert!(
+                !core.block_sync_inflight.contains_key(&parent),
+                "in-flight entry must be torn down once the parked proposal is dropped",
+            );
+            assert_eq!(
+                core.eviction_counters().block_sync_dropped(),
+                1,
+                "block_sync_dropped counter must tick once per dropped parked proposal",
+            );
+        }
+
+        /// Backoff suppression: with a non-zero initial backoff, a
+        /// `PacemakerAdvance` whose view-gap is shorter than
+        /// `backoff(attempts)` must not re-emit a RequestBlock. This
+        /// is the per-peer rate-limiting half of the issue —
+        /// without it, the same peer is asked on every advance.
+        #[test]
+        fn backoff_suppresses_retry_within_window() {
+            // Tight, predictable schedule: initial = 2, max = 2 →
+            // backoff is always 2 views. per_peer = MAX so peer
+            // never rotates and we can pin behaviour to a single
+            // dimension (timing).
+            let mut limits = CacheLimits::unbounded_for_tests();
+            limits.block_sync_initial_backoff_views = 2;
+            limits.block_sync_max_backoff_views = 2;
+            let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
+            let mut core = HotStuffCore::with_limits(
+                nid(1),
+                state,
+                builder,
+                limits,
+                CacheEvictionCounters::default(),
+            );
+
+            let parent: BlockHash = [0xCC; 32];
+            let child = orphan_child(parent, 5, nid(3));
+            let justify = dummy_qc(0, core.state().genesis_hash);
+            let sender = nid(2);
+
+            // Initial probe at view 0; last_asked_view = 0.
+            let _ = core.step(Event::ProposalReceived(signed_proposal(
+                child, justify, sender,
+            )));
+
+            // Advance to view 1 — only one view has elapsed; backoff
+            // requires two. No RequestBlock this round.
+            let suppressed = core.step(Event::PacemakerAdvance(1));
+            assert!(
+                !suppressed
+                    .iter()
+                    .any(|a| matches!(a, Action::RequestBlock { .. })),
+                "advance within the backoff window must not re-emit a RequestBlock; got {suppressed:?}",
+            );
+
+            // Advance to view 2 — two views have elapsed; backoff
+            // satisfied. RequestBlock fires.
+            let firing = core.step(Event::PacemakerAdvance(2));
+            assert_eq!(
+                firing
+                    .iter()
+                    .filter(|a| matches!(a, Action::RequestBlock { .. }))
+                    .count(),
+                1,
+                "advance once the backoff has elapsed must re-emit exactly one RequestBlock; got {firing:?}",
+            );
+        }
+
+        /// Re-delivery of the same orphan proposal within the
+        /// backoff window must be suppressed (unlike pre-#196 where
+        /// every re-delivery emitted a duplicate RequestBlock). The
+        /// safety core's own retry loop is now authoritative for
+        /// throttling.
+        #[test]
+        fn redelivery_within_backoff_window_is_suppressed() {
+            let mut limits = CacheLimits::unbounded_for_tests();
+            limits.block_sync_initial_backoff_views = 4;
+            limits.block_sync_max_backoff_views = 4;
+            let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
+            let mut core = HotStuffCore::with_limits(
+                nid(1),
+                state,
+                builder,
+                limits,
+                CacheEvictionCounters::default(),
+            );
+
+            let parent: BlockHash = [0xDD; 32];
+            let child = orphan_child(parent, 7, nid(3));
+            let justify = dummy_qc(0, core.state().genesis_hash);
+            let signed = signed_proposal(child, justify, nid(2));
+
+            // First delivery: initial probe fires.
+            let first = core.step(Event::ProposalReceived(signed.clone()));
+            assert_eq!(first.len(), 1);
+
+            // Re-delivery at the same view (backoff is 4 views, 0
+            // elapsed): suppressed.
+            let second = core.step(Event::ProposalReceived(signed));
+            assert!(
+                second.is_empty(),
+                "re-delivery within the backoff window must not refire RequestBlock; got {second:?}",
+            );
+            assert_eq!(core.parked_proposals.len(), 1);
+            // attempts must still be 1 — re-delivery did not consume
+            // budget.
+            assert_eq!(
+                core.block_sync_inflight.get(&parent).map(|i| i.attempts),
+                Some(1),
+            );
+        }
+
+        /// Direct unit on `pick_block_sync_peer`: rotation order is
+        /// validator-set sorted, starts after the original sender,
+        /// skips `self_id`, and wraps once the ring is exhausted.
+        /// This makes the rotation behaviour testable without
+        /// having to drive a fully-instrumented pacemaker.
+        #[test]
+        fn pick_block_sync_peer_rotates_validator_ring_skipping_self() {
+            let validators = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)]);
+            let self_id = nid(1);
+            let sender = nid(2);
+            // per_peer = 1 forces a fresh round on every increment.
+            // Round 0 = sender (nid(2)), round 1 = ring[0] (nid(3)),
+            // round 2 = ring[1] (nid(4)), round 3 = ring[2] (nid(2)),
+            // round 4 wraps back to ring[0] (nid(3)), …
+            let attempts_to_peer = |attempts: u32| {
+                pick_block_sync_peer(
+                    sender,
+                    attempts,
+                    /* per_peer = */ 1,
+                    &validators,
+                    self_id,
+                )
+            };
+            assert_eq!(attempts_to_peer(0), sender, "round 0 → sender");
+            assert_eq!(
+                attempts_to_peer(1),
+                nid(3),
+                "round 1 → first non-self peer after sender"
+            );
+            assert_eq!(attempts_to_peer(2), nid(4));
+            assert_eq!(
+                attempts_to_peer(3),
+                sender,
+                "ring wraps back to sender after exhaustion"
+            );
+            assert_eq!(attempts_to_peer(4), nid(3), "wrap loops around the ring");
+        }
+
+        /// `block_sync_backoff_views` schedule: zero on attempts == 0
+        /// (no probe yet), exponential thereafter, capped at `max`.
+        /// `initial == 0` short-circuits to `0` for every input.
+        #[test]
+        fn block_sync_backoff_views_doubles_and_saturates() {
+            // initial = 1, max = 8 → 1, 2, 4, 8, 8, 8, …
+            assert_eq!(block_sync_backoff_views(0, 1, 8), 0);
+            assert_eq!(block_sync_backoff_views(1, 1, 8), 1);
+            assert_eq!(block_sync_backoff_views(2, 1, 8), 2);
+            assert_eq!(block_sync_backoff_views(3, 1, 8), 4);
+            assert_eq!(block_sync_backoff_views(4, 1, 8), 8);
+            assert_eq!(block_sync_backoff_views(5, 1, 8), 8);
+            assert_eq!(block_sync_backoff_views(64, 1, 8), 8);
+            // initial = 0 disables backoff entirely (`unbounded_for_tests`).
+            assert_eq!(block_sync_backoff_views(1, 0, 0), 0);
+            assert_eq!(block_sync_backoff_views(99, 0, 0), 0);
+        }
     }
 
     // ── D9: replay determinism ─────────────────────────────────────
