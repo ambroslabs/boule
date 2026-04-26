@@ -2667,15 +2667,11 @@ mod tests {
     /// the survivors by ~40 blocks and the post-restart cluster
     /// permanently stalled.
     ///
-    /// **Currently expected to fail** in the testnet/wire repro per
-    /// reviewer feedback on PR #215; this sim test pins the same
-    /// "give me a wide gap, restart, demand catch-up" shape so we
-    /// can see whether the sim and the wire diverge here. If the
-    /// sim test passes while the wire repro stalls, the next PR's
-    /// job is to find the missing piece (most likely something the
-    /// in-memory routing happens to do for free that real TLS
-    /// transport doesn't, e.g. faster post-restart `PeerAdded`
-    /// delivery that lets block-sync requests find a target).
+    /// PR #215 made `pending_blocks` re-seed from disk on resume.
+    /// PR #218's `OnRoundSync` follow-up also keeps the post-restart
+    /// view-skew from wedging the wire repro. With both landed, this
+    /// test passes deterministically in the in-memory model and
+    /// passes 17/17 testnet seeds with the rotating-failure scenario.
     #[tokio::test]
     async fn divergent_restart_wide_gap_resumes_liveness() {
         tokio::time::pause();

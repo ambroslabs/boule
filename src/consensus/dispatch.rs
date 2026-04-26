@@ -208,7 +208,23 @@ pub fn ingress_wire(
         WireMessage::TimeoutVote(signed) => {
             verify_signer(signed.signer, vs)?;
             verify_sig(&signed)?;
-            Ok(vec![Dispatch::TimeoutVote(signed)])
+            let view = signed.payload.view;
+            // Surface a round-sync hint to the pacemaker alongside
+            // the timeout-vote bucketing. A single signed
+            // `TimeoutVote(V)` is enough evidence that *someone* is
+            // already past view `V - 1`, so we should at least be at
+            // `V` too. Without this hint the cluster could
+            // permanently wedge after a divergent restart: distinct
+            // resume views (e.g. 28 vs 29) leave each replica
+            // bucketing only at the view it itself is on, never
+            // reaching quorum, never emitting a TC, never advancing —
+            // see issue #218 for the wire-path reproduction. The
+            // pacemaker arm is a no-op for stale views, so this is
+            // always safe.
+            Ok(vec![
+                Dispatch::TimeoutVote(signed),
+                Dispatch::Pacemaker(pacemaker::Event::OnRoundSync(view)),
+            ])
         }
 
         WireMessage::BlockRequest(hash) => Ok(vec![Dispatch::ServeBlock { hash, to: from }]),
@@ -546,8 +562,16 @@ mod tests {
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let dispatches = ingress(signer.node_id(), &bytes, &vs).unwrap();
-        assert_eq!(dispatches.len(), 1);
+        // Issue #218: TimeoutVote ingress emits two dispatches —
+        // the bucket update plus a round-sync hint to the pacemaker
+        // so a behind-by-skew replica can fast-jump to the sender's
+        // view without waiting for a full TC.
+        assert_eq!(dispatches.len(), 2);
         assert!(matches!(dispatches[0], Dispatch::TimeoutVote(_)));
+        assert!(matches!(
+            dispatches[1],
+            Dispatch::Pacemaker(pacemaker::Event::OnRoundSync(7)),
+        ));
     }
 
     #[test]

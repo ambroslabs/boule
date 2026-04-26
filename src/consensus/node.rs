@@ -106,6 +106,7 @@ fn pacemaker_event_kind(ev: &PacemakerEvent) -> &'static str {
         PacemakerEvent::OnTimeoutCert(_) => "OnTimeoutCert",
         PacemakerEvent::OnTimeout(_) => "OnTimeout",
         PacemakerEvent::OnProposalReceived(_) => "OnProposalReceived",
+        PacemakerEvent::OnRoundSync(_) => "OnRoundSync",
     }
 }
 
@@ -3144,6 +3145,95 @@ mod tests {
         // but the timer IS armed. We verify the loop at least processed the
         // boot sequence without panicking: if the task panicked, the test
         // harness would surface it on the next await or drop.
+    }
+
+    // ── #218: TimeoutVote round-sync hint ───────────────────────────────────
+
+    /// A signed `TimeoutVote(view=N)` from a peer must fast-forward
+    /// the local pacemaker to `N` (not `N + 1`) when N is strictly
+    /// greater than `current_view`, even if no `high_qc` accompanies
+    /// it and even if no TC ever forms. This is the round-sync
+    /// hint #218 wires through `dispatch::ingress`; without it a
+    /// replica that booted with a slightly-stale `high_qc.view` and
+    /// missed the post-boot NewView broadcasts could permanently
+    /// wedge — its own `TimeoutVote(current_view)` would never
+    /// reach quorum because peers are voting on a different view.
+    #[tokio::test]
+    async fn timeout_vote_ingress_round_sync_advances_pacemaker_view() {
+        // Two-signer harness: `self` and `peer`. `self` sits at index
+        // 0 (validator_set[0]) so peer's TimeoutVote is from a
+        // different validator and the ingress signer-membership check
+        // passes.
+        let self_signer = fresh_signer();
+        let peer_signer = fresh_signer();
+        let validator_ids = {
+            let mut ids = vec![
+                self_signer.node_id(),
+                peer_signer.node_id(),
+                nid(0xA1),
+                nid(0xA2),
+            ];
+            // Don't sort — we need self at a fixed index for the test.
+            // ValidatorSet sorts internally, so just record the pair.
+            ids.sort();
+            ids
+        };
+        let vs = ValidatorSet::new(validator_ids);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        let mut node = ConsensusNode::new(
+            self_signer.node_id(),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Sanity: a fresh node sits at view 0 (the synthetic OnQc(0)
+        // that the boot path would emit hasn't fired yet).
+        assert_eq!(node.pacemaker.current_view(), 0);
+        let high_qc_view_before = node.pacemaker.high_qc_view();
+
+        // Construct a signed TimeoutVote at view 42 with no high_qc
+        // and decode through the wire path so this test exercises
+        // *exactly* the same ingress code the live event loop uses.
+        let tv = crate::consensus::hotstuff::qc::TimeoutVote {
+            view: 42,
+            high_qc: None,
+        };
+        let signed =
+            crate::crypto::signed::Signed::sign(tv, &peer_signer).expect("sign TimeoutVote");
+        let wire = WireMessage::TimeoutVote(signed);
+        let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
+
+        let dispatches = crate::consensus::dispatch::ingress(peer_signer.node_id(), &payload, &vs)
+            .expect("ingress");
+
+        // Apply each dispatch through the integration layer to mirror
+        // what the run loop does.
+        let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+        for d in dispatches {
+            node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
+                .await
+                .expect("apply_dispatch");
+        }
+
+        // The OnRoundSync(42) from ingress jumped the pacemaker to
+        // view 42 — not 43 — without inflating high_qc_view.
+        assert_eq!(
+            node.pacemaker.current_view(),
+            42,
+            "OnRoundSync must jump to v, not v+1",
+        );
+        assert_eq!(
+            node.pacemaker.high_qc_view(),
+            high_qc_view_before,
+            "OnRoundSync must not promote high_qc_view (single-signer evidence \
+             is too weak for QC adoption — see #218)",
+        );
     }
 
     // ── Self-addressed loopback (#118) ───────────────────────────────────────

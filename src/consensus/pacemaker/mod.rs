@@ -72,6 +72,19 @@ pub enum Event {
     /// of this view is alive. Re-arms the timer so a slow-but-progressing
     /// leader doesn't get timed out mid-proposal.
     OnProposalReceived(View),
+    /// Round-synchronisation hint: a peer's signed message (currently a
+    /// `TimeoutVote`) has reached us claiming view `V`. If `V` is
+    /// strictly greater than our current view, jump *to* `V` (not to
+    /// `V + 1` like `OnQc`/`OnTimeoutCert`) — we have evidence that a
+    /// peer has already given up on the prior view, so we should at
+    /// least catch up to where they are. Issue #218.
+    ///
+    /// Distinct from `OnQc` because a single signer is plenty of
+    /// evidence for "I should be at this view too" but is too weak
+    /// for QC adoption (`high_qc_view` tracking and the QC's
+    /// implicit chain-justification both require quorum-of-evidence).
+    /// Splitting the events keeps the trust gradients honest.
+    OnRoundSync(View),
 }
 
 /// Why the pacemaker advanced to a new view. Plumbed through on
@@ -86,6 +99,10 @@ pub enum AdvanceCause {
     /// A timeout certificate for the prior view was observed; the
     /// cluster abandoned that view via view-change recovery.
     Tc,
+    /// A peer's [`Event::OnRoundSync`] hint pulled us forward to a
+    /// view someone else had already abandoned — single-signer round
+    /// synchronisation, no QC implied.
+    RoundSync,
 }
 
 impl AdvanceCause {
@@ -94,6 +111,7 @@ impl AdvanceCause {
         match self {
             AdvanceCause::Qc => "qc",
             AdvanceCause::Tc => "tc",
+            AdvanceCause::RoundSync => "round_sync",
         }
     }
 }
@@ -218,6 +236,19 @@ impl Pacemaker {
                 vec![Action::ResetTimer(
                     self.policy.timeout(self.consecutive_failures),
                 )]
+            }
+            Event::OnRoundSync(v) => {
+                // Round sync is "I should be at this view" — jump *to*
+                // `v`, not `v + 1`. Idempotent for stale or current
+                // values: the only way to advance is strict `>`.
+                //
+                // Distinct from `OnQc(v - 1)`, which would also kick
+                // `high_qc_view`. Round sync is single-signer evidence
+                // and intentionally does not imply a QC at `v - 1`.
+                if v <= self.current_view {
+                    return Vec::new();
+                }
+                self.advance_to(v, AdvanceCause::RoundSync)
             }
         }
     }
