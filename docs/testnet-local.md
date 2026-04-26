@@ -724,15 +724,18 @@ kill -9 $PID2 $PID5
 sleep 5
 snap "t=8s, n2 + n5 dead (5 honest)"
 
-# t=8s: restart n2 (it has on-disk state and recovers via block sync)
+# t=8s: restart n2 (it has on-disk state and recovers via block sync).
+# Block-sync walks back one parent per pacemaker tick, so the post-restart
+# wait scales with the gap (here ~30 blocks at timeout_base_ms=500). If the
+# next snapshot still shows n2 mid-catch-up, bump this sleep.
 launch 2
-sleep 4
-snap "t=12s, n2 healed, only n5 dead"
+sleep 15
+snap "t=23s, n2 healed, only n5 dead"
 
-# t=12s: kill n4 (now the dead set is {n4, n5} — different from before)
+# t=23s: kill n4 (now the dead set is {n4, n5} — different from before)
 kill -9 $PID4
-sleep 6
-snap "t=18s, n4 + n5 dead, n2 fully participating"
+sleep 8
+snap "t=31s, n4 + n5 dead, n2 fully participating"
 
 # Shut down survivors
 for i in 1 2 3 6 7; do
@@ -759,23 +762,33 @@ A healthy run produces output like:
   n3: 86 commits, height=86
   ...
 
-== t=12s, n2 healed, only n5 dead ==
-  n2: 109 commits, height=109     ← caught up to live chain via block sync
-  n1: 109 commits, height=109     ← rate accelerated (only 1 dead)
+== t=23s, n2 healed, only n5 dead ==
+  n2: 220 commits, height=220     ← caught up to live chain via block sync
+  n1: 222 commits, height=222     ← rate accelerated (only 1 dead)
   ...
 
-== t=18s, n4 + n5 dead, n2 fully participating ==
-  n1: 113 commits, height=118     ← survivors progressed past kill
-  n2: 113 commits, height=118     ← formerly dead, now contributing
-  n4: 109 commits, height=109     ← frozen at second kill
+== t=31s, n4 + n5 dead, n2 fully participating ==
+  n1: 260 commits, height=265     ← survivors progressed past kill
+  n2: 260 commits, height=265     ← formerly dead, now contributing
+  n4: 222 commits, height=222     ← frozen at second kill
   n5: 78 commits, height=78       ← still frozen
   ...
 ```
 
+> The exact numbers will vary per run — what matters is the relative
+> shape: survivors advance across both faulty windows, n2 reaches
+> parity with the live chain by the second snapshot, and the two
+> killed nodes stay frozen at their pre-kill heights. If n2's height
+> in the `t=23s` snapshot is still well below the survivors', it's
+> still mid-catch-up: bump the `sleep 15` after the relaunch and
+> rerun. Block-sync currently walks back one parent per pacemaker
+> tick (see issue tracker for the planned bulk-range RPC), so the
+> wait scales with how many blocks were missed.
+
 Three properties to verify:
 
 1. **Liveness across both faulty windows.** Survivors gain commits in
-   both the t=3→8s window (n2+n5 down) and the t=12→18s window (n4+n5
+   both the t=3→8s window (n2+n5 down) and the t=23→31s window (n4+n5
    down). Both are `f = 2` configurations.
 2. **Recovery and re-participation.** n2 was dead for ~5 seconds, missed
    ~30 blocks, restarted, caught up to the live chain via block sync,
