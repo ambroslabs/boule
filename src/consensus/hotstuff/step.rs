@@ -2047,6 +2047,400 @@ mod tests {
         );
     }
 
+    // ── #197: Consensus-layer WAL-replay invariants ────────────────
+    //
+    // sim_crash.rs (in src/sim/) covers the storage half of the
+    // survivor guarantee — that fsync'd KV/WAL bytes survive a
+    // restart. These tests cover the *consensus* half: regardless of
+    // whether the bytes hit disk, when a fresh `HotStuffCore` is
+    // re-initialized from a persisted `(last_voted_view, locked,
+    // high_qc)` triple, does it actually behave like a survivor —
+    // refusing to double-vote, lose its lock, or re-adopt a stale
+    // high_qc?
+    //
+    // The tests are deliberately at the safety-core layer, not the
+    // sim layer: the core is pure (no clock, no I/O), so a
+    // "snapshot + new core from snapshot" pattern is the cleanest
+    // way to model a restart without dragging in disk-backing
+    // machinery the safety property doesn't depend on.
+    mod wal_replay {
+        use super::*;
+
+        /// Model what the integration layer does on boot: build a
+        /// fresh [`HotStuffCore`] whose [`HotStuffState`] is seeded
+        /// from a persisted `(last_voted_view, locked, high_qc)`
+        /// triple and a list of blocks the block-store hands back.
+        ///
+        /// `pending` mirrors what the integration layer would
+        /// re-insert from its block store on boot — `pending_blocks`
+        /// is *not* part of the persisted safety-state snapshot
+        /// (full blocks live in the block store, not in the WAL'd
+        /// safety triple), so the test supplies it explicitly.
+        fn restart_with_persisted_state(
+            self_byte: u8,
+            last_voted_view: View,
+            locked: Option<Locked>,
+            high_qc: Option<QuorumCertificate>,
+            pending: &[Block],
+        ) -> HotStuffCore {
+            let mut state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            state.last_voted_view = last_voted_view;
+            state.locked = locked;
+            state.high_qc = high_qc;
+            for block in pending {
+                state.insert_pending(block.clone());
+            }
+            let builder = Arc::new(TestBlockBuilder {
+                proposer: nid(self_byte),
+            });
+            HotStuffCore::new(nid(self_byte), state, builder)
+        }
+
+        /// Test 1 — vheight monotonicity across restart.
+        ///
+        /// Drive a node to vote at view 1, snapshot its persisted
+        /// state, re-initialize a fresh core from the snapshot, and
+        /// re-deliver the same view-1 proposal. The replica must
+        /// refuse — `safe_to_vote` returns false on the
+        /// `view > last_voted_view` precondition — so no
+        /// `Persist(VotedInView)`, no `Broadcast(Vote)`, and no
+        /// `Persist(HighQc)` (high_qc adoption is gated on
+        /// `safe_to_vote` firing).
+        ///
+        /// This is the load-bearing safety invariant of HotStuff:
+        /// the safety proof's "no equivocation" guarantee depends
+        /// on a restarted replica never voting twice at the same
+        /// view. See `docs/consensus/hotstuff-notes.md` "Why
+        /// monotonic vheight".
+        #[test]
+        fn restart_does_not_revote_at_already_voted_view() {
+            // Pre-restart: vote at view 1.
+            let genesis = Block::genesis([0; 32]);
+            let block_v1 = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+            let justify_v0 = dummy_qc(0, genesis.hash());
+            let signed = signed_proposal(block_v1.clone(), justify_v0, nid(2));
+
+            let mut pre = make_core(1);
+            let pre_actions = pre.step(Event::ProposalReceived(signed.clone()));
+            assert!(
+                pre_actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Persist(StateUpdate::VotedInView { view: 1 }))),
+                "pre-restart core must vote on the first view-1 proposal: {pre_actions:?}",
+            );
+            assert_eq!(pre.state().last_voted_view, 1);
+
+            // Snapshot persisted state. The integration layer flushes
+            // these three fields; nothing else needs to survive the
+            // crash for the safety invariant to hold.
+            let last_voted_view = pre.state().last_voted_view;
+            let locked = pre.state().locked;
+            let high_qc = pre.state().high_qc.clone();
+
+            // Restart: fresh core, same persisted triple.
+            let mut post = restart_with_persisted_state(
+                1,
+                last_voted_view,
+                locked,
+                high_qc,
+                std::slice::from_ref(&block_v1),
+            );
+
+            // Replay the same view-1 proposal.
+            let post_actions = post.step(Event::ProposalReceived(signed));
+
+            // No new vote, no broadcast, no high_qc churn — the
+            // proposal is silently absorbed (B2 still inserts it
+            // into pending_blocks, but that's not an `Action`).
+            assert!(
+                post_actions.is_empty(),
+                "restarted core must emit no actions on a re-delivered same-view proposal: \
+                 {post_actions:?}",
+            );
+            assert_eq!(
+                post.state().last_voted_view,
+                1,
+                "last_voted_view stays pinned at the persisted value",
+            );
+        }
+
+        /// Test 2 — locked_qc preservation.
+        ///
+        /// Drive a node to lock at height 1 (via three consecutive
+        /// proposals at views 1, 2, 3 — the two-chain rule fires on
+        /// the third). Snapshot, restart, then present a sibling
+        /// proposal at view 4 that does *not* extend the locked
+        /// block and whose justify is older than the lock. Both
+        /// arms of `safe_to_vote`'s safety disjunction (extension,
+        /// liveness) must fail — the replica refuses to vote and
+        /// the lock survives untouched.
+        ///
+        /// A regression that lost or weakened the lock on restart
+        /// would let the sibling extract a vote, splitting the
+        /// chain. See HotStuff Appendix B Lemma 6.
+        #[test]
+        fn restart_with_locked_qc_refuses_proposal_breaking_lock() {
+            // Pre-restart: drive to a lock at height 1.
+            let genesis = Block::genesis([0; 32]);
+            let chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
+            let block_v1 = chain[0].clone();
+            let block_v2 = chain[1].clone();
+            let block_v3 = chain[2].clone();
+
+            let mut pre = make_core(1);
+            pre.step(Event::ProposalReceived(signed_proposal(
+                block_v1.clone(),
+                dummy_qc(0, genesis.hash()),
+                nid(2),
+            )));
+            pre.step(Event::ProposalReceived(signed_proposal(
+                block_v2.clone(),
+                dummy_qc(1, block_v1.hash()),
+                nid(2),
+            )));
+            pre.step(Event::ProposalReceived(signed_proposal(
+                block_v3.clone(),
+                dummy_qc(2, block_v2.hash()),
+                nid(2),
+            )));
+            // Two-chain promotion fires on the third proposal:
+            // grandparent of view 3 is block_v1 (view 1, height 1).
+            let expected_lock = Locked {
+                view: 1,
+                height: 1,
+                block_hash: block_v1.hash(),
+            };
+            assert_eq!(pre.state().locked, Some(expected_lock));
+            assert_eq!(pre.state().last_voted_view, 3);
+
+            let last_voted_view = pre.state().last_voted_view;
+            let locked = pre.state().locked;
+            let high_qc = pre.state().high_qc.clone();
+
+            // Restart with the persisted snapshot. block_v1 is the
+            // locked block — it MUST be in `pending_blocks` for the
+            // extension walk that `safe_to_vote` will run.
+            let mut post = restart_with_persisted_state(
+                1,
+                last_voted_view,
+                locked,
+                high_qc,
+                &[block_v1.clone(), block_v2, block_v3],
+            );
+
+            // A Byzantine sibling at view 4: rooted directly on
+            // genesis (height 1, NOT extending the locked
+            // block_v1), with a stale justify (view 0 ≤ locked
+            // view 1, so the liveness rule doesn't fire either).
+            let sibling = Block {
+                header: BlockHeader {
+                    parent_hash: genesis.hash(),
+                    height: 1,
+                    view: 4,
+                    proposer: nid(3),
+                    state_commitment: [0xCC; 32],
+                    commands_commitment: Block::commands_commitment(&[]),
+                },
+                commands: Vec::new(),
+            };
+            let stale_justify = dummy_qc(0, genesis.hash());
+            let signed_sibling = signed_proposal(sibling, stale_justify, nid(3));
+
+            let actions = post.step(Event::ProposalReceived(signed_sibling));
+
+            assert!(
+                actions
+                    .iter()
+                    .all(|a| !matches!(a, Action::Broadcast(ConsensusMsg::Vote(_)))),
+                "lock-breaking sibling must not extract a vote: {actions:?}",
+            );
+            assert!(
+                actions
+                    .iter()
+                    .all(|a| !matches!(a, Action::Persist(StateUpdate::VotedInView { .. }))),
+                "no Persist(VotedInView) for a refused proposal: {actions:?}",
+            );
+            assert_eq!(
+                post.state().locked,
+                Some(expected_lock),
+                "lock survives the restart and the refused proposal",
+            );
+            assert_eq!(post.state().last_voted_view, 3);
+        }
+
+        /// Test 3 — high_qc preservation across restart.
+        ///
+        /// Drive a node to adopt a `high_qc` at view 1 (process
+        /// proposals at views 1 then 2 — the second's justify
+        /// QC(view=1) is adopted as high_qc). Snapshot, restart,
+        /// then deliver a `NewView` carrying a stale `high_qc`
+        /// (view 0). The strict `>` in [`should_update_high_qc`]
+        /// must reject the stale QC — no `Persist(HighQc)` and no
+        /// regression of `state.high_qc.view`.
+        #[test]
+        fn restart_does_not_adopt_stale_high_qc_via_newview() {
+            let genesis = Block::genesis([0; 32]);
+            let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
+            let block_v1 = chain[0].clone();
+            let block_v2 = chain[1].clone();
+
+            let mut pre = make_core(1);
+            pre.step(Event::ProposalReceived(signed_proposal(
+                block_v1.clone(),
+                dummy_qc(0, genesis.hash()),
+                nid(2),
+            )));
+            let fresh_qc_v1 = dummy_qc(1, block_v1.hash());
+            pre.step(Event::ProposalReceived(signed_proposal(
+                block_v2.clone(),
+                fresh_qc_v1.clone(),
+                nid(2),
+            )));
+            assert_eq!(pre.state().high_qc.as_ref().map(|q| q.view), Some(1));
+
+            let last_voted_view = pre.state().last_voted_view;
+            let locked = pre.state().locked;
+            let high_qc = pre.state().high_qc.clone();
+
+            let mut post = restart_with_persisted_state(
+                1,
+                last_voted_view,
+                locked,
+                high_qc,
+                &[block_v1, block_v2],
+            );
+
+            // A NewView carrying a stale high_qc (view 0). The
+            // sender is a peer; on the wire this is the shape an
+            // ill-informed validator would emit before catching up.
+            let stale_newview = signed_newview(dummy_qc(0, genesis.hash()), nid(3));
+            let actions = post.step(Event::NewViewReceived(stale_newview));
+
+            assert!(
+                actions.is_empty(),
+                "stale NewView must produce no actions: {actions:?}",
+            );
+            assert_eq!(
+                post.state().high_qc.as_ref().map(|q| q.view),
+                Some(1),
+                "high_qc preserved at view 1 across restart and stale NewView",
+            );
+            assert_eq!(post.state().high_qc, Some(fresh_qc_v1));
+        }
+
+        /// Test 4 — partial persistence.
+        ///
+        /// `on_proposal_received` emits `Persist(VotedInView)`
+        /// before `Persist(HighQc)`. The integration layer flushes
+        /// each Persist before the dependent broadcast leaves the
+        /// machine, so the worst case at a crash boundary is
+        /// "VotedInView hit disk, HighQc did not, Vote never went
+        /// out". Model that snapshot and assert two things:
+        ///
+        /// 1. The persisted vote is binding — re-delivering the
+        ///    same proposal post-restart does NOT produce a vote.
+        /// 2. The lost high_qc is harmless — it is not retroactively
+        ///    adopted from the (now refused) proposal, but it is
+        ///    naturally re-acquired from the next proposal's
+        ///    justify, so the cluster's freshness story still
+        ///    converges.
+        ///
+        /// This is the consensus-side mirror of
+        /// `sim_crash.rs::crash_recovery_preserves_flushed_storage_and_wal_state`'s
+        /// "unflushed entry may disappear" clause.
+        #[test]
+        fn restart_with_persisted_vote_but_missing_high_qc_is_safe() {
+            let genesis = Block::genesis([0; 32]);
+            let block_v1 = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+            let justify_v0 = dummy_qc(0, genesis.hash());
+            let signed_v1 = signed_proposal(block_v1.clone(), justify_v0, nid(2));
+
+            // Pre-restart: capture the action sequence and pin the
+            // emission order the partial-persistence scenario depends
+            // on. If a future refactor re-orders these, the
+            // "VotedInView landed but HighQc didn't" scenario stops
+            // being the worst-case crash boundary and this test
+            // needs to be re-derived.
+            let mut pre = make_core(1);
+            let pre_actions = pre.step(Event::ProposalReceived(signed_v1.clone()));
+            let voted_idx = pre_actions
+                .iter()
+                .position(|a| matches!(a, Action::Persist(StateUpdate::VotedInView { .. })));
+            let high_qc_idx = pre_actions
+                .iter()
+                .position(|a| matches!(a, Action::Persist(StateUpdate::HighQc(_))));
+            assert!(
+                matches!((voted_idx, high_qc_idx), (Some(v), Some(h)) if v < h),
+                "Persist(VotedInView) must precede Persist(HighQc) for the partial-\
+                 persistence scenario to be the worst case: {pre_actions:?}",
+            );
+
+            // The "crash between Persist actions" snapshot: the
+            // VotedInView write reached fsync'd disk, the HighQc
+            // write did not.
+            let mut post = restart_with_persisted_state(
+                1,
+                /* last_voted_view */ 1,
+                /* locked */ None,
+                /* high_qc */ None,
+                std::slice::from_ref(&block_v1),
+            );
+
+            // (1) Persisted vote is binding — re-delivery of the
+            // same proposal must not extract a second vote.
+            let replay = post.step(Event::ProposalReceived(signed_v1));
+            assert!(
+                replay
+                    .iter()
+                    .all(|a| !matches!(a, Action::Persist(StateUpdate::VotedInView { .. }))),
+                "binding vote: no Persist(VotedInView) on replay: {replay:?}",
+            );
+            assert!(
+                replay
+                    .iter()
+                    .all(|a| !matches!(a, Action::Broadcast(ConsensusMsg::Vote(_)))),
+                "binding vote: no Vote broadcast on replay: {replay:?}",
+            );
+            // High_qc adoption is gated on `safe_to_vote` firing,
+            // so the missed write is also not retroactively
+            // recovered from the refused proposal — this is
+            // *intentional*: the safety property never required us
+            // to remember it, only to not double-vote.
+            assert!(
+                post.state().high_qc.is_none(),
+                "missed HighQc not retroactively adopted from a refused proposal",
+            );
+
+            // (2) Harmless: the next proposal carries an even
+            // fresher justify and adoption resumes via the normal
+            // path. The lost high_qc was a freshness optimization,
+            // not a safety witness.
+            let block_v2 = chain_from_genesis(&genesis, &[1, 2], nid(2))[1].clone();
+            let qc_v1 = dummy_qc(1, block_v1.hash());
+            let signed_v2 = signed_proposal(block_v2, qc_v1.clone(), nid(2));
+            let actions_v2 = post.step(Event::ProposalReceived(signed_v2));
+
+            assert!(
+                actions_v2.iter().any(|a| matches!(
+                    a,
+                    Action::Persist(StateUpdate::HighQc(qc)) if qc.view == 1
+                )),
+                "next proposal recovers high_qc adoption via the normal path: \
+                 {actions_v2:?}",
+            );
+            assert_eq!(
+                post.state().high_qc.as_ref().map(|q| q.view),
+                Some(1),
+                "high_qc adopted at view 1 from the recovery proposal's justify",
+            );
+            assert_eq!(
+                post.state().last_voted_view,
+                2,
+                "the recovery proposal at view 2 is voted on normally",
+            );
+        }
+    }
+
     // ── E1 / E4: Multi-replica property-test harness ────────────────
     //
     // The harness lives as a nested `mod property` so clippy's
