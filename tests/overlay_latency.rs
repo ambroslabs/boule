@@ -303,6 +303,7 @@ async fn spawn_gossip(n: usize, k: usize) -> Harness {
         } = GossipOverlay::spawn(SpawnArgs {
             self_id: my_id,
             self_listen_addr: Some(sim_addr(idx)),
+            self_reachable: true,
             event_rx: raw_event_rx,
             sink,
             dialer: Arc::new(NoopDialer),

@@ -16,11 +16,20 @@
 //!
 //! # Selection bias
 //!
-//! Today: **uniform random** over the unconnected portion of the peer
-//! table. The breakdown comment on #137 documents this as the v1
-//! choice; latency / stake / reputation biasing is an explicit
+//! Today: **uniform random** over the unconnected, *reachable* portion
+//! of the peer table. The breakdown comment on #137 documents this as
+//! the v1 choice; latency / stake / reputation biasing is an explicit
 //! follow-up. The selection RNG is seeded from the caller so sim
 //! tests get byte-identical traces.
+//!
+//! # Outbound-only peers (#138)
+//!
+//! Peers advertising `reachable = false` (the issue #138 outbound-only
+//! mode, `[p2p] inbound_disabled = true`) are filtered out of the
+//! candidate pool — there is no listener to dial against. They stay
+//! in the [`PeerTable`] so peer-list gossip can still propagate them,
+//! and so we still see them as direct peers if and when they dial in
+//! to *us*. They simply don't count as outbound candidates.
 //!
 //! # Idempotency / dial deduplication
 //!
@@ -162,10 +171,15 @@ pub fn tick_once(
     let deficit = config.target_degree - direct_now.len();
 
     // Candidate set: peers in the table we are neither connected to
-    // nor already dialing. `entry.node_id != self_id` is enforced by
-    // `PeerTable::upsert` itself (the table filters self-references).
+    // nor already dialing, and that advertise `reachable = true`.
+    // `entry.node_id != self_id` is enforced by `PeerTable::upsert`
+    // itself (the table filters self-references).
+    //
+    // Issue #138: `snapshot_reachable` already excludes peers running
+    // `[p2p] inbound_disabled = true`, so the maintenance loop never
+    // wastes a TCP connect attempt on a host that has no listener.
     let mut candidates: Vec<_> = table
-        .snapshot()
+        .snapshot_reachable()
         .into_iter()
         .filter(|e| !direct_set.contains(&e.node_id))
         .filter(|e| !already_dialing.contains(&e.node_id))
@@ -339,6 +353,29 @@ mod tests {
         let spawned = tick_once(&cfg(8), &table, &direct, &dialer, &mut dialing, &mut rng);
         assert_eq!(spawned, 0);
         assert!(dialer.dialed.lock().is_empty());
+    }
+
+    #[test]
+    fn unreachable_peers_are_never_dialed() {
+        // Issue #138: outbound-only peers (advertising reachable=false)
+        // must be filtered out of the candidate pool. A reachable node
+        // with target_degree=4 and a table of 1 reachable + 6
+        // unreachable should only dial the one reachable peer.
+        let table = PeerTable::new(nid(0), 32);
+        table.upsert_with_reachable(nid(1), addr(7001), 100, true);
+        for i in 2..=7u8 {
+            table.upsert_with_reachable(nid(i), addr(7000 + i as u16), 100, false);
+        }
+        let direct = LockedVec::new(); // empty
+        let dialer = RecordingDialer::default();
+        let mut dialing = HashSet::new();
+        let mut rng = ChaCha20Rng::seed_from_u64(13);
+
+        let spawned = tick_once(&cfg(4), &table, &direct, &dialer, &mut dialing, &mut rng);
+        assert_eq!(spawned, 1, "only the reachable candidate may be dialed");
+        let dialed = dialer.dialed.lock();
+        assert_eq!(dialed.len(), 1);
+        assert_eq!(dialed[0].1, Some(nid(1)));
     }
 
     #[test]
