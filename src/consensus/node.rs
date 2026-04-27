@@ -464,6 +464,12 @@ pub struct ConsensusNode {
     /// can update it through a `&self` receiver — the existing
     /// signature is consumed by many tests with shared (`&`) borrows.
     recent_qcs: Mutex<RecentQcCache>,
+    /// Joiner-side snapshot-fetch state machine (#229). Watches
+    /// inbound proposals for lag, drives manifest+chunk fetch from a
+    /// single peer, and emits an action for the integration layer to
+    /// restore state. Disabled (no-op) when the policy's
+    /// `interval_blocks == 0`.
+    snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync,
 }
 
 /// Bounded LRU-by-insertion cache of QCs keyed by block hash.
@@ -588,6 +594,9 @@ impl ConsensusNode {
             peer_cmd_tx: None,
             snapshot_policy: config.snapshot_policy,
             recent_qcs: Mutex::new(RecentQcCache::default()),
+            snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync::new(
+                config.snapshot_policy,
+            ),
         }
     }
 
@@ -856,6 +865,9 @@ impl ConsensusNode {
             peer_cmd_tx: None,
             snapshot_policy: config.snapshot_policy,
             recent_qcs: Mutex::new(RecentQcCache::default()),
+            snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync::new(
+                config.snapshot_policy,
+            ),
         })
     }
 
@@ -1230,6 +1242,22 @@ impl ConsensusNode {
     ) -> anyhow::Result<()> {
         match d {
             Dispatch::Safety(ev) => {
+                // Joiner-side lag detection (#229): peek at the
+                // proposal's height before consuming the event, so
+                // the snapshot-fetch state machine can decide
+                // whether to fast-path the joiner past block-sync.
+                if let SafetyEvent::ProposalReceived(signed) = &ev {
+                    let proposer = signed.signer;
+                    let proposal_height = signed.payload.block.header.height;
+                    let actions = self.snapshot_sync.observe_proposal(
+                        self.last_committed_height,
+                        proposal_height,
+                        proposer,
+                        &self.validator_set,
+                    );
+                    self.apply_snapshot_sync_actions(actions, broadcaster, view_timer, signer)
+                        .await?;
+                }
                 let actions = self.step_safety(ev);
                 self.apply_safety_actions(actions, broadcaster, view_timer, signer)
                     .await?;
@@ -1357,8 +1385,13 @@ impl ConsensusNode {
                     from = %node_id_to_base58(&from),
                     has_manifest = manifest.is_some(),
                     height = manifest.as_ref().map(|m| m.height),
-                    "snapshot_manifest_response_received_no_consumer",
+                    "snapshot_manifest_response_received",
                 );
+                let actions =
+                    self.snapshot_sync
+                        .on_manifest_response(from, manifest, &self.validator_set);
+                self.apply_snapshot_sync_actions(actions, broadcaster, view_timer, signer)
+                    .await?;
             }
 
             Dispatch::ReceiveSnapshotChunk {
@@ -1374,10 +1407,183 @@ impl ConsensusNode {
                     chunk_idx,
                     has_payload = payload.is_some(),
                     payload_len = payload.as_ref().map(|p| p.len()),
-                    "snapshot_chunk_response_received_no_consumer",
+                    "snapshot_chunk_response_received",
                 );
+                let actions = self
+                    .snapshot_sync
+                    .on_chunk_response(from, height, chunk_idx, payload);
+                self.apply_snapshot_sync_actions(actions, broadcaster, view_timer, signer)
+                    .await?;
             }
         }
+        Ok(())
+    }
+
+    /// Execute a slice of [`SnapshotSyncAction`]s emitted by the
+    /// joiner-side state machine. Each action is mapped to either a
+    /// wire send (`SendManifestRequest`, `SendChunkRequest`), a
+    /// state-restore call ([`Self::restore_from_snapshot`]), or a
+    /// log-and-drop on `Abort`. The state machine has already
+    /// transitioned by the time we see the actions, so any error
+    /// here is treated as a soft failure: we log and let
+    /// block-sync take over.
+    async fn apply_snapshot_sync_actions(
+        &mut self,
+        actions: Vec<crate::consensus::snapshot_sync::SnapshotSyncAction>,
+        broadcaster: &dyn Broadcaster,
+        view_timer: &mut ViewTimer,
+        signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        use crate::consensus::snapshot_sync::SnapshotSyncAction;
+        for action in actions {
+            match action {
+                SnapshotSyncAction::SendManifestRequest { peer } => {
+                    tracing::info!(
+                        target: TRACE_TARGET,
+                        peer = %node_id_to_base58(&peer),
+                        "snapshot_manifest_request_sent",
+                    );
+                    let out = dispatch::egress_snapshot_manifest_request(None, peer);
+                    send_outbound(broadcaster, out).await;
+                }
+                SnapshotSyncAction::SendChunkRequest {
+                    peer,
+                    height,
+                    chunk_idx,
+                } => {
+                    tracing::info!(
+                        target: TRACE_TARGET,
+                        peer = %node_id_to_base58(&peer),
+                        height,
+                        chunk_idx,
+                        "snapshot_chunk_request_sent",
+                    );
+                    let out = dispatch::egress_snapshot_chunk_request(height, chunk_idx, peer);
+                    send_outbound(broadcaster, out).await;
+                }
+                SnapshotSyncAction::Restore { manifest, payload } => {
+                    let height = manifest.height;
+                    let view = manifest.view;
+                    if let Err(e) = self.restore_from_snapshot(*manifest, payload) {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            height,
+                            view,
+                            error = %e,
+                            "snapshot_restore_failed",
+                        );
+                    } else {
+                        tracing::info!(
+                            target: TRACE_TARGET,
+                            height,
+                            view,
+                            "snapshot_restored",
+                        );
+                        // Re-drive any parked proposals through the
+                        // safety core: the post-restore lock at the
+                        // snapshot's `(view, height)` may have just
+                        // unblocked previously-parked proposals.
+                        let current_view = self.pacemaker.current_view();
+                        let pa_actions =
+                            self.step_safety(SafetyEvent::PacemakerAdvance(current_view));
+                        self.apply_safety_actions(pa_actions, broadcaster, view_timer, signer)
+                            .await?;
+                    }
+                }
+                SnapshotSyncAction::Abort { reason } => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        reason = ?reason,
+                        "snapshot_fetch_aborted",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adopt a verified snapshot as the joiner's new starting
+    /// point. Called from [`Self::apply_snapshot_sync_actions`] when
+    /// the snapshot-fetch state machine emits
+    /// [`crate::consensus::snapshot_sync::SnapshotSyncAction::Restore`].
+    ///
+    /// Steps:
+    /// 1. `state_machine.restore(&payload)` — rehydrate application
+    ///    state. On failure, the SM is left implementation-defined;
+    ///    we abort the restore.
+    /// 2. Verify the SM's post-restore commitment matches the
+    ///    manifest's claimed `state_commitment`. A mismatch means
+    ///    the producer published a snapshot that doesn't agree with
+    ///    its own block header — defensively reject.
+    /// 3. Persist the snapshot block under
+    ///    [`STORAGE_KEY_BLOCK_PREFIX`], the new `last_committed`,
+    ///    and the manifest's `commit_qc` under
+    ///    [`STORAGE_KEY_HIGH_QC`] in one atomic batch. Survives
+    ///    crash recovery: a subsequent boot's [`recover_state`]
+    ///    rebuilds the safety state from these keys.
+    /// 4. Adopt the snapshot in the safety core: insert the block
+    ///    into `pending_blocks`, set `locked` and `high_qc` to the
+    ///    snapshot's values. Lock and high-QC views are
+    ///    monotonically forward (joiner's prior values are at most
+    ///    genesis), so safety invariants are preserved.
+    /// 5. Update the in-memory `last_committed_*` so subsequent
+    ///    `apply_commit`s don't regress.
+    fn restore_from_snapshot(
+        &mut self,
+        manifest: crate::replication::snapshot::SnapshotManifest,
+        payload: Bytes,
+    ) -> anyhow::Result<()> {
+        // Step 1: restore the application state machine.
+        self.state_machine
+            .lock()
+            .restore(&payload)
+            .map_err(|e| anyhow::anyhow!("state_machine.restore failed: {e}"))?;
+        // Step 2: confirm the post-restore commitment matches the
+        // manifest. A mismatch indicates a buggy or malicious
+        // producer; bail before touching durable state.
+        let post_restore = self.state_machine.lock().state_commitment();
+        if post_restore != manifest.state_commitment {
+            anyhow::bail!(
+                "post-restore state_commitment {} does not match manifest {}",
+                hex::encode(post_restore),
+                hex::encode(manifest.state_commitment),
+            );
+        }
+        // Step 3: persist (block, last_committed, high_qc) atomically.
+        let block = manifest.block.clone();
+        let block_hash = manifest.block_hash;
+        let last_committed = LastCommitted {
+            height: manifest.height,
+            view: manifest.view,
+        };
+        let block_bytes = encode_block(&block)?;
+        let last_committed_bytes = encode_last_committed(&last_committed)?;
+        let high_qc_bytes = encode_high_qc(&manifest.commit_qc)?;
+        let block_key = block_storage_key(&block_hash);
+        self.storage.batch(|b| {
+            b.put(&block_key, &block_bytes);
+            b.put(STORAGE_KEY_LAST_COMMITTED, &last_committed_bytes);
+            b.put(STORAGE_KEY_HIGH_QC, &high_qc_bytes);
+            Ok(())
+        })?;
+        // Step 4: adopt in the safety core.
+        self.core
+            .adopt_snapshot(block, manifest.commit_qc.clone(), manifest.view);
+        // Step 5: update in-memory last-committed counters. The
+        // safety core emits `Action::Commit` in height order, so
+        // future commits will increment from this baseline.
+        if manifest.height > self.last_committed_height {
+            self.last_committed_height = manifest.height;
+            self.last_committed_view = manifest.view;
+        }
+        // Mirror the recent_qcs cache update that
+        // `persist_updates` would do for a normally-adopted high_qc;
+        // keeps the snapshot-creation hook in `apply_commit`
+        // consistent if the joiner later commits a block whose
+        // hash equals the snapshot's (degenerate but cheap).
+        self.recent_qcs
+            .lock()
+            .insert(block_hash, manifest.commit_qc, RECENT_QC_CACHE_CAPACITY);
         Ok(())
     }
 
@@ -2208,10 +2414,7 @@ impl ConsensusNode {
         };
         // Capture the state-machine bytes and its commitment under one
         // lock so the snapshot is internally consistent.
-        let (snapshot_bytes, state_commitment) = {
-            let sm = self.state_machine.lock();
-            (sm.snapshot(), sm.state_commitment())
-        };
+        let snapshot_bytes = self.state_machine.lock().snapshot();
         let chunks_with_hashes =
             chunk_snapshot(&snapshot_bytes, self.snapshot_policy.chunk_size_bytes);
         let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
@@ -2220,11 +2423,11 @@ impl ConsensusNode {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        // The block's `state_commitment` is what consensus committed
+        // and what `manifest.verify` cross-checks against the
+        // standalone `state_commitment` field in the manifest.
         let manifest = SnapshotManifest::build(
-            block.header.height,
-            block.header.view,
-            block_hash,
-            state_commitment,
+            block.clone(), // `block` is `&Block` here; clone for the manifest's owned field.
             &self.validator_set,
             self.snapshot_policy.chunk_size_bytes,
             chunk_hashes,
@@ -3553,22 +3756,33 @@ mod tests {
         let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
 
         let vs = four_validators();
-        let block_hash = [0xAB; 32];
-        let mut qc = QuorumCertificate::new(0, block_hash, vs.len());
+        let block = {
+            // Build a structurally-valid Block at the requested
+            // height; the joiner's `manifest.verify` cross-checks
+            // block.hash() vs manifest.block_hash and reject any
+            // inconsistency.
+            let parent_hash = genesis().hash();
+            let commands: Vec<bytes::Bytes> = Vec::new();
+            crate::replication::block::Block {
+                header: crate::replication::block::BlockHeader {
+                    parent_hash,
+                    height,
+                    view: 7,
+                    proposer: [0u8; 32],
+                    state_commitment: [0xCD; 32],
+                    commands_commitment: crate::replication::block::Block::commands_commitment(
+                        &commands,
+                    ),
+                },
+                commands,
+            }
+        };
+        let mut qc = QuorumCertificate::new(0, block.hash(), vs.len());
         for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
             qc.add_signature(i, [0u8; 64]);
         }
-        let manifest = SnapshotManifest::build(
-            height,
-            7,
-            block_hash,
-            [0xCD; 32],
-            &vs,
-            chunk_size,
-            chunk_hashes,
-            qc,
-            1_700_000_000,
-        );
+        let manifest =
+            SnapshotManifest::build(block, &vs, chunk_size, chunk_hashes, qc, 1_700_000_000);
         SnapshotStore::new(Arc::clone(storage))
             .save(&manifest, &chunks)
             .expect("save snapshot");
@@ -3871,6 +4085,548 @@ mod tests {
                 other => panic!("expected SnapshotChunkResponse(Some), got {other:?}"),
             }
         }
+    }
+
+    // ── Joiner-side fetch (#229) ────────────────────────────────────────
+
+    fn snapshot_test_config_enabled(vs: ValidatorSet, interval: u64) -> NodeConfigForConsensus {
+        let mut cfg = NodeConfigForConsensus::for_testing(vs, genesis());
+        cfg.snapshot_policy = crate::replication::snapshot::SnapshotPolicy {
+            interval_blocks: interval,
+            retention_count: 3,
+            chunk_size_bytes: 1024,
+        };
+        cfg
+    }
+
+    /// Build a Proposal at `(height, view)` whose proposer is
+    /// `signer.node_id()`, parented at `parent_hash`, with empty
+    /// commands. The proposal's `justify` is the genesis QC over
+    /// the joiner's view of the chain — sufficient to reach the
+    /// integration layer's `Dispatch::Safety(Event::ProposalReceived)`
+    /// path, which is what `observe_proposal` peeks at.
+    ///
+    /// Tests use this to feed the joiner a synthetic high-height
+    /// proposal that triggers the snapshot-fetch path without
+    /// running a full consensus loop.
+    /// Drain outbound traffic until a `WireMessage` matching
+    /// `predicate` arrives, or the channel is empty. Returns
+    /// `Some((to, payload))` on hit, `None` on empty drain. Used by
+    /// the joiner-fetch tests to skip past the safety-core's
+    /// incidental outbounds (NewView on a high-view proposal,
+    /// BlockRequest for the missing parent, etc.) and find the
+    /// snapshot-fetch wire messages.
+    async fn drain_until<F>(
+        rx: &mut tokio::sync::mpsc::Receiver<ProtocolOutbound>,
+        mut predicate: F,
+    ) -> Option<(NodeId, bytes::Bytes)>
+    where
+        F: FnMut(&WireMessage) -> bool,
+    {
+        // A few iterations is enough; the safety core emits a
+        // bounded number of side effects per dispatch.
+        for _ in 0..16 {
+            let out = match rx.try_recv() {
+                Ok(o) => o,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    // Yield once in case the producer hasn't run yet.
+                    tokio::task::yield_now().await;
+                    match rx.try_recv() {
+                        Ok(o) => o,
+                        Err(_) => return None,
+                    }
+                }
+                Err(_) => return None,
+            };
+            if let ProtocolOutbound::SendTo { node_id, payload } = out {
+                let wire: WireMessage = match postcard::from_bytes(&payload) {
+                    Ok(w) => w,
+                    Err(_) => continue,
+                };
+                if predicate(&wire) {
+                    return Some((node_id, payload));
+                }
+            }
+            // Broadcasts and decode failures are skipped; the
+            // snapshot wire messages are all `SendTo`.
+        }
+        None
+    }
+
+    fn synthetic_proposal_dispatch(
+        signer: &NodeSigner,
+        height: u64,
+        view: u64,
+        parent_hash: BlockHash,
+    ) -> Dispatch {
+        use crate::consensus::hotstuff::Proposal;
+        use crate::consensus::hotstuff::qc::genesis_qc;
+        use crate::replication::block::{Block, BlockHeader};
+        let commands: Vec<bytes::Bytes> = Vec::new();
+        let block = Block {
+            header: BlockHeader {
+                parent_hash,
+                height,
+                view,
+                proposer: signer.node_id(),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&commands),
+            },
+            commands,
+        };
+        // Justify with the genesis QC — its content doesn't matter
+        // for the lag-detection observation. The integration layer
+        // peeks at `signed.payload.block.header.height` and
+        // `signed.signer`, both of which we control.
+        let justify = genesis_qc(&genesis(), 4);
+        let proposal = Proposal { block, justify };
+        let signed = Signed::sign(proposal, signer).expect("sign proposal");
+        Dispatch::Safety(SafetyEvent::ProposalReceived(signed))
+    }
+
+    /// Joiner happy path (#229 acceptance criteria 1):
+    /// 1. Server has a populated `SnapshotStore` with a snapshot at
+    ///    height ≥ `interval_blocks`.
+    /// 2. Joiner has empty storage and snapshots enabled.
+    /// 3. Joiner observes a synthetic proposal at high height →
+    ///    triggers a manifest request to the proposer (= server).
+    /// 4. The request is decoded by the server's run loop, which
+    ///    serves the manifest.
+    /// 5. The response is decoded by the joiner's run loop, which
+    ///    requests every chunk in order. Each chunk is served by
+    ///    the server.
+    /// 6. After the last chunk, the joiner restores state.
+    ///
+    /// Asserts:
+    /// - Joiner's `last_committed_height` equals the snapshot
+    ///   height after restore.
+    /// - Joiner's state machine commitment matches the manifest's.
+    /// - Snapshot block, last_committed, and high_qc are persisted
+    ///   to the joiner's storage (so a hypothetical restart would
+    ///   recover the same state).
+    #[tokio::test]
+    async fn joiner_fetches_snapshot_from_server_and_restores_state() {
+        use crate::replication::impls::counter_sm::CounterCommand;
+
+        let server_signer = fresh_signer();
+        let server_node_id = server_signer.node_id();
+        let joiner_signer = fresh_signer();
+        let other1_signer = fresh_signer();
+        let other2_signer = fresh_signer();
+        let vs = ValidatorSet::new(vec![
+            server_node_id,
+            joiner_signer.node_id(),
+            other1_signer.node_id(),
+            other2_signer.node_id(),
+        ]);
+
+        // ── Build the server with a populated SnapshotStore ────────────
+        let server_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        // Run a few CounterCommand applies so the SM has non-trivial
+        // state, then build a snapshot at height 50 / view 50. The
+        // test's interval is 50, so a proposal at height 50+ will
+        // trigger the joiner's fetch.
+        let server_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        for _ in 0..7 {
+            server_sm
+                .lock()
+                .apply(&CounterCommand::Increment.encode())
+                .unwrap();
+        }
+        let snapshot_payload = server_sm.lock().snapshot();
+        let expected_commitment = server_sm.lock().state_commitment();
+        let chunks_with_hashes =
+            crate::replication::snapshot::chunk_snapshot(&snapshot_payload, 1024);
+        let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
+        let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
+        let snapshot_block = {
+            let parent_hash = genesis().hash();
+            let commands: Vec<bytes::Bytes> = Vec::new();
+            crate::replication::block::Block {
+                header: crate::replication::block::BlockHeader {
+                    parent_hash,
+                    height: 50,
+                    view: 50,
+                    proposer: server_node_id,
+                    state_commitment: expected_commitment,
+                    commands_commitment: crate::replication::block::Block::commands_commitment(
+                        &commands,
+                    ),
+                },
+                commands,
+            }
+        };
+        let mut commit_qc = QuorumCertificate::new(50, snapshot_block.hash(), vs.len());
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
+            commit_qc.add_signature(i, [0u8; 64]);
+        }
+        let manifest = crate::replication::snapshot::SnapshotManifest::build(
+            snapshot_block.clone(),
+            &vs,
+            1024,
+            chunk_hashes,
+            commit_qc,
+            1_700_000_000,
+        );
+        // Defensive: verify the manifest before saving — catches
+        // any builder-side regression that would otherwise surface
+        // only at the joiner's verification step.
+        manifest
+            .verify(&vs)
+            .expect("server-built manifest must verify");
+        crate::replication::snapshot::SnapshotStore::new(Arc::clone(&server_storage))
+            .save(&manifest, &chunks)
+            .expect("save snapshot");
+
+        let mut server_node = ConsensusNode::new(
+            server_node_id,
+            snapshot_test_config_enabled(vs.clone(), 50),
+            server_sm,
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&server_storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // ── Build the fresh joiner ────────────────────────────────────
+        let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let joiner_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        let joiner_starting_commitment = joiner_sm.lock().state_commitment();
+        assert_ne!(
+            joiner_starting_commitment, expected_commitment,
+            "test setup: joiner's empty SM must differ from server's populated SM",
+        );
+        let mut joiner_node = ConsensusNode::new(
+            joiner_signer.node_id(),
+            snapshot_test_config_enabled(vs.clone(), 50),
+            Arc::clone(&joiner_sm),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&joiner_storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Wrap in Arc *after* using the original `server_signer` to
+        // sign the synthetic proposal below. `NodeSigner` is not
+        // `Clone`, so we hold the Arc separately for `apply_dispatch`
+        // calls that need a `&Arc<dyn Signer>` and the bare ref for
+        // signing.
+        let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
+        let (server_bc, mut server_outbound) = make_test_broadcaster();
+        let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut server_view_timer = ViewTimer::new(timer_tx.clone());
+        let mut joiner_view_timer = ViewTimer::new(timer_tx);
+
+        // ── Step 1: feed the joiner a synthetic proposal at height
+        //   100 from the server. This is what the joiner would see
+        //   in production: a high-height proposal carrying the
+        //   server's pubkey as the proposer.
+        let proposal = synthetic_proposal_dispatch(
+            &server_signer,
+            100,
+            100,
+            // The proposal's parent_hash doesn't matter for lag
+            // detection; the safety core will park it for missing
+            // parent regardless. Use a fake parent hash.
+            [0xEE; 32],
+        );
+        joiner_node
+            .apply_dispatch(
+                proposal,
+                joiner_bc.as_ref(),
+                &mut joiner_view_timer,
+                &joiner_signer_arc,
+            )
+            .await
+            .expect("joiner apply_dispatch");
+
+        // Now wrap the server signer in Arc for subsequent
+        // `apply_dispatch` calls.
+        let server_signer_arc: Arc<dyn Signer> = Arc::new(server_signer);
+
+        // The joiner's snapshot_sync should have emitted a manifest
+        // request to the proposer (= server). Filter past any
+        // incidental safety-core outbounds (NewView, vote, etc.)
+        // emitted by the same proposal.
+        let (req_to, req_payload) = drain_until(&mut joiner_outbound, |w| {
+            matches!(w, WireMessage::SnapshotManifestRequest { .. })
+        })
+        .await
+        .expect("manifest request outbound");
+        assert_eq!(req_to, server_node_id);
+        let req_wire: WireMessage =
+            postcard::from_bytes(&req_payload).expect("decode manifest request");
+        assert!(matches!(
+            req_wire,
+            WireMessage::SnapshotManifestRequest { height: None },
+        ));
+
+        // ── Step 2: feed the request into the server via ingress;
+        //   server's run loop serves the manifest.
+        let dispatches = dispatch::ingress(joiner_signer_arc.node_id(), &req_payload, &vs)
+            .expect("ingress manifest request");
+        for d in dispatches {
+            server_node
+                .apply_dispatch(
+                    d,
+                    server_bc.as_ref(),
+                    &mut server_view_timer,
+                    &server_signer_arc,
+                )
+                .await
+                .expect("server apply_dispatch");
+        }
+        let (resp_to, resp_payload) = drain_until(&mut server_outbound, |w| {
+            matches!(w, WireMessage::SnapshotManifestResponse(_))
+        })
+        .await
+        .expect("manifest response outbound");
+        assert_eq!(resp_to, joiner_signer_arc.node_id());
+
+        // ── Step 3: feed the response back into the joiner. The
+        //   joiner verifies the manifest and emits the first chunk
+        //   request. Then we shuttle each chunk request → response
+        //   through the in-memory transport until the joiner
+        //   restores.
+        let dispatches = dispatch::ingress(server_node_id, &resp_payload, &vs)
+            .expect("ingress manifest response");
+        for d in dispatches {
+            joiner_node
+                .apply_dispatch(
+                    d,
+                    joiner_bc.as_ref(),
+                    &mut joiner_view_timer,
+                    &joiner_signer_arc,
+                )
+                .await
+                .expect("joiner apply_dispatch manifest response");
+        }
+
+        // Loop: shuttle chunk requests/responses until the joiner
+        // restores. Bounded loop count guards against a state-
+        // machine bug that would otherwise hang the test.
+        for _ in 0..(manifest.chunk_count + 4) {
+            // Joiner emitted a chunk request? Drain and forward.
+            let chunk_req = drain_until(&mut joiner_outbound, |w| {
+                matches!(w, WireMessage::SnapshotChunkRequest { .. })
+            })
+            .await;
+            let Some((_, chunk_req_payload)) = chunk_req else {
+                break;
+            };
+            let dispatches =
+                dispatch::ingress(joiner_signer_arc.node_id(), &chunk_req_payload, &vs)
+                    .expect("ingress chunk request");
+            for d in dispatches {
+                server_node
+                    .apply_dispatch(
+                        d,
+                        server_bc.as_ref(),
+                        &mut server_view_timer,
+                        &server_signer_arc,
+                    )
+                    .await
+                    .expect("server apply_dispatch chunk request");
+            }
+            let (_, chunk_resp_payload) = drain_until(&mut server_outbound, |w| {
+                matches!(w, WireMessage::SnapshotChunkResponse { .. })
+            })
+            .await
+            .expect("chunk response");
+            let dispatches = dispatch::ingress(server_node_id, &chunk_resp_payload, &vs)
+                .expect("ingress chunk response");
+            for d in dispatches {
+                joiner_node
+                    .apply_dispatch(
+                        d,
+                        joiner_bc.as_ref(),
+                        &mut joiner_view_timer,
+                        &joiner_signer_arc,
+                    )
+                    .await
+                    .expect("joiner apply_dispatch chunk response");
+            }
+        }
+
+        // ── Assertions ────────────────────────────────────────────────
+        assert!(
+            joiner_node.snapshot_sync.is_done(),
+            "joiner's snapshot_sync must reach Done after a successful fetch",
+        );
+        assert_eq!(
+            joiner_node.last_committed_height, 50,
+            "joiner's last_committed_height must equal the snapshot's height",
+        );
+        assert_eq!(joiner_node.last_committed_view, 50);
+        assert_eq!(
+            joiner_sm.lock().state_commitment(),
+            expected_commitment,
+            "joiner's state machine commitment must match the snapshot's after restore",
+        );
+        // Persistence: snapshot block, last_committed, high_qc are
+        // all on disk so a hypothetical restart would recover.
+        let block_key = block_storage_key(&snapshot_block.hash());
+        assert!(
+            joiner_storage.get(&block_key).unwrap().is_some(),
+            "snapshot block must be persisted under the block-prefix",
+        );
+        assert!(
+            joiner_storage
+                .get(STORAGE_KEY_LAST_COMMITTED)
+                .unwrap()
+                .is_some(),
+            "last_committed checkpoint must be persisted after restore",
+        );
+        assert!(
+            joiner_storage.get(STORAGE_KEY_HIGH_QC).unwrap().is_some(),
+            "high_qc must be persisted after restore",
+        );
+        // The snapshot block is in pending_blocks so future
+        // safety-core walks terminate at the snapshot height.
+        assert!(
+            joiner_node
+                .core
+                .state()
+                .pending_blocks
+                .contains_key(&snapshot_block.hash()),
+            "snapshot block must be inserted into pending_blocks",
+        );
+    }
+
+    /// Joiner negative path (#229 acceptance criteria 2): a
+    /// tampered manifest from the server triggers fallback without
+    /// panicking. The joiner's `last_committed_height` stays at 0
+    /// (no restore happened) and the snapshot_sync state machine
+    /// is in `Aborted`.
+    #[tokio::test]
+    async fn joiner_aborts_on_tampered_manifest_without_panic() {
+        let server_signer = fresh_signer();
+        let server_node_id = server_signer.node_id();
+        let joiner_signer = fresh_signer();
+        let other1 = fresh_signer();
+        let other2 = fresh_signer();
+        let vs = ValidatorSet::new(vec![
+            server_node_id,
+            joiner_signer.node_id(),
+            other1.node_id(),
+            other2.node_id(),
+        ]);
+
+        let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let joiner_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        let mut joiner_node = ConsensusNode::new(
+            joiner_signer.node_id(),
+            snapshot_test_config_enabled(vs.clone(), 50),
+            Arc::clone(&joiner_sm),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&joiner_storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
+        let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut joiner_view_timer = ViewTimer::new(timer_tx);
+
+        // Trigger the joiner's fetch.
+        let proposal = synthetic_proposal_dispatch(&server_signer, 100, 100, [0xEE; 32]);
+        joiner_node
+            .apply_dispatch(
+                proposal,
+                joiner_bc.as_ref(),
+                &mut joiner_view_timer,
+                &joiner_signer_arc,
+            )
+            .await
+            .expect("joiner apply_dispatch proposal");
+
+        // Drain past any incidental safety-core outbounds and the
+        // manifest request the joiner emitted.
+        let _ = drain_until(&mut joiner_outbound, |w| {
+            matches!(w, WireMessage::SnapshotManifestRequest { .. })
+        })
+        .await
+        .expect("manifest request");
+
+        // Build a *tampered* manifest: validator set field doesn't
+        // match the joiner's `vs`. The joiner's verifier rejects
+        // this as `ValidatorSetMismatch`.
+        let bad_vs = ValidatorSet::new(vec![[10u8; 32], [11u8; 32], [12u8; 32], [13u8; 32]]);
+        let tampered_block = {
+            use crate::replication::block::{Block, BlockHeader};
+            let parent_hash = genesis().hash();
+            let commands: Vec<bytes::Bytes> = Vec::new();
+            Block {
+                header: BlockHeader {
+                    parent_hash,
+                    height: 50,
+                    view: 50,
+                    proposer: server_signer.node_id(),
+                    state_commitment: [0xCD; 32],
+                    commands_commitment: Block::commands_commitment(&commands),
+                },
+                commands,
+            }
+        };
+        let mut tampered_qc = QuorumCertificate::new(50, tampered_block.hash(), bad_vs.len());
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(bad_vs.len()) {
+            tampered_qc.add_signature(i, [0u8; 64]);
+        }
+        let bad_manifest = crate::replication::snapshot::SnapshotManifest::build(
+            tampered_block,
+            &bad_vs,
+            64,
+            vec![[0u8; 32]],
+            tampered_qc,
+            1_700_000_000,
+        );
+
+        // Synthesize a SnapshotManifestResponse from the server and
+        // feed it to the joiner.
+        let resp_payload =
+            postcard::to_stdvec(&WireMessage::SnapshotManifestResponse(Some(bad_manifest)))
+                .unwrap();
+        let dispatches = dispatch::ingress(server_signer.node_id(), &resp_payload, &vs)
+            .expect("ingress tampered manifest");
+        for d in dispatches {
+            joiner_node
+                .apply_dispatch(
+                    d,
+                    joiner_bc.as_ref(),
+                    &mut joiner_view_timer,
+                    &joiner_signer_arc,
+                )
+                .await
+                .expect("joiner apply_dispatch tampered manifest");
+        }
+
+        // Joiner's state machine must be Aborted.
+        assert!(
+            joiner_node.snapshot_sync.is_aborted(),
+            "joiner's snapshot_sync must enter Aborted after tampered manifest",
+        );
+        // No restore happened.
+        assert_eq!(
+            joiner_node.last_committed_height, 0,
+            "no restore must have run; last_committed stays at 0",
+        );
+        // No outbound chunk requests should have been emitted; the
+        // joiner stopped after rejecting the manifest. (Other
+        // safety-core outbounds may sit in the channel — we filter
+        // for chunk requests specifically.)
+        assert!(
+            drain_until(&mut joiner_outbound, |w| matches!(
+                w,
+                WireMessage::SnapshotChunkRequest { .. }
+            ))
+            .await
+            .is_none(),
+            "joiner must not emit chunk requests after aborting",
+        );
     }
 
     #[tokio::test]

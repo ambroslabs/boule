@@ -870,23 +870,26 @@ mod tests {
     }
 
     fn sample_manifest_for_dispatch() -> SnapshotManifest {
+        use crate::replication::block::{Block, BlockHeader};
         let vs = ValidatorSet::new(vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
-        let block_hash = [0xAB; 32];
-        let qc = sample_quorum_qc(vs.len(), block_hash);
+        let parent_hash = Block::genesis([0u8; 32]).hash();
+        let commands: Vec<bytes::Bytes> = Vec::new();
+        let block = Block {
+            header: BlockHeader {
+                parent_hash,
+                height: 42,
+                view: 7,
+                proposer: [0u8; 32],
+                state_commitment: [0xCD; 32],
+                commands_commitment: Block::commands_commitment(&commands),
+            },
+            commands,
+        };
+        let qc = sample_quorum_qc(vs.len(), block.hash());
         let payload = b"chunky payload".repeat(8);
         let chunks = crate::replication::snapshot::chunk_snapshot(&payload, 32);
         let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|(_, h)| *h).collect();
-        SnapshotManifest::build(
-            42,
-            7,
-            block_hash,
-            [0xCD; 32],
-            &vs,
-            32,
-            chunk_hashes,
-            qc,
-            1_700_000_000,
-        )
+        SnapshotManifest::build(block, &vs, 32, chunk_hashes, qc, 1_700_000_000)
     }
 
     #[test]

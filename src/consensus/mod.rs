@@ -36,6 +36,7 @@ pub mod hotstuff;
 pub mod limits;
 pub mod node;
 pub mod pacemaker;
+pub mod snapshot_sync;
 pub mod status;
 pub mod validator_set;
 pub mod view_timer;
