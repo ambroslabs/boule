@@ -47,7 +47,7 @@ use crate::p2p::NodeId;
 /// The numeric value matches the postcard variant tag emitted at byte 0
 /// of a serialized [`crate::consensus::node::WireMessage`] (postcard
 /// encodes enum discriminants as a varint in declaration order; for
-/// the six variants here the tag fits in a single byte). Locked in by
+/// the ten variants here the tag fits in a single byte). Locked in by
 /// the unit test [`tests::wire_tag_layout_locked`] below — reordering
 /// `WireMessage` without updating this enum is a test failure, not a
 /// silent miscount.
@@ -65,18 +65,30 @@ pub enum MessageKind {
     RequestBlock,
     /// `WireMessage::BlockResponse` — postcard tag 5.
     ReceiveBlock,
+    /// `WireMessage::SnapshotManifestRequest` — postcard tag 6.
+    SnapshotManifestRequest,
+    /// `WireMessage::SnapshotManifestResponse` — postcard tag 7.
+    SnapshotManifestResponse,
+    /// `WireMessage::SnapshotChunkRequest` — postcard tag 8.
+    SnapshotChunkRequest,
+    /// `WireMessage::SnapshotChunkResponse` — postcard tag 9.
+    SnapshotChunkResponse,
 }
 
 impl MessageKind {
     /// Iteration helper used by the rate limiter to construct one
     /// bucket per kind in a fixed order.
-    pub const ALL: [MessageKind; 6] = [
+    pub const ALL: [MessageKind; 10] = [
         MessageKind::Proposal,
         MessageKind::Vote,
         MessageKind::NewView,
         MessageKind::TimeoutVote,
         MessageKind::RequestBlock,
         MessageKind::ReceiveBlock,
+        MessageKind::SnapshotManifestRequest,
+        MessageKind::SnapshotManifestResponse,
+        MessageKind::SnapshotChunkRequest,
+        MessageKind::SnapshotChunkResponse,
     ];
 
     /// Map a `WireMessage`'s first postcard byte to a `MessageKind`.
@@ -91,6 +103,10 @@ impl MessageKind {
             3 => Self::TimeoutVote,
             4 => Self::RequestBlock,
             5 => Self::ReceiveBlock,
+            6 => Self::SnapshotManifestRequest,
+            7 => Self::SnapshotManifestResponse,
+            8 => Self::SnapshotChunkRequest,
+            9 => Self::SnapshotChunkResponse,
             _ => return None,
         })
     }
@@ -104,6 +120,10 @@ impl MessageKind {
             Self::TimeoutVote => "TimeoutVote",
             Self::RequestBlock => "RequestBlock",
             Self::ReceiveBlock => "ReceiveBlock",
+            Self::SnapshotManifestRequest => "SnapshotManifestRequest",
+            Self::SnapshotManifestResponse => "SnapshotManifestResponse",
+            Self::SnapshotChunkRequest => "SnapshotChunkRequest",
+            Self::SnapshotChunkResponse => "SnapshotChunkResponse",
         }
     }
 
@@ -115,6 +135,10 @@ impl MessageKind {
             Self::TimeoutVote => 3,
             Self::RequestBlock => 4,
             Self::ReceiveBlock => 5,
+            Self::SnapshotManifestRequest => 6,
+            Self::SnapshotManifestResponse => 7,
+            Self::SnapshotChunkRequest => 8,
+            Self::SnapshotChunkResponse => 9,
         }
     }
 }
@@ -207,6 +231,21 @@ pub struct RateLimitsConfig {
     /// peer. Mirrors `request_block_per_sec` since each request
     /// elicits at most one response.
     pub receive_block_per_sec: f64,
+    /// Steady-state rate of `SnapshotManifestRequest` frames received
+    /// from a peer. Snapshot fetches are bursty but rare — sized for
+    /// a joiner negotiating manifests with its known peers, not for
+    /// steady-state traffic.
+    pub snapshot_manifest_request_per_sec: f64,
+    /// Steady-state rate of `SnapshotManifestResponse` frames. Mirrors
+    /// the request side.
+    pub snapshot_manifest_response_per_sec: f64,
+    /// Steady-state rate of `SnapshotChunkRequest` frames received from
+    /// a peer. Sized for chunked catch-up — a joiner pulling a 100 MiB
+    /// snapshot at 1 MiB chunks fits well under the default.
+    pub snapshot_chunk_request_per_sec: f64,
+    /// Steady-state rate of `SnapshotChunkResponse` frames. Mirrors
+    /// the request side.
+    pub snapshot_chunk_response_per_sec: f64,
     /// Per-peer wire-bytes/sec ceiling, applied independently of the
     /// per-kind buckets so a flood of any one kind that fits within
     /// its bucket can still be dropped on bytes alone.
@@ -241,6 +280,10 @@ impl RateLimitsConfig {
             new_view_per_sec: HUGE,
             request_block_per_sec: HUGE,
             receive_block_per_sec: HUGE,
+            snapshot_manifest_request_per_sec: HUGE,
+            snapshot_manifest_response_per_sec: HUGE,
+            snapshot_chunk_request_per_sec: HUGE,
+            snapshot_chunk_response_per_sec: HUGE,
             bytes_per_sec: HUGE,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),
@@ -260,6 +303,17 @@ impl RateLimitsConfig {
             new_view_per_sec: 64.0,
             request_block_per_sec: 8.0,
             receive_block_per_sec: 8.0,
+            // Snapshot rates: bursty but rare. A joiner fetching a
+            // 1 GiB snapshot at 1 MiB chunks issues ~1024 chunk
+            // requests; 32/sec lets the fetch complete in ~30s
+            // without tripping the limiter, and steady-state traffic
+            // (zero in healthy clusters) sits comfortably below.
+            // Manifest exchanges happen O(1) per fetch; cap them
+            // tighter to bound a Byzantine peer's manifest-flood.
+            snapshot_manifest_request_per_sec: 4.0,
+            snapshot_manifest_response_per_sec: 4.0,
+            snapshot_chunk_request_per_sec: 32.0,
+            snapshot_chunk_response_per_sec: 32.0,
             bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),
@@ -275,6 +329,10 @@ impl RateLimitsConfig {
             MessageKind::TimeoutVote => self.timeout_vote_per_sec,
             MessageKind::RequestBlock => self.request_block_per_sec,
             MessageKind::ReceiveBlock => self.receive_block_per_sec,
+            MessageKind::SnapshotManifestRequest => self.snapshot_manifest_request_per_sec,
+            MessageKind::SnapshotManifestResponse => self.snapshot_manifest_response_per_sec,
+            MessageKind::SnapshotChunkRequest => self.snapshot_chunk_request_per_sec,
+            MessageKind::SnapshotChunkResponse => self.snapshot_chunk_response_per_sec,
         }
     }
 
@@ -318,7 +376,7 @@ pub struct RateLimitCounters {
 
 #[derive(Debug, Default)]
 struct RateLimitCountersInner {
-    by_kind: [AtomicU64; 6],
+    by_kind: [AtomicU64; 10],
     bytes: AtomicU64,
     disconnects: AtomicU64,
 }
@@ -365,7 +423,7 @@ impl RateLimitCounters {
 // ── PeerState + RateLimiter ──────────────────────────────────────────────────
 
 struct PeerState {
-    buckets: [TokenBucket; 6],
+    buckets: [TokenBucket; 10],
     bytes_bucket: TokenBucket,
     /// Monotonic instants of recent violations, oldest first.
     violations: VecDeque<Duration>,
@@ -387,6 +445,10 @@ impl PeerState {
                 mk(MessageKind::TimeoutVote),
                 mk(MessageKind::RequestBlock),
                 mk(MessageKind::ReceiveBlock),
+                mk(MessageKind::SnapshotManifestRequest),
+                mk(MessageKind::SnapshotManifestResponse),
+                mk(MessageKind::SnapshotChunkRequest),
+                mk(MessageKind::SnapshotChunkResponse),
             ],
             bytes_bucket: TokenBucket::new(config.bytes_per_sec, config.bytes_capacity(), now),
             violations: VecDeque::new(),
@@ -757,6 +819,35 @@ mod tests {
         let bytes = postcard::to_allocvec(&resp).expect("encode");
         assert_eq!(bytes[0], 5, "BlockResponse must serialize at tag 5");
 
+        let req = WireMessage::SnapshotManifestRequest { height: None };
+        let bytes = postcard::to_allocvec(&req).expect("encode");
+        assert_eq!(
+            bytes[0], 6,
+            "SnapshotManifestRequest must serialize at tag 6"
+        );
+
+        let resp = WireMessage::SnapshotManifestResponse(None);
+        let bytes = postcard::to_allocvec(&resp).expect("encode");
+        assert_eq!(
+            bytes[0], 7,
+            "SnapshotManifestResponse must serialize at tag 7"
+        );
+
+        let req = WireMessage::SnapshotChunkRequest {
+            height: 0,
+            chunk_idx: 0,
+        };
+        let bytes = postcard::to_allocvec(&req).expect("encode");
+        assert_eq!(bytes[0], 8, "SnapshotChunkRequest must serialize at tag 8");
+
+        let resp = WireMessage::SnapshotChunkResponse {
+            height: 0,
+            chunk_idx: 0,
+            payload: None,
+        };
+        let bytes = postcard::to_allocvec(&resp).expect("encode");
+        assert_eq!(bytes[0], 9, "SnapshotChunkResponse must serialize at tag 9");
+
         // Round-trip the classification helper for every documented tag.
         for (tag, kind) in [
             (0, MessageKind::Proposal),
@@ -765,10 +856,14 @@ mod tests {
             (3, MessageKind::TimeoutVote),
             (4, MessageKind::RequestBlock),
             (5, MessageKind::ReceiveBlock),
+            (6, MessageKind::SnapshotManifestRequest),
+            (7, MessageKind::SnapshotManifestResponse),
+            (8, MessageKind::SnapshotChunkRequest),
+            (9, MessageKind::SnapshotChunkResponse),
         ] {
             assert_eq!(MessageKind::from_wire_tag(tag), Some(kind));
         }
-        assert_eq!(MessageKind::from_wire_tag(6), None);
+        assert_eq!(MessageKind::from_wire_tag(10), None);
         assert_eq!(MessageKind::from_wire_tag(0xFF), None);
     }
 
@@ -825,6 +920,10 @@ mod tests {
             new_view_per_sec: 4.0,
             request_block_per_sec: 4.0,
             receive_block_per_sec: 4.0,
+            snapshot_manifest_request_per_sec: 4.0,
+            snapshot_manifest_response_per_sec: 4.0,
+            snapshot_chunk_request_per_sec: 4.0,
+            snapshot_chunk_response_per_sec: 4.0,
             bytes_per_sec: 4096.0,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),

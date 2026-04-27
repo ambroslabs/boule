@@ -479,6 +479,10 @@ impl P2pLimitsConfig {
             new_view_per_sec: self.rate.new_view_per_sec,
             request_block_per_sec: self.rate.request_block_per_sec,
             receive_block_per_sec: self.rate.receive_block_per_sec,
+            snapshot_manifest_request_per_sec: self.rate.snapshot_manifest_request_per_sec,
+            snapshot_manifest_response_per_sec: self.rate.snapshot_manifest_response_per_sec,
+            snapshot_chunk_request_per_sec: self.rate.snapshot_chunk_request_per_sec,
+            snapshot_chunk_response_per_sec: self.rate.snapshot_chunk_response_per_sec,
             bytes_per_sec: self.rate.bytes_per_sec,
             burst_seconds: self.rate.burst_seconds,
             violation_window: std::time::Duration::from_secs(self.violations.window_secs),
@@ -503,6 +507,19 @@ pub struct P2pRateLimitsConfig {
     pub request_block_per_sec: f64,
     #[serde(default = "default_receive_block_per_sec")]
     pub receive_block_per_sec: f64,
+    /// Steady-state inbound rate of `SnapshotManifestRequest` frames.
+    /// See [`crate::p2p::limits::RateLimitsConfig::snapshot_manifest_request_per_sec`].
+    #[serde(default = "default_snapshot_manifest_request_per_sec")]
+    pub snapshot_manifest_request_per_sec: f64,
+    /// Steady-state inbound rate of `SnapshotManifestResponse` frames.
+    #[serde(default = "default_snapshot_manifest_response_per_sec")]
+    pub snapshot_manifest_response_per_sec: f64,
+    /// Steady-state inbound rate of `SnapshotChunkRequest` frames.
+    #[serde(default = "default_snapshot_chunk_request_per_sec")]
+    pub snapshot_chunk_request_per_sec: f64,
+    /// Steady-state inbound rate of `SnapshotChunkResponse` frames.
+    #[serde(default = "default_snapshot_chunk_response_per_sec")]
+    pub snapshot_chunk_response_per_sec: f64,
     #[serde(default = "default_bytes_per_sec")]
     pub bytes_per_sec: f64,
     /// Burst capacity = `rate × burst_seconds`. A 1.0s burst window is
@@ -521,6 +538,10 @@ impl Default for P2pRateLimitsConfig {
             new_view_per_sec: default_new_view_per_sec(),
             request_block_per_sec: default_request_block_per_sec(),
             receive_block_per_sec: default_receive_block_per_sec(),
+            snapshot_manifest_request_per_sec: default_snapshot_manifest_request_per_sec(),
+            snapshot_manifest_response_per_sec: default_snapshot_manifest_response_per_sec(),
+            snapshot_chunk_request_per_sec: default_snapshot_chunk_request_per_sec(),
+            snapshot_chunk_response_per_sec: default_snapshot_chunk_response_per_sec(),
             bytes_per_sec: default_bytes_per_sec(),
             burst_seconds: default_burst_seconds(),
         }
@@ -574,6 +595,18 @@ fn default_request_block_per_sec() -> f64 {
 }
 fn default_receive_block_per_sec() -> f64 {
     8.0
+}
+fn default_snapshot_manifest_request_per_sec() -> f64 {
+    4.0
+}
+fn default_snapshot_manifest_response_per_sec() -> f64 {
+    4.0
+}
+fn default_snapshot_chunk_request_per_sec() -> f64 {
+    32.0
+}
+fn default_snapshot_chunk_response_per_sec() -> f64 {
+    32.0
 }
 fn default_bytes_per_sec() -> f64 {
     1024.0 * 1024.0
