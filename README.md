@@ -94,6 +94,7 @@ Module crib sheet (see `cargo doc` for the authoritative version):
 | `clock`   | Object-safe time abstraction; `TokioClock` in prod, `SimClock` in tests.          |
 | `sim`     | `#[cfg(test)]`-only deterministic simulator: in-memory pipes, virtual time, seeded RNG. |
 | `storage` | `Storage` (KV) and `Wal` (append-only) traits with in-memory and `redb` backends. Durability audit and operator runbook in [docs/storage-durability.md](docs/storage-durability.md). |
+| ops       | Production-deployment guidance: outbound-only / NAT mode, state snapshots and disk-usage expectations, manual export/import. See [docs/operations.md](docs/operations.md). |
 | `config`  | TOML config loading and identity-backend resolution.                              |
 
 ## Configuration
