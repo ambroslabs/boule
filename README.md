@@ -93,7 +93,7 @@ Module crib sheet (see `cargo doc` for the authoritative version):
 | `crypto`  | Application-level `Signed<T>` envelopes for consensus votes, proposals, etc.      |
 | `clock`   | Object-safe time abstraction; `TokioClock` in prod, `SimClock` in tests.          |
 | `sim`     | `#[cfg(test)]`-only deterministic simulator: in-memory pipes, virtual time, seeded RNG. |
-| `storage` | `Storage` (KV) and `Wal` (append-only) traits with in-memory and `redb` backends. |
+| `storage` | `Storage` (KV) and `Wal` (append-only) traits with in-memory and `redb` backends. Durability audit and operator runbook in [docs/storage-durability.md](docs/storage-durability.md). |
 | `config`  | TOML config loading and identity-backend resolution.                              |
 
 ## Configuration
