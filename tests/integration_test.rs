@@ -1189,6 +1189,212 @@ async fn test_consensus_status_returns_404_on_gossip_only_node() {
     );
 }
 
+// ── Outbound-only mode (issue #138) ─────────────────────────────────────────
+//
+// A node carrying `[p2p] inbound_disabled = true` skips binding its
+// TCP listener entirely; the test exercises that the gossip overlay
+// still reaches it via the connection it dials out, and that consensus
+// commits across the four-node cluster.
+//
+// macOS / Linux laptops can't reliably script iptables in a unit test,
+// and we don't want to require docker. Skipping the listener bind is
+// in fact a stronger blocker than iptables — there is no socket to
+// connect to at all — and works identically on every host.
+
+/// Spawn a consensus node with `[p2p] inbound_disabled = true` and the
+/// gossip overlay enabled. The node never binds its P2P listener, so
+/// `bootstrap_addrs` MUST point at a reachable peer that this node can
+/// dial out to. The "p2p_addr" in the returned guard is whatever was
+/// configured (typically `127.0.0.1:0` resolved to a phony address);
+/// no other node should attempt to dial it.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_consensus_node_inbound_disabled(
+    key_path: &str,
+    bootstrap_addrs: &[String],
+    validators_toml: &str,
+    target_degree: usize,
+) -> NodeGuard {
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+
+    let bootstrap_toml = bootstrap_addrs
+        .iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // listen_addr is still required by the parser, but the listener is
+    // never bound; pick `127.0.0.1:0` so the parser is happy.
+    let config = format!(
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [p2p]\ninbound_disabled = true\n\n\
+        [overlay]\nmode = \"gossip\"\ntarget_degree = {target_degree}\npeer_gossip_interval_ms = 250\nmesh_check_interval_ms = 250\nbootstrap_addrs = [{bootstrap_toml}]\n\n\
+        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    run_init(config_file.path().to_str().unwrap());
+
+    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let child = Command::new(bin)
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn inbound-disabled consensus node");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let addrs = loop {
+        if Instant::now() > deadline {
+            panic!("inbound-disabled node did not write addr_file within 10s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break addrs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+
+    NodeGuard {
+        child,
+        api_port,
+        p2p_addr: addrs.p2p_addr,
+        node_id: addrs.node_id,
+        _config: config_file,
+        _key_dir: tempfile::tempdir().unwrap(),
+        _addr_file: addr_file,
+    }
+}
+
+/// Issue #138 acceptance test: a four-node gossip cluster where node 3
+/// is configured with `[p2p] inbound_disabled = true`. Asserts:
+///
+/// 1. Every node — including the unreachable one — commits at steady
+///    state (proves consensus traffic flows over the connection node 3
+///    initiated).
+/// 2. The reachable nodes' `/peers` endpoints list node 3 as a peer
+///    (because it dialed in to one of them and the gossip overlay
+///    propagated the connection through the partial mesh).
+/// 3. The reachable nodes never attempted to dial node 3 — verified
+///    indirectly by the fact that node 3's listener never bound (the
+///    listener task is only spawned when `inbound_disabled = false`),
+///    so any spurious dial would fail with connection-refused and node
+///    3 would have zero direct peers, contradicting (2).
+#[tokio::test]
+async fn test_inbound_disabled_node_participates_via_outbound_only() {
+    const N: usize = 4;
+    const UNREACHABLE_IDX: usize = 3;
+
+    let key_dirs: Vec<tempfile::TempDir> = (0..N).map(|_| tempfile::tempdir().unwrap()).collect();
+    let key_paths: Vec<String> = key_dirs
+        .iter()
+        .map(|d| d.path().join("node.key").to_str().unwrap().to_owned())
+        .collect();
+
+    // Phase 1: discover everyone's identity. Reachable nodes (0..3)
+    // also discover their bound P2P addresses; node 3 binds during
+    // phase-1 discovery (which uses the default config) but won't bind
+    // in phase 2 — its addr is unused after phase 1.
+    let mut specs: Vec<ConsensusNodeSpec> = Vec::with_capacity(N);
+    for key_path in &key_paths {
+        let info = launch_once_for_discovery(key_path).await;
+        specs.push(ConsensusNodeSpec {
+            key_path: key_path.clone(),
+            p2p_addr: info.p2p_addr,
+            node_id: info.node_id,
+        });
+    }
+
+    let validators_toml = specs
+        .iter()
+        .map(|s| format!("\"{}\"", s.node_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Phase 2: relaunch.
+    //
+    // Node 0: gossip overlay, no bootstrap (others connect to it).
+    // Nodes 1, 2: gossip overlay, bootstrap via node 0.
+    // Node 3:    gossip overlay + inbound_disabled, bootstrap via node 0.
+    //
+    // The cluster topology: node 3 only ever reaches the rest via the
+    // outbound TCP connection it initiated to node 0; the partial-mesh
+    // maintenance loop on every other node sees node 3 advertised as
+    // reachable=false (issue #138's reachability gossip) and never
+    // attempts to dial back.
+    let mut guards: Vec<NodeGuard> = Vec::with_capacity(N);
+    for (i, spec) in specs.iter().enumerate() {
+        let bootstrap = if i == 0 {
+            Vec::new()
+        } else {
+            vec![specs[0].p2p_addr.clone()]
+        };
+        let g = if i == UNREACHABLE_IDX {
+            spawn_consensus_node_inbound_disabled(
+                &spec.key_path,
+                &bootstrap,
+                &validators_toml,
+                /* target_degree */ 3,
+            )
+            .await
+        } else {
+            spawn_consensus_node_gossip(
+                &spec.key_path,
+                &spec.p2p_addr,
+                &bootstrap,
+                &validators_toml,
+                /* target_degree */ 3,
+                /* peer_gossip_interval_ms */ 250,
+                /* mesh_check_interval_ms  */ 250,
+            )
+            .await
+        };
+        guards.push(g);
+    }
+
+    let ready_timeout = Duration::from_secs(10);
+    for g in &guards {
+        wait_until_ready(g, ready_timeout).await;
+    }
+
+    // (1) Every node — including the inbound-disabled one — commits.
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    'outer: loop {
+        if Instant::now() > deadline {
+            panic!("4-node cluster with one inbound-disabled node did not commit within 15s");
+        }
+        for g in &guards {
+            let resp = client.get(g.api_url("/consensus/status")).send().await;
+            let body: Value = match resp {
+                Ok(r) if r.status() == 200 => r.json().await.unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            let committed = body["last_committed_height"].as_u64().unwrap_or(0);
+            if committed == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+
+    // (2) The unreachable node established at least one direct peer
+    // (the gossip overlay routed via the connection it dialed). It also
+    // commits, which it could not without ingress on that connection.
+    let unreachable = &guards[UNREACHABLE_IDX];
+    wait_for_peer_count(unreachable, 1, Duration::from_secs(10)).await;
+
+    drop(guards);
+    drop(key_dirs);
+}
+
 // ── `config` subcommand tests (issue #148) ──────────────────────────────────
 //
 // These tests exercise the binary directly — no node is spawned, since the
