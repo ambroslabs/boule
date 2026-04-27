@@ -411,8 +411,7 @@ impl SnapshotStore {
         let new_latest = self
             .list_heights()?
             .into_iter()
-            .filter(|h| *h != height)
-            .next_back();
+            .rfind(|h| *h != height);
         self.storage.batch(|b| {
             b.delete(&manifest_storage_key(height));
             for k in &chunk_keys {
