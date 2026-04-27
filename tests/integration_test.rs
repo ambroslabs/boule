@@ -342,8 +342,8 @@ async fn test_duplicate_messages_are_deduplicated() {
         .unwrap();
     assert!(r2.status().is_success());
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
+    // No wait: dedup runs synchronously inside POST /messages on node1, so
+    // the second response returning is already proof the store has settled.
     let messages: Value = client
         .get(node1.api_url("/messages"))
         .send()
@@ -570,6 +570,9 @@ async fn test_four_node_full_mesh_is_stable_under_simultaneous_dials() {
                 N - 1,
             );
         }
+        // Sampling cadence, not a wait: this loop verifies the mesh count
+        // *stays* at N-1 across a window — there is no positive observable
+        // to early-exit on, so a fixed real-time cadence is correct.
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
@@ -1912,6 +1915,9 @@ async fn test_self_loopback_dial_is_refused_at_handshake() {
             count, 0,
             "self-loopback peer surfaced in /peers — handshake guard failed",
         );
+        // Sampling cadence, not a wait: this loop verifies the peer count
+        // *stays* at 0 across a window — there is no positive observable to
+        // early-exit on, so a fixed real-time cadence is correct.
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
