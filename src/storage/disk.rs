@@ -11,8 +11,12 @@
 //! # Wal layout
 //!
 //! Two tables share the `Wal`'s database:
-//! - `wal_entries`, keyed by the raw `u64` LSN, value is the opaque payload
-//!   bytes.
+//! - `wal_entries`, keyed by the raw `u64` LSN, value is `[checksum:8][payload]`.
+//!   The 8-byte prefix is a SHA-256 of the payload truncated to its first 8
+//!   bytes; `iter_from` recomputes and verifies it on every read so a bit
+//!   flip inside a payload page that escapes redb's per-page xxhash3
+//!   surfaces as a storage error rather than as a confused decode at the
+//!   consensus layer (issue #233).
 //! - `wal_meta`, a small KV used only to persist `next_lsn` across reopens
 //!   (so truncation that drops every entry doesn't reset the counter and
 //!   violate LSN monotonicity across a reopen).
@@ -23,6 +27,18 @@
 //! the buffer into a single `redb` write transaction and commits (fsync).
 //! Within a live process, [`DiskWal::iter_from`] observes both persisted
 //! and buffered entries — across a crash, only flushed entries survive.
+//!
+//! # Corruption detection
+//!
+//! `redb` writes per-page xxhash3 checksums on commit but does **not**
+//! verify them on normal reads (only during the post-crash repair scan and
+//! the explicit [`redb::Database::check_integrity`] call). To catch a
+//! tampered or bit-flipped page that nonetheless deserializes cleanly,
+//! `DiskStorage::open` calls `check_integrity` once at startup (the
+//! HotStuff control-plane KV is small enough that a full scan is cheap)
+//! and `DiskWal` wraps each entry with its own 8-byte checksum that's
+//! verified per-read in [`DiskWal::iter_from`]. See `docs/storage-durability.md`
+//! for the trade-off rationale.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,8 +46,25 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use sha2::{Digest, Sha256};
 
 use super::{Lsn, Storage, Wal, WalIter, WriteBatch, WriteOp};
+
+/// Length of the per-WAL-entry checksum prefix.
+const WAL_CHECKSUM_LEN: usize = 8;
+
+/// 8-byte WAL-entry checksum: SHA-256 of `payload` truncated to its first
+/// 8 bytes. SHA-256 is overkill for tamper detection here (we're guarding
+/// against bit flips, not adversarial collisions — the page is on local
+/// disk), but `sha2` is already a dependency and ~1 µs per typical
+/// entry on modern hardware is comfortably below consensus's per-step
+/// budget. See `WAL_CHECKSUM_LEN` for the prefix length.
+fn wal_checksum(payload: &[u8]) -> [u8; WAL_CHECKSUM_LEN] {
+    let digest = Sha256::digest(payload);
+    let mut out = [0u8; WAL_CHECKSUM_LEN];
+    out.copy_from_slice(&digest[..WAL_CHECKSUM_LEN]);
+    out
+}
 
 const KV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
 const WAL_ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("wal_entries");
@@ -47,7 +80,19 @@ pub struct DiskStorage {
 
 impl DiskStorage {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let db = Database::create(path.as_ref())?;
+        let mut db = Database::create(path.as_ref())?;
+        // Defense-in-depth (issue #233): redb writes a per-page xxhash3 on
+        // commit but does not verify it on normal reads. The KV file holds
+        // HotStuff's control-plane state (last-voted view, locked QC,
+        // high QC, plus the blocks they reference) — bounded in size by
+        // design, so a full integrity scan at startup is cheap. This
+        // catches a flipped byte deep in a redb page before it can surface
+        // as a malformed-payload error at the consensus layer.
+        //
+        // Returns `Ok(true)` if the file was already clean, `Ok(false)` if
+        // redb had to repair it from a torn write — both are acceptable
+        // post-conditions; any actual corruption surfaces as `Err`.
+        let _was_clean = db.check_integrity()?;
         // Ensure the table exists so read transactions don't fail on a fresh db.
         let txn = db.begin_write()?;
         {
@@ -245,8 +290,19 @@ impl Wal for DiskWal {
         let txn = self.db.begin_write()?;
         {
             let mut entries = txn.open_table(WAL_ENTRIES)?;
+            // Prepend an 8-byte SHA-256-truncated checksum of the payload
+            // to each entry. iter_from verifies it on every read so a
+            // bit-flipped page that escapes redb's per-page xxhash3
+            // surfaces as a storage-layer Err. See module-level
+            // "Corruption detection" docs and issue #233.
+            let mut buf: Vec<u8> = Vec::new();
             for (lsn, payload) in &to_flush {
-                entries.insert(lsn.raw(), payload.as_ref())?;
+                let checksum = wal_checksum(payload);
+                buf.clear();
+                buf.reserve(WAL_CHECKSUM_LEN + payload.len());
+                buf.extend_from_slice(&checksum);
+                buf.extend_from_slice(payload);
+                entries.insert(lsn.raw(), buf.as_slice())?;
             }
         }
         {
@@ -272,7 +328,28 @@ impl Wal for DiskWal {
         let entries = txn.open_table(WAL_ENTRIES)?;
         for row in entries.range(lsn.raw()..)? {
             let (k, v) = row?;
-            out.push((Lsn::from_raw(k.value()), Bytes::copy_from_slice(v.value())));
+            let raw = v.value();
+            // Verify the per-entry checksum prepended on flush. A mismatch
+            // means redb returned a value that was tampered with after
+            // commit but before this read — typically a bit flip deep in
+            // a payload page that escaped redb's per-page xxhash3 (which
+            // is only verified during repair, not on every read).
+            if raw.len() < WAL_CHECKSUM_LEN {
+                anyhow::bail!(
+                    "WAL entry at lsn={} is too short ({} bytes) to contain a checksum",
+                    k.value(),
+                    raw.len(),
+                );
+            }
+            let (stored, payload) = raw.split_at(WAL_CHECKSUM_LEN);
+            let computed = wal_checksum(payload);
+            if stored != computed {
+                anyhow::bail!(
+                    "WAL entry at lsn={} failed checksum verification: storage corruption",
+                    k.value(),
+                );
+            }
+            out.push((Lsn::from_raw(k.value()), Bytes::copy_from_slice(payload)));
         }
 
         let buffer_snapshot = {
@@ -1315,6 +1392,187 @@ mod tests {
         let result = std::panic::catch_unwind(|| DiskWal::open(&path));
         if let Ok(Ok(_)) = result {
             panic!("DiskWal::open must reject a fully overwritten file");
+        }
+    }
+
+    #[test]
+    fn wal_iter_detects_byte_flip_inside_payload_data_page() {
+        // Issue #233 regression: a flipped byte deep inside a *payload*
+        // data page (not the header / god-byte region) used to silently
+        // round-trip through `iter_from`. redb writes a per-page xxhash3
+        // on commit but only verifies it during the post-crash repair
+        // scan / explicit `check_integrity`, never on a normal read. The
+        // per-entry checksum prepended on flush is the read-time backstop
+        // — without it, the consensus layer would catch the corruption
+        // later as a malformed-message decode error, which is much harder
+        // to diagnose as "storage corrupted".
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.redb");
+
+        // Use a long, distinctive marker as the payload so we can locate
+        // it byte-for-byte in the on-disk file. 0xAB is unlikely to
+        // appear naturally in redb's b-tree pointers / page metadata.
+        let marker_payload: Vec<u8> = vec![0xABu8; 4096];
+
+        let w = DiskWal::open(&path).unwrap();
+        w.append(&marker_payload).unwrap();
+        w.flush().unwrap();
+        drop(w);
+
+        // Locate the payload in the on-disk file and flip a byte well
+        // inside its interior (not at the boundaries, where a future
+        // redb layout change might overlap framing bytes).
+        let bytes = std::fs::read(&path).unwrap();
+        let pos = bytes
+            .windows(marker_payload.len())
+            .position(|w| w == marker_payload.as_slice())
+            .expect("payload must appear verbatim in the on-disk WAL file");
+        let flip_at = pos + marker_payload.len() / 2;
+
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(flip_at as u64)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0x01;
+            f.seek(SeekFrom::Start(flip_at as u64)).unwrap();
+            f.write_all(&byte).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Open succeeds (the redb structural pages are intact). The
+        // corruption MUST surface when iter_from reads the entry and
+        // recomputes the checksum — either as `iter_from` returning
+        // `Err`, or as the iterator yielding `Err` on the bad row.
+        let w = DiskWal::open(&path).expect("structural redb open should still succeed");
+        let result: anyhow::Result<Vec<_>> = w.iter_from(Lsn::ZERO).and_then(|it| it.collect());
+        assert!(
+            result.is_err(),
+            "iter_from must surface the flipped payload byte as an Err (got Ok)",
+        );
+    }
+
+    #[test]
+    fn storage_open_check_integrity_accepts_clean_file() {
+        // The check_integrity() call we added on DiskStorage::open
+        // (issue #233) must not regress the happy path — a cleanly
+        // closed file must reopen successfully and surface its
+        // committed contents.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("kv.redb");
+
+        let s = DiskStorage::open(&path).unwrap();
+        s.put(b"k", b"v").unwrap();
+        s.batch(|b| {
+            b.put(b"a", b"1");
+            b.put(b"b", b"2");
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+
+        let s = DiskStorage::open(&path).expect("clean reopen with integrity check");
+        assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(s.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(s.get(b"b").unwrap().as_deref(), Some(&b"2"[..]));
+    }
+
+    /// One-off benchmark backing the open-time cost claim for
+    /// `Database::check_integrity()` in `docs/storage-durability.md`
+    /// (issue #233). Gated with `#[ignore]` so it does not run on CI;
+    /// invoke explicitly via:
+    ///
+    /// ```sh
+    /// cargo test --release --lib storage::disk::tests::bench_check_integrity \
+    ///     -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_check_integrity_open_cost() {
+        use std::time::Instant;
+
+        for n in [10usize, 100, 1_000, 10_000] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("kv.redb");
+
+            let s = DiskStorage::open(&path).unwrap();
+            let block_payload = vec![0xCDu8; 1024];
+            for i in 0..n {
+                let key = format!("blocks/{i:08}");
+                s.batch(|b| {
+                    b.put(key.as_bytes(), &block_payload);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            s.put(b"last_voted_view", &42u64.to_be_bytes()).unwrap();
+            s.put(b"locked_qc_hash", &[0xABu8; 32]).unwrap();
+            s.put(b"high_qc_hash", &[0xCDu8; 32]).unwrap();
+            drop(s);
+
+            let size_bytes = std::fs::metadata(&path).unwrap().len();
+            let start = Instant::now();
+            let s = DiskStorage::open(&path).unwrap();
+            let elapsed = start.elapsed();
+            drop(s);
+
+            eprintln!(
+                "n={n:>6} blocks  file_size={size_bytes:>10}  open_with_integrity={elapsed:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn storage_open_check_integrity_detects_payload_page_corruption() {
+        // Issue #233: a flipped byte inside a redb data page that
+        // happens to land in the KV file (not the header) used to
+        // round-trip silently through `get` / `scan_prefix`. With
+        // `check_integrity()` on open, redb walks every page and
+        // verifies its xxhash3, so the corruption surfaces at startup.
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("kv.redb");
+
+        let s = DiskStorage::open(&path).unwrap();
+        // Use a distinctive value pattern we can locate in the file.
+        let marker: Vec<u8> = vec![0xCDu8; 4096];
+        s.put(b"k", &marker).unwrap();
+        drop(s);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let pos = bytes
+            .windows(marker.len())
+            .position(|w| w == marker.as_slice())
+            .expect("value must appear verbatim in the on-disk KV file");
+        let flip_at = pos + marker.len() / 2;
+
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(flip_at as u64)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            byte[0] ^= 0x01;
+            f.seek(SeekFrom::Start(flip_at as u64)).unwrap();
+            f.write_all(&byte).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // check_integrity() must reject the file. Either Err from open
+        // or a panic from inside redb is acceptable — both fail loud.
+        let result = std::panic::catch_unwind(|| DiskStorage::open(&path));
+        if let Ok(Ok(_)) = result {
+            panic!("DiskStorage::open must reject a payload-byte-flipped file (got Ok)");
         }
     }
 }
