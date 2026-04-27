@@ -371,6 +371,7 @@ impl SimCluster {
                 timeout_base,
                 timeout_max: Duration::from_secs(30),
                 limits: CacheLimits::unbounded_for_tests(),
+                snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
             };
 
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -867,6 +868,7 @@ impl SimCluster {
                 timeout_base: self.timeout_base,
                 timeout_max: Duration::from_secs(30),
                 limits: CacheLimits::unbounded_for_tests(),
+                snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
             };
             // Fresh state machine and mempool — the previous session's
             // state machine doesn't survive a process restart in
@@ -1269,6 +1271,7 @@ impl SimCluster {
                 timeout_base,
                 timeout_max: Duration::from_secs(30),
                 limits: CacheLimits::unbounded_for_tests(),
+                snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
             };
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));

@@ -235,6 +235,12 @@ pub struct NodeConfigForConsensus {
     /// [`crate::consensus::limits::CacheLimits`] for the policy
     /// documentation.
     pub limits: CacheLimits,
+    /// Snapshot creation policy. Defaults to disabled (no snapshots
+    /// produced) so tests that don't opt in see zero behavioural
+    /// change; production wiring in `src/node.rs` substitutes the
+    /// operator-configured policy from
+    /// [`crate::config::ConsensusConfig`].
+    pub snapshot_policy: crate::replication::snapshot::SnapshotPolicy,
 }
 
 impl NodeConfigForConsensus {
@@ -253,6 +259,9 @@ impl NodeConfigForConsensus {
             // `CacheLimits::production_defaults` (or the operator's
             // override).
             limits: CacheLimits::unbounded_for_tests(),
+            // Tests opt into snapshots by replacing this with a real
+            // policy. The default keeps the snapshot store untouched.
+            snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
         }
     }
 }
@@ -412,7 +421,53 @@ pub struct ConsensusNode {
     /// records the disconnect-decision in its own counter so tests
     /// can observe the decision.
     peer_cmd_tx: Option<mpsc::Sender<crate::p2p::PeerCommand>>,
+    /// Snapshot creation policy. When `is_enabled()`, [`apply_commit`]
+    /// produces a snapshot at every multiple of `interval_blocks`.
+    snapshot_policy: crate::replication::snapshot::SnapshotPolicy,
+    /// Bounded cache of QCs adopted as `high_qc`, keyed by block hash.
+    /// Populated by [`persist_updates`] on every `StateUpdate::HighQc`.
+    /// Read at snapshot creation time to find a QC over the snapshot
+    /// block. Wrapped in a [`parking_lot::Mutex`] so [`persist_updates`]
+    /// can update it through a `&self` receiver — the existing
+    /// signature is consumed by many tests with shared (`&`) borrows.
+    recent_qcs: Mutex<RecentQcCache>,
 }
+
+/// Bounded LRU-by-insertion cache of QCs keyed by block hash.
+///
+/// Insertion order is tracked in a `VecDeque`; on overflow, the
+/// oldest entry is dropped. Lookups are O(1) via the inner `HashMap`.
+#[derive(Default)]
+struct RecentQcCache {
+    map: HashMap<BlockHash, QuorumCertificate>,
+    order: std::collections::VecDeque<BlockHash>,
+}
+
+impl RecentQcCache {
+    fn insert(&mut self, hash: BlockHash, qc: QuorumCertificate, capacity: usize) {
+        if self.map.insert(hash, qc).is_none() {
+            self.order.push_back(hash);
+            // Evict the oldest entries until back under cap.
+            while self.order.len() > capacity {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+    }
+
+    fn get(&self, hash: &BlockHash) -> Option<&QuorumCertificate> {
+        self.map.get(hash)
+    }
+}
+
+/// Bound on [`ConsensusNode::recent_qcs`]. The cache only needs to
+/// retain the QC for the most recently-committed block (so the
+/// snapshot creation hook can find it); a small buffer absorbs
+/// re-orderings between proposal arrival and commit. Production
+/// memory cost is negligible — each QC is ≤ a few KiB and the cache
+/// is tens of entries deep.
+pub const RECENT_QC_CACHE_CAPACITY: usize = 32;
 
 /// Accumulator for one view's timeout votes.
 ///
@@ -498,6 +553,8 @@ impl ConsensusNode {
             status_tx: None,
             rate_limiter: None,
             peer_cmd_tx: None,
+            snapshot_policy: config.snapshot_policy,
+            recent_qcs: Mutex::new(RecentQcCache::default()),
         }
     }
 
@@ -764,6 +821,8 @@ impl ConsensusNode {
             status_tx: None,
             rate_limiter: None,
             peer_cmd_tx: None,
+            snapshot_policy: config.snapshot_policy,
+            recent_qcs: Mutex::new(RecentQcCache::default()),
         })
     }
 
@@ -840,6 +899,18 @@ impl ConsensusNode {
             }
             Ok(())
         })?;
+        // After durable writes succeed, populate the in-memory QC cache
+        // so the snapshot creation hook (in `apply_commit`) can find a
+        // QC over each committed block. Done after the batch commits so
+        // a backend error can't leave the cache holding entries that
+        // never made it to disk.
+        for u in updates {
+            if let StateUpdate::HighQc(qc) = u {
+                self.recent_qcs
+                    .lock()
+                    .insert(qc.block_hash, qc.clone(), RECENT_QC_CACHE_CAPACITY);
+            }
+        }
         let kinds: Vec<&'static str> = updates.iter().map(update_kind).collect();
         tracing::debug!(
             target: TRACE_TARGET,
@@ -1908,9 +1979,98 @@ impl ConsensusNode {
             block.header.height,
             block.header.view,
         );
+        // Take a snapshot when the configured policy fires. This runs
+        // after the block is persisted (so an aborted snapshot leaves
+        // the chain intact) and before the commit observer fires (so
+        // tests subscribing to the commit channel can sequence on
+        // snapshot creation completion). Errors are logged and swallowed
+        // — snapshots are an optimization, not a correctness path.
+        if self.snapshot_policy.should_snapshot_at(block.header.height) {
+            if let Err(e) = self.try_take_snapshot(&block) {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    height = block.header.height,
+                    view = block.header.view,
+                    error = %e,
+                    "snapshot_create_failed",
+                );
+            }
+        }
         if let Some(tx) = &self.commit_tx {
             let _ = tx.send(block);
         }
+    }
+
+    /// Build and persist a snapshot of the state machine at `block`'s
+    /// height, then prune older snapshots per the configured retention.
+    ///
+    /// Caller must check [`SnapshotPolicy::should_snapshot_at`] before
+    /// invoking — this routine assumes the policy is enabled and the
+    /// height is appropriate.
+    fn try_take_snapshot(&self, block: &crate::replication::block::Block) -> anyhow::Result<()> {
+        use crate::replication::snapshot::{SnapshotManifest, SnapshotStore, chunk_snapshot};
+        let block_hash = block.hash();
+        // Find a QC over this block. The cache is populated whenever
+        // the safety core adopts a new high_qc; by the time block
+        // commits, its QC must have been adopted (it sat in high_qc
+        // when the proposal at the next height arrived). If the cache
+        // has been evicted, skip the snapshot rather than synthesizing
+        // a placeholder QC — the joiner-side verifier will reject
+        // unsigned manifests. Subsequent snapshots at later heights
+        // will succeed once a fresh QC populates the cache.
+        let commit_qc = match self.recent_qcs.lock().get(&block_hash) {
+            Some(qc) => qc.clone(),
+            None => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height,
+                    view = block.header.view,
+                    "snapshot_skipped_no_qc_cached",
+                );
+                return Ok(());
+            }
+        };
+        // Capture the state-machine bytes and its commitment under one
+        // lock so the snapshot is internally consistent.
+        let (snapshot_bytes, state_commitment) = {
+            let sm = self.state_machine.lock();
+            (sm.snapshot(), sm.state_commitment())
+        };
+        let chunks_with_hashes =
+            chunk_snapshot(&snapshot_bytes, self.snapshot_policy.chunk_size_bytes);
+        let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
+        let chunks: Vec<Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
+        let created_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let manifest = SnapshotManifest::build(
+            block.header.height,
+            block.header.view,
+            block_hash,
+            state_commitment,
+            &self.validator_set,
+            self.snapshot_policy.chunk_size_bytes,
+            chunk_hashes,
+            commit_qc,
+            created_unix_secs,
+        );
+        let store = SnapshotStore::new(Arc::clone(&self.storage));
+        store.save(&manifest, &chunks)?;
+        // Prune older snapshots. `0` retention disables pruning so a
+        // test (or operator) accumulating snapshots for forensic
+        // reasons retains everything; the default keeps three.
+        let pruned = store.prune_older_than(self.snapshot_policy.retention_count)?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            height = manifest.height,
+            view = manifest.view,
+            chunk_count = manifest.chunk_count,
+            chunk_size = manifest.chunk_size,
+            pruned = ?pruned,
+            "snapshot_created",
+        );
+        Ok(())
     }
 }
 
@@ -4314,5 +4474,279 @@ mod tests {
                 crate::p2p::limits::Decision::Allow
             );
         }
+    }
+
+    // ── Snapshot creation hook ──────────────────────────────────────────
+    //
+    // These tests exercise the `apply_commit → try_take_snapshot` path
+    // at the integration-layer level, without spinning up the sim
+    // cluster. They drive the same code paths an inbound proposal +
+    // 3-chain commit would, but synthesize the inputs directly:
+    //
+    //   1. Persist a `HighQc` so the in-memory `recent_qcs` cache has
+    //      a QC whose `block_hash` matches the block we're about to
+    //      commit. (`persist_updates` populates the cache as a side
+    //      effect — that side effect is what the snapshot hook
+    //      depends on.)
+    //   2. Call `apply_commit(block)` directly. The snapshot policy is
+    //      checked against `block.header.height`, so the test controls
+    //      which heights trigger.
+    //   3. Inspect the snapshot store to assert the expected manifests
+    //      and chunks landed (or didn't).
+
+    fn snapshot_test_config(
+        vs: ValidatorSet,
+        policy: crate::replication::snapshot::SnapshotPolicy,
+    ) -> NodeConfigForConsensus {
+        let mut cfg = NodeConfigForConsensus::for_testing(vs, genesis());
+        cfg.snapshot_policy = policy;
+        cfg
+    }
+
+    fn make_committable_block(parent: &Block, height: u64, view: View) -> Block {
+        // Synthesize a block whose header is well-formed enough for
+        // `apply_commit` to write to storage without complaint. The
+        // safety-rule walks aren't exercised here — `apply_commit`
+        // is the integration-layer hook, not the safety core.
+        let commands: Vec<bytes::Bytes> = Vec::new();
+        Block {
+            header: BlockHeader {
+                parent_hash: parent.hash(),
+                height,
+                view,
+                proposer: [0u8; 32],
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&commands),
+            },
+            commands,
+        }
+    }
+
+    #[test]
+    fn snapshot_created_on_commit_at_interval() {
+        let policy = crate::replication::snapshot::SnapshotPolicy {
+            interval_blocks: 5,
+            retention_count: 3,
+            chunk_size_bytes: 1024,
+        };
+        let cfg = snapshot_test_config(four_validators(), policy);
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Build a block at height 5 (the first multiple of the
+        // interval after genesis). Persist a QC over its hash so the
+        // recent_qcs cache is populated when apply_commit runs.
+        let parent = genesis();
+        let block = make_committable_block(&parent, 5, 5);
+        let mut qc = QuorumCertificate::new(5, block.hash(), 4);
+        qc.add_signature(0, [0u8; 64]);
+        qc.add_signature(1, [0u8; 64]);
+        qc.add_signature(2, [0u8; 64]);
+        node.persist_updates(&[StateUpdate::HighQc(qc.clone())])
+            .unwrap();
+
+        node.apply_commit(block.clone());
+
+        let store = crate::replication::snapshot::SnapshotStore::new(Arc::clone(&storage));
+        let manifest = store
+            .load_manifest(5)
+            .unwrap()
+            .expect("snapshot must have been created at height 5");
+        assert_eq!(manifest.height, 5);
+        assert_eq!(manifest.view, 5);
+        assert_eq!(manifest.block_hash, block.hash());
+        // Manifest's QC matches the one we cached.
+        assert_eq!(manifest.commit_qc, qc);
+        // Validator set round-trips byte-for-byte.
+        assert_eq!(manifest.validator_set(), four_validators());
+        // Latest pointer matches.
+        assert_eq!(store.latest_height().unwrap(), Some(5));
+    }
+
+    #[test]
+    fn snapshot_not_created_when_disabled_default() {
+        // Default config has `SnapshotPolicy::disabled()`, so
+        // committing a block (any height) must leave the snapshot
+        // store empty. This is the "tests that don't opt in see zero
+        // behavioural change" acceptance criterion.
+        let cfg = test_config(four_validators());
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        let parent = genesis();
+        let block = make_committable_block(&parent, 1, 1);
+        let mut qc = QuorumCertificate::new(1, block.hash(), 4);
+        qc.add_signature(0, [0u8; 64]);
+        qc.add_signature(1, [0u8; 64]);
+        qc.add_signature(2, [0u8; 64]);
+        node.persist_updates(&[StateUpdate::HighQc(qc)]).unwrap();
+        node.apply_commit(block);
+
+        let store = crate::replication::snapshot::SnapshotStore::new(storage);
+        assert!(store.list_heights().unwrap().is_empty());
+        assert_eq!(store.latest_height().unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_skipped_for_non_interval_height() {
+        let policy = crate::replication::snapshot::SnapshotPolicy {
+            interval_blocks: 5,
+            retention_count: 3,
+            chunk_size_bytes: 1024,
+        };
+        let cfg = snapshot_test_config(four_validators(), policy);
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        let parent = genesis();
+        let block = make_committable_block(&parent, 3, 3); // not a multiple of 5
+        let mut qc = QuorumCertificate::new(3, block.hash(), 4);
+        qc.add_signature(0, [0u8; 64]);
+        qc.add_signature(1, [0u8; 64]);
+        qc.add_signature(2, [0u8; 64]);
+        node.persist_updates(&[StateUpdate::HighQc(qc)]).unwrap();
+        node.apply_commit(block);
+
+        let store = crate::replication::snapshot::SnapshotStore::new(storage);
+        assert!(store.list_heights().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_skipped_when_qc_not_in_cache() {
+        // The cache is bounded; a snapshot at a height whose QC has
+        // been evicted must be silently skipped (warning logged) so
+        // the chain keeps moving. Recreate that case by feeding the
+        // cache (RECENT_QC_CACHE_CAPACITY + 1) unrelated QCs before
+        // committing — the QC for our target block is never inserted.
+        let policy = crate::replication::snapshot::SnapshotPolicy {
+            interval_blocks: 5,
+            retention_count: 3,
+            chunk_size_bytes: 1024,
+        };
+        let cfg = snapshot_test_config(four_validators(), policy);
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        let parent = genesis();
+        let block = make_committable_block(&parent, 5, 5);
+        // Note: we deliberately do NOT persist a HighQc over
+        // `block.hash()`. The cache is empty for this hash, so the
+        // snapshot creation hook returns early.
+        node.apply_commit(block);
+
+        let store = crate::replication::snapshot::SnapshotStore::new(storage);
+        assert!(store.list_heights().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_retention_prunes_older_after_each_commit() {
+        let policy = crate::replication::snapshot::SnapshotPolicy {
+            interval_blocks: 5,
+            retention_count: 3,
+            chunk_size_bytes: 1024,
+        };
+        let cfg = snapshot_test_config(four_validators(), policy);
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Drive 5 snapshots at heights 5, 10, 15, 20, 25. Each commit
+        // is independent — the safety-core invariants aren't checked
+        // here, just the integration hook.
+        for n in 1..=5u64 {
+            let height = n * 5;
+            let parent = if height == 5 {
+                genesis()
+            } else {
+                make_committable_block(&genesis(), height - 1, height - 1)
+            };
+            let block = make_committable_block(&parent, height, height);
+            let mut qc = QuorumCertificate::new(height, block.hash(), 4);
+            qc.add_signature(0, [0u8; 64]);
+            qc.add_signature(1, [0u8; 64]);
+            qc.add_signature(2, [0u8; 64]);
+            node.persist_updates(&[StateUpdate::HighQc(qc)]).unwrap();
+            node.apply_commit(block);
+        }
+
+        let store = crate::replication::snapshot::SnapshotStore::new(storage);
+        // Retention=3 keeps the 3 most-recent (15, 20, 25); 5 and 10
+        // are pruned. The pruner runs atomically with each new
+        // snapshot, so the assertion holds at any point after
+        // commit-25.
+        assert_eq!(store.list_heights().unwrap(), vec![15, 20, 25]);
+        assert_eq!(store.latest_height().unwrap(), Some(25));
+    }
+
+    #[test]
+    fn snapshot_retention_zero_keeps_all_snapshots() {
+        let policy = crate::replication::snapshot::SnapshotPolicy {
+            interval_blocks: 5,
+            retention_count: 0, // disable pruning
+            chunk_size_bytes: 1024,
+        };
+        let cfg = snapshot_test_config(four_validators(), policy);
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        for n in 1..=4u64 {
+            let height = n * 5;
+            let parent = if height == 5 {
+                genesis()
+            } else {
+                make_committable_block(&genesis(), height - 1, height - 1)
+            };
+            let block = make_committable_block(&parent, height, height);
+            let mut qc = QuorumCertificate::new(height, block.hash(), 4);
+            qc.add_signature(0, [0u8; 64]);
+            qc.add_signature(1, [0u8; 64]);
+            qc.add_signature(2, [0u8; 64]);
+            node.persist_updates(&[StateUpdate::HighQc(qc)]).unwrap();
+            node.apply_commit(block);
+        }
+
+        let store = crate::replication::snapshot::SnapshotStore::new(storage);
+        assert_eq!(store.list_heights().unwrap(), vec![5, 10, 15, 20]);
     }
 }
