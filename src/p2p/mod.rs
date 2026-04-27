@@ -151,7 +151,9 @@ pub use tls::NodeId;
 /// let protocol = TlsConnectionProtocol {
 ///     identity,
 ///     peers: Vec::new(),
-///     listener,
+///     // `Some(listener)` for normal nodes; `None` skips the inbound
+///     // listener task (issue #138's `[p2p] inbound_disabled = true`).
+///     listener: Some(listener),
 ///     clock,
 ///     peer_cmd_tx: None,
 /// };
