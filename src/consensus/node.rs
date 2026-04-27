@@ -924,9 +924,34 @@ impl ConsensusNode {
         // queried in the tiny window before the boot actions fire.
         self.publish_status();
 
-        // Boot: advance pacemaker from 0 → 1, arm the view timer, and
-        // broadcast NewView (if we have a high_qc from a prior session).
-        let boot_actions = self.step_pacemaker(PacemakerEvent::OnQc(0));
+        // Boot: advance the pacemaker out of view 0, arm the view timer,
+        // and broadcast NewView (if we have a high_qc from a prior
+        // session).
+        //
+        // For a fresh start, persisted `high_qc` and `last_voted_view`
+        // are both zero so this is `OnQc(0)` → advance to view 1 — the
+        // historical behaviour. After a restart with non-trivial durable
+        // state we instead seed from
+        // `max(high_qc.view, last_voted_view)` so the pacemaker lands
+        // directly at the next post-restart view rather than briefly
+        // advertising view 1 to peers and then jumping forward via the
+        // self-loopback `OnQc(high_qc.view)`. The previous transient was
+        // the path that left the first-killed-of-three replica wedged
+        // at exactly its persisted `last_voted_view` (issue #222): if
+        // peers' subsequent NewView messages are filtered out by the
+        // gossip layer for any reason, the lagging replica's only catch-
+        // up path is its own outbound timeout votes — and seeding from
+        // disk eliminates the gap between "we restarted" and "our timer
+        // is armed for the right view".
+        let boot_view = self
+            .core
+            .state()
+            .high_qc
+            .as_ref()
+            .map(|qc| qc.view)
+            .unwrap_or(0)
+            .max(self.core.state().last_voted_view);
+        let boot_actions = self.step_pacemaker(PacemakerEvent::OnQc(boot_view));
         self.apply_pacemaker_actions(boot_actions, broadcaster.as_ref(), &mut view_timer, &signer)
             .await?;
         self.publish_status();
@@ -1579,15 +1604,50 @@ impl ConsensusNode {
     ) -> anyhow::Result<()> {
         let view = signed.payload.view;
 
-        // Stale: we have already advanced past this view via some other
-        // path (QC or an earlier TC). Nothing to do.
-        if view < self.pacemaker.current_view() {
-            return Ok(());
-        }
         // Defence-in-depth: ingress already rejected unknown signers,
         // but asserting here lets tests hand-construct Signed<TimeoutVote>
         // without going through ingress.
         if !self.validator_set.contains(&signed.signer) {
+            return Ok(());
+        }
+
+        // Stale: we have already advanced past this view via some other
+        // path (QC or an earlier TC). The bucket logic below would
+        // ignore the vote anyway, but a peer broadcasting a stale
+        // timeout is also our cleanest signal that they are wedged at
+        // a low view (typically a post-restart replica stuck at its
+        // persisted `last_voted_view` — issue #222). Reply with our
+        // current `high_qc` as a unicast NewView so they can adopt it
+        // through the standard `OnQc(high_qc.view)` ingress path and
+        // catch up. Only one reply per stale vote: if the wedged peer
+        // is broadcasting timeouts on backoff, each one earns one fresh
+        // NewView, but no per-message amplification beyond that.
+        if view < self.pacemaker.current_view() {
+            if let Some(high_qc) = self.core.state().high_qc.clone() {
+                let nv = NewView { high_qc };
+                let signed_nv = Signed::sign(nv, signer.as_ref())
+                    .context("signing catch-up NewView for stale TimeoutVote")?;
+                let wire = WireMessage::NewView(signed_nv);
+                let payload = postcard::to_stdvec(&wire)
+                    .map(Bytes::from)
+                    .context("encoding catch-up NewView for stale TimeoutVote")?;
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    wedged_peer = %node_id_to_base58(&signed.signer),
+                    wedged_view = view,
+                    our_view = self.pacemaker.current_view(),
+                    our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view),
+                    "catch_up_new_view_sent",
+                );
+                send_outbound(
+                    broadcaster,
+                    Outbound::SendTo {
+                        to: signed.signer,
+                        payload,
+                    },
+                )
+                .await;
+            }
             return Ok(());
         }
 
@@ -3331,6 +3391,237 @@ mod tests {
             high_qc_view_before,
             "OnRoundSync must not promote high_qc_view — round sync is a \
              liveness hint, not a QC witness",
+        );
+    }
+
+    /// Issue #222 regression: a peer's `TimeoutVote(view=V)` where
+    /// `V < self.current_view` is the cleanest signal that the peer is
+    /// wedged (typically post-restart, stuck at its persisted
+    /// `last_voted_view`). The bucket logic ignores the vote, but we
+    /// also reply with a unicast `NewView` carrying our current
+    /// `high_qc` so the wedged peer can fire `OnQc(high_qc.view)`
+    /// through the standard ingress path and exit the wedge.
+    ///
+    /// Without this reply, the wedged replica's only forward-progress
+    /// signal is its own outbound timeout votes, which the rest of the
+    /// cluster ignores; if proposals/NewViews from caught-up peers are
+    /// also dropped at the gossip layer for any reason, no path advances
+    /// the wedged pacemaker. This is the wedge observed at ~12% under
+    /// the "kill 3 of 4, restart 3" recipe in #222.
+    #[tokio::test]
+    async fn stale_timeout_vote_replies_with_new_view_to_wedged_peer() {
+        let self_signer = fresh_signer();
+        let wedged_peer = fresh_signer();
+        let mut ids = vec![
+            self_signer.node_id(),
+            wedged_peer.node_id(),
+            nid(0xA1),
+            nid(0xA2),
+        ];
+        ids.sort();
+        let vs = ValidatorSet::new(ids);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        let mut node = ConsensusNode::new(
+            self_signer.node_id(),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Advance our pacemaker well past the wedged peer's view.
+        // Use OnQc(50) so current_view = 51 — comfortably ahead of the
+        // wedged_view = 5 we will inject below.
+        let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+        let actions = node.step_pacemaker(PacemakerEvent::OnQc(50));
+        node.apply_pacemaker_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer_arc)
+            .await
+            .expect("apply boot");
+        // Drain whatever the boot emitted (NewView, ResetTimer plumbing
+        // through outbound_rx, etc.) so the assertion below sees only
+        // the catch-up reply.
+        while outbound_rx.try_recv().is_ok() {}
+        let our_view_before = node.pacemaker.current_view();
+        assert!(
+            our_view_before > 5,
+            "test setup: our pacemaker must be ahead of the wedged peer's view (5)",
+        );
+        let our_high_qc_view_before = node
+            .core
+            .state()
+            .high_qc
+            .as_ref()
+            .expect("genesis_qc must seed high_qc on a fresh node")
+            .view;
+
+        // Inject a stale TimeoutVote(view=5) from the wedged peer
+        // through the ingress + dispatch path.
+        let tv = crate::consensus::hotstuff::qc::TimeoutVote {
+            view: 5,
+            high_qc: None,
+        };
+        let signed =
+            crate::crypto::signed::Signed::sign(tv, &wedged_peer).expect("sign TimeoutVote");
+        let wire = WireMessage::TimeoutVote(signed);
+        let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
+
+        let dispatches = crate::consensus::dispatch::ingress(wedged_peer.node_id(), &payload, &vs)
+            .expect("ingress");
+        for d in dispatches {
+            node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
+                .await
+                .expect("apply_dispatch");
+        }
+
+        // Our pacemaker must not have moved — the stale vote does not
+        // contribute to any bucket at our current view.
+        assert_eq!(
+            node.pacemaker.current_view(),
+            our_view_before,
+            "stale TimeoutVote must not advance our own pacemaker",
+        );
+
+        // We must have emitted a unicast NewView reply addressed to the
+        // wedged peer, carrying our current high_qc.
+        let mut found_reply = false;
+        while let Ok(out) = outbound_rx.try_recv() {
+            if let ProtocolOutbound::SendTo {
+                node_id, payload, ..
+            } = out
+            {
+                if node_id != wedged_peer.node_id() {
+                    continue;
+                }
+                let decoded: WireMessage =
+                    postcard::from_bytes(&payload).expect("decode reply payload");
+                if let WireMessage::NewView(signed) = decoded {
+                    assert_eq!(
+                        signed.payload.high_qc.view, our_high_qc_view_before,
+                        "reply must carry our current high_qc",
+                    );
+                    found_reply = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_reply,
+            "expected a unicast NewView reply to the wedged peer carrying our high_qc",
+        );
+    }
+
+    /// Issue #222 regression: after `recover` from non-trivial durable
+    /// state, the integration boot must seed the pacemaker from
+    /// `max(persisted high_qc.view, persisted last_voted_view)` rather
+    /// than starting at view 0 + jumping to view 1. Without this, the
+    /// boot path briefly advertises view 1 to peers (carrying the
+    /// stale persisted high_qc), then catches up via the self-loopback
+    /// `OnQc(high_qc.view)`. The transient is harmless on its own, but
+    /// it is the timing window that turns into a permanent wedge if
+    /// peer NewView traffic is filtered out for any reason.
+    #[tokio::test]
+    async fn boot_after_recover_seeds_pacemaker_from_persisted_state() {
+        use crate::consensus::hotstuff::Locked;
+        use crate::replication::block::BlockHeader;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        // Build a uncommitted block at view 9 so its hash + header can
+        // back the persisted high_qc.
+        let g = genesis();
+        let b_high = Block {
+            header: BlockHeader {
+                parent_hash: g.hash(),
+                height: 1,
+                view: 9,
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+            },
+            commands: vec![],
+        };
+        let high_qc = QuorumCertificate::new(9, b_high.hash(), 4);
+        let locked = Locked {
+            view: 8,
+            height: 1,
+            block_hash: b_high.hash(),
+        };
+
+        // Session 1: persist a vote at view 10, plus locked / high_qc.
+        // The locked entry's referenced block is `b_high`, which we
+        // insert into pending_blocks first so `persist_updates` writes
+        // it to durable storage too (#206 path).
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        );
+        node.core.insert_pending_block(b_high.clone());
+        node.persist_updates(&[
+            StateUpdate::VotedInView { view: 10 },
+            StateUpdate::Locked(locked),
+            StateUpdate::HighQc(high_qc.clone()),
+        ])
+        .unwrap();
+        drop(node);
+
+        // Session 2: recover and run the same `boot_view` snippet the
+        // integration boot uses. Asserts the pacemaker lands at
+        // max(high_qc.view = 9, last_voted_view = 10) + 1 = 11, not 1.
+        let mut recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(recovered.core.state().last_voted_view, 10);
+        assert_eq!(recovered.core.state().high_qc.as_ref().unwrap().view, 9);
+
+        // Build a self-signer whose node_id matches recovered.self_id
+        // (= nid(1) here is a synthetic placeholder, not derived from a
+        // real key). The boot snippet only needs the signer to sign
+        // outbound NewView frames, which we don't assert on.
+        let self_signer = fresh_signer();
+        let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let boot_view = recovered
+            .core
+            .state()
+            .high_qc
+            .as_ref()
+            .map(|qc| qc.view)
+            .unwrap_or(0)
+            .max(recovered.core.state().last_voted_view);
+        let boot_actions = recovered.step_pacemaker(PacemakerEvent::OnQc(boot_view));
+        recovered
+            .apply_pacemaker_actions(
+                boot_actions,
+                broadcaster.as_ref(),
+                &mut view_timer,
+                &signer_arc,
+            )
+            .await
+            .expect("boot");
+
+        assert_eq!(
+            recovered.pacemaker.current_view(),
+            11,
+            "pacemaker must land at max(high_qc.view, last_voted_view) + 1 = 11 after recover boot",
         );
     }
 
