@@ -1327,6 +1327,7 @@ impl SimCluster {
             } = GossipOverlay::spawn(SpawnArgs {
                 self_id: nid,
                 self_listen_addr: Some(sim_addr_for(idx)),
+                self_reachable: true,
                 event_rx: raw_event_rx,
                 sink,
                 dialer: Arc::new(SimNoopDialer),

@@ -87,6 +87,14 @@ pub enum OverlayFrame {
 /// bounded by the consensus pacemaker's timeout in practice, which is
 /// well below the merge-window granularity, so a few hundred
 /// milliseconds of skew is harmless.
+///
+/// # Wire compatibility
+///
+/// `reachable` was added in issue #138 (NAT-tolerant connectivity).
+/// All in-cluster nodes must run a build that includes the field —
+/// postcard's positional struct encoding does not tolerate adding
+/// fields across versions. The pre-1.0 project policy is to roll
+/// every node forward together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerEntry {
     /// Long-term identity of the peer (Ed25519 pubkey == NodeId).
@@ -98,6 +106,23 @@ pub struct PeerEntry {
     /// last refreshed by the sender. Receivers use this for last-seen-
     /// wins merge.
     pub last_seen_unix_ms: u64,
+    /// Whether the peer accepts inbound TCP/TLS connections.
+    ///
+    /// `true` is the default for normal validators: other nodes can
+    /// dial them when the partial-mesh maintenance loop has a deficit.
+    /// `false` is set by nodes running `[p2p] inbound_disabled = true`
+    /// (issue #138) — typically operators behind a NAT or asymmetric
+    /// firewall that can dial out but cannot accept new connections.
+    /// The mesh-maintenance loop skips unreachable peers when picking
+    /// dial candidates, so reachable nodes never waste TCP-connect
+    /// attempts on hosts that would refuse them.
+    ///
+    /// The source of truth is the peer itself: every node injects its
+    /// own self-entry into each peer-list push with the correct
+    /// reachable bit, and the table's last-seen-wins merge propagates
+    /// it. Third-party hops cannot fabricate reachability for someone
+    /// else once that peer's own self-advertisement has been heard.
+    pub reachable: bool,
 }
 
 #[cfg(test)]
@@ -131,11 +156,13 @@ mod tests {
                 node_id: nid(1),
                 addr: addr(7000),
                 last_seen_unix_ms: 1_700_000_000_000,
+                reachable: true,
             },
             PeerEntry {
                 node_id: nid(2),
                 addr: addr(7001),
                 last_seen_unix_ms: 1_700_000_001_000,
+                reachable: false,
             },
         ]);
         let bytes = postcard::to_stdvec(&original).expect("encode");
@@ -177,5 +204,31 @@ mod tests {
 
         assert_eq!(f_bytes[0], 0);
         assert_eq!(p_bytes[0], 1);
+    }
+
+    #[test]
+    fn peer_entry_carries_reachable_flag() {
+        // Issue #138: outbound-only nodes self-advertise with
+        // `reachable = false` so the rest of the cluster knows not to
+        // attempt to dial them. Round-trip both values to lock the
+        // wire shape in.
+        let entries = vec![
+            PeerEntry {
+                node_id: nid(1),
+                addr: addr(7000),
+                last_seen_unix_ms: 100,
+                reachable: true,
+            },
+            PeerEntry {
+                node_id: nid(2),
+                addr: addr(7001),
+                last_seen_unix_ms: 200,
+                reachable: false,
+            },
+        ];
+        let original = OverlayFrame::PeerList(entries);
+        let bytes = postcard::to_stdvec(&original).expect("encode");
+        let back: OverlayFrame = postcard::from_bytes(&bytes).expect("decode");
+        assert_eq!(back, original);
     }
 }

@@ -188,9 +188,25 @@ pub async fn run(
     // a `(self_id, listen_addr)` self-entry into every peer-list
     // push so receivers can dial us back). Listener is consumed
     // later when `TlsConnectionProtocol` is constructed.
-    let p2p_listener = TcpListener::bind(config.node.listen_addr).await?;
-    let p2p_actual_addr = p2p_listener.local_addr()?;
-    info!("P2P listening on {p2p_actual_addr}");
+    //
+    // Outbound-only mode (issue #138): when `[p2p] inbound_disabled =
+    // true` we skip the bind entirely. The overlay's self-advertise
+    // then carries `reachable = false` so peers know not to attempt
+    // to dial back; consensus traffic flows over connections we
+    // initiated.
+    let inbound_disabled = config.p2p.inbound_disabled;
+    let (p2p_listener, p2p_actual_addr) = if inbound_disabled {
+        info!(
+            "P2P inbound disabled (outbound-only mode); skipping listener bind on {}",
+            config.node.listen_addr
+        );
+        (None, config.node.listen_addr)
+    } else {
+        let listener = TcpListener::bind(config.node.listen_addr).await?;
+        let addr = listener.local_addr()?;
+        info!("P2P listening on {addr}");
+        (Some(listener), addr)
+    };
 
     // Optionally start consensus. When the [consensus] section is
     // present, the protocol is registered, the ConsensusNode is
@@ -220,6 +236,7 @@ pub async fn run(
                 dialer_ctx,
                 Arc::clone(&clock),
                 p2p_actual_addr,
+                inbound_disabled,
                 rate_limiter,
             )
             .await?,
@@ -352,6 +369,7 @@ async fn start_consensus(
     dialer_ctx: DialerCtx,
     clock: Arc<dyn Clock>,
     self_listen_addr: std::net::SocketAddr,
+    inbound_disabled: bool,
     rate_limiter: Option<Arc<p2p::limits::RateLimiter>>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
@@ -406,6 +424,7 @@ async fn start_consensus(
         discovery_tx,
         *self_id,
         self_listen_addr,
+        inbound_disabled,
         dialer_ctx,
         clock,
     )
@@ -456,6 +475,7 @@ async fn build_overlay_wiring(
     discovery_tx: &broadcast::Sender<DiscoveryEvent>,
     self_id: NodeId,
     self_listen_addr: std::net::SocketAddr,
+    inbound_disabled: bool,
     dialer_ctx: DialerCtx,
     clock: Arc<dyn Clock>,
 ) -> anyhow::Result<OverlayWiring> {
@@ -508,9 +528,21 @@ async fn build_overlay_wiring(
             let rng_seed = u64::from_le_bytes(seed_bytes);
             let cfg = GossipOverlayConfig::from_config(overlay_cfg, rng_seed);
 
+            // In outbound-only mode (issue #138) the listener was
+            // never bound, so there is no advertisable listen address.
+            // Pass `None` so the publisher omits the self-entry —
+            // peers learn about us only through whichever connection
+            // we initiated, and our `reachable = false` advertisement
+            // is carried by the publisher's `self_reachable` flag.
+            let advertise_addr = if inbound_disabled {
+                None
+            } else {
+                Some(self_listen_addr)
+            };
             let handles = GossipOverlay::spawn(SpawnArgs {
                 self_id,
-                self_listen_addr: Some(self_listen_addr),
+                self_listen_addr: advertise_addr,
+                self_reachable: !inbound_disabled,
                 event_rx: handle.event_rx,
                 sink,
                 dialer,

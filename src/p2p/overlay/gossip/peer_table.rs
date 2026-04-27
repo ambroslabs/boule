@@ -71,6 +71,9 @@ struct Inner {
 struct EntryRecord {
     addr: SocketAddr,
     last_seen_unix_ms: u64,
+    /// Whether the peer accepts inbound connections. Mirrors
+    /// [`super::wire::PeerEntry::reachable`]; see issue #138.
+    reachable: bool,
 }
 
 impl PeerTable {
@@ -114,10 +117,23 @@ impl PeerTable {
             node_id: *node_id,
             addr: rec.addr,
             last_seen_unix_ms: rec.last_seen_unix_ms,
+            reachable: rec.reachable,
         })
     }
 
-    /// Insert or refresh `(node_id, addr)`.
+    /// Insert or refresh `(node_id, addr)` with the historical
+    /// `reachable = true` default. Wraps [`Self::upsert_with_reachable`]
+    /// for callers (and tests) that don't care about reachability.
+    pub fn upsert(
+        &self,
+        node_id: NodeId,
+        addr: SocketAddr,
+        last_seen_unix_ms: u64,
+    ) -> UpsertOutcome {
+        self.upsert_with_reachable(node_id, addr, last_seen_unix_ms, true)
+    }
+
+    /// Insert or refresh `(node_id, addr, reachable)`.
     ///
     /// Refuses to insert the local node id (filtered against `self_id`).
     /// If the table is at capacity and `node_id` is not already
@@ -125,13 +141,17 @@ impl PeerTable {
     /// evicted to make room. If the existing entry has a newer
     /// `last_seen_unix_ms` than the proposed one, the existing entry
     /// wins and the upsert is a no-op (last-seen wins on tie-break).
+    /// Reachability is overwritten on each successful refresh; the
+    /// peer's own self-advertisement is the source of truth and a
+    /// fresher record always reflects the latest claim.
     ///
     /// Returns [`UpsertOutcome`] describing what changed.
-    pub fn upsert(
+    pub fn upsert_with_reachable(
         &self,
         node_id: NodeId,
         addr: SocketAddr,
         last_seen_unix_ms: u64,
+        reachable: bool,
     ) -> UpsertOutcome {
         if node_id == self.self_id {
             return UpsertOutcome::SkippedSelf;
@@ -145,6 +165,7 @@ impl PeerTable {
             let addr_changed = existing.addr != addr;
             existing.addr = addr;
             existing.last_seen_unix_ms = last_seen_unix_ms;
+            existing.reachable = reachable;
             return if addr_changed {
                 UpsertOutcome::AddrChanged
             } else {
@@ -174,6 +195,7 @@ impl PeerTable {
             EntryRecord {
                 addr,
                 last_seen_unix_ms,
+                reachable,
             },
         );
         UpsertOutcome::Inserted
@@ -190,7 +212,12 @@ impl PeerTable {
     {
         let mut changed = Vec::new();
         for entry in entries {
-            match self.upsert(entry.node_id, entry.addr, entry.last_seen_unix_ms) {
+            match self.upsert_with_reachable(
+                entry.node_id,
+                entry.addr,
+                entry.last_seen_unix_ms,
+                entry.reachable,
+            ) {
                 UpsertOutcome::Inserted | UpsertOutcome::AddrChanged | UpsertOutcome::Refreshed => {
                     changed.push(entry.node_id);
                 }
@@ -214,6 +241,30 @@ impl PeerTable {
                 node_id: *node_id,
                 addr: rec.addr,
                 last_seen_unix_ms: rec.last_seen_unix_ms,
+                reachable: rec.reachable,
+            })
+            .collect()
+    }
+
+    /// Snapshot only the entries where `reachable == true`.
+    ///
+    /// Used by [`super::maintenance`] to filter dial candidates so the
+    /// partial-mesh maintenance loop never picks an outbound-only
+    /// peer (issue #138). Unreachable peers stay in the table — they
+    /// are still propagated through peer-list gossip so other nodes
+    /// can learn about them, and they may dial in to us themselves —
+    /// but we never initiate connections to them.
+    pub fn snapshot_reachable(&self) -> Vec<PeerEntry> {
+        let inner = self.inner.lock();
+        inner
+            .entries
+            .iter()
+            .filter(|(_, rec)| rec.reachable)
+            .map(|(node_id, rec)| PeerEntry {
+                node_id: *node_id,
+                addr: rec.addr,
+                last_seen_unix_ms: rec.last_seen_unix_ms,
+                reachable: rec.reachable,
             })
             .collect()
     }
@@ -235,6 +286,7 @@ impl PeerTable {
             node_id: *node_id,
             addr: rec.addr,
             last_seen_unix_ms: rec.last_seen_unix_ms,
+            reachable: rec.reachable,
         })
     }
 
@@ -292,6 +344,7 @@ mod tests {
             node_id: nid(byte),
             addr: addr(port),
             last_seen_unix_ms: last_seen,
+            reachable: true,
         }
     }
 
@@ -455,6 +508,82 @@ mod tests {
     #[should_panic(expected = "capacity must be > 0")]
     fn zero_capacity_panics() {
         let _ = PeerTable::new(nid(0), 0);
+    }
+
+    #[test]
+    fn upsert_default_marks_entry_reachable() {
+        let t = PeerTable::new(nid(0), 16);
+        assert_eq!(t.upsert(nid(1), addr(7000), 100), UpsertOutcome::Inserted);
+        let got = t.get(&nid(1)).unwrap();
+        assert!(
+            got.reachable,
+            "default upsert must mark entries reachable for backward compat"
+        );
+    }
+
+    #[test]
+    fn upsert_with_reachable_round_trips_flag() {
+        let t = PeerTable::new(nid(0), 16);
+        assert_eq!(
+            t.upsert_with_reachable(nid(1), addr(7000), 100, false),
+            UpsertOutcome::Inserted
+        );
+        let got = t.get(&nid(1)).unwrap();
+        assert!(!got.reachable);
+    }
+
+    #[test]
+    fn fresher_advertisement_overwrites_reachable_bit() {
+        // Source of truth for `reachable` is the peer itself; a fresher
+        // self-advertisement (or last-seen-wins refresh) replaces the
+        // stored flag. This matches the merge contract documented on
+        // PeerEntry.
+        let t = PeerTable::new(nid(0), 16);
+        t.upsert_with_reachable(nid(1), addr(7000), 100, true);
+        t.upsert_with_reachable(nid(1), addr(7000), 200, false);
+        assert!(!t.get(&nid(1)).unwrap().reachable);
+        // And vice versa: a peer that comes back online marks itself
+        // reachable again.
+        t.upsert_with_reachable(nid(1), addr(7000), 300, true);
+        assert!(t.get(&nid(1)).unwrap().reachable);
+    }
+
+    #[test]
+    fn snapshot_reachable_excludes_inbound_disabled_peers() {
+        let t = PeerTable::new(nid(0), 16);
+        t.upsert_with_reachable(nid(1), addr(7001), 100, true);
+        t.upsert_with_reachable(nid(2), addr(7002), 100, false);
+        t.upsert_with_reachable(nid(3), addr(7003), 100, true);
+        let mut ids: Vec<NodeId> = t
+            .snapshot_reachable()
+            .into_iter()
+            .map(|e| e.node_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![nid(1), nid(3)]);
+        // Full snapshot still includes the unreachable entry.
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn merge_propagates_reachable_from_peer_entry() {
+        let t = PeerTable::new(nid(0), 16);
+        let _ = t.merge(vec![
+            PeerEntry {
+                node_id: nid(1),
+                addr: addr(7001),
+                last_seen_unix_ms: 100,
+                reachable: false,
+            },
+            PeerEntry {
+                node_id: nid(2),
+                addr: addr(7002),
+                last_seen_unix_ms: 100,
+                reachable: true,
+            },
+        ]);
+        assert!(!t.get(&nid(1)).unwrap().reachable);
+        assert!(t.get(&nid(2)).unwrap().reachable);
     }
 
     #[test]
