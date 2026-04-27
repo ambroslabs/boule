@@ -165,7 +165,205 @@ impl SnapshotManifest {
     pub fn validator_set(&self) -> ValidatorSet {
         ValidatorSet::new(self.validator_set.clone())
     }
+
+    /// Verify the manifest is internally consistent and trustworthy
+    /// against `local_validator_set` — the validator set the verifier
+    /// already knows.
+    ///
+    /// Checks (in order; first failure wins):
+    ///
+    /// 1. `version == SNAPSHOT_FORMAT_VERSION` — reject schemas this
+    ///    binary doesn't implement.
+    /// 2. The embedded `validator_set` byte-equals `local_validator_set`.
+    ///    Static-membership clusters require an exact match; when
+    ///    dynamic membership lands (#23), this generalizes to a
+    ///    chain-verify against a trust anchor.
+    /// 3. `commit_qc.is_well_formed(local_validator_set)` —
+    ///    bitmap/signature shape matches the validator set.
+    /// 4. `commit_qc.has_quorum(local_validator_set)` — the QC
+    ///    actually demonstrates ≥ quorum support.
+    /// 5. `commit_qc.block_hash == block_hash` — the QC is over the
+    ///    snapshot block, not some descendant or unrelated block.
+    /// 6. `chunk_count == chunk_hashes.len()` — the chunk-count
+    ///    field and the hash vector agree.
+    /// 7. `chunk_size > 0`.
+    ///
+    /// Note: this does **not** verify Ed25519 signatures inside the
+    /// QC. The QC's `signatures` are validated at envelope ingress in
+    /// production; the snapshot path inherits that trust gradient.
+    /// The chunk hashes are verified separately by
+    /// [`SnapshotChunk::verify`].
+    pub fn verify(&self, local_validator_set: &ValidatorSet) -> Result<(), ManifestError> {
+        if self.version != SNAPSHOT_FORMAT_VERSION {
+            return Err(ManifestError::UnsupportedVersion {
+                got: self.version,
+                expected: SNAPSHOT_FORMAT_VERSION,
+            });
+        }
+        let embedded: Vec<NodeId> = self.validator_set.clone();
+        let embedded_set = ValidatorSet::new(embedded);
+        if &embedded_set != local_validator_set {
+            return Err(ManifestError::ValidatorSetMismatch);
+        }
+        if !self.commit_qc.is_well_formed(local_validator_set) {
+            return Err(ManifestError::QcMalformed);
+        }
+        if !self.commit_qc.has_quorum(local_validator_set) {
+            return Err(ManifestError::QcInsufficientQuorum {
+                signers: self.commit_qc.signer_count(),
+                quorum: crate::consensus::hotstuff::qc::quorum_size(local_validator_set.len()),
+            });
+        }
+        if self.commit_qc.block_hash != self.block_hash {
+            return Err(ManifestError::QcBlockHashMismatch);
+        }
+        if self.chunk_count as usize != self.chunk_hashes.len() {
+            return Err(ManifestError::ChunkCountMismatch {
+                chunk_count: self.chunk_count,
+                hashes_len: self.chunk_hashes.len(),
+            });
+        }
+        if self.chunk_size == 0 {
+            return Err(ManifestError::InvalidChunkSize);
+        }
+        Ok(())
+    }
 }
+
+/// Reasons a [`SnapshotManifest`] can be rejected by [`SnapshotManifest::verify`].
+///
+/// Each variant is distinct so test assertions and operator logs can
+/// distinguish "wrong validator set" from "QC missing quorum" without
+/// string-matching error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestError {
+    /// `version` does not equal [`SNAPSHOT_FORMAT_VERSION`].
+    UnsupportedVersion { got: u8, expected: u8 },
+    /// Embedded validator set does not byte-equal the local one.
+    ValidatorSetMismatch,
+    /// QC bitmap or signature shape does not match the validator set.
+    QcMalformed,
+    /// QC has fewer signers than the quorum threshold.
+    QcInsufficientQuorum { signers: usize, quorum: usize },
+    /// QC's `block_hash` does not match the manifest's `block_hash`.
+    QcBlockHashMismatch,
+    /// `chunk_count` field disagrees with `chunk_hashes.len()`.
+    ChunkCountMismatch { chunk_count: u32, hashes_len: usize },
+    /// `chunk_size == 0`. Snapshots with zero-size chunks can't be
+    /// transferred meaningfully.
+    InvalidChunkSize,
+}
+
+impl std::fmt::Display for ManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion { got, expected } => write!(
+                f,
+                "unsupported snapshot manifest version {got} (expected {expected})",
+            ),
+            Self::ValidatorSetMismatch => write!(
+                f,
+                "manifest's embedded validator set does not match the local validator set",
+            ),
+            Self::QcMalformed => write!(
+                f,
+                "manifest's commit_qc is malformed under the local validator set",
+            ),
+            Self::QcInsufficientQuorum { signers, quorum } => write!(
+                f,
+                "manifest's commit_qc has {signers} signers; quorum requires {quorum}",
+            ),
+            Self::QcBlockHashMismatch => write!(
+                f,
+                "manifest's commit_qc.block_hash does not match manifest.block_hash",
+            ),
+            Self::ChunkCountMismatch {
+                chunk_count,
+                hashes_len,
+            } => write!(
+                f,
+                "manifest chunk_count {chunk_count} disagrees with chunk_hashes.len() = {hashes_len}",
+            ),
+            Self::InvalidChunkSize => write!(f, "manifest chunk_size is zero"),
+        }
+    }
+}
+
+impl std::error::Error for ManifestError {}
+
+/// Verify a chunk payload against the manifest's recorded hash for
+/// that chunk index.
+///
+/// Returns `Err(ChunkError)` if `chunk_idx` is out of range or if
+/// `sha256(payload)` does not match `manifest.chunk_hashes[chunk_idx]`.
+/// On success, the chunk is bit-identical to what the snapshot
+/// producer wrote.
+///
+/// Callers are expected to have run [`SnapshotManifest::verify`]
+/// against the manifest first; this helper trusts the manifest's
+/// integrity.
+pub fn verify_chunk(
+    manifest: &SnapshotManifest,
+    chunk_idx: u32,
+    payload: &[u8],
+) -> Result<(), ChunkError> {
+    let idx = chunk_idx as usize;
+    let expected = manifest
+        .chunk_hashes
+        .get(idx)
+        .ok_or(ChunkError::IndexOutOfRange {
+            chunk_idx,
+            chunk_count: manifest.chunk_count,
+        })?;
+    let actual = sha256_of(payload);
+    if &actual != expected {
+        return Err(ChunkError::HashMismatch {
+            chunk_idx,
+            expected: *expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Reasons a snapshot chunk can be rejected by [`verify_chunk`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkError {
+    /// `chunk_idx` is `>= chunk_count`.
+    IndexOutOfRange { chunk_idx: u32, chunk_count: u32 },
+    /// `sha256(payload)` does not match `manifest.chunk_hashes[chunk_idx]`.
+    HashMismatch {
+        chunk_idx: u32,
+        expected: [u8; 32],
+        actual: [u8; 32],
+    },
+}
+
+impl std::fmt::Display for ChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexOutOfRange {
+                chunk_idx,
+                chunk_count,
+            } => write!(
+                f,
+                "snapshot chunk index {chunk_idx} is out of range; manifest has {chunk_count} chunks",
+            ),
+            Self::HashMismatch {
+                chunk_idx,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "snapshot chunk {chunk_idx} hash mismatch: expected {}, got {}",
+                hex::encode(expected),
+                hex::encode(actual),
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChunkError {}
 
 /// Slice `payload` into fixed-size chunks of at most `chunk_size`
 /// bytes, returning each chunk's `sha256` alongside the bytes.
@@ -828,6 +1026,182 @@ mod tests {
         assert_eq!(
             store_b.load_manifest(manifest.height).unwrap().unwrap(),
             manifest,
+        );
+    }
+
+    // ── Verifier (#228) ─────────────────────────────────────────────────────
+
+    fn validator_set_len_4() -> ValidatorSet {
+        // Distinct, sorted node IDs so the embedded encoding is
+        // stable and we can build a "different validator set" for
+        // negative tests.
+        ValidatorSet::new(vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]])
+    }
+
+    fn quorum_qc(vs: &ValidatorSet, block_hash: BlockHash) -> QuorumCertificate {
+        let mut qc = QuorumCertificate::new(0, block_hash, vs.len());
+        // Quorum for n=4 is 2f+1 with f=1 → 3.
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
+            qc.add_signature(i, [0u8; 64]);
+        }
+        qc
+    }
+
+    fn manifest_for_verify(vs: &ValidatorSet) -> SnapshotManifest {
+        let block_hash = [0xAB; 32];
+        let qc = quorum_qc(vs, block_hash);
+        let payload = b"snapshot payload".repeat(4);
+        let chunks = chunk_snapshot(&payload, 16);
+        let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|(_, h)| *h).collect();
+        SnapshotManifest::build(
+            42,
+            7,
+            block_hash,
+            [0xCD; 32],
+            vs,
+            16,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        )
+    }
+
+    #[test]
+    fn verify_accepts_well_formed_manifest() {
+        let vs = validator_set_len_4();
+        let m = manifest_for_verify(&vs);
+        m.verify(&vs).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_unsupported_version() {
+        let vs = validator_set_len_4();
+        let mut m = manifest_for_verify(&vs);
+        m.version = 0xFE;
+        assert_eq!(
+            m.verify(&vs),
+            Err(ManifestError::UnsupportedVersion {
+                got: 0xFE,
+                expected: SNAPSHOT_FORMAT_VERSION,
+            }),
+        );
+    }
+
+    #[test]
+    fn verify_rejects_validator_set_mismatch() {
+        let vs = validator_set_len_4();
+        let m = manifest_for_verify(&vs);
+        // Local set has different members.
+        let other = ValidatorSet::new(vec![[5u8; 32], [6u8; 32], [7u8; 32], [8u8; 32]]);
+        assert_eq!(m.verify(&other), Err(ManifestError::ValidatorSetMismatch));
+    }
+
+    #[test]
+    fn verify_rejects_qc_under_different_validator_set() {
+        // The manifest carries a QC built against the producer's
+        // validator set; if we substitute a same-shape but different
+        // set in the manifest, the embedded-set check catches it
+        // before the QC check. This is a distinct error variant from
+        // a malformed QC: the validator-set anchoring is what changed.
+        let vs = validator_set_len_4();
+        let mut m = manifest_for_verify(&vs);
+        // Mutate the embedded set (still len-4, still sorted), but
+        // for a fresh local set that matches the *new* members, so
+        // the validator-set-mismatch arm fires.
+        m.validator_set = vec![[10u8; 32], [11u8; 32], [12u8; 32], [13u8; 32]];
+        let err = m.verify(&vs).unwrap_err();
+        assert_eq!(err, ManifestError::ValidatorSetMismatch);
+    }
+
+    #[test]
+    fn verify_rejects_qc_missing_quorum() {
+        let vs = validator_set_len_4();
+        let mut m = manifest_for_verify(&vs);
+        // Strip down to a single signer so the QC no longer has
+        // quorum (n=4, f=1 → quorum=3).
+        let mut weak_qc = QuorumCertificate::new(0, m.block_hash, vs.len());
+        weak_qc.add_signature(0, [0u8; 64]);
+        m.commit_qc = weak_qc;
+        let err = m.verify(&vs).unwrap_err();
+        assert!(matches!(
+            err,
+            ManifestError::QcInsufficientQuorum {
+                signers: 1,
+                quorum: 3
+            },
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_qc_block_hash_pointing_at_another_block() {
+        let vs = validator_set_len_4();
+        let mut m = manifest_for_verify(&vs);
+        // Re-sign a QC over a different block hash. Bypass the
+        // manifest field so the integrity check fires.
+        m.commit_qc = quorum_qc(&vs, [0x99; 32]);
+        assert_eq!(m.verify(&vs), Err(ManifestError::QcBlockHashMismatch));
+    }
+
+    #[test]
+    fn verify_rejects_chunk_count_mismatch() {
+        let vs = validator_set_len_4();
+        let mut m = manifest_for_verify(&vs);
+        m.chunk_count += 1; // claim one more chunk than we have hashes for
+        assert!(matches!(
+            m.verify(&vs),
+            Err(ManifestError::ChunkCountMismatch { .. }),
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_zero_chunk_size() {
+        let vs = validator_set_len_4();
+        let mut m = manifest_for_verify(&vs);
+        m.chunk_size = 0;
+        assert_eq!(m.verify(&vs), Err(ManifestError::InvalidChunkSize));
+    }
+
+    // ── verify_chunk ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn verify_chunk_accepts_matching_payload() {
+        let vs = validator_set_len_4();
+        let payload = b"chunk-zero contents";
+        let mut m = manifest_for_verify(&vs);
+        m.chunk_count = 1;
+        m.chunk_hashes = vec![sha256_of(payload)];
+        verify_chunk(&m, 0, payload).unwrap();
+    }
+
+    #[test]
+    fn verify_chunk_rejects_index_out_of_range() {
+        let vs = validator_set_len_4();
+        let m = manifest_for_verify(&vs);
+        let err = verify_chunk(&m, m.chunk_count, b"anything").unwrap_err();
+        assert!(matches!(
+            err,
+            ChunkError::IndexOutOfRange { chunk_idx, chunk_count }
+                if chunk_idx == m.chunk_count && chunk_count == m.chunk_count,
+        ));
+    }
+
+    #[test]
+    fn verify_chunk_rejects_tampered_byte_naming_index() {
+        // Acceptance: tampered chunk → clear error naming the offending index.
+        let vs = validator_set_len_4();
+        let payload = b"chunk-zero contents";
+        let mut m = manifest_for_verify(&vs);
+        m.chunk_count = 1;
+        m.chunk_hashes = vec![sha256_of(payload)];
+
+        let mut tampered = payload.to_vec();
+        tampered[0] ^= 0xFF;
+        let err = verify_chunk(&m, 0, &tampered).unwrap_err();
+        assert!(matches!(err, ChunkError::HashMismatch { chunk_idx: 0, .. },));
+        let s = err.to_string();
+        assert!(
+            s.contains("chunk 0"),
+            "error must name the chunk index, got: {s}"
         );
     }
 

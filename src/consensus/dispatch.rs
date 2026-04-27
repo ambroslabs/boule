@@ -42,6 +42,7 @@ use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{Signed, SignedMessage, Signer};
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
+use crate::replication::snapshot::SnapshotManifest;
 
 // ── NodeEvent ────────────────────────────────────────────────────────────────
 
@@ -86,6 +87,35 @@ pub enum Dispatch {
     /// it into its timeout-certificate bucket; on reaching quorum the
     /// bucket emits [`pacemaker::Event::OnTimeoutCert`] directly.
     TimeoutVote(Signed<TimeoutVote>),
+    /// Peer asked for a snapshot manifest (latest if `height = None`,
+    /// or at exact height). The integration layer looks the manifest
+    /// up in its [`crate::replication::SnapshotStore`] and replies
+    /// with [`WireMessage::SnapshotManifestResponse`].
+    ServeSnapshotManifest { height: Option<u64>, to: NodeId },
+    /// Peer replied to our [`WireMessage::SnapshotManifestRequest`].
+    /// The joiner-side state machine (issue #229) consumes this; the
+    /// run loop in this PR logs and drops, since no joiner is wired
+    /// in yet.
+    ReceiveSnapshotManifest {
+        manifest: Option<SnapshotManifest>,
+        from: NodeId,
+    },
+    /// Peer asked for chunk `chunk_idx` of the snapshot at `height`.
+    /// The integration layer looks the chunk up and replies with
+    /// [`WireMessage::SnapshotChunkResponse`].
+    ServeSnapshotChunk {
+        height: u64,
+        chunk_idx: u32,
+        to: NodeId,
+    },
+    /// Peer replied to our [`WireMessage::SnapshotChunkRequest`].
+    /// Same joiner-side note as for [`Dispatch::ReceiveSnapshotManifest`].
+    ReceiveSnapshotChunk {
+        height: u64,
+        chunk_idx: u32,
+        payload: Option<bytes::Bytes>,
+        from: NodeId,
+    },
 }
 
 // ── Outbound ─────────────────────────────────────────────────────────────────
@@ -224,6 +254,33 @@ pub fn ingress_wire(
         WireMessage::BlockRequest(hash) => Ok(vec![Dispatch::ServeBlock { hash, to: from }]),
 
         WireMessage::BlockResponse(block) => Ok(vec![Dispatch::ReceiveBlock { block, from }]),
+
+        WireMessage::SnapshotManifestRequest { height } => {
+            Ok(vec![Dispatch::ServeSnapshotManifest { height, to: from }])
+        }
+
+        WireMessage::SnapshotManifestResponse(manifest) => {
+            Ok(vec![Dispatch::ReceiveSnapshotManifest { manifest, from }])
+        }
+
+        WireMessage::SnapshotChunkRequest { height, chunk_idx } => {
+            Ok(vec![Dispatch::ServeSnapshotChunk {
+                height,
+                chunk_idx,
+                to: from,
+            }])
+        }
+
+        WireMessage::SnapshotChunkResponse {
+            height,
+            chunk_idx,
+            payload,
+        } => Ok(vec![Dispatch::ReceiveSnapshotChunk {
+            height,
+            chunk_idx,
+            payload,
+            from,
+        }]),
     }
 }
 
@@ -311,6 +368,62 @@ pub fn egress_block_response(block: Option<Block>, to: NodeId) -> Outbound {
     Outbound::SendTo { to, payload }
 }
 
+/// Encode a [`SnapshotManifestRequest`] as a `SendTo` outbound frame.
+///
+/// [`SnapshotManifestRequest`]: WireMessage::SnapshotManifestRequest
+pub fn egress_snapshot_manifest_request(height: Option<u64>, to: NodeId) -> Outbound {
+    let wire = WireMessage::SnapshotManifestRequest { height };
+    let payload = postcard::to_stdvec(&wire)
+        .map(Bytes::from)
+        .expect("SnapshotManifestRequest encoding must not fail");
+    Outbound::SendTo { to, payload }
+}
+
+/// Encode a [`SnapshotManifestResponse`] as a `SendTo` outbound frame.
+///
+/// [`SnapshotManifestResponse`]: WireMessage::SnapshotManifestResponse
+pub fn egress_snapshot_manifest_response(
+    manifest: Option<SnapshotManifest>,
+    to: NodeId,
+) -> Outbound {
+    let wire = WireMessage::SnapshotManifestResponse(manifest);
+    let payload = postcard::to_stdvec(&wire)
+        .map(Bytes::from)
+        .expect("SnapshotManifestResponse encoding must not fail");
+    Outbound::SendTo { to, payload }
+}
+
+/// Encode a [`SnapshotChunkRequest`] as a `SendTo` outbound frame.
+///
+/// [`SnapshotChunkRequest`]: WireMessage::SnapshotChunkRequest
+pub fn egress_snapshot_chunk_request(height: u64, chunk_idx: u32, to: NodeId) -> Outbound {
+    let wire = WireMessage::SnapshotChunkRequest { height, chunk_idx };
+    let payload = postcard::to_stdvec(&wire)
+        .map(Bytes::from)
+        .expect("SnapshotChunkRequest encoding must not fail");
+    Outbound::SendTo { to, payload }
+}
+
+/// Encode a [`SnapshotChunkResponse`] as a `SendTo` outbound frame.
+///
+/// [`SnapshotChunkResponse`]: WireMessage::SnapshotChunkResponse
+pub fn egress_snapshot_chunk_response(
+    height: u64,
+    chunk_idx: u32,
+    payload: Option<Bytes>,
+    to: NodeId,
+) -> Outbound {
+    let wire = WireMessage::SnapshotChunkResponse {
+        height,
+        chunk_idx,
+        payload,
+    };
+    let payload = postcard::to_stdvec(&wire)
+        .map(Bytes::from)
+        .expect("SnapshotChunkResponse encoding must not fail");
+    Outbound::SendTo { to, payload }
+}
+
 /// Sign a [`ConsensusMsg`] and wrap it in the appropriate [`WireMessage`]
 /// variant.
 fn sign_consensus_msg(msg: &ConsensusMsg, signer: &dyn Signer) -> anyhow::Result<WireMessage> {
@@ -382,7 +495,11 @@ pub fn egress_consensus_msg_with_loopback(
         // sign_consensus_msg only ever produces Proposal/Vote/NewView.
         WireMessage::TimeoutVote(_)
         | WireMessage::BlockRequest(_)
-        | WireMessage::BlockResponse(_) => {
+        | WireMessage::BlockResponse(_)
+        | WireMessage::SnapshotManifestRequest { .. }
+        | WireMessage::SnapshotManifestResponse(_)
+        | WireMessage::SnapshotChunkRequest { .. }
+        | WireMessage::SnapshotChunkResponse { .. } => {
             unreachable!("sign_consensus_msg always produces Proposal/Vote/NewView wire variants")
         }
     };
@@ -740,6 +857,215 @@ mod tests {
             }
             other => panic!("unexpected first dispatch: {other:?}"),
         }
+    }
+
+    // ── Snapshot wire protocol (#228) ─────────────────────────────────────
+
+    fn sample_quorum_qc(vs_len: usize, block_hash: [u8; 32]) -> QuorumCertificate {
+        let mut qc = QuorumCertificate::new(0, block_hash, vs_len);
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs_len) {
+            qc.add_signature(i, [0u8; 64]);
+        }
+        qc
+    }
+
+    fn sample_manifest_for_dispatch() -> SnapshotManifest {
+        let vs = ValidatorSet::new(vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
+        let block_hash = [0xAB; 32];
+        let qc = sample_quorum_qc(vs.len(), block_hash);
+        let payload = b"chunky payload".repeat(8);
+        let chunks = crate::replication::snapshot::chunk_snapshot(&payload, 32);
+        let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|(_, h)| *h).collect();
+        SnapshotManifest::build(
+            42,
+            7,
+            block_hash,
+            [0xCD; 32],
+            &vs,
+            32,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        )
+    }
+
+    #[test]
+    fn ingress_snapshot_manifest_request_no_signature_needed() {
+        let from = [0x01u8; 32];
+        let vs = ValidatorSet::new(vec![]);
+        let wire = WireMessage::SnapshotManifestRequest { height: Some(1234) };
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert!(matches!(
+            &dispatches[0],
+            Dispatch::ServeSnapshotManifest { height: Some(1234), to } if to == &from,
+        ));
+    }
+
+    #[test]
+    fn ingress_snapshot_manifest_request_latest_round_trips() {
+        let from = [0x02u8; 32];
+        let vs = ValidatorSet::new(vec![]);
+        let wire = WireMessage::SnapshotManifestRequest { height: None };
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        assert!(matches!(
+            &dispatches[0],
+            Dispatch::ServeSnapshotManifest { height: None, to } if to == &from,
+        ));
+    }
+
+    #[test]
+    fn ingress_snapshot_manifest_response_carries_manifest() {
+        let from = [0x03u8; 32];
+        let vs = ValidatorSet::new(vec![]);
+        let manifest = sample_manifest_for_dispatch();
+        let wire = WireMessage::SnapshotManifestResponse(Some(manifest.clone()));
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        match &dispatches[0] {
+            Dispatch::ReceiveSnapshotManifest {
+                manifest: Some(m),
+                from: f,
+            } => {
+                assert_eq!(m, &manifest);
+                assert_eq!(f, &from);
+            }
+            other => panic!("unexpected dispatch: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ingress_snapshot_chunk_request_carries_height_and_index() {
+        let from = [0x04u8; 32];
+        let vs = ValidatorSet::new(vec![]);
+        let wire = WireMessage::SnapshotChunkRequest {
+            height: 555,
+            chunk_idx: 7,
+        };
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        assert!(matches!(
+            &dispatches[0],
+            Dispatch::ServeSnapshotChunk { height: 555, chunk_idx: 7, to } if to == &from,
+        ));
+    }
+
+    #[test]
+    fn ingress_snapshot_chunk_response_carries_payload() {
+        let from = [0x05u8; 32];
+        let vs = ValidatorSet::new(vec![]);
+        let payload = bytes::Bytes::from_static(b"hello chunk");
+        let wire = WireMessage::SnapshotChunkResponse {
+            height: 99,
+            chunk_idx: 3,
+            payload: Some(payload.clone()),
+        };
+        let bytes_vec = postcard::to_stdvec(&wire).unwrap();
+        let dispatches = ingress(from, &bytes_vec, &vs).unwrap();
+        match &dispatches[0] {
+            Dispatch::ReceiveSnapshotChunk {
+                height: 99,
+                chunk_idx: 3,
+                payload: Some(p),
+                from: f,
+            } => {
+                assert_eq!(p.as_ref(), payload.as_ref());
+                assert_eq!(f, &from);
+            }
+            other => panic!("unexpected dispatch: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_wire_round_trip_postcard_stable() {
+        // Encode/decode each new wire message; bytes round-trip and
+        // first-byte tag matches the layout pinned by
+        // `wire_tag_layout_locked` in p2p::limits.
+        let manifest = sample_manifest_for_dispatch();
+        let cases: Vec<WireMessage> = vec![
+            WireMessage::SnapshotManifestRequest { height: None },
+            WireMessage::SnapshotManifestRequest { height: Some(42) },
+            WireMessage::SnapshotManifestResponse(None),
+            WireMessage::SnapshotManifestResponse(Some(manifest.clone())),
+            WireMessage::SnapshotChunkRequest {
+                height: 1,
+                chunk_idx: 0,
+            },
+            WireMessage::SnapshotChunkResponse {
+                height: 1,
+                chunk_idx: 0,
+                payload: None,
+            },
+            WireMessage::SnapshotChunkResponse {
+                height: 1,
+                chunk_idx: 0,
+                payload: Some(bytes::Bytes::from_static(b"abc")),
+            },
+        ];
+        for msg in cases {
+            let bytes = postcard::to_stdvec(&msg).unwrap();
+            let decoded: WireMessage = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    #[test]
+    fn egress_snapshot_manifest_response_round_trips_via_ingress() {
+        let from = [0x66u8; 32];
+        let vs = ValidatorSet::new(vec![]);
+        let manifest = sample_manifest_for_dispatch();
+        let out = egress_snapshot_manifest_response(Some(manifest.clone()), from);
+        let Outbound::SendTo { to, payload } = out else {
+            panic!("expected SendTo");
+        };
+        assert_eq!(to, from);
+        let dispatches = ingress(from, &payload, &vs).unwrap();
+        match &dispatches[0] {
+            Dispatch::ReceiveSnapshotManifest {
+                manifest: Some(m), ..
+            } => {
+                assert_eq!(m, &manifest);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_chunk_response_fits_under_max_frame_bytes_at_1mib() {
+        // Frame-size budget: a 1 MiB chunk plus the
+        // `SnapshotChunkResponse` envelope must comfortably fit
+        // inside the consensus protocol's `MAX_FRAME_BYTES` cap so
+        // production-default chunks never get truncated mid-flight.
+        // Use a 1 MiB payload whose entropy defeats any compression
+        // assumption: postcard does no compression, so we're really
+        // just checking framing overhead.
+        let payload = bytes::Bytes::from(vec![0xA5u8; 1024 * 1024]);
+        let wire = WireMessage::SnapshotChunkResponse {
+            height: 0xDEAD_BEEF,
+            chunk_idx: u32::MAX,
+            payload: Some(payload),
+        };
+        let encoded = postcard::to_stdvec(&wire).unwrap();
+        let max = crate::consensus::node::MAX_FRAME_BYTES;
+        assert!(
+            encoded.len() < max,
+            "encoded SnapshotChunkResponse ({} bytes) must fit under MAX_FRAME_BYTES ({}) at 1 MiB chunks",
+            encoded.len(),
+            max,
+        );
+        // The envelope adds at most a few bytes (tag + varints +
+        // length prefix). Lock that the overhead is trivially small,
+        // so a future change that bloats the envelope without
+        // reducing the chunk size hits this test before it hits the
+        // wire frame cap.
+        let overhead = encoded.len() - 1024 * 1024;
+        assert!(
+            overhead < 64,
+            "envelope overhead grew unexpectedly: {overhead} bytes",
+        );
     }
 
     #[test]

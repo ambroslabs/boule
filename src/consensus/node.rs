@@ -192,6 +192,18 @@ pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 /// when the safety core emits `Action::RequestBlock(hash, peer)`, the
 /// integration layer sends `BlockRequest`; the peer replies with
 /// `BlockResponse` (carrying the block if it has it, `None` otherwise).
+///
+/// `SnapshotManifestRequest` / `SnapshotManifestResponse` /
+/// `SnapshotChunkRequest` / `SnapshotChunkResponse` are the snapshot
+/// sub-protocol (#228): a joiner asks a peer for a manifest (latest or
+/// at a specific height), then for each chunk by `(height, idx)`.
+/// Issue #229 builds the joiner-side state machine on top.
+///
+/// **Variant order is wire-stable.** Postcard encodes the discriminant
+/// as a varint at byte 0; reordering breaks every running peer.
+/// Adding new variants at the end is fine. The
+/// [`crate::p2p::limits::MessageKind`] enum mirrors this order and is
+/// pinned by `wire_tag_layout_locked`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireMessage {
     Proposal(Signed<crate::consensus::hotstuff::Proposal>),
@@ -205,6 +217,27 @@ pub enum WireMessage {
     BlockRequest(BlockHash),
     /// Reply to a `BlockRequest`. `None` means "I don't have it".
     BlockResponse(Option<Block>),
+    /// Ask a peer for a snapshot manifest. `None` means "your latest";
+    /// `Some(h)` means "the snapshot at exact height `h`".
+    SnapshotManifestRequest {
+        height: Option<u64>,
+    },
+    /// Reply to a [`WireMessage::SnapshotManifestRequest`]. `None`
+    /// means "I have no matching snapshot".
+    SnapshotManifestResponse(Option<crate::replication::snapshot::SnapshotManifest>),
+    /// Ask a peer for chunk `chunk_idx` of the snapshot at `height`.
+    SnapshotChunkRequest {
+        height: u64,
+        chunk_idx: u32,
+    },
+    /// Reply to a [`WireMessage::SnapshotChunkRequest`]. `payload =
+    /// None` means "I have no such chunk" (snapshot pruned, chunk
+    /// index out of range, or never had this snapshot).
+    SnapshotChunkResponse {
+        height: u64,
+        chunk_idx: u32,
+        payload: Option<Bytes>,
+    },
 }
 
 // ── Node configuration ───────────────────────────────────────────────────────
@@ -1301,8 +1334,151 @@ impl ConsensusNode {
                 self.on_timeout_vote(signed, broadcaster, view_timer, signer)
                     .await?;
             }
+
+            Dispatch::ServeSnapshotManifest { height, to } => {
+                self.serve_snapshot_manifest(height, to, broadcaster).await;
+            }
+
+            Dispatch::ServeSnapshotChunk {
+                height,
+                chunk_idx,
+                to,
+            } => {
+                self.serve_snapshot_chunk(height, chunk_idx, to, broadcaster)
+                    .await;
+            }
+
+            // Joiner-side consumers land in #229. For now, log and drop
+            // so the wire protocol can be exercised end-to-end (peer A
+            // serves, peer B drops with a debug log).
+            Dispatch::ReceiveSnapshotManifest { manifest, from } => {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    from = %node_id_to_base58(&from),
+                    has_manifest = manifest.is_some(),
+                    height = manifest.as_ref().map(|m| m.height),
+                    "snapshot_manifest_response_received_no_consumer",
+                );
+            }
+
+            Dispatch::ReceiveSnapshotChunk {
+                height,
+                chunk_idx,
+                payload,
+                from,
+            } => {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    from = %node_id_to_base58(&from),
+                    height,
+                    chunk_idx,
+                    has_payload = payload.is_some(),
+                    payload_len = payload.as_ref().map(|p| p.len()),
+                    "snapshot_chunk_response_received_no_consumer",
+                );
+            }
         }
         Ok(())
+    }
+
+    /// Serve a [`Dispatch::ServeSnapshotManifest`] by looking up the
+    /// requested manifest in the local
+    /// [`crate::replication::SnapshotStore`] and replying.
+    ///
+    /// `height = None` requests the latest available manifest;
+    /// `Some(h)` requests the exact-match manifest. Misses (no
+    /// snapshots, height not found) reply with
+    /// `SnapshotManifestResponse(None)` so the joiner can fall through
+    /// to another peer or to plain block-sync.
+    async fn serve_snapshot_manifest(
+        &self,
+        height: Option<u64>,
+        to: NodeId,
+        broadcaster: &dyn Broadcaster,
+    ) {
+        let store = crate::replication::snapshot::SnapshotStore::new(Arc::clone(&self.storage));
+        let manifest = match height {
+            Some(h) => match store.load_manifest(h) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!(
+                        target: TRACE_TARGET,
+                        height = h,
+                        error = %e,
+                        "snapshot_manifest_lookup_failed",
+                    );
+                    None
+                }
+            },
+            None => match store.latest_height() {
+                Ok(Some(h)) => match store.load_manifest(h) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            height = h,
+                            error = %e,
+                            "snapshot_latest_manifest_lookup_failed",
+                        );
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::error!(
+                        target: TRACE_TARGET,
+                        error = %e,
+                        "snapshot_latest_height_lookup_failed",
+                    );
+                    None
+                }
+            },
+        };
+        tracing::info!(
+            target: TRACE_TARGET,
+            from = %node_id_to_base58(&to),
+            requested_height = ?height,
+            served_height = manifest.as_ref().map(|m| m.height),
+            "snapshot_manifest_request_received",
+        );
+        let out = dispatch::egress_snapshot_manifest_response(manifest, to);
+        send_outbound(broadcaster, out).await;
+    }
+
+    /// Serve a [`Dispatch::ServeSnapshotChunk`] by looking up the
+    /// chunk in the local snapshot store. Misses reply with
+    /// `payload = None`.
+    async fn serve_snapshot_chunk(
+        &self,
+        height: u64,
+        chunk_idx: u32,
+        to: NodeId,
+        broadcaster: &dyn Broadcaster,
+    ) {
+        let store = crate::replication::snapshot::SnapshotStore::new(Arc::clone(&self.storage));
+        let payload = match store.load_chunk(height, chunk_idx) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    height,
+                    chunk_idx,
+                    error = %e,
+                    "snapshot_chunk_lookup_failed",
+                );
+                None
+            }
+        };
+        tracing::info!(
+            target: TRACE_TARGET,
+            from = %node_id_to_base58(&to),
+            height,
+            chunk_idx,
+            served = payload.is_some(),
+            "snapshot_chunk_request_received",
+        );
+        let out = dispatch::egress_snapshot_chunk_response(height, chunk_idx, payload, to);
+        send_outbound(broadcaster, out).await;
     }
 
     /// Apply a slice of safety-core actions with the persist-before-send
@@ -3356,6 +3532,347 @@ mod tests {
         }
     }
 
+    // ── Snapshot wire protocol (#228) — serving handlers ────────────────
+
+    /// Helper: write a fully-populated snapshot (manifest + chunks)
+    /// into the node's `Storage` so the serving handlers find it.
+    fn seed_snapshot(
+        storage: &Arc<dyn Storage>,
+        height: u64,
+        chunk_size: u32,
+        n_chunks: u32,
+    ) -> crate::replication::snapshot::SnapshotManifest {
+        use crate::replication::snapshot::{SnapshotManifest, SnapshotStore, chunk_snapshot};
+
+        let payload: Vec<u8> = (0..n_chunks * chunk_size)
+            .map(|i| (i & 0xFF) as u8)
+            .collect();
+        let chunks_with_hashes = chunk_snapshot(&payload, chunk_size);
+        assert_eq!(chunks_with_hashes.len(), n_chunks as usize);
+        let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
+        let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
+
+        let vs = four_validators();
+        let block_hash = [0xAB; 32];
+        let mut qc = QuorumCertificate::new(0, block_hash, vs.len());
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
+            qc.add_signature(i, [0u8; 64]);
+        }
+        let manifest = SnapshotManifest::build(
+            height,
+            7,
+            block_hash,
+            [0xCD; 32],
+            &vs,
+            chunk_size,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        );
+        SnapshotStore::new(Arc::clone(storage))
+            .save(&manifest, &chunks)
+            .expect("save snapshot");
+        manifest
+    }
+
+    fn decode_outbound_wire(out: ProtocolOutbound) -> (NodeId, WireMessage) {
+        match out {
+            ProtocolOutbound::SendTo { node_id, payload } => {
+                let wire: WireMessage = postcard::from_bytes(&payload).expect("decode wire");
+                (node_id, wire)
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_snapshot_manifest_latest_returns_stored_manifest() {
+        // A peer asks for our latest snapshot manifest; we look it up
+        // via SnapshotStore and reply via the run-loop's serving
+        // handler. Exercises the end-to-end Dispatch → SendTo path.
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let manifest = seed_snapshot(&storage, 100, 64, 2);
+
+        let cfg = test_config(four_validators());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        node.apply_dispatch(
+            Dispatch::ServeSnapshotManifest {
+                height: None,
+                to: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        let (to, wire) = decode_outbound_wire(outbound_rx.recv().await.expect("outbound"));
+        assert_eq!(to, nid(2));
+        match wire {
+            WireMessage::SnapshotManifestResponse(Some(got)) => {
+                assert_eq!(got, manifest);
+            }
+            other => panic!("expected SnapshotManifestResponse(Some), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_snapshot_manifest_at_height_returns_exact_match() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let m_low = seed_snapshot(&storage, 100, 64, 1);
+        let _m_high = seed_snapshot(&storage, 200, 64, 1);
+
+        let cfg = test_config(four_validators());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        node.apply_dispatch(
+            Dispatch::ServeSnapshotManifest {
+                height: Some(100),
+                to: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        let (_, wire) = decode_outbound_wire(outbound_rx.recv().await.expect("outbound"));
+        match wire {
+            WireMessage::SnapshotManifestResponse(Some(got)) => {
+                assert_eq!(got, m_low);
+                assert_eq!(got.height, 100);
+            }
+            other => panic!("expected SnapshotManifestResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_snapshot_manifest_returns_none_when_store_empty() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let cfg = test_config(four_validators());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        node.apply_dispatch(
+            Dispatch::ServeSnapshotManifest {
+                height: None,
+                to: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        let (_, wire) = decode_outbound_wire(outbound_rx.recv().await.expect("outbound"));
+        assert!(matches!(wire, WireMessage::SnapshotManifestResponse(None)));
+    }
+
+    #[tokio::test]
+    async fn serve_snapshot_chunk_returns_payload_for_known_index() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let manifest = seed_snapshot(&storage, 100, 64, 3);
+
+        let cfg = test_config(four_validators());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Walk every chunk index served back, and verify each
+        // payload matches the manifest's recorded hash.
+        for idx in 0..manifest.chunk_count {
+            node.apply_dispatch(
+                Dispatch::ServeSnapshotChunk {
+                    height: 100,
+                    chunk_idx: idx,
+                    to: nid(2),
+                },
+                broadcaster.as_ref(),
+                &mut view_timer,
+                &signer,
+            )
+            .await
+            .expect("apply_dispatch");
+
+            let (to, wire) = decode_outbound_wire(outbound_rx.recv().await.expect("outbound"));
+            assert_eq!(to, nid(2));
+            match wire {
+                WireMessage::SnapshotChunkResponse {
+                    height: 100,
+                    chunk_idx,
+                    payload: Some(p),
+                } => {
+                    assert_eq!(chunk_idx, idx);
+                    crate::replication::snapshot::verify_chunk(&manifest, idx, &p)
+                        .expect("served chunk must verify against manifest");
+                }
+                other => panic!("expected SnapshotChunkResponse(Some), got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_snapshot_chunk_returns_none_for_missing_height() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let cfg = test_config(four_validators());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        node.apply_dispatch(
+            Dispatch::ServeSnapshotChunk {
+                height: 999,
+                chunk_idx: 0,
+                to: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        let (_, wire) = decode_outbound_wire(outbound_rx.recv().await.expect("outbound"));
+        match wire {
+            WireMessage::SnapshotChunkResponse {
+                height: 999,
+                chunk_idx: 0,
+                payload: None,
+            } => {}
+            other => panic!("expected SnapshotChunkResponse(None), got {other:?}"),
+        }
+    }
+
+    /// End-to-end "peer A serves a manifest + chunks to peer B" via
+    /// the in-process transport: the request is decoded by
+    /// `dispatch::ingress`, fed through `apply_dispatch`, and the
+    /// outbound reply is decoded back to a `WireMessage`. Acceptance
+    /// criterion: "a node serves a manifest + all chunks to another
+    /// node over the in-process transport."
+    #[tokio::test]
+    async fn serve_full_snapshot_round_trip_through_dispatch() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let manifest = seed_snapshot(&storage, 50, 32, 4);
+
+        let cfg = test_config(four_validators());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Step 1: peer B (nid(2)) sends a manifest request, encoded
+        // on the wire. Decode via ingress, dispatch through the run
+        // loop's apply_dispatch, and capture the outbound reply.
+        let req_bytes =
+            postcard::to_stdvec(&WireMessage::SnapshotManifestRequest { height: None }).unwrap();
+        let dispatches = dispatch::ingress(nid(2), &req_bytes, &four_validators()).unwrap();
+        assert_eq!(dispatches.len(), 1);
+        for d in dispatches {
+            node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
+                .await
+                .expect("apply_dispatch");
+        }
+        let (to, wire) = decode_outbound_wire(outbound_rx.recv().await.expect("outbound"));
+        assert_eq!(to, nid(2));
+        let served = match wire {
+            WireMessage::SnapshotManifestResponse(Some(m)) => m,
+            other => panic!("expected SnapshotManifestResponse, got {other:?}"),
+        };
+        assert_eq!(served, manifest);
+
+        // Step 2: for each chunk index in the manifest, peer B
+        // requests the chunk and we observe the outbound reply.
+        for idx in 0..served.chunk_count {
+            let req_bytes = postcard::to_stdvec(&WireMessage::SnapshotChunkRequest {
+                height: served.height,
+                chunk_idx: idx,
+            })
+            .unwrap();
+            let dispatches = dispatch::ingress(nid(2), &req_bytes, &four_validators()).unwrap();
+            for d in dispatches {
+                node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
+                    .await
+                    .expect("apply_dispatch");
+            }
+            let (_, wire) = decode_outbound_wire(outbound_rx.recv().await.expect("outbound"));
+            match wire {
+                WireMessage::SnapshotChunkResponse {
+                    height,
+                    chunk_idx,
+                    payload: Some(p),
+                } => {
+                    assert_eq!(height, served.height);
+                    assert_eq!(chunk_idx, idx);
+                    crate::replication::snapshot::verify_chunk(&served, idx, &p)
+                        .expect("chunk must verify");
+                }
+                other => panic!("expected SnapshotChunkResponse(Some), got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn run_shuts_down_cleanly_on_signal() {
         let node = make_node(nid(1));
@@ -4284,6 +4801,10 @@ mod tests {
             new_view_per_sec: 1.0,
             request_block_per_sec: 1.0,
             receive_block_per_sec: 1.0,
+            snapshot_manifest_request_per_sec: 1.0,
+            snapshot_manifest_response_per_sec: 1.0,
+            snapshot_chunk_request_per_sec: 1.0,
+            snapshot_chunk_response_per_sec: 1.0,
             bytes_per_sec: 1024.0 * 1024.0, // generous, isolate the test on per-kind
             burst_seconds: 1.0,
             violation_window: std::time::Duration::from_secs(60),
@@ -4442,6 +4963,10 @@ mod tests {
             new_view_per_sec: 4.0,
             request_block_per_sec: 4.0,
             receive_block_per_sec: 4.0,
+            snapshot_manifest_request_per_sec: 4.0,
+            snapshot_manifest_response_per_sec: 4.0,
+            snapshot_chunk_request_per_sec: 4.0,
+            snapshot_chunk_response_per_sec: 4.0,
             bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
             violation_window: std::time::Duration::from_secs(60),
