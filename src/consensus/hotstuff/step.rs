@@ -374,6 +374,46 @@ impl HotStuffCore {
         self.state.high_qc = Some(qc);
     }
 
+    /// Adopt a verified snapshot as a new starting point for the
+    /// safety core (issue #229).
+    ///
+    /// Sets the safety state as if the joiner had committed up to
+    /// the snapshot's `(height, view)`:
+    ///
+    /// - Inserts `snapshot_block` into `pending_blocks` so future
+    ///   parent-walks terminate at the snapshot rather than recursing
+    ///   back to genesis (which the joiner does not have intermediate
+    ///   blocks for).
+    /// - Sets `locked` to the snapshot's `(view, height, block_hash)`.
+    ///   Lock monotonicity is preserved because the joiner's previous
+    ///   `locked` is at most genesis (height 0); the snapshot's
+    ///   height is strictly greater.
+    /// - Adopts `commit_qc` as `high_qc`. The same view-monotonicity
+    ///   argument applies: the joiner's prior `high_qc` is at most
+    ///   the genesis QC (view 0).
+    ///
+    /// Caller must verify `commit_qc` is well-formed under the
+    /// validator set and has quorum
+    /// ([`crate::replication::snapshot::SnapshotManifest::verify`])
+    /// before calling. The integration layer's `restore_from_snapshot`
+    /// already enforces this.
+    pub fn adopt_snapshot(
+        &mut self,
+        snapshot_block: Block,
+        commit_qc: QuorumCertificate,
+        snapshot_view: View,
+    ) {
+        let block_hash = snapshot_block.hash();
+        let height = snapshot_block.header.height;
+        self.state.insert_pending(snapshot_block);
+        self.state.locked = Some(super::Locked {
+            view: snapshot_view,
+            height,
+            block_hash,
+        });
+        self.state.high_qc = Some(commit_qc);
+    }
+
     /// Leader path: build and return a `Broadcast(Proposal)` action for
     /// `view` using the current `high_qc` as the justify.
     ///

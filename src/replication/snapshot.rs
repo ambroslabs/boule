@@ -48,7 +48,7 @@ use crate::consensus::View;
 use crate::consensus::hotstuff::QuorumCertificate;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::p2p::NodeId;
-use crate::replication::block::BlockHash;
+use crate::replication::block::{Block, BlockHash};
 use crate::storage::{Storage, StorageExt};
 
 /// Storage-key prefix under which [`SnapshotManifest`] values are
@@ -67,7 +67,14 @@ pub const STORAGE_KEY_SNAPSHOT_LATEST: &[u8] = b"consensus/snap/latest";
 /// or chunk hashing changes in a non-backwards-compatible way; readers
 /// must reject manifests whose `version` does not match a version they
 /// implement.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 1;
+///
+/// History:
+/// - `1`: original. Manifest carried `block_hash` but not the block
+///   itself.
+/// - `2`: adds the snapshot block as `block: Block` so the joiner can
+///   restore `pending_blocks` without an extra round-trip — required
+///   by the safety core's parent-walks (#229).
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 2;
 
 /// Manifest describing one snapshot at `(height, view)`.
 ///
@@ -81,16 +88,15 @@ pub const SNAPSHOT_FORMAT_VERSION: u8 = 1;
 pub struct SnapshotManifest {
     /// Schema version. Must equal [`SNAPSHOT_FORMAT_VERSION`] today.
     pub version: u8,
-    /// Block height the snapshot was taken at.
+    /// Block height the snapshot was taken at. Equal to
+    /// `block.header.height` for a well-formed manifest.
     pub height: u64,
-    /// View of the snapshot block.
+    /// View of the snapshot block. Equal to `block.header.view`.
     pub view: View,
-    /// Content-hash of the snapshot block (the one whose
-    /// `state_commitment` matches [`SnapshotManifest::state_commitment`]).
+    /// Content-hash of the snapshot block. Equal to `block.hash()`.
     pub block_hash: BlockHash,
     /// `StateMachine::state_commitment` after the snapshot block's
-    /// commands were applied. Equal to `block.header.state_commitment`
-    /// for a well-formed snapshot.
+    /// commands were applied. Equal to `block.header.state_commitment`.
     pub state_commitment: [u8; 32],
     /// Validator set active at the snapshot height. See module docs.
     pub validator_set: Vec<NodeId>,
@@ -102,6 +108,13 @@ pub struct SnapshotManifest {
     pub chunk_hashes: Vec<[u8; 32]>,
     /// Quorum-bearing QC over the snapshot block. See [`SnapshotManifest::block_hash`].
     pub commit_qc: QuorumCertificate,
+    /// The snapshot block itself. Carried inside the manifest so a
+    /// joiner can populate `pending_blocks` for the safety core's
+    /// parent-walks without an extra `BlockRequest` round-trip
+    /// (#229). Sized at most a few hundred bytes for an empty
+    /// production state machine; payload commands grow the size
+    /// linearly.
+    pub block: Block,
     /// Wall-clock seconds-since-Unix-epoch at creation. Informational
     /// only — verifiers do not key safety on this field.
     pub created_unix_secs: u64,
@@ -119,10 +132,7 @@ impl SnapshotManifest {
     /// `created_unix_secs`, supplied by the caller.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
-        height: u64,
-        view: View,
-        block_hash: BlockHash,
-        state_commitment: [u8; 32],
+        block: Block,
         validator_set: &ValidatorSet,
         chunk_size: u32,
         chunk_hashes: Vec<[u8; 32]>,
@@ -134,6 +144,10 @@ impl SnapshotManifest {
             .try_into()
             .expect("snapshot chunk count must fit in u32 — manifest layout pins this bound");
         let validator_set: Vec<NodeId> = validator_set.iter().copied().collect();
+        let height = block.header.height;
+        let view = block.header.view;
+        let block_hash = block.hash();
+        let state_commitment = block.header.state_commitment;
         Self {
             version: SNAPSHOT_FORMAT_VERSION,
             height,
@@ -145,6 +159,7 @@ impl SnapshotManifest {
             chunk_count,
             chunk_hashes,
             commit_qc,
+            block,
             created_unix_secs,
         }
     }
@@ -226,6 +241,24 @@ impl SnapshotManifest {
         if self.chunk_size == 0 {
             return Err(ManifestError::InvalidChunkSize);
         }
+        // The embedded block must be self-consistent with the
+        // standalone height/view/hash/state-commitment fields. A
+        // mismatched block would let a malicious peer corrupt the
+        // joiner's safety state by feeding a block whose header
+        // disagrees with what they're claiming the snapshot
+        // committed.
+        if self.block.hash() != self.block_hash {
+            return Err(ManifestError::BlockHashMismatch);
+        }
+        if self.block.header.height != self.height {
+            return Err(ManifestError::BlockHeightMismatch);
+        }
+        if self.block.header.view != self.view {
+            return Err(ManifestError::BlockViewMismatch);
+        }
+        if self.block.header.state_commitment != self.state_commitment {
+            return Err(ManifestError::BlockStateCommitmentMismatch);
+        }
         Ok(())
     }
 }
@@ -252,6 +285,14 @@ pub enum ManifestError {
     /// `chunk_size == 0`. Snapshots with zero-size chunks can't be
     /// transferred meaningfully.
     InvalidChunkSize,
+    /// `manifest.block.hash() != manifest.block_hash`.
+    BlockHashMismatch,
+    /// `manifest.block.header.height != manifest.height`.
+    BlockHeightMismatch,
+    /// `manifest.block.header.view != manifest.view`.
+    BlockViewMismatch,
+    /// `manifest.block.header.state_commitment != manifest.state_commitment`.
+    BlockStateCommitmentMismatch,
 }
 
 impl std::fmt::Display for ManifestError {
@@ -285,6 +326,21 @@ impl std::fmt::Display for ManifestError {
                 "manifest chunk_count {chunk_count} disagrees with chunk_hashes.len() = {hashes_len}",
             ),
             Self::InvalidChunkSize => write!(f, "manifest chunk_size is zero"),
+            Self::BlockHashMismatch => write!(
+                f,
+                "manifest.block.hash() does not match manifest.block_hash",
+            ),
+            Self::BlockHeightMismatch => write!(
+                f,
+                "manifest.block.header.height does not match manifest.height",
+            ),
+            Self::BlockViewMismatch => {
+                write!(f, "manifest.block.header.view does not match manifest.view",)
+            }
+            Self::BlockStateCommitmentMismatch => write!(
+                f,
+                "manifest.block.header.state_commitment does not match manifest.state_commitment",
+            ),
         }
     }
 }
@@ -766,27 +822,54 @@ impl SnapshotPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::hotstuff::qc::genesis_qc;
-    use crate::replication::block::Block;
+    use crate::consensus::hotstuff::qc::quorum_size;
+    use crate::replication::block::{Block, BlockHeader};
     use crate::storage::MemoryStorage;
 
     fn vs(n: u8) -> ValidatorSet {
         ValidatorSet::new((0..n).map(|i| [i; 32]).collect())
     }
 
+    /// Build a `Block` whose header is structurally well-formed for a
+    /// snapshot at `(height, view)` with the given state commitment.
+    /// `parent_hash` defaults to genesis's hash; tests that need a
+    /// specific parent can build their own Block.
+    fn sample_block(height: u64, view: u64, state_commitment: [u8; 32]) -> Block {
+        let parent_hash = Block::genesis([0u8; 32]).hash();
+        let commands: Vec<Bytes> = Vec::new();
+        Block {
+            header: BlockHeader {
+                parent_hash,
+                height,
+                view,
+                proposer: [0u8; 32],
+                state_commitment,
+                commands_commitment: Block::commands_commitment(&commands),
+            },
+            commands,
+        }
+    }
+
+    /// Build a quorum-bearing QC over `block_hash` for the given
+    /// validator-set length.
+    fn quorum_qc_over(vs_len: usize, block_hash: BlockHash) -> QuorumCertificate {
+        let mut qc = QuorumCertificate::new(0, block_hash, vs_len);
+        for i in 0..quorum_size(vs_len) {
+            qc.add_signature(i, [0u8; 64]);
+        }
+        qc
+    }
+
     fn sample_manifest() -> (SnapshotManifest, Vec<Bytes>) {
         let validator_set = vs(4);
-        let genesis = Block::genesis([0u8; 32]);
-        let qc = genesis_qc(&genesis, validator_set.len());
+        let block = sample_block(42, 7, [0xAB; 32]);
+        let qc = quorum_qc_over(validator_set.len(), block.hash());
         let payload = b"hello world".repeat(50_000); // 550_000 bytes
         let chunks_with_hashes = chunk_snapshot(&payload, 100_000);
         let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
         let chunks: Vec<Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
         let manifest = SnapshotManifest::build(
-            42,
-            7,
-            genesis.hash(),
-            [0xAB; 32],
+            block,
             &validator_set,
             100_000,
             chunk_hashes,
@@ -1048,22 +1131,12 @@ mod tests {
     }
 
     fn manifest_for_verify(vs: &ValidatorSet) -> SnapshotManifest {
-        let block_hash = [0xAB; 32];
-        let qc = quorum_qc(vs, block_hash);
+        let block = sample_block(42, 7, [0xCD; 32]);
+        let qc = quorum_qc(vs, block.hash());
         let payload = b"snapshot payload".repeat(4);
         let chunks = chunk_snapshot(&payload, 16);
         let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|(_, h)| *h).collect();
-        SnapshotManifest::build(
-            42,
-            7,
-            block_hash,
-            [0xCD; 32],
-            vs,
-            16,
-            chunk_hashes,
-            qc,
-            1_700_000_000,
-        )
+        SnapshotManifest::build(block, vs, 16, chunk_hashes, qc, 1_700_000_000)
     }
 
     #[test]
