@@ -899,4 +899,422 @@ mod tests {
         let s = DiskStorage::open(&path).unwrap();
         assert_eq!(s.get(b"k").unwrap().as_deref(), Some(&b"v1"[..]));
     }
+
+    // ── Disk-full / corruption / SIGKILL audits (issue #136) ──────────────
+    //
+    // These tests exercise the failure modes the persist-before-send
+    // invariant in `consensus::node::apply_safety_actions` ultimately
+    // depends on:
+    //
+    //   - ENOSPC: when the underlying filesystem can't accept the write,
+    //     `flush` / `apply_batch` must surface the error rather than
+    //     silently dropping data. The consensus loop propagates that error
+    //     up and the node exits — fail-stop is the correct safety
+    //     behavior.
+    //   - SIGKILL mid-write: even if the process dies during a redb
+    //     commit, the next reopen must observe a contiguous prefix of
+    //     LSNs (the god-byte protocol guarantees the previous commit slot
+    //     remains valid).
+    //   - Corruption: a flipped byte or truncated tail must either be
+    //     repaired transparently by redb or produce a clear error on
+    //     open / read — never silently change recovered state.
+    //
+    // ENOSPC and SIGKILL tests use the child-process re-exec pattern
+    // already established for the abort-based crash tests; corruption
+    // tests do not need a child since they manipulate the file in-place
+    // after a clean close.
+
+    const CRASH_MARKER_PATH: &str = "AMBROS_STORAGE_CRASH_MARKER_PATH";
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_disk_full_returns_error_and_preserves_durable_prefix() {
+        // ENOSPC / EFBIG audit: every flush that returned `Ok` is durable;
+        // a flush that returns `Err` does not silently advance state.
+        //
+        // The child sets `RLIMIT_FSIZE` to a value just above redb's
+        // initial allocation, ignores `SIGXFSZ` (so writes that exceed
+        // the limit return `EFBIG` instead of killing the process), then
+        // appends + flushes 8 KiB payloads one at a time, recording the
+        // last successfully flushed LSN to the marker file. When `flush`
+        // finally errors, the child exits 0; the parent reopens the WAL
+        // and asserts the recovered LSNs are exactly `1..=last_durable`.
+        let test_name =
+            "storage::disk::tests::wal_disk_full_returns_error_and_preserves_durable_prefix";
+
+        if env::var(CRASH_MODE).is_ok() {
+            disk_full_child();
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.redb");
+        let marker = tmp.path().join("marker");
+        let status = Command::new(env::current_exe().unwrap())
+            .env(CRASH_MODE, "disk_full")
+            .env(CRASH_DB_PATH, &path)
+            .env(CRASH_MARKER_PATH, &marker)
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .status()
+            .expect("failed to spawn disk-full child");
+        assert!(
+            status.success(),
+            "child must observe a flush error and exit cleanly (got {status:?})",
+        );
+
+        let last_durable: u64 = std::fs::read_to_string(&marker)
+            .expect("child should have written the marker before flush failed")
+            .trim()
+            .parse()
+            .expect("marker must be a number");
+        assert!(
+            last_durable >= 1,
+            "child must have flushed at least one entry before hitting ENOSPC (got {last_durable})",
+        );
+
+        let w = DiskWal::open(&path).expect("WAL must reopen cleanly after ENOSPC");
+        let entries: Vec<_> = w
+            .iter_from(Lsn::ZERO)
+            .unwrap()
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        let recovered: Vec<u64> = entries.iter().map(|(l, _)| l.raw()).collect();
+        let expected: Vec<u64> = (1..=last_durable).collect();
+        assert_eq!(
+            recovered, expected,
+            "recovered LSNs must equal the contiguous prefix of fully-flushed LSNs",
+        );
+    }
+
+    #[cfg(unix)]
+    fn disk_full_child() {
+        // 64 KiB payload + 4 MiB ceiling: redb's initial layout is ~1 MiB;
+        // we'll get a few flushes through before hitting EFBIG.
+        const PAYLOAD_BYTES: usize = 64 * 1024;
+        const FILE_SIZE_LIMIT: u64 = 4 * 1024 * 1024;
+        // Hard cap the loop so a future redb that grows past the limit
+        // gracefully (e.g. via compression) doesn't hang the test forever.
+        const MAX_ITERS: u64 = 10_000;
+
+        let path = env::var(CRASH_DB_PATH).unwrap();
+        let marker_path = env::var(CRASH_MARKER_PATH).unwrap();
+
+        // SAFETY: setrlimit / signal are ffi syscalls with simple integer
+        // arguments and no aliasing concerns. The signal handler is
+        // installed once before any flush; no other thread or signal path
+        // touches SIGXFSZ in this test.
+        unsafe {
+            let lim = libc::rlimit {
+                rlim_cur: FILE_SIZE_LIMIT,
+                rlim_max: FILE_SIZE_LIMIT,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &lim), 0);
+            // Ignore SIGXFSZ so the over-limit write returns EFBIG to
+            // userspace instead of killing the process (the default
+            // disposition).
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        }
+
+        // Seed the marker with 0 so the parent always finds a file (even
+        // if the very first flush errors).
+        std::fs::write(&marker_path, "0").unwrap();
+
+        let w = DiskWal::open(&path).expect("WAL must open before rlimit kicks in");
+        let payload = vec![0xABu8; PAYLOAD_BYTES];
+        for i in 1..=MAX_ITERS {
+            w.append(&payload)
+                .expect("append is in-memory and cannot fail");
+            match w.flush() {
+                Ok(()) => {
+                    std::fs::write(&marker_path, i.to_string()).unwrap();
+                }
+                Err(_) => {
+                    // Surfaced cleanly. Done.
+                    std::process::exit(0);
+                }
+            }
+        }
+        panic!("never hit ENOSPC after {MAX_ITERS} iterations — increase payload or lower limit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_disk_full_returns_error_for_apply_batch() {
+        // Same audit as the WAL test, but for the kv-store batch path
+        // that consensus's `persist_updates` actually uses.
+        let test_name = "storage::disk::tests::storage_disk_full_returns_error_for_apply_batch";
+
+        if env::var(CRASH_MODE).is_ok() {
+            storage_disk_full_child();
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("kv.redb");
+        let marker = tmp.path().join("marker");
+        let status = Command::new(env::current_exe().unwrap())
+            .env(CRASH_MODE, "storage_disk_full")
+            .env(CRASH_DB_PATH, &path)
+            .env(CRASH_MARKER_PATH, &marker)
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .status()
+            .expect("failed to spawn storage disk-full child");
+        assert!(
+            status.success(),
+            "child must observe an apply_batch error and exit cleanly (got {status:?})",
+        );
+
+        let last_durable: u64 = std::fs::read_to_string(&marker)
+            .expect("child should have written the marker before apply_batch failed")
+            .trim()
+            .parse()
+            .expect("marker must be a number");
+        assert!(
+            last_durable >= 1,
+            "child must have committed at least one batch"
+        );
+
+        let s = DiskStorage::open(&path).expect("storage must reopen cleanly after ENOSPC");
+        for i in 1..=last_durable {
+            let key = format!("k{i:08}");
+            assert!(
+                s.get(key.as_bytes()).unwrap().is_some(),
+                "key {key} from a successful batch must survive",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn storage_disk_full_child() {
+        const PAYLOAD_BYTES: usize = 64 * 1024;
+        const FILE_SIZE_LIMIT: u64 = 4 * 1024 * 1024;
+        const MAX_ITERS: u64 = 10_000;
+
+        let path = env::var(CRASH_DB_PATH).unwrap();
+        let marker_path = env::var(CRASH_MARKER_PATH).unwrap();
+
+        // SAFETY: see disk_full_child().
+        unsafe {
+            let lim = libc::rlimit {
+                rlim_cur: FILE_SIZE_LIMIT,
+                rlim_max: FILE_SIZE_LIMIT,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &lim), 0);
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        }
+
+        std::fs::write(&marker_path, "0").unwrap();
+
+        let s = DiskStorage::open(&path).expect("storage must open before rlimit kicks in");
+        let payload = vec![0xCDu8; PAYLOAD_BYTES];
+        for i in 1..=MAX_ITERS {
+            let key = format!("k{i:08}");
+            let res = s.batch(|b| {
+                b.put(key.as_bytes(), &payload);
+                Ok(())
+            });
+            match res {
+                Ok(()) => {
+                    std::fs::write(&marker_path, i.to_string()).unwrap();
+                }
+                Err(_) => std::process::exit(0),
+            }
+        }
+        panic!("never hit ENOSPC after {MAX_ITERS} iterations");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_opens_cleanly_after_sigkill_during_writes() {
+        // Partial-write audit: a SIGKILL while the WAL is in the middle
+        // of `flush()` (the only path that hits redb commit) must not
+        // corrupt the file. The next open must succeed and surface a
+        // contiguous prefix of LSNs whose count is at least the
+        // last-marker'd LSN the child reported (it may be larger if a
+        // commit slot flipped in the kernel after the marker write).
+        let test_name = "storage::disk::tests::wal_opens_cleanly_after_sigkill_during_writes";
+
+        if env::var(CRASH_MODE).is_ok() {
+            sigkill_child();
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.redb");
+        let marker = tmp.path().join("marker");
+        let mut child = Command::new(env::current_exe().unwrap())
+            .env(CRASH_MODE, "sigkill_during_writes")
+            .env(CRASH_DB_PATH, &path)
+            .env(CRASH_MARKER_PATH, &marker)
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn sigkill child");
+
+        // Poll the marker rather than sleeping a fixed interval.
+        // Child needs ~100-300ms to spin up the test runner + open
+        // redb in debug builds; once it's flushing, the marker
+        // updates on every successful flush. Kill as soon as we
+        // see a few flushes, keeping wall-clock low and avoiding
+        // a sleep that's too short on a loaded machine.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut observed: u64 = 0;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(s) = std::fs::read_to_string(&marker)
+                && let Ok(n) = s.trim().parse::<u64>()
+            {
+                observed = n;
+                if n >= 5 {
+                    break;
+                }
+            }
+        }
+        child.kill().expect("kill should succeed");
+        let _ = child.wait();
+
+        let last_durable: u64 = std::fs::read_to_string(&marker)
+            .expect("child should have written at least the seed marker")
+            .trim()
+            .parse()
+            .expect("marker must be a number");
+        assert!(
+            last_durable >= 1,
+            "child should have flushed at least once (poll observed {observed}, marker={last_durable})",
+        );
+
+        let w = DiskWal::open(&path).expect("WAL must reopen cleanly after SIGKILL");
+        let entries: Vec<_> = w
+            .iter_from(Lsn::ZERO)
+            .unwrap()
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap();
+        let recovered: Vec<u64> = entries.iter().map(|(l, _)| l.raw()).collect();
+
+        for (idx, &lsn) in recovered.iter().enumerate() {
+            assert_eq!(
+                lsn,
+                (idx as u64) + 1,
+                "recovered LSNs must form a contiguous prefix starting at 1",
+            );
+        }
+        assert!(
+            (recovered.len() as u64) >= last_durable,
+            "recovered count ({}) must be >= last marker'd LSN ({})",
+            recovered.len(),
+            last_durable,
+        );
+    }
+
+    #[cfg(unix)]
+    fn sigkill_child() {
+        let path = env::var(CRASH_DB_PATH).unwrap();
+        let marker_path = env::var(CRASH_MARKER_PATH).unwrap();
+
+        // Seed so the parent always finds the marker file even if SIGKILL
+        // hits before the first flush.
+        std::fs::write(&marker_path, "0").unwrap();
+
+        let w = DiskWal::open(&path).unwrap();
+        for i in 1u64.. {
+            w.append(format!("entry-{i}").as_bytes()).unwrap();
+            w.flush().unwrap();
+            // Best-effort marker; an intervening SIGKILL is the whole
+            // point. `_ = ` instead of `.unwrap()` because the parent may
+            // have torn down the temp dir between the write and us
+            // re-checking errno.
+            let _ = std::fs::write(&marker_path, i.to_string());
+        }
+    }
+
+    #[test]
+    fn wal_open_rejects_garbled_header() {
+        // Corruption audit, level 1: a flipped byte in the redb file
+        // header (the very first page, which holds the magic bytes,
+        // the layout, and the god-byte) must be caught at open. This
+        // is the strongest corruption-detection guarantee redb gives
+        // us, and the operator runbook in `docs/storage-durability.md`
+        // depends on it ("if the WAL is corrupt, the node will refuse
+        // to start").
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.redb");
+
+        let w = DiskWal::open(&path).unwrap();
+        for i in 0..16u32 {
+            w.append(format!("entry-{i}").as_bytes()).unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+
+        // Corrupt several bytes inside the magic-number / header
+        // region at offset 0. A single-byte flip is enough in
+        // practice (the magic number check fails), but we flip a
+        // small range to be robust to future redb header layout
+        // changes.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            let mut buf = [0u8; 16];
+            f.read_exact(&mut buf).unwrap();
+            for b in &mut buf {
+                *b ^= 0xFF;
+            }
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&buf).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Open MUST fail — either with `Err` or by panicking from
+        // inside redb (we accept both as "fail-loud"; the operator
+        // sees the node refuse to start). Silently returning an
+        // empty/recovered WAL would be a safety bug.
+        let result = std::panic::catch_unwind(|| DiskWal::open(&path));
+        if let Ok(Ok(_)) = result {
+            panic!("DiskWal::open must reject a header-corrupted file (got Ok)");
+        }
+    }
+
+    #[test]
+    fn wal_open_after_random_garbage_overwrite_does_not_silently_succeed() {
+        // Corruption audit, level 2: overwrite the entire file with
+        // a deterministic-but-invalid pattern. redb's magic-number
+        // and layout checks should reject it at open; no path should
+        // return a wrongly-recovered set of entries.
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.redb");
+
+        let w = DiskWal::open(&path).unwrap();
+        for i in 0..16u32 {
+            w.append(format!("entry-{i}").as_bytes()).unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            let garbage: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            f.write_all(&garbage).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let result = std::panic::catch_unwind(|| DiskWal::open(&path));
+        if let Ok(Ok(_)) = result {
+            panic!("DiskWal::open must reject a fully overwritten file");
+        }
+    }
 }

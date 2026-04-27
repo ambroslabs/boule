@@ -389,8 +389,7 @@ fn default_snapshot_chunk_size_bytes() -> u32 {
 }
 
 /// Configuration for the p2p layer that is independent of the overlay
-/// mode and consensus wiring. Currently exposes only the rate-limiting
-/// and connection-cap knobs introduced in issue #134.
+/// mode and consensus wiring.
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct P2pConfig {
     /// `[p2p.limits]` sub-table. Optional: when absent, no rate
@@ -400,6 +399,19 @@ pub struct P2pConfig {
     /// [`P2pLimitsConfig::production_defaults`].
     #[serde(default)]
     pub limits: Option<P2pLimitsConfig>,
+    /// Outbound-only mode (issue #138). When `true` the node skips
+    /// binding the TCP listener and never accepts new inbound
+    /// connections, but still dials peers over outbound TCP/TLS and
+    /// uses each established session bidirectionally. Suitable for
+    /// validators behind a NAT or asymmetric firewall.
+    ///
+    /// A node running in this mode MUST configure either
+    /// `[overlay] bootstrap_addrs = [...]` or `[[peers]]` so it has
+    /// somewhere to dial out to; the gossip overlay also publishes
+    /// `reachable = false` in its peer-list gossip so the rest of the
+    /// cluster knows not to attempt to dial back.
+    #[serde(default)]
+    pub inbound_disabled: bool,
 }
 
 /// Per-peer rate limits + connection caps. Surfaced as the
@@ -1437,6 +1449,37 @@ bootstrap_addrs = ["10.0.0.1:7000", "[::1]:7000"]
         assert_eq!(c.overlay.bootstrap_addrs.len(), 2);
         assert_eq!(c.overlay.bootstrap_addrs[0].port(), 7000);
         assert!(c.overlay.bootstrap_addrs[1].is_ipv6());
+    }
+
+    #[test]
+    fn p2p_inbound_disabled_defaults_to_false() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+"#,
+        );
+        assert!(!c.p2p.inbound_disabled);
+    }
+
+    #[test]
+    fn p2p_inbound_disabled_parses_when_set() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[p2p]
+inbound_disabled = true
+"#,
+        );
+        assert!(c.p2p.inbound_disabled);
     }
 
     #[test]

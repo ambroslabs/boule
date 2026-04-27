@@ -193,12 +193,21 @@ pub struct SpawnArgs {
     /// frames and as the self-filter on the peer table.
     pub self_id: NodeId,
     /// Local listening address. When `Some`, the publisher injects a
-    /// `(self_id, listen_addr, now)` self-entry into every published
-    /// peer-list frame so peers can learn our listening port even
-    /// when they only ever saw us via an inbound connection (whose
-    /// source port is ephemeral). `None` only in unit tests that
-    /// don't exercise peer-list propagation.
+    /// `(self_id, listen_addr, now, self_reachable)` self-entry into
+    /// every published peer-list frame so peers can learn our
+    /// listening port even when they only ever saw us via an inbound
+    /// connection (whose source port is ephemeral). `None` is the
+    /// outbound-only case (issue #138's `[p2p] inbound_disabled =
+    /// true`) and also the unit-test case where peer-list propagation
+    /// isn't exercised.
     pub self_listen_addr: Option<std::net::SocketAddr>,
+    /// Whether the local node accepts inbound connections (issue #138).
+    /// Carried into the publisher's [`SelfAdvertise`] so the rest of
+    /// the cluster knows whether to dial us. Set `false` for nodes
+    /// running with `[p2p] inbound_disabled = true`. Has no effect
+    /// when `self_listen_addr` is `None` because the publisher then
+    /// injects no self-entry at all.
+    pub self_reachable: bool,
     /// Inbound `ProtocolEvent` stream from
     /// [`crate::p2p::PeerCommand::RegisterProtocol`].
     pub event_rx: mpsc::Receiver<ProtocolEvent>,
@@ -268,6 +277,7 @@ impl GossipOverlay {
         let SpawnArgs {
             self_id,
             self_listen_addr,
+            self_reachable,
             event_rx,
             sink,
             dialer,
@@ -305,6 +315,7 @@ impl GossipOverlay {
         let self_advertise = self_listen_addr.map(|addr| SelfAdvertise {
             node_id: self_id,
             addr,
+            reachable: self_reachable,
         });
         let publisher_join = tokio::spawn(run_peer_list_publisher(
             config.peer_list.clone(),
@@ -690,6 +701,7 @@ mod tests {
         let handles = GossipOverlay::spawn(SpawnArgs {
             self_id,
             self_listen_addr: None,
+            self_reachable: true,
             event_rx,
             sink: sink.clone() as Arc<dyn OverlayUnicast>,
             dialer,
@@ -985,11 +997,13 @@ mod tests {
                 node_id: nid(5),
                 addr: addr(7005),
                 last_seen_unix_ms: 100,
+                reachable: true,
             },
             PeerEntry {
                 node_id: nid(6),
                 addr: addr(7006),
                 last_seen_unix_ms: 200,
+                reachable: true,
             },
         ];
         s.event_tx
@@ -1093,6 +1107,7 @@ mod tests {
         let mut handles = GossipOverlay::spawn(SpawnArgs {
             self_id: nid(1),
             self_listen_addr: None,
+            self_reachable: true,
             event_rx,
             sink: sink.clone() as Arc<dyn OverlayUnicast>,
             dialer,

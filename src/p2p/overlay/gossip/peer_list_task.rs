@@ -85,21 +85,30 @@ pub trait DirectPeers: Send + Sync + 'static {
     fn snapshot(&self) -> Vec<NodeId>;
 }
 
-/// `(node_id, listen_addr)` injected into every published peer-list
-/// frame so receivers learn the publisher's listening address.
+/// `(node_id, listen_addr, reachable)` injected into every published
+/// peer-list frame so receivers learn the publisher's listening
+/// address and whether it accepts inbound connections.
 ///
 /// Without this, a node that learned about a peer only via an inbound
 /// connection would carry the peer's ephemeral source port in its
 /// `PeerTable` and gossip a non-dialable address. The remedy is for
 /// every node to self-advertise: each tick the publisher prepends its
-/// own `(node_id, listen_addr, now_unix_ms)` to the snapshot before
-/// encoding.
+/// own `(node_id, listen_addr, now_unix_ms, reachable)` to the
+/// snapshot before encoding.
+///
+/// `reachable = false` is the outbound-only case (issue #138's
+/// `[p2p] inbound_disabled = true`): the partial-mesh maintenance
+/// loop on every other node skips us when picking dial candidates,
+/// so we never get spurious connect attempts from peers that would
+/// then time out at our (absent) listener.
 #[derive(Debug, Clone, Copy)]
 pub struct SelfAdvertise {
     /// Local NodeId.
     pub node_id: NodeId,
     /// Local listening address (post-`bind`, with the actual port).
     pub addr: SocketAddr,
+    /// Whether the local node accepts inbound connections.
+    pub reachable: bool,
 }
 
 /// Build the postcard wire bytes for a peer-list push, optionally
@@ -249,6 +258,7 @@ fn tick_once(
         node_id: s.node_id,
         addr: s.addr,
         last_seen_unix_ms: now_unix_ms(),
+        reachable: s.reachable,
     });
     let frame = build_peer_list_frame(table, self_entry, config.max_entries);
     for target in peers {
@@ -370,11 +380,13 @@ mod tests {
                 node_id: nid(1),
                 addr: addr(7001),
                 last_seen_unix_ms: 200,
+                reachable: true,
             },
             PeerEntry {
                 node_id: nid(2),
                 addr: addr(7002),
                 last_seen_unix_ms: 150,
+                reachable: true,
             },
         ]);
         let bytes = postcard::to_stdvec(&incoming).unwrap();
@@ -471,6 +483,73 @@ mod tests {
                 OverlayFrame::PeerList(_) => {}
                 other => panic!("expected PeerList, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn publisher_self_advertises_reachable_flag() {
+        // Issue #138: an outbound-only node injects its own self-entry
+        // with reachable=false so peers know not to attempt to dial it.
+        let table = PeerTable::new(nid(0), 16);
+        let direct = Arc::new(LockedVec::new());
+        direct.set(vec![nid(1)]);
+        let sink = Arc::new(RecordingSink::default());
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+
+        let cfg = PeerListGossipConfig {
+            interval: Duration::from_secs(1),
+            fanout: 1,
+            max_entries: None,
+        };
+
+        let advertise = SelfAdvertise {
+            node_id: nid(0),
+            addr: addr(7000),
+            reachable: false,
+        };
+
+        let (sd_tx, sd_rx) = oneshot::channel();
+        let task = tokio::spawn({
+            let direct = direct.clone() as Arc<dyn DirectPeers>;
+            let sink = sink.clone() as Arc<dyn OverlayUnicast>;
+            let table = table.clone();
+            let clock = clock.clone();
+            run_peer_list_publisher(
+                cfg,
+                table,
+                direct,
+                sink,
+                clock,
+                /* seed */ 7,
+                Some(advertise),
+                sd_rx,
+            )
+        });
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let _ = sd_tx.send(());
+        let _ = task.await;
+
+        let sent = sink.sent.lock();
+        assert!(!sent.is_empty(), "publisher fired at least once");
+        let (_, payload) = sent.first().unwrap();
+        match postcard::from_bytes::<OverlayFrame>(payload).unwrap() {
+            OverlayFrame::PeerList(entries) => {
+                let self_entry = entries
+                    .iter()
+                    .find(|e| e.node_id == nid(0))
+                    .expect("self-entry present");
+                assert!(
+                    !self_entry.reachable,
+                    "outbound-only node must self-advertise reachable=false"
+                );
+                assert_eq!(self_entry.addr, addr(7000));
+            }
+            other => panic!("expected PeerList, got {other:?}"),
         }
     }
 

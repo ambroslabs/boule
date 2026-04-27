@@ -14,7 +14,11 @@ use crate::config::PeerConfig;
 pub struct TlsConnectionProtocol {
     pub identity: Arc<TlsIdentity>,
     pub peers: Vec<PeerConfig>,
-    pub listener: TcpListener,
+    /// `Some` for normal nodes that accept inbound connections; `None`
+    /// when the node is in outbound-only mode (issue #138's
+    /// `[p2p] inbound_disabled = true`). When `None`, no listener task
+    /// is spawned and the node only ever participates as a dialer.
+    pub listener: Option<TcpListener>,
     pub clock: Arc<dyn Clock>,
     /// Optional handle back into the peer manager's command channel so the
     /// dialer can ask whether a peer is already connected before redialing
@@ -29,12 +33,14 @@ impl ConnectionProtocol for TlsConnectionProtocol {
         manager_tx: mpsc::Sender<ManagerMsg>,
         peer_gone_tx: broadcast::Sender<NodeId>,
     ) {
-        tokio::spawn(listener::run(
-            self.listener,
-            self.identity.acceptor.clone(),
-            self.identity.node_id,
-            manager_tx.clone(),
-        ));
+        if let Some(listener) = self.listener {
+            tokio::spawn(listener::run(
+                listener,
+                self.identity.acceptor.clone(),
+                self.identity.node_id,
+                manager_tx.clone(),
+            ));
+        }
 
         let dialer_ctx = DialerCtx {
             identity: Arc::clone(&self.identity),
