@@ -408,10 +408,7 @@ impl SnapshotStore {
             .into_iter()
             .map(|(k, _v)| k)
             .collect::<Vec<_>>();
-        let new_latest = self
-            .list_heights()?
-            .into_iter()
-            .rfind(|h| *h != height);
+        let new_latest = self.list_heights()?.into_iter().rfind(|h| *h != height);
         self.storage.batch(|b| {
             b.delete(&manifest_storage_key(height));
             for k in &chunk_keys {
