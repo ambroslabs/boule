@@ -9,13 +9,17 @@ re-init rather than from the disk).
 The TL;DR for an operator: the node fails *loudly* on disk problems —
 ENOSPC, corruption, and crashes mid-write all manifest as the consensus
 loop returning an error, which terminates the node. There is no silent
-loss path on the persist-before-send chain. The two known limits are
-(a) redb does not verify per-page checksums on normal reads (only during
-explicit `check_integrity` or on the post-crash repair scan), so a flipped
-data byte may surface as a malformed payload at the consensus layer rather
-than as a clean storage error, and (b) the operator runbook below is the
-manual recovery procedure — there is no automatic state-sync from peers
-yet (tracked separately).
+loss path on the persist-before-send chain. The remaining known limit is
+that the operator runbook below is the manual recovery procedure — there
+is no automatic state-sync from peers yet (tracked separately).
+
+Page-level corruption that escapes redb's per-page xxhash3 (which redb
+only verifies during repair, not on every read) is now caught by two
+layers of defense-in-depth: `DiskStorage::open` calls
+`Database::check_integrity()` once at startup, and `DiskWal` prepends an
+8-byte SHA-256-truncated checksum to every entry that
+`DiskWal::iter_from` recomputes and verifies on every read. See
+"Page-level corruption: read-time and open-time checks" below.
 
 ## What the persist-before-send invariant actually persists
 
@@ -44,7 +48,9 @@ safety-relevant data when block log replay lands.
 | Durability per commit         | `Durability::Immediate` (the redb default)     | redb's `WriteTransaction` defaults to `Immediate` — fsyncs before `commit()` returns            |
 | 2-phase commit                | Off (the redb default — single-phase commit)   | See "Trade-offs" below                                                                          |
 | Page checksum (on-write)      | xxhash3 over every leaf and branch page        | `redb::tree_store::btree_base::leaf_checksum` / `branch_checksum`                               |
-| Page checksum (on-read)       | **Not validated by default**                   | `verify_checksum_helper` is only called from explicit `check_integrity` and the repair scan     |
+| Page checksum (on-read)       | Not validated by redb on every read            | `verify_checksum_helper` is only called from explicit `check_integrity` and the repair scan     |
+| Open-time integrity scan (KV) | `Database::check_integrity()` on every open    | [`DiskStorage::open`](../src/storage/disk.rs) — full-file xxhash3 walk, cheap because KV is small |
+| Per-entry checksum (WAL)      | 8-byte SHA-256 prefix on every entry           | [`DiskWal::flush`](../src/storage/disk.rs) writes it, [`DiskWal::iter_from`](../src/storage/disk.rs) verifies it |
 | File grow strategy            | redb manages — initial layout ~1 MiB usable    | `MIN_DESIRED_USABLE_BYTES = 1 MiB` in redb's `page_manager.rs`                                  |
 | `Storage::apply_batch` fsync  | One fsync per `commit` call                    | `DiskStorage::apply_batch` → `txn.commit()`                                                     |
 | `Storage::compare_and_swap`   | Mismatch path skips commit (no fsync)          | [`DiskStorage::compare_and_swap`](../src/storage/disk.rs) — returns `Ok(false)` before committing |
@@ -59,15 +65,16 @@ safety-relevant data when block log replay lands.
   attacker-controlled crash sequence with adversarial workload — see the
   threat model in `redb::WriteTransaction::set_two_phase_commit`'s docs.
   We are not in that threat model.
-- **Read-time checksum verification.** redb writes per-page xxhash3
-  checksums but only verifies them during the post-crash repair scan
-  and the explicit `Database::check_integrity` call. We do not call
-  `check_integrity` on open. The reasoning: it's a full file scan, and
-  the consensus layer signs every block and every QC, so a bit-flipped
-  payload that survives the page checksum will fail signature/hash
-  validation at the protocol layer — fail-loud, just one layer up.
-  *Caveat:* this is a noisier failure mode (decode error rather than
-  storage error). Tracked as a follow-up — see "Known gaps" below.
+- **Read-time page-checksum verification across the entire WAL on every
+  open.** We considered calling `Database::check_integrity()` on
+  `DiskWal::open` but rejected it because it's a full file scan; on a
+  multi-GB WAL the cost would dominate startup. Instead we prepend a
+  per-entry SHA-256-truncated checksum to every flushed WAL entry and
+  verify it on read — see "Page-level corruption: read-time and
+  open-time checks" below. The KV file gets the full
+  `check_integrity()` scan because its size is bounded by HotStuff's
+  control-plane state (a small fixed set of keys plus the blocks the
+  active QCs reference).
 
 ## Failure-mode audit
 
@@ -130,10 +137,61 @@ and
   recovery to a wrong state.
 - A full-file overwrite with garbage is rejected at open for the same
   reason (magic-number mismatch).
-- A flipped byte deep inside a *payload data page* is **not always
-  caught by redb on read** — see "Known gaps" below.
+- A flipped byte deep inside a *payload data page* is **not caught by
+  redb on read** — but it now is by the layer we own. See
+  "Page-level corruption: read-time and open-time checks" below.
 
 **Operator action:** see [Operator runbook](#operator-runbook).
+
+### Page-level corruption: read-time and open-time checks
+
+redb writes a per-page xxhash3 on commit but does not verify it on
+normal reads — the verification path runs only during the post-crash
+repair scan and the explicit `Database::check_integrity()` call. Without
+the mitigations below, a bit flip deep inside a payload data page (e.g.
+from a bad sector that the OS / filesystem still hands back) would
+round-trip through `Storage::get` / `Wal::iter_from` and surface
+later as a malformed-message decode error at the consensus layer — fail-
+loud (every block and QC is signed and hash-chained), but a confusing
+diagnostic.
+
+We close that gap from both sides:
+
+- **KV file** ([`DiskStorage::open`](../src/storage/disk.rs)). Calls
+  `Database::check_integrity()` once on every open. This is a full
+  page-checksum walk of the file. We can afford it because the KV file
+  is bounded by HotStuff's control-plane state — `last_voted_view`,
+  `locked_qc`, `high_qc`, plus the blocks those QCs reference (only
+  the active tip is needed for safety; older blocks beyond a snapshot
+  watermark can be pruned). The
+  [`bench_check_integrity_open_cost`](../src/storage/disk.rs)
+  benchmark (release build, Apple M-series, redb 4.1, in-tree
+  `#[ignore]`d test) measured the scan at ~20 ms for a fresh DB,
+  ~23 ms for 1 000 1-KiB blocks (~2.7 MB file), and ~34 ms for 10 000
+  blocks (~21 MB file). That's a couple of orders of magnitude below
+  the existing TLS handshake / peer-discovery startup cost and well
+  bounded by the small KV size. Tested by
+  [`storage_open_check_integrity_detects_payload_page_corruption`](../src/storage/disk.rs).
+- **WAL file** ([`DiskWal::flush`](../src/storage/disk.rs) /
+  [`DiskWal::iter_from`](../src/storage/disk.rs)). Each flushed entry
+  is stored as `[checksum:8][payload]` where the checksum is the first
+  8 bytes of `SHA-256(payload)`. `iter_from` recomputes and verifies
+  it on every read. We do *not* call `check_integrity()` on WAL open
+  because the WAL is unbounded in size (one entry per consensus
+  decision, plus block log replay when that lands), so a startup-time
+  full-file scan would not amortize. The per-read verification covers
+  the same gap and scales with the entries the caller actually reads.
+  Tested by
+  [`wal_iter_detects_byte_flip_inside_payload_data_page`](../src/storage/disk.rs).
+
+The SHA-256 truncation is overkill for tamper detection (we are
+guarding against bit flips on local disk, not adversarial collisions),
+but `sha2` is already a dependency and the per-entry overhead is ~1 µs
+on modern hardware — comfortably below the consensus per-step budget.
+
+**Operator action:** the node refuses to start (KV) or fails when
+consensus replays the WAL (per-entry checksum). Either way, see
+[Operator runbook](#operator-runbook).
 
 ### Truncated tail (e.g. partial write of a torn page)
 
@@ -158,24 +216,14 @@ These are real limitations the audit surfaced; each is small enough that
 fixing it is plausible inline but large enough that it deserves its own
 issue rather than bundling here.
 
-1. **redb does not verify page checksums on normal reads.** A flipped
-   byte in a payload data page will not raise a storage-layer error —
-   the consensus layer catches it later via its own
-   signature/hash validation, but the failure mode is "decode error from
-   a peer-looking message" rather than "storage corruption detected".
-   The fix is one of: (a) call `Database::check_integrity()` on open
-   (full file scan, slow on large WALs), (b) wrap each WAL entry with
-   our own CRC, or (c) lobby upstream redb to add an opt-in
-   read-time-verify mode. Tracked as [#233][issue-233].
-
-2. **No automatic peer state-sync on a corrupt WAL.** The current
+1. **No automatic peer state-sync on a corrupt WAL.** The current
    recovery procedure is "restore from a backup or wipe and re-join the
    cluster". Eventually a node should be able to detect "my WAL is
    unrecoverable" and request a snapshot from peers; that's mentioned
    in the issue but is out of scope for this audit. Tracked as the
    block/state-sync work — see [#136][issue-136] body for the pointer.
 
-3. **Hand-truncated files panic instead of returning `Err`.** Functionally
+2. **Hand-truncated files panic instead of returning `Err`.** Functionally
    fail-loud (the node exits and refuses to start), but uglier than an
    `Err(Corrupted)`. We don't expect this to happen in practice —
    the only realistic way to get a torn file is a crash mid-write, and
@@ -239,4 +287,3 @@ unmounted, permissions changed, hardware fault), fix it, and restart.
 
 [issue-136]: https://github.com/zrbecker/ambros-p2p/issues/136
 [issue-197]: https://github.com/zrbecker/ambros-p2p/issues/197
-[issue-233]: https://github.com/zrbecker/ambros-p2p/issues/233
