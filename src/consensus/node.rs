@@ -1089,10 +1089,33 @@ impl ConsensusNode {
                         Ok(DiscoveryEvent::PeerAdded(node_id)) => {
                             tracing::debug!("consensus: peer added {node_id:?}");
                             self.peers_connected.insert(node_id);
+                            // Snapshot-sync (#230): a freshly-added peer
+                            // can immediately serve chunks. The state
+                            // machine is a no-op outside `Fetching`.
+                            let actions = self.snapshot_sync.add_candidate(node_id);
+                            self.apply_snapshot_sync_actions(
+                                actions,
+                                broadcaster.as_ref(),
+                                &mut view_timer,
+                                &signer,
+                            )
+                            .await?;
                         }
                         Ok(DiscoveryEvent::PeerRemoved(node_id)) => {
                             tracing::debug!("consensus: peer removed {node_id:?}");
                             self.peers_connected.remove(&node_id);
+                            // Snapshot-sync (#230): drop from candidate
+                            // set, reassign in-flight chunks. The state
+                            // machine handles non-`Fetching` states as
+                            // no-ops.
+                            let actions = self.snapshot_sync.on_peer_disconnected(node_id);
+                            self.apply_snapshot_sync_actions(
+                                actions,
+                                broadcaster.as_ref(),
+                                &mut view_timer,
+                                &signer,
+                            )
+                            .await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             // Resync from the snapshot — the cache is the
@@ -4627,6 +4650,429 @@ mod tests {
             .is_none(),
             "joiner must not emit chunk requests after aborting",
         );
+    }
+
+    /// Joiner multi-source happy path (#230 acceptance criterion 1):
+    /// 3 peers serve the same snapshot in parallel. Drives the
+    /// fetch end-to-end via in-memory dispatch and asserts that
+    /// chunks were served from ≥ 2 distinct peers (the workpool
+    /// fanned out instead of pinning the primary).
+    ///
+    /// To keep the test compact, "servers" are simulated as a
+    /// single shared `SnapshotStore` looked up by chunk index;
+    /// the routing layer attributes each request to the peer it
+    /// was addressed to, and the returned response is decoded by
+    /// the joiner's `apply_dispatch`. This exercises the same
+    /// joiner-side code paths as full multi-`ConsensusNode`
+    /// scaffolding without spinning up redundant nodes.
+    #[tokio::test]
+    async fn joiner_multi_source_fan_out_uses_at_least_two_peers() {
+        // 3 server pubkeys + 1 joiner. The joiner observes
+        // proposals from each of the 3 servers.
+        let server_signers: Vec<NodeSigner> = (0..3).map(|_| fresh_signer()).collect();
+        let server_ids: Vec<NodeId> = server_signers.iter().map(|s| s.node_id()).collect();
+        let joiner_signer = fresh_signer();
+        let mut all_ids = server_ids.clone();
+        all_ids.push(joiner_signer.node_id());
+        let vs = ValidatorSet::new(all_ids);
+
+        // Seed the SM via `restore` to a large counter value so
+        // the postcard-encoded snapshot is wide enough to slice
+        // into multiple chunks. (Calling `apply(Increment)` enough
+        // times to reach a multi-byte varint would take 2M+
+        // iterations.)
+        let big_value: u64 = u64::MAX;
+        let snapshot_payload = bytes::Bytes::from(postcard::to_stdvec(&big_value).unwrap());
+        let server_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        server_sm.lock().restore(&snapshot_payload).unwrap();
+        let expected_commitment = server_sm.lock().state_commitment();
+        // 2-byte chunks over the ~10-byte u64::MAX postcard varint
+        // → ≥ 4 chunks for the workpool to fan out across.
+        let chunks_with_hashes = crate::replication::snapshot::chunk_snapshot(&snapshot_payload, 2);
+        assert!(chunks_with_hashes.len() >= 4, "need ≥ 4 chunks for fanout");
+        let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
+        let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
+        let snapshot_block = {
+            let parent_hash = genesis().hash();
+            let commands: Vec<bytes::Bytes> = Vec::new();
+            crate::replication::block::Block {
+                header: crate::replication::block::BlockHeader {
+                    parent_hash,
+                    height: 50,
+                    view: 50,
+                    proposer: server_ids[0],
+                    state_commitment: expected_commitment,
+                    commands_commitment: crate::replication::block::Block::commands_commitment(
+                        &commands,
+                    ),
+                },
+                commands,
+            }
+        };
+        let mut commit_qc = QuorumCertificate::new(50, snapshot_block.hash(), vs.len());
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
+            commit_qc.add_signature(i, [0u8; 64]);
+        }
+        let manifest = crate::replication::snapshot::SnapshotManifest::build(
+            snapshot_block.clone(),
+            &vs,
+            2,
+            chunk_hashes,
+            commit_qc,
+            1_700_000_000,
+        );
+        manifest.verify(&vs).expect("manifest must verify");
+
+        // ── Build the joiner ──────────────────────────────────────
+        let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let joiner_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        let mut joiner_node = ConsensusNode::new(
+            joiner_signer.node_id(),
+            snapshot_test_config_enabled(vs.clone(), 50),
+            Arc::clone(&joiner_sm),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&joiner_storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
+        let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut joiner_view_timer = ViewTimer::new(timer_tx);
+
+        // ── Step 1: feed the joiner a proposal from each server ──────
+        // Each observation accumulates the proposer into the
+        // candidate pool the snapshot_sync will use once the fetch
+        // starts.
+        for s in &server_signers {
+            let proposal = synthetic_proposal_dispatch(s, 100, 100, [0xEE; 32]);
+            joiner_node
+                .apply_dispatch(
+                    proposal,
+                    joiner_bc.as_ref(),
+                    &mut joiner_view_timer,
+                    &joiner_signer_arc,
+                )
+                .await
+                .expect("joiner apply_dispatch proposal");
+        }
+
+        // ── Step 2: extract the manifest request and synthesize a
+        //   response from the primary server (whichever one was
+        //   asked).
+        let (manifest_to, manifest_req_payload) = drain_until(&mut joiner_outbound, |w| {
+            matches!(w, WireMessage::SnapshotManifestRequest { .. })
+        })
+        .await
+        .expect("manifest request");
+        let primary = manifest_to;
+        let _ = manifest_req_payload;
+        let resp_payload = postcard::to_stdvec(&WireMessage::SnapshotManifestResponse(Some(
+            manifest.clone(),
+        )))
+        .unwrap();
+        let dispatches =
+            dispatch::ingress(primary, &resp_payload, &vs).expect("ingress manifest response");
+        for d in dispatches {
+            joiner_node
+                .apply_dispatch(
+                    d,
+                    joiner_bc.as_ref(),
+                    &mut joiner_view_timer,
+                    &joiner_signer_arc,
+                )
+                .await
+                .expect("joiner apply_dispatch manifest response");
+        }
+
+        // ── Step 3: shuttle every emitted chunk request →
+        //   synthesized response, using the chunk_idx to look up
+        //   the canonical chunk bytes. Track which peers were used
+        //   to drive each chunk so the test can assert fanout.
+        let mut chunk_peer_count: HashMap<NodeId, u32> = HashMap::new();
+        // Bound the loop so a state-machine bug doesn't hang the test.
+        for _ in 0..(manifest.chunk_count + 16) {
+            let req = drain_until(&mut joiner_outbound, |w| {
+                matches!(w, WireMessage::SnapshotChunkRequest { .. })
+            })
+            .await;
+            let Some((peer, chunk_req_payload)) = req else {
+                break;
+            };
+            let req_wire: WireMessage = postcard::from_bytes(&chunk_req_payload).unwrap();
+            let (height, chunk_idx) = match req_wire {
+                WireMessage::SnapshotChunkRequest { height, chunk_idx } => (height, chunk_idx),
+                other => panic!("expected SnapshotChunkRequest, got {other:?}"),
+            };
+            *chunk_peer_count.entry(peer).or_insert(0) += 1;
+            // Synthesize the chunk response from the canonical
+            // store (any "server" has the same chunks).
+            let resp = WireMessage::SnapshotChunkResponse {
+                height,
+                chunk_idx,
+                payload: Some(chunks[chunk_idx as usize].clone()),
+            };
+            let resp_payload = postcard::to_stdvec(&resp).unwrap();
+            let dispatches =
+                dispatch::ingress(peer, &resp_payload, &vs).expect("ingress chunk response");
+            for d in dispatches {
+                joiner_node
+                    .apply_dispatch(
+                        d,
+                        joiner_bc.as_ref(),
+                        &mut joiner_view_timer,
+                        &joiner_signer_arc,
+                    )
+                    .await
+                    .expect("joiner apply_dispatch chunk response");
+            }
+            if joiner_node.snapshot_sync.is_done() {
+                break;
+            }
+        }
+
+        // ── Assertions ────────────────────────────────────────────
+        assert!(
+            joiner_node.snapshot_sync.is_done(),
+            "joiner must complete the multi-source fetch",
+        );
+        assert_eq!(
+            joiner_node.last_committed_height, 50,
+            "joiner's last_committed_height must equal snapshot height",
+        );
+        assert_eq!(
+            joiner_sm.lock().state_commitment(),
+            expected_commitment,
+            "joiner's state machine commitment must match the snapshot's",
+        );
+        let distinct_peer_count = chunk_peer_count.len();
+        assert!(
+            distinct_peer_count >= 2,
+            "workpool must fan out across ≥ 2 peers; got {distinct_peer_count}: {chunk_peer_count:?}",
+        );
+    }
+
+    /// Joiner mid-fetch peer drop (#230 acceptance criterion 2):
+    /// after a peer is dropped via `DiscoveryEvent::PeerRemoved`,
+    /// the joiner reassigns its in-flight chunks to surviving
+    /// peers and completes the fetch. Driven through the same
+    /// in-memory shuttle as the happy-path test.
+    #[tokio::test]
+    async fn joiner_completes_fetch_after_one_peer_disconnects() {
+        let server_signers: Vec<NodeSigner> = (0..3).map(|_| fresh_signer()).collect();
+        let server_ids: Vec<NodeId> = server_signers.iter().map(|s| s.node_id()).collect();
+        let joiner_signer = fresh_signer();
+        let mut all_ids = server_ids.clone();
+        all_ids.push(joiner_signer.node_id());
+        let vs = ValidatorSet::new(all_ids);
+
+        let big_value: u64 = u64::MAX;
+        let snapshot_payload = bytes::Bytes::from(postcard::to_stdvec(&big_value).unwrap());
+        let server_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        server_sm.lock().restore(&snapshot_payload).unwrap();
+        let expected_commitment = server_sm.lock().state_commitment();
+        let chunks_with_hashes = crate::replication::snapshot::chunk_snapshot(&snapshot_payload, 2);
+        let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
+        let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
+        let snapshot_block = {
+            let parent_hash = genesis().hash();
+            let commands: Vec<bytes::Bytes> = Vec::new();
+            crate::replication::block::Block {
+                header: crate::replication::block::BlockHeader {
+                    parent_hash,
+                    height: 50,
+                    view: 50,
+                    proposer: server_ids[0],
+                    state_commitment: expected_commitment,
+                    commands_commitment: crate::replication::block::Block::commands_commitment(
+                        &commands,
+                    ),
+                },
+                commands,
+            }
+        };
+        let mut commit_qc = QuorumCertificate::new(50, snapshot_block.hash(), vs.len());
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
+            commit_qc.add_signature(i, [0u8; 64]);
+        }
+        let manifest = crate::replication::snapshot::SnapshotManifest::build(
+            snapshot_block.clone(),
+            &vs,
+            2,
+            chunk_hashes,
+            commit_qc,
+            1_700_000_000,
+        );
+
+        let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let joiner_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        let mut joiner_node = ConsensusNode::new(
+            joiner_signer.node_id(),
+            snapshot_test_config_enabled(vs.clone(), 50),
+            Arc::clone(&joiner_sm),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&joiner_storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
+        let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut joiner_view_timer = ViewTimer::new(timer_tx);
+
+        for s in &server_signers {
+            let proposal = synthetic_proposal_dispatch(s, 100, 100, [0xEE; 32]);
+            joiner_node
+                .apply_dispatch(
+                    proposal,
+                    joiner_bc.as_ref(),
+                    &mut joiner_view_timer,
+                    &joiner_signer_arc,
+                )
+                .await
+                .expect("joiner apply_dispatch proposal");
+        }
+
+        let (primary, _) = drain_until(&mut joiner_outbound, |w| {
+            matches!(w, WireMessage::SnapshotManifestRequest { .. })
+        })
+        .await
+        .expect("manifest request");
+        let resp_payload = postcard::to_stdvec(&WireMessage::SnapshotManifestResponse(Some(
+            manifest.clone(),
+        )))
+        .unwrap();
+        let dispatches =
+            dispatch::ingress(primary, &resp_payload, &vs).expect("ingress manifest response");
+        for d in dispatches {
+            joiner_node
+                .apply_dispatch(
+                    d,
+                    joiner_bc.as_ref(),
+                    &mut joiner_view_timer,
+                    &joiner_signer_arc,
+                )
+                .await
+                .expect("joiner apply_dispatch manifest response");
+        }
+
+        // Serve exactly one chunk to ensure the workpool has
+        // distributed requests, then drop a peer that's actually
+        // serving chunks.
+        let (first_peer, first_payload) = drain_until(&mut joiner_outbound, |w| {
+            matches!(w, WireMessage::SnapshotChunkRequest { .. })
+        })
+        .await
+        .expect("first chunk request");
+        let (height, idx) = match postcard::from_bytes::<WireMessage>(&first_payload).unwrap() {
+            WireMessage::SnapshotChunkRequest { height, chunk_idx } => (height, chunk_idx),
+            _ => panic!(),
+        };
+        let resp = WireMessage::SnapshotChunkResponse {
+            height,
+            chunk_idx: idx,
+            payload: Some(chunks[idx as usize].clone()),
+        };
+        let resp_bytes = postcard::to_stdvec(&resp).unwrap();
+        let dispatches = dispatch::ingress(first_peer, &resp_bytes, &vs).unwrap();
+        for d in dispatches {
+            joiner_node
+                .apply_dispatch(
+                    d,
+                    joiner_bc.as_ref(),
+                    &mut joiner_view_timer,
+                    &joiner_signer_arc,
+                )
+                .await
+                .unwrap();
+        }
+
+        // Drop the peer that just served us via a synthetic
+        // PeerRemoved event-equivalent: drive snapshot_sync's
+        // disconnect hook directly. This is what
+        // `DiscoveryEvent::PeerRemoved` would do at runtime.
+        let drop_actions = joiner_node.snapshot_sync.on_peer_disconnected(first_peer);
+        joiner_node
+            .apply_snapshot_sync_actions(
+                drop_actions,
+                joiner_bc.as_ref(),
+                &mut joiner_view_timer,
+                &joiner_signer_arc,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !joiner_node.snapshot_sync.is_aborted(),
+            "with 2 surviving candidates, dropping one peer must not abort",
+        );
+
+        // Drain the rest. Bounded loop guards against state-machine
+        // bugs. Stale requests still in the channel from before the
+        // disconnect was processed (i.e. addressed to `first_peer`)
+        // are silently dropped — the state machine has already
+        // reassigned those chunks to surviving peers, so freshly-
+        // emitted requests target other peers and the workpool
+        // makes progress.
+        let mut served_via_other = false;
+        for _ in 0..(manifest.chunk_count * 4 + 16) {
+            let req = drain_until(&mut joiner_outbound, |w| {
+                matches!(w, WireMessage::SnapshotChunkRequest { .. })
+            })
+            .await;
+            let Some((peer, payload)) = req else {
+                break;
+            };
+            if peer == first_peer {
+                // Stale: the disconnect superseded this request;
+                // the state machine reassigned the chunk and we
+                // shouldn't synthesize a response from a "dropped"
+                // peer.
+                continue;
+            }
+            served_via_other = true;
+            let (height, idx) = match postcard::from_bytes::<WireMessage>(&payload).unwrap() {
+                WireMessage::SnapshotChunkRequest { height, chunk_idx } => (height, chunk_idx),
+                _ => panic!(),
+            };
+            let resp = WireMessage::SnapshotChunkResponse {
+                height,
+                chunk_idx: idx,
+                payload: Some(chunks[idx as usize].clone()),
+            };
+            let resp_bytes = postcard::to_stdvec(&resp).unwrap();
+            let dispatches = dispatch::ingress(peer, &resp_bytes, &vs).unwrap();
+            for d in dispatches {
+                joiner_node
+                    .apply_dispatch(
+                        d,
+                        joiner_bc.as_ref(),
+                        &mut joiner_view_timer,
+                        &joiner_signer_arc,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if joiner_node.snapshot_sync.is_done() {
+                break;
+            }
+        }
+        assert!(
+            served_via_other,
+            "at least one chunk must be served by a non-dropped peer for the test to be meaningful",
+        );
+
+        assert!(
+            joiner_node.snapshot_sync.is_done(),
+            "joiner must complete fetch after a single peer drop",
+        );
+        assert_eq!(joiner_node.last_committed_height, 50);
+        assert_eq!(joiner_sm.lock().state_commitment(), expected_commitment);
     }
 
     #[tokio::test]
