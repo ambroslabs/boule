@@ -148,6 +148,16 @@ pub enum BlockSyncReason {
     /// proposal is still parked because its parent has not arrived.
     /// See [`HotStuffCore::on_pacemaker_advance`].
     StillParkedOnPacemakerAdvance,
+    /// First emission: a `NewView` adopted a fresher `high_qc` whose
+    /// referenced block is not in `pending_blocks`. The replica needs
+    /// the block before it can extend the chain, run the two-chain
+    /// lock rule, or fire three-chain commit. Without this trigger a
+    /// lagger can lift its `current_view` from NewView traffic alone
+    /// while its `last_committed_height` stays parked indefinitely
+    /// (issue #240, the height-skew leg of the post-restart wedge
+    /// #224 closed the view-skew leg of). See
+    /// [`HotStuffCore::on_new_view_received`].
+    UnknownHighQcOnNewView,
 }
 
 impl BlockSyncReason {
@@ -156,6 +166,7 @@ impl BlockSyncReason {
         match self {
             BlockSyncReason::UnknownParentOnProposal => "unknown_parent_on_proposal",
             BlockSyncReason::StillParkedOnPacemakerAdvance => "still_parked_on_pacemaker_advance",
+            BlockSyncReason::UnknownHighQcOnNewView => "unknown_high_qc_on_new_view",
         }
     }
 }
@@ -722,13 +733,41 @@ impl HotStuffCore {
     /// envelope". The QC itself carries its own quorum proof;
     /// `should_update_high_qc`'s strict view comparison prevents the
     /// stalest-writes-win anti-pattern.
+    ///
+    /// When the adopted QC's `block_hash` is not in `pending_blocks`,
+    /// also seed a `RequestBlock` so the integration layer can fetch
+    /// it. Without this branch, a replica whose gossip mesh missed the
+    /// originating proposal would lift its view via NewView traffic
+    /// but never see the block, leaving `last_committed_height` parked
+    /// while the cluster advances — the post-restart height-skew
+    /// wedge in #240. The probe shares the existing per-parent retry
+    /// tracker (`block_sync_inflight`), so backoff/rotation/budget
+    /// from #196/#214 kick in unchanged: re-deliveries within the
+    /// backoff window suppress, and the pacemaker-advance loop drives
+    /// retries thereafter.
     fn on_new_view_received(&mut self, signed: Signed<NewView>) -> Vec<Action> {
         let qc = signed.payload.high_qc;
         if !should_update_high_qc(&qc, &self.state) {
             return Vec::new();
         }
+        let block_hash = qc.block_hash;
+        let sender = signed.signer;
         self.state.high_qc = Some(qc.clone());
-        vec![Action::Persist(StateUpdate::HighQc(qc))]
+        let mut actions = vec![Action::Persist(StateUpdate::HighQc(qc))];
+        if !self.state.pending_blocks.contains_key(&block_hash) {
+            // `expected_height` is informational (the integration
+            // layer logs it as `requesting_height`). The QC carries
+            // no height field and we don't have the block yet, so
+            // emit `0` — the same convention used for genesis-rooted
+            // orphans on the proposal-driven path.
+            actions.extend(self.try_emit_block_sync_retry(
+                block_hash,
+                sender,
+                0,
+                BlockSyncReason::UnknownHighQcOnNewView,
+            ));
+        }
+        actions
     }
 
     /// Handle a [`Event::PacemakerAdvance(v)`] signal from the outer
@@ -816,16 +855,32 @@ impl HotStuffCore {
         // distinct children we hold for it. Iteration order is
         // sorted-by-parent so replay/property tests stay byte-
         // identical regardless of `HashMap` ordering.
-        let mut parent_to_children: std::collections::BTreeMap<BlockHash, Vec<BlockHash>> =
-            std::collections::BTreeMap::new();
-        for (child_hash, signed) in &self.parked_proposals {
-            let parent_hash = signed.payload.block.header.parent_hash;
-            parent_to_children
-                .entry(parent_hash)
-                .or_default()
-                .push(*child_hash);
+        //
+        // Also include the current `high_qc.block_hash` if it isn't in
+        // `pending_blocks`. The NewView-driven seed in
+        // `on_new_view_received` (#240) produces an in-flight entry
+        // that has no parked children, so the parked-proposals walk
+        // alone wouldn't retry it. Folding it into the same
+        // `BTreeSet` driver gives that entry the standard
+        // backoff/rotation/budget behaviour and lets
+        // `run_block_sync_retry_for_parent`'s exhaustion path tear
+        // it down once attempts are spent (rather than leaking
+        // `block_sync_inflight` capacity).
+        let mut parent_hashes_to_retry: std::collections::BTreeSet<BlockHash> =
+            std::collections::BTreeSet::new();
+        for signed in self.parked_proposals.values() {
+            parent_hashes_to_retry.insert(signed.payload.block.header.parent_hash);
         }
-        for parent_hash in parent_to_children.keys() {
+        if let Some(high_qc_hash) = self
+            .state
+            .high_qc
+            .as_ref()
+            .map(|qc| qc.block_hash)
+            .filter(|h| !self.state.pending_blocks.contains_key(h))
+        {
+            parent_hashes_to_retry.insert(high_qc_hash);
+        }
+        for parent_hash in &parent_hashes_to_retry {
             actions.extend(self.run_block_sync_retry_for_parent(*parent_hash));
         }
 
@@ -2140,7 +2195,13 @@ mod tests {
     #[test]
     fn newview_adopts_fresher_high_qc_and_ignores_stale() {
         let mut core = make_core(1);
-        let block_hash: BlockHash = [0x11; 32];
+        // Use the genesis hash for the QC's `block_hash` so the
+        // adoption path doesn't fall through to the #240 block-sync
+        // branch — that branch is exercised in
+        // `newview_with_unknown_block_hash_seeds_block_sync` below.
+        // This test focuses purely on the adoption / strict-greater
+        // gating that pre-dated #240.
+        let block_hash = core.state().genesis_hash;
 
         // Empty `high_qc` → any incoming QC is strictly fresher and
         // adopted. Emission: single `Persist(HighQc(qc))`.
@@ -2168,8 +2229,9 @@ mod tests {
         assert!(stale.is_empty(), "stale NewView is a no-op: {stale:?}");
         assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
 
-        // Strictly newer — adopted, overwriting the previous.
-        let qc_v9 = dummy_qc(9, [0x99; 32]);
+        // Strictly newer over the genesis hash again — adopted,
+        // overwriting the previous, still no block-sync (block known).
+        let qc_v9 = dummy_qc(9, block_hash);
         let newer = core.step(Event::NewViewReceived(signed_newview(
             qc_v9.clone(),
             nid(2),
@@ -2179,6 +2241,74 @@ mod tests {
             vec![Action::Persist(StateUpdate::HighQc(qc_v9.clone()))],
         );
         assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v9));
+    }
+
+    /// Issue #240: a `NewView` whose adopted `high_qc` references a
+    /// block we don't have must seed a `RequestBlock` so the
+    /// integration layer can fetch it. Without this trigger, a
+    /// replica whose gossip mesh missed the originating proposal
+    /// would lift its view from NewView traffic alone but never see
+    /// the block, leaving `last_committed_height` parked while the
+    /// cluster advances heights without it.
+    #[test]
+    fn newview_with_unknown_block_hash_seeds_block_sync() {
+        let mut core = make_core(1);
+        let unknown_hash: BlockHash = [0xC0; 32];
+        let qc_v7 = dummy_qc(7, unknown_hash);
+        let sender = nid(2);
+
+        let actions = core.step(Event::NewViewReceived(signed_newview(
+            qc_v7.clone(),
+            sender,
+        )));
+
+        assert_eq!(
+            actions,
+            vec![
+                Action::Persist(StateUpdate::HighQc(qc_v7.clone())),
+                Action::RequestBlock {
+                    hash: unknown_hash,
+                    peer: sender,
+                    expected_height: 0,
+                    reason: BlockSyncReason::UnknownHighQcOnNewView,
+                },
+            ],
+            "NewView adopting a fresh high_qc over an unknown block must persist + request the block",
+        );
+        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v7));
+        assert!(
+            core.block_sync_inflight.contains_key(&unknown_hash),
+            "in-flight retry tracker must be installed so PacemakerAdvance can drive retries",
+        );
+    }
+
+    /// Companion to the previous test: when the QC's block IS in
+    /// `pending_blocks`, the NewView path must NOT emit a
+    /// `RequestBlock`. The block-sync trigger is gated on the block
+    /// genuinely missing.
+    #[test]
+    fn newview_with_known_block_hash_does_not_request_block() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32]);
+        let block_v1 = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let block_v1_hash = block_v1.hash();
+        core.state.insert_pending(block_v1);
+
+        let qc_v1 = dummy_qc(1, block_v1_hash);
+        let actions = core.step(Event::NewViewReceived(signed_newview(
+            qc_v1.clone(),
+            nid(2),
+        )));
+
+        assert_eq!(
+            actions,
+            vec![Action::Persist(StateUpdate::HighQc(qc_v1))],
+            "NewView whose QC block is already in pending_blocks must not fire block-sync",
+        );
+        assert!(
+            !core.block_sync_inflight.contains_key(&block_v1_hash),
+            "no in-flight tracker should be installed when the block is known",
+        );
     }
 
     #[test]
@@ -2836,6 +2966,139 @@ mod tests {
                 "ring wraps back to sender after exhaustion"
             );
             assert_eq!(attempts_to_peer(4), nid(3), "wrap loops around the ring");
+        }
+
+        /// Issue #240: once the integration layer hands us the
+        /// requested block via `insert_pending_block`, the in-flight
+        /// retry tracker keyed on the NewView-seeded hash must clear.
+        /// Mirrors the proposal-driven `parent_arrival_via_*` tests.
+        #[test]
+        fn high_qc_block_arrival_via_insert_pending_block_clears_inflight_entry() {
+            let mut core = make_rotation_core(1, 2, 8);
+            let genesis = Block::genesis([0; 32]);
+            let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
+            let block_v3_hash = block_v3.hash();
+            let qc_v3 = dummy_qc(3, block_v3_hash);
+
+            let _ = core.step(Event::NewViewReceived(signed_newview(qc_v3, nid(2))));
+            assert!(
+                core.block_sync_inflight.contains_key(&block_v3_hash),
+                "in-flight entry must be installed on the NewView-driven initial probe",
+            );
+
+            core.insert_pending_block(block_v3);
+            assert!(
+                !core.block_sync_inflight.contains_key(&block_v3_hash),
+                "in-flight entry must clear once the high_qc's referenced block has landed",
+            );
+        }
+
+        /// Issue #240, retry leg: a NewView seeds an in-flight entry
+        /// for an unknown high_qc block_hash. With no parked
+        /// proposals depending on that hash, the parked-proposals
+        /// loop alone wouldn't drive retries. `on_pacemaker_advance`
+        /// must include the high_qc parent in its retry set so the
+        /// existing rotation/budget machinery applies.
+        #[test]
+        fn pacemaker_advance_retries_unknown_high_qc_block_with_no_parked_proposals() {
+            // self = nid(1); per_peer = 1 forces rotation on every
+            // attempt so the test can pin the rotation cycle. Backoff
+            // disabled so each PacemakerAdvance is eligible to fire.
+            let mut core = make_rotation_core(1, /* per_peer = */ 1, /* max = */ 4);
+            let unknown: BlockHash = [0xC0; 32];
+            let qc = dummy_qc(7, unknown);
+            let sender = nid(2);
+
+            // Seed via NewView: initial probe lands at the sender,
+            // attempts = 1.
+            let initial = core.step(Event::NewViewReceived(signed_newview(qc, sender)));
+            assert_eq!(
+                initial
+                    .iter()
+                    .filter(|a| matches!(a, Action::RequestBlock { .. }))
+                    .count(),
+                1,
+                "NewView with unknown block must seed exactly one RequestBlock; got {initial:?}",
+            );
+            assert_eq!(
+                core.block_sync_inflight.get(&unknown).map(|e| e.attempts),
+                Some(1),
+            );
+            assert!(
+                core.parked_proposals.is_empty(),
+                "this test specifically covers the no-parked-proposals path; \
+                 parked_proposals must remain empty",
+            );
+
+            // Advance #1: per_peer=1 → rotation steps off sender to
+            // nid(3) (ring[0] after sender, skipping self=nid(1)).
+            let advance_one = core.step(Event::PacemakerAdvance(1));
+            let req_one = advance_one
+                .iter()
+                .find_map(|a| match a {
+                    Action::RequestBlock { peer, .. } => Some(*peer),
+                    _ => None,
+                })
+                .expect("retry must fire on advance #1");
+            assert_eq!(req_one, nid(3));
+        }
+
+        /// Issue #240: budget exhaustion on a NewView-seeded entry
+        /// must tear down the in-flight tracker even when no parked
+        /// proposals depend on the missing parent. Otherwise
+        /// `block_sync_inflight` leaks: every distinct high_qc whose
+        /// block we never receive would consume a slot forever.
+        #[test]
+        fn pacemaker_advance_drops_exhausted_high_qc_inflight_entry_with_no_parked_proposals() {
+            // per_peer = 4, max = 4 — initial probe + 3 advances and
+            // we are at the budget. The 4th advance must clean up.
+            let mut core = make_rotation_core(1, /* per_peer = */ 4, /* max = */ 4);
+            let unknown: BlockHash = [0xD0; 32];
+            let qc = dummy_qc(11, unknown);
+            let sender = nid(2);
+
+            // Seed: attempts goes 0 → 1.
+            let _ = core.step(Event::NewViewReceived(signed_newview(qc, sender)));
+            assert_eq!(core.block_sync_inflight.len(), 1);
+
+            // Advances 1..=3: attempts climbs 1 → 4.
+            for v in 1..=3 {
+                let advance = core.step(Event::PacemakerAdvance(v));
+                assert_eq!(
+                    advance
+                        .iter()
+                        .filter(|a| matches!(a, Action::RequestBlock { .. }))
+                        .count(),
+                    1,
+                    "advance {v} must fire one retry while the budget is unspent",
+                );
+            }
+            assert!(core.block_sync_inflight.contains_key(&unknown));
+
+            // Advance #4: attempts has reached `max_attempts (=4)`.
+            // No parked proposals depend on `unknown`, so
+            // `drop_parked_for_parent` evicts zero parked entries
+            // (the counter does NOT tick — it counts dropped parked
+            // proposals, not exhausted in-flight slots) but still
+            // tears the in-flight entry down.
+            let drop_advance = core.step(Event::PacemakerAdvance(4));
+            assert!(
+                !drop_advance
+                    .iter()
+                    .any(|a| matches!(a, Action::RequestBlock { .. })),
+                "exhausted-budget advance must not emit another RequestBlock; got {drop_advance:?}",
+            );
+            assert!(
+                !core.block_sync_inflight.contains_key(&unknown),
+                "in-flight entry must be torn down once the high_qc-driven retry budget is spent, \
+                 even with no parked proposals on hand",
+            );
+            assert_eq!(
+                core.eviction_counters().block_sync_dropped(),
+                0,
+                "block_sync_dropped counts dropped parked proposals; \
+                 this path drops zero parked proposals (none depended on the missing parent)",
+            );
         }
 
         /// `block_sync_backoff_views` schedule: zero on attempts == 0
