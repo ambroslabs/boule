@@ -386,6 +386,11 @@ async fn start_consensus(
         timeout_base: Duration::from_millis(cons_cfg.timeout_base_ms),
         timeout_max: Duration::from_millis(cons_cfg.timeout_max_ms),
         limits: cons_cfg.limits.to_cache_limits(),
+        snapshot_policy: crate::replication::snapshot::SnapshotPolicy {
+            interval_blocks: cons_cfg.snapshot_interval_blocks,
+            retention_count: cons_cfg.snapshot_retention_count,
+            chunk_size_bytes: cons_cfg.snapshot_chunk_size_bytes,
+        },
     };
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =

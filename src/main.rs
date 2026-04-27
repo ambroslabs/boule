@@ -67,6 +67,7 @@ async fn dispatch(args: &[String]) -> anyhow::Result<()> {
         "start" => handle_start(&args[1..]).await,
         "key" => handle_key_subcommand(&args[1..]),
         "config" => handle_config(&args[1..]),
+        "snapshot" => handle_snapshot_subcommand(&args[1..]),
         "--help" | "-h" | "help" => {
             print_usage();
             Ok(())
@@ -97,6 +98,16 @@ fn print_usage() {
     println!("        --to keyring          [--service <name>] [--account <name>]");
     println!("      Reads the current [node.identity] from --config; pass");
     println!("      --delete-source to zeroize and remove a file-backed source.");
+    println!();
+    println!("  snapshot export [--config <path>] [--height <H>] --out <dir>");
+    println!("      Dump a snapshot from the consensus storage_dir into a");
+    println!("      portable directory layout (manifest.bin + chunk-N.bin).");
+    println!("      `--height` selects an exact snapshot; omit for the latest.");
+    println!();
+    println!("  snapshot import [--config <path>] --in <dir>");
+    println!("      Read a directory layout produced by `snapshot export` and");
+    println!("      write it back into the local consensus storage_dir's");
+    println!("      snapshot store. Verifies chunk hashes against the manifest.");
     println!();
     println!("  config [--config <path>] [--format human|json|toml] [--raw|--edit|--path]");
     println!("      Print or edit the node's effective configuration. Default");
@@ -790,4 +801,182 @@ fn split_editor_command(cmd: &str) -> (std::ffi::OsString, Vec<std::ffi::OsStrin
     let program = parts.next().unwrap_or("nano").into();
     let argv = parts.map(std::ffi::OsString::from).collect();
     (program, argv)
+}
+
+// ── `snapshot` subcommand ───────────────────────────────────────────────────
+
+fn handle_snapshot_subcommand(args: &[String]) -> anyhow::Result<()> {
+    let sub = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing snapshot subcommand (try: export, import)"))?;
+    match sub.as_str() {
+        "export" => handle_snapshot_export(&args[1..]),
+        "import" => handle_snapshot_import(&args[1..]),
+        other => anyhow::bail!("unknown `snapshot` subcommand: {other}"),
+    }
+}
+
+#[derive(Debug, Default)]
+struct SnapshotExportArgs {
+    config_path: Option<PathBuf>,
+    height: Option<u64>,
+    out: Option<PathBuf>,
+}
+
+fn parse_snapshot_export_args(args: &[String]) -> anyhow::Result<SnapshotExportArgs> {
+    let mut out = SnapshotExportArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" | "-c" => {
+                i += 1;
+                out.config_path = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?
+                        .into(),
+                );
+            }
+            "--height" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--height requires a value"))?;
+                out.height = Some(
+                    raw.parse::<u64>()
+                        .map_err(|e| anyhow::anyhow!("invalid --height {raw:?}: {e}"))?,
+                );
+            }
+            "--out" | "-o" => {
+                i += 1;
+                out.out = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--out requires a path"))?
+                        .into(),
+                );
+            }
+            other => anyhow::bail!("unknown snapshot export flag: {other}"),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn handle_snapshot_export(args: &[String]) -> anyhow::Result<()> {
+    let args = parse_snapshot_export_args(args)?;
+    let out_dir = args
+        .out
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("snapshot export requires --out <dir>"))?;
+    let config_path = resolve_config_path(args.config_path)?;
+    let config = config::load(&config_path)?;
+    let store = open_snapshot_store_for_cli(&config)?;
+
+    let height = match args.height {
+        Some(h) => h,
+        None => store.latest_height()?.ok_or_else(|| {
+            anyhow::anyhow!("no snapshots found in consensus storage_dir; nothing to export")
+        })?,
+    };
+    let manifest = store.load_manifest(height)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no snapshot at height {height}; available: {:?}",
+            store.list_heights().unwrap_or_default(),
+        )
+    })?;
+
+    let mut chunks: Vec<bytes::Bytes> = Vec::with_capacity(manifest.chunk_count as usize);
+    for idx in 0..manifest.chunk_count {
+        let chunk = store
+            .load_chunk(height, idx)?
+            .ok_or_else(|| anyhow::anyhow!("snapshot at height {height} is missing chunk {idx}"))?;
+        chunks.push(chunk);
+    }
+    ambros_p2p::replication::snapshot::export_to_directory(&manifest, &chunks, &out_dir)?;
+    println!(
+        "exported snapshot height={} view={} chunks={} into {}",
+        manifest.height,
+        manifest.view,
+        manifest.chunk_count,
+        out_dir.display(),
+    );
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct SnapshotImportArgs {
+    config_path: Option<PathBuf>,
+    in_dir: Option<PathBuf>,
+}
+
+fn parse_snapshot_import_args(args: &[String]) -> anyhow::Result<SnapshotImportArgs> {
+    let mut out = SnapshotImportArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" | "-c" => {
+                i += 1;
+                out.config_path = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?
+                        .into(),
+                );
+            }
+            "--in" | "-i" => {
+                i += 1;
+                out.in_dir = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--in requires a path"))?
+                        .into(),
+                );
+            }
+            other => anyhow::bail!("unknown snapshot import flag: {other}"),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn handle_snapshot_import(args: &[String]) -> anyhow::Result<()> {
+    let args = parse_snapshot_import_args(args)?;
+    let in_dir = args
+        .in_dir
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("snapshot import requires --in <dir>"))?;
+    let config_path = resolve_config_path(args.config_path)?;
+    let config = config::load(&config_path)?;
+    let store = open_snapshot_store_for_cli(&config)?;
+
+    let (manifest, chunks) = ambros_p2p::replication::snapshot::import_from_directory(&in_dir)?;
+    store.save(&manifest, &chunks)?;
+    println!(
+        "imported snapshot height={} view={} chunks={} into consensus storage",
+        manifest.height, manifest.view, manifest.chunk_count,
+    );
+    Ok(())
+}
+
+/// Open the [`crate::replication::SnapshotStore`] backed by the
+/// configured consensus `storage_dir`. Errors if `[consensus]` or
+/// `storage_dir` is missing — there is no meaningful place to put
+/// snapshots otherwise.
+fn open_snapshot_store_for_cli(
+    config: &Config,
+) -> anyhow::Result<ambros_p2p::replication::snapshot::SnapshotStore> {
+    let cons_cfg = config
+        .consensus
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("snapshot subcommands require [consensus] in the config"))?;
+    let dir = cons_cfg.storage_dir.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "snapshot subcommands require [consensus] storage_dir to be set; \
+             in-memory storage has nothing to export from / import into"
+        )
+    })?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("creating consensus storage_dir {}: {e}", dir.display()))?;
+    let storage: Arc<dyn ambros_p2p::storage::Storage> =
+        Arc::new(ambros_p2p::storage::DiskStorage::open(dir.join("kv.redb"))?);
+    Ok(ambros_p2p::replication::snapshot::SnapshotStore::new(
+        storage,
+    ))
 }

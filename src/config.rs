@@ -181,6 +181,59 @@ pub struct ConsensusConfig {
     /// [`crate::consensus::limits::CacheLimits::production_defaults`].
     #[serde(default)]
     pub limits: ConsensusLimits,
+    /// Take a state-machine snapshot every `snapshot_interval_blocks`
+    /// committed blocks. `0` disables snapshot creation entirely. See
+    /// [`crate::replication::snapshot`] for the on-disk layout.
+    #[serde(default = "default_snapshot_interval_blocks")]
+    pub snapshot_interval_blocks: u64,
+    /// Number of most-recent snapshots to keep on disk. Older snapshots
+    /// are pruned atomically when a new one commits. `0` disables
+    /// pruning (snapshots accumulate without bound — useful for tests).
+    #[serde(default = "default_snapshot_retention_count")]
+    pub snapshot_retention_count: usize,
+    /// Bytes per snapshot chunk. Must be `> 0` and leave headroom under
+    /// the consensus protocol's `MAX_FRAME_BYTES` once postcard envelope
+    /// overhead is added; [`ConsensusConfig::validate_snapshot_policy`]
+    /// enforces the bound.
+    #[serde(default = "default_snapshot_chunk_size_bytes")]
+    pub snapshot_chunk_size_bytes: u32,
+}
+
+impl ConsensusConfig {
+    /// Validate that the snapshot-policy fields are internally
+    /// consistent. Surfaced as `Err` from [`Config::validate`] so an
+    /// operator who picks a chunk size larger than the wire-frame cap
+    /// learns at startup rather than on the first snapshot.
+    pub fn validate_snapshot_policy(&self) -> anyhow::Result<()> {
+        if self.snapshot_interval_blocks > 0 && self.snapshot_chunk_size_bytes == 0 {
+            anyhow::bail!(
+                "consensus.snapshot_chunk_size_bytes must be > 0 when \
+                 snapshot_interval_blocks is non-zero"
+            );
+        }
+        // `MAX_FRAME_BYTES` (4 MiB) caps a single postcard frame on the
+        // consensus protocol. Reserve 64 KiB of headroom for the chunk-
+        // response envelope (`SnapshotChunkResponse` carries `height`,
+        // `chunk_idx`, and a postcard `Option<Bytes>` framing on top of
+        // the raw payload). 64 KiB is comfortably above the actual
+        // overhead (a few dozen bytes) but small enough that operators
+        // who deliberately push the chunk size to the wire-frame
+        // ceiling still leave room for protocol evolution.
+        const FRAME_OVERHEAD_RESERVED: usize = 64 * 1024;
+        let max_chunk_size =
+            crate::consensus::node::MAX_FRAME_BYTES.saturating_sub(FRAME_OVERHEAD_RESERVED);
+        if (self.snapshot_chunk_size_bytes as usize) > max_chunk_size {
+            anyhow::bail!(
+                "consensus.snapshot_chunk_size_bytes={} exceeds wire-frame budget {} \
+                 (MAX_FRAME_BYTES {} − {} reserved for envelope)",
+                self.snapshot_chunk_size_bytes,
+                max_chunk_size,
+                crate::consensus::node::MAX_FRAME_BYTES,
+                FRAME_OVERHEAD_RESERVED,
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Per-cache capacity caps and an in-memory mempool cap. Parsed from
@@ -321,6 +374,18 @@ fn default_block_sync_max_attempts() -> u32 {
 
 fn default_mempool_capacity() -> usize {
     1024
+}
+
+fn default_snapshot_interval_blocks() -> u64 {
+    10_000
+}
+
+fn default_snapshot_retention_count() -> usize {
+    3
+}
+
+fn default_snapshot_chunk_size_bytes() -> u32 {
+    1024 * 1024
 }
 
 /// Configuration for the p2p layer that is independent of the overlay
@@ -682,6 +747,9 @@ impl Config {
                 );
             }
         }
+        if let Some(cons) = self.consensus.as_ref() {
+            cons.validate_snapshot_policy()?;
+        }
         Ok(())
     }
 }
@@ -1010,6 +1078,99 @@ mempool_capacity = 2048
         assert_eq!(runtime.block_sync_per_peer_attempts, 5);
         assert_eq!(runtime.block_sync_max_attempts, 25);
         assert_eq!(cons.limits.mempool_capacity, 2048);
+    }
+
+    #[test]
+    fn consensus_snapshot_policy_defaults_when_omitted() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+"#,
+        );
+        let cons = c.consensus.expect("consensus section");
+        assert_eq!(cons.snapshot_interval_blocks, 10_000);
+        assert_eq!(cons.snapshot_retention_count, 3);
+        assert_eq!(cons.snapshot_chunk_size_bytes, 1024 * 1024);
+        cons.validate_snapshot_policy().unwrap();
+    }
+
+    #[test]
+    fn consensus_snapshot_policy_overrides_apply() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+snapshot_interval_blocks = 250
+snapshot_retention_count = 1
+snapshot_chunk_size_bytes = 524288
+"#,
+        );
+        let cons = c.consensus.expect("consensus section");
+        assert_eq!(cons.snapshot_interval_blocks, 250);
+        assert_eq!(cons.snapshot_retention_count, 1);
+        assert_eq!(cons.snapshot_chunk_size_bytes, 524288);
+        cons.validate_snapshot_policy().unwrap();
+    }
+
+    #[test]
+    fn consensus_snapshot_chunk_size_bound_rejects_oversized() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+snapshot_interval_blocks = 100
+snapshot_chunk_size_bytes = 4194304
+"#,
+        );
+        // 4 MiB == MAX_FRAME_BYTES; the policy reserves headroom and
+        // must reject this value.
+        let cons = c.consensus.expect("consensus section");
+        let err = cons
+            .validate_snapshot_policy()
+            .expect_err("4 MiB chunks leave no room for envelope");
+        assert!(err.to_string().contains("snapshot_chunk_size_bytes"));
+    }
+
+    #[test]
+    fn consensus_snapshot_zero_interval_disables() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+snapshot_interval_blocks = 0
+snapshot_chunk_size_bytes = 0
+"#,
+        );
+        // chunk_size_bytes=0 is fine when snapshots are disabled — the
+        // validator only enforces the bound when the interval is
+        // non-zero.
+        let cons = c.consensus.expect("consensus section");
+        cons.validate_snapshot_policy().unwrap();
     }
 
     #[test]
