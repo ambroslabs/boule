@@ -100,6 +100,29 @@ impl ReconfigCommand {
         postcard::from_bytes(body).map_err(|e| anyhow::anyhow!("malformed ReconfigCommand: {e}"))
     }
 
+    /// Construct a tagged "add a single validator" payload, suitable
+    /// for injection into a mempool. Convenience wrapper used by the
+    /// CLI (#251).
+    pub fn build_add_validator_payload(node_id: NodeId, addr: SocketAddr, v_eff: View) -> Bytes {
+        Self {
+            adds: vec![ValidatorEntry { node_id, addr }],
+            removes: vec![],
+            v_eff,
+        }
+        .encode()
+    }
+
+    /// Construct a tagged "remove a single validator" payload.
+    /// Convenience wrapper used by the CLI (#251).
+    pub fn build_remove_validator_payload(node_id: NodeId, v_eff: View) -> Bytes {
+        Self {
+            adds: vec![],
+            removes: vec![node_id],
+            v_eff,
+        }
+        .encode()
+    }
+
     /// Validate this command against the active state at validation time.
     /// Returns the resulting member list (sorted, deduplicated) on
     /// success.
@@ -417,6 +440,35 @@ mod tests {
             err.to_string().contains("below floor"),
             "expected floor error, got: {err}"
         );
+    }
+
+    // ── #251: CLI builder helpers ───────────────────────────────────
+
+    #[test]
+    fn build_add_validator_payload_round_trips() {
+        let node_id = nid(7);
+        let addr: SocketAddr = "127.0.0.1:7007".parse().unwrap();
+        let v_eff = 42;
+        let bytes = ReconfigCommand::build_add_validator_payload(node_id, addr, v_eff);
+        assert!(ReconfigCommand::is_reconfig_payload(&bytes));
+        let decoded = ReconfigCommand::decode(&bytes).unwrap();
+        assert_eq!(decoded.adds.len(), 1);
+        assert_eq!(decoded.adds[0].node_id, node_id);
+        assert_eq!(decoded.adds[0].addr, addr);
+        assert!(decoded.removes.is_empty());
+        assert_eq!(decoded.v_eff, v_eff);
+    }
+
+    #[test]
+    fn build_remove_validator_payload_round_trips() {
+        let node_id = nid(3);
+        let v_eff = 99;
+        let bytes = ReconfigCommand::build_remove_validator_payload(node_id, v_eff);
+        assert!(ReconfigCommand::is_reconfig_payload(&bytes));
+        let decoded = ReconfigCommand::decode(&bytes).unwrap();
+        assert!(decoded.adds.is_empty());
+        assert_eq!(decoded.removes, vec![node_id]);
+        assert_eq!(decoded.v_eff, v_eff);
     }
 
     #[test]
