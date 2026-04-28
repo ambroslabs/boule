@@ -4048,6 +4048,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
             }],
             removes: vec![],
             v_eff,
@@ -4091,6 +4092,7 @@ mod tests {
         let _ = ValidatorEntry {
             node_id: nid(0),
             addr: "127.0.0.1:0".parse().unwrap(),
+            bls_pop: None,
         };
         let block = block_with_reconfig(1, 0, nid(1), cmd);
         node.apply_commit(block);
@@ -4111,6 +4113,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
             }],
             removes: vec![],
             v_eff: 5,
@@ -4132,6 +4135,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
             }],
             removes: vec![],
             v_eff: v_eff_a,
@@ -4140,6 +4144,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(6),
                 addr: "127.0.0.1:9006".parse().unwrap(),
+                bls_pop: None,
             }],
             removes: vec![],
             v_eff: v_eff_b,
@@ -4196,6 +4201,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
             }],
             removes: vec![],
             v_eff,

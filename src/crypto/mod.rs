@@ -9,5 +9,6 @@
 // (voting, proposals) that don't exist yet. Allow dead code until then.
 #![allow(dead_code)]
 
+pub mod bls_key;
 pub mod sig_scheme;
 pub mod signed;
