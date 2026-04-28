@@ -59,6 +59,7 @@ use crate::consensus::status::{
     BUCKET_VIEW_WINDOW, CacheEvictionStatus, ConsensusStatus, LockedStatus, ParkedProposalStatus,
     QcStatus, TimeoutBucketStatus, VoteBucketStatus,
 };
+use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::view_timer::ViewTimer;
 use crate::crypto::signed::Signed;
@@ -401,6 +402,14 @@ pub struct ConsensusNode {
     pub wal: Arc<dyn Wal>,
     /// The ordered committee this node participates in.
     pub validator_set: ValidatorSet,
+    /// View-keyed history of `validator_set` across reconfiguration
+    /// boundaries (#248). Until #253 lands the active reconfiguration
+    /// path, this holds only the genesis boundary, so `set_at(view)`
+    /// returns `validator_set` for every view. The dispatcher's
+    /// per-message signer check consults this in #249 so signature
+    /// verification can switch sides at a future boundary without
+    /// further plumbing.
+    pub validator_history: ValidatorSetHistory,
     /// Configured view-timer behaviour; consulted by the timer helper
     /// in Phase D when arming/re-arming the view timer.
     pub timeout_policy: Arc<ExponentialBackoff>,
@@ -572,6 +581,7 @@ impl ConsensusNode {
             eviction_counters.clone(),
         );
 
+        let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         Self {
             self_id,
             core,
@@ -581,6 +591,7 @@ impl ConsensusNode {
             storage,
             wal,
             validator_set: config.validator_set,
+            validator_history,
             timeout_policy,
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
@@ -843,6 +854,7 @@ impl ConsensusNode {
             eviction_counters.clone(),
         );
 
+        let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         Ok(Self {
             self_id,
             core,
@@ -852,6 +864,7 @@ impl ConsensusNode {
             storage,
             wal,
             validator_set: config.validator_set,
+            validator_history,
             timeout_policy,
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
@@ -1149,7 +1162,7 @@ impl ConsensusNode {
                             if !self.admit_inbound(from, &payload).await {
                                 continue;
                             }
-                            match dispatch::ingress(from, &payload, &self.validator_set) {
+                            match dispatch::ingress(from, &payload, &self.validator_history) {
                                 Ok(dispatches) => {
                                     for d in dispatches {
                                         self.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
@@ -4064,7 +4077,12 @@ mod tests {
         // loop's apply_dispatch, and capture the outbound reply.
         let req_bytes =
             postcard::to_stdvec(&WireMessage::SnapshotManifestRequest { height: None }).unwrap();
-        let dispatches = dispatch::ingress(nid(2), &req_bytes, &four_validators()).unwrap();
+        let dispatches = dispatch::ingress(
+            nid(2),
+            &req_bytes,
+            &ValidatorSetHistory::from_genesis(four_validators()),
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 1);
         for d in dispatches {
             node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
@@ -4087,7 +4105,12 @@ mod tests {
                 chunk_idx: idx,
             })
             .unwrap();
-            let dispatches = dispatch::ingress(nid(2), &req_bytes, &four_validators()).unwrap();
+            let dispatches = dispatch::ingress(
+                nid(2),
+                &req_bytes,
+                &ValidatorSetHistory::from_genesis(four_validators()),
+            )
+            .unwrap();
             for d in dispatches {
                 node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
                     .await
@@ -4389,8 +4412,12 @@ mod tests {
 
         // ── Step 2: feed the request into the server via ingress;
         //   server's run loop serves the manifest.
-        let dispatches = dispatch::ingress(joiner_signer_arc.node_id(), &req_payload, &vs)
-            .expect("ingress manifest request");
+        let dispatches = dispatch::ingress(
+            joiner_signer_arc.node_id(),
+            &req_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress manifest request");
         for d in dispatches {
             server_node
                 .apply_dispatch(
@@ -4414,8 +4441,12 @@ mod tests {
         //   request. Then we shuttle each chunk request → response
         //   through the in-memory transport until the joiner
         //   restores.
-        let dispatches = dispatch::ingress(server_node_id, &resp_payload, &vs)
-            .expect("ingress manifest response");
+        let dispatches = dispatch::ingress(
+            server_node_id,
+            &resp_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress manifest response");
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -4440,9 +4471,12 @@ mod tests {
             let Some((_, chunk_req_payload)) = chunk_req else {
                 break;
             };
-            let dispatches =
-                dispatch::ingress(joiner_signer_arc.node_id(), &chunk_req_payload, &vs)
-                    .expect("ingress chunk request");
+            let dispatches = dispatch::ingress(
+                joiner_signer_arc.node_id(),
+                &chunk_req_payload,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .expect("ingress chunk request");
             for d in dispatches {
                 server_node
                     .apply_dispatch(
@@ -4459,8 +4493,12 @@ mod tests {
             })
             .await
             .expect("chunk response");
-            let dispatches = dispatch::ingress(server_node_id, &chunk_resp_payload, &vs)
-                .expect("ingress chunk response");
+            let dispatches = dispatch::ingress(
+                server_node_id,
+                &chunk_resp_payload,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .expect("ingress chunk response");
             for d in dispatches {
                 joiner_node
                     .apply_dispatch(
@@ -4613,8 +4651,12 @@ mod tests {
         let resp_payload =
             postcard::to_stdvec(&WireMessage::SnapshotManifestResponse(Some(bad_manifest)))
                 .unwrap();
-        let dispatches = dispatch::ingress(server_signer.node_id(), &resp_payload, &vs)
-            .expect("ingress tampered manifest");
+        let dispatches = dispatch::ingress(
+            server_signer.node_id(),
+            &resp_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress tampered manifest");
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -4774,8 +4816,12 @@ mod tests {
             manifest.clone(),
         )))
         .unwrap();
-        let dispatches =
-            dispatch::ingress(primary, &resp_payload, &vs).expect("ingress manifest response");
+        let dispatches = dispatch::ingress(
+            primary,
+            &resp_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress manifest response");
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -4816,8 +4862,12 @@ mod tests {
                 payload: Some(chunks[chunk_idx as usize].clone()),
             };
             let resp_payload = postcard::to_stdvec(&resp).unwrap();
-            let dispatches =
-                dispatch::ingress(peer, &resp_payload, &vs).expect("ingress chunk response");
+            let dispatches = dispatch::ingress(
+                peer,
+                &resp_payload,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .expect("ingress chunk response");
             for d in dispatches {
                 joiner_node
                     .apply_dispatch(
@@ -4948,8 +4998,12 @@ mod tests {
             manifest.clone(),
         )))
         .unwrap();
-        let dispatches =
-            dispatch::ingress(primary, &resp_payload, &vs).expect("ingress manifest response");
+        let dispatches = dispatch::ingress(
+            primary,
+            &resp_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress manifest response");
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -4980,7 +5034,12 @@ mod tests {
             payload: Some(chunks[idx as usize].clone()),
         };
         let resp_bytes = postcard::to_stdvec(&resp).unwrap();
-        let dispatches = dispatch::ingress(first_peer, &resp_bytes, &vs).unwrap();
+        let dispatches = dispatch::ingress(
+            first_peer,
+            &resp_bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -5046,7 +5105,12 @@ mod tests {
                 payload: Some(chunks[idx as usize].clone()),
             };
             let resp_bytes = postcard::to_stdvec(&resp).unwrap();
-            let dispatches = dispatch::ingress(peer, &resp_bytes, &vs).unwrap();
+            let dispatches = dispatch::ingress(
+                peer,
+                &resp_bytes,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .unwrap();
             for d in dispatches {
                 joiner_node
                     .apply_dispatch(
@@ -5181,8 +5245,12 @@ mod tests {
         let wire = WireMessage::TimeoutVote(signed);
         let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
 
-        let dispatches = crate::consensus::dispatch::ingress(peer_signer.node_id(), &payload, &vs)
-            .expect("ingress");
+        let dispatches = crate::consensus::dispatch::ingress(
+            peer_signer.node_id(),
+            &payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress");
         let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
         let (broadcaster, _outbound_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
@@ -5251,8 +5319,12 @@ mod tests {
             let signed = crate::crypto::signed::Signed::sign(tv, peer).expect("sign TimeoutVote");
             let wire = WireMessage::TimeoutVote(signed);
             let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
-            let dispatches = crate::consensus::dispatch::ingress(peer.node_id(), &payload, &vs)
-                .expect("ingress");
+            let dispatches = crate::consensus::dispatch::ingress(
+                peer.node_id(),
+                &payload,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .expect("ingress");
             for d in dispatches {
                 node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
                     .await
@@ -5348,8 +5420,12 @@ mod tests {
         let wire = WireMessage::TimeoutVote(signed);
         let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
 
-        let dispatches = crate::consensus::dispatch::ingress(wedged_peer.node_id(), &payload, &vs)
-            .expect("ingress");
+        let dispatches = crate::consensus::dispatch::ingress(
+            wedged_peer.node_id(),
+            &payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress");
         for d in dispatches {
             node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
                 .await
