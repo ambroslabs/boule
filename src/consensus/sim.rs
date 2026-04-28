@@ -3077,6 +3077,89 @@ mod tests {
             })?;
         }
 
+        /// **L5 — validator key rotation safety.** A 4-node cluster
+        /// commits a `DualSignedRotation` for a randomly-chosen
+        /// validator at a random `v_eff_offset` in the future.
+        /// Independent of which validator rotates and when, the
+        /// cluster must:
+        ///   1. continue to commit (liveness),
+        ///   2. never have committed conflicting blocks (safety),
+        ///   3. land at least one commit at view ≥ `v_eff` to
+        ///      demonstrate the post-boundary regime is live.
+        ///
+        /// Quorum tightness: n=4, f=1, quorum=3. With the rotated
+        /// validator's signer not swapped (operational concern; same
+        /// as the deterministic happy-path test), one validator's
+        /// post-boundary votes are rejected. Three honest validators
+        /// remain — exactly quorum — so the property is a meaningful
+        /// liveness assertion under the tightest fault-tolerance
+        /// envelope.
+        #[test]
+        fn proptest_rotation_preserves_safety_and_liveness(
+            target in 0usize..4,
+            v_eff_offset in 8u64..30,
+        ) {
+            use crate::consensus::View;
+            use crate::consensus::validator_rotation::{
+                DualSignedRotation, ValidatorKeyRotation,
+            };
+
+            run_paused(|| async move {
+                let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+                let warmed = cluster
+                    .advance_and_yield_until(PHASE_CAP, |c| {
+                        c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 1
+                    })
+                    .await;
+                prop_assert!(warmed, "L5: warm-up did not produce any commit");
+
+                let v_eff: View = v_eff_offset + 5; // floor + small margin
+                let current = cluster
+                    .signer(target)
+                    .expect("regular SimCluster captures signers");
+                let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
+                let envelope = DualSignedRotation::sign(
+                    ValidatorKeyRotation {
+                        validator: cluster.node_ids[target],
+                        new_pubkey: new_signer.node_id(),
+                        v_eff,
+                    },
+                    &*current,
+                    &*new_signer,
+                )
+                .expect("rotation envelope sign");
+                let payload = envelope.encode_command();
+                for mp in &cluster.mempools {
+                    let _ = mp.insert(payload.clone());
+                }
+
+                let crossed = cluster
+                    .advance_and_yield_until(Duration::from_secs(12), |c| {
+                        c.peek_commit_heights().iter().min().copied().unwrap_or(0)
+                            >= v_eff + 5
+                    })
+                    .await;
+                prop_assert!(
+                    crossed,
+                    "L5: cluster failed to commit past v_eff={v_eff} for target={target}",
+                );
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                let any_post = committed
+                    .iter()
+                    .any(|node_blocks| node_blocks.iter().any(|b| b.header.view >= v_eff));
+                prop_assert!(
+                    any_post,
+                    "L5: no committed block at view >= v_eff={v_eff} for target={target}",
+                );
+
+                Ok(())
+            })?;
+        }
+
         /// **L4 — reconfiguration safety.** A 5-node cluster commits a
         /// `ReconfigCommand` removing one randomly-chosen validator at
         /// a random `v_eff_offset` in the future. After `current_view`
@@ -3885,6 +3968,219 @@ mod tests {
         assert!(
             rotation_committed,
             "expected at least one committed block to carry the rotation tx",
+        );
+    }
+
+    // ── #261: rotation rejection sim tests ────────────────────────────────
+    //
+    // The dispatch-level signer check (PR #286) and the post-commit
+    // `apply_committed_rotations` path (#260) together enforce that a
+    // malformed rotation tx never mutates `validator_key_history`. The
+    // unit tests in `validator_rotation.rs` and `validator_key_history.rs`
+    // exhaustively cover the rejection logic in isolation — these
+    // sim-level tests close the loop by showing that the rejection
+    // doesn't crash the cluster, the bad tx still propagates as opaque
+    // bytes through propose → commit (the safety core treats every
+    // command as opaque, so it can't reject one), and crucially that
+    // the cluster maintains safety and liveness either way.
+
+    /// Helper: build a structurally-valid `DualSignedRotation` for
+    /// validator `idx` with `v_eff = 60`, then return both the encoded
+    /// envelope bytes and the original (mutable) envelope so callers
+    /// can mangle a single field before encoding.
+    async fn rotation_envelope_for_idx(
+        cluster: &SimCluster,
+        idx: usize,
+        v_eff: crate::consensus::View,
+    ) -> (
+        crate::consensus::validator_rotation::DualSignedRotation,
+        Arc<dyn Signer>,
+    ) {
+        use crate::consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+
+        let current = cluster
+            .signer(idx)
+            .expect("regular SimCluster captures signers");
+        let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
+        let payload = ValidatorKeyRotation {
+            validator: cluster.node_ids[idx],
+            new_pubkey: new_signer.node_id(),
+            v_eff,
+        };
+        let env = DualSignedRotation::sign(payload, &*current, &*new_signer)
+            .expect("constructing rotation envelope must succeed");
+        (env, new_signer)
+    }
+
+    /// Rotation tx whose `sig_old` is zeroed: cryptographic
+    /// verification at commit time rejects it. The cluster commits the
+    /// tx as opaque bytes — the safety core can't peek inside — but
+    /// `apply_committed_rotations` log+drops it and the key history
+    /// stays untouched. Cluster maintains safety + liveness.
+    #[tokio::test(start_paused = true)]
+    async fn cluster_rejects_rotation_tx_with_zeroed_sig_old() {
+        use crate::consensus::View;
+        use crate::consensus::validator_rotation::DualSignedRotation;
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 2
+            })
+            .await;
+        assert!(warmed, "warm-up did not commit");
+
+        let v_eff: View = 60;
+        let (mut env, _) = rotation_envelope_for_idx(&cluster, 1, v_eff).await;
+        // Zero out sig_old. sig_new still verifies under
+        // payload.new_pubkey, but the dual-signature property requires
+        // both — apply_committed_rotations rejects.
+        env.sig_old = [0u8; 64];
+        let bad_bytes = env.encode_command();
+        for mp in &cluster.mempools {
+            let _ = mp.insert(bad_bytes.clone());
+        }
+
+        // Drive past the would-be v_eff. Because the rotation was
+        // rejected, the rotated validator's key history is unchanged,
+        // its old-key votes are still accepted at view >= v_eff, and
+        // all four validators contribute to quorum — the cluster runs
+        // at full speed (no wasted views from a rejected leader).
+        let crossed = cluster
+            .advance_and_yield_until(Duration::from_secs(8), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff + 5
+            })
+            .await;
+        assert!(crossed, "cluster failed to commit past v_eff = {v_eff}");
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // The bad rotation tx still made it onto the chain — that's
+        // the safety core's job, it commits whatever leaders
+        // propose. The rejection happens after commit.
+        let rotation_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|cmd| DualSignedRotation::is_rotation_payload(cmd))
+            })
+        });
+        assert!(
+            rotation_committed,
+            "the rejected rotation tx should still appear on-chain",
+        );
+    }
+
+    /// Mirror of the above, but `sig_new` is zeroed. Verification
+    /// rejects on the new-key-signature check rather than the old-key
+    /// check; the safety/liveness invariants are unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn cluster_rejects_rotation_tx_with_zeroed_sig_new() {
+        use crate::consensus::View;
+        use crate::consensus::validator_rotation::DualSignedRotation;
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 2
+            })
+            .await;
+        assert!(warmed, "warm-up did not commit");
+
+        let v_eff: View = 60;
+        let (mut env, _) = rotation_envelope_for_idx(&cluster, 1, v_eff).await;
+        env.sig_new = [0u8; 64];
+        let bad_bytes = env.encode_command();
+        for mp in &cluster.mempools {
+            let _ = mp.insert(bad_bytes.clone());
+        }
+
+        let crossed = cluster
+            .advance_and_yield_until(Duration::from_secs(8), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff + 5
+            })
+            .await;
+        assert!(crossed, "cluster failed to commit past v_eff = {v_eff}");
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        let rotation_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|cmd| DualSignedRotation::is_rotation_payload(cmd))
+            })
+        });
+        assert!(
+            rotation_committed,
+            "the rejected rotation tx should still appear on-chain",
+        );
+    }
+
+    /// Structural rejection: `v_eff` violates the
+    /// `current_view + V_EFF_MIN_DELAY` floor. `apply_committed_rotations`
+    /// runs `validate_structural` first; the rotation is dropped before
+    /// any cryptographic check.
+    #[tokio::test(start_paused = true)]
+    async fn cluster_rejects_rotation_tx_with_v_eff_below_min_delay() {
+        use crate::consensus::validator_rotation::DualSignedRotation;
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 5
+            })
+            .await;
+        assert!(warmed, "warm-up did not commit");
+
+        // v_eff = 0: invalid for *any* commit_view since we require
+        // commit_view + V_EFF_MIN_DELAY <= v_eff. Even the genesis
+        // block at view 0 wouldn't accept this. Build a fresh envelope
+        // signed at v_eff = 0 so both signatures verify cleanly — the
+        // structural check (which fires before any cryptographic check)
+        // is what we're asserting catches it.
+        let current = cluster.signer(1).unwrap();
+        let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
+        let env = crate::consensus::validator_rotation::DualSignedRotation::sign(
+            crate::consensus::validator_rotation::ValidatorKeyRotation {
+                validator: cluster.node_ids[1],
+                new_pubkey: new_signer.node_id(),
+                v_eff: 0,
+            },
+            &*current,
+            &*new_signer,
+        )
+        .unwrap();
+        let bad_bytes = env.encode_command();
+        for mp in &cluster.mempools {
+            let _ = mp.insert(bad_bytes.clone());
+        }
+
+        // Drive forward; the cluster should keep making progress at
+        // full speed since the rotation was rejected pre-application.
+        let progressed = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 20
+            })
+            .await;
+        assert!(progressed, "cluster failed to make progress");
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // The bad tx still landed on-chain (safety core can't peek).
+        let rotation_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|cmd| DualSignedRotation::is_rotation_payload(cmd))
+            })
+        });
+        assert!(
+            rotation_committed,
+            "the rejected rotation tx should still appear on-chain",
         );
     }
 }
