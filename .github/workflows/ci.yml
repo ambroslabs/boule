@@ -83,9 +83,9 @@ jobs:
         name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
       - if: needs.changes.outputs.rust == 'true'
-        run: cargo nextest run --locked --all-targets
+        run: cargo nextest run --locked --all-targets --test-threads=$((4 * $(nproc)))
       - if: needs.changes.outputs.rust == 'true'
-        run: cargo test --locked --doc
+        run: cargo test --locked --doc -- --test-threads=$((4 * $(nproc)))
 
   deny:
     name: Deny (licenses + advisories)
