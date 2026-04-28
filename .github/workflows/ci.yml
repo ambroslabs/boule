@@ -65,16 +65,7 @@ jobs:
         with:
           components: clippy
       - if: needs.changes.outputs.rust == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-
+        uses: Swatinem/rust-cache@v2
       - if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --all-targets -- -D warnings
 
@@ -87,16 +78,7 @@ jobs:
       - if: needs.changes.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@stable
       - if: needs.changes.outputs.rust == 'true'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-build-
+        uses: Swatinem/rust-cache@v2
       - if: needs.changes.outputs.rust == 'true'
         name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
