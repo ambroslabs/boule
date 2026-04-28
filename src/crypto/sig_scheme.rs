@@ -312,6 +312,16 @@ impl BlsAggregated {
     /// signatures share the same hash-to-curve domain.
     pub const DST: &'static [u8] = b"AMBROS_HOTSTUFF_BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
+    /// True iff `agg` is the sentinel returned by
+    /// [`Self::empty_aggregate`] — i.e. no partials have been folded in.
+    /// Used by [`crate::consensus::hotstuff::QuorumCertificate::is_well_formed`]
+    /// for a cheap structural check that pairs the bitmap state with
+    /// the aggregate state, before the cryptographic
+    /// [`Self::verify_aggregate`] pairing check runs.
+    pub fn is_empty_aggregate(agg: &BlsAggregate) -> bool {
+        *agg == BLS_EMPTY_AGGREGATE_SENTINEL
+    }
+
     /// Generate a fresh BLS keypair from input keying material.
     /// `ikm` must be at least 32 bytes per the IETF spec; shorter
     /// inputs are rejected.
