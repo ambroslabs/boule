@@ -2629,10 +2629,11 @@ impl ConsensusNode {
             // so all replicas accept or reject identically.
             let block_view = block.header.view;
             let current_set = self.validator_history.set_at(block_view);
-            let next_members = match cmd.validate_against_with_delay(
+            let next_members = match cmd.validate_against_with_delay_and_scheme(
                 &current_set,
                 block_view,
                 self.min_v_eff_delay,
+                self.signature_scheme,
             ) {
                 Ok(m) => m,
                 Err(e) => {
