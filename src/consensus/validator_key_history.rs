@@ -38,6 +38,7 @@
 use std::collections::BTreeMap;
 
 use crate::consensus::View;
+use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_rotation::{RotationStructuralError, ValidatorKeyRotation};
 use crate::p2p::NodeId;
 
@@ -139,6 +140,79 @@ impl ValidatorKeyHistory {
             h.pubkey_to_stable_id.insert(v, v);
         }
         h
+    }
+
+    /// Reconstruct a key history that mirrors the boundaries of
+    /// `set_history`, treating each validator's join view as their
+    /// initial entry. Used at startup when the persisted set history
+    /// has been rebuilt but no rotation history is yet persisted —
+    /// the result is correct as long as no rotations have committed
+    /// (which is true today; persistence of rotations is a follow-up).
+    ///
+    /// Walks the set history boundaries in order. The first time a
+    /// validator pubkey appears in any boundary's set, an entry is
+    /// recorded at that boundary's `v_eff`; subsequent boundaries
+    /// don't overwrite. This means a validator that was in the genesis
+    /// set has a `v_eff = 0` entry, while a validator added via a
+    /// reconfig at view `R` has a `v_eff = R` entry — matching when
+    /// they actually started being a valid signer.
+    pub fn from_set_history(set_history: &ValidatorSetHistory) -> Self {
+        let mut h = Self::default();
+        for (v_eff, set) in set_history.iter() {
+            for member in set.iter().copied() {
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    h.by_stable_id.entry(member)
+                {
+                    slot.insert(vec![KeyEntry {
+                        v_eff,
+                        pubkey: member,
+                    }]);
+                    h.pubkey_to_stable_id.insert(member, member);
+                }
+            }
+        }
+        h
+    }
+
+    /// Register a validator that joins via reconfig at `v_eff`. The
+    /// validator's initial signing key is `node_id` itself — same
+    /// identity model as genesis-seeded validators — and it becomes a
+    /// valid signer starting at view `v_eff`.
+    ///
+    /// Rejects if `node_id` is already known to this history under any
+    /// validator (collision with the reverse index would make
+    /// [`Self::validator_for`] ambiguous). Use [`Self::apply_rotation`]
+    /// for the case where a known validator is changing keys.
+    pub fn add_validator(&mut self, node_id: NodeId, v_eff: View) -> Result<(), HistoryError> {
+        if let Some(owner) = self.pubkey_to_stable_id.get(&node_id) {
+            return Err(HistoryError::NewKeyCollidesWithOtherValidator {
+                new_pubkey: node_id,
+                owner: *owner,
+            });
+        }
+        self.by_stable_id.insert(
+            node_id,
+            vec![KeyEntry {
+                v_eff,
+                pubkey: node_id,
+            }],
+        );
+        self.pubkey_to_stable_id.insert(node_id, node_id);
+        Ok(())
+    }
+
+    /// Resolve any pubkey ever used by a validator (genesis, current,
+    /// or any historical key it has rotated through) to that
+    /// validator's stable identifier. Returns `None` if the pubkey is
+    /// not associated with any validator.
+    ///
+    /// This is the lookup the verification path uses to bridge
+    /// "signer pubkey on the wire" to "validator's stable id in the
+    /// validator set" — without it, the post-rotation key wouldn't be
+    /// recognizable as belonging to the same validator that was
+    /// originally seated.
+    pub fn validator_for(&self, pubkey: &NodeId) -> Option<NodeId> {
+        self.pubkey_to_stable_id.get(pubkey).copied()
     }
 
     /// The active signing key for the validator identified by
@@ -522,5 +596,126 @@ mod tests {
             h.current_key(&nid(10)),
         );
         assert_eq!(snapshot_before_reject, snapshot_after_reject);
+    }
+
+    // ── validator_for ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validator_for_resolves_genesis_pubkey() {
+        let h = ValidatorKeyHistory::new([nid(1), nid(2)]);
+        assert_eq!(h.validator_for(&nid(1)), Some(nid(1)));
+        assert_eq!(h.validator_for(&nid(2)), Some(nid(2)));
+        assert_eq!(h.validator_for(&nid(99)), None);
+    }
+
+    #[test]
+    fn validator_for_resolves_post_rotation_pubkey_to_stable_id() {
+        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
+        h.apply_rotation(&rot(nid(10), nid(20), 200), 150).unwrap();
+        // Every key the validator has ever used resolves to the same
+        // stable id — that's what bridges spanning-vote verification
+        // back to the validator's identity in the validator set.
+        assert_eq!(h.validator_for(&nid(1)), Some(nid(1)));
+        assert_eq!(h.validator_for(&nid(10)), Some(nid(1)));
+        assert_eq!(h.validator_for(&nid(20)), Some(nid(1)));
+        assert_eq!(h.validator_for(&nid(99)), None);
+    }
+
+    // ── add_validator ─────────────────────────────────────────────────────
+
+    #[test]
+    fn add_validator_makes_node_a_valid_signer_starting_at_v_eff() {
+        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        h.add_validator(nid(2), 10).unwrap();
+        // Before they joined, the validator has no active key.
+        assert_eq!(h.key_at(&nid(2), 9), None);
+        // From v_eff onwards, they're a valid signer using their own
+        // pubkey as the initial key.
+        assert_eq!(h.key_at(&nid(2), 10), Some(nid(2)));
+        assert_eq!(h.key_at(&nid(2), 1_000), Some(nid(2)));
+        // And the reverse index resolves them.
+        assert_eq!(h.validator_for(&nid(2)), Some(nid(2)));
+    }
+
+    #[test]
+    fn add_validator_rejects_pubkey_already_known() {
+        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        // Genesis validator's pubkey collides.
+        let err = h.add_validator(nid(1), 10).unwrap_err();
+        assert!(matches!(
+            err,
+            HistoryError::NewKeyCollidesWithOtherValidator { .. }
+        ));
+    }
+
+    #[test]
+    fn add_validator_then_apply_rotation_works_for_added_validator() {
+        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        h.add_validator(nid(2), 10).unwrap();
+        // Newly-added validator can subsequently rotate keys.
+        h.apply_rotation(&rot(nid(2), nid(20), 100), 50).unwrap();
+        assert_eq!(h.key_at(&nid(2), 50), Some(nid(2)));
+        assert_eq!(h.key_at(&nid(2), 100), Some(nid(20)));
+        assert_eq!(h.validator_for(&nid(20)), Some(nid(2)));
+    }
+
+    // ── from_set_history ──────────────────────────────────────────────────
+
+    #[test]
+    fn from_set_history_genesis_only_matches_new() {
+        use crate::consensus::validator_set::ValidatorSet;
+        let vs = ValidatorSet::new(vec![nid(1), nid(2), nid(3)]);
+        let sh = ValidatorSetHistory::from_genesis(vs);
+
+        let h = ValidatorKeyHistory::from_set_history(&sh);
+        for v in [nid(1), nid(2), nid(3)] {
+            assert_eq!(h.key_at(&v, 0), Some(v));
+            assert_eq!(h.key_at(&v, 1_000), Some(v));
+            assert_eq!(h.validator_for(&v), Some(v));
+        }
+    }
+
+    #[test]
+    fn from_set_history_picks_up_validators_added_via_reconfig() {
+        use crate::consensus::validator_set::ValidatorSet;
+        let mut sh = ValidatorSetHistory::from_genesis(ValidatorSet::new(vec![nid(1), nid(2)]));
+        sh.insert_boundary(10, ValidatorSet::new(vec![nid(1), nid(2), nid(3)]))
+            .unwrap();
+
+        let h = ValidatorKeyHistory::from_set_history(&sh);
+        // Genesis validators get entries at v_eff = 0.
+        assert_eq!(h.key_at(&nid(1), 0), Some(nid(1)));
+        assert_eq!(h.key_at(&nid(2), 0), Some(nid(2)));
+        // Reconfig-added validator only becomes a valid signer at v_eff.
+        assert_eq!(h.key_at(&nid(3), 9), None);
+        assert_eq!(h.key_at(&nid(3), 10), Some(nid(3)));
+        assert_eq!(h.key_at(&nid(3), 1_000), Some(nid(3)));
+        // Validators that left the set (none in this test) would still
+        // appear in key history forever — they're tracked for spanning
+        // votes against their tenure, even if removed later.
+    }
+
+    #[test]
+    fn from_set_history_does_not_re_add_validators_present_in_multiple_boundaries() {
+        use crate::consensus::validator_set::ValidatorSet;
+        let mut sh = ValidatorSetHistory::from_genesis(ValidatorSet::new(vec![nid(1), nid(2)]));
+        sh.insert_boundary(10, ValidatorSet::new(vec![nid(1), nid(2), nid(3)]))
+            .unwrap();
+        sh.insert_boundary(20, ValidatorSet::new(vec![nid(1), nid(3)]))
+            .unwrap(); // nid(2) removed
+
+        let h = ValidatorKeyHistory::from_set_history(&sh);
+        // nid(1) appears in every boundary; the entry stays at v_eff = 0
+        // (its earliest appearance), not bumped forward by later
+        // boundaries.
+        assert_eq!(h.key_at(&nid(1), 0), Some(nid(1)));
+        // nid(2) was in genesis + first reconfig but removed at 20.
+        // The key history retains its entry at v_eff = 0 — needed so
+        // late spanning votes from view < 20 still verify.
+        assert_eq!(h.key_at(&nid(2), 0), Some(nid(2)));
+        assert_eq!(h.key_at(&nid(2), 19), Some(nid(2)));
+        // nid(3) joined at 10.
+        assert_eq!(h.key_at(&nid(3), 10), Some(nid(3)));
     }
 }

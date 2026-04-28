@@ -261,7 +261,11 @@ proptest! {
         let from = [from_byte; 32];
         let vs = pool_validator_set();
         let history = crate::consensus::validator_history::ValidatorSetHistory::from_genesis(vs);
-        let _ = ingress(from, &bytes, &history);
+        let key_history =
+            crate::consensus::validator_key_history::ValidatorKeyHistory::from_set_history(
+                &history,
+            );
+        let _ = ingress(from, &bytes, &history, &key_history);
     }
 
     /// A `WireMessage` whose payload is structurally adversarial —
@@ -278,7 +282,11 @@ proptest! {
     ) {
         let vs = pool_validator_set();
         let history = crate::consensus::validator_history::ValidatorSetHistory::from_genesis(vs);
-        let _ = ingress(from, &bytes, &history);
+        let key_history =
+            crate::consensus::validator_key_history::ValidatorKeyHistory::from_set_history(
+                &history,
+            );
+        let _ = ingress(from, &bytes, &history, &key_history);
     }
 }
 
