@@ -114,10 +114,15 @@ across the cluster are the **validator** node IDs.
 > messages by validator pubkey, while the p2p layer addresses peers by
 > their TLS pubkey. As long as the two pubkeys match (single-key mode, or
 > a `[node.validator_identity]` that resolves to the same key bytes as
-> `[node.identity]`), routing works. Independently rotating the validator
-> key requires the validator-set reconfiguration runbook (issue #140) to
-> register a `(validator pubkey → network address)` mapping; until that
-> lands the binary warns at startup if the two pubkeys differ.
+> `[node.identity]`), routing works. To independently rotate the
+> validator key now that #142 has landed, see
+> [the rotation runbook in operations.md][rotation-runbook]; that path
+> uses the per-validator key history so the dispatch layer can resolve a
+> post-rotation signer back to the right network address. The binary
+> still warns at startup if the two pubkeys differ as a heads-up that the
+> deployment is using independent keys.
+>
+> [rotation-runbook]: operations.md#rotating-a-validators-consensus-signing-key-issue-142
 
 ---
 
@@ -909,6 +914,23 @@ to commit a *second* reconfig that rolls back the change (`add` becomes
 `remove` and vice versa). Until that second reconfig also reaches
 `v_eff`, the cluster is in degraded mode — design accordingly when
 choosing `v_eff`.
+
+**Rotating an existing validator's signing key** (without removing and
+re-adding it) uses a separate, dedicated mechanism — the dual-signed
+[`DualSignedRotation`][rotation-tx] transaction. See the
+["Rotating a validator's consensus signing key" section in
+operations.md][rotation-runbook] for the runbook.
+
+[rotation-tx]: https://github.com/zrbecker/ambros-p2p/blob/main/src/consensus/validator_rotation.rs
+[rotation-runbook]: operations.md#rotating-a-validators-consensus-signing-key-issue-142
+
+Also note the older note in §2 above (under "Network identity vs.
+validator identity") — that warning was written before the rotation
+path landed and assumed reconfig was the only way to change a
+validator key. The rotation path is now the right answer for that
+specific case; reconfig stays the right answer when changing the
+validator address (i.e. its stable identifier, not just the active
+signing key).
 
 ---
 
