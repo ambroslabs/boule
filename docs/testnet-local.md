@@ -826,6 +826,90 @@ The available `op =` values match the CLI: `wait_all_reach_height`,
 > Byzantine votes/proposals/NewViews with honest delivery and assert
 > `assert_no_conflicting_commits`.
 
+### 9c. Validator-set reconfiguration
+
+The four-node cluster from §8 is pinned at the genesis committee. To
+add or remove a validator at runtime, an operator constructs a tagged
+`ReconfigCommand` payload, injects it into a leader's mempool, and
+waits for the chain to commit the reconfig and roll past `v_eff`.
+This section walks through both directions on the testnet you've
+already got running.
+
+**Constraints (consensus-side floors):**
+
+- The post-reconfig committee size must be at least
+  `MIN_VALIDATOR_FLOOR = 4` (the smallest `3f + 1` BFT cluster). A
+  reconfig that would drop below this is rejected at commit time and
+  the block continues to commit normally.
+- `v_eff` must be at least `current_view + MIN_V_EFF_DELAY = 2` so a
+  newly-added validator has a window to finish state-sync before it
+  must vote. Operator-supplied `min_v_eff_delay` in `[consensus]`
+  raises this floor; it cannot be undercut.
+- Only one reconfig may be pending at a time. While a previously
+  committed reconfig's `v_eff` is still in the future, any second
+  reconfig is dropped silently.
+
+**Step 1: build the payload.** Use the CLI on any host (it doesn't
+talk to the cluster — just encodes the tagged bytes). For an `add`,
+you need the new validator's `NodeId` (run `ambros-p2p init` on the
+new host first to mint its key) and its routable `listen_addr`:
+
+```sh
+# What's the cluster's current view? Read it off the admin API.
+curl -s http://127.0.0.1:8000/consensus/status | jq .current_view
+# Pick a v_eff comfortably in the future — e.g. current_view + 100 —
+# so the reconfig has time to commit before its boundary lands.
+
+./target/release/ambros-p2p reconfig add-validator \
+    --pubkey <new-node-NodeId-base58> \
+    --addr   127.0.0.1:7004 \
+    --v-eff  150
+# Output: a single hex line — the encoded ReconfigCommand bytes.
+```
+
+For a `remove`, the address is irrelevant (the validator's already in
+the active set):
+
+```sh
+./target/release/ambros-p2p reconfig remove-validator \
+    --pubkey <removed-node-NodeId-base58> \
+    --v-eff  150
+```
+
+**Step 2: inject the payload into a mempool.** There is no
+transaction-submission API yet (#251 follow-up). Today the operator
+path is "edit one node's mempool out-of-band" — the simplest route is
+to copy the hex into a small Rust harness or use a dev-only RPC. In
+the testnet driver this is a single helper call against a running
+node; consult `tests/integration_test.rs` for the programmatic shape.
+A first-class submission CLI is tracked as a follow-up to #251.
+
+**Step 3: watch the reconfig commit and apply.** Tail the consensus
+logs (or poll the admin API) until you see the cluster commit a block
+whose commands include the tagged payload. The structured event is
+`reconfig_applied` with the resulting committee size:
+
+```
+INFO ambros_p2p::consensus: reconfig_applied height=42 view=43 v_eff=150 next_size=5
+```
+
+After `current_view` crosses `v_eff`, leader rotation observes the
+post-boundary committee — for an add, the new validator starts taking
+its leader slots; for a remove, the removed node's votes are dropped
+at ingress and the rotation skips it. Inspect the active committee by
+restarting any node: `ambros-p2p start` reads
+`consensus/validator_history` (#254) on boot, replays every committed
+reconfig boundary, and prints the recovered committee in the startup
+logs.
+
+**Recovery from a stuck reconfig.** If a reconfig commits but the new
+validator is not online by `v_eff`, the cluster can stall: vote tally
+under the new committee may fall below quorum. The recovery path is
+to commit a *second* reconfig that rolls back the change (`add` becomes
+`remove` and vice versa). Until that second reconfig also reaches
+`v_eff`, the cluster is in degraded mode — design accordingly when
+choosing `v_eff`.
+
 ---
 
 ## 10. Shut down and clean up
