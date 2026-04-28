@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
 use crate::consensus::limits::CacheEvictionCounters;
+use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::replication::block::{Block, BlockHash};
 
@@ -84,9 +85,21 @@ pub struct HotStuffState {
     /// Prevents double-voting within a view.
     pub last_voted_view: View,
 
-    /// Committee the replica is operating under. Dynamic validator-set
-    /// churn is out of scope for milestone 7 (#23).
+    /// Committee the replica is operating under at the *current* view.
+    /// Mirrors `validator_history.current_set()` at the boundary that
+    /// most recently took effect; integration callers without a view
+    /// context (e.g. block-sync peer pick) can read this as "the
+    /// committee right now". Anywhere a specific view is in scope —
+    /// vote tally, leader pick, QC well-formedness — read
+    /// `validator_history.set_at(view)` instead, so verification does
+    /// not drift across reconfiguration boundaries (#140).
     pub validator_set: ValidatorSet,
+
+    /// View-keyed validator-set history (#248). Until #272 lands the
+    /// commit-time application path this contains only the genesis
+    /// boundary, so `set_at(view)` is the same set for every view and
+    /// behaviour matches the pre-history single-set safety core.
+    pub validator_history: ValidatorSetHistory,
 
     /// Blocks the replica has observed but not yet committed. Keyed by
     /// header hash (`Block::hash()`). Parent chains are walked through
@@ -121,12 +134,14 @@ impl HotStuffState {
         let genesis_hash = genesis.hash();
         let mut pending = HashMap::new();
         pending.insert(genesis_hash, genesis);
+        let validator_history = ValidatorSetHistory::from_genesis(validator_set.clone());
         Self {
             current_view: 0,
             locked: None,
             high_qc: None,
             last_voted_view: 0,
             validator_set,
+            validator_history,
             pending_blocks: pending,
             genesis_hash,
             // Default to "unbounded" so unit tests in

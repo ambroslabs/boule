@@ -509,7 +509,13 @@ impl HotStuffCore {
     /// `on_vote_received`'s QC-formed branch) that fire regardless
     /// of whether self is the leader.
     fn try_propose_as_leader(&mut self, view: View) -> Vec<Action> {
-        if round_robin_leader(&self.state.validator_set, view) != self.self_id {
+        // Leader rotation is keyed by the validator set authoritative
+        // at `view`. Today the history holds only the genesis boundary
+        // so this matches the previous `state.validator_set` lookup;
+        // after #272 it correctly picks the post-boundary set for any
+        // proposal at or after `v_eff`.
+        let vs = self.state.validator_history.set_at(view);
+        if round_robin_leader(&vs, view) != self.self_id {
             return Vec::new();
         }
         self.build_proposal_at_view(view)
@@ -720,21 +726,27 @@ impl HotStuffCore {
         let vote = &signed.payload;
         let next_view = vote.view + 1;
 
-        // The voter must be a known validator; otherwise we have no
-        // index into the `SignerBitmap`. A well-behaved integration
-        // layer already filters these in signature verification, but
-        // we repeat the check here for defence-in-depth against a
-        // replay or test-wiring bug.
-        let Some(voter_idx) = self.state.validator_set.index_of(&signed.signer) else {
+        // The voter must be a known validator at `vote.view`;
+        // otherwise we have no index into the `SignerBitmap`. A
+        // well-behaved integration layer already filters these in
+        // signature verification (#249), but we repeat the check here
+        // for defence-in-depth against a replay or test-wiring bug.
+        // Looking up against the historical set means votes that span
+        // a reconfig boundary are validated against the right
+        // committee on either side.
+        let vs_at_vote = self.state.validator_history.set_at(vote.view);
+        let Some(voter_idx) = vs_at_vote.index_of(&signed.signer) else {
             return Vec::new();
         };
 
         // Accumulate into the bucket for this `(view, block_hash)`
         // pair. `QuorumCertificate::add_signature` is idempotent on
         // the set-bit — duplicate votes from the same signer are
-        // no-ops.
+        // no-ops. The bucket is sized to the set authoritative at
+        // `vote.view` so the bitmap and quorum threshold match what
+        // the QC will be checked against later.
         let key = (vote.view, vote.block_hash);
-        let validator_set_len = self.state.validator_set.len();
+        let validator_set_len = vs_at_vote.len();
         // Make room before insert. Updating an existing bucket
         // doesn't grow the map, so the cap check only fires on
         // genuinely new (view, block_hash) tuples — exactly the
@@ -746,9 +758,9 @@ impl HotStuffCore {
         let qc = self.vote_bucket.entry(key).or_insert_with(|| {
             QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len)
         });
-        let had_quorum = qc.has_quorum(&self.state.validator_set);
+        let had_quorum = qc.has_quorum(&vs_at_vote);
         qc.add_signature(voter_idx, signed.sig);
-        let has_quorum_now = qc.has_quorum(&self.state.validator_set);
+        let has_quorum_now = qc.has_quorum(&vs_at_vote);
 
         // Only fire on the transition from sub-quorum to quorum.
         // Late votes arriving after the QC formed are absorbed
@@ -2585,6 +2597,93 @@ mod tests {
             core.vote_bucket.is_empty(),
             "bucket must not grow on unknown signer",
         );
+    }
+
+    // ── #270: vote validation across a reconfig boundary ────────────────
+
+    /// A vote at `vote.view >= v_eff` signed by a validator who is in
+    /// the *old* set but not in the post-boundary set must be dropped:
+    /// the safety core looks up `set_at(vote.view)`, which returns the
+    /// new set, and the old-only signer has no index there.
+    #[test]
+    fn vote_at_v_eff_signed_by_old_set_only_member_is_dropped() {
+        let mut core = make_core(1);
+        // Old genesis set is `[nid(1), nid(2), nid(3), nid(4)]` from
+        // `validators()`. Boundary at v_eff = 5 swaps in a new set
+        // that drops nid(4) and adds nid(5) + nid(6) to keep size 5.
+        let v_eff: View = 5;
+        let new_set = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(5), nid(6)]);
+        core.state
+            .validator_history
+            .insert_boundary(v_eff, new_set)
+            .unwrap();
+
+        // Vote at view = v_eff signed by the old-only member.
+        let vote = signed_vote(v_eff, [0xAA; 32], nid(4));
+        let actions = core.step(Event::VoteReceived(vote));
+
+        assert!(
+            actions.is_empty(),
+            "old-set-only signer at v_eff must drop: {actions:?}",
+        );
+        assert!(
+            core.vote_bucket.is_empty(),
+            "bucket must not grow when signer is outside set_at(vote.view)",
+        );
+    }
+
+    /// A vote at `vote.view < v_eff` signed by a validator who is only
+    /// in the *new* set is dropped: `set_at(vote.view)` returns the
+    /// pre-boundary genesis set, and the new-only signer has no index.
+    /// Confirms that historical votes are not retroactively re-validated
+    /// against the post-boundary committee.
+    #[test]
+    fn vote_before_boundary_signed_by_new_set_only_member_is_dropped() {
+        let mut core = make_core(1);
+        let v_eff: View = 5;
+        let new_set = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5)]);
+        core.state
+            .validator_history
+            .insert_boundary(v_eff, new_set)
+            .unwrap();
+
+        // Vote at view = v_eff - 1 signed by the new-only member.
+        let vote = signed_vote(v_eff - 1, [0xBB; 32], nid(5));
+        let actions = core.step(Event::VoteReceived(vote));
+
+        assert!(
+            actions.is_empty(),
+            "new-set-only signer at v_eff - 1 must drop: {actions:?}",
+        );
+        assert!(
+            core.vote_bucket.is_empty(),
+            "bucket must not grow when signer is outside set_at(vote.view)",
+        );
+    }
+
+    /// Sanity: a vote at `vote.view >= v_eff` signed by someone *only*
+    /// in the new set lands in the bucket correctly. This verifies the
+    /// positive side — the historical lookup picks the right set
+    /// rather than the wrong one in both directions.
+    #[test]
+    fn vote_at_v_eff_signed_by_new_set_only_member_lands_in_bucket() {
+        let mut core = make_core(1);
+        let v_eff: View = 5;
+        let new_set = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(7)]);
+        core.state
+            .validator_history
+            .insert_boundary(v_eff, new_set)
+            .unwrap();
+
+        let block_hash: BlockHash = [0xCC; 32];
+        let vote = signed_vote(v_eff, block_hash, nid(7));
+        let _ = core.step(Event::VoteReceived(vote));
+
+        let bucket = core
+            .vote_bucket
+            .get(&(v_eff, block_hash))
+            .expect("bucket keyed by (view, block_hash) must exist after the vote landed");
+        assert_eq!(bucket.signer_count(), 1);
     }
 
     // ── D7: parked proposal re-dispatch after parent arrives ────────
