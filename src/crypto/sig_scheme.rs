@@ -171,7 +171,14 @@ pub enum SignatureSchemeChoice {
     /// See [`Ed25519Collected`].
     #[default]
     Ed25519Collected,
-    // BlsAggregated arrives in #289.
+    /// BLS12-381 signature aggregation: each QC carries one ~96-byte
+    /// aggregate G2 point. `O(1)` pairing-check verification, constant
+    /// QC wire size in `n`. See [`BlsAggregated`].
+    ///
+    /// **Scaffold only as of #289** — keygen, signing, aggregation and
+    /// verification logic land in #290. A node that selects this
+    /// variant in genesis will fail at first call into the BLS path.
+    BlsAggregated,
 }
 
 impl SignatureSchemeChoice {
@@ -179,6 +186,7 @@ impl SignatureSchemeChoice {
     pub fn name(self) -> &'static str {
         match self {
             Self::Ed25519Collected => Ed25519Collected::NAME,
+            Self::BlsAggregated => BlsAggregated::NAME,
         }
     }
 }
@@ -252,6 +260,86 @@ impl SignatureScheme for Ed25519Collected {
                 .map_err(|_| AggregateVerifyError::InvalidAggregate)?;
         }
         Ok(())
+    }
+}
+
+/// BLS12-381 signature aggregation scheme: each QC carries a single
+/// ~96-byte aggregate G2 point. Verification is one pairing check.
+///
+/// **Scaffold only as of #289.** The associated types are sized for the
+/// `min-pk` BLS12-381 variant (G1 pubkeys, G2 sigs) so #290 can fill
+/// in the actual `blst` calls without further trait churn:
+///
+/// - [`PartialSig`]: 96-byte compressed G2 point (one validator's sig).
+/// - [`Aggregate`]: 96-byte compressed G2 point (sum of all partials).
+/// - [`PublicKey`]: 48-byte compressed G1 point (validator's BLS pubkey).
+///
+/// Every method here panics with a clearly-labeled `todo!` so a node
+/// that selects this scheme in genesis fails fast and visibly rather
+/// than producing nonsense QCs. #290 replaces the panics with real
+/// blst-backed logic; #291 adds proof-of-possession at registration.
+///
+/// [`PartialSig`]: SignatureScheme::PartialSig
+/// [`Aggregate`]: SignatureScheme::Aggregate
+/// [`PublicKey`]: SignatureScheme::PublicKey
+pub struct BlsAggregated;
+
+/// Compressed BLS12-381 G2 point (one validator's partial signature, or
+/// the aggregate). 96 bytes per the IETF compressed serialization.
+pub type BlsPartialSig = [u8; 96];
+
+/// Compressed BLS12-381 G2 point. Same size as a partial because
+/// aggregation is point addition in G2.
+pub type BlsAggregate = [u8; 96];
+
+/// Compressed BLS12-381 G1 point (validator's BLS pubkey under the
+/// `min-pk` variant). 48 bytes per IETF.
+pub type BlsPublicKey = [u8; 48];
+
+impl SignatureScheme for BlsAggregated {
+    type PartialSig = BlsPartialSig;
+    type Aggregate = BlsAggregate;
+    type PublicKey = BlsPublicKey;
+
+    const NAME: &'static str = "bls_aggregated";
+
+    fn empty_aggregate() -> Self::Aggregate {
+        // Identity element placeholder. Once #290 is real, this becomes
+        // the G2 identity in the chosen serialization.
+        [0u8; 96]
+    }
+
+    fn add_partial(
+        _agg: &mut Self::Aggregate,
+        _signers_before: &SignerBitmap,
+        _validator_idx: usize,
+        _partial: Self::PartialSig,
+    ) {
+        todo!(
+            "BlsAggregated::add_partial: BLS aggregation logic lands in #290, \
+             see https://github.com/zrbecker/ambros-p2p/issues/290",
+        )
+    }
+
+    fn aggregate_count(_agg: &Self::Aggregate) -> usize {
+        // BLS aggregates are a single point; the "count" is carried
+        // alongside as the bitmap's set-bit count, not embedded in the
+        // aggregate. Returning 0 here is harmless (no caller exists yet)
+        // and is the right answer once #290 lands — the count comes
+        // from `signers.count()`, not from the aggregate.
+        0
+    }
+
+    fn verify_aggregate(
+        _agg: &Self::Aggregate,
+        _signers: &SignerBitmap,
+        _message: &[u8],
+        _pubkeys: &[Self::PublicKey],
+    ) -> Result<(), AggregateVerifyError> {
+        todo!(
+            "BlsAggregated::verify_aggregate: BLS pairing check lands in #290, \
+             see https://github.com/zrbecker/ambros-p2p/issues/290",
+        )
     }
 }
 
@@ -441,5 +529,65 @@ mod tests {
             Ed25519Collected::verify_aggregate(&agg, &signers, &message, &pubkeys),
             Err(AggregateVerifyError::InvalidAggregate),
         );
+    }
+
+    // ── BlsAggregated scaffold (#289) ────────────────────────────────
+
+    #[test]
+    fn bls_aggregated_name_is_bls_aggregated() {
+        assert_eq!(BlsAggregated::NAME, "bls_aggregated");
+        assert_eq!(
+            SignatureSchemeChoice::BlsAggregated.name(),
+            "bls_aggregated",
+        );
+    }
+
+    #[test]
+    fn bls_scheme_choice_round_trips_through_toml() {
+        // Genesis-config field uses snake_case; both variants round trip.
+        let raw = "scheme = \"bls_aggregated\"\n";
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            scheme: SignatureSchemeChoice,
+        }
+        let parsed: Wrap = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.scheme, SignatureSchemeChoice::BlsAggregated);
+    }
+
+    #[test]
+    fn bls_aggregated_empty_aggregate_is_zeroed_placeholder() {
+        // #290 will replace this with the real G2 identity element.
+        // Today it's just zero bytes; we assert the placeholder shape so
+        // the contract is explicit for the next PR's regression check.
+        assert_eq!(BlsAggregated::empty_aggregate(), [0u8; 96]);
+        assert_eq!(
+            BlsAggregated::aggregate_count(&BlsAggregated::empty_aggregate()),
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "BlsAggregated::add_partial")]
+    fn bls_aggregated_add_partial_is_clearly_unimplemented() {
+        let mut agg = BlsAggregated::empty_aggregate();
+        let signers = SignerBitmap::new(1);
+        BlsAggregated::add_partial(&mut agg, &signers, 0, [0u8; 96]);
+    }
+
+    #[test]
+    #[should_panic(expected = "BlsAggregated::verify_aggregate")]
+    fn bls_aggregated_verify_is_clearly_unimplemented() {
+        let agg = BlsAggregated::empty_aggregate();
+        let signers = SignerBitmap::new(1);
+        let pubkeys: Vec<BlsPublicKey> = vec![[0u8; 48]];
+        let _ = BlsAggregated::verify_aggregate(&agg, &signers, b"x", &pubkeys);
+    }
+
+    #[test]
+    fn blst_dependency_is_actually_pulled_in() {
+        // Cheap smoke test that the `blst` crate is reachable from this
+        // crate. #290 turns this into a real keygen-and-sign test; for
+        // #289 we just want CI to fail loudly if the dep gets dropped.
+        let _zero = blst::min_pk::SecretKey::default();
     }
 }
