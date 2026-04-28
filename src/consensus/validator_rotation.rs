@@ -16,17 +16,19 @@
 //!
 //! # Scope of this module
 //!
-//! Type definition, postcard codec, and structural well-formedness checks
-//! (rejecting an effective view that gives the validator no time to
-//! provision the new key, and rotations that don't actually change the
-//! key). Cryptographic verification of the two signatures lives in a
-//! follow-up (issue #258); per-view key resolution against historical QCs
-//! lives in #259.
+//! Type definition, postcard codec, structural well-formedness checks,
+//! and dual-signature verification. The "current consensus key" the
+//! `sig_old` check runs against is supplied by the caller — looking that
+//! up against a per-view validator key history is #259's job (which in
+//! turn waits on #140's per-view validator-set history). Wiring the
+//! envelope into block admission and the consensus event loop is #260.
 
+use anyhow::Result;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
-use crate::crypto::signed::SignedMessage;
+use crate::crypto::signed::{SignedMessage, Signer, preimage};
 use crate::p2p::NodeId;
 
 /// Minimum gap between the view in which a rotation is committed and its
@@ -134,6 +136,107 @@ impl ValidatorKeyRotation {
     }
 }
 
+/// Reasons a [`DualSignedRotation`] can fail cryptographic verification,
+/// after structural well-formedness has already been checked. These map
+/// 1:1 to the four rejection cases enumerated in the acceptance criteria
+/// for #258, so callers can log a precise reason without re-deriving it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RotationVerifyError {
+    /// `sig_old` does not verify under the validator's currently-active
+    /// consensus key. Covers the "signed only by the new key" case (the
+    /// envelope still has *some* bytes in `sig_old`, but they are not a
+    /// signature by the old key) and the "tampered old signature" case.
+    InvalidOldSignature,
+    /// `sig_new` does not verify under `payload.new_pubkey`. Covers the
+    /// "signed only by the old key" case, the "tampered new signature"
+    /// case, and the "sig_new is a real signature but over different
+    /// bytes" case.
+    InvalidNewSignature,
+    /// Re-serializing the payload to recover the canonical pre-image
+    /// failed. In practice this should never happen for the fixed-shape
+    /// payload used here, but surfacing it as a distinct variant keeps
+    /// the verifier from masking unexpected serialization regressions
+    /// behind a generic "invalid signature" verdict.
+    Preimage(String),
+}
+
+impl std::fmt::Display for RotationVerifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidOldSignature => f.write_str(
+                "rotation sig_old does not verify under the validator's current consensus key",
+            ),
+            Self::InvalidNewSignature => {
+                f.write_str("rotation sig_new does not verify under payload.new_pubkey")
+            }
+            Self::Preimage(e) => write!(f, "computing rotation pre-image failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RotationVerifyError {}
+
+impl DualSignedRotation {
+    /// Construct a dual-signed rotation envelope. The `current` signer
+    /// must hold the validator's currently-active consensus key; the
+    /// `new` signer must hold the key being rotated to (and its
+    /// `node_id()` must equal `payload.new_pubkey`, which the helper
+    /// asserts so callers can't accidentally produce an envelope whose
+    /// `sig_new` would never verify).
+    ///
+    /// Both signatures are over the same canonical pre-image as
+    /// [`crate::crypto::signed::Signed`] for `ValidatorKeyRotation` — the
+    /// shared helper guarantees the bytes signed match the bytes
+    /// [`Self::verify`] reconstructs.
+    pub fn sign(
+        payload: ValidatorKeyRotation,
+        current: &dyn Signer,
+        new: &dyn Signer,
+    ) -> Result<Self> {
+        if new.node_id() != payload.new_pubkey {
+            anyhow::bail!(
+                "new signer's node_id does not match payload.new_pubkey; the resulting \
+                 sig_new would never verify"
+            );
+        }
+        let bytes = preimage::<ValidatorKeyRotation>(&payload)?;
+        let sig_old = current.sign(&bytes);
+        let sig_new = new.sign(&bytes);
+        Ok(Self {
+            payload,
+            sig_old,
+            sig_new,
+        })
+    }
+
+    /// Verify both signatures: `sig_old` under `current_pubkey` (the
+    /// validator's currently-active consensus key, looked up by the
+    /// caller against the live validator set), and `sig_new` under
+    /// `self.payload.new_pubkey`. Both must verify.
+    ///
+    /// This is the cryptographic half of the self-attestation property
+    /// from #142: it proves the validator controls both keys at the
+    /// moment the rotation was signed, so a compromise of only the old
+    /// key cannot rotate to a key the legitimate operator does not hold.
+    /// Structural validation ([`ValidatorKeyRotation::validate_structural`])
+    /// is independent — callers should run it first because it's
+    /// strictly cheaper.
+    pub fn verify(&self, current_pubkey: &NodeId) -> Result<(), RotationVerifyError> {
+        let bytes = preimage::<ValidatorKeyRotation>(&self.payload)
+            .map_err(|e| RotationVerifyError::Preimage(e.to_string()))?;
+
+        UnparsedPublicKey::new(&ED25519, current_pubkey as &[u8])
+            .verify(&bytes, &self.sig_old)
+            .map_err(|_| RotationVerifyError::InvalidOldSignature)?;
+
+        UnparsedPublicKey::new(&ED25519, &self.payload.new_pubkey as &[u8])
+            .verify(&bytes, &self.sig_new)
+            .map_err(|_| RotationVerifyError::InvalidNewSignature)?;
+
+        Ok(())
+    }
+}
+
 /// Mirror of `crypto::signed::serde_sig` for the two raw signatures held
 /// by [`DualSignedRotation`]. Kept private here so the envelope's wire
 /// format stays decoupled from the `Signed<T>` envelope's internals.
@@ -156,8 +259,21 @@ mod serde_sig {
 mod tests {
     use super::*;
 
+    use crate::crypto::signed::NodeSigner;
+    use crate::p2p::identity::NodeIdentity;
+    use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
+    use zeroize::Zeroizing;
+
     fn nid(b: u8) -> NodeId {
         [b; 32]
+    }
+
+    fn fresh_signer() -> NodeSigner {
+        let kp = RcgenKeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let id = NodeIdentity {
+            pkcs8_der: Zeroizing::new(kp.serialize_der()),
+        };
+        NodeSigner::from_identity(&id).unwrap()
     }
 
     fn sample_payload() -> ValidatorKeyRotation {
@@ -315,6 +431,189 @@ mod tests {
             ValidatorKeyRotation::DOMAIN,
             "ambros.consensus.validator_rotation.v1"
         );
+    }
+
+    // ── verification ────────────────────────────────────────────────────────
+
+    /// Helper: build a real, valid `DualSignedRotation` where `current` is
+    /// the validator's currently-active key and `new` is the rotation
+    /// target. Returns the envelope plus the two signers' pubkeys, since
+    /// every rejection test wants to introspect at least one of them.
+    fn valid_envelope() -> (DualSignedRotation, NodeId, NodeId) {
+        let current = fresh_signer();
+        let new = fresh_signer();
+        let payload = ValidatorKeyRotation {
+            validator: current.node_id(),
+            new_pubkey: new.node_id(),
+            v_eff: 100,
+        };
+        let env = DualSignedRotation::sign(payload, &current, &new).unwrap();
+        (env, current.node_id(), new.node_id())
+    }
+
+    #[test]
+    fn verify_accepts_valid_dual_signed_rotation() {
+        let (env, current_pubkey, _) = valid_envelope();
+        env.verify(&current_pubkey).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_when_sig_old_is_zeroed() {
+        // Zeroed signature stands in for "missing" in a wire format that
+        // can't actually omit the field — postcard always serializes both.
+        let (mut env, current_pubkey, _) = valid_envelope();
+        env.sig_old = [0u8; 64];
+        assert_eq!(
+            env.verify(&current_pubkey),
+            Err(RotationVerifyError::InvalidOldSignature)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_sig_new_is_zeroed() {
+        let (mut env, current_pubkey, _) = valid_envelope();
+        env.sig_new = [0u8; 64];
+        assert_eq!(
+            env.verify(&current_pubkey),
+            Err(RotationVerifyError::InvalidNewSignature)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_sig_old_is_signed_by_unrelated_key() {
+        // "Signed only by the new key" maps to: sig_old slot contains
+        // some valid Ed25519 signature, just not one produced by the
+        // validator's current key. Use a third unrelated signer so we're
+        // exercising the verification check, not the equality check.
+        let (env, current_pubkey, _) = valid_envelope();
+        let attacker = fresh_signer();
+        let bytes = preimage::<ValidatorKeyRotation>(&env.payload).unwrap();
+        let mut tampered = env;
+        tampered.sig_old = attacker.sign(&bytes);
+        assert_eq!(
+            tampered.verify(&current_pubkey),
+            Err(RotationVerifyError::InvalidOldSignature)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_sig_new_is_signed_by_unrelated_key() {
+        // Mirror of the previous case: "signed only by the old key".
+        let (env, current_pubkey, _) = valid_envelope();
+        let attacker = fresh_signer();
+        let bytes = preimage::<ValidatorKeyRotation>(&env.payload).unwrap();
+        let mut tampered = env;
+        tampered.sig_new = attacker.sign(&bytes);
+        assert_eq!(
+            tampered.verify(&current_pubkey),
+            Err(RotationVerifyError::InvalidNewSignature)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_sig_new_covers_different_payload() {
+        // Both signatures must cover the same canonical encoding. If
+        // sig_new is a real signature by new_pubkey but over a *different*
+        // payload (different v_eff in this case), it must not verify
+        // against the envelope's payload.
+        let current = fresh_signer();
+        let new = fresh_signer();
+        let payload = ValidatorKeyRotation {
+            validator: current.node_id(),
+            new_pubkey: new.node_id(),
+            v_eff: 100,
+        };
+        let other_payload = ValidatorKeyRotation {
+            v_eff: 999,
+            ..payload.clone()
+        };
+        let other_bytes = preimage::<ValidatorKeyRotation>(&other_payload).unwrap();
+        let bad_sig_new = new.sign(&other_bytes);
+        let bytes = preimage::<ValidatorKeyRotation>(&payload).unwrap();
+        let env = DualSignedRotation {
+            payload,
+            sig_old: current.sign(&bytes),
+            sig_new: bad_sig_new,
+        };
+        assert_eq!(
+            env.verify(&current.node_id()),
+            Err(RotationVerifyError::InvalidNewSignature)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_caller_supplies_wrong_current_pubkey() {
+        // Even with a perfectly valid envelope, verifying against the
+        // wrong "current" key (e.g. the caller resolved a stale validator
+        // set) must fail — never succeed by silently treating the
+        // envelope's own claim as authoritative.
+        let (env, _, _) = valid_envelope();
+        let unrelated = fresh_signer();
+        assert_eq!(
+            env.verify(&unrelated.node_id()),
+            Err(RotationVerifyError::InvalidOldSignature)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_when_payload_is_tampered_post_signing() {
+        // Bumping v_eff after both signatures are produced makes both
+        // signatures invalid (they cover the original v_eff). The
+        // verifier reports the *first* failure in fixed order — sig_old —
+        // which is enough to reject; we just want to confirm the bare
+        // payload cannot pass through unchecked.
+        let (mut env, current_pubkey, _) = valid_envelope();
+        env.payload.v_eff = env.payload.v_eff.wrapping_add(1);
+        assert!(matches!(
+            env.verify(&current_pubkey),
+            Err(RotationVerifyError::InvalidOldSignature)
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_when_new_pubkey_field_is_swapped() {
+        // The verifier reads new_pubkey out of the payload to know what
+        // key to check sig_new against. Rewriting that field after
+        // signing must invalidate the sig (because either the pre-image
+        // changed too, breaking sig_old; or — more interesting — the new
+        // field doesn't match the actual signer of sig_new).
+        let (mut env, current_pubkey, _) = valid_envelope();
+        let attacker = fresh_signer();
+        env.payload.new_pubkey = attacker.node_id();
+        // sig_old was over the original new_pubkey, so it now fails first.
+        assert!(matches!(
+            env.verify(&current_pubkey),
+            Err(RotationVerifyError::InvalidOldSignature)
+        ));
+    }
+
+    #[test]
+    fn sign_rejects_mismatched_new_signer() {
+        // Constructor guard: caller passed a `new` signer whose pubkey
+        // doesn't match payload.new_pubkey. Producing the envelope would
+        // succeed but the resulting sig_new could never verify, so we
+        // fail loudly at sign time instead.
+        let current = fresh_signer();
+        let new = fresh_signer();
+        let wrong_new = fresh_signer();
+        let payload = ValidatorKeyRotation {
+            validator: current.node_id(),
+            new_pubkey: new.node_id(),
+            v_eff: 100,
+        };
+        let err = DualSignedRotation::sign(payload, &current, &wrong_new).unwrap_err();
+        assert!(format!("{err}").contains("new signer's node_id does not match"));
+    }
+
+    #[test]
+    fn sign_envelope_round_trips_through_postcard_and_still_verifies() {
+        // End-to-end: real signatures survive the wire encoding both
+        // structurally and cryptographically.
+        let (env, current_pubkey, _) = valid_envelope();
+        let bytes = postcard::to_stdvec(&env).unwrap();
+        let back: DualSignedRotation = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, env);
+        back.verify(&current_pubkey).unwrap();
     }
 
     #[test]
