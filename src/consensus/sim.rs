@@ -3065,6 +3065,89 @@ mod tests {
                 Ok(())
             })?;
         }
+
+        /// **L4 — reconfiguration safety.** A 5-node cluster commits a
+        /// `ReconfigCommand` removing one randomly-chosen validator at
+        /// a random `v_eff_offset` in the future. After `current_view`
+        /// crosses `v_eff` the cluster must:
+        ///   1. continue to commit (liveness),
+        ///   2. never have committed conflicting blocks at any point
+        ///      (safety, including across the boundary),
+        ///   3. land at least one commit at view ≥ `v_eff` to
+        ///      demonstrate the post-boundary set is genuinely
+        ///      driving progress.
+        ///
+        /// Floor consideration: removing one of five lands exactly on
+        /// `MIN_VALIDATOR_FLOOR = 4`, which is the smallest committee
+        /// the post-reconfig cluster is allowed to be — the tightest
+        /// scenario the property needs to cover.
+        #[test]
+        fn proptest_reconfig_remove_preserves_safety_and_liveness(
+            target in 0usize..5,
+            v_eff_offset in 8u64..30,
+        ) {
+            use crate::consensus::View;
+            use crate::consensus::reconfig::ReconfigCommand;
+
+            run_paused(|| async move {
+                let mut cluster = SimCluster::spawn(5, Duration::from_millis(50)).await;
+
+                // Warm-up: get every node committing under the
+                // genesis 5-validator set so the reconfig lands on a
+                // chain that's already advanced past genesis.
+                let warmed = cluster
+                    .advance_and_yield_until(PHASE_CAP, |c| {
+                        c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 1
+                    })
+                    .await;
+                prop_assert!(warmed, "L4: warm-up did not produce any commit");
+
+                let removed = cluster.node_ids[target];
+                let v_eff: View = v_eff_offset + 5; // floor + a small margin
+                let cmd = ReconfigCommand {
+                    adds: vec![],
+                    removes: vec![removed],
+                    v_eff,
+                };
+                let payload = cmd.encode();
+
+                // Drop the same payload into every node's mempool;
+                // whichever leader proposes next picks it up.
+                for mp in &cluster.mempools {
+                    let _ = mp.insert(payload.clone());
+                }
+
+                // Drive the cluster until at least one survivor has
+                // committed past v_eff. The exit condition uses the
+                // committed-heights floor as a proxy for "view has
+                // crossed v_eff" — height advances 1:1 per commit and
+                // views advance ≥ heights, so a height of `v_eff +
+                // 5` guarantees the post-boundary regime is active.
+                let crossed = cluster
+                    .advance_and_yield_until(Duration::from_secs(8), |c| {
+                        c.peek_commit_heights().iter().min().copied().unwrap_or(0)
+                            >= v_eff + 5
+                    })
+                    .await;
+                prop_assert!(
+                    crossed,
+                    "L4: cluster failed to commit past v_eff={v_eff} for target={target}",
+                );
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                let any_post = committed
+                    .iter()
+                    .any(|node_blocks| node_blocks.iter().any(|b| b.header.view >= v_eff));
+                prop_assert!(
+                    any_post,
+                    "L4: no committed block at view >= v_eff={v_eff} for target={target}",
+                );
+
+                Ok(())
+            })?;
+        }
     }
 
     // ── L-fixed: deterministic regression sentinels for the L-series ─────────
