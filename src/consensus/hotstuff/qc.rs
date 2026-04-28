@@ -8,27 +8,30 @@
 //! # Signature representation
 //!
 //! The `(view, block_hash)`-pair quorum is encoded as a
-//! [`SignerBitmap`] plus an aggregate of partial signatures. The shape
-//! of that aggregate is decided by the chain's signature scheme — see
-//! [`crate::crypto::sig_scheme`]. Today only
-//! [`Ed25519Collected`](crate::crypto::sig_scheme::Ed25519Collected) is
-//! wired through, and its aggregate is a `Vec<[u8; 64]>` of raw Ed25519
-//! signatures parallel to the bitmap's set bits.
+//! [`SignerBitmap`] plus an aggregate of partial signatures. The
+//! aggregate is carried in the scheme-tagged [`QcSignatures`] enum:
 //!
-//! The [`SignerBitmap`] + `signatures: Vec<[u8; 64]>` layout is
-//! "parallel on set bits": the k-th entry of [`QuorumCertificate::signatures`]
-//! belongs to the k-th validator index whose bit is set in
-//! [`QuorumCertificate::signers`] (scanning low→high).
-//! [`QuorumCertificate::add_signature`] delegates to
-//! [`SignatureScheme::add_partial`](crate::crypto::sig_scheme::SignatureScheme::add_partial)
-//! and maintains that invariant for you; direct field mutation is
-//! possible only inside the crate.
+//! - [`QcSignatures::Ed25519Collected`]: a `Vec<[u8; 64]>` of raw
+//!   Ed25519 signatures parallel to the bitmap's set bits. The k-th
+//!   entry belongs to the k-th validator index whose bit is set in
+//!   [`QuorumCertificate::signers`] (scanning low→high).
+//! - [`QcSignatures::BlsAggregated`]: a single ~96-byte BLS12-381 G2
+//!   point aggregating every partial signature.
 //!
-//! When BLS aggregation lands (#143 / #289 onward) the `signatures`
-//! field becomes scheme-shaped (likely a tagged enum). The trait
-//! surface in [`crate::crypto::sig_scheme`] is already general enough to
-//! cover that, so the QC type itself is the only thing that has to grow
-//! a variant.
+//! Choose at construction:
+//! [`QuorumCertificate::new`] + [`QuorumCertificate::add_signature`]
+//! for Ed25519, or [`QuorumCertificate::new_bls`] +
+//! [`QuorumCertificate::add_bls_partial`] for BLS. The
+//! Ed25519/BLS-flavored helpers (`add_signature` / `add_bls_partial` /
+//! `verify_aggregate` / `verify_aggregate_bls`) panic if invoked on a
+//! QC whose variant they don't match — chains pick one scheme at
+//! genesis (#288) so a mixed call site is a programming error, not a
+//! runtime input the protocol must tolerate.
+//!
+//! Wire format: postcard tags the [`QcSignatures`] variant with one
+//! byte. The pre-#293 layout (a bare `Vec<[u8; 64]>`) is no longer
+//! compatible — the scheme tag is mandatory so an inbound QC can be
+//! decoded without ambient knowledge of the chain's scheme.
 //!
 //! # Wire types
 //!
@@ -48,7 +51,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
 use crate::consensus::validator_set::ValidatorSet;
-use crate::crypto::sig_scheme::{AggregateVerifyError, Ed25519Collected, SignatureScheme};
+use crate::crypto::sig_scheme::{
+    AggregateVerifyError, BlsAggregate, BlsAggregated, BlsPublicKey, Ed25519Collected,
+    SignatureScheme,
+};
 use crate::crypto::signed::SignedMessage;
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
@@ -181,17 +187,54 @@ impl SignerBitmap {
 /// A proof that a quorum of validators signed off on
 /// `(view, block_hash)`.
 ///
-/// Fields are `pub(crate)` so 7.B/7.C can hand-construct QCs in tests
+/// The `signatures` field is scheme-shaped — see [`QcSignatures`]. On
+/// Ed25519 chains it carries the parallel-on-set-bits Vec; on BLS
+/// chains it carries a single ~96-byte aggregate G2 point.
+///
+/// Fields are `pub(crate)` so safety-rule tests can hand-construct QCs
 /// without forcing new `add_signature` + `seal` plumbing here; outside
 /// the crate, construct via [`QuorumCertificate::new`] +
-/// [`QuorumCertificate::add_signature`].
+/// [`QuorumCertificate::add_signature`] (Ed25519) or
+/// [`QuorumCertificate::new_bls`] + [`QuorumCertificate::add_bls_partial`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuorumCertificate {
     pub view: View,
     pub block_hash: BlockHash,
     pub(crate) signers: SignerBitmap,
-    #[serde(with = "serde_sig_vec")]
-    pub(crate) signatures: Vec<[u8; 64]>,
+    pub(crate) signatures: QcSignatures,
+}
+
+/// The aggregate-signature payload carried in a [`QuorumCertificate`].
+///
+/// Tagged at the wire-format level by a postcard variant byte (one
+/// extra byte per QC vs. the pre-#293 collected-only layout) so a node
+/// can decode an inbound QC without ambient knowledge of the chain's
+/// scheme. Mismatched-scheme QCs are caught structurally instead of
+/// silently mis-deserializing.
+///
+/// Mixed-scheme chains are out of scope (parent issue non-goal): a
+/// chain commits to one scheme at genesis (#288), and only that
+/// variant ever appears in committed blocks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QcSignatures {
+    /// One raw Ed25519 signature per signer, parallel to the set bits
+    /// of the QC's [`SignerBitmap`]. Wire size grows with the quorum.
+    Ed25519Collected(#[serde(with = "serde_sig_vec")] Vec<[u8; 64]>),
+    /// A single ~96-byte BLS12-381 G2 point aggregating every partial.
+    /// Wire size is constant in the quorum count.
+    BlsAggregated(#[serde(with = "serde_g2_aggregate")] BlsAggregate),
+}
+
+impl QcSignatures {
+    /// Variant name for diagnostics. Matches
+    /// [`crate::crypto::sig_scheme::SignatureScheme::NAME`] so logs
+    /// stay consistent.
+    pub fn scheme_name(&self) -> &'static str {
+        match self {
+            Self::Ed25519Collected(_) => Ed25519Collected::NAME,
+            Self::BlsAggregated(_) => BlsAggregated::NAME,
+        }
+    }
 }
 
 /// Serialize a `Vec<[u8; 64]>` as a sequence of byte arrays. Needed
@@ -224,9 +267,25 @@ mod serde_sig_vec {
     }
 }
 
+mod serde_g2_aggregate {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(agg: &[u8; 96], s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&agg[..], s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 96], D::Error> {
+        let v: Vec<u8> = Vec::<u8>::deserialize(d)?;
+        v.as_slice()
+            .try_into()
+            .map_err(|_| D::Error::custom("BLS aggregate must be exactly 96 bytes"))
+    }
+}
+
 impl QuorumCertificate {
-    /// Start an empty QC that can accumulate up to `validator_set_len`
-    /// signatures. Use [`add_signature`] to populate it.
+    /// Start an empty Ed25519-collected QC that can accumulate up to
+    /// `validator_set_len` signatures. Use [`add_signature`] to populate
+    /// it.
     ///
     /// [`add_signature`]: Self::add_signature
     pub fn new(view: View, block_hash: BlockHash, validator_set_len: usize) -> Self {
@@ -234,8 +293,32 @@ impl QuorumCertificate {
             view,
             block_hash,
             signers: SignerBitmap::new(validator_set_len),
-            signatures: Vec::new(),
+            signatures: QcSignatures::Ed25519Collected(Vec::new()),
         }
+    }
+
+    /// Start an empty BLS-aggregated QC that can accumulate up to
+    /// `validator_set_len` partials. Use [`add_bls_partial`] to populate
+    /// it.
+    ///
+    /// [`add_bls_partial`]: Self::add_bls_partial
+    pub fn new_bls(view: View, block_hash: BlockHash, validator_set_len: usize) -> Self {
+        Self {
+            view,
+            block_hash,
+            signers: SignerBitmap::new(validator_set_len),
+            signatures: QcSignatures::BlsAggregated(BlsAggregated::empty_aggregate()),
+        }
+    }
+
+    /// True iff this QC carries an Ed25519 collected aggregate.
+    pub fn is_ed25519(&self) -> bool {
+        matches!(self.signatures, QcSignatures::Ed25519Collected(_))
+    }
+
+    /// True iff this QC carries a BLS aggregate.
+    pub fn is_bls(&self) -> bool {
+        matches!(self.signatures, QcSignatures::BlsAggregated(_))
     }
 
     /// Record one signer's `[u8; 64]` Ed25519 signature. `validator_idx`
@@ -247,42 +330,90 @@ impl QuorumCertificate {
     /// already set — duplicate signatures for the same signer do not
     /// change quorum status.
     ///
-    /// Aggregation is delegated to
-    /// [`SignatureScheme::add_partial`](crate::crypto::sig_scheme::SignatureScheme::add_partial)
-    /// so the same code path drives both the wire-shape and the
-    /// (eventual) BLS path.
+    /// **Panics** if this QC was constructed for a non-Ed25519 scheme.
+    /// Use [`Self::add_bls_partial`] on BLS QCs.
     pub fn add_signature(&mut self, validator_idx: usize, sig: [u8; 64]) {
+        let QcSignatures::Ed25519Collected(sigs) = &mut self.signatures else {
+            panic!(
+                "QuorumCertificate::add_signature called on a {} QC; use add_bls_partial",
+                self.signatures.scheme_name(),
+            );
+        };
         if self.signers.get(validator_idx) {
             return;
         }
-        Ed25519Collected::add_partial(&mut self.signatures, &self.signers, validator_idx, sig);
+        Ed25519Collected::add_partial(sigs, &self.signers, validator_idx, sig);
         self.signers.set(validator_idx);
         debug_assert_eq!(
             self.signers.count(),
-            Ed25519Collected::aggregate_count(&self.signatures),
+            Ed25519Collected::aggregate_count(sigs),
             "signer bits and signatures must stay parallel",
         );
     }
 
-    /// Verify that this QC's aggregate is a valid quorum signature over
-    /// `message` under `pubkeys`. `pubkeys` must contain one entry per
-    /// validator in the relevant validator set, in the same sorted order
-    /// the [`SignerBitmap`] indexes.
+    /// Record one signer's BLS partial signature on a BLS-flavored QC.
+    /// `validator_idx` is the index in the sorted [`ValidatorSet`].
     ///
-    /// `message` is the canonical signing pre-image — typically the
-    /// `(view, block_hash)` payload framed with the same domain
-    /// separator used at vote time.
+    /// **Panics** if this QC was constructed for a non-BLS scheme.
+    /// The caller MUST have validated `partial` against the signer's
+    /// pubkey via
+    /// [`BlsAggregated::verify_partial`](crate::crypto::sig_scheme::BlsAggregated::verify_partial)
+    /// before calling this — folding a malformed partial into the
+    /// aggregate corrupts it for everyone.
+    pub fn add_bls_partial(
+        &mut self,
+        validator_idx: usize,
+        partial: crate::crypto::sig_scheme::BlsPartialSig,
+    ) {
+        let QcSignatures::BlsAggregated(agg) = &mut self.signatures else {
+            panic!(
+                "QuorumCertificate::add_bls_partial called on a {} QC; use add_signature",
+                self.signatures.scheme_name(),
+            );
+        };
+        if self.signers.get(validator_idx) {
+            return;
+        }
+        BlsAggregated::add_partial(agg, &self.signers, validator_idx, partial);
+        self.signers.set(validator_idx);
+    }
+
+    /// Verify that this QC's Ed25519 aggregate is valid over `message`
+    /// under `pubkeys`. `pubkeys` must contain one entry per validator
+    /// in the relevant validator set, in the same sorted order the
+    /// [`SignerBitmap`] indexes.
     ///
-    /// Currently dispatches to
-    /// [`Ed25519Collected`](crate::crypto::sig_scheme::Ed25519Collected).
-    /// The signature lets BLS slot in via the same trait without
-    /// touching call sites; #289+ wires that variant up.
+    /// **Panics** if this QC carries a non-Ed25519 scheme.
     pub fn verify_aggregate(
         &self,
         message: &[u8],
         pubkeys: &[NodeId],
     ) -> Result<(), AggregateVerifyError> {
-        Ed25519Collected::verify_aggregate(&self.signatures, &self.signers, message, pubkeys)
+        let QcSignatures::Ed25519Collected(sigs) = &self.signatures else {
+            panic!(
+                "verify_aggregate called on a {} QC; use verify_aggregate_bls",
+                self.signatures.scheme_name(),
+            );
+        };
+        Ed25519Collected::verify_aggregate(sigs, &self.signers, message, pubkeys)
+    }
+
+    /// Verify that this QC's BLS aggregate is valid over `message`
+    /// under `pubkeys`. Single pairing check.
+    ///
+    /// **Panics** if this QC carries a non-BLS scheme.
+    pub fn verify_aggregate_bls(
+        &self,
+        message: &[u8],
+        pubkeys: &[BlsPublicKey],
+    ) -> Result<(), AggregateVerifyError> {
+        let QcSignatures::BlsAggregated(agg) = &self.signatures else {
+            panic!(
+                "verify_aggregate_bls called on a {} QC; use verify_aggregate",
+                self.signatures.scheme_name(),
+            );
+        };
+        BlsAggregated::verify_aggregate(agg, &self.signers, message, pubkeys)
     }
 
     /// Number of validators whose signature this QC carries.
@@ -298,19 +429,39 @@ impl QuorumCertificate {
 
     /// Well-formedness check used when accepting a QC from the wire:
     /// the bitmap sizes match the claimed validator set, no stray bits
-    /// are set, and the `signatures` vector is parallel to the set
-    /// bits. Does **not** check signature validity — that's the
-    /// integration layer's job.
+    /// are set, and the `signatures` payload is structurally consistent
+    /// with the bitmap. Does **not** check signature validity — that's
+    /// the integration layer's job.
+    ///
+    /// For Ed25519: the parallel `Vec<[u8; 64]>` length must equal the
+    /// bitmap's set-bit count.
+    /// For BLS: the aggregate is a single point so there's no count to
+    /// check; only the bitmap shape is validated. The aggregate's
+    /// cryptographic well-formedness is exercised by
+    /// [`Self::verify_aggregate_bls`].
     pub fn is_well_formed(&self, vs: &ValidatorSet) -> bool {
-        self.signers.len() == vs.len()
-            && self.signers.is_well_formed()
-            && self.signatures.len() == self.signers.count()
+        if self.signers.len() != vs.len() || !self.signers.is_well_formed() {
+            return false;
+        }
+        match &self.signatures {
+            QcSignatures::Ed25519Collected(sigs) => sigs.len() == self.signers.count(),
+            QcSignatures::BlsAggregated(_) => true,
+        }
     }
 
     /// Iterate `(validator_idx, &signature)` pairs in validator-index
-    /// order.
+    /// order. Ed25519-only — BLS QCs carry a single aggregate, not a
+    /// per-signer view.
+    ///
+    /// **Panics** if this QC carries a non-Ed25519 scheme.
     pub fn iter_signatures(&self) -> impl Iterator<Item = (usize, &[u8; 64])> + '_ {
-        self.signers.iter_set().zip(self.signatures.iter())
+        let QcSignatures::Ed25519Collected(sigs) = &self.signatures else {
+            panic!(
+                "iter_signatures called on a {} QC; the BLS aggregate is a single point",
+                self.signatures.scheme_name(),
+            );
+        };
+        self.signers.iter_set().zip(sigs.iter())
     }
 }
 
@@ -562,8 +713,11 @@ mod tests {
         qc.add_signature(2, [7; 64]);
         qc.add_signature(2, [9; 64]); // duplicate — first write wins
         assert_eq!(qc.signer_count(), 1);
-        assert_eq!(qc.signatures.len(), 1);
-        assert_eq!(qc.signatures[0], [7; 64]);
+        let QcSignatures::Ed25519Collected(sigs) = &qc.signatures else {
+            panic!("expected Ed25519");
+        };
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0], [7; 64]);
     }
 
     #[test]
@@ -698,5 +852,133 @@ mod tests {
         let wire = postcard::to_stdvec(&msg).unwrap();
         let back: ConsensusMsg = postcard::from_bytes(&wire).unwrap();
         assert_eq!(back, msg);
+    }
+
+    // ── BLS-flavored QCs (#293) ──────────────────────────────────
+
+    use crate::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
+
+    fn bls_keypair(seed: u8) -> (BlsSecretKey, BlsPublicKey) {
+        let mut ikm = [0u8; 32];
+        ikm.fill(seed);
+        BlsAggregated::keygen(&ikm).unwrap()
+    }
+
+    #[test]
+    fn bls_qc_starts_empty_and_passes_well_formed() {
+        let vs = four_validators();
+        let qc = QuorumCertificate::new_bls(7, [0xAA; 32], vs.len());
+        assert!(qc.is_bls());
+        assert!(!qc.is_ed25519());
+        assert_eq!(qc.signer_count(), 0);
+        assert!(!qc.has_quorum(&vs));
+        assert!(qc.is_well_formed(&vs));
+    }
+
+    #[test]
+    fn bls_qc_aggregates_partials_and_verifies() {
+        let vs = four_validators();
+        let block_hash = [0xBB; 32];
+        let view: View = 11;
+        let message = postcard::to_stdvec(&Vote { view, block_hash }).unwrap();
+
+        let signers: Vec<(BlsSecretKey, BlsPublicKey)> =
+            (0..vs.len() as u8).map(|i| bls_keypair(0x70 | i)).collect();
+        let pubkeys: Vec<BlsPublicKey> = signers.iter().map(|(_, pk)| *pk).collect();
+
+        let mut qc = QuorumCertificate::new_bls(view, block_hash, vs.len());
+        for (idx, (sk, _)) in signers.iter().enumerate().take(quorum_size(vs.len())) {
+            let partial = BlsAggregated::sign_partial(sk, &message).unwrap();
+            qc.add_bls_partial(idx, partial);
+        }
+        assert!(qc.has_quorum(&vs));
+        assert!(qc.is_well_formed(&vs));
+        qc.verify_aggregate_bls(&message, &pubkeys)
+            .expect("BLS QC must verify under selected pubkeys");
+    }
+
+    #[test]
+    fn bls_qc_postcard_roundtrip_byte_size_constant_in_n() {
+        // Aggregate is a fixed 96 bytes plus bitmap + metadata,
+        // regardless of how many partials we fold in.
+        let vs_small = ValidatorSet::new((0..4u8).map(|b| nid(b + 1)).collect());
+        let vs_large = ValidatorSet::new((0..50u8).map(|b| nid(b + 1)).collect());
+        let block_hash = [0xCC; 32];
+
+        let mut qc_small = QuorumCertificate::new_bls(1, block_hash, vs_small.len());
+        let mut qc_large = QuorumCertificate::new_bls(1, block_hash, vs_large.len());
+
+        let message = b"benchmark";
+        for (idx, qc) in [&mut qc_small, &mut qc_large].into_iter().enumerate() {
+            let n = if idx == 0 {
+                vs_small.len()
+            } else {
+                vs_large.len()
+            };
+            for i in 0..n {
+                let (sk, _) = bls_keypair((idx * 100 + i) as u8);
+                let partial = BlsAggregated::sign_partial(&sk, message).unwrap();
+                qc.add_bls_partial(i, partial);
+            }
+        }
+        let wire_small = postcard::to_stdvec(&qc_small).unwrap();
+        let wire_large = postcard::to_stdvec(&qc_large).unwrap();
+        // The aggregate-sig portion is fixed at 96 bytes + 1 byte
+        // length prefix; growth between small (n=4) and large (n=50)
+        // should come only from the bitmap and signer-count varints,
+        // not from the signature payload.
+        let bitmap_diff = vs_large.len().div_ceil(8) - vs_small.len().div_ceil(8);
+        assert!(
+            wire_large.len() <= wire_small.len() + bitmap_diff + 4,
+            "BLS QC wire size grew faster than the bitmap: small={} large={} bitmap_diff={}",
+            wire_small.len(),
+            wire_large.len(),
+            bitmap_diff,
+        );
+    }
+
+    #[test]
+    fn bls_qc_rejects_tampered_aggregate() {
+        let vs = four_validators();
+        let view: View = 5;
+        let block_hash = [0xDD; 32];
+        let message = postcard::to_stdvec(&Vote { view, block_hash }).unwrap();
+        let (sk0, pk0) = bls_keypair(0x80);
+        let (sk1, pk1) = bls_keypair(0x81);
+        let (sk2, pk2) = bls_keypair(0x82);
+        let (_, pk3) = bls_keypair(0x83);
+        let pubkeys = vec![pk0, pk1, pk2, pk3];
+
+        let mut qc = QuorumCertificate::new_bls(view, block_hash, vs.len());
+        for (idx, sk) in [&sk0, &sk1, &sk2].iter().enumerate() {
+            qc.add_bls_partial(idx, BlsAggregated::sign_partial(sk, &message).unwrap());
+        }
+        // Tamper the aggregate.
+        if let QcSignatures::BlsAggregated(agg) = &mut qc.signatures {
+            agg[0] ^= 0xFF;
+        }
+        assert!(qc.verify_aggregate_bls(&message, &pubkeys).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "called on a bls_aggregated QC")]
+    fn ed25519_helpers_panic_on_bls_qc() {
+        let mut qc = QuorumCertificate::new_bls(0, [0; 32], 4);
+        qc.add_signature(0, [0; 64]); // wrong API
+    }
+
+    #[test]
+    #[should_panic(expected = "called on a ed25519_collected QC")]
+    fn bls_helpers_panic_on_ed25519_qc() {
+        let mut qc = QuorumCertificate::new(0, [0; 32], 4);
+        qc.add_bls_partial(0, [0; 96]); // wrong API
+    }
+
+    #[test]
+    fn qc_signatures_scheme_name_matches_variant() {
+        let qc_ed = QuorumCertificate::new(0, [0; 32], 4);
+        let qc_bls = QuorumCertificate::new_bls(0, [0; 32], 4);
+        assert_eq!(qc_ed.signatures.scheme_name(), "ed25519_collected");
+        assert_eq!(qc_bls.signatures.scheme_name(), "bls_aggregated");
     }
 }
