@@ -371,3 +371,188 @@ heights if no snapshot exists at exactly `H`.
   `snapshot_chunk_size_bytes` must leave 64 KiB of headroom under
   `MAX_FRAME_BYTES` (4 MiB); `Config::validate` rejects oversize
   values at startup rather than on the first chunk.
+
+## Rotating a validator's consensus signing key (issue #142)
+
+A validator can swap its consensus signing key without leaving and
+rejoining the validator set. The protocol path lives in
+`src/consensus/validator_rotation.rs` (the dual-signed tx),
+`src/consensus/validator_key_history.rs` (the per-validator key
+timeline), and `src/consensus/node.rs::apply_committed_rotations`
+(the commit-time application). Reasons to rotate, from
+[the issue][142-issue]:
+
+- Periodic key hygiene (annual rotation policy).
+- Suspected (but not confirmed) compromise — full compromise needs
+  the removal path under [validator-set reconfiguration](testnet-local.md).
+- Migration to a stronger backend (`file` → `keyring` → HSM).
+
+[142-issue]: https://github.com/zrbecker/ambros-p2p/issues/142
+
+The rotation transaction is **self-attested**: it carries two
+Ed25519 signatures over the same canonical pre-image, one under the
+validator's *current* consensus key and one under the proposed *new*
+key. Both must verify before the rotation can take effect. Without
+the dual-signature, an attacker who holds only the current key
+could rotate to a key only they control, locking out the legitimate
+operator.
+
+### Producing the new key
+
+Mint the new key under any of the existing `KeyProvider` backends
+(file, env, encrypted file, exec, keyring). The choice can match or
+differ from the current `validator_identity` backend — rotation is
+the natural moment to migrate from a hot backend to colder
+storage (`file` → keyring/HSM).
+
+For the file backend, today, you'll generate the new keypair
+out-of-band (e.g. with `openssl genpkey -algorithm Ed25519`) and
+write the PKCS#8 DER bytes to a fresh path. The `key migrate`
+subcommand (introduced with the split network/validator identity in
+issue #141) moves an *existing* identity between backends; it does
+not mint new keys.
+
+A future CLI subcommand will wrap "mint + sign + submit" into a
+single command (parallel to `reconfig add-validator` /
+`reconfig remove-validator` from issue #251). Until that lands,
+operators construct rotation transactions programmatically against
+the `DualSignedRotation::sign` API.
+
+### Choosing `v_eff`
+
+`v_eff` is the view at which the new key becomes the validator's
+authoritative signer. The protocol enforces a floor of
+`current_view + 2` views (`V_EFF_MIN_DELAY` in
+`validator_rotation.rs`); operators should pick a much larger
+lead time in production:
+
+- A few hundred views is typical — enough that the operator has
+  time to provision the new key on the running node, schedule a
+  restart window, and perform the restart before `v_eff`.
+- **Once the rotation commits there is no abort path.** If `v_eff`
+  arrives before the validator can produce votes under the new key,
+  the validator is effectively offline until it catches up — same
+  failure mode as a slow joiner. With `n = 4` and `f = 1` the
+  cluster quorum is `3`, so the cluster keeps committing without
+  the rotated validator's vote, but liveness is at its floor and
+  any other transient failure (slow peer, partition) starts to bite.
+
+### Submitting the rotation transaction
+
+A rotation transaction is a tagged opaque payload in a
+`Block.commands` slot, mirroring how `ReconfigCommand` is carried
+(see [the reconfig runbook](testnet-local.md)). The on-the-wire
+form is `b"VKROT\0" || postcard(DualSignedRotation)`; the
+constructor is `DualSignedRotation::sign(payload, current, new)`.
+
+Pseudocode for a one-off submission, until the wrapping CLI
+subcommand lands:
+
+```rust
+use ambros_p2p::consensus::validator_rotation::{
+    DualSignedRotation, ValidatorKeyRotation,
+};
+
+let payload = ValidatorKeyRotation {
+    validator: <validator's currently-active pubkey>,
+    new_pubkey: <new signer's pubkey>,
+    v_eff: <chosen effective view>,
+};
+let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer)?;
+let bytes = envelope.encode_command();
+// Inject into the validator's mempool by any in-process route, or
+// have a colocated peer accept it via gossip.
+```
+
+The encoded bytes can be dropped into any validator's mempool;
+whichever validator is the leader of the next view picks it up,
+proposes it inside a block, and the standard 3-chain commit rule
+seals it. Every replica's `apply_committed_rotations` then runs
+the same dual-signature check independently — no replica trusts
+another's verdict.
+
+### Provisioning the new key on the running node
+
+Currently, the validator's signing identity is read from
+`[node.validator_identity]` once at startup and bound into the
+running consensus loop. Mid-run swap of the active signing key is
+**not yet supported** — that requires a deeper refactor of the
+`Signer` trait to decouple "claimed identity" from "active signing
+key" (tracked as a follow-up to #260, since the existing trait
+returns a single `node_id()`).
+
+The operational sequence today is:
+
+1. **Before `v_eff`** — submit the rotation transaction; observe
+   that it commits.
+2. **After it commits, before `v_eff`** — update the node's
+   `config.toml` to point `[node.validator_identity]` at the new
+   key's backend and path. Restart the node. The restart loads the
+   new identity and validates against the persisted
+   `validator_key_history`, which already records the rotation.
+3. **At `v_eff`** — the node is now signing with the new key; other
+   validators verify it through `validator_key_history.key_at(view)`,
+   which returns the new pubkey for any view `>= v_eff`.
+
+If the restart slips past `v_eff`, the validator's old-key votes are
+rejected by other replicas (PR #286's three-step signer check) and
+the cluster runs at f=0 (no fault tolerance) until the validator
+restarts under the new key.
+
+### Verifying the rotation took effect
+
+The most direct observable today is the chain itself: the
+`DualSignedRotation` envelope is preserved in the committed block's
+`commands` and can be inspected with any block-reading tool that
+filters by the `VKROT\0` tag prefix. After `v_eff`, the rotated
+validator's votes carry the new pubkey as their signer field —
+visible in the `Vote` envelopes flowing through the consensus
+protocol (see `src/consensus/dispatch.rs`).
+
+A future enhancement will surface the post-rotation key history in
+`/consensus/status`, parallel to the validator-set boundaries
+already reported there. Until that lands, log inspection
+(`rotation_applied` info-level traces from
+`apply_committed_rotations` on every replica) is the canonical
+operator-facing signal that a rotation took effect cluster-wide.
+
+### Failure modes
+
+- **Rotation rejected at commit time.** Both signature checks and
+  the structural floor (`v_eff >= current_view + 2`) run
+  independently on every replica. A malformed rotation (single
+  signature, mismatched key pair, `v_eff` too soon) is logged at
+  warn level (`rotation_signature_verification_failed` /
+  `rotation_history_apply_failed`) and dropped. The cluster keeps
+  committing; the validator's key history is unchanged. There is no
+  on-chain receipt of rejection — the `DualSignedRotation` bytes
+  remain in the committed block as inert data.
+- **Validator not ready by `v_eff`.** As above: the validator's
+  old-key votes stop counting after `v_eff`, the cluster runs at
+  reduced fault tolerance, restart resolves it.
+- **Aborting a pending rotation is not supported.** Once a rotation
+  commits, its `v_eff` is binding. To revert to the old key the
+  operator must submit a *new* rotation transaction (signed by the
+  current new key + a re-introduction of the old key as
+  `new_pubkey`). The history retains every key the validator has
+  ever used, so the old key is still reachable as a target.
+- **Total key loss.** If both the current and the new key become
+  unrecoverable, the validator cannot self-attest a further
+  rotation. Recovery is the validator-set removal path: another
+  validator submits a `ReconfigCommand { removes: [<validator>], …
+  }` to drop the lost validator from the set, then re-adds the
+  operator with a fresh identity. See
+  [the reconfig runbook](testnet-local.md).
+
+### Relationship to validator-set reconfiguration
+
+Rotation and reconfig are independent mechanisms. The key history
+is keyed by the validator's *stable identifier* (its genesis
+pubkey, or — for a validator added via reconfig — the pubkey it was
+added under). Reconfig adds and removes stable identifiers from the
+active set; rotation changes which signing key a stable identifier
+authoritatively uses, without touching set membership.
+
+A validator added via reconfig at view `R` starts with its initial
+pubkey as both stable id and signing key. It can later rotate via
+the same flow described here.
