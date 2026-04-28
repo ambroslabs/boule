@@ -45,6 +45,7 @@
 use std::collections::BTreeMap;
 
 use crate::consensus::View;
+use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::sig_scheme::BlsPublicKey;
 use crate::p2p::NodeId;
 
@@ -84,6 +85,30 @@ pub enum BlsHistoryError {
     /// QCs always have a unique pubkey-at-view answer.
     VeffNotStrictlyIncreasing { last_v_eff: View, v_eff: View },
 }
+
+/// Returned by [`BlsKeyHistory::pubkeys_for_set`] when a validator in
+/// the supplied set has no BLS pubkey on file at the requested view.
+/// On a well-formed BLS chain this should never happen; surfacing it
+/// as a typed error lets the verifier reject the QC instead of
+/// silently producing a wrong-shape pubkey vector.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MissingBlsPubkey {
+    pub stable_id: NodeId,
+    pub view: View,
+}
+
+impl std::fmt::Display for MissingBlsPubkey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no BLS pubkey for validator {} at view {}",
+            hex::encode(self.stable_id),
+            self.view,
+        )
+    }
+}
+
+impl std::error::Error for MissingBlsPubkey {}
 
 impl std::fmt::Display for BlsHistoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -194,6 +219,36 @@ impl BlsKeyHistory {
             return None;
         }
         Some(entries[i - 1].bls_pubkey)
+    }
+
+    /// Resolve the BLS pubkey for every validator in `set` at `view`,
+    /// in `set.iter()` order — i.e. the order the QC's
+    /// [`SignerBitmap`](crate::consensus::hotstuff::qc::SignerBitmap)
+    /// indexes. The returned `Vec<BlsPublicKey>` is suitable for
+    /// passing to
+    /// [`QuorumCertificate::verify_aggregate_bls`](crate::consensus::hotstuff::qc::QuorumCertificate::verify_aggregate_bls).
+    ///
+    /// Returns [`MissingBlsPubkey`] naming the first validator that has
+    /// no BLS pubkey at `view`. The verifier should reject the QC
+    /// rather than aggregate-verify against a partial vector.
+    pub fn pubkeys_for_set(
+        &self,
+        set: &ValidatorSet,
+        view: View,
+    ) -> Result<Vec<BlsPublicKey>, MissingBlsPubkey> {
+        let mut out = Vec::with_capacity(set.len());
+        for stable_id in set.iter() {
+            match self.key_at(stable_id, view) {
+                Some(pk) => out.push(pk),
+                None => {
+                    return Err(MissingBlsPubkey {
+                        stable_id: *stable_id,
+                        view,
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The most recent BLS pubkey on file for `stable_id`. Used by the
@@ -335,6 +390,72 @@ mod tests {
         assert_eq!(h.key_at(&nid(1), 200), Some(pk(0xC1)));
         // View 999: still second-rotation key (it's the latest).
         assert_eq!(h.key_at(&nid(1), 999), Some(pk(0xC1)));
+    }
+
+    #[test]
+    fn pubkeys_for_set_returns_keys_in_validator_order() {
+        // ValidatorSet sorts by NodeId. Resolve all members at view 0.
+        let h = BlsKeyHistory::with_genesis([
+            (nid(2), pk(0xB2)),
+            (nid(1), pk(0xB1)),
+            (nid(3), pk(0xB3)),
+        ]);
+        let vs = ValidatorSet::new(vec![nid(2), nid(1), nid(3)]);
+        let keys = h.pubkeys_for_set(&vs, 0).unwrap();
+        // ValidatorSet sorts, so the result is keyed by sorted NodeId.
+        assert_eq!(keys, vec![pk(0xB1), pk(0xB2), pk(0xB3)]);
+    }
+
+    #[test]
+    fn pubkeys_for_set_resolves_pre_and_post_rotation() {
+        // Before rotation, validator 1 → A1; after, → B1. The lookup
+        // must respect the view it's called with.
+        let mut h = BlsKeyHistory::with_genesis([(nid(1), pk(0xA1)), (nid(2), pk(0xA2))]);
+        h.apply_rotation(nid(1), 100, pk(0xB1)).unwrap();
+        let vs = ValidatorSet::new(vec![nid(1), nid(2)]);
+
+        let pre = h.pubkeys_for_set(&vs, 50).unwrap();
+        assert_eq!(pre, vec![pk(0xA1), pk(0xA2)]);
+
+        let post = h.pubkeys_for_set(&vs, 100).unwrap();
+        assert_eq!(post, vec![pk(0xB1), pk(0xA2)]);
+    }
+
+    #[test]
+    fn pubkeys_for_set_reports_missing_validator() {
+        let h = BlsKeyHistory::with_genesis([(nid(1), pk(0xA1))]);
+        // The set claims validator 99 too, but the history doesn't know it.
+        let vs = ValidatorSet::new(vec![nid(1), nid(99)]);
+        let err = h.pubkeys_for_set(&vs, 5).unwrap_err();
+        assert_eq!(
+            err,
+            MissingBlsPubkey {
+                stable_id: nid(99),
+                view: 5
+            }
+        );
+    }
+
+    #[test]
+    fn pubkeys_for_set_reports_missing_when_view_predates_registration() {
+        // Validator 5 was registered at view 102. Asking for view 50
+        // is asking before they existed.
+        let mut h = BlsKeyHistory::with_genesis([(nid(1), pk(0xA1))]);
+        h.register(nid(5), 102, pk(0x55)).unwrap();
+        let vs = ValidatorSet::new(vec![nid(1), nid(5)]);
+
+        let err = h.pubkeys_for_set(&vs, 50).unwrap_err();
+        assert_eq!(
+            err,
+            MissingBlsPubkey {
+                stable_id: nid(5),
+                view: 50
+            }
+        );
+
+        // After registration, both resolve.
+        let keys = h.pubkeys_for_set(&vs, 102).unwrap();
+        assert_eq!(keys, vec![pk(0xA1), pk(0x55)]);
     }
 
     #[test]
