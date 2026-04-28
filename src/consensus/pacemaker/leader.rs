@@ -10,16 +10,16 @@
 use std::sync::Arc;
 
 use crate::consensus::View;
+use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::p2p::NodeId;
 
 /// Maps a [`View`] to the proposer for that view.
 ///
-/// Implementations hold their own reference to the [`ValidatorSet`]; the
+/// Implementations hold their own reference to the validator history; the
 /// trait intentionally does not take it as a parameter, so callers
 /// (notably the `Pacemaker` state machine) don't have to thread it
-/// through every event. Dynamic validator-set churn is out of scope for
-/// #22.
+/// through every event.
 ///
 /// # Contract
 ///
@@ -31,34 +31,52 @@ pub trait LeaderSelector: Send + Sync {
     fn leader_for_view(&self, view: View) -> NodeId;
 }
 
-/// Rotates through the [`ValidatorSet`] in sort order:
-/// `validators[view % validators.len()]`.
+/// Rotates through the [`ValidatorSet`] authoritative at `view`,
+/// looked up via [`ValidatorSetHistory::set_at`]:
+/// `set_at(view)[view % set_at(view).len()]`.
+///
+/// On either side of a reconfiguration boundary the rotation runs over
+/// the corresponding committee — leaders before `v_eff` come from the
+/// pre-boundary set, leaders at or after `v_eff` come from the post-
+/// boundary set. Until #272 lands the commit-time application path the
+/// history holds only the genesis boundary, so this matches the prior
+/// single-set rotation exactly.
 #[derive(Debug, Clone)]
 pub struct RoundRobinSelector {
-    validators: Arc<ValidatorSet>,
+    history: Arc<ValidatorSetHistory>,
 }
 
 impl RoundRobinSelector {
-    /// Panics if `validators` is empty — a pacemaker with no validators
-    /// cannot make progress, and silently returning a zero [`NodeId`]
-    /// would be a subtle footgun.
-    pub fn new(validators: Arc<ValidatorSet>) -> Self {
-        assert!(
-            !validators.is_empty(),
-            "RoundRobinSelector requires at least one validator"
-        );
-        Self { validators }
+    /// Build a selector backed by `history`. Panics if any boundary's
+    /// set is empty — a pacemaker with no validators cannot make
+    /// progress, and silently returning a zero [`NodeId`] would be a
+    /// subtle footgun.
+    pub fn new(history: Arc<ValidatorSetHistory>) -> Self {
+        for (v_eff, set) in history.iter() {
+            assert!(
+                !set.is_empty(),
+                "RoundRobinSelector: boundary at view {v_eff} has no validators"
+            );
+        }
+        Self { history }
+    }
+
+    /// Convenience constructor for callers that still hold a single
+    /// `Arc<ValidatorSet>` (no reconfiguration history). Equivalent to
+    /// `Self::new(Arc::new(ValidatorSetHistory::from_genesis((*set).clone())))`.
+    pub fn from_genesis_set(set: Arc<ValidatorSet>) -> Self {
+        let history = Arc::new(ValidatorSetHistory::from_genesis((*set).clone()));
+        Self::new(history)
     }
 }
 
 impl LeaderSelector for RoundRobinSelector {
     fn leader_for_view(&self, view: View) -> NodeId {
+        let vs = self.history.set_at(view);
         // `view % len as u64` before narrowing to usize so the rotation
         // is identical on 32- and 64-bit platforms.
-        let idx = (view % self.validators.len() as u64) as usize;
-        *self
-            .validators
-            .get(idx)
+        let idx = (view % vs.len() as u64) as usize;
+        *vs.get(idx)
             .expect("modulo of non-zero length is always in bounds")
     }
 }
@@ -72,7 +90,7 @@ mod tests {
     }
 
     fn sel(ids: Vec<NodeId>) -> RoundRobinSelector {
-        RoundRobinSelector::new(Arc::new(ValidatorSet::new(ids)))
+        RoundRobinSelector::from_genesis_set(Arc::new(ValidatorSet::new(ids)))
     }
 
     #[test]
@@ -108,8 +126,70 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "at least one validator")]
+    #[should_panic(expected = "no validators")]
     fn empty_validator_set_panics() {
-        let _ = RoundRobinSelector::new(Arc::new(ValidatorSet::new(vec![])));
+        let _ = RoundRobinSelector::from_genesis_set(Arc::new(ValidatorSet::new(vec![])));
+    }
+
+    // ── #271: leader rotation across a reconfiguration boundary ──────
+
+    /// With a synthetic boundary at view `v_eff`, the round-robin index
+    /// is computed against the set authoritative at each view: leaders
+    /// before `v_eff` come from the old set, leaders at or after `v_eff`
+    /// come from the new set.
+    #[test]
+    fn rotation_picks_pre_boundary_set_before_v_eff_and_post_at_or_after() {
+        let old_set = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)]);
+        let new_set = ValidatorSet::new(vec![nid(10), nid(20), nid(30)]);
+        let v_eff: View = 7;
+
+        let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
+        history.insert_boundary(v_eff, new_set.clone()).unwrap();
+        let s = RoundRobinSelector::new(Arc::new(history));
+
+        // Pre-boundary leaders are the old set: idx = view % 4.
+        for v in [0u64, 1, 2, 3, 4, 5, 6] {
+            let expected = *old_set.get((v % 4) as usize).unwrap();
+            assert_eq!(s.leader_for_view(v), expected, "pre-boundary leader at {v}");
+        }
+        // At and beyond v_eff the new set rotates: idx = view % 3.
+        for v in [7u64, 8, 9, 10, 11] {
+            let expected = *new_set.get((v % 3) as usize).unwrap();
+            assert_eq!(
+                s.leader_for_view(v),
+                expected,
+                "post-boundary leader at {v}",
+            );
+        }
+    }
+
+    /// A boundary that arrives at view 0 (i.e. the genesis "boundary")
+    /// continues to drive the rotation even as later boundaries are
+    /// stacked on top. Two consecutive boundaries: leaders advance
+    /// through three regimes in order.
+    #[test]
+    fn multiple_boundaries_drive_rotation_through_each_regime() {
+        let g = ValidatorSet::new(vec![nid(1), nid(2)]);
+        let mid = ValidatorSet::new(vec![nid(3), nid(4), nid(5)]);
+        let post = ValidatorSet::new(vec![nid(6), nid(7), nid(8), nid(9)]);
+
+        let mut history = ValidatorSetHistory::from_genesis(g.clone());
+        history.insert_boundary(5, mid.clone()).unwrap();
+        history.insert_boundary(11, post.clone()).unwrap();
+        let s = RoundRobinSelector::new(Arc::new(history));
+
+        // Regime 1: views 0..=4 over the genesis set (size 2).
+        assert_eq!(s.leader_for_view(0), *g.get(0).unwrap());
+        assert_eq!(s.leader_for_view(1), *g.get(1).unwrap());
+        assert_eq!(s.leader_for_view(4), *g.get(0).unwrap());
+
+        // Regime 2: views 5..=10 over the mid set (size 3).
+        assert_eq!(s.leader_for_view(5), *mid.get(2).unwrap()); // 5 % 3 = 2
+        assert_eq!(s.leader_for_view(6), *mid.get(0).unwrap()); // 6 % 3 = 0
+        assert_eq!(s.leader_for_view(10), *mid.get(1).unwrap()); // 10 % 3 = 1
+
+        // Regime 3: views 11.. over the post set (size 4).
+        assert_eq!(s.leader_for_view(11), *post.get(3).unwrap()); // 11 % 4 = 3
+        assert_eq!(s.leader_for_view(12), *post.get(0).unwrap()); // 12 % 4 = 0
     }
 }

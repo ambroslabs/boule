@@ -549,7 +549,14 @@ impl ConsensusNode {
             config.timeout_max,
         ));
 
-        let selector = Arc::new(RoundRobinSelector::new(Arc::clone(&validator_set)));
+        // Pacemaker leader rotation runs against the historical lookup
+        // (#271). With the genesis-only history below, behavior matches
+        // the previous single-set rotation exactly; once #272 lands the
+        // commit-time application path, leaders past `v_eff` will come
+        // from the post-boundary set.
+        let selector = Arc::new(RoundRobinSelector::from_genesis_set(Arc::clone(
+            &validator_set,
+        )));
 
         let pacemaker = Pacemaker::new(
             self_id,
@@ -832,7 +839,9 @@ impl ConsensusNode {
             config.timeout_base,
             config.timeout_max,
         ));
-        let selector = Arc::new(RoundRobinSelector::new(Arc::clone(&validator_set)));
+        let selector = Arc::new(RoundRobinSelector::from_genesis_set(Arc::clone(
+            &validator_set,
+        )));
         let pacemaker = Pacemaker::new(
             self_id,
             Arc::clone(&selector) as _,

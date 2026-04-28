@@ -40,7 +40,7 @@ fn validators() -> Arc<ValidatorSet> {
 }
 
 fn selector(vs: Arc<ValidatorSet>) -> Arc<dyn LeaderSelector> {
-    Arc::new(RoundRobinSelector::new(vs))
+    Arc::new(RoundRobinSelector::from_genesis_set(vs))
 }
 
 fn policy() -> Arc<dyn TimeoutPolicy> {
