@@ -7,17 +7,28 @@
 //!
 //! # Signature representation
 //!
-//! Milestone 7 (#23) deliberately targets *collected-sig* QCs: the
-//! certificate carries one raw Ed25519 signature per signer plus a
-//! [`SignerBitmap`] indexed over the [`ValidatorSet`]. BLS / threshold
-//! aggregation is a later optimization.
+//! The `(view, block_hash)`-pair quorum is encoded as a
+//! [`SignerBitmap`] plus an aggregate of partial signatures. The shape
+//! of that aggregate is decided by the chain's signature scheme — see
+//! [`crate::crypto::sig_scheme`]. Today only
+//! [`Ed25519Collected`](crate::crypto::sig_scheme::Ed25519Collected) is
+//! wired through, and its aggregate is a `Vec<[u8; 64]>` of raw Ed25519
+//! signatures parallel to the bitmap's set bits.
 //!
 //! The [`SignerBitmap`] + `signatures: Vec<[u8; 64]>` layout is
 //! "parallel on set bits": the k-th entry of [`QuorumCertificate::signatures`]
 //! belongs to the k-th validator index whose bit is set in
-//! [`QuorumCertificate::signers`] (scanning low→high). Constructors in
-//! this module maintain that invariant for you; direct field mutation
-//! is possible only inside the crate.
+//! [`QuorumCertificate::signers`] (scanning low→high).
+//! [`QuorumCertificate::add_signature`] delegates to
+//! [`SignatureScheme::add_partial`](crate::crypto::sig_scheme::SignatureScheme::add_partial)
+//! and maintains that invariant for you; direct field mutation is
+//! possible only inside the crate.
+//!
+//! When BLS aggregation lands (#143 / #289 onward) the `signatures`
+//! field becomes scheme-shaped (likely a tagged enum). The trait
+//! surface in [`crate::crypto::sig_scheme`] is already general enough to
+//! cover that, so the QC type itself is the only thing that has to grow
+//! a variant.
 //!
 //! # Wire types
 //!
@@ -37,7 +48,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
 use crate::consensus::validator_set::ValidatorSet;
+use crate::crypto::sig_scheme::{AggregateVerifyError, Ed25519Collected, SignatureScheme};
 use crate::crypto::signed::SignedMessage;
+use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 
 /// HotStuff quorum threshold: `2n/3 + 1`.
@@ -225,7 +238,7 @@ impl QuorumCertificate {
         }
     }
 
-    /// Record one signer's [`[u8; 64]`] Ed25519 signature. `validator_idx`
+    /// Record one signer's `[u8; 64]` Ed25519 signature. `validator_idx`
     /// is the validator's index in the sorted [`ValidatorSet`].
     ///
     /// Keeps the "parallel on set bits" invariant: the signature is
@@ -233,24 +246,43 @@ impl QuorumCertificate {
     /// falls among the already-set bits. Ignored (no-op) if the bit is
     /// already set — duplicate signatures for the same signer do not
     /// change quorum status.
+    ///
+    /// Aggregation is delegated to
+    /// [`SignatureScheme::add_partial`](crate::crypto::sig_scheme::SignatureScheme::add_partial)
+    /// so the same code path drives both the wire-shape and the
+    /// (eventual) BLS path.
     pub fn add_signature(&mut self, validator_idx: usize, sig: [u8; 64]) {
         if self.signers.get(validator_idx) {
             return;
         }
-        // Find the insertion position by counting set bits strictly
-        // below `validator_idx`.
-        let insert_at = self
-            .signers
-            .iter_set()
-            .take_while(|&i| i < validator_idx)
-            .count();
+        Ed25519Collected::add_partial(&mut self.signatures, &self.signers, validator_idx, sig);
         self.signers.set(validator_idx);
-        self.signatures.insert(insert_at, sig);
         debug_assert_eq!(
             self.signers.count(),
-            self.signatures.len(),
+            Ed25519Collected::aggregate_count(&self.signatures),
             "signer bits and signatures must stay parallel",
         );
+    }
+
+    /// Verify that this QC's aggregate is a valid quorum signature over
+    /// `message` under `pubkeys`. `pubkeys` must contain one entry per
+    /// validator in the relevant validator set, in the same sorted order
+    /// the [`SignerBitmap`] indexes.
+    ///
+    /// `message` is the canonical signing pre-image — typically the
+    /// `(view, block_hash)` payload framed with the same domain
+    /// separator used at vote time.
+    ///
+    /// Currently dispatches to
+    /// [`Ed25519Collected`](crate::crypto::sig_scheme::Ed25519Collected).
+    /// The signature lets BLS slot in via the same trait without
+    /// touching call sites; #289+ wires that variant up.
+    pub fn verify_aggregate(
+        &self,
+        message: &[u8],
+        pubkeys: &[NodeId],
+    ) -> Result<(), AggregateVerifyError> {
+        Ed25519Collected::verify_aggregate(&self.signatures, &self.signers, message, pubkeys)
     }
 
     /// Number of validators whose signature this QC carries.
