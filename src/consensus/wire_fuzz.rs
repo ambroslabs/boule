@@ -260,7 +260,8 @@ proptest! {
     ) {
         let from = [from_byte; 32];
         let vs = pool_validator_set();
-        let _ = ingress(from, &bytes, &vs);
+        let history = crate::consensus::validator_history::ValidatorSetHistory::from_genesis(vs);
+        let _ = ingress(from, &bytes, &history);
     }
 
     /// A `WireMessage` whose payload is structurally adversarial —
@@ -276,7 +277,8 @@ proptest! {
         (bytes, from) in arb_signed_wire_bytes_and_signer(),
     ) {
         let vs = pool_validator_set();
-        let _ = ingress(from, &bytes, &vs);
+        let history = crate::consensus::validator_history::ValidatorSetHistory::from_genesis(vs);
+        let _ = ingress(from, &bytes, &history);
     }
 }
 

@@ -38,6 +38,7 @@ use crate::consensus::hotstuff::qc::TimeoutVote;
 use crate::consensus::hotstuff::step::Action as SafetyAction;
 use crate::consensus::node::WireMessage;
 use crate::consensus::pacemaker;
+use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{Signed, SignedMessage, Signer};
 use crate::p2p::NodeId;
@@ -142,6 +143,13 @@ pub enum IngressError {
     Decode(postcard::Error),
     UnknownSigner(NodeId),
     InvalidSignature(anyhow::Error),
+    /// A NewView's `high_qc` is not well-formed under the validator set
+    /// authoritative at `high_qc.view` (bitmap length mismatch, stray
+    /// bits, or signature/bit count divergence). Carries the
+    /// `high_qc.view` so logs and tests can distinguish boundaries.
+    MalformedHighQc {
+        view: View,
+    },
 }
 
 impl std::fmt::Display for IngressError {
@@ -152,6 +160,10 @@ impl std::fmt::Display for IngressError {
                 write!(f, "signer {id:?} is not in the validator set")
             }
             IngressError::InvalidSignature(e) => write!(f, "signature verification failed: {e}"),
+            IngressError::MalformedHighQc { view } => write!(
+                f,
+                "NewView's high_qc at view {view} is not well-formed under the historical validator set",
+            ),
         }
     }
 }
@@ -161,7 +173,7 @@ impl std::error::Error for IngressError {
         match self {
             IngressError::Decode(e) => Some(e),
             IngressError::InvalidSignature(e) => Some(e.as_ref()),
-            IngressError::UnknownSigner(_) => None,
+            IngressError::UnknownSigner(_) | IngressError::MalformedHighQc { .. } => None,
         }
     }
 }
@@ -180,16 +192,24 @@ impl From<postcard::Error> for IngressError {
 /// `bytes` is the raw payload from [`crate::p2p::ProtocolEvent::Message`]
 /// (protocol tag and length prefix already stripped).
 ///
+/// `history` is the per-view validator-set lookup. Each consensus message
+/// is verified against the set authoritative at that message's own view:
+/// proposals at `block.header.view`, votes and timeout votes at their
+/// `view` field, and NewView at `high_qc.view`. With history holding only
+/// the genesis boundary this matches the prior single-set behaviour
+/// exactly; once reconfiguration boundaries land via #253, signers get
+/// validated against the right set on either side of each boundary.
+///
 /// Returns [`Err(IngressError)`] if the frame can't be decoded or fails
 /// signature verification. The event loop should log and drop on error;
 /// the state machines are never touched.
 pub fn ingress(
     from: NodeId,
     bytes: &[u8],
-    vs: &ValidatorSet,
+    history: &ValidatorSetHistory,
 ) -> Result<Vec<Dispatch>, IngressError> {
     let msg: WireMessage = postcard::from_bytes(bytes)?;
-    ingress_wire(from, msg, vs)
+    ingress_wire(from, msg, history)
 }
 
 /// Same as [`ingress`] but takes an already-decoded [`WireMessage`].
@@ -198,13 +218,14 @@ pub fn ingress(
 pub fn ingress_wire(
     from: NodeId,
     msg: WireMessage,
-    vs: &ValidatorSet,
+    history: &ValidatorSetHistory,
 ) -> Result<Vec<Dispatch>, IngressError> {
     match msg {
         WireMessage::Proposal(signed) => {
-            verify_signer(signed.signer, vs)?;
-            verify_sig(&signed)?;
             let view = signed.payload.block.header.view;
+            let vs = history.set_at(view);
+            verify_signer(signed.signer, &vs)?;
+            verify_sig(&signed)?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::ProposalReceived(
                     signed,
@@ -214,7 +235,8 @@ pub fn ingress_wire(
         }
 
         WireMessage::Vote(signed) => {
-            verify_signer(signed.signer, vs)?;
+            let vs = history.set_at(signed.payload.view);
+            verify_signer(signed.signer, &vs)?;
             verify_sig(&signed)?;
             Ok(vec![Dispatch::Safety(
                 crate::consensus::hotstuff::step::Event::VoteReceived(signed),
@@ -222,9 +244,27 @@ pub fn ingress_wire(
         }
 
         WireMessage::NewView(signed) => {
-            verify_signer(signed.signer, vs)?;
-            verify_sig(&signed)?;
+            // The wire envelope doesn't carry an explicit "current view"
+            // field — the closest signal we have is `high_qc.view`. The
+            // signer at the receiving boundary is whoever entered the
+            // *next* view armed with this high_qc, so we look up against
+            // the set at `high_qc.view`. The `high_qc` itself was minted
+            // at `high_qc.view` under the same set (#250) — so its
+            // bitmap shape, signature count, and quorum threshold must
+            // all match the historical set, not the current one.
             let high_qc_view = signed.payload.high_qc.view;
+            let vs = history.set_at(high_qc_view);
+            verify_signer(signed.signer, &vs)?;
+            verify_sig(&signed)?;
+            // #250: well-formedness of the embedded high_qc against the
+            // set authoritative at `high_qc.view`. A NewView whose
+            // high_qc was constructed against a different set size
+            // (e.g. minted under the new set after a reconfig but
+            // claimed at a pre-boundary view) is rejected here before
+            // it can pollute the safety core's `state.high_qc`.
+            if !signed.payload.high_qc.is_well_formed(&vs) {
+                return Err(IngressError::MalformedHighQc { view: high_qc_view });
+            }
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
                     signed,
@@ -236,7 +276,8 @@ pub fn ingress_wire(
         }
 
         WireMessage::TimeoutVote(signed) => {
-            verify_signer(signed.signer, vs)?;
+            let vs = history.set_at(signed.payload.view);
+            verify_signer(signed.signer, &vs)?;
             verify_sig(&signed)?;
             // The round-sync hint that closes the #218 wedge fires
             // at the integration layer (`on_timeout_vote`), not here:
@@ -559,7 +600,12 @@ mod tests {
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(signer.node_id(), &bytes, &vs).unwrap();
+        let dispatches = ingress(
+            signer.node_id(),
+            &bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 2);
         assert!(matches!(
             dispatches[0],
@@ -585,7 +631,12 @@ mod tests {
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(signer.node_id(), &bytes, &vs).unwrap_err();
+        let err = ingress(
+            signer.node_id(),
+            &bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap_err();
         assert!(matches!(err, IngressError::UnknownSigner(_)));
     }
 
@@ -604,7 +655,12 @@ mod tests {
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(signer.node_id(), &bytes, &vs).unwrap_err();
+        let err = ingress(
+            signer.node_id(),
+            &bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap_err();
         assert!(matches!(err, IngressError::InvalidSignature(_)));
     }
 
@@ -623,7 +679,12 @@ mod tests {
         let wire = WireMessage::Vote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(signer.node_id(), &bytes, &vs).unwrap();
+        let dispatches = ingress(
+            signer.node_id(),
+            &bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             dispatches[0],
@@ -645,7 +706,12 @@ mod tests {
         let wire = WireMessage::NewView(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(signer.node_id(), &bytes, &vs).unwrap();
+        let dispatches = ingress(
+            signer.node_id(),
+            &bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 2);
         assert!(matches!(
             dispatches[0],
@@ -672,7 +738,12 @@ mod tests {
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(signer.node_id(), &bytes, &vs).unwrap();
+        let dispatches = ingress(
+            signer.node_id(),
+            &bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(dispatches[0], Dispatch::TimeoutVote(_)));
     }
@@ -691,7 +762,12 @@ mod tests {
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(signer.node_id(), &bytes, &vs).unwrap_err();
+        let err = ingress(
+            signer.node_id(),
+            &bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap_err();
         assert!(matches!(err, IngressError::UnknownSigner(_)));
     }
 
@@ -709,7 +785,12 @@ mod tests {
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(signer.node_id(), &bytes, &vs).unwrap_err();
+        let err = ingress(
+            signer.node_id(),
+            &bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap_err();
         assert!(matches!(err, IngressError::InvalidSignature(_)));
     }
 
@@ -723,7 +804,8 @@ mod tests {
         let wire = WireMessage::BlockRequest(hash);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        let dispatches =
+            ingress(from, &bytes, &ValidatorSetHistory::from_genesis(vs.clone())).unwrap();
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             &dispatches[0],
@@ -738,7 +820,8 @@ mod tests {
         let wire = WireMessage::BlockResponse(Some(genesis()));
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        let dispatches =
+            ingress(from, &bytes, &ValidatorSetHistory::from_genesis(vs.clone())).unwrap();
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             &dispatches[0],
@@ -750,7 +833,12 @@ mod tests {
     fn ingress_garbage_bytes_returns_decode_error() {
         let from = [0x01u8; 32];
         let vs = ValidatorSet::new(vec![]);
-        let err = ingress(from, &[0xFFu8; 16], &vs).unwrap_err();
+        let err = ingress(
+            from,
+            &[0xFFu8; 16],
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap_err();
         assert!(matches!(err, IngressError::Decode(_)));
     }
 
@@ -849,7 +937,12 @@ mod tests {
         };
 
         // Run through ingress — should succeed.
-        let dispatches = ingress(signer.node_id(), &payload, &vs).unwrap();
+        let dispatches = ingress(
+            signer.node_id(),
+            &payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 2);
         match &dispatches[0] {
             Dispatch::Safety(SafetyEvent::ProposalReceived(s)) => {
@@ -898,7 +991,8 @@ mod tests {
         let vs = ValidatorSet::new(vec![]);
         let wire = WireMessage::SnapshotManifestRequest { height: Some(1234) };
         let bytes = postcard::to_stdvec(&wire).unwrap();
-        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        let dispatches =
+            ingress(from, &bytes, &ValidatorSetHistory::from_genesis(vs.clone())).unwrap();
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             &dispatches[0],
@@ -912,7 +1006,8 @@ mod tests {
         let vs = ValidatorSet::new(vec![]);
         let wire = WireMessage::SnapshotManifestRequest { height: None };
         let bytes = postcard::to_stdvec(&wire).unwrap();
-        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        let dispatches =
+            ingress(from, &bytes, &ValidatorSetHistory::from_genesis(vs.clone())).unwrap();
         assert!(matches!(
             &dispatches[0],
             Dispatch::ServeSnapshotManifest { height: None, to } if to == &from,
@@ -926,7 +1021,8 @@ mod tests {
         let manifest = sample_manifest_for_dispatch();
         let wire = WireMessage::SnapshotManifestResponse(Some(manifest.clone()));
         let bytes = postcard::to_stdvec(&wire).unwrap();
-        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        let dispatches =
+            ingress(from, &bytes, &ValidatorSetHistory::from_genesis(vs.clone())).unwrap();
         assert_eq!(dispatches.len(), 1);
         match &dispatches[0] {
             Dispatch::ReceiveSnapshotManifest {
@@ -949,7 +1045,8 @@ mod tests {
             chunk_idx: 7,
         };
         let bytes = postcard::to_stdvec(&wire).unwrap();
-        let dispatches = ingress(from, &bytes, &vs).unwrap();
+        let dispatches =
+            ingress(from, &bytes, &ValidatorSetHistory::from_genesis(vs.clone())).unwrap();
         assert!(matches!(
             &dispatches[0],
             Dispatch::ServeSnapshotChunk { height: 555, chunk_idx: 7, to } if to == &from,
@@ -967,7 +1064,12 @@ mod tests {
             payload: Some(payload.clone()),
         };
         let bytes_vec = postcard::to_stdvec(&wire).unwrap();
-        let dispatches = ingress(from, &bytes_vec, &vs).unwrap();
+        let dispatches = ingress(
+            from,
+            &bytes_vec,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         match &dispatches[0] {
             Dispatch::ReceiveSnapshotChunk {
                 height: 99,
@@ -1025,7 +1127,12 @@ mod tests {
             panic!("expected SendTo");
         };
         assert_eq!(to, from);
-        let dispatches = ingress(from, &payload, &vs).unwrap();
+        let dispatches = ingress(
+            from,
+            &payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         match &dispatches[0] {
             Dispatch::ReceiveSnapshotManifest {
                 manifest: Some(m), ..
@@ -1084,11 +1191,260 @@ mod tests {
         };
         assert_eq!(to, peer);
 
-        let dispatches = ingress(from, &payload, &vs).unwrap();
+        let dispatches = ingress(
+            from,
+            &payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             &dispatches[0],
             Dispatch::ServeBlock { hash: h, to: t } if h == &[0xCCu8; 32] && t == &from,
+        ));
+    }
+
+    // ── ingress: ValidatorSetHistory boundary semantics (#249) ───────────────
+
+    /// A vote at view `v_eff`, signed by a validator that is **only** in
+    /// the new (post-boundary) set, must verify against the
+    /// post-boundary set — not against the genesis set.
+    #[test]
+    fn vote_at_v_eff_verifies_against_post_boundary_set() {
+        let old_signer = fresh_signer();
+        let new_signer = fresh_signer();
+        let old_set = make_vs_with_signers(&[&old_signer]);
+        let new_set = make_vs_with_signers(&[&old_signer, &new_signer]);
+
+        let v_eff: View = 5;
+        let mut history = ValidatorSetHistory::from_genesis(old_set);
+        history.insert_boundary(v_eff, new_set).unwrap();
+
+        let vote = Vote {
+            view: v_eff,
+            block_hash: [0xAB; 32],
+        };
+        let signed = Signed::sign(vote, &new_signer).unwrap();
+        let wire = WireMessage::Vote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        // Succeeds against the history that contains the boundary.
+        let dispatches = ingress(new_signer.node_id(), &bytes, &history).unwrap();
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+        ));
+    }
+
+    /// The same vote rejected when the history is missing the boundary —
+    /// the post-boundary signer is not yet a member at any view.
+    #[test]
+    fn vote_at_v_eff_rejected_without_boundary() {
+        let old_signer = fresh_signer();
+        let new_signer = fresh_signer();
+        let old_set = make_vs_with_signers(&[&old_signer]);
+
+        let history_without_boundary = ValidatorSetHistory::from_genesis(old_set);
+
+        let vote = Vote {
+            view: 5,
+            block_hash: [0xAB; 32],
+        };
+        let signed = Signed::sign(vote, &new_signer).unwrap();
+        let wire = WireMessage::Vote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let err = ingress(new_signer.node_id(), &bytes, &history_without_boundary).unwrap_err();
+        assert!(
+            matches!(err, IngressError::UnknownSigner(_)),
+            "expected UnknownSigner, got {err:?}"
+        );
+    }
+
+    /// A vote at view `v_eff - 1` must still verify against the **old**
+    /// set even after the new boundary exists — historical messages do
+    /// not get retroactively re-validated against the newer committee.
+    #[test]
+    fn vote_before_boundary_verifies_against_pre_boundary_set() {
+        let old_signer = fresh_signer();
+        let new_signer = fresh_signer();
+        let old_set = make_vs_with_signers(&[&old_signer]);
+        // Critically, `new_set` does *not* contain `old_signer`.
+        let new_set = make_vs_with_signers(&[&new_signer]);
+
+        let v_eff: View = 10;
+        let mut history = ValidatorSetHistory::from_genesis(old_set);
+        history.insert_boundary(v_eff, new_set).unwrap();
+
+        let vote = Vote {
+            view: v_eff - 1,
+            block_hash: [0xCD; 32],
+        };
+        let signed = Signed::sign(vote, &old_signer).unwrap();
+        let wire = WireMessage::Vote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let dispatches = ingress(old_signer.node_id(), &bytes, &history).unwrap();
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+        ));
+    }
+
+    /// A proposal at the boundary view: the proposer is a post-boundary
+    /// member only. Verification picks the right set.
+    #[test]
+    fn proposal_at_v_eff_verifies_against_post_boundary_set() {
+        let old_signer = fresh_signer();
+        let new_signer = fresh_signer();
+        let old_set = make_vs_with_signers(&[&old_signer]);
+        let new_set = make_vs_with_signers(&[&old_signer, &new_signer]);
+
+        let v_eff: View = 7;
+        let mut history = ValidatorSetHistory::from_genesis(old_set);
+        history.insert_boundary(v_eff, new_set).unwrap();
+
+        // Build a block at the boundary view; the proposer is the
+        // post-boundary-only validator.
+        let parent = genesis();
+        let header = crate::replication::block::BlockHeader {
+            parent_hash: parent.hash(),
+            height: parent.header.height + 1,
+            view: v_eff,
+            proposer: new_signer.node_id(),
+            state_commitment: [0u8; 32],
+            commands_commitment: Block::commands_commitment(&[]),
+        };
+        let block = Block {
+            header,
+            commands: vec![],
+        };
+
+        let proposal = Proposal {
+            block,
+            justify: sample_qc(),
+        };
+        let signed = Signed::sign(proposal, &new_signer).unwrap();
+        let wire = WireMessage::Proposal(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let dispatches = ingress(new_signer.node_id(), &bytes, &history).unwrap();
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::ProposalReceived(_))
+        ));
+    }
+
+    // ── ingress: NewView high_qc cross-boundary semantics (#250) ─────────────
+
+    /// A NewView straddling a reconfig boundary: high_qc.view = v_eff - 1
+    /// (still under the old set), envelope signer is in the old set,
+    /// high_qc bitmap shape matches the old set. Must be accepted —
+    /// historical messages do not get retroactively re-validated against
+    /// the newer committee.
+    #[test]
+    fn new_view_with_pre_boundary_high_qc_under_old_set_accepted() {
+        let old_a = fresh_signer();
+        let old_b = fresh_signer();
+        let new_only = fresh_signer();
+        let old_set = make_vs_with_signers(&[&old_a, &old_b]);
+        let new_set = make_vs_with_signers(&[&old_a, &old_b, &new_only]);
+
+        let v_eff: View = 5;
+        let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
+        history.insert_boundary(v_eff, new_set).unwrap();
+
+        // high_qc minted at view v_eff - 1 against the *old* set.
+        let mut high_qc = QuorumCertificate::new(v_eff - 1, [0xAB; 32], old_set.len());
+        for i in 0..old_set.len() {
+            high_qc.add_signature(i, [0xCC; 64]);
+        }
+        assert!(high_qc.is_well_formed(&old_set));
+
+        let nv = NewView { high_qc };
+        let signed = Signed::sign(nv, &old_a).unwrap();
+        let wire = WireMessage::NewView(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let dispatches = ingress(old_a.node_id(), &bytes, &history).unwrap();
+        assert_eq!(dispatches.len(), 2);
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::NewViewReceived(_))
+        ));
+        assert!(matches!(
+            dispatches[1],
+            Dispatch::Pacemaker(pacemaker::Event::OnQc(v)) if v == v_eff - 1
+        ));
+    }
+
+    /// A NewView claiming a pre-boundary high_qc.view but whose high_qc
+    /// bitmap is sized against the *new* (post-boundary) set: rejected
+    /// with `MalformedHighQc`. The new set is larger here, so the bitmap
+    /// length doesn't match `set_at(high_qc.view) = old_set` and
+    /// well-formedness fails.
+    #[test]
+    fn new_view_with_high_qc_minted_against_new_set_rejected_at_pre_boundary_view() {
+        let old_a = fresh_signer();
+        let old_b = fresh_signer();
+        let new_only = fresh_signer();
+        let old_set = make_vs_with_signers(&[&old_a, &old_b]);
+        let new_set = make_vs_with_signers(&[&old_a, &old_b, &new_only]);
+
+        let v_eff: View = 5;
+        let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
+        history.insert_boundary(v_eff, new_set.clone()).unwrap();
+
+        // high_qc minted against the *new* (larger) set, but claimed at
+        // a pre-boundary view. The bitmap length will be `new_set.len()`,
+        // which doesn't match `set_at(v_eff - 1) = old_set`.
+        let mut high_qc = QuorumCertificate::new(v_eff - 1, [0xAB; 32], new_set.len());
+        for i in 0..new_set.len() {
+            high_qc.add_signature(i, [0xDD; 64]);
+        }
+        assert!(high_qc.is_well_formed(&new_set));
+        assert!(!high_qc.is_well_formed(&old_set));
+
+        // Envelope signer must verify first; pick someone in the old set
+        // so we exercise the high_qc check rather than the signer check.
+        let nv = NewView { high_qc };
+        let signed = Signed::sign(nv, &old_a).unwrap();
+        let wire = WireMessage::NewView(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let err = ingress(old_a.node_id(), &bytes, &history).unwrap_err();
+        assert!(
+            matches!(err, IngressError::MalformedHighQc { view } if view == v_eff - 1),
+            "expected MalformedHighQc at v_eff - 1, got {err:?}",
+        );
+    }
+
+    /// Sanity: the existing single-set `ingress_new_view_emits_pacemaker_on_qc`
+    /// test exercises the genesis-only path. Mirror that here with an
+    /// explicit history of length 1, so a regression in the well-formedness
+    /// check catches both flavors.
+    #[test]
+    fn new_view_under_genesis_only_history_round_trips() {
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+
+        let mut high_qc = QuorumCertificate::new(7, [0xCD; 32], vs.len());
+        high_qc.add_signature(0, [0x11; 64]);
+        let nv = NewView { high_qc };
+        let signed = Signed::sign(nv, &signer).unwrap();
+        let wire = WireMessage::NewView(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let dispatches = ingress(signer.node_id(), &bytes, &history).unwrap();
+        assert_eq!(dispatches.len(), 2);
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::NewViewReceived(_))
+        ));
+        assert!(matches!(
+            dispatches[1],
+            Dispatch::Pacemaker(pacemaker::Event::OnQc(7))
         ));
     }
 }
