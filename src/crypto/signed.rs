@@ -163,7 +163,13 @@ where
 }
 
 /// Canonical signing pre-image: `be_u32(|domain|) || domain || postcard(payload)`.
-fn preimage<T: Serialize + SignedMessage>(payload: &T) -> Result<Vec<u8>> {
+///
+/// Exposed at crate visibility so envelopes that carry more than one
+/// signature over the same payload (e.g. the dual-signed validator-key
+/// rotation tx in [`crate::consensus::validator_rotation`]) reuse this
+/// exact framing instead of duplicating it. Reusing the helper keeps a
+/// single source of truth for "what bytes are signed".
+pub(crate) fn preimage<T: Serialize + SignedMessage>(payload: &T) -> Result<Vec<u8>> {
     let domain = T::DOMAIN.as_bytes();
     if domain.len() > u32::MAX as usize {
         bail!("domain tag too long");
