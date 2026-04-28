@@ -235,6 +235,25 @@ pub struct HotStuffCore {
     /// budget is exhausted, and finally drop the parked proposal
     /// once the total attempt budget is spent.
     block_sync_inflight: HashMap<BlockHash, BlockSyncInflight>,
+    /// Highest view at which this replica has broadcast a proposal as
+    /// leader. Guards against double-proposing across the multiple
+    /// entry points that can fire `try_propose_as_leader` for the
+    /// same view (issue #243): `become_leader` fires once when the
+    /// pacemaker advances, `on_pacemaker_advance` fires every time
+    /// `PacemakerAdvance` is dispatched (including after a block-sync
+    /// response brings in a previously-missing high_qc parent), and
+    /// the QC-formed branch of `on_vote_received` fires when the
+    /// next-view leader collects quorum. Without this guard a leader
+    /// whose first propose attempt failed (high_qc parent missing)
+    /// could still emit two proposals at the same view if block-sync
+    /// arrived between the QC-formed branch and the AdvanceToView
+    /// pacemaker action — indistinguishable from Byzantine
+    /// equivocation to peers. In-memory only: across a process
+    /// restart the cluster will have advanced to a strictly later
+    /// view via NewView/RoundSync traffic before this replica's
+    /// pacemaker reaches the same leader slot again, so a transient
+    /// `proposed_in_view = 0` post-restart is safe.
+    proposed_in_view: View,
     builder: Arc<dyn BlockBuilder>,
     /// Per-cache caps. Forced evictions fire when an `insert` would
     /// otherwise grow a cache past its cap; see
@@ -309,6 +328,7 @@ impl HotStuffCore {
             vote_bucket: HashMap::new(),
             parked_proposals: HashMap::new(),
             block_sync_inflight: HashMap::new(),
+            proposed_in_view: 0,
             builder,
             limits,
             eviction_counters,
@@ -429,12 +449,45 @@ impl HotStuffCore {
     /// `view` using the current `high_qc` as the justify.
     ///
     /// Called by the integration layer when the pacemaker emits
-    /// `Action::BecomeLeader(view)`. Returns an empty `Vec` if:
-    /// - there is no `high_qc` yet (first ever view, waiting for NewViews), or
+    /// `Action::BecomeLeader(view)`. The pacemaker only emits that
+    /// action when `leader_for_view(view) == self_id`, so this entry
+    /// point trusts the caller to have done the leader-rotation
+    /// check; only the per-view duplicate guard, the high_qc
+    /// presence check, and the parent-block lookup are enforced
+    /// here.
+    ///
+    /// Returns an empty `Vec` if:
+    /// - we have already proposed at `view` (the
+    ///   `proposed_in_view` guard, which keeps multiple entry points
+    ///   from double-broadcasting — the integration-layer
+    ///   `BecomeLeader` action and the safety-core's own
+    ///   `on_pacemaker_advance` recovery path can both target the
+    ///   same view),
+    /// - there is no `high_qc` yet (first ever view, waiting for
+    ///   NewViews), or
     /// - the parent block the QC refers to is not in `pending_blocks`
-    ///   (block-sync not yet complete; the proposal will happen once
-    ///   the parent arrives via the `ReceiveBlock` path).
+    ///   (block-sync not yet complete; a later `PacemakerAdvance`
+    ///   will retry once the block arrives — see issue #243).
     pub fn become_leader(&mut self, view: View) -> Vec<Action> {
+        self.build_proposal_at_view(view)
+    }
+
+    /// Build the proposal action for `view` if the per-view guard,
+    /// high_qc presence, and parent-block lookup all pass. The
+    /// leader-rotation check is intentionally *not* part of this
+    /// helper — callers that want it use [`Self::try_propose_as_leader`].
+    ///
+    /// The `proposed_in_view` guard is updated atomically with the
+    /// emission so multiple call sites for the same view (the
+    /// `BecomeLeader` pacemaker action, the `on_pacemaker_advance`
+    /// recovery path for issue #243, and the QC-formed branch of
+    /// `on_vote_received`) collectively emit at most one proposal
+    /// per view — required to stay distinguishable from Byzantine
+    /// equivocation.
+    fn build_proposal_at_view(&mut self, view: View) -> Vec<Action> {
+        if view <= self.proposed_in_view {
+            return Vec::new();
+        }
         let Some(high_qc) = self.state.high_qc.clone() else {
             return Vec::new();
         };
@@ -442,10 +495,24 @@ impl HotStuffCore {
             return Vec::new();
         };
         let new_block = self.builder.build(&parent, view, &high_qc);
+        self.proposed_in_view = view;
         vec![Action::Broadcast(ConsensusMsg::Proposal(Proposal {
             block: new_block,
             justify: high_qc,
         }))]
+    }
+
+    /// The leader-rotation-aware variant of [`Self::build_proposal_at_view`].
+    /// Returns empty when this replica is not the round-robin leader
+    /// of `view`; otherwise delegates to the build path. Used from
+    /// re-entrant entry points (`on_pacemaker_advance`,
+    /// `on_vote_received`'s QC-formed branch) that fire regardless
+    /// of whether self is the leader.
+    fn try_propose_as_leader(&mut self, view: View) -> Vec<Action> {
+        if round_robin_leader(&self.state.validator_set, view) != self.self_id {
+            return Vec::new();
+        }
+        self.build_proposal_at_view(view)
     }
 
     /// React to `event` and return the [`Action`]s the integration
@@ -708,16 +775,11 @@ impl HotStuffCore {
         // `block_hash`; edge cases where we don't have it (leader
         // restart, etc.) safely skip the broadcast — the pacemaker
         // handles the resulting view stall via its usual timeout
-        // path.
-        if round_robin_leader(&self.state.validator_set, next_view) == self.self_id
-            && let Some(parent) = self.state.pending_blocks.get(&formed.block_hash).cloned()
-        {
-            let new_block = self.builder.build(&parent, next_view, &formed);
-            actions.push(Action::Broadcast(ConsensusMsg::Proposal(Proposal {
-                block: new_block,
-                justify: formed,
-            })));
-        }
+        // path. The shared helper enforces the per-view double-propose
+        // guard so a later `PacemakerAdvance` on the same `next_view`
+        // (e.g. block-sync delivered the parent — issue #243)
+        // re-attempts the proposal exactly once.
+        actions.extend(self.try_propose_as_leader(next_view));
 
         actions
     }
@@ -889,6 +951,19 @@ impl HotStuffCore {
                 high_qc,
             })));
         }
+
+        // Issue #243: leader recovery. If we are the round-robin
+        // leader of `v` and we never broadcast a proposal at this
+        // view (typically because the high_qc parent was missing
+        // when `BecomeLeader` first fired), re-attempt now. This
+        // path is the one block-sync's `Dispatch::ReceiveBlock`
+        // depends on: it inserts the freshly-arrived block into
+        // `pending_blocks` and feeds `PacemakerAdvance(current_view)`
+        // back to the safety core, expecting the leader's pending
+        // proposal to fire. Pre-#243 this path emitted only the
+        // NewView broadcast above and the wedged leader stayed
+        // silent until the pacemaker timed out and rotated past it.
+        actions.extend(self.try_propose_as_leader(v));
 
         actions
     }
@@ -2188,6 +2263,134 @@ mod tests {
             }))],
         );
         assert_eq!(core.state().current_view, 7);
+    }
+
+    // ── #243: leader catches up via block-sync, then proposes ───────
+
+    /// Issue #243 regression: a post-restart leader whose `high_qc`
+    /// references a block missing from `pending_blocks` cannot propose
+    /// when `become_leader` first fires. Block-sync brings the parent
+    /// in later (via `insert_pending_block` + `PacemakerAdvance`), but
+    /// the safety core never re-attempts the proposal — the leader
+    /// stays silent for the entire view, which view-changes around it
+    /// only after the pacemaker timeout (a 200ms→2s budget on tight
+    /// pacemaker settings; well within the 60s recovery budget the
+    /// testnet sweep observed wedging at ~10%).
+    ///
+    /// Without the fix this test fails on the second
+    /// `PacemakerAdvance(view=5)` assertion: the leader emits a
+    /// `NewView` broadcast but no `Proposal`.
+    #[test]
+    fn leader_proposes_after_block_sync_delivers_missing_high_qc_parent() {
+        // self = nid(2). Round-robin leader of view 5 = validators[5 %
+        // 4] = validators[1] = nid(2), so we own the propose path for
+        // view 5.
+        let mut core = make_core(2);
+        let genesis = Block::genesis([0; 32]);
+        // Build a chain so we have a concrete `high_qc` target block
+        // to point at without inserting it into `pending_blocks`.
+        let chain = chain_from_genesis(&genesis, &[1, 2, 3, 4], nid(1));
+        let high_qc_block = chain[3].clone(); // view 4, height 4
+        let high_qc_hash = high_qc_block.hash();
+        let high_qc = dummy_qc(4, high_qc_hash);
+
+        // Mimic the post-restart wedge: NewView from a peer adopts a
+        // fresh high_qc, but block-sync hasn't delivered the block
+        // yet. We seed the inflight tracker the way the NewView path
+        // would (via #240), so PacemakerAdvance below isn't a no-op
+        // on the retry side.
+        core.state.high_qc = Some(high_qc.clone());
+        core.block_sync_inflight.insert(
+            high_qc_hash,
+            BlockSyncInflight {
+                original_sender: nid(3),
+                attempts: 1,
+                last_asked_view: 0,
+                expected_height: 0,
+            },
+        );
+
+        // First PacemakerAdvance: pacemaker has just lifted us to view
+        // 5. The high_qc block is missing, so the proposal can't fire
+        // yet. The actions must include NewView (we have a high_qc to
+        // advertise) and a block-sync retry (because we have an
+        // outstanding inflight entry the pacemaker drives).
+        let advance_to_5 = core.step(Event::PacemakerAdvance(5));
+        let proposed_now = advance_to_5
+            .iter()
+            .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
+        assert!(
+            !proposed_now,
+            "before block-sync delivers high_qc parent, leader must not propose: {advance_to_5:?}",
+        );
+
+        // BecomeLeader is the integration layer's follow-up after the
+        // AdvanceToView pacemaker action. With the parent still
+        // missing it produces no proposal — pre-fix behaviour, kept
+        // as an explicit assertion so the regression couldn't quietly
+        // shift the symptom from "never proposes" to "proposes
+        // garbage".
+        let become_leader_actions = core.become_leader(5);
+        let proposed_in_become_leader = become_leader_actions
+            .iter()
+            .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
+        assert!(
+            !proposed_in_become_leader,
+            "become_leader must not propose while high_qc parent is missing: {become_leader_actions:?}",
+        );
+
+        // Block-sync response: the missing high_qc block lands in
+        // `pending_blocks` via the integration layer's
+        // `Dispatch::ReceiveBlock` path.
+        core.insert_pending_block(high_qc_block.clone());
+
+        // The integration layer feeds a fresh `PacemakerAdvance` for
+        // the same view after `insert_pending_block` (see
+        // `node.rs::Dispatch::ReceiveBlock`). Now that the parent is
+        // available the safety core MUST broadcast the leader's
+        // proposal — this is the recovery path issue #243 needs.
+        let recovery = core.step(Event::PacemakerAdvance(5));
+        let proposal = recovery.iter().find_map(|a| match a {
+            Action::Broadcast(ConsensusMsg::Proposal(p)) => Some(p.clone()),
+            _ => None,
+        });
+        let proposal = proposal.unwrap_or_else(|| {
+            panic!(
+                "issue #243: leader must re-attempt the proposal after \
+                 block-sync brings in the missing high_qc parent. actions={recovery:?}"
+            )
+        });
+        assert_eq!(
+            proposal.block.header.view, 5,
+            "proposal must be at the leader's current view"
+        );
+        assert_eq!(
+            proposal.block.header.parent_hash, high_qc_hash,
+            "proposal must extend the freshly-arrived high_qc block",
+        );
+        assert_eq!(
+            proposal.block.header.height,
+            high_qc_block.header.height + 1,
+            "proposal must increment height over the high_qc parent",
+        );
+        assert_eq!(
+            proposal.justify, high_qc,
+            "proposal's justify is the adopted high_qc",
+        );
+
+        // Idempotency: a second PacemakerAdvance for the same view
+        // (e.g. another block-sync response landing) must not
+        // re-propose. Re-proposing would split votes across two
+        // leader proposals at the same view and is indistinguishable
+        // from Byzantine equivocation.
+        let dup = core.step(Event::PacemakerAdvance(5));
+        let dup_proposed = dup
+            .iter()
+            .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
+        assert!(
+            !dup_proposed,
+            "leader must propose at most once per view; got {dup:?}",
+        );
     }
 
     // ── C3: NewViewReceived ────────────────────────────────────────
