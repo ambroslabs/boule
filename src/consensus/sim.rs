@@ -483,6 +483,17 @@ impl SimCluster {
         (cluster, limiters)
     }
 
+    /// Borrow node `idx`'s consensus signer. Returns `None` if the
+    /// cluster was spawned without restart-capable signers (i.e. the
+    /// gossip-mode harness, which doesn't capture them). Used by sim
+    /// tests that need to construct signed payloads under a node's
+    /// current identity — e.g. the validator-key-rotation tx (#260),
+    /// where the rotation envelope's `sig_old` must come from the
+    /// validator's currently-active key.
+    pub fn signer(&self, idx: usize) -> Option<Arc<dyn Signer>> {
+        self.signers.as_ref().map(|s| Arc::clone(&s[idx]))
+    }
+
     /// Add node `idx` to the partition set. The routing tasks will drop all
     /// messages to and from this node until [`heal_node`] is called.
     ///
@@ -3748,6 +3759,132 @@ mod tests {
         assert!(
             any_post_boundary,
             "expected at least one committed block at view >= v_eff",
+        );
+    }
+
+    // ── #260: validator key rotation end-to-end ───────────────────────────
+
+    /// 4-node cluster commits a [`DualSignedRotation`] for one of its
+    /// validators and continues to make progress past `v_eff`. The
+    /// rotated validator's signer is *not* swapped mid-run (operational
+    /// concern; deferred to a follow-up since the Signer trait conflates
+    /// "claimed identity" with "active signing key" in a way that needs
+    /// a deeper refactor to decouple). Post-boundary, that validator's
+    /// stale-keyed votes are rejected by the verifier (the property
+    /// PR #286 plumbed in), but the remaining three honest validators
+    /// meet quorum (n=4, f=1, quorum=3) and the chain advances.
+    ///
+    /// What this test proves:
+    ///
+    /// - The tagged rotation tx flows from mempool → leader proposal →
+    ///   committed block (the codec from this PR).
+    /// - The rotation tx lands inside a committed block at the chain
+    ///   level (drained and asserted).
+    /// - The cluster maintains liveness across the rotation boundary
+    ///   even when the rotated validator is effectively offline (its
+    ///   stale-keyed votes don't count).
+    /// - No safety violations: drained commits show no conflicting
+    ///   blocks across replicas (`assert_no_conflicts`).
+    #[tokio::test(start_paused = true)]
+    async fn cluster_commits_validator_key_rotation_and_makes_progress() {
+        use crate::consensus::View;
+        use crate::consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Warm-up: commit a few blocks under the genesis identity so we
+        // have non-trivial chain depth before injecting the rotation.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 2
+            })
+            .await;
+        assert!(warmed, "cluster failed to commit warm-up blocks");
+
+        // Pick the validator at index 1 (second in sorted node_id
+        // order) to rotate — choosing a non-leader-of-view-0 keeps the
+        // boundary clean: the genesis-leader's behaviour is unchanged.
+        let rotated_idx = 1;
+        let rotated_validator = cluster.node_ids[rotated_idx];
+        let current_signer = cluster
+            .signer(rotated_idx)
+            .expect("regular SimCluster captures signers");
+
+        // Mint the new key the validator will rotate to. It must be a
+        // real Ed25519 keypair so the dual-signed envelope's `sig_new`
+        // verifies under `new_pubkey`.
+        let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
+        let new_pubkey = new_signer.node_id();
+
+        // v_eff sits comfortably ahead of where the warm-up landed and
+        // ahead of any leader-of-view turn the rotated validator might
+        // serve right after commit, so the cross-boundary window is
+        // unambiguous.
+        let v_eff: View = 60;
+        let payload = ValidatorKeyRotation {
+            validator: rotated_validator,
+            new_pubkey,
+            v_eff,
+        };
+        let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer)
+            .expect("constructing rotation envelope must succeed");
+        let cmd_bytes = envelope.encode_command();
+
+        // Drop the encoded rotation into every node's mempool so
+        // whichever validator leads the next view picks it up.
+        for mp in &cluster.mempools {
+            let _ = mp.insert(cmd_bytes.clone());
+        }
+
+        // Drive the cluster past v_eff. With one validator effectively
+        // offline post-boundary (signer not swapped, stale-keyed votes
+        // rejected), n=4 quorum=3 just barely holds — every honest view
+        // needs all three other validators to vote, and views that
+        // round-robin to the rotated validator timeout. Generous budget
+        // absorbs the wasted views.
+        let crossed = cluster
+            .advance_and_yield_until(Duration::from_secs(12), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff + 5
+            })
+            .await;
+        assert!(
+            crossed,
+            "cluster failed to commit past v_eff = {v_eff} within budget",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // At least one node committed a block at view >= v_eff: the
+        // post-boundary regime. (peek_commit_heights uses height not
+        // view, but in this sim view advances at least as fast as
+        // height, so a height of v_eff + 5 implies a view of at least
+        // v_eff somewhere on the chain.)
+        let any_post_boundary = committed
+            .iter()
+            .any(|node_blocks| node_blocks.iter().any(|b| b.header.view >= v_eff));
+        assert!(
+            any_post_boundary,
+            "expected at least one committed block at view >= v_eff",
+        );
+
+        // The rotation tx itself made it onto the chain — visible in
+        // some committed block's `commands`. This is the cleanest
+        // observable proof from the test harness that the propose →
+        // vote → commit pipeline carried the dual-signed envelope
+        // intact, at which point every replica's
+        // `apply_committed_rotations` runs deterministically over the
+        // same block.
+        let rotation_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|cmd| DualSignedRotation::is_rotation_payload(cmd))
+            })
+        });
+        assert!(
+            rotation_committed,
+            "expected at least one committed block to carry the rotation tx",
         );
     }
 }

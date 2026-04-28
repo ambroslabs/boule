@@ -37,6 +37,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::consensus::View;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_rotation::{RotationStructuralError, ValidatorKeyRotation};
@@ -320,6 +322,112 @@ impl ValidatorKeyHistory {
             .insert(rotation.new_pubkey, stable_id);
         Ok(())
     }
+
+    /// Snapshot the history into a serializable wire form, suitable for
+    /// durable persistence (#260 follow-up). Mirrors
+    /// [`ValidatorSetHistory::to_persisted`]: encode every validator's
+    /// timeline as a flat list so recovery is a single read + decode.
+    pub fn to_persisted(&self) -> PersistedValidatorKeyHistory {
+        let validators = self
+            .by_stable_id
+            .iter()
+            .map(|(stable_id, entries)| PersistedValidator {
+                stable_id: *stable_id,
+                entries: entries
+                    .iter()
+                    .map(|e| PersistedKeyEntry {
+                        v_eff: e.v_eff,
+                        pubkey: e.pubkey,
+                    })
+                    .collect(),
+            })
+            .collect();
+        PersistedValidatorKeyHistory { validators }
+    }
+
+    /// Rebuild a history from its persisted form. Validates that every
+    /// validator has at least one entry, that entries are in
+    /// strictly-increasing `v_eff` order, that the first entry's pubkey
+    /// matches the stable identifier (the validator's genesis pubkey),
+    /// and that no pubkey is claimed by two distinct validators.
+    pub fn from_persisted(persisted: PersistedValidatorKeyHistory) -> anyhow::Result<Self> {
+        let mut h = Self::default();
+        for v in persisted.validators {
+            if v.entries.is_empty() {
+                anyhow::bail!(
+                    "persisted validator {} has no entries",
+                    hex::encode(v.stable_id)
+                );
+            }
+            // The first entry's pubkey must equal the stable id —
+            // that's the convention `new` and `add_validator` set up,
+            // and `apply_rotation` only appends, so any deviation here
+            // means the persisted form was tampered with or
+            // hand-constructed inconsistently.
+            if v.entries[0].pubkey != v.stable_id {
+                anyhow::bail!(
+                    "persisted validator {}'s first entry pubkey {} does not match stable id",
+                    hex::encode(v.stable_id),
+                    hex::encode(v.entries[0].pubkey),
+                );
+            }
+            let mut last_v_eff: Option<View> = None;
+            let mut local_entries: Vec<KeyEntry> = Vec::with_capacity(v.entries.len());
+            for entry in v.entries {
+                if let Some(prev) = last_v_eff
+                    && entry.v_eff <= prev
+                {
+                    anyhow::bail!(
+                        "persisted validator {}'s entries not strictly v_eff-increasing: \
+                         got {} after {}",
+                        hex::encode(v.stable_id),
+                        entry.v_eff,
+                        prev,
+                    );
+                }
+                last_v_eff = Some(entry.v_eff);
+                if let Some(owner) = h.pubkey_to_stable_id.get(&entry.pubkey)
+                    && *owner != v.stable_id
+                {
+                    anyhow::bail!(
+                        "persisted pubkey {} claimed by both validator {} and {}",
+                        hex::encode(entry.pubkey),
+                        hex::encode(owner),
+                        hex::encode(v.stable_id),
+                    );
+                }
+                h.pubkey_to_stable_id.insert(entry.pubkey, v.stable_id);
+                local_entries.push(KeyEntry {
+                    v_eff: entry.v_eff,
+                    pubkey: entry.pubkey,
+                });
+            }
+            h.by_stable_id.insert(v.stable_id, local_entries);
+        }
+        Ok(h)
+    }
+}
+
+/// One entry in the persisted (wire) form of a validator's key timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedKeyEntry {
+    pub v_eff: View,
+    pub pubkey: NodeId,
+}
+
+/// One validator's full timeline in the persisted form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedValidator {
+    pub stable_id: NodeId,
+    pub entries: Vec<PersistedKeyEntry>,
+}
+
+/// Serializable snapshot of a [`ValidatorKeyHistory`] (#260). Encoded
+/// via postcard at storage write time, written under
+/// [`crate::consensus::node::STORAGE_KEY_VALIDATOR_KEY_HISTORY`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedValidatorKeyHistory {
+    pub validators: Vec<PersistedValidator>,
 }
 
 #[cfg(test)]
@@ -717,5 +825,144 @@ mod tests {
         assert_eq!(h.key_at(&nid(2), 19), Some(nid(2)));
         // nid(3) joined at 10.
         assert_eq!(h.key_at(&nid(3), 10), Some(nid(3)));
+    }
+
+    // ── persistence (#260) ────────────────────────────────────────────────
+
+    #[test]
+    fn round_trips_through_persisted_form_genesis_only() {
+        let h = ValidatorKeyHistory::new([nid(1), nid(2), nid(3)]);
+        let persisted = h.to_persisted();
+        let bytes = postcard::to_stdvec(&persisted).unwrap();
+        let decoded: PersistedValidatorKeyHistory = postcard::from_bytes(&bytes).unwrap();
+        let restored = ValidatorKeyHistory::from_persisted(decoded).unwrap();
+
+        // Same lookups as the original.
+        for v in [nid(1), nid(2), nid(3)] {
+            assert_eq!(restored.key_at(&v, 0), Some(v));
+            assert_eq!(restored.key_at(&v, 1_000), Some(v));
+            assert_eq!(restored.validator_for(&v), Some(v));
+        }
+    }
+
+    #[test]
+    fn round_trips_through_persisted_form_with_rotations() {
+        let mut h = ValidatorKeyHistory::new([nid(1), nid(2)]);
+        h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
+        h.apply_rotation(&rot(nid(10), nid(20), 200), 150).unwrap();
+        h.apply_rotation(&rot(nid(2), nid(30), 300), 250).unwrap();
+
+        let persisted = h.to_persisted();
+        let bytes = postcard::to_stdvec(&persisted).unwrap();
+        let decoded: PersistedValidatorKeyHistory = postcard::from_bytes(&bytes).unwrap();
+        let restored = ValidatorKeyHistory::from_persisted(decoded).unwrap();
+
+        // Spanning queries reach back through every era.
+        for query in [nid(1), nid(10), nid(20)] {
+            assert_eq!(restored.key_at(&query, 0), Some(nid(1)));
+            assert_eq!(restored.key_at(&query, 99), Some(nid(1)));
+            assert_eq!(restored.key_at(&query, 100), Some(nid(10)));
+            assert_eq!(restored.key_at(&query, 199), Some(nid(10)));
+            assert_eq!(restored.key_at(&query, 200), Some(nid(20)));
+        }
+        for query in [nid(2), nid(30)] {
+            assert_eq!(restored.key_at(&query, 0), Some(nid(2)));
+            assert_eq!(restored.key_at(&query, 299), Some(nid(2)));
+            assert_eq!(restored.key_at(&query, 300), Some(nid(30)));
+        }
+    }
+
+    #[test]
+    fn from_persisted_rejects_validator_with_no_entries() {
+        let bad = PersistedValidatorKeyHistory {
+            validators: vec![PersistedValidator {
+                stable_id: nid(1),
+                entries: vec![],
+            }],
+        };
+        let err = ValidatorKeyHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("no entries"));
+    }
+
+    #[test]
+    fn from_persisted_rejects_first_entry_pubkey_mismatch() {
+        // Genesis entry's pubkey must equal the stable_id (that's the
+        // invariant `new` and `add_validator` set up). A persisted blob
+        // claiming otherwise is structurally bogus.
+        let bad = PersistedValidatorKeyHistory {
+            validators: vec![PersistedValidator {
+                stable_id: nid(1),
+                entries: vec![PersistedKeyEntry {
+                    v_eff: 0,
+                    pubkey: nid(99),
+                }],
+            }],
+        };
+        let err = ValidatorKeyHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("does not match stable id"));
+    }
+
+    #[test]
+    fn from_persisted_rejects_non_monotone_v_eff_within_a_validator() {
+        let bad = PersistedValidatorKeyHistory {
+            validators: vec![PersistedValidator {
+                stable_id: nid(1),
+                entries: vec![
+                    PersistedKeyEntry {
+                        v_eff: 0,
+                        pubkey: nid(1),
+                    },
+                    PersistedKeyEntry {
+                        v_eff: 100,
+                        pubkey: nid(10),
+                    },
+                    PersistedKeyEntry {
+                        v_eff: 50,
+                        pubkey: nid(20),
+                    },
+                ],
+            }],
+        };
+        let err = ValidatorKeyHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("not strictly v_eff-increasing"));
+    }
+
+    #[test]
+    fn from_persisted_rejects_pubkey_collision_across_validators() {
+        // Two distinct validators claiming the same pubkey would break
+        // the reverse index — a single key can only belong to one
+        // validator at a time.
+        let bad = PersistedValidatorKeyHistory {
+            validators: vec![
+                PersistedValidator {
+                    stable_id: nid(1),
+                    entries: vec![
+                        PersistedKeyEntry {
+                            v_eff: 0,
+                            pubkey: nid(1),
+                        },
+                        PersistedKeyEntry {
+                            v_eff: 100,
+                            pubkey: nid(50),
+                        },
+                    ],
+                },
+                PersistedValidator {
+                    stable_id: nid(2),
+                    entries: vec![
+                        PersistedKeyEntry {
+                            v_eff: 0,
+                            pubkey: nid(2),
+                        },
+                        PersistedKeyEntry {
+                            v_eff: 200,
+                            pubkey: nid(50),
+                        },
+                    ],
+                },
+            ],
+        };
+        let err = ValidatorKeyHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("claimed by both"));
     }
 }

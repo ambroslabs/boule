@@ -17,19 +17,29 @@
 //! # Scope of this module
 //!
 //! Type definition, postcard codec, structural well-formedness checks,
-//! and dual-signature verification. The "current consensus key" the
-//! `sig_old` check runs against is supplied by the caller — looking that
-//! up against a per-view validator key history is #259's job (which in
-//! turn waits on #140's per-view validator-set history). Wiring the
-//! envelope into block admission and the consensus event loop is #260.
+//! dual-signature verification, and the tagged on-the-wire form used as
+//! a `Block.commands` payload. The commit-time application path lives
+//! in `consensus::node::ConsensusNode::apply_committed_rotations`
+//! (#260) and reads via [`DualSignedRotation::is_rotation_payload`] +
+//! [`DualSignedRotation::decode_command`].
 
 use anyhow::Result;
+use bytes::Bytes;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
 use crate::crypto::signed::{SignedMessage, Signer, preimage};
 use crate::p2p::NodeId;
+
+/// Magic prefix that tags a `Block.commands` entry as a tagged
+/// [`DualSignedRotation`] payload. Mirrors the [`RECONFIG_TAG`] convention
+/// from [`crate::consensus::reconfig`]: a 6-byte prefix lets the
+/// commit-time scanner tell rotation txs apart from opaque application
+/// commands without attempting `postcard::from_bytes` on every slot.
+///
+/// [`RECONFIG_TAG`]: crate::consensus::reconfig::RECONFIG_TAG
+pub const ROTATION_TAG: &[u8; 6] = b"VKROT\0";
 
 /// Minimum gap between the view in which a rotation is committed and its
 /// effective view, matching the convention established by validator-set
@@ -177,6 +187,40 @@ impl std::fmt::Display for RotationVerifyError {
 impl std::error::Error for RotationVerifyError {}
 
 impl DualSignedRotation {
+    /// Encode as a tagged byte sequence suitable for a
+    /// `Block.commands` slot: [`ROTATION_TAG`] || `postcard(self)`.
+    /// The tag prefix lets the commit-time scanner identify rotation
+    /// txs without attempting `postcard::from_bytes` on every command
+    /// in the block.
+    pub fn encode_command(&self) -> Bytes {
+        let body =
+            postcard::to_stdvec(self).expect("postcard encoding of DualSignedRotation cannot fail");
+        let mut out = Vec::with_capacity(ROTATION_TAG.len() + body.len());
+        out.extend_from_slice(ROTATION_TAG);
+        out.extend_from_slice(&body);
+        Bytes::from(out)
+    }
+
+    /// True iff `bytes` carries the [`ROTATION_TAG`] prefix. Returns
+    /// false on near-miss prefixes (5-byte truncations, off-by-one) so
+    /// the commit-time scanner can short-circuit obvious non-rotations
+    /// before paying the postcard decode.
+    pub fn is_rotation_payload(bytes: &[u8]) -> bool {
+        bytes.starts_with(ROTATION_TAG)
+    }
+
+    /// Decode a tagged rotation tx. Returns an error if the tag is
+    /// absent or the postcard body is malformed. The caller is
+    /// expected to follow this with [`Self::verify`] before applying
+    /// the rotation — `decode_command` does not do cryptographic
+    /// validation.
+    pub fn decode_command(bytes: &[u8]) -> Result<Self> {
+        let body = bytes
+            .strip_prefix(ROTATION_TAG.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("missing rotation tag prefix"))?;
+        postcard::from_bytes(body).map_err(|e| anyhow::anyhow!("malformed DualSignedRotation: {e}"))
+    }
+
     /// Construct a dual-signed rotation envelope. The `current` signer
     /// must hold the validator's currently-active consensus key; the
     /// `new` signer must hold the key being rotated to (and its
@@ -290,6 +334,55 @@ mod tests {
             sig_old: [0xAA; 64],
             sig_new: [0xBB; 64],
         }
+    }
+
+    // ── tagged command codec (#260) ──────────────────────────────────────
+
+    #[test]
+    fn encode_decode_command_roundtrip() {
+        let env = sample_envelope();
+        let bytes = env.encode_command();
+        assert!(DualSignedRotation::is_rotation_payload(&bytes));
+        let back = DualSignedRotation::decode_command(&bytes).unwrap();
+        assert_eq!(back, env);
+    }
+
+    #[test]
+    fn is_rotation_payload_rejects_untagged_bytes() {
+        assert!(!DualSignedRotation::is_rotation_payload(b""));
+        assert!(!DualSignedRotation::is_rotation_payload(b"hello"));
+        // A near-miss (5 of 6 tag bytes) must not match.
+        assert!(!DualSignedRotation::is_rotation_payload(b"VKROT"));
+        // The reconfig tag must not be misinterpreted as a rotation.
+        assert!(!DualSignedRotation::is_rotation_payload(
+            crate::consensus::reconfig::RECONFIG_TAG
+        ));
+    }
+
+    #[test]
+    fn decode_command_errors_without_tag() {
+        let err = DualSignedRotation::decode_command(b"not a rotation").unwrap_err();
+        assert!(err.to_string().contains("missing rotation tag prefix"));
+    }
+
+    #[test]
+    fn decode_command_errors_on_truncated_body() {
+        let env = sample_envelope();
+        let bytes = env.encode_command();
+        let truncated = &bytes[..bytes.len() - 1];
+        assert!(DualSignedRotation::is_rotation_payload(truncated));
+        let err = DualSignedRotation::decode_command(truncated).unwrap_err();
+        assert!(err.to_string().contains("malformed DualSignedRotation"));
+    }
+
+    #[test]
+    fn rotation_tag_does_not_collide_with_reconfig_tag() {
+        // Both consume a `Block.commands` slot, so their first six bytes
+        // must disambiguate which payload type a slot holds.
+        assert_ne!(
+            ROTATION_TAG.as_slice(),
+            crate::consensus::reconfig::RECONFIG_TAG.as_slice()
+        );
     }
 
     #[test]
