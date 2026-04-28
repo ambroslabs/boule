@@ -39,6 +39,7 @@ pub mod pacemaker;
 pub mod reconfig;
 pub mod snapshot_sync;
 pub mod status;
+pub mod validator_history;
 pub mod validator_set;
 pub mod view_timer;
 
