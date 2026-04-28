@@ -355,6 +355,34 @@ impl HotStuffCore {
         &self.state
     }
 
+    /// Insert a committed validator-set boundary into the safety core's
+    /// history (#272). This is the *only* sanctioned mutation of
+    /// `state.validator_history` from outside `step` — driven by the
+    /// integration layer's commit-time reconfig hook in
+    /// [`crate::consensus::node::ConsensusNode::apply_commit`].
+    ///
+    /// `set` is the resulting set after the reconfig applies. The
+    /// caller is responsible for having already validated the
+    /// `ReconfigCommand` (floor, overlap, v_eff delay) — this method
+    /// only enforces the per-history monotonicity invariant.
+    pub fn insert_validator_boundary(
+        &mut self,
+        v_eff: View,
+        set: ValidatorSet,
+    ) -> anyhow::Result<()> {
+        // Mirror the boundary into `state.validator_set` if `v_eff` has
+        // already been reached. Today the commit hook always inserts
+        // strictly future boundaries (`v_eff > current_view`), so this
+        // branch is defensive — but cheap, and it keeps `validator_set`
+        // honest if the rule ever loosens.
+        let new_set = set.clone();
+        self.state.validator_history.insert_boundary(v_eff, set)?;
+        if v_eff <= self.state.current_view {
+            self.state.validator_set = new_set;
+        }
+        Ok(())
+    }
+
     /// Iterate over the currently-accumulating vote buckets. Consumed
     /// by [`crate::consensus::status`] to surface partial-QC progress
     /// through the admin HTTP endpoint; never mutated from outside.
@@ -881,6 +909,17 @@ impl HotStuffCore {
     /// the `Broadcast(NewView)` sentinel last.
     fn on_pacemaker_advance(&mut self, v: View) -> Vec<Action> {
         self.state.current_view = v;
+
+        // Refresh `state.validator_set` to the committee authoritative
+        // at the new view. Until #272 lands the commit-time reconfig
+        // hook the history is genesis-only and this is a no-op assign;
+        // afterwards crossing `v_eff` swaps in the post-boundary set
+        // for downstream readers (e.g. `pick_block_sync_peer`) that
+        // don't carry a view context.
+        let active = self.state.validator_history.set_at(v);
+        if *active != self.state.validator_set {
+            self.state.validator_set = (*active).clone();
+        }
 
         // gc_below sweep: a vote bucket whose `view < current_view`
         // can no longer feed a freshly-formed QC into our high_qc

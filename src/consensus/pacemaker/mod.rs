@@ -177,6 +177,23 @@ impl Pacemaker {
         self.self_id
     }
 
+    /// Replace the leader selector. Driven by the integration layer's
+    /// commit-time reconfig hook (#272): when a committed
+    /// `ReconfigCommand` inserts a new boundary into the validator
+    /// history, the integration layer rebuilds a `RoundRobinSelector`
+    /// over the now-extended history and installs it here so leader
+    /// rotation past `v_eff` consults the post-boundary set.
+    pub fn set_selector(&mut self, selector: Arc<dyn LeaderSelector>) {
+        self.selector = selector;
+    }
+
+    /// Resolve the leader for `view` through the currently installed
+    /// selector. Provided so integration tests can assert post-boundary
+    /// rotation without reaching past the private `selector` field.
+    pub fn leader_for_view(&self, view: View) -> NodeId {
+        self.selector.leader_for_view(view)
+    }
+
     pub fn current_view(&self) -> View {
         self.current_view
     }
