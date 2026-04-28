@@ -60,6 +60,7 @@ use crate::consensus::status::{
     QcStatus, TimeoutBucketStatus, VoteBucketStatus,
 };
 use crate::consensus::validator_history::ValidatorSetHistory;
+use crate::consensus::validator_key_history::ValidatorKeyHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::view_timer::ViewTimer;
 use crate::crypto::signed::Signed;
@@ -428,6 +429,14 @@ pub struct ConsensusNode {
     /// verification can switch sides at a future boundary without
     /// further plumbing.
     pub validator_history: ValidatorSetHistory,
+    /// Per-validator history of consensus signing keys (#259). Bridges
+    /// the signer pubkey on the wire — which may be a post-rotation key
+    /// — to the validator's stable identifier in `validator_history`.
+    /// Until rotation tx commit-time application lands (#260), this
+    /// only ever contains genesis entries (and any reconfig-added
+    /// validators), so verification semantics match the
+    /// pre-rotation behaviour.
+    pub validator_key_history: ValidatorKeyHistory,
     /// Configured view-timer behaviour; consulted by the timer helper
     /// in Phase D when arming/re-arming the view timer.
     pub timeout_policy: Arc<ExponentialBackoff>,
@@ -612,6 +621,7 @@ impl ConsensusNode {
         );
 
         let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
+        let validator_key_history = ValidatorKeyHistory::new(config.validator_set.iter().copied());
         Self {
             self_id,
             core,
@@ -622,6 +632,7 @@ impl ConsensusNode {
             wal,
             validator_set: config.validator_set,
             validator_history,
+            validator_key_history,
             timeout_policy,
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
@@ -918,6 +929,13 @@ impl ConsensusNode {
                 .with_context(|| format!("replay validator boundary at v_eff = {v_eff}"))?;
         }
 
+        // Reconstruct the per-validator key history by mirroring the
+        // restored set history's boundaries — every validator that has
+        // ever been seated gets an entry as of the boundary they joined
+        // at. Persistence of rotation tx history is a separate follow-up;
+        // until then this is correct because no rotations are wired up.
+        let validator_key_history = ValidatorKeyHistory::from_set_history(&validator_history);
+
         Ok(Self {
             self_id,
             core,
@@ -928,6 +946,7 @@ impl ConsensusNode {
             wal,
             validator_set: active_set,
             validator_history,
+            validator_key_history,
             timeout_policy,
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
@@ -1226,7 +1245,12 @@ impl ConsensusNode {
                             if !self.admit_inbound(from, &payload).await {
                                 continue;
                             }
-                            match dispatch::ingress(from, &payload, &self.validator_history) {
+                            match dispatch::ingress(
+                                from,
+                                &payload,
+                                &self.validator_history,
+                                &self.validator_key_history,
+                            ) {
                                 Ok(dispatches) => {
                                     for d in dispatches {
                                         self.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
@@ -4615,6 +4639,7 @@ mod tests {
             nid(2),
             &req_bytes,
             &ValidatorSetHistory::from_genesis(four_validators()),
+            &ValidatorKeyHistory::new(four_validators().iter().copied()),
         )
         .unwrap();
         assert_eq!(dispatches.len(), 1);
@@ -4643,6 +4668,7 @@ mod tests {
                 nid(2),
                 &req_bytes,
                 &ValidatorSetHistory::from_genesis(four_validators()),
+                &ValidatorKeyHistory::new(four_validators().iter().copied()),
             )
             .unwrap();
             for d in dispatches {
@@ -4950,6 +4976,7 @@ mod tests {
             joiner_signer_arc.node_id(),
             &req_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
         )
         .expect("ingress manifest request");
         for d in dispatches {
@@ -4979,6 +5006,7 @@ mod tests {
             server_node_id,
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -5009,6 +5037,7 @@ mod tests {
                 joiner_signer_arc.node_id(),
                 &chunk_req_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
+                &ValidatorKeyHistory::new(vs.iter().copied()),
             )
             .expect("ingress chunk request");
             for d in dispatches {
@@ -5031,6 +5060,7 @@ mod tests {
                 server_node_id,
                 &chunk_resp_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
+                &ValidatorKeyHistory::new(vs.iter().copied()),
             )
             .expect("ingress chunk response");
             for d in dispatches {
@@ -5189,6 +5219,7 @@ mod tests {
             server_signer.node_id(),
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
         )
         .expect("ingress tampered manifest");
         for d in dispatches {
@@ -5354,6 +5385,7 @@ mod tests {
             primary,
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -5400,6 +5432,7 @@ mod tests {
                 peer,
                 &resp_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
+                &ValidatorKeyHistory::new(vs.iter().copied()),
             )
             .expect("ingress chunk response");
             for d in dispatches {
@@ -5536,6 +5569,7 @@ mod tests {
             primary,
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -5572,6 +5606,7 @@ mod tests {
             first_peer,
             &resp_bytes,
             &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
         )
         .unwrap();
         for d in dispatches {
@@ -5643,6 +5678,7 @@ mod tests {
                 peer,
                 &resp_bytes,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
+                &ValidatorKeyHistory::new(vs.iter().copied()),
             )
             .unwrap();
             for d in dispatches {
@@ -5783,6 +5819,7 @@ mod tests {
             peer_signer.node_id(),
             &payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
         )
         .expect("ingress");
         let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
@@ -5857,6 +5894,7 @@ mod tests {
                 peer.node_id(),
                 &payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
+                &ValidatorKeyHistory::new(vs.iter().copied()),
             )
             .expect("ingress");
             for d in dispatches {
@@ -5958,6 +5996,7 @@ mod tests {
             wedged_peer.node_id(),
             &payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
         )
         .expect("ingress");
         for d in dispatches {
