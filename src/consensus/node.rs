@@ -182,6 +182,14 @@ pub const STORAGE_KEY_LAST_COMMITTED: &[u8] = b"consensus/last_committed";
 /// revisit if validator-set churn ever becomes pathological).
 pub const STORAGE_KEY_VALIDATOR_HISTORY: &[u8] = b"consensus/validator_history";
 
+/// Storage key for the persisted [`ValidatorKeyHistory`] (#260).
+/// Written after every successful commit-time rotation application;
+/// read at startup so post-rotation signing keys persist across
+/// restarts. Same encoding shape as
+/// [`STORAGE_KEY_VALIDATOR_HISTORY`]: a single full snapshot rather
+/// than a journal, traded for simpler recovery.
+pub const STORAGE_KEY_VALIDATOR_KEY_HISTORY: &[u8] = b"consensus/validator_key_history";
+
 /// Protocol ID registered with the p2p multiplexer for consensus traffic.
 /// Gossip uses `0x01`, ping-RPC uses `0x02`.
 pub const PROTOCOL_ID: u8 = 0x03;
@@ -929,12 +937,24 @@ impl ConsensusNode {
                 .with_context(|| format!("replay validator boundary at v_eff = {v_eff}"))?;
         }
 
-        // Reconstruct the per-validator key history by mirroring the
-        // restored set history's boundaries — every validator that has
-        // ever been seated gets an entry as of the boundary they joined
-        // at. Persistence of rotation tx history is a separate follow-up;
-        // until then this is correct because no rotations are wired up.
-        let validator_key_history = ValidatorKeyHistory::from_set_history(&validator_history);
+        // #260: load the persisted key history first, falling back to a
+        // mirror of the set history if no rotations have ever been
+        // committed (or the WAL key is otherwise absent). The persisted
+        // form is authoritative once written — every committed rotation
+        // is reflected — so we never overwrite it from set history.
+        let validator_key_history = match storage
+            .get(STORAGE_KEY_VALIDATOR_KEY_HISTORY)
+            .context("read validator_key_history from storage")?
+        {
+            Some(raw) => {
+                let persisted: crate::consensus::validator_key_history::PersistedValidatorKeyHistory =
+                    postcard::from_bytes(&raw)
+                        .context("decode persisted validator_key_history")?;
+                ValidatorKeyHistory::from_persisted(persisted)
+                    .context("rebuild ValidatorKeyHistory from persisted form")?
+            }
+            None => ValidatorKeyHistory::from_set_history(&validator_history),
+        };
 
         Ok(Self {
             self_id,
@@ -2510,6 +2530,15 @@ impl ConsensusNode {
         // and drop — the block itself stays committed since the
         // safety core is independent of payload validity.
         self.apply_committed_reconfigs(&block);
+        // #260: same treatment for tagged DualSignedRotation
+        // payloads. Reconfigs come first so that a rotation
+        // committed in the same block as a reconfig sees the
+        // post-reconfig key history (the rotation tx's `validator`
+        // field must resolve via the reverse index, which a
+        // reconfig-added validator will be present in only after
+        // the reconfig has applied — though in practice committing
+        // both in the same block is unusual).
+        self.apply_committed_rotations(&block);
         if let Some(tx) = &self.commit_tx {
             let _ = tx.send(block);
         }
@@ -2671,6 +2700,143 @@ impl ConsensusNode {
                         target: TRACE_TARGET,
                         error = %e,
                         "validator_history_encode_failed",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scan `block.commands` for tagged [`DualSignedRotation`] payloads
+    /// (#260) and, for each one that passes structural and cryptographic
+    /// validation, apply it to `validator_key_history`. Persisting the
+    /// updated history happens once per commit if any rotation
+    /// applied — same shape as `apply_committed_reconfigs`.
+    ///
+    /// Validation failures (structural, signature, history-invariant)
+    /// are logged and dropped — they do not roll the block back. The
+    /// safety core has already committed; an invalid rotation in the
+    /// payload is treated as a no-op so all replicas agree on which
+    /// rotations took effect (which is none, when the rotation is
+    /// invalid).
+    fn apply_committed_rotations(&mut self, block: &crate::replication::block::Block) {
+        use crate::consensus::validator_rotation::DualSignedRotation;
+
+        let block_view = block.header.view;
+        let mut applied_any = false;
+        for cmd_bytes in &block.commands {
+            if !DualSignedRotation::is_rotation_payload(cmd_bytes) {
+                continue;
+            }
+            let envelope = match DualSignedRotation::decode_command(cmd_bytes) {
+                Ok(env) => env,
+                Err(e) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        height = block.header.height,
+                        view = block_view,
+                        error = %e,
+                        "rotation_payload_malformed",
+                    );
+                    continue;
+                }
+            };
+
+            // The validator's currently-active signing key, looked up
+            // through the reverse index. If the field doesn't resolve,
+            // `apply_rotation` below will produce the same error — but
+            // resolving here gives us the pubkey for the cryptographic
+            // dual-signature check first, which is the more informative
+            // failure to log when both would fire.
+            let current_key = match self
+                .validator_key_history
+                .current_key(&envelope.payload.validator)
+            {
+                Some(k) => k,
+                None => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        height = block.header.height,
+                        view = block_view,
+                        validator = ?envelope.payload.validator,
+                        "rotation_validator_not_in_key_history",
+                    );
+                    continue;
+                }
+            };
+
+            // Cryptographic self-attestation: both signatures must
+            // verify. Done at commit time so a malicious leader who
+            // smuggled in a single-signed rotation can't make it
+            // take effect — every replica re-runs this check
+            // independently before mutating the history.
+            if let Err(e) = envelope.verify(&current_key) {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height,
+                    view = block_view,
+                    validator = ?envelope.payload.validator,
+                    error = %e,
+                    "rotation_signature_verification_failed",
+                );
+                continue;
+            }
+
+            // History-invariant check (structural + monotone v_eff +
+            // no cross-validator key collision). Logs and drops on
+            // failure — the in-memory state is unchanged.
+            if let Err(e) = self
+                .validator_key_history
+                .apply_rotation(&envelope.payload, block_view)
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height,
+                    view = block_view,
+                    validator = ?envelope.payload.validator,
+                    new_pubkey = ?envelope.payload.new_pubkey,
+                    v_eff = envelope.payload.v_eff,
+                    error = %e,
+                    "rotation_history_apply_failed",
+                );
+                continue;
+            }
+
+            tracing::info!(
+                target: TRACE_TARGET,
+                height = block.header.height,
+                view = block_view,
+                validator = ?envelope.payload.validator,
+                new_pubkey = ?envelope.payload.new_pubkey,
+                v_eff = envelope.payload.v_eff,
+                "rotation_applied",
+            );
+            applied_any = true;
+        }
+
+        // Same persistence pattern as the reconfig path: write once
+        // per commit if any rotation applied, encoded as a single
+        // full-history blob (not a journal). Failures log + drop —
+        // the in-memory history is authoritative; a subsequent
+        // rotation will get another chance to flush, and recovery
+        // resets to whatever was durably written before the last
+        // successful flush.
+        if applied_any {
+            let persisted = self.validator_key_history.to_persisted();
+            match postcard::to_stdvec(&persisted) {
+                Ok(bytes) => {
+                    if let Err(e) = self.storage.put(STORAGE_KEY_VALIDATOR_KEY_HISTORY, &bytes) {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "validator_key_history_persist_failed",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: TRACE_TARGET,
+                        error = %e,
+                        "validator_key_history_encode_failed",
                     );
                 }
             }
