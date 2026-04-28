@@ -556,3 +556,126 @@ authoritatively uses, without touching set membership.
 A validator added via reconfig at view `R` starts with its initial
 pubkey as both stable id and signing key. It can later rotate via
 the same flow described here.
+
+## Consensus signature scheme (issues #143, #287–#296)
+
+A chain commits to one signature scheme at genesis and uses it for
+the lifetime of the chain. Two schemes are supported, each with
+distinct operational tradeoffs.
+
+### Picking a scheme
+
+| | `ed25519_collected` | `bls_aggregated` |
+|---|---|---|
+| QC size on the wire | grows linearly with the quorum (~64 B per signer) | constant ~96 B aggregate + bitmap |
+| QC verification cost | `O(n)` `ring::ED25519::verify` calls | one BLS pairing check |
+| Validator key shape | one 32-byte Ed25519 key (also network identity) | one 32-byte Ed25519 key (network identity) **plus** a 32-byte BLS12-381 secret key |
+| Operator setup | a single `[node.identity]` key, just like today | the same `[node.identity]` key **and** a separate BLS validator key file |
+| Rogue-key defense at registration | not applicable (Ed25519 keys are self-authenticating) | proof-of-possession (PoP) on each `add` reconfig — the validator signs their own pubkey and the registration tx carries that signature |
+| Production scale ceiling | ~150–200 validators (Cosmos-Hub regime) | thousands |
+| Maturity in this codebase | shipping default | trait-level support shipped in #287–#295; full integration through the voting layer and proptest harness is the follow-up to #293 |
+
+**When to pick which:**
+
+- Permissioned, small-`n`, simplicity-first deployments (≤100
+  validators) → `ed25519_collected`. Ed25519 is what's wired into
+  the network identity and TLS layer anyway, so there's nothing
+  extra to manage.
+- Public networks, large-`n`, sub-second block times, or any
+  deployment where per-view bandwidth is the bottleneck →
+  `bls_aggregated`. Past the ~150-validator mark the linear
+  growth of collected sigs starts to dominate gossip bandwidth.
+
+The scheme is **fixed at genesis**. Switching requires a
+coordinated chain restart from new genesis — same constraint as
+changing the hash function or domain separators. Mixed-scheme
+chains (different validators on different schemes within the same
+chain) are out of scope.
+
+### Genesis configuration
+
+Set the `signature_scheme` field in the `[consensus]` table:
+
+```toml
+[consensus]
+validators = [ "...", "...", "...", "..." ]
+genesis_seed_hex = "00112233...ff"
+signature_scheme = "ed25519_collected"   # or "bls_aggregated"
+# … other consensus fields …
+```
+
+The default is `"ed25519_collected"`. Unknown values are rejected
+at startup — an operator typo (e.g. `"ed25519_aggregated"`) fails
+the parse with a message that names both the offending field and
+the value.
+
+### Validator key material
+
+**On Ed25519 chains** the existing `[node.identity]` /
+`[node.validator_identity]` slot is sufficient: one Ed25519 key
+serves both network identity and consensus signing.
+
+**On BLS chains** every validator additionally provisions a BLS
+secret key. The file-backed [`BlsKeyFile` provider][bls-key-file]
+generates a fresh 32-byte BLS12-381 secret key on first start and
+persists it to disk with `0o600` permissions. The on-disk format
+is one version byte (`0x01` today) followed by the 32 raw secret
+bytes — total 33 bytes. PEM/PKCS#8 framing is unnecessary because
+BLS12-381 isn't an X.509 algorithm.
+
+The proof-of-possession (PoP) is **not** persisted alongside the
+secret. It's derived from the secret on every load — keeps the
+on-disk format minimal and means there's only one source of
+truth.
+
+[bls-key-file]: ../src/crypto/bls_key.rs
+
+### Validator registration on BLS chains
+
+Adding a validator via the `add-validator` reconfig CLI on a BLS
+chain requires the new validator's BLS pubkey **and** a
+proof-of-possession signature: the validator signs their own
+compressed BLS pubkey under the IETF `_POP_` ciphersuite. The
+reconfig validator rejects any `adds` entry whose embedded
+`bls_pop` fails to verify, with a clear `BLS PoP for validator
+<NodeId> failed to verify` error.
+
+The PoP defends against rogue-key attacks: an attacker who picks
+a pubkey `K' = K_target − K_self` cannot produce a valid PoP for
+`K'` without holding its secret half, so the registration is
+rejected pre-commit. Without PoP, BLS aggregation is vulnerable.
+
+PoPs are not required on Ed25519 chains — Ed25519 keys are
+self-authenticating, so the field is `None` on every `adds` entry.
+
+### Historical key retention across reconfigurations
+
+QCs from before a reconfiguration must remain verifiable forever,
+so nodes retain the historical pubkey for every validator they
+have ever known. On Ed25519 chains this is
+[`ValidatorKeyHistory`][vkh]; on BLS chains it's the parallel
+[`BlsKeyHistory`][bkh], keyed by stable Ed25519 NodeId.
+
+Both structures answer "which pubkey was active for validator V
+at view T?" via binary search on a per-validator timeline. Old
+QCs verify against the era's pubkey, not the validator's current
+one.
+
+[vkh]: ../src/consensus/validator_key_history.rs
+[bkh]: ../src/consensus/bls_key_history.rs
+
+### Bandwidth/CPU benchmark
+
+The relative cost of the two schemes is reported by an `#[ignore]`d
+benchmark:
+
+```sh
+cargo test --release --test qc_scheme_bandwidth --ignored -- --nocapture
+```
+
+`--release` matters; debug builds dominate the BLS pairing check
+by 100× and would mislead the comparison. Sample output and
+analysis are in the bench's docstring; the headline number is
+that BLS QC wire size is constant in `n` while Ed25519 grows
+linearly — at `n = 200` (`q = 134`) BLS is ~55× smaller on the
+wire (159 B vs 8.7 KB).

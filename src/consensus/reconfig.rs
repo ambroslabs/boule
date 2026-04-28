@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
 use crate::consensus::validator_set::ValidatorSet;
+use crate::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop};
 use crate::p2p::NodeId;
 
 /// Magic prefix that tags a `Block.commands` entry as a reconfig payload.
@@ -55,12 +56,26 @@ pub const MIN_V_EFF_DELAY: u64 = 2;
 /// A pubkey + network address pair describing a validator to admit.
 ///
 /// `node_id` is the Ed25519 pubkey used by [`crate::p2p::tls`]; `addr` is
-/// the routable socket peers should use to reach this validator. Both
-/// fields participate in the postcard-encoded wire form.
+/// the routable socket peers should use to reach this validator. On BLS
+/// chains (#143 / #289) `bls_pop` carries the new validator's BLS
+/// pubkey paired with a proof-of-possession signature over that pubkey;
+/// on Ed25519 chains the field is `None`. The reconfig validator (this
+/// module) verifies the PoP whenever it is present, regardless of the
+/// chain's scheme — scheme-driven enforcement (PoP *required* on BLS
+/// chains) lands together with the rest of the BLS integration in #293.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorEntry {
     pub node_id: NodeId,
     pub addr: SocketAddr,
+    /// Optional BLS proof-of-possession bundle (pubkey + sig over the
+    /// pubkey under the IETF `_POP_` ciphersuite). `None` on Ed25519
+    /// chains; required and verified on BLS chains (#293 enforces the
+    /// "required" half).
+    ///
+    /// Always serialized (postcard is schema-bound and does not
+    /// tolerate `skip_serializing_if`) — `None` adds a single Option
+    /// discriminant byte to the wire payload.
+    pub bls_pop: Option<BlsPop>,
 }
 
 /// A typed reconfiguration payload.
@@ -105,7 +120,11 @@ impl ReconfigCommand {
     /// CLI (#251).
     pub fn build_add_validator_payload(node_id: NodeId, addr: SocketAddr, v_eff: View) -> Bytes {
         Self {
-            adds: vec![ValidatorEntry { node_id, addr }],
+            adds: vec![ValidatorEntry {
+                node_id,
+                addr,
+                bls_pop: None,
+            }],
             removes: vec![],
             v_eff,
         }
@@ -199,6 +218,28 @@ impl ReconfigCommand {
             }
         }
 
+        // Verify any embedded BLS proof-of-possession.
+        //
+        // Any `adds` entry that carries a `bls_pop` is checked here so a
+        // malformed PoP is rejected pre-commit, regardless of the
+        // chain's signature scheme. Scheme-driven *requirement* (BLS
+        // chains must carry a PoP per add) is enforced by the call
+        // site in #293, when the rest of the BLS integration lands.
+        for entry in &self.adds {
+            if let Some(pop) = &entry.bls_pop {
+                BlsAggregated::verify_pop(pop, &pop.pubkey).map_err(|e| match e {
+                    BlsKeyError::PopPubkeyMismatch => anyhow::anyhow!(
+                        "BLS PoP for validator {} has mismatched embedded pubkey",
+                        hex::encode(entry.node_id),
+                    ),
+                    BlsKeyError::Blst(err) => anyhow::anyhow!(
+                        "BLS PoP for validator {} failed to verify: {err:?}",
+                        hex::encode(entry.node_id),
+                    ),
+                })?;
+            }
+        }
+
         let mut next: Vec<NodeId> = current_set.iter().copied().collect();
         next.retain(|n| !removes_seen.contains(n));
         next.extend(adds_seen.iter().copied());
@@ -233,6 +274,7 @@ mod tests {
         ValidatorEntry {
             node_id: nid(b),
             addr: addr(port),
+            bls_pop: None,
         }
     }
 
@@ -481,5 +523,85 @@ mod tests {
         };
         let err = cmd.validate_against(&cur, u64::MAX).unwrap_err();
         assert!(err.to_string().contains("overflow"), "{err}");
+    }
+
+    // ---------- BLS proof-of-possession on adds (#291) ----------
+
+    /// Generate a BLS keypair and a valid PoP for embedding in a
+    /// `ValidatorEntry`. Seed the keygen with the bottom byte of the
+    /// validator's NodeId so different fixtures get different keys.
+    fn entry_with_valid_pop(b: u8, port: u16) -> ValidatorEntry {
+        let mut ikm = [0u8; 32];
+        ikm.fill(b);
+        let (sk, _pk) = BlsAggregated::keygen(&ikm).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        ValidatorEntry {
+            node_id: nid(b),
+            addr: addr(port),
+            bls_pop: Some(pop),
+        }
+    }
+
+    #[test]
+    fn add_with_valid_bls_pop_passes_validation() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry_with_valid_pop(5, 7005)],
+            removes: vec![],
+            v_eff: 10,
+        };
+        let next = cmd.validate_against(&cur, 0).unwrap();
+        assert!(next.contains(&nid(5)));
+    }
+
+    #[test]
+    fn add_with_invalid_bls_pop_signature_is_rejected() {
+        let mut entry = entry_with_valid_pop(5, 7005);
+        // Tamper the signature byte 0.
+        if let Some(p) = entry.bls_pop.as_mut() {
+            p.sig[0] ^= 0xFF;
+        }
+        let cmd = ReconfigCommand {
+            adds: vec![entry],
+            removes: vec![],
+            v_eff: 10,
+        };
+        let err = cmd.validate_against(&floor_set(), 0).unwrap_err();
+        assert!(err.to_string().contains("PoP"), "{err}");
+    }
+
+    #[test]
+    fn add_with_pop_pubkey_swapped_to_other_key_is_rejected() {
+        // Forge: take sk_a's PoP but rewrite the embedded pubkey to
+        // someone else's. The signature is over pk_a's bytes but the
+        // payload now claims pk_b — verification fails at the BLS step.
+        let mut a = entry_with_valid_pop(5, 7005);
+        let b = entry_with_valid_pop(6, 7006);
+        if let (Some(pop_a), Some(pop_b)) = (a.bls_pop.as_mut(), b.bls_pop.as_ref()) {
+            pop_a.pubkey = pop_b.pubkey;
+        }
+        let cmd = ReconfigCommand {
+            adds: vec![a],
+            removes: vec![],
+            v_eff: 10,
+        };
+        let err = cmd.validate_against(&floor_set(), 0).unwrap_err();
+        assert!(err.to_string().contains("PoP"), "{err}");
+    }
+
+    #[test]
+    fn add_without_pop_still_passes_validation_today() {
+        // Pre-#293: PoP is verified when present but not required. An
+        // Ed25519 chain's add has `bls_pop: None` and validation
+        // succeeds. #293 will add scheme-driven enforcement (BLS chain
+        // = PoP required) at the call site.
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry(5, 7005)],
+            removes: vec![],
+            v_eff: 10,
+        };
+        cmd.validate_against(&cur, 0)
+            .expect("entries without PoP must still validate (Ed25519 chains)");
     }
 }

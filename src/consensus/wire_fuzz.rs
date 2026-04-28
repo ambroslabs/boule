@@ -137,7 +137,9 @@ fn arb_qc() -> impl Strategy<Value = QuorumCertificate> {
                 view,
                 block_hash,
                 signers,
-                signatures,
+                signatures: crate::consensus::hotstuff::qc::QcSignatures::Ed25519Collected(
+                    signatures,
+                ),
             },
         )
 }
