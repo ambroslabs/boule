@@ -29,8 +29,11 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::consensus::View;
 use crate::consensus::validator_set::ValidatorSet;
+use crate::p2p::NodeId;
 
 /// One boundary in the history: the view at which `set` becomes
 /// authoritative, and the set itself.
@@ -128,6 +131,60 @@ impl ValidatorSetHistory {
     pub fn iter(&self) -> impl Iterator<Item = (View, &Arc<ValidatorSet>)> {
         self.boundaries.iter().map(|b| (b.v_eff, &b.set))
     }
+
+    /// Snapshot the history into a serializable wire form (#254). The
+    /// genesis boundary at `v_eff = 0` is included so a fresh node can
+    /// restore the full chain of committee changes from a single blob.
+    pub fn to_persisted(&self) -> PersistedValidatorHistory {
+        let boundaries: Vec<PersistedBoundary> = self
+            .iter()
+            .map(|(v_eff, set)| PersistedBoundary {
+                v_eff,
+                members: set.iter().copied().collect(),
+            })
+            .collect();
+        PersistedValidatorHistory { boundaries }
+    }
+
+    /// Rebuild a history from its persisted form (#254). The first
+    /// boundary must be the genesis boundary at `v_eff = 0`; subsequent
+    /// entries must be in strictly increasing `v_eff` order.
+    pub fn from_persisted(persisted: PersistedValidatorHistory) -> anyhow::Result<Self> {
+        let mut iter = persisted.boundaries.into_iter();
+        let genesis = iter
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("persisted history is empty"))?;
+        if genesis.v_eff != 0 {
+            anyhow::bail!(
+                "persisted history's first boundary must be at v_eff = 0, got {}",
+                genesis.v_eff
+            );
+        }
+        let mut history = Self::from_genesis(ValidatorSet::new(genesis.members));
+        for boundary in iter {
+            history.insert_boundary(boundary.v_eff, ValidatorSet::new(boundary.members))?;
+        }
+        Ok(history)
+    }
+}
+
+/// One boundary in the persisted (wire) form of a [`ValidatorSetHistory`].
+///
+/// `members` is the *full* member list at and after `v_eff`; the diff
+/// against the previous boundary can be derived but isn't part of the
+/// wire shape — the format trades a few extra bytes per boundary for
+/// validation simplicity at recovery time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBoundary {
+    pub v_eff: View,
+    pub members: Vec<NodeId>,
+}
+
+/// Serializable snapshot of a [`ValidatorSetHistory`] (#254). Encoded
+/// via postcard at storage write time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedValidatorHistory {
+    pub boundaries: Vec<PersistedBoundary>,
 }
 
 #[cfg(test)]
@@ -239,5 +296,67 @@ mod tests {
         let collected: Vec<(View, ValidatorSet)> =
             h.iter().map(|(v, s)| (v, (**s).clone())).collect();
         assert_eq!(collected, vec![(0, genesis()), (10, five()), (20, six())]);
+    }
+
+    // ── #254: persistence round-trip ────────────────────────────────────
+
+    #[test]
+    fn round_trips_through_persisted_form() {
+        let mut h = ValidatorSetHistory::from_genesis(genesis());
+        h.insert_boundary(7, five()).unwrap();
+        h.insert_boundary(15, six()).unwrap();
+
+        let persisted = h.to_persisted();
+        let bytes = postcard::to_stdvec(&persisted).unwrap();
+        let decoded: PersistedValidatorHistory = postcard::from_bytes(&bytes).unwrap();
+        let restored = ValidatorSetHistory::from_persisted(decoded).unwrap();
+
+        assert_eq!(restored.boundary_count(), 3);
+        assert_eq!(*restored.set_at(0), genesis());
+        assert_eq!(*restored.set_at(7), five());
+        assert_eq!(*restored.set_at(15), six());
+        assert_eq!(*restored.current_set(), six());
+    }
+
+    #[test]
+    fn from_persisted_rejects_empty_blob() {
+        let empty = PersistedValidatorHistory { boundaries: vec![] };
+        let err = ValidatorSetHistory::from_persisted(empty).unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn from_persisted_rejects_non_genesis_first_boundary() {
+        let bad = PersistedValidatorHistory {
+            boundaries: vec![PersistedBoundary {
+                v_eff: 5,
+                members: vec![nid(1), nid(2), nid(3), nid(4)],
+            }],
+        };
+        let err = ValidatorSetHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("v_eff = 0"));
+    }
+
+    #[test]
+    fn from_persisted_rejects_non_monotone_v_eff() {
+        let bad = PersistedValidatorHistory {
+            boundaries: vec![
+                PersistedBoundary {
+                    v_eff: 0,
+                    members: vec![nid(1), nid(2), nid(3), nid(4)],
+                },
+                PersistedBoundary {
+                    v_eff: 10,
+                    members: vec![nid(1), nid(2), nid(3), nid(4), nid(5)],
+                },
+                // Out-of-order: v_eff 5 < previous 10.
+                PersistedBoundary {
+                    v_eff: 5,
+                    members: vec![nid(1), nid(2), nid(3), nid(4)],
+                },
+            ],
+        };
+        let err = ValidatorSetHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("strictly greater"));
     }
 }

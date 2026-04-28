@@ -171,6 +171,16 @@ pub const STORAGE_KEY_BLOCK_PREFIX: &[u8] = b"consensus/block/";
 /// = 0` gap called out in #178's reopen comment.
 pub const STORAGE_KEY_LAST_COMMITTED: &[u8] = b"consensus/last_committed";
 
+/// Storage key for the persisted [`ValidatorSetHistory`] (#254). Written
+/// after every successful commit-time reconfig application; read at
+/// startup by [`ConsensusNode::recover`] so the active set tracks
+/// committed reconfigs across restarts. The blob is the postcard-
+/// encoded full history (genesis boundary + every later boundary in
+/// chronological order) — small enough that we don't bother with
+/// incremental encoding or a GC bound (#140 open question: keep all,
+/// revisit if validator-set churn ever becomes pathological).
+pub const STORAGE_KEY_VALIDATOR_HISTORY: &[u8] = b"consensus/validator_history";
+
 /// Protocol ID registered with the p2p multiplexer for consensus traffic.
 /// Gossip uses `0x01`, ping-RPC uses `0x02`.
 pub const PROTOCOL_ID: u8 = 0x03;
@@ -848,14 +858,31 @@ impl ConsensusNode {
             None => LastCommitted { height: 0, view: 0 },
         };
 
-        let validator_set = Arc::new(config.validator_set.clone());
+        // #254: recover the persisted validator history if any
+        // committed reconfig has flushed it. Missing key → fresh
+        // genesis-only history.
+        let validator_history = match storage
+            .get(STORAGE_KEY_VALIDATOR_HISTORY)
+            .context("read validator_history from storage")?
+        {
+            Some(raw) => {
+                let persisted: crate::consensus::validator_history::PersistedValidatorHistory =
+                    postcard::from_bytes(&raw).context("decode persisted validator_history")?;
+                ValidatorSetHistory::from_persisted(persisted)
+                    .context("rebuild ValidatorSetHistory from persisted form")?
+            }
+            None => ValidatorSetHistory::from_genesis(config.validator_set.clone()),
+        };
+
+        let active_set = (*validator_history.current_set()).clone();
         let timeout_policy = Arc::new(ExponentialBackoff::new(
             config.timeout_base,
             config.timeout_max,
         ));
-        let selector = Arc::new(RoundRobinSelector::from_genesis_set(Arc::clone(
-            &validator_set,
-        )));
+        // Build the selector against a snapshot of the recovered
+        // history so leader rotation honors any post-genesis boundaries
+        // immediately after restart.
+        let selector = Arc::new(RoundRobinSelector::new(Arc::new(validator_history.clone())));
         let pacemaker = Pacemaker::new(
             self_id,
             Arc::clone(&selector) as _,
@@ -869,7 +896,7 @@ impl ConsensusNode {
             config.propose_limit,
         ));
         let eviction_counters = CacheEvictionCounters::default();
-        let core = HotStuffCore::with_limits(
+        let mut core = HotStuffCore::with_limits(
             self_id,
             hs_state,
             builder as Arc<dyn BlockBuilder>,
@@ -877,7 +904,20 @@ impl ConsensusNode {
             eviction_counters.clone(),
         );
 
-        let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
+        // #254: replay each post-genesis boundary into the safety
+        // core's history so vote tally / QC sizing / proposal-time
+        // leader pick all see the recovered committee. Genesis is
+        // already seeded by `HotStuffState::new`. Any failure here
+        // surfaces as a recovery error — we'd rather fail closed than
+        // run with a stale set.
+        for (v_eff, set) in validator_history.iter() {
+            if v_eff == 0 {
+                continue;
+            }
+            core.insert_validator_boundary(v_eff, (**set).clone())
+                .with_context(|| format!("replay validator boundary at v_eff = {v_eff}"))?;
+        }
+
         Ok(Self {
             self_id,
             core,
@@ -886,7 +926,7 @@ impl ConsensusNode {
             mempool,
             storage,
             wal,
-            validator_set: config.validator_set,
+            validator_set: active_set,
             validator_history,
             timeout_policy,
             timeout_buckets: HashMap::new(),
@@ -2466,6 +2506,7 @@ impl ConsensusNode {
     fn apply_committed_reconfigs(&mut self, block: &crate::replication::block::Block) {
         use crate::consensus::reconfig::ReconfigCommand;
 
+        let mut applied_any = false;
         for cmd_bytes in &block.commands {
             if !ReconfigCommand::is_reconfig_payload(cmd_bytes) {
                 continue;
@@ -2578,6 +2619,37 @@ impl ConsensusNode {
                 next_size = new_set.len(),
                 "reconfig_applied",
             );
+            applied_any = true;
+        }
+
+        // #254: durably persist the updated history once any boundary
+        // has landed. Write a single blob over the full history (rather
+        // than a journal of diffs) so recovery is a single read +
+        // decode. Failures log + drop — the in-memory state is
+        // authoritative for the running process; on the next reconfig
+        // we'll get another chance to flush, and the recovery path will
+        // just reset to whatever state was durably written before the
+        // last successful flush.
+        if applied_any {
+            let persisted = self.validator_history.to_persisted();
+            match postcard::to_stdvec(&persisted) {
+                Ok(bytes) => {
+                    if let Err(e) = self.storage.put(STORAGE_KEY_VALIDATOR_HISTORY, &bytes) {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "validator_history_persist_failed",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: TRACE_TARGET,
+                        error = %e,
+                        "validator_history_encode_failed",
+                    );
+                }
+            }
         }
     }
 
@@ -2624,9 +2696,15 @@ impl ConsensusNode {
         // The block's `state_commitment` is what consensus committed
         // and what `manifest.verify` cross-checks against the
         // standalone `state_commitment` field in the manifest.
+        // #254: pick the validator set authoritative *at the snapshot
+        // block's view* rather than `self.validator_set` (which is
+        // the boot-time genesis set). After a reconfig, the snapshot
+        // must embed the post-boundary committee so a fresh joiner's
+        // QC verification picks the right set.
+        let active_set = self.validator_history.set_at(block.header.view);
         let manifest = SnapshotManifest::build(
             block.clone(), // `block` is `&Block` here; clone for the manifest's owned field.
-            &self.validator_set,
+            &active_set,
             self.snapshot_policy.chunk_size_bytes,
             chunk_hashes,
             commit_qc,
@@ -3892,6 +3970,106 @@ mod tests {
         // (otherwise the set would be six_validators).
         assert_eq!(*node.validator_history.set_at(v_eff_b), five_validators());
         assert_ne!(*node.validator_history.set_at(v_eff_b), six_validators());
+    }
+
+    /// #254: a reconfig committed by one ConsensusNode must be visible
+    /// to a fresh node `recover`'d against the same storage. Both the
+    /// integration-side `validator_history` and the safety core's
+    /// mirror must reflect the post-boundary committee.
+    #[test]
+    fn recovered_node_replays_persisted_validator_history() {
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let cfg = test_config(four_validators());
+
+        // Phase 1: a fresh node commits a block carrying a reconfig.
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let v_eff = MIN_V_EFF_DELAY + 5;
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+            }],
+            removes: vec![],
+            v_eff,
+        };
+        let block = block_with_reconfig(1, 0, nid(1), cmd);
+        node.apply_commit(block);
+        assert_eq!(node.validator_history.boundary_count(), 2);
+        drop(node);
+
+        // Phase 2: a fresh node recovered against the same storage
+        // must see the boundary in both histories, and the active set
+        // looked up at v_eff must be the post-reconfig committee.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover must succeed against persisted history");
+
+        assert_eq!(
+            recovered.validator_history.boundary_count(),
+            2,
+            "integration history must replay the boundary",
+        );
+        assert_eq!(
+            recovered.core.state().validator_history.boundary_count(),
+            2,
+            "safety-core history must mirror the boundary after replay",
+        );
+        assert_eq!(
+            *recovered.validator_history.set_at(v_eff),
+            five_validators()
+        );
+        assert_eq!(
+            *recovered.core.state().validator_history.set_at(v_eff),
+            five_validators()
+        );
+
+        // The pacemaker selector built during `recover` rotates over
+        // the recovered history — leaders at v_eff come from the post-
+        // boundary set.
+        assert!(
+            five_validators().contains(&recovered.pacemaker.leader_for_view(v_eff)),
+            "recovered selector must rotate over post-boundary committee",
+        );
+    }
+
+    /// A node `recover`'d from storage that has no validator-history
+    /// blob (i.e. no reconfig was ever committed) falls back cleanly
+    /// to the genesis-only history, identical to a fresh node.
+    #[test]
+    fn recovered_node_with_no_persisted_history_uses_genesis_only() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let cfg = test_config(four_validators());
+
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover with empty storage must succeed");
+
+        assert_eq!(recovered.validator_history.boundary_count(), 1);
+        assert_eq!(
+            *recovered.validator_history.current_set(),
+            four_validators()
+        );
     }
 
     #[test]
