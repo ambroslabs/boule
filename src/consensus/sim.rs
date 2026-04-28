@@ -380,6 +380,7 @@ impl SimCluster {
                 limits: CacheLimits::unbounded_for_tests(),
                 snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+                signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
             };
 
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -892,6 +893,7 @@ impl SimCluster {
                 limits: CacheLimits::unbounded_for_tests(),
                 snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+                signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
             };
             // Fresh state machine and mempool — the previous session's
             // state machine doesn't survive a process restart in
@@ -1299,6 +1301,7 @@ impl SimCluster {
                 limits: CacheLimits::unbounded_for_tests(),
                 snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+                signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
             };
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));

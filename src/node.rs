@@ -410,6 +410,7 @@ async fn start_consensus(
             chunk_size_bytes: cons_cfg.snapshot_chunk_size_bytes,
         },
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        signature_scheme: cons_cfg.signature_scheme,
     };
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
