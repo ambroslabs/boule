@@ -396,8 +396,6 @@ async fn start_consensus(
     let genesis_bls = cons_cfg
         .resolve_genesis_bls_keys()
         .context("validating genesis BLS validator table")?;
-    let bls_key_history =
-        reconcile_bls_identity(cons_cfg, bls_identity_config, self_id, &genesis_bls)?;
 
     let (storage, wal): (Arc<dyn Storage>, Arc<dyn Wal>) = match &cons_cfg.storage_dir {
         Some(dir) => {
@@ -455,6 +453,19 @@ async fn start_consensus(
     )
     .await?;
 
+    // Resolve the BLS key history. On Ed25519 chains: None. On BLS
+    // chains: prefer the persisted form (#339), falling back to a
+    // fresh genesis seed if storage has nothing yet. Both branches
+    // re-validate the local node's BLS identity against the canonical
+    // genesis pubkey for that NodeId (#335).
+    let bls_key_history = reconcile_bls_identity(
+        cons_cfg,
+        bls_identity_config,
+        self_id,
+        &genesis_bls,
+        storage.as_ref(),
+    )?;
+
     let mut node =
         ConsensusNode::recover(*self_id, node_cfg, state_machine, mempool, storage, wal)?;
     if let Some(history) = bls_key_history {
@@ -500,7 +511,10 @@ fn reconcile_bls_identity(
     bls_identity_config: Option<&BlsIdentityConfig>,
     self_id: &NodeId,
     genesis_bls: &[(NodeId, crate::crypto::sig_scheme::BlsPublicKey)],
+    storage: &dyn crate::storage::Storage,
 ) -> anyhow::Result<Option<crate::consensus::bls_key_history::BlsKeyHistory>> {
+    use crate::consensus::bls_key_history::PersistedBlsKeyHistory;
+    use crate::consensus::node::STORAGE_KEY_BLS_KEY_HISTORY;
     use crate::crypto::sig_scheme::SignatureSchemeChoice;
 
     match cons_cfg.signature_scheme {
@@ -562,12 +576,24 @@ fn reconcile_bls_identity(
                     );
                 }
             }
-            // Seed the per-validator BLS pubkey timeline so the
-            // dispatch-layer QC verifier (#332) can resolve pubkeys at
-            // any view.
-            let history = crate::consensus::bls_key_history::BlsKeyHistory::with_genesis(
-                genesis_bls.iter().copied(),
-            );
+            // Prefer the persisted form (#339) so reconfig-added
+            // validators and post-genesis rotations survive restart.
+            // Fall back to a fresh genesis seed when storage has
+            // nothing yet (first boot, or in-memory storage).
+            let history = match storage
+                .get(STORAGE_KEY_BLS_KEY_HISTORY)
+                .context("read bls_key_history from storage")?
+            {
+                Some(raw) => {
+                    let persisted: PersistedBlsKeyHistory =
+                        postcard::from_bytes(&raw).context("decode persisted bls_key_history")?;
+                    crate::consensus::bls_key_history::BlsKeyHistory::from_persisted(persisted)
+                        .context("rebuild BlsKeyHistory from persisted form")?
+                }
+                None => crate::consensus::bls_key_history::BlsKeyHistory::with_genesis(
+                    genesis_bls.iter().copied(),
+                ),
+            };
             Ok(Some(history))
         }
     }
@@ -760,8 +786,18 @@ mod tests {
     use crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY;
     use crate::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
     use crate::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
+    use crate::storage::MemoryStorage;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// Empty in-memory storage — all reconcile_bls_identity tests
+    /// below run without persisted history (first-boot scenarios).
+    /// The persisted-form-survives-restart case is exercised by the
+    /// integration test in `reload_bls_history_from_storage`.
+    fn empty_storage() -> Arc<MemoryStorage> {
+        Arc::new(MemoryStorage::new())
+    }
 
     fn cons_cfg(scheme: SignatureSchemeChoice) -> ConsensusConfig {
         ConsensusConfig {
@@ -799,7 +835,8 @@ mod tests {
     #[test]
     fn ed25519_chain_with_no_bls_config_returns_none() {
         let cfg = cons_cfg(SignatureSchemeChoice::Ed25519Collected);
-        let res = reconcile_bls_identity(&cfg, None, &nid(1), &[]).unwrap();
+        let storage = empty_storage();
+        let res = reconcile_bls_identity(&cfg, None, &nid(1), &[], storage.as_ref()).unwrap();
         assert!(res.is_none());
     }
 
@@ -810,14 +847,17 @@ mod tests {
             path: PathBuf::from("/tmp/unused.key"),
             allow_insecure_perms: false,
         };
-        let err = reconcile_bls_identity(&cfg, Some(&bls_cfg), &nid(1), &[]).unwrap_err();
+        let storage = empty_storage();
+        let err = reconcile_bls_identity(&cfg, Some(&bls_cfg), &nid(1), &[], storage.as_ref())
+            .unwrap_err();
         assert!(err.to_string().contains("ed25519_collected"), "{err}");
     }
 
     #[test]
     fn bls_chain_with_no_bls_config_is_rejected() {
         let cfg = cons_cfg(SignatureSchemeChoice::BlsAggregated);
-        let err = reconcile_bls_identity(&cfg, None, &nid(1), &[]).unwrap_err();
+        let storage = empty_storage();
+        let err = reconcile_bls_identity(&cfg, None, &nid(1), &[], storage.as_ref()).unwrap_err();
         assert!(
             err.to_string().contains("[node.bls_validator_identity]"),
             "{err}",
@@ -835,8 +875,10 @@ mod tests {
         };
         let cfg = cons_cfg(SignatureSchemeChoice::BlsAggregated);
         let genesis = vec![(self_id, pk), (nid(8), [0xAB; 48])];
+        let storage = empty_storage();
         let history =
-            reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis).expect("must succeed");
+            reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis, storage.as_ref())
+                .expect("must succeed");
         let history = history.expect("BLS chain must seed a history");
         assert_eq!(history.len(), 2);
         assert_eq!(history.key_at(&self_id, 0), Some(pk));
@@ -858,7 +900,10 @@ mod tests {
         };
         let cfg = cons_cfg(SignatureSchemeChoice::BlsAggregated);
         let genesis = vec![(self_id, other_pk)];
-        let err = reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis).unwrap_err();
+        let storage = empty_storage();
+        let err =
+            reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis, storage.as_ref())
+                .unwrap_err();
         assert!(err.to_string().contains("does not match"), "{err}");
     }
 
@@ -875,10 +920,49 @@ mod tests {
         let cfg = cons_cfg(SignatureSchemeChoice::BlsAggregated);
         // Genesis has stranger, not self_id.
         let genesis = vec![(stranger, pk)];
-        let err = reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis).unwrap_err();
+        let storage = empty_storage();
+        let err =
+            reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis, storage.as_ref())
+                .unwrap_err();
         assert!(
             err.to_string().contains("not a BLS-genesis validator"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn reload_bls_history_from_storage() {
+        // Persist a non-trivial history (genesis + a rotation), then
+        // confirm reconcile_bls_identity reloads it instead of
+        // re-seeding from genesis.
+        use crate::consensus::bls_key_history::BlsKeyHistory;
+        use crate::consensus::node::STORAGE_KEY_BLS_KEY_HISTORY;
+        use crate::storage::Storage as _;
+
+        let dir = TempDir::new().unwrap();
+        let self_id = nid(7);
+        let (path, pk) = provision_bls_key(&dir, "self.key");
+        let bls_cfg = BlsIdentityConfig::File {
+            path,
+            allow_insecure_perms: false,
+        };
+        let cfg = cons_cfg(SignatureSchemeChoice::BlsAggregated);
+        let genesis = vec![(self_id, pk)];
+
+        // Build a history with a rotation past genesis and persist it.
+        let mut h = BlsKeyHistory::with_genesis(genesis.iter().copied());
+        h.apply_rotation(self_id, 100, [0xCC; 48]).unwrap();
+        let bytes = postcard::to_stdvec(&h.to_persisted()).unwrap();
+        let storage = empty_storage();
+        storage.put(STORAGE_KEY_BLS_KEY_HISTORY, &bytes).unwrap();
+
+        let reloaded =
+            reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis, storage.as_ref())
+                .expect("must succeed")
+                .expect("BLS chain seeds a history");
+        // The post-rotation pubkey survived the persist/reload cycle.
+        assert_eq!(reloaded.key_at(&self_id, 100), Some([0xCC; 48]));
+        // And the genesis pubkey is still there for older views.
+        assert_eq!(reloaded.key_at(&self_id, 0), Some(pk));
     }
 }
