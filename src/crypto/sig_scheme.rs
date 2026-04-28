@@ -348,6 +348,90 @@ impl BlsAggregated {
             err => Err(BlsKeyError::Blst(err)),
         }
     }
+
+    /// Produce a proof-of-possession (PoP) over `pubkey` using
+    /// `secret`. The PoP is a BLS signature whose message is the
+    /// validator's own compressed pubkey bytes — it proves the signer
+    /// actually holds the secret half of the registered pubkey.
+    ///
+    /// PoPs defend against rogue-key attacks: an attacker who picks a
+    /// pubkey `K' = K_target − K_self` cannot produce a valid PoP for
+    /// `K'` without holding its secret half, so the registration tx
+    /// can reject the malicious key. Required at validator
+    /// registration time on BLS chains; the reconfig path enforces
+    /// presence in #293, when the rest of the BLS integration also
+    /// lands.
+    pub fn sign_pop(secret: &BlsSecretKey) -> Result<BlsPop, BlsKeyError> {
+        let sk = blst::min_pk::SecretKey::from_bytes(secret).map_err(BlsKeyError::Blst)?;
+        let pubkey = sk.sk_to_pk().to_bytes();
+        let sig = sk.sign(&pubkey, Self::DST, &[]).to_bytes();
+        Ok(BlsPop { pubkey, sig })
+    }
+
+    /// Verify a [`BlsPop`]. Returns `Ok(())` iff:
+    /// 1. `pop.pubkey` equals `expected_pubkey` — an attacker cannot
+    ///    submit a PoP for someone else's key as their own.
+    /// 2. `pop.sig` is a valid BLS signature over `pop.pubkey` under
+    ///    `pop.pubkey` — proving possession of the secret half.
+    pub fn verify_pop(pop: &BlsPop, expected_pubkey: &BlsPublicKey) -> Result<(), BlsKeyError> {
+        if pop.pubkey != *expected_pubkey {
+            return Err(BlsKeyError::PopPubkeyMismatch);
+        }
+        let pk = blst::min_pk::PublicKey::from_bytes(&pop.pubkey).map_err(BlsKeyError::Blst)?;
+        let sig = blst::min_pk::Signature::from_bytes(&pop.sig).map_err(BlsKeyError::Blst)?;
+        match sig.verify(true, &pop.pubkey, Self::DST, &[], &pk, true) {
+            blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
+            err => Err(BlsKeyError::Blst(err)),
+        }
+    }
+}
+
+/// Proof-of-possession (PoP) bundle for a BLS validator pubkey.
+/// Carries the pubkey explicitly so the wire shape is self-describing:
+/// the PoP can be verified independently of the surrounding tx.
+///
+/// On BLS chains, every validator-registration tx (#140 / #251) embeds
+/// a `BlsPop` per `adds` entry; the reconfig validator (#293) rejects
+/// any add that lacks a PoP or whose PoP fails to verify. PoPs are
+/// persisted alongside the historical pubkey in
+/// [`crate::consensus::validator_key_history`] (#294) so historical
+/// validator-set lookups never trust an unverified key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlsPop {
+    #[serde(with = "serde_g1_pubkey")]
+    pub pubkey: BlsPublicKey,
+    #[serde(with = "serde_g2_sig")]
+    pub sig: BlsPartialSig,
+}
+
+mod serde_g1_pubkey {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(pk: &[u8; 48], s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&pk[..], s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 48], D::Error> {
+        let v: Vec<u8> = Vec::<u8>::deserialize(d)?;
+        v.as_slice()
+            .try_into()
+            .map_err(|_| D::Error::custom("BLS pubkey must be exactly 48 bytes"))
+    }
+}
+
+mod serde_g2_sig {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(sig: &[u8; 96], s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&sig[..], s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 96], D::Error> {
+        let v: Vec<u8> = Vec::<u8>::deserialize(d)?;
+        v.as_slice()
+            .try_into()
+            .map_err(|_| D::Error::custom("BLS sig must be exactly 96 bytes"))
+    }
 }
 
 impl SignatureScheme for BlsAggregated {
@@ -449,19 +533,27 @@ impl SignatureScheme for BlsAggregated {
     }
 }
 
-/// Errors produced by the BLS keygen / signing / partial-verify
+/// Errors produced by the BLS keygen / signing / partial-verify / PoP
 /// helpers on [`BlsAggregated`]. Wraps the `blst` error code so callers
 /// can distinguish "bad input bytes" from "bad signature" without
 /// taking a transitive dep on the `blst` crate.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlsKeyError {
     Blst(blst::BLST_ERROR),
+    /// A [`BlsPop`]'s embedded pubkey did not match the
+    /// `expected_pubkey` argument passed to [`BlsAggregated::verify_pop`].
+    /// Distinguished from [`Self::Blst`] so the registration path can
+    /// surface "you submitted someone else's PoP" specifically.
+    PopPubkeyMismatch,
 }
 
 impl fmt::Display for BlsKeyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Blst(err) => write!(f, "blst error: {err:?}"),
+            Self::PopPubkeyMismatch => f.write_str(
+                "BLS proof-of-possession pubkey does not match expected validator pubkey",
+            ),
         }
     }
 }
@@ -910,5 +1002,76 @@ mod tests {
         // Sanity: still verifies (it's still a 1-of-1 aggregate).
         BlsAggregated::verify_aggregate(&agg, &signers, message, &[pk])
             .expect("idempotent add must keep aggregate valid");
+    }
+
+    // ── BLS proof-of-possession (#291) ────────────────────────────────
+
+    #[test]
+    fn bls_pop_round_trips_under_correct_pubkey() {
+        let (sk, pk) = bls_signer(0xF0);
+        let pop = BlsAggregated::sign_pop(&sk).expect("PoP signing must succeed");
+        assert_eq!(pop.pubkey, pk);
+        BlsAggregated::verify_pop(&pop, &pk).expect("real PoP must verify");
+    }
+
+    #[test]
+    fn bls_pop_rejects_pubkey_mismatch() {
+        // An attacker who substitutes someone else's PoP for their own
+        // registration tx must be caught. `verify_pop` checks the
+        // embedded pubkey first.
+        let (sk_a, _pk_a) = bls_signer(0xF1);
+        let (_sk_b, pk_b) = bls_signer(0xF2);
+        let pop = BlsAggregated::sign_pop(&sk_a).unwrap();
+        // pop.pubkey is pk_a; checking against pk_b must fail.
+        assert_eq!(
+            BlsAggregated::verify_pop(&pop, &pk_b),
+            Err(BlsKeyError::PopPubkeyMismatch),
+        );
+    }
+
+    #[test]
+    fn bls_pop_rejects_tampered_signature() {
+        let (sk, pk) = bls_signer(0xF3);
+        let mut pop = BlsAggregated::sign_pop(&sk).unwrap();
+        pop.sig[0] ^= 0xFF;
+        assert!(BlsAggregated::verify_pop(&pop, &pk).is_err());
+    }
+
+    #[test]
+    fn bls_pop_postcard_roundtrip() {
+        // Wire-format stability: the PoP encodes/decodes through
+        // postcard. `[u8; 48]` and `[u8; 96]` go through the
+        // dedicated serde modules above.
+        let (sk, _pk) = bls_signer(0xF4);
+        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let bytes = postcard::to_stdvec(&pop).unwrap();
+        let back: BlsPop = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, pop);
+    }
+
+    #[test]
+    fn bls_pop_for_one_validator_does_not_validate_under_another() {
+        // Forgery defense: a PoP signed under sk_a is not a valid PoP
+        // for any other pubkey, even if the byte payload (the embedded
+        // pubkey) is swapped to pk_b. The signature itself is over the
+        // pubkey, so swapping invalidates the signature.
+        let (sk_a, pk_a) = bls_signer(0xF5);
+        let (_sk_b, pk_b) = bls_signer(0xF6);
+        let mut pop = BlsAggregated::sign_pop(&sk_a).unwrap();
+        // Forge: replace embedded pubkey with pk_b but keep sig from sk_a.
+        pop.pubkey = pk_b;
+        // Now caller passes pk_b as expected, so the mismatch check
+        // passes, but the signature verifies over pk_b's bytes under
+        // pk_a's signature — must fail at the BLS verify step.
+        assert!(matches!(
+            BlsAggregated::verify_pop(&pop, &pk_b),
+            Err(BlsKeyError::Blst(_)),
+        ));
+        // For completeness: with the correct expected pubkey (pk_a), the
+        // mismatch check fires first.
+        assert_eq!(
+            BlsAggregated::verify_pop(&pop, &pk_a),
+            Err(BlsKeyError::PopPubkeyMismatch),
+        );
     }
 }
