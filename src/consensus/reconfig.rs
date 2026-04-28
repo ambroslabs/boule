@@ -116,17 +116,30 @@ impl ReconfigCommand {
         current_set: &ValidatorSet,
         current_view: View,
     ) -> anyhow::Result<Vec<NodeId>> {
-        let min_v_eff = current_view.checked_add(MIN_V_EFF_DELAY).ok_or_else(|| {
-            anyhow::anyhow!(
-                "current_view {current_view} + MIN_V_EFF_DELAY {MIN_V_EFF_DELAY} overflows",
-            )
+        self.validate_against_with_delay(current_set, current_view, MIN_V_EFF_DELAY)
+    }
+
+    /// Same as [`Self::validate_against`] but uses an operator-supplied
+    /// minimum delay floor, which must be at least [`MIN_V_EFF_DELAY`].
+    /// Wired through [`crate::consensus::node::NodeConfigForConsensus::min_v_eff_delay`]
+    /// (#272) so deployments can require a longer "give the new
+    /// validator time to state-sync" window than the consensus floor.
+    pub fn validate_against_with_delay(
+        &self,
+        current_set: &ValidatorSet,
+        current_view: View,
+        min_v_eff_delay: View,
+    ) -> anyhow::Result<Vec<NodeId>> {
+        let effective_delay = std::cmp::max(min_v_eff_delay, MIN_V_EFF_DELAY);
+        let min_v_eff = current_view.checked_add(effective_delay).ok_or_else(|| {
+            anyhow::anyhow!("current_view {current_view} + delay {effective_delay} overflows",)
         })?;
         if self.v_eff < min_v_eff {
             anyhow::bail!(
-                "v_eff {} must be >= current_view {} + MIN_V_EFF_DELAY {}",
+                "v_eff {} must be >= current_view {} + delay {}",
                 self.v_eff,
                 current_view,
-                MIN_V_EFF_DELAY
+                effective_delay
             );
         }
 

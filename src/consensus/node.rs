@@ -275,6 +275,13 @@ pub struct NodeConfigForConsensus {
     /// operator-configured policy from
     /// [`crate::config::ConsensusConfig`].
     pub snapshot_policy: crate::replication::snapshot::SnapshotPolicy,
+
+    /// Operator-supplied floor on the gap between a reconfig's commit
+    /// view and its `v_eff` (#272). Clamped up to
+    /// [`crate::consensus::reconfig::MIN_V_EFF_DELAY`] at validation
+    /// time so the consensus-side floor is never undercut. Defaults to
+    /// the constant.
+    pub min_v_eff_delay: View,
 }
 
 impl NodeConfigForConsensus {
@@ -296,6 +303,7 @@ impl NodeConfigForConsensus {
             // Tests opt into snapshots by replacing this with a real
             // policy. The default keeps the snapshot store untouched.
             snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         }
     }
 }
@@ -466,6 +474,11 @@ pub struct ConsensusNode {
     /// Snapshot creation policy. When `is_enabled()`, [`apply_commit`]
     /// produces a snapshot at every multiple of `interval_blocks`.
     snapshot_policy: crate::replication::snapshot::SnapshotPolicy,
+    /// Operator-supplied floor on the gap between a reconfig's commit
+    /// view and its `v_eff` (#272). Clamped up to
+    /// [`crate::consensus::reconfig::MIN_V_EFF_DELAY`] at validation
+    /// time so the consensus-side floor is never undercut.
+    min_v_eff_delay: View,
     /// Bounded cache of QCs adopted as `high_qc`, keyed by block hash.
     /// Populated by [`persist_updates`] on every `StateUpdate::HighQc`.
     /// Read at snapshot creation time to find a QC over the snapshot
@@ -611,6 +624,7 @@ impl ConsensusNode {
             rate_limiter: None,
             peer_cmd_tx: None,
             snapshot_policy: config.snapshot_policy,
+            min_v_eff_delay: config.min_v_eff_delay,
             recent_qcs: Mutex::new(RecentQcCache::default()),
             snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync::new(
                 config.snapshot_policy,
@@ -886,6 +900,7 @@ impl ConsensusNode {
             rate_limiter: None,
             peer_cmd_tx: None,
             snapshot_policy: config.snapshot_policy,
+            min_v_eff_delay: config.min_v_eff_delay,
             recent_qcs: Mutex::new(RecentQcCache::default()),
             snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync::new(
                 config.snapshot_policy,
@@ -2423,8 +2438,146 @@ impl ConsensusNode {
                 );
             }
         }
+        // #272: scan the committed block's commands for any tagged
+        // ReconfigCommand payloads and apply them to the validator
+        // history. Done after the block is durably persisted so a
+        // crash mid-apply leaves the chain intact and recovery can
+        // re-derive the boundary on next replay (#254). Errors log
+        // and drop — the block itself stays committed since the
+        // safety core is independent of payload validity.
+        self.apply_committed_reconfigs(&block);
         if let Some(tx) = &self.commit_tx {
             let _ = tx.send(block);
+        }
+    }
+
+    /// Scan `block.commands` for tagged `ReconfigCommand` payloads
+    /// (#247) and, for each one that validates against the active set
+    /// at the block's view, insert a new boundary into
+    /// `validator_history`, mirror it into the safety core, and
+    /// re-install the leader selector so the pacemaker rotation
+    /// observes the new committee at and after `v_eff`.
+    ///
+    /// Validation failures (floor, overlap, v_eff delay, conflict
+    /// with an unsettled pending reconfig) are logged and dropped —
+    /// they do not roll the block back. A reconfig that conflicts
+    /// with a pending one is dropped silently so a single block
+    /// can't sneak two contradictory boundaries past validation.
+    fn apply_committed_reconfigs(&mut self, block: &crate::replication::block::Block) {
+        use crate::consensus::reconfig::ReconfigCommand;
+
+        for cmd_bytes in &block.commands {
+            if !ReconfigCommand::is_reconfig_payload(cmd_bytes) {
+                continue;
+            }
+            let cmd = match ReconfigCommand::decode(cmd_bytes) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        height = block.header.height,
+                        view = block.header.view,
+                        error = %e,
+                        "reconfig_payload_malformed",
+                    );
+                    continue;
+                }
+            };
+
+            // Validate against the set authoritative at the block's
+            // view — the cluster's view of "now" at commit time. The
+            // pacemaker may have advanced past this by the time the
+            // commit drains, but the rule must use the block's view
+            // so all replicas accept or reject identically.
+            let block_view = block.header.view;
+            let current_set = self.validator_history.set_at(block_view);
+            let next_members = match cmd.validate_against_with_delay(
+                &current_set,
+                block_view,
+                self.min_v_eff_delay,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        height = block.header.height,
+                        view = block_view,
+                        v_eff = cmd.v_eff,
+                        error = %e,
+                        "reconfig_validation_failed",
+                    );
+                    continue;
+                }
+            };
+
+            // Conflict guard: only one reconfig may be pending at a
+            // time. If the history already carries a non-genesis
+            // boundary whose `v_eff` is strictly after the committing
+            // block's view, a previously committed reconfig has not
+            // yet taken effect — drop the second so the two cannot
+            // compose unsoundly (cmd_b's validation baseline would
+            // need to be cmd_a's post-boundary set, not the current
+            // set, which we'd have to thread through). Future PRs can
+            // relax this rule once compositional validation lands.
+            let conflict = self
+                .validator_history
+                .iter()
+                .any(|(v_eff, _)| v_eff != 0 && v_eff > block_view);
+            if conflict {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height,
+                    view = block_view,
+                    v_eff = cmd.v_eff,
+                    "reconfig_conflicts_with_pending_or_committed_boundary",
+                );
+                continue;
+            }
+
+            let new_set = ValidatorSet::new(next_members);
+
+            // Insert the boundary into the integration-layer history
+            // (used by `dispatch::ingress`).
+            if let Err(e) = self
+                .validator_history
+                .insert_boundary(cmd.v_eff, new_set.clone())
+            {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    error = %e,
+                    "reconfig_insert_boundary_into_node_history_failed",
+                );
+                continue;
+            }
+            // Mirror into the safety core's history so vote tally,
+            // QC sizing, and proposal-time leader pick all see the
+            // boundary at and after `v_eff`.
+            if let Err(e) = self
+                .core
+                .insert_validator_boundary(cmd.v_eff, new_set.clone())
+            {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    error = %e,
+                    "reconfig_insert_boundary_into_safety_core_failed",
+                );
+                continue;
+            }
+            // Re-install the pacemaker selector against a fresh
+            // snapshot of the now-extended history so leader rotation
+            // past `v_eff` lands on the post-boundary set.
+            let snapshot = Arc::new(self.validator_history.clone());
+            self.pacemaker
+                .set_selector(Arc::new(RoundRobinSelector::new(snapshot)));
+
+            tracing::info!(
+                target: TRACE_TARGET,
+                height = block.header.height,
+                view = block_view,
+                v_eff = cmd.v_eff,
+                next_size = new_set.len(),
+                "reconfig_applied",
+            );
         }
     }
 
@@ -3567,6 +3720,200 @@ mod tests {
             0,
             "committed commands must be drained from mempool"
         );
+    }
+
+    // ── #272: commit-time reconfig application ────────────────────────────────
+
+    fn five_validators() -> ValidatorSet {
+        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5)])
+    }
+
+    fn six_validators() -> ValidatorSet {
+        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5), nid(6)])
+    }
+
+    /// Build a Block at `(height, view)` that carries a single tagged
+    /// `ReconfigCommand` payload built by `make_cmd`.
+    fn block_with_reconfig(
+        height: u64,
+        view: View,
+        proposer: NodeId,
+        cmd: crate::consensus::reconfig::ReconfigCommand,
+    ) -> crate::replication::block::Block {
+        let payload = cmd.encode();
+        let commands = vec![payload];
+        let header = crate::replication::block::BlockHeader {
+            parent_hash: genesis().hash(),
+            height,
+            view,
+            proposer,
+            state_commitment: [0u8; 32],
+            commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
+        };
+        crate::replication::block::Block { header, commands }
+    }
+
+    #[test]
+    fn apply_commit_with_valid_reconfig_inserts_boundary_into_history() {
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+
+        let mut node = make_node(nid(1));
+        // Pre-conditions: only the genesis boundary, with the original
+        // four-validator set.
+        assert_eq!(node.validator_history.boundary_count(), 1);
+        assert_eq!(node.core.state().validator_history.boundary_count(), 1);
+        assert_eq!(*node.validator_history.current_set(), four_validators());
+
+        // Construct a reconfig adding nid(5) at v_eff = 5 (≥ block.view +
+        // MIN_V_EFF_DELAY for block.view = 0).
+        let v_eff = MIN_V_EFF_DELAY + 3;
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+            }],
+            removes: vec![],
+            v_eff,
+        };
+        let block = block_with_reconfig(1, 0, nid(1), cmd);
+        node.apply_commit(block);
+
+        // Both histories carry the new boundary.
+        assert_eq!(node.validator_history.boundary_count(), 2);
+        assert_eq!(node.core.state().validator_history.boundary_count(), 2);
+        assert_eq!(*node.validator_history.set_at(v_eff), five_validators());
+        assert_eq!(
+            *node.core.state().validator_history.set_at(v_eff),
+            five_validators()
+        );
+
+        // The pacemaker selector now picks leaders from the post-
+        // boundary set at and after v_eff.
+        let leader_at_v_eff = node.pacemaker.leader_for_view(v_eff);
+        assert!(
+            five_validators().contains(&leader_at_v_eff),
+            "leader at v_eff must come from post-boundary set",
+        );
+    }
+
+    #[test]
+    fn apply_commit_with_floor_violating_reconfig_drops_silently() {
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+
+        let mut node = make_node(nid(1));
+        // Removing two of four would leave a 2-member set, below the
+        // MIN_VALIDATOR_FLOOR of 4. apply_commit must log + drop, but
+        // the block itself stays committed.
+        let v_eff = MIN_V_EFF_DELAY + 5;
+        let cmd = ReconfigCommand {
+            adds: vec![],
+            removes: vec![nid(3), nid(4)],
+            v_eff,
+        };
+        // Empty `adds` so nothing's needed; this is purely a removal.
+        let _ = ValidatorEntry {
+            node_id: nid(0),
+            addr: "127.0.0.1:0".parse().unwrap(),
+        };
+        let block = block_with_reconfig(1, 0, nid(1), cmd);
+        node.apply_commit(block);
+
+        // History unchanged — only the genesis boundary remains.
+        assert_eq!(node.validator_history.boundary_count(), 1);
+        assert_eq!(node.core.state().validator_history.boundary_count(), 1);
+    }
+
+    #[test]
+    fn apply_commit_with_v_eff_below_min_delay_drops_silently() {
+        use crate::consensus::reconfig::{ReconfigCommand, ValidatorEntry};
+
+        let mut node = make_node(nid(1));
+        // block.view = 5, v_eff = 5 — equal, but the rule wants
+        // v_eff >= block.view + MIN_V_EFF_DELAY, so this is too low.
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+            }],
+            removes: vec![],
+            v_eff: 5,
+        };
+        let block = block_with_reconfig(1, 5, nid(1), cmd);
+        node.apply_commit(block);
+
+        assert_eq!(node.validator_history.boundary_count(), 1);
+    }
+
+    #[test]
+    fn apply_commit_with_two_reconfigs_in_one_block_keeps_only_first() {
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+
+        let mut node = make_node(nid(1));
+        let v_eff_a = MIN_V_EFF_DELAY + 3;
+        let v_eff_b = v_eff_a + 5;
+        let cmd_a = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+            }],
+            removes: vec![],
+            v_eff: v_eff_a,
+        };
+        let cmd_b = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(6),
+                addr: "127.0.0.1:9006".parse().unwrap(),
+            }],
+            removes: vec![],
+            v_eff: v_eff_b,
+        };
+
+        let payload_a = cmd_a.encode();
+        let payload_b = cmd_b.encode();
+        let commands = vec![payload_a, payload_b];
+        let header = crate::replication::block::BlockHeader {
+            parent_hash: genesis().hash(),
+            height: 1,
+            view: 0,
+            proposer: nid(1),
+            state_commitment: [0u8; 32],
+            commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
+        };
+        let block = crate::replication::block::Block { header, commands };
+        node.apply_commit(block);
+
+        // The first reconfig lands; the second is dropped because the
+        // history's now-non-genesis boundary at v_eff_a conflicts with
+        // any `v_eff >= v_eff_a`.
+        assert_eq!(node.validator_history.boundary_count(), 2);
+        assert_eq!(*node.validator_history.set_at(v_eff_a), five_validators());
+        // v_eff_b is past the only non-genesis boundary, so the same
+        // post-boundary set applies — confirming cmd_b did NOT land
+        // (otherwise the set would be six_validators).
+        assert_eq!(*node.validator_history.set_at(v_eff_b), five_validators());
+        assert_ne!(*node.validator_history.set_at(v_eff_b), six_validators());
+    }
+
+    #[test]
+    fn apply_commit_with_malformed_reconfig_payload_logs_and_drops() {
+        let mut node = make_node(nid(1));
+        // Tagged but truncated body — decode will error.
+        let bad_payload = bytes::Bytes::copy_from_slice(b"RECFG\0deliberately-truncated-body");
+        let commands = vec![bad_payload];
+        let header = crate::replication::block::BlockHeader {
+            parent_hash: genesis().hash(),
+            height: 1,
+            view: 0,
+            proposer: nid(1),
+            state_commitment: [0u8; 32],
+            commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
+        };
+        let block = crate::replication::block::Block { header, commands };
+        node.apply_commit(block);
+
+        // History unchanged — malformed payloads do not insert a
+        // boundary.
+        assert_eq!(node.validator_history.boundary_count(), 1);
     }
 
     // ── #178 follow-up: durable block store + ServeBlock fallback ────────────
