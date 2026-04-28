@@ -31,6 +31,7 @@
 #![allow(dead_code)]
 
 pub mod api;
+pub mod bls_key_history;
 pub mod dispatch;
 pub mod hotstuff;
 pub mod limits;
