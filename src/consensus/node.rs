@@ -301,6 +301,14 @@ pub struct NodeConfigForConsensus {
     /// time so the consensus-side floor is never undercut. Defaults to
     /// the constant.
     pub min_v_eff_delay: View,
+
+    /// Chain-level signature scheme selected at genesis (#288). Fixed
+    /// for the lifetime of the chain — switching requires a
+    /// coordinated chain restart from new genesis. Today only
+    /// `Ed25519Collected` is implemented; the BLS variant lands in #289
+    /// and the "node built for the wrong scheme" mismatch check lands
+    /// in #292.
+    pub signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice,
 }
 
 impl NodeConfigForConsensus {
@@ -323,6 +331,7 @@ impl NodeConfigForConsensus {
             // policy. The default keeps the snapshot store untouched.
             snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
             min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+            signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
         }
     }
 }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::cli::OutputFormat;
+use crate::crypto::sig_scheme::SignatureSchemeChoice;
 use crate::p2p::identity::KeyProvider;
 use crate::p2p::identity::encrypted_file::EncryptedFileKeyProvider;
 use crate::p2p::identity::env::EnvKeyProvider;
@@ -197,6 +198,14 @@ pub struct ConsensusConfig {
     /// enforces the bound.
     #[serde(default = "default_snapshot_chunk_size_bytes")]
     pub snapshot_chunk_size_bytes: u32,
+    /// Signature scheme used by this chain's QCs. Selected at genesis
+    /// and **fixed** for the lifetime of the chain — switching requires
+    /// a coordinated restart from new genesis. Defaults to
+    /// `"ed25519_collected"`. Unknown values are rejected at parse time
+    /// so an operator who fat-fingers the field learns at startup
+    /// rather than mid-cluster. See [`SignatureSchemeChoice`].
+    #[serde(default)]
+    pub signature_scheme: SignatureSchemeChoice,
 }
 
 impl ConsensusConfig {
@@ -1085,6 +1094,55 @@ validators = ["a"]
             crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
         );
         assert_eq!(cons.limits.mempool_capacity, 1024);
+        // Default scheme: collected Ed25519. BLS lands at #289.
+        assert_eq!(
+            cons.signature_scheme,
+            SignatureSchemeChoice::Ed25519Collected,
+        );
+    }
+
+    #[test]
+    fn consensus_signature_scheme_explicit_ed25519_collected_parses() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+signature_scheme = "ed25519_collected"
+"#,
+        );
+        let cons = c.consensus.expect("consensus section");
+        assert_eq!(
+            cons.signature_scheme,
+            SignatureSchemeChoice::Ed25519Collected,
+        );
+    }
+
+    #[test]
+    fn consensus_signature_scheme_unknown_value_fails_to_parse() {
+        // Catch operator typos at startup, not on the first QC.
+        let s = r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["a"]
+signature_scheme = "ed25519_aggregated"
+"#;
+        let err = toml::from_str::<Config>(s).expect_err("unknown scheme must not parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signature_scheme") || msg.contains("ed25519_aggregated"),
+            "error must point at the offending field/value, got: {msg}",
+        );
     }
 
     #[test]

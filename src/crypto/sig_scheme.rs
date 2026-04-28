@@ -40,6 +40,7 @@
 use std::fmt::{self, Debug};
 
 use ring::signature::{ED25519, UnparsedPublicKey};
+use serde::{Deserialize, Serialize};
 
 use crate::consensus::hotstuff::qc::SignerBitmap;
 use crate::p2p::NodeId;
@@ -150,6 +151,43 @@ impl fmt::Display for AggregateVerifyError {
 }
 
 impl std::error::Error for AggregateVerifyError {}
+
+/// Chain-level choice of signature scheme, selected at genesis (#288).
+///
+/// Within a single chain every validator uses the same scheme and every
+/// QC carries one form of aggregate. Switching schemes requires a
+/// coordinated chain restart from new genesis (mixed-scheme chains are
+/// out of scope, see #143).
+///
+/// Stored in `[consensus]` TOML as
+/// `signature_scheme = "ed25519_collected"` (and, once #289 lands,
+/// `"bls_aggregated"`). Unknown values fail to parse — callers should
+/// surface that as a startup error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureSchemeChoice {
+    /// One raw Ed25519 signature per signer plus a [`SignerBitmap`];
+    /// `O(n)` verifies, wire size grows with the quorum.
+    /// See [`Ed25519Collected`].
+    #[default]
+    Ed25519Collected,
+    // BlsAggregated arrives in #289.
+}
+
+impl SignatureSchemeChoice {
+    /// Stable name used on the wire and in error messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ed25519Collected => Ed25519Collected::NAME,
+        }
+    }
+}
+
+impl fmt::Display for SignatureSchemeChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 /// Collected-Ed25519 scheme: each QC carries one 64-byte signature per
 /// signer in a `Vec<[u8; 64]>` parallel to the [`SignerBitmap`].
