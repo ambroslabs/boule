@@ -435,17 +435,22 @@ impl QuorumCertificate {
     ///
     /// For Ed25519: the parallel `Vec<[u8; 64]>` length must equal the
     /// bitmap's set-bit count.
-    /// For BLS: the aggregate is a single point so there's no count to
-    /// check; only the bitmap shape is validated. The aggregate's
-    /// cryptographic well-formedness is exercised by
-    /// [`Self::verify_aggregate_bls`].
+    /// For BLS: the aggregate is a single G2 point, so there's no count
+    /// to check, but the bitmap-emptiness and aggregate-emptiness must
+    /// agree: an empty bitmap requires the empty-aggregate sentinel,
+    /// and a non-empty bitmap requires a non-sentinel aggregate.
+    /// `verify_aggregate_bls` would catch the cryptographic side of the
+    /// same problem, but a structural reject here is cheap and lets
+    /// callers drop malformed QCs without paying a pairing check.
     pub fn is_well_formed(&self, vs: &ValidatorSet) -> bool {
         if self.signers.len() != vs.len() || !self.signers.is_well_formed() {
             return false;
         }
         match &self.signatures {
             QcSignatures::Ed25519Collected(sigs) => sigs.len() == self.signers.count(),
-            QcSignatures::BlsAggregated(_) => true,
+            QcSignatures::BlsAggregated(agg) => {
+                (self.signers.count() == 0) == BlsAggregated::is_empty_aggregate(agg)
+            }
         }
     }
 
@@ -972,6 +977,36 @@ mod tests {
     fn bls_helpers_panic_on_ed25519_qc() {
         let mut qc = QuorumCertificate::new(0, [0; 32], 4);
         qc.add_bls_partial(0, [0; 96]); // wrong API
+    }
+
+    #[test]
+    fn bls_qc_is_well_formed_rejects_signers_with_empty_aggregate() {
+        // A bitmap claiming signers but the aggregate still at the
+        // empty-sentinel is structurally malformed. Catch it at
+        // is_well_formed time so callers don't pay a pairing check.
+        let vs = four_validators();
+        let mut qc = QuorumCertificate::new_bls(3, [0xEE; 32], vs.len());
+        // Hand-set a bit without folding a partial in: leaves the
+        // aggregate at the sentinel.
+        qc.signers.set(1);
+        assert!(!qc.is_well_formed(&vs));
+    }
+
+    #[test]
+    fn bls_qc_is_well_formed_rejects_no_signers_with_non_sentinel_aggregate() {
+        // The other direction: empty bitmap but a non-sentinel
+        // aggregate is also structurally malformed. Forge by signing
+        // outside the QC API, then dropping the bytes into the
+        // aggregate slot without setting any signer bit.
+        let vs = four_validators();
+        let (sk, _) = bls_keypair(0x9A);
+        let stray = BlsAggregated::sign_partial(&sk, b"unrelated").unwrap();
+        let mut qc = QuorumCertificate::new_bls(4, [0xEF; 32], vs.len());
+        if let QcSignatures::BlsAggregated(agg) = &mut qc.signatures {
+            *agg = stray;
+        }
+        assert_eq!(qc.signer_count(), 0);
+        assert!(!qc.is_well_formed(&vs));
     }
 
     #[test]
