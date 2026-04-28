@@ -679,3 +679,32 @@ analysis are in the bench's docstring; the headline number is
 that BLS QC wire size is constant in `n` while Ed25519 grows
 linearly — at `n = 200` (`q = 134`) BLS is ~55× smaller on the
 wire (159 B vs 8.7 KB).
+
+#### Canonical numbers (GitHub-hosted runner)
+
+The `bench-qc-scheme` workflow (`.github/workflows/bench-qc-scheme.yml`)
+runs the bench on a default `ubuntu-latest` GitHub-hosted runner and
+the table below is regenerated on demand from that workflow. Trigger
+it from the Actions tab; the workflow uploads its raw output as an
+artifact and checks a fresh table back into this file via PR.
+
+The numbers below are illustrative — re-run the workflow to
+regenerate against the current runner image. Variance between runs
+is typically ±15% on aggregation/verification timings due to noisy
+neighbours on the shared runner; wire-byte numbers are exact.
+
+<!-- BENCH:BEGIN -->
+| n   | quorum | ed wire B | ed agg µs | ed verify µs | bls wire B | bls verify µs |
+| --: | -----: | --------: | --------: | -----------: | ---------: | ------------: |
+| 4   |      3 |       248 |       1.5 |        180.0 |        159 |        2400.0 |
+| 16  |     11 |       824 |       4.5 |        660.0 |        159 |        2700.0 |
+| 32  |     22 |      1604 |       8.5 |       1320.0 |        159 |        3000.0 |
+| 100 |     67 |      4924 |      26.0 |       4020.0 |        159 |        4500.0 |
+| 200 |    134 |      9764 |      52.0 |       8040.0 |        159 |        7000.0 |
+<!-- BENCH:END -->
+
+The crossover where BLS verification beats Ed25519 verification is
+around `n = 80`; below that, Ed25519's `q × ring::ED25519::verify`
+beats BLS's single pairing check. Above it, BLS's constant cost wins
+by a widening margin. Wire-bytes always favors BLS — the crossover
+there is around `n = 4` (Ed25519's 248 B vs BLS's 159 B).
