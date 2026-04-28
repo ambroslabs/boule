@@ -7,14 +7,15 @@
 //! - [`Ed25519Collected`]: one raw 64-byte Ed25519 signature per signer
 //!   plus a [`SignerBitmap`]. Verification is `O(n)` `ring::ED25519`
 //!   verifies. QC wire size scales with the quorum count.
-//! - `BlsAggregated` *(future, see #143)*: a single ~96-byte BLS point
-//!   aggregating every partial signature. Verification is one pairing
-//!   check. QC wire size is constant in `n`.
+//! - [`BlsAggregated`]: a single ~96-byte BLS12-381 G2 point aggregating
+//!   every partial. Verification is one pairing check. QC wire size is
+//!   constant in `n`.
 //!
-//! This module establishes the trait surface so both schemes can plug in
-//! through the same hooks. For #287 only [`Ed25519Collected`] is
-//! implemented and wired through [`QuorumCertificate`]; BLS arrives in
-//! #289 onward.
+//! Both schemes are implemented at the trait level. [`QuorumCertificate`]
+//! itself currently carries an Ed25519-shaped `signatures: Vec<[u8; 64]>`
+//! field; widening it to dispatch on either scheme (tagged enum or
+//! generic) lands when the BLS path is wired through the voting layer
+//! in #293.
 //!
 //! # Chain-level scheme selection
 //!
@@ -175,9 +176,9 @@ pub enum SignatureSchemeChoice {
     /// aggregate G2 point. `O(1)` pairing-check verification, constant
     /// QC wire size in `n`. See [`BlsAggregated`].
     ///
-    /// **Scaffold only as of #289** — keygen, signing, aggregation and
-    /// verification logic land in #290. A node that selects this
-    /// variant in genesis will fail at first call into the BLS path.
+    /// Keygen, signing, aggregation and verification are wired up;
+    /// proof-of-possession at validator registration arrives in #291,
+    /// and the integration with the HotStuff voting path is in #293.
     BlsAggregated,
 }
 
@@ -266,18 +267,17 @@ impl SignatureScheme for Ed25519Collected {
 /// BLS12-381 signature aggregation scheme: each QC carries a single
 /// ~96-byte aggregate G2 point. Verification is one pairing check.
 ///
-/// **Scaffold only as of #289.** The associated types are sized for the
-/// `min-pk` BLS12-381 variant (G1 pubkeys, G2 sigs) so #290 can fill
-/// in the actual `blst` calls without further trait churn:
+/// Uses the `min-pk` BLS12-381 variant (G1 pubkeys, G2 sigs):
 ///
 /// - [`PartialSig`]: 96-byte compressed G2 point (one validator's sig).
-/// - [`Aggregate`]: 96-byte compressed G2 point (sum of all partials).
+/// - [`Aggregate`]: 96-byte compressed G2 point (sum of all partials),
+///   or the all-zeros sentinel for the empty aggregate.
 /// - [`PublicKey`]: 48-byte compressed G1 point (validator's BLS pubkey).
 ///
-/// Every method here panics with a clearly-labeled `todo!` so a node
-/// that selects this scheme in genesis fails fast and visibly rather
-/// than producing nonsense QCs. #290 replaces the panics with real
-/// blst-backed logic; #291 adds proof-of-possession at registration.
+/// The IETF DST is the standard `_POP_` variant — proof-of-possession
+/// is the rogue-key-attack defense for chains that allow validators to
+/// register their own pubkey. PoP enforcement at registration time
+/// arrives in #291.
 ///
 /// [`PartialSig`]: SignatureScheme::PartialSig
 /// [`Aggregate`]: SignatureScheme::Aggregate
@@ -296,6 +296,144 @@ pub type BlsAggregate = [u8; 96];
 /// `min-pk` variant). 48 bytes per IETF.
 pub type BlsPublicKey = [u8; 48];
 
+/// 32-byte serialized BLS12-381 secret key.
+pub type BlsSecretKey = [u8; 32];
+
+/// Sentinel used in [`BlsAggregated::empty_aggregate`] to mean "no
+/// partials folded in yet." Distinct from any valid compressed G2
+/// point because the IETF compressed-infinity encoding has the
+/// infinity flag set in the high bits of byte 0, which is not all-zero.
+const BLS_EMPTY_AGGREGATE_SENTINEL: BlsAggregate = [0u8; 96];
+
+impl BlsAggregated {
+    /// IETF BLS signature DST: `_POP_` ciphersuite for the `min-pk`
+    /// G2-sig variant. Ties our protocol's DST to the standard
+    /// proof-of-possession scheme so PoP signatures (#291) and QC
+    /// signatures share the same hash-to-curve domain.
+    pub const DST: &'static [u8] = b"AMBROS_HOTSTUFF_BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+    /// Generate a fresh BLS keypair from input keying material.
+    /// `ikm` must be at least 32 bytes per the IETF spec; shorter
+    /// inputs are rejected.
+    pub fn keygen(ikm: &[u8]) -> Result<(BlsSecretKey, BlsPublicKey), BlsKeyError> {
+        let secret = blst::min_pk::SecretKey::key_gen(ikm, &[]).map_err(BlsKeyError::Blst)?;
+        let public = secret.sk_to_pk();
+        Ok((secret.to_bytes(), public.to_bytes()))
+    }
+
+    /// Produce a partial signature over `message` under `secret`. The
+    /// returned 96-byte compressed point is one validator's contribution
+    /// to a future QC aggregate.
+    pub fn sign_partial(
+        secret: &BlsSecretKey,
+        message: &[u8],
+    ) -> Result<BlsPartialSig, BlsKeyError> {
+        let sk = blst::min_pk::SecretKey::from_bytes(secret).map_err(BlsKeyError::Blst)?;
+        Ok(sk.sign(message, Self::DST, &[]).to_bytes())
+    }
+
+    /// Verify a single partial under `pubkey`. Used by leaders to
+    /// validate each incoming partial *before* folding it into the
+    /// aggregate — that way [`SignatureScheme::add_partial`] never sees
+    /// malformed bytes.
+    pub fn verify_partial(
+        pubkey: &BlsPublicKey,
+        message: &[u8],
+        partial: &BlsPartialSig,
+    ) -> Result<(), BlsKeyError> {
+        let pk = blst::min_pk::PublicKey::from_bytes(pubkey).map_err(BlsKeyError::Blst)?;
+        let sig = blst::min_pk::Signature::from_bytes(partial).map_err(BlsKeyError::Blst)?;
+        match sig.verify(true, message, Self::DST, &[], &pk, true) {
+            blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
+            err => Err(BlsKeyError::Blst(err)),
+        }
+    }
+
+    /// Produce a proof-of-possession (PoP) over `pubkey` using
+    /// `secret`. The PoP is a BLS signature whose message is the
+    /// validator's own compressed pubkey bytes — it proves the signer
+    /// actually holds the secret half of the registered pubkey.
+    ///
+    /// PoPs defend against rogue-key attacks: an attacker who picks a
+    /// pubkey `K' = K_target − K_self` cannot produce a valid PoP for
+    /// `K'` without holding its secret half, so the registration tx
+    /// can reject the malicious key. Required at validator
+    /// registration time on BLS chains; the reconfig path enforces
+    /// presence in #293, when the rest of the BLS integration also
+    /// lands.
+    pub fn sign_pop(secret: &BlsSecretKey) -> Result<BlsPop, BlsKeyError> {
+        let sk = blst::min_pk::SecretKey::from_bytes(secret).map_err(BlsKeyError::Blst)?;
+        let pubkey = sk.sk_to_pk().to_bytes();
+        let sig = sk.sign(&pubkey, Self::DST, &[]).to_bytes();
+        Ok(BlsPop { pubkey, sig })
+    }
+
+    /// Verify a [`BlsPop`]. Returns `Ok(())` iff:
+    /// 1. `pop.pubkey` equals `expected_pubkey` — an attacker cannot
+    ///    submit a PoP for someone else's key as their own.
+    /// 2. `pop.sig` is a valid BLS signature over `pop.pubkey` under
+    ///    `pop.pubkey` — proving possession of the secret half.
+    pub fn verify_pop(pop: &BlsPop, expected_pubkey: &BlsPublicKey) -> Result<(), BlsKeyError> {
+        if pop.pubkey != *expected_pubkey {
+            return Err(BlsKeyError::PopPubkeyMismatch);
+        }
+        let pk = blst::min_pk::PublicKey::from_bytes(&pop.pubkey).map_err(BlsKeyError::Blst)?;
+        let sig = blst::min_pk::Signature::from_bytes(&pop.sig).map_err(BlsKeyError::Blst)?;
+        match sig.verify(true, &pop.pubkey, Self::DST, &[], &pk, true) {
+            blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
+            err => Err(BlsKeyError::Blst(err)),
+        }
+    }
+}
+
+/// Proof-of-possession (PoP) bundle for a BLS validator pubkey.
+/// Carries the pubkey explicitly so the wire shape is self-describing:
+/// the PoP can be verified independently of the surrounding tx.
+///
+/// On BLS chains, every validator-registration tx (#140 / #251) embeds
+/// a `BlsPop` per `adds` entry; the reconfig validator (#293) rejects
+/// any add that lacks a PoP or whose PoP fails to verify. PoPs are
+/// persisted alongside the historical pubkey in
+/// [`crate::consensus::validator_key_history`] (#294) so historical
+/// validator-set lookups never trust an unverified key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlsPop {
+    #[serde(with = "serde_g1_pubkey")]
+    pub pubkey: BlsPublicKey,
+    #[serde(with = "serde_g2_sig")]
+    pub sig: BlsPartialSig,
+}
+
+mod serde_g1_pubkey {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(pk: &[u8; 48], s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&pk[..], s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 48], D::Error> {
+        let v: Vec<u8> = Vec::<u8>::deserialize(d)?;
+        v.as_slice()
+            .try_into()
+            .map_err(|_| D::Error::custom("BLS pubkey must be exactly 48 bytes"))
+    }
+}
+
+mod serde_g2_sig {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(sig: &[u8; 96], s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&sig[..], s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 96], D::Error> {
+        let v: Vec<u8> = Vec::<u8>::deserialize(d)?;
+        v.as_slice()
+            .try_into()
+            .map_err(|_| D::Error::custom("BLS sig must be exactly 96 bytes"))
+    }
+}
+
 impl SignatureScheme for BlsAggregated {
     type PartialSig = BlsPartialSig;
     type Aggregate = BlsAggregate;
@@ -304,44 +442,123 @@ impl SignatureScheme for BlsAggregated {
     const NAME: &'static str = "bls_aggregated";
 
     fn empty_aggregate() -> Self::Aggregate {
-        // Identity element placeholder. Once #290 is real, this becomes
-        // the G2 identity in the chosen serialization.
-        [0u8; 96]
+        BLS_EMPTY_AGGREGATE_SENTINEL
     }
 
     fn add_partial(
-        _agg: &mut Self::Aggregate,
-        _signers_before: &SignerBitmap,
-        _validator_idx: usize,
-        _partial: Self::PartialSig,
+        agg: &mut Self::Aggregate,
+        signers_before: &SignerBitmap,
+        validator_idx: usize,
+        partial: Self::PartialSig,
     ) {
-        todo!(
-            "BlsAggregated::add_partial: BLS aggregation logic lands in #290, \
-             see https://github.com/zrbecker/ambros-p2p/issues/290",
-        )
+        if signers_before.get(validator_idx) {
+            return;
+        }
+        let new_sig = blst::min_pk::Signature::from_bytes(&partial).unwrap_or_else(|e| {
+            panic!(
+                "BlsAggregated::add_partial: malformed partial sig for validator {validator_idx}: {e:?}. \
+                 Caller must verify partials with BlsAggregated::verify_partial before aggregating.",
+            )
+        });
+
+        if *agg == BLS_EMPTY_AGGREGATE_SENTINEL {
+            *agg = new_sig.to_bytes();
+            return;
+        }
+
+        let current_sig = blst::min_pk::Signature::from_bytes(agg)
+            .expect("aggregate state must be a valid compressed G2 point");
+        let mut combined = blst::min_pk::AggregateSignature::from_signature(&current_sig);
+        combined
+            .add_signature(&new_sig, false)
+            .expect("partial was already deserialized; subgroup check optional here");
+        *agg = combined.to_signature().to_bytes();
     }
 
     fn aggregate_count(_agg: &Self::Aggregate) -> usize {
-        // BLS aggregates are a single point; the "count" is carried
-        // alongside as the bitmap's set-bit count, not embedded in the
-        // aggregate. Returning 0 here is harmless (no caller exists yet)
-        // and is the right answer once #290 lands — the count comes
-        // from `signers.count()`, not from the aggregate.
+        // BLS aggregates are a single point; the "count" lives in the
+        // bitmap, not in the aggregate. Verification helpers consult
+        // `signers.count()` directly. Returning 0 keeps the
+        // QuorumCertificate well-formedness check (#287) honest by
+        // preventing it from being driven off the aggregate side; that
+        // path is BLS-aware in #293.
         0
     }
 
     fn verify_aggregate(
-        _agg: &Self::Aggregate,
-        _signers: &SignerBitmap,
-        _message: &[u8],
-        _pubkeys: &[Self::PublicKey],
+        agg: &Self::Aggregate,
+        signers: &SignerBitmap,
+        message: &[u8],
+        pubkeys: &[Self::PublicKey],
     ) -> Result<(), AggregateVerifyError> {
-        todo!(
-            "BlsAggregated::verify_aggregate: BLS pairing check lands in #290, \
-             see https://github.com/zrbecker/ambros-p2p/issues/290",
-        )
+        if signers.len() != pubkeys.len() {
+            return Err(AggregateVerifyError::LengthMismatch {
+                bitmap_len: signers.len(),
+                pubkeys_len: pubkeys.len(),
+            });
+        }
+        let signer_count = signers.count();
+        let is_empty = *agg == BLS_EMPTY_AGGREGATE_SENTINEL;
+        if signer_count == 0 {
+            return if is_empty {
+                Ok(())
+            } else {
+                Err(AggregateVerifyError::Malformed {
+                    reason: "non-empty aggregate with no signers in bitmap",
+                })
+            };
+        }
+        if is_empty {
+            return Err(AggregateVerifyError::Malformed {
+                reason: "empty aggregate with non-zero signer bitmap",
+            });
+        }
+
+        let signature = blst::min_pk::Signature::from_bytes(agg)
+            .map_err(|_| AggregateVerifyError::InvalidAggregate)?;
+
+        let selected: Vec<blst::min_pk::PublicKey> = signers
+            .iter_set()
+            .map(|idx| {
+                blst::min_pk::PublicKey::from_bytes(&pubkeys[idx])
+                    .map_err(|_| AggregateVerifyError::InvalidAggregate)
+            })
+            .collect::<Result<_, _>>()?;
+        let pk_refs: Vec<&blst::min_pk::PublicKey> = selected.iter().collect();
+
+        match signature.fast_aggregate_verify(true, message, Self::DST, &pk_refs) {
+            blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
+            _ => Err(AggregateVerifyError::InvalidAggregate),
+        }
     }
 }
+
+/// Errors produced by the BLS keygen / signing / partial-verify / PoP
+/// helpers on [`BlsAggregated`]. Wraps the `blst` error code so callers
+/// can distinguish "bad input bytes" from "bad signature" without
+/// taking a transitive dep on the `blst` crate.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BlsKeyError {
+    Blst(blst::BLST_ERROR),
+    /// A [`BlsPop`]'s embedded pubkey did not match the
+    /// `expected_pubkey` argument passed to [`BlsAggregated::verify_pop`].
+    /// Distinguished from [`Self::Blst`] so the registration path can
+    /// surface "you submitted someone else's PoP" specifically.
+    PopPubkeyMismatch,
+}
+
+impl fmt::Display for BlsKeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blst(err) => write!(f, "blst error: {err:?}"),
+            Self::PopPubkeyMismatch => f.write_str(
+                "BLS proof-of-possession pubkey does not match expected validator pubkey",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BlsKeyError {}
 
 #[cfg(test)]
 mod tests {
@@ -555,39 +772,306 @@ mod tests {
     }
 
     #[test]
-    fn bls_aggregated_empty_aggregate_is_zeroed_placeholder() {
-        // #290 will replace this with the real G2 identity element.
-        // Today it's just zero bytes; we assert the placeholder shape so
-        // the contract is explicit for the next PR's regression check.
+    fn bls_aggregated_empty_aggregate_is_sentinel() {
+        // The sentinel represents "no partials folded in." It is
+        // distinct from any valid compressed G2 point because IETF
+        // compressed-infinity has the infinity flag set in byte 0 (a
+        // non-zero high bit), so all-zeros is unambiguously empty.
         assert_eq!(BlsAggregated::empty_aggregate(), [0u8; 96]);
+    }
+
+    #[test]
+    fn bls_keygen_produces_consistent_pubkey() {
+        let ikm = [0x42u8; 32];
+        let (sk1, pk1) = BlsAggregated::keygen(&ikm).unwrap();
+        let (sk2, pk2) = BlsAggregated::keygen(&ikm).unwrap();
+        assert_eq!(sk1, sk2, "keygen is deterministic in ikm");
+        assert_eq!(pk1, pk2);
+    }
+
+    #[test]
+    fn bls_keygen_rejects_short_ikm() {
+        // IETF requires at least 32 bytes of IKM.
+        let short = [0u8; 16];
+        assert!(BlsAggregated::keygen(&short).is_err());
+    }
+
+    fn bls_signer(seed: u8) -> (BlsSecretKey, BlsPublicKey) {
+        let mut ikm = [0u8; 32];
+        ikm.fill(seed);
+        BlsAggregated::keygen(&ikm).expect("seeded keygen must succeed")
+    }
+
+    #[test]
+    fn bls_sign_partial_round_trips_with_verify_partial() {
+        let (sk, pk) = bls_signer(0x11);
+        let message = b"hello bls";
+        let sig = BlsAggregated::sign_partial(&sk, message).unwrap();
+        BlsAggregated::verify_partial(&pk, message, &sig).expect("real signature must verify");
+    }
+
+    #[test]
+    fn bls_verify_partial_rejects_wrong_message() {
+        let (sk, pk) = bls_signer(0x22);
+        let sig = BlsAggregated::sign_partial(&sk, b"original").unwrap();
+        assert!(BlsAggregated::verify_partial(&pk, b"different", &sig).is_err());
+    }
+
+    #[test]
+    fn bls_verify_partial_rejects_wrong_pubkey() {
+        let (sk_a, _pk_a) = bls_signer(0x33);
+        let (_sk_b, pk_b) = bls_signer(0x44);
+        let sig = BlsAggregated::sign_partial(&sk_a, b"msg").unwrap();
+        assert!(BlsAggregated::verify_partial(&pk_b, b"msg", &sig).is_err());
+    }
+
+    #[test]
+    fn bls_aggregate_of_one_partial_verifies() {
+        let (sk, pk) = bls_signer(0x55);
+        let message = b"single signer aggregate";
+        let sig = BlsAggregated::sign_partial(&sk, message).unwrap();
+
+        let mut signers = SignerBitmap::new(1);
+        let mut agg = BlsAggregated::empty_aggregate();
+        BlsAggregated::add_partial(&mut agg, &signers, 0, sig);
+        signers.set(0);
+
+        BlsAggregated::verify_aggregate(&agg, &signers, message, &[pk])
+            .expect("single-signer BLS aggregate must verify");
+    }
+
+    #[test]
+    fn bls_aggregate_of_three_partials_verifies() {
+        let (sk0, pk0) = bls_signer(0xA0);
+        let (sk1, pk1) = bls_signer(0xA1);
+        let (sk2, pk2) = bls_signer(0xA2);
+        let pubkeys = vec![pk0, pk1, pk2];
+        let message = b"three-party quorum".to_vec();
+
+        let mut signers = SignerBitmap::new(3);
+        let mut agg = BlsAggregated::empty_aggregate();
+        for (idx, sk) in [&sk0, &sk1, &sk2].iter().enumerate() {
+            let sig = BlsAggregated::sign_partial(sk, &message).unwrap();
+            BlsAggregated::add_partial(&mut agg, &signers, idx, sig);
+            signers.set(idx);
+        }
+        BlsAggregated::verify_aggregate(&agg, &signers, &message, &pubkeys)
+            .expect("3-of-3 BLS aggregate must verify");
+    }
+
+    #[test]
+    fn bls_aggregate_of_partial_quorum_verifies_only_signed_indices() {
+        // Five validators, only 0/2/4 sign. Verification must use the
+        // selected pubkeys (per the bitmap) and succeed; if it tried to
+        // include 1 and 3, it would fail.
+        let signers_all: Vec<(BlsSecretKey, BlsPublicKey)> =
+            (0..5u8).map(|i| bls_signer(0xB0 | i)).collect();
+        let pubkeys: Vec<BlsPublicKey> = signers_all.iter().map(|(_, pk)| *pk).collect();
+        let message = b"partial quorum, sparse signers";
+
+        let mut signers = SignerBitmap::new(5);
+        let mut agg = BlsAggregated::empty_aggregate();
+        for &idx in &[0usize, 2, 4] {
+            let sig = BlsAggregated::sign_partial(&signers_all[idx].0, message).unwrap();
+            BlsAggregated::add_partial(&mut agg, &signers, idx, sig);
+            signers.set(idx);
+        }
+        BlsAggregated::verify_aggregate(&agg, &signers, message, &pubkeys)
+            .expect("3-of-5 BLS aggregate over indices {0,2,4} must verify");
+    }
+
+    #[test]
+    fn bls_verify_aggregate_rejects_tampered_aggregate() {
+        let (sk, pk) = bls_signer(0xC0);
+        let message = b"will tamper";
+        let sig = BlsAggregated::sign_partial(&sk, message).unwrap();
+        let mut signers = SignerBitmap::new(1);
+        let mut agg = BlsAggregated::empty_aggregate();
+        BlsAggregated::add_partial(&mut agg, &signers, 0, sig);
+        signers.set(0);
+        agg[10] ^= 0xFF;
+
+        assert!(matches!(
+            BlsAggregated::verify_aggregate(&agg, &signers, message, &[pk]),
+            Err(AggregateVerifyError::InvalidAggregate),
+        ));
+    }
+
+    #[test]
+    fn bls_verify_aggregate_rejects_wrong_message() {
+        let (sk, pk) = bls_signer(0xC1);
+        let sig = BlsAggregated::sign_partial(&sk, b"signed").unwrap();
+        let mut signers = SignerBitmap::new(1);
+        let mut agg = BlsAggregated::empty_aggregate();
+        BlsAggregated::add_partial(&mut agg, &signers, 0, sig);
+        signers.set(0);
+
+        assert!(matches!(
+            BlsAggregated::verify_aggregate(&agg, &signers, b"different", &[pk]),
+            Err(AggregateVerifyError::InvalidAggregate),
+        ));
+    }
+
+    #[test]
+    fn bls_verify_aggregate_rejects_signer_index_pointing_at_wrong_pubkey() {
+        // Validator 1 signs, but the aggregate is registered as if
+        // validator 0 signed. The pubkey at idx 0 belongs to the wrong
+        // signer, so verification fails.
+        let (_sk0, pk0) = bls_signer(0xD0);
+        let (sk1, pk1) = bls_signer(0xD1);
+        let pubkeys = vec![pk0, pk1];
+        let message = b"index swap";
+
+        let sig1 = BlsAggregated::sign_partial(&sk1, message).unwrap();
+        let mut signers = SignerBitmap::new(2);
+        let mut agg = BlsAggregated::empty_aggregate();
+        BlsAggregated::add_partial(&mut agg, &signers, 0, sig1);
+        signers.set(0);
+
+        assert!(matches!(
+            BlsAggregated::verify_aggregate(&agg, &signers, message, &pubkeys),
+            Err(AggregateVerifyError::InvalidAggregate),
+        ));
+    }
+
+    #[test]
+    fn bls_verify_aggregate_rejects_bitmap_pubkey_length_mismatch() {
+        let agg = BlsAggregated::empty_aggregate();
+        let signers = SignerBitmap::new(2);
         assert_eq!(
-            BlsAggregated::aggregate_count(&BlsAggregated::empty_aggregate()),
-            0,
+            BlsAggregated::verify_aggregate(&agg, &signers, b"x", &[[0u8; 48]]),
+            Err(AggregateVerifyError::LengthMismatch {
+                bitmap_len: 2,
+                pubkeys_len: 1
+            }),
         );
     }
 
     #[test]
-    #[should_panic(expected = "BlsAggregated::add_partial")]
-    fn bls_aggregated_add_partial_is_clearly_unimplemented() {
-        let mut agg = BlsAggregated::empty_aggregate();
-        let signers = SignerBitmap::new(1);
-        BlsAggregated::add_partial(&mut agg, &signers, 0, [0u8; 96]);
-    }
-
-    #[test]
-    #[should_panic(expected = "BlsAggregated::verify_aggregate")]
-    fn bls_aggregated_verify_is_clearly_unimplemented() {
+    fn bls_verify_aggregate_rejects_empty_aggregate_with_signers() {
+        // Bitmap claims a signer but the aggregate is the empty
+        // sentinel — structurally malformed.
+        let mut signers = SignerBitmap::new(1);
+        signers.set(0);
         let agg = BlsAggregated::empty_aggregate();
-        let signers = SignerBitmap::new(1);
-        let pubkeys: Vec<BlsPublicKey> = vec![[0u8; 48]];
-        let _ = BlsAggregated::verify_aggregate(&agg, &signers, b"x", &pubkeys);
+        assert!(matches!(
+            BlsAggregated::verify_aggregate(&agg, &signers, b"x", &[[0u8; 48]]),
+            Err(AggregateVerifyError::Malformed { .. }),
+        ));
     }
 
     #[test]
-    fn blst_dependency_is_actually_pulled_in() {
-        // Cheap smoke test that the `blst` crate is reachable from this
-        // crate. #290 turns this into a real keygen-and-sign test; for
-        // #289 we just want CI to fail loudly if the dep gets dropped.
-        let _zero = blst::min_pk::SecretKey::default();
+    fn bls_aggregate_resolution_constant_size_independent_of_n() {
+        // Sanity: the aggregate carried inside a QC is always 96 bytes
+        // regardless of the quorum size. This is the load-bearing
+        // property the BLS path is supposed to deliver vs.
+        // Ed25519Collected's `64 * (2f+1)` growth.
+        let large_n = 50;
+        let signers_all: Vec<(BlsSecretKey, BlsPublicKey)> =
+            (0..large_n).map(|i| bls_signer(i as u8)).collect();
+        let pubkeys: Vec<BlsPublicKey> = signers_all.iter().map(|(_, pk)| *pk).collect();
+        let message = b"size test";
+
+        let mut signers = SignerBitmap::new(large_n);
+        let mut agg = BlsAggregated::empty_aggregate();
+        for (idx, (sk, _)) in signers_all.iter().enumerate() {
+            let sig = BlsAggregated::sign_partial(sk, message).unwrap();
+            BlsAggregated::add_partial(&mut agg, &signers, idx, sig);
+            signers.set(idx);
+        }
+        // Aggregate size is the trait associated type's size, not a
+        // function of N.
+        assert_eq!(std::mem::size_of_val(&agg), 96);
+        BlsAggregated::verify_aggregate(&agg, &signers, message, &pubkeys)
+            .expect("50-of-50 aggregate must still verify in O(1) pairings");
+    }
+
+    #[test]
+    fn bls_add_partial_is_idempotent_for_already_set_index() {
+        let (sk, pk) = bls_signer(0xE0);
+        let message = b"idempotent add";
+        let sig = BlsAggregated::sign_partial(&sk, message).unwrap();
+        let mut signers = SignerBitmap::new(1);
+        let mut agg = BlsAggregated::empty_aggregate();
+        BlsAggregated::add_partial(&mut agg, &signers, 0, sig);
+        signers.set(0);
+        let after_first = agg;
+        BlsAggregated::add_partial(&mut agg, &signers, 0, sig);
+        assert_eq!(agg, after_first, "duplicate add must not mutate aggregate");
+
+        // Sanity: still verifies (it's still a 1-of-1 aggregate).
+        BlsAggregated::verify_aggregate(&agg, &signers, message, &[pk])
+            .expect("idempotent add must keep aggregate valid");
+    }
+
+    // ── BLS proof-of-possession (#291) ────────────────────────────────
+
+    #[test]
+    fn bls_pop_round_trips_under_correct_pubkey() {
+        let (sk, pk) = bls_signer(0xF0);
+        let pop = BlsAggregated::sign_pop(&sk).expect("PoP signing must succeed");
+        assert_eq!(pop.pubkey, pk);
+        BlsAggregated::verify_pop(&pop, &pk).expect("real PoP must verify");
+    }
+
+    #[test]
+    fn bls_pop_rejects_pubkey_mismatch() {
+        // An attacker who substitutes someone else's PoP for their own
+        // registration tx must be caught. `verify_pop` checks the
+        // embedded pubkey first.
+        let (sk_a, _pk_a) = bls_signer(0xF1);
+        let (_sk_b, pk_b) = bls_signer(0xF2);
+        let pop = BlsAggregated::sign_pop(&sk_a).unwrap();
+        // pop.pubkey is pk_a; checking against pk_b must fail.
+        assert_eq!(
+            BlsAggregated::verify_pop(&pop, &pk_b),
+            Err(BlsKeyError::PopPubkeyMismatch),
+        );
+    }
+
+    #[test]
+    fn bls_pop_rejects_tampered_signature() {
+        let (sk, pk) = bls_signer(0xF3);
+        let mut pop = BlsAggregated::sign_pop(&sk).unwrap();
+        pop.sig[0] ^= 0xFF;
+        assert!(BlsAggregated::verify_pop(&pop, &pk).is_err());
+    }
+
+    #[test]
+    fn bls_pop_postcard_roundtrip() {
+        // Wire-format stability: the PoP encodes/decodes through
+        // postcard. `[u8; 48]` and `[u8; 96]` go through the
+        // dedicated serde modules above.
+        let (sk, _pk) = bls_signer(0xF4);
+        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let bytes = postcard::to_stdvec(&pop).unwrap();
+        let back: BlsPop = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, pop);
+    }
+
+    #[test]
+    fn bls_pop_for_one_validator_does_not_validate_under_another() {
+        // Forgery defense: a PoP signed under sk_a is not a valid PoP
+        // for any other pubkey, even if the byte payload (the embedded
+        // pubkey) is swapped to pk_b. The signature itself is over the
+        // pubkey, so swapping invalidates the signature.
+        let (sk_a, pk_a) = bls_signer(0xF5);
+        let (_sk_b, pk_b) = bls_signer(0xF6);
+        let mut pop = BlsAggregated::sign_pop(&sk_a).unwrap();
+        // Forge: replace embedded pubkey with pk_b but keep sig from sk_a.
+        pop.pubkey = pk_b;
+        // Now caller passes pk_b as expected, so the mismatch check
+        // passes, but the signature verifies over pk_b's bytes under
+        // pk_a's signature — must fail at the BLS verify step.
+        assert!(matches!(
+            BlsAggregated::verify_pop(&pop, &pk_b),
+            Err(BlsKeyError::Blst(_)),
+        ));
+        // For completeness: with the correct expected pubkey (pk_a), the
+        // mismatch check fires first.
+        assert_eq!(
+            BlsAggregated::verify_pop(&pop, &pk_a),
+            Err(BlsKeyError::PopPubkeyMismatch),
+        );
     }
 }
