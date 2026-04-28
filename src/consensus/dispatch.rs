@@ -143,6 +143,13 @@ pub enum IngressError {
     Decode(postcard::Error),
     UnknownSigner(NodeId),
     InvalidSignature(anyhow::Error),
+    /// A NewView's `high_qc` is not well-formed under the validator set
+    /// authoritative at `high_qc.view` (bitmap length mismatch, stray
+    /// bits, or signature/bit count divergence). Carries the
+    /// `high_qc.view` so logs and tests can distinguish boundaries.
+    MalformedHighQc {
+        view: View,
+    },
 }
 
 impl std::fmt::Display for IngressError {
@@ -153,6 +160,10 @@ impl std::fmt::Display for IngressError {
                 write!(f, "signer {id:?} is not in the validator set")
             }
             IngressError::InvalidSignature(e) => write!(f, "signature verification failed: {e}"),
+            IngressError::MalformedHighQc { view } => write!(
+                f,
+                "NewView's high_qc at view {view} is not well-formed under the historical validator set",
+            ),
         }
     }
 }
@@ -162,7 +173,7 @@ impl std::error::Error for IngressError {
         match self {
             IngressError::Decode(e) => Some(e),
             IngressError::InvalidSignature(e) => Some(e.as_ref()),
-            IngressError::UnknownSigner(_) => None,
+            IngressError::UnknownSigner(_) | IngressError::MalformedHighQc { .. } => None,
         }
     }
 }
@@ -237,12 +248,23 @@ pub fn ingress_wire(
             // field — the closest signal we have is `high_qc.view`. The
             // signer at the receiving boundary is whoever entered the
             // *next* view armed with this high_qc, so we look up against
-            // the set at `high_qc.view`. #250 will refine the boundary
-            // semantics with a dedicated test.
+            // the set at `high_qc.view`. The `high_qc` itself was minted
+            // at `high_qc.view` under the same set (#250) — so its
+            // bitmap shape, signature count, and quorum threshold must
+            // all match the historical set, not the current one.
             let high_qc_view = signed.payload.high_qc.view;
             let vs = history.set_at(high_qc_view);
             verify_signer(signed.signer, &vs)?;
             verify_sig(&signed)?;
+            // #250: well-formedness of the embedded high_qc against the
+            // set authoritative at `high_qc.view`. A NewView whose
+            // high_qc was constructed against a different set size
+            // (e.g. minted under the new set after a reconfig but
+            // claimed at a pre-boundary view) is rejected here before
+            // it can pollute the safety core's `state.high_qc`.
+            if !signed.payload.high_qc.is_well_formed(&vs) {
+                return Err(IngressError::MalformedHighQc { view: high_qc_view });
+            }
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
                     signed,
@@ -1310,6 +1332,119 @@ mod tests {
         assert!(matches!(
             dispatches[0],
             Dispatch::Safety(SafetyEvent::ProposalReceived(_))
+        ));
+    }
+
+    // ── ingress: NewView high_qc cross-boundary semantics (#250) ─────────────
+
+    /// A NewView straddling a reconfig boundary: high_qc.view = v_eff - 1
+    /// (still under the old set), envelope signer is in the old set,
+    /// high_qc bitmap shape matches the old set. Must be accepted —
+    /// historical messages do not get retroactively re-validated against
+    /// the newer committee.
+    #[test]
+    fn new_view_with_pre_boundary_high_qc_under_old_set_accepted() {
+        let old_a = fresh_signer();
+        let old_b = fresh_signer();
+        let new_only = fresh_signer();
+        let old_set = make_vs_with_signers(&[&old_a, &old_b]);
+        let new_set = make_vs_with_signers(&[&old_a, &old_b, &new_only]);
+
+        let v_eff: View = 5;
+        let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
+        history.insert_boundary(v_eff, new_set).unwrap();
+
+        // high_qc minted at view v_eff - 1 against the *old* set.
+        let mut high_qc = QuorumCertificate::new(v_eff - 1, [0xAB; 32], old_set.len());
+        for i in 0..old_set.len() {
+            high_qc.add_signature(i, [0xCC; 64]);
+        }
+        assert!(high_qc.is_well_formed(&old_set));
+
+        let nv = NewView { high_qc };
+        let signed = Signed::sign(nv, &old_a).unwrap();
+        let wire = WireMessage::NewView(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let dispatches = ingress(old_a.node_id(), &bytes, &history).unwrap();
+        assert_eq!(dispatches.len(), 2);
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::NewViewReceived(_))
+        ));
+        assert!(matches!(
+            dispatches[1],
+            Dispatch::Pacemaker(pacemaker::Event::OnQc(v)) if v == v_eff - 1
+        ));
+    }
+
+    /// A NewView claiming a pre-boundary high_qc.view but whose high_qc
+    /// bitmap is sized against the *new* (post-boundary) set: rejected
+    /// with `MalformedHighQc`. The new set is larger here, so the bitmap
+    /// length doesn't match `set_at(high_qc.view) = old_set` and
+    /// well-formedness fails.
+    #[test]
+    fn new_view_with_high_qc_minted_against_new_set_rejected_at_pre_boundary_view() {
+        let old_a = fresh_signer();
+        let old_b = fresh_signer();
+        let new_only = fresh_signer();
+        let old_set = make_vs_with_signers(&[&old_a, &old_b]);
+        let new_set = make_vs_with_signers(&[&old_a, &old_b, &new_only]);
+
+        let v_eff: View = 5;
+        let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
+        history.insert_boundary(v_eff, new_set.clone()).unwrap();
+
+        // high_qc minted against the *new* (larger) set, but claimed at
+        // a pre-boundary view. The bitmap length will be `new_set.len()`,
+        // which doesn't match `set_at(v_eff - 1) = old_set`.
+        let mut high_qc = QuorumCertificate::new(v_eff - 1, [0xAB; 32], new_set.len());
+        for i in 0..new_set.len() {
+            high_qc.add_signature(i, [0xDD; 64]);
+        }
+        assert!(high_qc.is_well_formed(&new_set));
+        assert!(!high_qc.is_well_formed(&old_set));
+
+        // Envelope signer must verify first; pick someone in the old set
+        // so we exercise the high_qc check rather than the signer check.
+        let nv = NewView { high_qc };
+        let signed = Signed::sign(nv, &old_a).unwrap();
+        let wire = WireMessage::NewView(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let err = ingress(old_a.node_id(), &bytes, &history).unwrap_err();
+        assert!(
+            matches!(err, IngressError::MalformedHighQc { view } if view == v_eff - 1),
+            "expected MalformedHighQc at v_eff - 1, got {err:?}",
+        );
+    }
+
+    /// Sanity: the existing single-set `ingress_new_view_emits_pacemaker_on_qc`
+    /// test exercises the genesis-only path. Mirror that here with an
+    /// explicit history of length 1, so a regression in the well-formedness
+    /// check catches both flavors.
+    #[test]
+    fn new_view_under_genesis_only_history_round_trips() {
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+
+        let mut high_qc = QuorumCertificate::new(7, [0xCD; 32], vs.len());
+        high_qc.add_signature(0, [0x11; 64]);
+        let nv = NewView { high_qc };
+        let signed = Signed::sign(nv, &signer).unwrap();
+        let wire = WireMessage::NewView(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let dispatches = ingress(signer.node_id(), &bytes, &history).unwrap();
+        assert_eq!(dispatches.len(), 2);
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::NewViewReceived(_))
+        ));
+        assert!(matches!(
+            dispatches[1],
+            Dispatch::Pacemaker(pacemaker::Event::OnQc(7))
         ));
     }
 }
