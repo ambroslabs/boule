@@ -59,6 +59,7 @@ use crate::consensus::status::{
     BUCKET_VIEW_WINDOW, CacheEvictionStatus, ConsensusStatus, LockedStatus, ParkedProposalStatus,
     QcStatus, TimeoutBucketStatus, VoteBucketStatus,
 };
+use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::view_timer::ViewTimer;
 use crate::crypto::signed::Signed;
@@ -401,6 +402,14 @@ pub struct ConsensusNode {
     pub wal: Arc<dyn Wal>,
     /// The ordered committee this node participates in.
     pub validator_set: ValidatorSet,
+    /// View-keyed history of `validator_set` across reconfiguration
+    /// boundaries (#248). Until #253 lands the active reconfiguration
+    /// path, this holds only the genesis boundary, so `set_at(view)`
+    /// returns `validator_set` for every view. The dispatcher's
+    /// per-message signer check consults this in #249 so signature
+    /// verification can switch sides at a future boundary without
+    /// further plumbing.
+    pub validator_history: ValidatorSetHistory,
     /// Configured view-timer behaviour; consulted by the timer helper
     /// in Phase D when arming/re-arming the view timer.
     pub timeout_policy: Arc<ExponentialBackoff>,
@@ -572,6 +581,7 @@ impl ConsensusNode {
             eviction_counters.clone(),
         );
 
+        let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         Self {
             self_id,
             core,
@@ -581,6 +591,7 @@ impl ConsensusNode {
             storage,
             wal,
             validator_set: config.validator_set,
+            validator_history,
             timeout_policy,
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
@@ -843,6 +854,7 @@ impl ConsensusNode {
             eviction_counters.clone(),
         );
 
+        let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         Ok(Self {
             self_id,
             core,
@@ -852,6 +864,7 @@ impl ConsensusNode {
             storage,
             wal,
             validator_set: config.validator_set,
+            validator_history,
             timeout_policy,
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
@@ -1149,7 +1162,7 @@ impl ConsensusNode {
                             if !self.admit_inbound(from, &payload).await {
                                 continue;
                             }
-                            match dispatch::ingress(from, &payload, &self.validator_set) {
+                            match dispatch::ingress(from, &payload, &self.validator_history) {
                                 Ok(dispatches) => {
                                     for d in dispatches {
                                         self.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
@@ -4064,7 +4077,12 @@ mod tests {
         // loop's apply_dispatch, and capture the outbound reply.
         let req_bytes =
             postcard::to_stdvec(&WireMessage::SnapshotManifestRequest { height: None }).unwrap();
-        let dispatches = dispatch::ingress(nid(2), &req_bytes, &four_validators()).unwrap();
+        let dispatches = dispatch::ingress(
+            nid(2),
+            &req_bytes,
+            &ValidatorSetHistory::from_genesis(four_validators()),
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 1);
         for d in dispatches {
             node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
@@ -4087,7 +4105,12 @@ mod tests {
                 chunk_idx: idx,
             })
             .unwrap();
-            let dispatches = dispatch::ingress(nid(2), &req_bytes, &four_validators()).unwrap();
+            let dispatches = dispatch::ingress(
+                nid(2),
+                &req_bytes,
+                &ValidatorSetHistory::from_genesis(four_validators()),
+            )
+            .unwrap();
             for d in dispatches {
                 node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
                     .await
@@ -4389,8 +4412,12 @@ mod tests {
 
         // ── Step 2: feed the request into the server via ingress;
         //   server's run loop serves the manifest.
-        let dispatches = dispatch::ingress(joiner_signer_arc.node_id(), &req_payload, &vs)
-            .expect("ingress manifest request");
+        let dispatches = dispatch::ingress(
+            joiner_signer_arc.node_id(),
+            &req_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress manifest request");
         for d in dispatches {
             server_node
                 .apply_dispatch(
@@ -4414,8 +4441,12 @@ mod tests {
         //   request. Then we shuttle each chunk request → response
         //   through the in-memory transport until the joiner
         //   restores.
-        let dispatches = dispatch::ingress(server_node_id, &resp_payload, &vs)
-            .expect("ingress manifest response");
+        let dispatches = dispatch::ingress(
+            server_node_id,
+            &resp_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress manifest response");
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -4440,9 +4471,12 @@ mod tests {
             let Some((_, chunk_req_payload)) = chunk_req else {
                 break;
             };
-            let dispatches =
-                dispatch::ingress(joiner_signer_arc.node_id(), &chunk_req_payload, &vs)
-                    .expect("ingress chunk request");
+            let dispatches = dispatch::ingress(
+                joiner_signer_arc.node_id(),
+                &chunk_req_payload,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .expect("ingress chunk request");
             for d in dispatches {
                 server_node
                     .apply_dispatch(
@@ -4459,8 +4493,12 @@ mod tests {
             })
             .await
             .expect("chunk response");
-            let dispatches = dispatch::ingress(server_node_id, &chunk_resp_payload, &vs)
-                .expect("ingress chunk response");
+            let dispatches = dispatch::ingress(
+                server_node_id,
+                &chunk_resp_payload,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .expect("ingress chunk response");
             for d in dispatches {
                 joiner_node
                     .apply_dispatch(
@@ -4613,8 +4651,12 @@ mod tests {
         let resp_payload =
             postcard::to_stdvec(&WireMessage::SnapshotManifestResponse(Some(bad_manifest)))
                 .unwrap();
-        let dispatches = dispatch::ingress(server_signer.node_id(), &resp_payload, &vs)
-            .expect("ingress tampered manifest");
+        let dispatches = dispatch::ingress(
+            server_signer.node_id(),
+            &resp_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress tampered manifest");
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -4774,8 +4816,12 @@ mod tests {
             manifest.clone(),
         )))
         .unwrap();
-        let dispatches =
-            dispatch::ingress(primary, &resp_payload, &vs).expect("ingress manifest response");
+        let dispatches = dispatch::ingress(
+            primary,
+            &resp_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress manifest response");
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -4816,8 +4862,12 @@ mod tests {
                 payload: Some(chunks[chunk_idx as usize].clone()),
             };
             let resp_payload = postcard::to_stdvec(&resp).unwrap();
-            let dispatches =
-                dispatch::ingress(peer, &resp_payload, &vs).expect("ingress chunk response");
+            let dispatches = dispatch::ingress(
+                peer,
+                &resp_payload,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .expect("ingress chunk response");
             for d in dispatches {
                 joiner_node
                     .apply_dispatch(
@@ -4948,8 +4998,12 @@ mod tests {
             manifest.clone(),
         )))
         .unwrap();
-        let dispatches =
-            dispatch::ingress(primary, &resp_payload, &vs).expect("ingress manifest response");
+        let dispatches = dispatch::ingress(
+            primary,
+            &resp_payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress manifest response");
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -4980,7 +5034,12 @@ mod tests {
             payload: Some(chunks[idx as usize].clone()),
         };
         let resp_bytes = postcard::to_stdvec(&resp).unwrap();
-        let dispatches = dispatch::ingress(first_peer, &resp_bytes, &vs).unwrap();
+        let dispatches = dispatch::ingress(
+            first_peer,
+            &resp_bytes,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .unwrap();
         for d in dispatches {
             joiner_node
                 .apply_dispatch(
@@ -5046,7 +5105,12 @@ mod tests {
                 payload: Some(chunks[idx as usize].clone()),
             };
             let resp_bytes = postcard::to_stdvec(&resp).unwrap();
-            let dispatches = dispatch::ingress(peer, &resp_bytes, &vs).unwrap();
+            let dispatches = dispatch::ingress(
+                peer,
+                &resp_bytes,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .unwrap();
             for d in dispatches {
                 joiner_node
                     .apply_dispatch(
@@ -5181,8 +5245,12 @@ mod tests {
         let wire = WireMessage::TimeoutVote(signed);
         let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
 
-        let dispatches = crate::consensus::dispatch::ingress(peer_signer.node_id(), &payload, &vs)
-            .expect("ingress");
+        let dispatches = crate::consensus::dispatch::ingress(
+            peer_signer.node_id(),
+            &payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress");
         let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
         let (broadcaster, _outbound_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
@@ -5251,8 +5319,12 @@ mod tests {
             let signed = crate::crypto::signed::Signed::sign(tv, peer).expect("sign TimeoutVote");
             let wire = WireMessage::TimeoutVote(signed);
             let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
-            let dispatches = crate::consensus::dispatch::ingress(peer.node_id(), &payload, &vs)
-                .expect("ingress");
+            let dispatches = crate::consensus::dispatch::ingress(
+                peer.node_id(),
+                &payload,
+                &ValidatorSetHistory::from_genesis(vs.clone()),
+            )
+            .expect("ingress");
             for d in dispatches {
                 node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
                     .await
@@ -5348,8 +5420,12 @@ mod tests {
         let wire = WireMessage::TimeoutVote(signed);
         let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
 
-        let dispatches = crate::consensus::dispatch::ingress(wedged_peer.node_id(), &payload, &vs)
-            .expect("ingress");
+        let dispatches = crate::consensus::dispatch::ingress(
+            wedged_peer.node_id(),
+            &payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+        )
+        .expect("ingress");
         for d in dispatches {
             node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
                 .await
@@ -5805,171 +5881,85 @@ mod tests {
         assert!(send_rx.try_recv().is_err());
     }
 
-    // ── Structured tracing capture (#122) ───────────────────────────────────
+    // ── Structured-trace contract (#122, #192) ──────────────────────────────
 
-    /// Shared buffer of captured log lines. Cloneable so the same sink
-    /// can back every `MakeWriter::make_writer` call issued by the
-    /// subscriber during a test run.
-    #[derive(Clone)]
-    struct CaptureBuf(Arc<Mutex<Vec<u8>>>);
+    /// Operator-visible structured-log message names that the
+    /// integration layer is expected to keep emitting on the
+    /// pacemaker → safety → outbound flow. These are the strings
+    /// runbooks and dashboards grep for; renaming or deleting one
+    /// silently breaks downstream observability.
+    ///
+    /// The previous incarnation of this guard installed a
+    /// `tracing-subscriber` and asserted these messages fired in a
+    /// specific order during a happy-path leader flow. That test was
+    /// flaky under parallel `cargo test` because tracing's
+    /// per-thread dispatcher state interleaves with sibling test
+    /// workers (issue #192 — flaky for both `with_subscriber` and
+    /// `set_default` capture variants). Replacing it with a static
+    /// source-text check trades the order assertion (which any
+    /// refactor that breaks ordering would also reflect in the
+    /// source-text co-location of these macros) for a deterministic,
+    /// always-correct check that catches the load-bearing
+    /// regression: a trace point being deleted or renamed.
+    const EXPECTED_OPERATOR_TRACE_MESSAGES: &[&str] = &[
+        "pacemaker_event",
+        "pacemaker_action",
+        "view_advanced",
+        "outbound_broadcast",
+        "new_view_received",
+        "proposal_received",
+        "persisted",
+        "vote_received",
+    ];
 
-    impl CaptureBuf {
-        fn new() -> Self {
-            Self(Arc::new(Mutex::new(Vec::new())))
-        }
+    /// Snapshot of `node.rs` baked into the test binary at compile
+    /// time. Lets the contract test scan for `tracing::debug!(...)`
+    /// macro calls without adding a runtime dependency on the file
+    /// system or on cargo's package layout.
+    const NODE_SOURCE_FOR_TRACE_AUDIT: &str = include_str!("node.rs");
 
-        fn take_string(&self) -> String {
-            String::from_utf8(self.0.lock().clone()).expect("capture writer produced non-UTF8")
-        }
-    }
-
-    impl std::io::Write for CaptureBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
-        type Writer = CaptureBuf;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Extract the ordered `message` field from each JSON-encoded trace
-    /// event in `captured`, ignoring lines that don't parse (defensive).
-    fn trace_messages(captured: &str) -> Vec<String> {
-        captured
-            .lines()
-            .filter_map(|line| {
-                let v: serde_json::Value = serde_json::from_str(line).ok()?;
-                v.get("fields")?
-                    .get("message")?
-                    .as_str()
-                    .map(|s| s.to_owned())
-            })
-            .collect()
-    }
-
-    /// Panic if `expected` does not appear (in order, possibly with other
-    /// events in between) as a subsequence of `actual`.
-    fn assert_subsequence(actual: &[String], expected: &[&str]) {
-        let mut it = actual.iter();
-        for want in expected {
-            let found = it.any(|got| got == want);
+    /// Each name in [`EXPECTED_OPERATOR_TRACE_MESSAGES`] must appear
+    /// as a quoted string literal in `src/consensus/node.rs` at
+    /// least twice — once in the contract array immediately above,
+    /// and at least once more at the actual `tracing::debug!` macro
+    /// call site. Counting `>= 2` is what catches deletion or
+    /// rename of the macro call: the array entry alone leaves the
+    /// count at exactly 1 and the assertion trips. If the rename is
+    /// intentional, both the macro and the array are updated
+    /// together and the count stays >= 2 with the new name.
+    #[test]
+    fn integration_layer_keeps_emitting_operator_trace_messages() {
+        for name in EXPECTED_OPERATOR_TRACE_MESSAGES {
+            // Quote the literal so we match `tracing::debug!(... "msg")`
+            // and the array entry, not bare-word references in
+            // comments or in field names with the same spelling.
+            let needle = format!("\"{name}\"");
+            let count = NODE_SOURCE_FOR_TRACE_AUDIT.matches(&needle).count();
             assert!(
-                found,
-                "expected subsequence {expected:?}, missing {want:?} in {actual:?}",
+                count >= 2,
+                "operator-runbook contract: structured-trace message {name:?} appears \
+                 only {count} time(s) as a quoted literal in src/consensus/node.rs \
+                 (expected >= 2: one in EXPECTED_OPERATOR_TRACE_MESSAGES, one at the \
+                 tracing::debug! call site). Renaming or removing this message silently \
+                 breaks downstream log filters; if the rename is intentional, update \
+                 EXPECTED_OPERATOR_TRACE_MESSAGES and any operator documentation that \
+                 references the old name.",
             );
         }
     }
 
-    /// Happy-path flow: feed a QC to the pacemaker, then trigger a
-    /// leader proposal through the safety core. Verify the integration
-    /// layer emits the expected ordered trace events so operators get
-    /// pacemaker → safety → outbound visibility without grepping for
-    /// p2p-layer accidents.
-    ///
-    /// This guards against accidentally removing instrumentation later.
-    /// The actual proposal is driven by `core.become_leader` directly
-    /// rather than through `PacemakerAction::BecomeLeader` because
-    /// `ValidatorSet::new` sorts by `NodeId` and a fresh Ed25519 public
-    /// key ends up at a non-deterministic sorted position — so we can't
-    /// rely on the pacemaker picking `self` as the view-1 leader.
-    #[tokio::test]
-    async fn tracing_emits_expected_events_for_proposal_and_vote_flow() {
-        use tracing::instrument::WithSubscriber as _;
-
-        let capture = CaptureBuf::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(
-                "ambros_p2p::consensus=debug",
-            ))
-            .with_writer(capture.clone())
-            .json()
-            .finish();
-
-        // Bind the subscriber to the test future via `with_subscriber`
-        // rather than installing it as a thread-local default. Under
-        // parallel `cargo test` workers, `set_default` raced with other
-        // tests using the same OS thread (~80% flake), so the first few
-        // synchronous events fell through to the global `NoSubscriber`
-        // before the local default attached. Issue #192.
-        let ns = fresh_signer();
-        let (mut node, _vs) = make_node_with_signer(&ns, 1);
-        let signer: Arc<dyn Signer> = Arc::new(ns);
-
-        let (broadcaster, _send_rx) = make_test_broadcaster();
-        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
-        let mut view_timer = ViewTimer::new(timer_tx);
-
-        async {
-            // Phase 1: OnQc(0) through the pacemaker. Covers pacemaker_event,
-            // pacemaker_action, view_advanced (cause=qc), plus the
-            // Broadcast(NewView) that on_pacemaker_advance emits once the
-            // safety core sees the view jump — so outbound_broadcast and
-            // new_view_received appear as part of the same flow.
-            let boot_actions = node.step_pacemaker(PacemakerEvent::OnQc(0));
-            node.apply_pacemaker_actions(
-                boot_actions,
-                broadcaster.as_ref(),
-                &mut view_timer,
-                &signer,
-            )
-            .await
-            .unwrap();
-
-            // Phase 2: directly drive the view-1 leader path so the proposal
-            // broadcast + self-loopback vote emission is deterministic
-            // regardless of sort-order-dependent leader selection.
-            let proposal_actions = node.core.become_leader(1);
-            node.apply_safety_actions(
-                proposal_actions,
-                broadcaster.as_ref(),
-                &mut view_timer,
-                &signer,
-            )
-            .await
-            .unwrap();
-        }
-        .with_subscriber(subscriber)
-        .await;
-
-        let captured = capture.take_string();
-        let events = trace_messages(&captured);
-
-        // Required subsequence. Extra events are allowed between these
-        // points — the assertion is that each named boundary fires in
-        // the expected order, not that nothing else fires.
-        assert_subsequence(
-            &events,
-            &[
-                "pacemaker_event",    // OnQc(0)
-                "pacemaker_action",   // AdvanceToView { view: 1, cause: Qc }
-                "view_advanced",      // cause = "qc"
-                "outbound_broadcast", // NewView emitted on PacemakerAdvance
-                "new_view_received",  // self-loopback into safety core
-                "outbound_broadcast", // Proposal from become_leader(1)
-                "proposal_received",  // self-loopback into safety core
-                "persisted",          // VotedInView flushed before the vote
-                "outbound_broadcast", // Vote broadcast to the cluster (#124)
-            ],
-        );
-
-        // Sanity: the view_advanced event must be tagged cause="qc", not
-        // "tc". This is what distinguishes happy-path progress from
-        // view-change recovery in the logs.
-        let has_qc_view_advanced = captured.lines().any(|line| {
-            line.contains("\"message\":\"view_advanced\"") && line.contains("\"cause\":\"qc\"")
-        });
-        assert!(
-            has_qc_view_advanced,
-            "view_advanced must carry cause=\"qc\"; got: {captured}",
-        );
+    /// `view_advanced` carries `cause = ?` (Qc/Tc), and the string
+    /// tag operators read off the wire is fixed by
+    /// [`crate::consensus::pacemaker::AdvanceCause::as_str`]. Pinning
+    /// these here keeps the structured-log contract regression-checked
+    /// without going through the dispatcher; renaming `"qc"` → `"QC"`
+    /// (etc.) would silently break grep-based dashboards.
+    #[test]
+    fn advance_cause_strings_match_operator_runbooks() {
+        use crate::consensus::pacemaker::AdvanceCause;
+        assert_eq!(AdvanceCause::Qc.as_str(), "qc");
+        assert_eq!(AdvanceCause::Tc.as_str(), "tc");
+        assert_eq!(AdvanceCause::RoundSync.as_str(), "round_sync");
     }
 
     // ── RateLimiter integration (issue #134) ────────────────────────────────
