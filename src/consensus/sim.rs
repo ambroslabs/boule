@@ -4137,13 +4137,10 @@ mod tests {
 
         // v_eff = 0: invalid for *any* commit_view since we require
         // commit_view + V_EFF_MIN_DELAY <= v_eff. Even the genesis
-        // block at view 0 wouldn't accept this. Both signatures verify
-        // — the structural check fires first.
-        let (mut env, _) = rotation_envelope_for_idx(&cluster, 1, 100).await;
-        env.payload.v_eff = 0;
-        // Re-sign so we're not also tripping the cryptographic check
-        // on a now-tampered payload. The structural check must run
-        // before sig verification, which is what we want to assert.
+        // block at view 0 wouldn't accept this. Build a fresh envelope
+        // signed at v_eff = 0 so both signatures verify cleanly — the
+        // structural check (which fires before any cryptographic check)
+        // is what we're asserting catches it.
         let current = cluster.signer(1).unwrap();
         let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
         let env = crate::consensus::validator_rotation::DualSignedRotation::sign(
