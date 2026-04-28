@@ -68,6 +68,7 @@ async fn dispatch(args: &[String]) -> anyhow::Result<()> {
         "key" => handle_key_subcommand(&args[1..]),
         "config" => handle_config(&args[1..]),
         "snapshot" => handle_snapshot_subcommand(&args[1..]),
+        "reconfig" => handle_reconfig_subcommand(&args[1..]),
         "--help" | "-h" | "help" => {
             print_usage();
             Ok(())
@@ -108,6 +109,25 @@ fn print_usage() {
     println!("      Read a directory layout produced by `snapshot export` and");
     println!("      write it back into the local consensus storage_dir's");
     println!("      snapshot store. Verifies chunk hashes against the manifest.");
+    println!();
+    println!("  reconfig add-validator --pubkey <base58> --addr <socketaddr> --v-eff <view>");
+    println!("      Build a tagged ReconfigCommand payload that adds a validator");
+    println!("      to the active committee at view `v_eff` and print it as hex");
+    println!("      on stdout. Operators inject the resulting bytes into a");
+    println!("      cluster member's mempool to propose the reconfig. The");
+    println!(
+        "      consensus floor is {} validators after applying;",
+        ambros_p2p::consensus::reconfig::MIN_VALIDATOR_FLOOR,
+    );
+    println!(
+        "      `v_eff` must be at least `current_view + {}`.",
+        ambros_p2p::consensus::reconfig::MIN_V_EFF_DELAY,
+    );
+    println!();
+    println!("  reconfig remove-validator --pubkey <base58> --v-eff <view>");
+    println!("      Build a tagged ReconfigCommand payload that removes a");
+    println!("      validator at view `v_eff` and print it as hex on stdout.");
+    println!("      Same rules as add-validator (floor, v_eff delay).");
     println!();
     println!("  config [--config <path>] [--format human|json|toml] [--raw|--edit|--path]");
     println!("      Print or edit the node's effective configuration. Default");
@@ -952,6 +972,120 @@ fn handle_snapshot_import(args: &[String]) -> anyhow::Result<()> {
         "imported snapshot height={} view={} chunks={} into consensus storage",
         manifest.height, manifest.view, manifest.chunk_count,
     );
+    Ok(())
+}
+
+// ── `reconfig` subcommand (#251) ───────────────────────────────────────────
+
+fn handle_reconfig_subcommand(args: &[String]) -> anyhow::Result<()> {
+    let sub = args.first().ok_or_else(|| {
+        anyhow::anyhow!("missing reconfig subcommand (try: add-validator, remove-validator)")
+    })?;
+    match sub.as_str() {
+        "add-validator" => handle_reconfig_add(&args[1..]),
+        "remove-validator" => handle_reconfig_remove(&args[1..]),
+        other => anyhow::bail!("unknown `reconfig` subcommand: {other}"),
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReconfigArgs {
+    pubkey: Option<String>,
+    addr: Option<String>,
+    v_eff: Option<u64>,
+}
+
+fn parse_reconfig_args(args: &[String]) -> anyhow::Result<ReconfigArgs> {
+    let mut out = ReconfigArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pubkey" => {
+                i += 1;
+                out.pubkey = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--pubkey requires a base58 NodeId"))?
+                        .clone(),
+                );
+            }
+            "--addr" => {
+                i += 1;
+                out.addr = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--addr requires a socket address"))?
+                        .clone(),
+                );
+            }
+            "--v-eff" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--v-eff requires a view number"))?;
+                out.v_eff = Some(
+                    raw.parse::<u64>()
+                        .map_err(|e| anyhow::anyhow!("invalid --v-eff {raw:?}: {e}"))?,
+                );
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("unknown reconfig flag: {other}"),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
+    use ambros_p2p::consensus::reconfig::ReconfigCommand;
+    use ambros_p2p::p2p::tls::base58_to_node_id;
+
+    let a = parse_reconfig_args(args)?;
+    let pubkey_b58 = a
+        .pubkey
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --pubkey <base58>"))?;
+    let addr_str = a
+        .addr
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --addr <socketaddr>"))?;
+    let v_eff = a
+        .v_eff
+        .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --v-eff <view>"))?;
+
+    let node_id = base58_to_node_id(pubkey_b58)
+        .map_err(|e| anyhow::anyhow!("--pubkey {pubkey_b58:?} is not a valid NodeId: {e}"))?;
+    let addr: std::net::SocketAddr = addr_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("--addr {addr_str:?} is not a valid socket address: {e}"))?;
+
+    let payload = ReconfigCommand::build_add_validator_payload(node_id, addr, v_eff);
+    println!("{}", hex::encode(&payload));
+    Ok(())
+}
+
+fn handle_reconfig_remove(args: &[String]) -> anyhow::Result<()> {
+    use ambros_p2p::consensus::reconfig::ReconfigCommand;
+    use ambros_p2p::p2p::tls::base58_to_node_id;
+
+    let a = parse_reconfig_args(args)?;
+    let pubkey_b58 = a
+        .pubkey
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --pubkey <base58>"))?;
+    let v_eff = a
+        .v_eff
+        .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --v-eff <view>"))?;
+    if a.addr.is_some() {
+        anyhow::bail!("reconfig remove-validator does not take --addr");
+    }
+
+    let node_id = base58_to_node_id(pubkey_b58)
+        .map_err(|e| anyhow::anyhow!("--pubkey {pubkey_b58:?} is not a valid NodeId: {e}"))?;
+
+    let payload = ReconfigCommand::build_remove_validator_payload(node_id, v_eff);
+    println!("{}", hex::encode(&payload));
     Ok(())
 }
 
