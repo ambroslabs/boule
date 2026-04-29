@@ -2180,6 +2180,78 @@ impl ConsensusNode {
             self.last_committed_height = manifest.height;
             self.last_committed_view = manifest.view;
         }
+        // Step 5b (#325 PR D): install the producer's validator
+        // history triple from the manifest. `SnapshotManifest::verify`
+        // has already cross-checked the embedded persisted forms
+        // against the snapshot block's stamped
+        // `validator_history_commitment` (called from
+        // `snapshot_sync::on_manifest_response`), so by the time we
+        // reach this point the histories are known to match the
+        // chain's claim. Without installing them here, the joiner's
+        // `validator_history` would remain genesis-only after
+        // restore — wrong on any chain that committed a reconfig
+        // before snapshot height — and a subsequent
+        // `verify_persisted_history_consistency` would reject every
+        // restart.
+        let installed_set =
+            crate::consensus::validator_history::ValidatorSetHistory::from_persisted(
+                manifest.validator_history.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("decode validator_history from manifest: {e}"))?;
+        let installed_key =
+            crate::consensus::validator_key_history::ValidatorKeyHistory::from_persisted(
+                manifest.validator_key_history.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("decode validator_key_history from manifest: {e}"))?;
+        let installed_bls = match &manifest.bls_key_history {
+            Some(p) => Some(
+                crate::consensus::bls_key_history::BlsKeyHistory::from_persisted(p.clone())
+                    .map_err(|e| anyhow::anyhow!("decode bls_key_history from manifest: {e}"))?,
+            ),
+            None => None,
+        };
+        // Mirror every post-genesis boundary into the safety core's
+        // history so vote tally / QC sizing / proposal-time leader
+        // pick all see the snapshot-time committee. Genesis is
+        // already seeded; only later boundaries need replay.
+        for (v_eff, set) in installed_set.iter() {
+            if v_eff == 0 {
+                continue;
+            }
+            self.core
+                .insert_validator_boundary(v_eff, (**set).clone())
+                .with_context(|| {
+                    format!("replay validator boundary at v_eff = {v_eff} from snapshot manifest")
+                })?;
+        }
+        // Re-install the pacemaker selector against the snapshot's
+        // history so leader rotation past `snapshot.view` honors the
+        // post-boundary committees.
+        let snapshot_set = (*installed_set.current_set()).clone();
+        self.validator_set = snapshot_set;
+        self.validator_history = installed_set;
+        self.validator_key_history = installed_key;
+        self.bls_key_history = installed_bls;
+        self.pacemaker
+            .set_selector(Arc::new(RoundRobinSelector::new(Arc::new(
+                self.validator_history.clone(),
+            ))));
+        // Persist the installed histories so a subsequent restart
+        // reads them back and the recovery-time consistency check
+        // (#325 PR B) finds them matching the chain. Failures log
+        // and drop — the in-memory state is authoritative for the
+        // running process.
+        if let Ok(bytes) = postcard::to_stdvec(&self.validator_history.to_persisted()) {
+            let _ = self.storage.put(STORAGE_KEY_VALIDATOR_HISTORY, &bytes);
+        }
+        if let Ok(bytes) = postcard::to_stdvec(&self.validator_key_history.to_persisted()) {
+            let _ = self.storage.put(STORAGE_KEY_VALIDATOR_KEY_HISTORY, &bytes);
+        }
+        if let Some(bls) = self.bls_key_history.as_ref() {
+            if let Ok(bytes) = postcard::to_stdvec(&bls.to_persisted()) {
+                let _ = self.storage.put(STORAGE_KEY_BLS_KEY_HISTORY, &bytes);
+            }
+        }
         // Mirror the recent_qcs cache update that
         // `persist_updates` would do for a normally-adopted high_qc;
         // keeps the snapshot-creation hook in `apply_commit`
@@ -3588,6 +3660,17 @@ impl ConsensusNode {
         // must embed the post-boundary committee so a fresh joiner's
         // QC verification picks the right set.
         let active_set = self.validator_history.set_at(block.header.view);
+        // #325 PR D: embed the producer's full `(validator_history,
+        // validator_key_history, bls_key_history?)` triple in the
+        // manifest's persisted forms. The joiner installs these
+        // verbatim during restore, and `SnapshotManifest::verify`
+        // cross-checks their v1 hash against the snapshot block's
+        // stamped `validator_history_commitment` so a tampered or
+        // rolled-back triple is rejected before any durable state on
+        // the joiner is touched.
+        let validator_history_persisted = self.validator_history.to_persisted();
+        let validator_key_history_persisted = self.validator_key_history.to_persisted();
+        let bls_key_history_persisted = self.bls_key_history.as_ref().map(|h| h.to_persisted());
         let manifest = SnapshotManifest::build(
             block.clone(), // `block` is `&Block` here; clone for the manifest's owned field.
             &active_set,
@@ -3595,6 +3678,9 @@ impl ConsensusNode {
             chunk_hashes,
             commit_qc,
             created_unix_secs,
+            validator_history_persisted,
+            validator_key_history_persisted,
+            bls_key_history_persisted,
         );
         let store = SnapshotStore::new(Arc::clone(&self.storage));
         store.save(&manifest, &chunks)?;
@@ -5336,8 +5422,14 @@ mod tests {
         for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
             qc.add_signature(i, [0u8; 64]);
         }
-        let manifest =
-            SnapshotManifest::build(block, &vs, chunk_size, chunk_hashes, qc, 1_700_000_000);
+        let manifest = SnapshotManifest::build_for_test_genesis_histories(
+            block,
+            &vs,
+            chunk_size,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        );
         SnapshotStore::new(Arc::clone(storage))
             .save(&manifest, &chunks)
             .expect("save snapshot");
@@ -5833,14 +5925,19 @@ mod tests {
         for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
             commit_qc.add_signature(i, [0u8; 64]);
         }
-        let manifest = crate::replication::snapshot::SnapshotManifest::build(
-            snapshot_block.clone(),
-            &vs,
-            1024,
-            chunk_hashes,
-            commit_qc,
-            1_700_000_000,
-        );
+        let manifest =
+            crate::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
+                snapshot_block,
+                &vs,
+                1024,
+                chunk_hashes,
+                commit_qc,
+                1_700_000_000,
+            );
+        // The helper patches `block.header.validator_history_commitment`
+        // which changes the block hash; rebind through the manifest so
+        // downstream assertions match the post-patch value.
+        let snapshot_block = manifest.block.clone();
         // Defensive: verify the manifest before saving — catches
         // any builder-side regression that would otherwise surface
         // only at the joiner's verification step.
@@ -6171,14 +6268,15 @@ mod tests {
         for i in 0..crate::consensus::hotstuff::qc::quorum_size(bad_vs.len()) {
             tampered_qc.add_signature(i, [0u8; 64]);
         }
-        let bad_manifest = crate::replication::snapshot::SnapshotManifest::build(
-            tampered_block,
-            &bad_vs,
-            64,
-            vec![[0u8; 32]],
-            tampered_qc,
-            1_700_000_000,
-        );
+        let bad_manifest =
+            crate::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
+                tampered_block,
+                &bad_vs,
+                64,
+                vec![[0u8; 32]],
+                tampered_qc,
+                1_700_000_000,
+            );
 
         // Synthesize a SnapshotManifestResponse from the server and
         // feed it to the joiner.
@@ -6294,14 +6392,15 @@ mod tests {
         for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
             commit_qc.add_signature(i, [0u8; 64]);
         }
-        let manifest = crate::replication::snapshot::SnapshotManifest::build(
-            snapshot_block.clone(),
-            &vs,
-            2,
-            chunk_hashes,
-            commit_qc,
-            1_700_000_000,
-        );
+        let manifest =
+            crate::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
+                snapshot_block.clone(),
+                &vs,
+                2,
+                chunk_hashes,
+                commit_qc,
+                1_700_000_000,
+            );
         manifest.verify(&vs).expect("manifest must verify");
 
         // ── Build the joiner ──────────────────────────────────────
@@ -6492,14 +6591,15 @@ mod tests {
         for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
             commit_qc.add_signature(i, [0u8; 64]);
         }
-        let manifest = crate::replication::snapshot::SnapshotManifest::build(
-            snapshot_block.clone(),
-            &vs,
-            2,
-            chunk_hashes,
-            commit_qc,
-            1_700_000_000,
-        );
+        let manifest =
+            crate::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
+                snapshot_block.clone(),
+                &vs,
+                2,
+                chunk_hashes,
+                commit_qc,
+                1_700_000_000,
+            );
 
         let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let joiner_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
