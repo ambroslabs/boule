@@ -1030,7 +1030,11 @@ impl ConsensusNode {
             .context("read last_committed from storage")?
         {
             Some(raw) => decode_last_committed(&raw)?,
-            None => LastCommitted { height: 0, view: 0 },
+            None => LastCommitted {
+                height: 0,
+                view: 0,
+                last_committed_hash: [0u8; 32],
+            },
         };
 
         // #254: recover the persisted validator history if any
@@ -1150,6 +1154,276 @@ impl ConsensusNode {
             ),
             chain_id,
         })
+    }
+
+    /// Walk the persisted committed-block chain from genesis to the
+    /// last-committed tip, rebuilding the validator histories from
+    /// each block's reconfig and rotation commands, and assert that
+    /// the rebuilt histories match what's currently loaded into this
+    /// node from storage.
+    ///
+    /// **Audit goal (#325 PR B / 7-F2 anti-rollback)**: a corrupted
+    /// or rolled-back persisted history blob — for instance, an
+    /// attacker who flipped a byte in a boundary's `v_eff` to seat a
+    /// validator early, or replaced the genesis member list — must be
+    /// rejected at startup before consensus signs anything against
+    /// the rolled-back state. This method is the gate.
+    ///
+    /// Two checks run together:
+    ///
+    /// 1. **Per-block commitment cross-check** (defense-in-depth):
+    ///    each block's
+    ///    [`crate::replication::block::BlockHeader::validator_history_commitment`]
+    ///    must match the rebuild's `(set, key, bls?)` snapshot taken
+    ///    *before* applying the block's commands. With PR A's
+    ///    pre-block stamping semantics, this matches what the leader
+    ///    actually signed at proposal time.
+    /// 2. **End-of-walk equality**: after applying every block's
+    ///    commands, the rebuilt persisted forms must equal the
+    ///    histories loaded from storage. This is the literal audit
+    ///    criterion: a tampered blob that survived the
+    ///    `from_persisted` invariants will diverge here.
+    ///
+    /// Caller contract: invoke this **after** [`Self::with_bls_key_history`]
+    /// has been wired in on BLS chains, since the BLS history is part
+    /// of the commitment.
+    ///
+    /// Returns `Err` on any divergence. The caller propagates: the
+    /// operator sees the error and the node refuses to start.
+    ///
+    /// # Out of scope
+    ///
+    /// Snapshot sync (#229) will eventually bound the walk; today it
+    /// walks the entire committed chain. For chains a few thousand
+    /// blocks deep this is fine (each iteration is a storage read +
+    /// in-memory hash); deployments with millions of blocks may
+    /// notice startup latency. Acceptable until #229 lands.
+    pub fn verify_persisted_history_consistency(&self) -> anyhow::Result<()> {
+        use crate::consensus::history_commitment::{
+            apply_reconfig_commands_to_set_history, apply_rotation_commands_to_histories,
+            validator_history_commitment_v1,
+        };
+
+        // Locate the chain tip from storage. Empty-tip = no blocks
+        // committed yet (fresh boot or freshly reset storage); the
+        // genesis-only triple in memory is trivially consistent with
+        // a zero-block chain, so there's nothing to walk.
+        let last_committed = match self
+            .storage
+            .get(STORAGE_KEY_LAST_COMMITTED)
+            .context("read last_committed from storage")?
+        {
+            Some(raw) => decode_last_committed(&raw)?,
+            None => return Ok(()),
+        };
+        if last_committed.height == 0 {
+            // No committed blocks past genesis; nothing to walk.
+            return Ok(());
+        }
+
+        // Walk backward from the tip to genesis, collecting blocks.
+        // The walk uses each block's `parent_hash` link, same as
+        // block-sync. Genesis is found either:
+        //
+        //  - in the in-memory `pending_blocks` (where
+        //    [`HotStuffState::new`] always pre-seeds it), or
+        //  - in storage at the `consensus/block/<genesis_hash>` key, if
+        //    the safety core's `persist_updates` ever wrote it (which
+        //    happens whenever a Locked / HighQc references genesis).
+        //
+        // We accept either source — both paths share the same hash so
+        // the rebuilt chain anchors on the same content. Failing to
+        // find genesis is an error (unreachable on a healthy chain
+        // because the chain head's parent walk must terminate at
+        // `genesis_hash`).
+        let configured_genesis_hash = self.core.state().genesis_hash;
+        let mut chain: Vec<Block> = Vec::new();
+        let mut cursor = last_committed.last_committed_hash;
+        loop {
+            let block = if cursor == configured_genesis_hash {
+                // Prefer the in-memory genesis (always present at
+                // recover time) over a storage lookup. This keeps the
+                // walk working even on tests that don't bother
+                // persisting genesis under STORAGE_KEY_BLOCK_PREFIX.
+                if let Some(g) = self.core.state().pending_blocks.get(&cursor).cloned() {
+                    g
+                } else if let Some(g) = load_block_from_storage(self.storage.as_ref(), &cursor)? {
+                    g
+                } else {
+                    anyhow::bail!(
+                        "validator history rebuild: genesis block at hash {} missing from both \
+                         pending_blocks and storage — this should be unreachable on a healthy \
+                         restart",
+                        hex::encode(cursor),
+                    );
+                }
+            } else {
+                load_block_from_storage(self.storage.as_ref(), &cursor)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "validator history rebuild: storage missing committed block at \
+                             hash {} (chain walk diverged from persisted \
+                             last_committed_hash)",
+                        hex::encode(cursor),
+                    )
+                })?
+            };
+            let is_genesis = block.header.height == 0;
+            let parent = block.header.parent_hash;
+            chain.push(block);
+            if is_genesis {
+                break;
+            }
+            cursor = parent;
+        }
+        chain.reverse();
+
+        // Genesis bookkeeping: the first block of the rebuilt chain
+        // must be the same genesis configured into this node. If
+        // not, the persisted block store has been replaced wholesale
+        // — we'd rather refuse than splice an alien chain onto our
+        // identity.
+        let walked_genesis_hash = chain
+            .first()
+            .expect("non-empty chain by virtue of last_committed.height > 0")
+            .hash();
+        if walked_genesis_hash != configured_genesis_hash {
+            anyhow::bail!(
+                "validator history rebuild: walked-chain genesis hash {} does not match \
+                 configured genesis hash {} — persisted block store may be from a \
+                 different chain",
+                hex::encode(walked_genesis_hash),
+                hex::encode(configured_genesis_hash),
+            );
+        }
+
+        // Seed the rebuild from the loaded `validator_history`'s
+        // genesis (`v_eff = 0`) boundary. We deliberately do *not*
+        // re-derive from `self.validator_set` because that's the
+        // *current* (latest-boundary) set after recovery — which
+        // would differ from the genesis members on any chain that
+        // has already committed a reconfig.
+        //
+        // Trusting the loaded blob's genesis boundary is safe even
+        // under tampering: if those members are wrong, the very
+        // first iteration of the walk below computes a commitment
+        // over the tampered seed and compares against the genesis
+        // *block*'s stamped commitment (which was hashed over the
+        // *real* members at chain birth). The mismatch fires the
+        // rejection.
+        let genesis_members: Vec<NodeId> = self
+            .validator_history
+            .iter()
+            .next()
+            .map(|(_, set)| set.iter().copied().collect())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "validator history rebuild: loaded validator_history is empty (no genesis \
+                     boundary)"
+                )
+            })?;
+        let genesis_seed_set = ValidatorSet::new(genesis_members);
+        let _ = chain.first().expect("non-empty chain"); // sanity: bind drops when block-walked is non-empty
+        let mut rebuilt_set = ValidatorSetHistory::from_genesis(genesis_seed_set.clone());
+        let mut rebuilt_key = ValidatorKeyHistory::new(genesis_seed_set.iter().copied());
+        // BLS history seed: on a BLS chain, mirror whatever genesis
+        // entries the loaded BLS history starts with. We don't have
+        // the original `genesis_bls` config in hand here (it's
+        // resolved by `src/node.rs` and folded into `bls_key_history`
+        // via `with_bls_key_history`), so we extract the genesis
+        // (`v_eff = 0`) entries from the loaded history. If the
+        // loaded BLS history was tampered, the end-of-walk equality
+        // check still catches it because the tampered entries flow
+        // through both sides of the comparison.
+        //
+        // PR B refinement: instead of trusting the loaded history's
+        // genesis entries, we cross-check against the genesis block's
+        // stamped commitment below — the very first iteration
+        // compares the rebuilt commitment (computed from the seed we
+        // just constructed) against the genesis block's claim. If the
+        // seed is wrong, the genesis-iteration check fires.
+        let mut rebuilt_bls = self.bls_key_history.as_ref().map(genesis_only_bls_seed);
+
+        for block in &chain {
+            let claimed = block.header.validator_history_commitment;
+            let actual =
+                validator_history_commitment_v1(&rebuilt_set, &rebuilt_key, rebuilt_bls.as_ref());
+            if claimed != actual {
+                anyhow::bail!(
+                    "validator_history_commitment mismatch at block height={} view={} hash={}: \
+                     block claims {} but rebuild from chain produces {} — persisted history \
+                     blob may be tampered or rolled back (audit #325/7-F2)",
+                    block.header.height,
+                    block.header.view,
+                    hex::encode(block.hash()),
+                    hex::encode(claimed),
+                    hex::encode(actual),
+                );
+            }
+            apply_reconfig_commands_to_set_history(
+                block,
+                &mut rebuilt_set,
+                &mut rebuilt_key,
+                self.signature_scheme,
+                self.min_v_eff_delay,
+            );
+            apply_rotation_commands_to_histories(
+                block,
+                &rebuilt_set,
+                &mut rebuilt_key,
+                rebuilt_bls.as_mut(),
+                &self.chain_id,
+                self.signature_scheme,
+            );
+        }
+
+        // End-of-walk equality: the loaded blobs must match the
+        // rebuild byte-for-byte. This is the literal audit criterion.
+        let loaded_set_persisted = self.validator_history.to_persisted();
+        let rebuilt_set_persisted = rebuilt_set.to_persisted();
+        if loaded_set_persisted != rebuilt_set_persisted {
+            anyhow::bail!(
+                "validator_history_rebuild_mismatch: loaded validator_history does not match \
+                 rebuild from chain — persisted blob may be tampered. \
+                 loaded boundary_count={} rebuilt boundary_count={}",
+                loaded_set_persisted.boundaries.len(),
+                rebuilt_set_persisted.boundaries.len(),
+            );
+        }
+        let loaded_key_persisted = self.validator_key_history.to_persisted();
+        let rebuilt_key_persisted = rebuilt_key.to_persisted();
+        if loaded_key_persisted != rebuilt_key_persisted {
+            anyhow::bail!(
+                "validator_key_history_rebuild_mismatch: loaded validator_key_history does not \
+                 match rebuild from chain — persisted blob may be tampered. \
+                 loaded validators={} rebuilt validators={}",
+                loaded_key_persisted.validators.len(),
+                rebuilt_key_persisted.validators.len(),
+            );
+        }
+        match (self.bls_key_history.as_ref(), rebuilt_bls.as_ref()) {
+            (Some(loaded), Some(rebuilt)) => {
+                let lp = loaded.to_persisted();
+                let rp = rebuilt.to_persisted();
+                if lp != rp {
+                    anyhow::bail!(
+                        "bls_key_history_rebuild_mismatch: loaded bls_key_history does not \
+                         match rebuild from chain — persisted blob may be tampered. \
+                         loaded validators={} rebuilt validators={}",
+                        lp.validators.len(),
+                        rp.validators.len(),
+                    );
+                }
+            }
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "bls_key_history_rebuild_mismatch: BLS history present/absent mismatch \
+                     between loaded and rebuild — chain scheme inconsistency",
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Durably record a slice of [`StateUpdate`]s to
@@ -1876,6 +2150,7 @@ impl ConsensusNode {
         let last_committed = LastCommitted {
             height: manifest.height,
             view: manifest.view,
+            last_committed_hash: block_hash,
         };
         let block_bytes = encode_block(&block)?;
         let last_committed_bytes = encode_last_committed(&last_committed)?;
@@ -2700,6 +2975,7 @@ impl ConsensusNode {
         let last_committed = LastCommitted {
             height: self.last_committed_height,
             view: self.last_committed_view,
+            last_committed_hash: block_hash,
         };
         let put_result = (|| -> anyhow::Result<()> {
             let block_bytes = encode_block(&block)?;
@@ -2778,6 +3054,17 @@ impl ConsensusNode {
     /// can't sneak two contradictory boundaries past validation.
     fn apply_committed_reconfigs(&mut self, block: &crate::replication::block::Block) {
         use crate::consensus::reconfig::ReconfigCommand;
+
+        // #325 PR B: snapshot the pre-state so a debug_assert can
+        // confirm that the pure rebuild path (used by recovery-time
+        // validation) produces the same final history this wrapper
+        // does. Any divergence is a bug — the rebuild would otherwise
+        // produce a different history than what's persisted, and the
+        // recovery check would falsely flag healthy storage. The
+        // snapshot is `cfg(debug_assertions)`-gated so release builds
+        // don't pay the clone.
+        #[cfg(debug_assertions)]
+        let pre_state_for_parity = self.validator_history.clone();
 
         let mut applied_any = false;
         for cmd_bytes in &block.commands {
@@ -2925,6 +3212,35 @@ impl ConsensusNode {
                 }
             }
         }
+
+        // #325 PR B: confirm the pure-rebuild function lands in the
+        // same place the wrapper did for the set_history surface.
+        // The pure function additionally mirrors new validators into
+        // key_history (matching the from_set_history fallback that
+        // recover() applies when no key_history blob is persisted),
+        // but the wrapper deliberately leaves key_history untouched
+        // — that mirror happens implicitly at the next recover. So
+        // this debug_assert only checks set_history parity. See the
+        // snapshot at the top of this method for context.
+        #[cfg(debug_assertions)]
+        {
+            let mut rebuilt = pre_state_for_parity;
+            let mut throwaway_key = ValidatorKeyHistory::new(self.validator_set.iter().copied());
+            crate::consensus::history_commitment::apply_reconfig_commands_to_set_history(
+                block,
+                &mut rebuilt,
+                &mut throwaway_key,
+                self.signature_scheme,
+                self.min_v_eff_delay,
+            );
+            debug_assert_eq!(
+                rebuilt.to_persisted(),
+                self.validator_history.to_persisted(),
+                "pure-rebuild reconfig path diverged from wrapper at height={} view={}",
+                block.header.height,
+                block.header.view,
+            );
+        }
     }
 
     /// Scan `block.commands` for tagged [`DualSignedRotation`] payloads
@@ -2941,6 +3257,14 @@ impl ConsensusNode {
     /// invalid).
     fn apply_committed_rotations(&mut self, block: &crate::replication::block::Block) {
         use crate::consensus::validator_rotation::DualSignedRotation;
+
+        // #325 PR B: parity snapshot — see the matching block in
+        // apply_committed_reconfigs for the rationale.
+        #[cfg(debug_assertions)]
+        let pre_state_for_parity = (
+            self.validator_key_history.clone(),
+            self.bls_key_history.clone(),
+        );
 
         let block_view = block.header.view;
         let mut applied_any = false;
@@ -3162,6 +3486,36 @@ impl ConsensusNode {
                 }
             }
         }
+
+        // #325 PR B: confirm the pure-rebuild rotation function lands
+        // in the same place this wrapper did. See the matching block
+        // in apply_committed_reconfigs for the rationale.
+        #[cfg(debug_assertions)]
+        {
+            let (mut rebuilt_keys, mut rebuilt_bls) = pre_state_for_parity;
+            crate::consensus::history_commitment::apply_rotation_commands_to_histories(
+                block,
+                &self.validator_history,
+                &mut rebuilt_keys,
+                rebuilt_bls.as_mut(),
+                &self.chain_id,
+                self.signature_scheme,
+            );
+            debug_assert_eq!(
+                rebuilt_keys.to_persisted(),
+                self.validator_key_history.to_persisted(),
+                "pure-rebuild rotation path diverged from wrapper at height={} view={}",
+                block.header.height,
+                block.header.view,
+            );
+            debug_assert_eq!(
+                rebuilt_bls.as_ref().map(|h| h.to_persisted()),
+                self.bls_key_history.as_ref().map(|h| h.to_persisted()),
+                "pure-rebuild BLS rotation path diverged from wrapper at height={} view={}",
+                block.header.height,
+                block.header.view,
+            );
+        }
     }
 
     /// Build and persist a snapshot of the state machine at `block`'s
@@ -3293,12 +3647,26 @@ pub fn decode_block(bytes: &[u8]) -> anyhow::Result<Block> {
     postcard::from_bytes(bytes).context("decode committed block")
 }
 
-/// Persisted `(height, view)` pair for the most recently committed
-/// block. Stored at [`STORAGE_KEY_LAST_COMMITTED`].
+/// Persisted `(height, view, hash)` triple for the most recently
+/// committed block. Stored at [`STORAGE_KEY_LAST_COMMITTED`].
+///
+/// `last_committed_hash` is the content-hash of the most recently
+/// committed block — used by the recovery path (#325 PR B) as the tip
+/// from which to walk the committed-block chain backward to genesis,
+/// rebuilding the validator histories from each block's reconfig and
+/// rotation commands. Without the hash, recovery would have no way to
+/// locate the chain tip in storage.
+///
+/// The genesis case (no blocks yet committed) is `height == 0`,
+/// `view == 0`, `last_committed_hash == [0; 32]` (the all-zero hash
+/// is reserved for "no tip persisted" and is distinguishable from a
+/// real block hash because the recovery path treats `height == 0` as
+/// "no chain to walk").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastCommitted {
     pub height: u64,
     pub view: View,
+    pub last_committed_hash: BlockHash,
 }
 
 /// Serialize the `(height, view)` checkpoint to its on-storage
@@ -3427,6 +3795,54 @@ async fn send_outbound(broadcaster: &dyn Broadcaster, out: Outbound) {
         Outbound::Broadcast(b) => broadcaster.broadcast(b).await,
         Outbound::SendTo { to, payload } => broadcaster.send_to(to, payload).await,
     }
+}
+
+/// Extract a fresh `BlsKeyHistory` containing only the genesis
+/// (`v_eff = 0`) entries of `loaded`. Used by the recovery rebuild
+/// path (#325 PR B) as the seed for replaying the chain's BLS
+/// rotations: we can't trust the loaded history's later entries
+/// (those are exactly what the rebuild is verifying), but the
+/// genesis entries are cross-checked at the genesis iteration
+/// against the genesis block's stamped `validator_history_commitment`.
+/// If those entries are tampered with, the very first iteration of
+/// the walk fires the mismatch error.
+fn genesis_only_bls_seed(
+    loaded: &crate::consensus::bls_key_history::BlsKeyHistory,
+) -> crate::consensus::bls_key_history::BlsKeyHistory {
+    use crate::consensus::bls_key_history::{
+        BlsKeyHistory, PersistedBlsKeyEntry, PersistedBlsKeyHistory, PersistedBlsValidator,
+    };
+    let persisted = loaded.to_persisted();
+    let genesis_only = PersistedBlsKeyHistory {
+        validators: persisted
+            .validators
+            .into_iter()
+            .filter_map(|v| {
+                let mut v0_entries: Vec<PersistedBlsKeyEntry> =
+                    v.entries.into_iter().filter(|e| e.v_eff == 0).collect();
+                if v0_entries.is_empty() {
+                    // Reconfig-added validator (no genesis entry).
+                    // Don't seed it — the rebuild will add it back via
+                    // the corresponding reconfig command at its
+                    // `v_eff` block. If the loaded history has a
+                    // genesis-time entry the chain didn't actually
+                    // produce (or the chain produced one this
+                    // tampering removed), the per-block commitment
+                    // check fires at the relevant iteration.
+                    None
+                } else {
+                    // Genesis entry only — strip any later entries.
+                    v0_entries.truncate(1);
+                    Some(PersistedBlsValidator {
+                        stable_id: v.stable_id,
+                        entries: v0_entries,
+                    })
+                }
+            })
+            .collect(),
+    };
+    BlsKeyHistory::from_persisted(genesis_only)
+        .expect("genesis-only BLS seed has valid invariants by construction")
 }
 
 /// Read a previously-committed block from durable storage by its
@@ -7799,5 +8215,453 @@ mod tests {
 
         let store = crate::replication::snapshot::SnapshotStore::new(storage);
         assert_eq!(store.list_heights().unwrap(), vec![5, 10, 15, 20]);
+    }
+
+    // ── #325 PR B: recovery-time validation acceptance tests ───────────────────
+    //
+    // The audit's anti-rollback gate is "a node that loaded a tampered
+    // history blob must refuse to start." These tests pin that gate
+    // by exercising the rebuild-from-chain path on:
+    //
+    //  1. Fresh genesis-only node (happy path).
+    //  2. Single-byte-flip in a v_eff field.
+    //  3. Append-a-fake-boundary tampering.
+    //  4. Wrong-genesis-member-set tampering.
+    //  5. BLS chain happy path (separate code branch from #1).
+    //
+    // Bisect-confirmation is noted in the PR summary: temporarily
+    // disabling the end-of-walk equality check makes test #2 pass when
+    // it should fail, proving the gate is what produces the rejection.
+
+    /// Build a genesis block whose `validator_history_commitment` is
+    /// the real v1 hash over the genesis-time histories — what the
+    /// production `build_genesis` does (#325 PR B).
+    fn genesis_with_real_commitment(vs: &ValidatorSet) -> Block {
+        let set_hist = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_hist = ValidatorKeyHistory::new(vs.iter().copied());
+        let commitment = crate::consensus::history_commitment::validator_history_commitment_v1(
+            &set_hist, &key_hist, None,
+        );
+        Block::genesis([0u8; 32], commitment)
+    }
+
+    /// Like [`block_with_reconfig`] but takes an explicit genesis hash
+    /// for `parent_hash` so the rebuilt-chain walk can chase the link.
+    fn block_with_reconfig_extending(
+        parent_hash: BlockHash,
+        height: u64,
+        view: View,
+        proposer: NodeId,
+        cmd: crate::consensus::reconfig::ReconfigCommand,
+        validator_history_commitment: [u8; 32],
+    ) -> Block {
+        let payload = cmd.encode();
+        let commands = vec![payload];
+        let header = crate::replication::block::BlockHeader {
+            parent_hash,
+            height,
+            view,
+            proposer,
+            state_commitment: [0u8; 32],
+            commands_commitment: Block::commands_commitment(&commands),
+            validator_history_commitment,
+        };
+        Block { header, commands }
+    }
+
+    /// Test 1 (happy path): construct a node, commit a few blocks
+    /// (including one with a reconfig), persist storage, then drop
+    /// and recover. Verify recovery passes the consistency check.
+    #[test]
+    fn verify_persisted_history_consistency_happy_path() {
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let vs = four_validators();
+        let g = genesis_with_real_commitment(&vs);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
+
+        // Phase 1: commit a block carrying a reconfig.
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        // Block 1 carries a reconfig — its claimed commitment is the
+        // pre-block hash (genesis-time triple) since the leader
+        // stamps before the block's commands apply.
+        let pre_block_commitment =
+            crate::consensus::history_commitment::validator_history_commitment_v1(
+                &node.validator_history,
+                &node.validator_key_history,
+                None,
+            );
+        let v_eff = MIN_V_EFF_DELAY + 5;
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
+            }],
+            removes: vec![],
+            v_eff,
+        };
+        let block1 =
+            block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, pre_block_commitment);
+        node.apply_commit(block1);
+        // Sanity: the reconfig must have applied so the recovered
+        // history has 2 boundaries.
+        assert_eq!(node.validator_history.boundary_count(), 2);
+        drop(node);
+
+        // Phase 2: recover and run the consistency check.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover should succeed");
+        recovered
+            .verify_persisted_history_consistency()
+            .expect("happy-path recovery must pass consistency check");
+    }
+
+    /// Test 2 (corrupt blob — single byte flip): flip one byte inside
+    /// a boundary's `v_eff` field of the persisted validator-history
+    /// blob. Recovery's consistency check must reject.
+    #[test]
+    fn verify_persisted_history_consistency_rejects_byte_flip_in_v_eff() {
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+        use crate::consensus::validator_history::PersistedValidatorHistory;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let vs = four_validators();
+        let g = genesis_with_real_commitment(&vs);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
+
+        // Commit a block with a reconfig so the persisted history has
+        // a non-genesis boundary whose v_eff we can flip.
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let pre_block_commitment =
+            crate::consensus::history_commitment::validator_history_commitment_v1(
+                &node.validator_history,
+                &node.validator_key_history,
+                None,
+            );
+        let v_eff = MIN_V_EFF_DELAY + 5;
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
+            }],
+            removes: vec![],
+            v_eff,
+        };
+        let block1 =
+            block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, pre_block_commitment);
+        node.apply_commit(block1);
+        drop(node);
+
+        // Tamper: decode the persisted blob, change the second
+        // boundary's v_eff (the reconfig's v_eff), re-encode, write
+        // back. This is the "modifies one boundary's v_eff" case the
+        // audit explicitly calls out.
+        let raw = storage
+            .get(STORAGE_KEY_VALIDATOR_HISTORY)
+            .unwrap()
+            .expect("validator history blob must be persisted");
+        let mut persisted: PersistedValidatorHistory = postcard::from_bytes(&raw).unwrap();
+        assert_eq!(persisted.boundaries.len(), 2);
+        persisted.boundaries[1].v_eff = persisted.boundaries[1].v_eff.wrapping_add(1);
+        let tampered = postcard::to_stdvec(&persisted).unwrap();
+        storage
+            .put(STORAGE_KEY_VALIDATOR_HISTORY, &tampered)
+            .unwrap();
+
+        // Recover and check: the consistency check must reject.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover (decoding the tampered blob) succeeds; the gate is the consistency check");
+        let err = recovered
+            .verify_persisted_history_consistency()
+            .expect_err("consistency check must reject tampered v_eff");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("validator_history") || msg.contains("history_commitment"),
+            "error message should mention the failing surface: {msg}",
+        );
+    }
+
+    /// Test 3 (tampered blob — extra boundary): append a fabricated
+    /// boundary to the persisted history with a `v_eff` past anything
+    /// the chain saw. Recovery must reject.
+    #[test]
+    fn verify_persisted_history_consistency_rejects_extra_boundary() {
+        use crate::consensus::validator_history::{PersistedBoundary, PersistedValidatorHistory};
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let vs = four_validators();
+        let g = genesis_with_real_commitment(&vs);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
+
+        // Commit a single empty block so there's a chain to walk
+        // (the tip's `last_committed_hash` is non-genesis, and the
+        // tip's stamped commitment is the genesis-baseline hash).
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let pre_block_commitment =
+            crate::consensus::history_commitment::validator_history_commitment_v1(
+                &node.validator_history,
+                &node.validator_key_history,
+                None,
+            );
+        let block1 = Block {
+            header: crate::replication::block::BlockHeader {
+                parent_hash: g.hash(),
+                height: 1,
+                view: 1,
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: pre_block_commitment,
+            },
+            commands: vec![],
+        };
+        node.apply_commit(block1);
+        drop(node);
+
+        // Without the validator-history blob persisted (no reconfig
+        // committed), the loaded history is empty-genesis-only. Seed
+        // it explicitly so we have a blob to tamper. We do this by
+        // manually persisting the genesis-only persisted form, then
+        // appending a fake boundary.
+        let genesis_only = ValidatorSetHistory::from_genesis(vs.clone()).to_persisted();
+        let mut tampered = PersistedValidatorHistory {
+            boundaries: genesis_only.boundaries,
+        };
+        tampered.boundaries.push(PersistedBoundary {
+            v_eff: 999, // Past anything in the committed chain.
+            members: vec![nid(1), nid(2), nid(3), nid(4), nid(99)],
+        });
+        let bytes = postcard::to_stdvec(&tampered).unwrap();
+        storage.put(STORAGE_KEY_VALIDATOR_HISTORY, &bytes).unwrap();
+
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover decodes the (well-formed) tampered blob");
+        let err = recovered
+            .verify_persisted_history_consistency()
+            .expect_err("consistency check must reject extra boundary");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("validator_history") || msg.contains("history_commitment"),
+            "error must mention the failing surface: {msg}",
+        );
+    }
+
+    /// Test 4 (tampered blob — wrong genesis member set): change a
+    /// NodeId in the genesis boundary, re-encode, write back.
+    /// Recovery must reject (the genesis-iteration commitment check
+    /// fires because the rebuilt seed depends on the loaded blob's
+    /// genesis members).
+    #[test]
+    fn verify_persisted_history_consistency_rejects_tampered_genesis_member() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let vs = four_validators();
+        let g = genesis_with_real_commitment(&vs);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
+
+        // Commit a single empty block — we need a non-zero chain
+        // height so the recovery-time walk runs (height == 0 is the
+        // "no chain to walk" early return).
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let pre_block_commitment =
+            crate::consensus::history_commitment::validator_history_commitment_v1(
+                &node.validator_history,
+                &node.validator_key_history,
+                None,
+            );
+        let block1 = Block {
+            header: crate::replication::block::BlockHeader {
+                parent_hash: g.hash(),
+                height: 1,
+                view: 1,
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: pre_block_commitment,
+            },
+            commands: vec![],
+        };
+        node.apply_commit(block1);
+        drop(node);
+
+        // Seed and tamper: write a genesis-only blob with a NodeId
+        // swapped in the genesis boundary.
+        let mut tampered = ValidatorSetHistory::from_genesis(vs.clone()).to_persisted();
+        // Swap out one NodeId in the genesis boundary.
+        tampered.boundaries[0].members[0] = nid(99);
+        let bytes = postcard::to_stdvec(&tampered).unwrap();
+        storage.put(STORAGE_KEY_VALIDATOR_HISTORY, &bytes).unwrap();
+
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover decodes the tampered blob");
+        let err = recovered
+            .verify_persisted_history_consistency()
+            .expect_err("consistency check must reject wrong genesis member set");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("validator_history") || msg.contains("history_commitment"),
+            "error must mention the failing surface: {msg}",
+        );
+    }
+
+    /// Test 5 (BLS chain happy path): on a BLS-flavored node, commit
+    /// a block, then verify the consistency check passes. The BLS
+    /// path is a separate code branch from the Ed25519 path; without
+    /// this test, a future regression in the BLS-history walk would
+    /// silently rot.
+    #[test]
+    fn verify_persisted_history_consistency_bls_happy_path() {
+        use crate::consensus::bls_key_history::BlsKeyHistory;
+        use crate::crypto::sig_scheme::{BlsPublicKey, SignatureSchemeChoice};
+
+        // Synthesize 4 BLS pubkeys (deterministic, since the test
+        // only exercises the bookkeeping path; PoP verification is
+        // not on this gate's hot path).
+        let bls_pk = |b: u8| -> BlsPublicKey {
+            let mut out = [0u8; 48];
+            out.fill(b);
+            out
+        };
+        let vs = four_validators();
+        let genesis_bls: Vec<(NodeId, BlsPublicKey)> = vs
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, id)| (id, bls_pk(0xA0 + i as u8)))
+            .collect();
+        let bls_history = BlsKeyHistory::with_genesis(genesis_bls.iter().copied());
+
+        // Build genesis with a commitment over the full BLS-aware triple.
+        let set_hist = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_hist = ValidatorKeyHistory::new(vs.iter().copied());
+        let commitment = crate::consensus::history_commitment::validator_history_commitment_v1(
+            &set_hist,
+            &key_hist,
+            Some(&bls_history),
+        );
+        let g = Block::genesis([0u8; 32], commitment);
+
+        let mut cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
+        cfg.signature_scheme = SignatureSchemeChoice::BlsAggregated;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+
+        // Phase 1: commit a single empty block on the BLS chain. The
+        // block builder leaves validator_history_commitment at the
+        // pre-block hash; mirror that here.
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .with_bls_key_history(bls_history.clone());
+        let pre_block_commitment =
+            crate::consensus::history_commitment::validator_history_commitment_v1(
+                &node.validator_history,
+                &node.validator_key_history,
+                node.bls_key_history.as_ref(),
+            );
+        let block1 = Block {
+            header: crate::replication::block::BlockHeader {
+                parent_hash: g.hash(),
+                height: 1,
+                view: 1,
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: pre_block_commitment,
+            },
+            commands: vec![],
+        };
+        node.apply_commit(block1);
+        // Persist the BLS history so recovery can load it. apply_commit
+        // doesn't write the BLS-history blob unless a rotation
+        // applied; for a no-rotation block we mirror what `src/node.rs`
+        // does by writing it through the with_bls_key_history wiring.
+        // The simplest equivalent here: persist the in-memory BLS
+        // history once explicitly.
+        let bls_persisted = node.bls_key_history.as_ref().unwrap().to_persisted();
+        let bls_bytes = postcard::to_stdvec(&bls_persisted).unwrap();
+        storage
+            .put(STORAGE_KEY_BLS_KEY_HISTORY, &bls_bytes)
+            .unwrap();
+        drop(node);
+
+        // Phase 2: recover and re-attach the BLS history (mirroring
+        // what `src/node.rs` does), then run the consistency check.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover BLS chain")
+        .with_bls_key_history(bls_history);
+        recovered
+            .verify_persisted_history_consistency()
+            .expect("BLS happy-path consistency check must pass");
     }
 }

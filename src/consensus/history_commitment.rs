@@ -39,9 +39,14 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::consensus::View;
 use crate::consensus::bls_key_history::BlsKeyHistory;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
+use crate::consensus::validator_set::ValidatorSet;
+use crate::crypto::sig_scheme::SignatureSchemeChoice;
+use crate::crypto::signed::ChainId;
+use crate::replication::block::Block;
 
 /// Domain tag mixed into the leading bytes of the v1 commitment. Bumped
 /// alongside the function name on any future shape change.
@@ -97,6 +102,205 @@ pub fn validator_history_commitment_v1(
 fn feed_section(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
+}
+
+// ── Pure history-apply functions (#325 PR B) ─────────────────────────────────
+//
+// `ConsensusNode::apply_committed_reconfigs` and
+// `apply_committed_rotations` mutate `self`, the safety core, the
+// pacemaker, and storage. The pure functions below replay the same
+// validation rules but only mutate the histories — used by the
+// recovery-time rebuild path (and potentially future call sites that
+// need to rebuild histories from a chain of committed blocks without
+// touching live consensus state).
+//
+// **Invariant**: the validation behavior must match the production
+// code byte-for-byte. If a reconfig at view V was rejected at commit
+// time, it must also be rejected here. Otherwise the rebuild produces
+// a different history than what was persisted, and the "did this blob
+// match the chain?" check will fire spurious mismatches on perfectly
+// healthy storage.
+//
+// The corresponding wrappers in `node.rs` call these and then layer
+// the side-effects (mirror into safety core, re-install pacemaker,
+// persist, log) on top.
+
+/// Apply any reconfig commands in `block` to `set_history` (and to
+/// `key_history` for any newly-added validators). Mirrors the
+/// validation rules in
+/// [`crate::consensus::node::ConsensusNode::apply_committed_reconfigs`]
+/// but without side effects on the safety core, pacemaker, or storage.
+///
+/// `key_history` is updated to add a fresh entry at `cmd.v_eff` for
+/// every validator the reconfig adds. This mirrors what
+/// [`crate::consensus::validator_key_history::ValidatorKeyHistory::from_set_history`]
+/// produces at recover time when no rotation has yet been committed
+/// for that validator — keeping the rebuild's `key_history` identical
+/// to what `recover` loads.
+///
+/// Used at recovery rebuild time (#325 PR B). Validation failures are
+/// silently dropped — the production code logs them and drops, and the
+/// rebuild path needs to drop in the same places to produce an
+/// identical history.
+pub fn apply_reconfig_commands_to_set_history(
+    block: &Block,
+    set_history: &mut ValidatorSetHistory,
+    key_history: &mut ValidatorKeyHistory,
+    scheme: SignatureSchemeChoice,
+    min_v_eff_delay: View,
+) {
+    use crate::consensus::reconfig::ReconfigCommand;
+
+    let block_view = block.header.view;
+    for cmd_bytes in &block.commands {
+        if !ReconfigCommand::is_reconfig_payload(cmd_bytes) {
+            continue;
+        }
+        let cmd = match ReconfigCommand::decode(cmd_bytes) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Validate against the set authoritative at the block's view.
+        let current_set = set_history.set_at(block_view);
+        let next_members = match cmd.validate_against_with_delay_and_scheme(
+            &current_set,
+            block_view,
+            min_v_eff_delay,
+            scheme,
+        ) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Conflict guard: only one reconfig may be pending at a time.
+        // Mirrors the production check exactly — the boundary at
+        // v_eff == 0 (genesis) is allowed, but any later boundary
+        // whose v_eff is strictly past the committing block's view
+        // means a previously committed reconfig has not yet taken
+        // effect.
+        let conflict = set_history
+            .iter()
+            .any(|(v_eff, _)| v_eff != 0 && v_eff > block_view);
+        if conflict {
+            continue;
+        }
+
+        let new_set = ValidatorSet::new(next_members);
+        // Snapshot the post-reconfig members for the key_history
+        // mirror so we don't double-borrow `set_history` after the
+        // boundary is inserted.
+        let new_members: Vec<crate::p2p::NodeId> = new_set.iter().copied().collect();
+        if set_history.insert_boundary(cmd.v_eff, new_set).is_err() {
+            continue;
+        }
+        // Mirror new validators into key_history at the same v_eff.
+        // Failures (collision with an existing pubkey) are dropped
+        // silently — `from_set_history` would skip them too.
+        for member in new_members {
+            if !key_history.validators().any(|id| *id == member) {
+                let _ = key_history.add_validator(member, cmd.v_eff);
+            }
+        }
+    }
+}
+
+/// Apply any rotation commands in `block` to `key_history` and
+/// `bls_key_history` (where present). Mirrors the validation in
+/// [`crate::consensus::node::ConsensusNode::apply_committed_rotations`].
+///
+/// `set_history` is borrowed read-only — rotations don't change set
+/// membership but the production validation looks up the validator's
+/// current key against `validator_key_history`, which is what we
+/// mutate here. `chain_id` is required to re-verify the dual-signed
+/// envelope; the rebuild path must run the same check the original
+/// commit-time code did so a forged rotation that snuck past the
+/// production check (or, more relevantly here, a tampered
+/// `validator_key_history` blob) would not be silently accepted by
+/// the rebuild.
+pub fn apply_rotation_commands_to_histories(
+    block: &Block,
+    _set_history: &ValidatorSetHistory,
+    key_history: &mut ValidatorKeyHistory,
+    mut bls_key_history: Option<&mut BlsKeyHistory>,
+    chain_id: &ChainId,
+    scheme: SignatureSchemeChoice,
+) {
+    use crate::consensus::validator_rotation::DualSignedRotation;
+
+    let block_view = block.header.view;
+    for cmd_bytes in &block.commands {
+        if !DualSignedRotation::is_rotation_payload(cmd_bytes) {
+            continue;
+        }
+        let envelope = match DualSignedRotation::decode_command(cmd_bytes) {
+            Ok(env) => env,
+            Err(_) => continue,
+        };
+
+        let current_key = match key_history.current_key(&envelope.payload.validator) {
+            Some(k) => k,
+            None => continue,
+        };
+
+        if envelope.verify(&current_key, chain_id).is_err() {
+            continue;
+        }
+
+        if envelope
+            .payload
+            .validate_scheme_consistency(scheme)
+            .is_err()
+        {
+            continue;
+        }
+
+        // Snapshot stable_id before mutating — same ordering as the
+        // production code so the rebuild's branch is identical even
+        // when validate_scheme_consistency fails after the lookup.
+        let stable_id = key_history.validator_for(&envelope.payload.validator);
+
+        if key_history
+            .apply_rotation(&envelope.payload, block_view)
+            .is_err()
+        {
+            continue;
+        }
+
+        if scheme == SignatureSchemeChoice::BlsAggregated {
+            let new_bls_pk = match envelope.payload.new_bls_pubkey {
+                Some(pk) => pk,
+                None => {
+                    // Should have been caught by validate_scheme_consistency
+                    // above on a BLS chain, but mirror the production
+                    // code's expect-style guard with a soft drop here:
+                    // if we got this far, the production code panicked,
+                    // so the persisted history could not have included
+                    // this rotation either.
+                    continue;
+                }
+            };
+            let bls_history = match bls_key_history.as_deref_mut() {
+                Some(h) => h,
+                None => {
+                    // Same reasoning: the production code would have
+                    // panicked, so this rotation never landed in the
+                    // persisted history. Drop on the rebuild path.
+                    continue;
+                }
+            };
+            let stable_id = match stable_id {
+                Some(id) => id,
+                None => continue,
+            };
+            // Production logs and continues (does not roll back) on
+            // BLS-history apply failure after the Ed25519 history
+            // already mutated. We do the same — the Ed25519 mutation
+            // already happened, leaving the rebuild in the same shape
+            // the production code left it in.
+            let _ = bls_history.apply_rotation(stable_id, envelope.payload.v_eff, new_bls_pk);
+        }
+    }
 }
 
 #[cfg(test)]
