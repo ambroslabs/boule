@@ -240,11 +240,16 @@ impl BlsKeyHistory {
     ) -> Result<Vec<BlsPublicKey>, MissingBlsPubkey> {
         let mut out = Vec::with_capacity(set.len());
         for stable_id in set.iter() {
-            match self.key_at(stable_id, view) {
+            // BLS-side APIs key off the raw `NodeId` bytes (per #328
+            // scope, BLS key types are tracked in #143/#287). The
+            // ValidatorId from the consensus typestate flattens to the
+            // same bytes.
+            let bytes = stable_id.as_node_id();
+            match self.key_at(bytes, view) {
                 Some(pk) => out.push(pk),
                 None => {
                     return Err(MissingBlsPubkey {
-                        stable_id: *stable_id,
+                        stable_id: *bytes,
                         view,
                     });
                 }
@@ -506,7 +511,11 @@ mod tests {
             (nid(1), pk(0xB1)),
             (nid(3), pk(0xB3)),
         ]);
-        let vs = ValidatorSet::new(vec![nid(2), nid(1), nid(3)]);
+        let vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(2)),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(1)),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(3)),
+        ]);
         let keys = h.pubkeys_for_set(&vs, 0).unwrap();
         // ValidatorSet sorts, so the result is keyed by sorted NodeId.
         assert_eq!(keys, vec![pk(0xB1), pk(0xB2), pk(0xB3)]);
@@ -518,7 +527,10 @@ mod tests {
         // must respect the view it's called with.
         let mut h = BlsKeyHistory::with_genesis([(nid(1), pk(0xA1)), (nid(2), pk(0xA2))]);
         h.apply_rotation(nid(1), 100, pk(0xB1)).unwrap();
-        let vs = ValidatorSet::new(vec![nid(1), nid(2)]);
+        let vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(1)),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(2)),
+        ]);
 
         let pre = h.pubkeys_for_set(&vs, 50).unwrap();
         assert_eq!(pre, vec![pk(0xA1), pk(0xA2)]);
@@ -531,7 +543,10 @@ mod tests {
     fn pubkeys_for_set_reports_missing_validator() {
         let h = BlsKeyHistory::with_genesis([(nid(1), pk(0xA1))]);
         // The set claims validator 99 too, but the history doesn't know it.
-        let vs = ValidatorSet::new(vec![nid(1), nid(99)]);
+        let vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(1)),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(99)),
+        ]);
         let err = h.pubkeys_for_set(&vs, 5).unwrap_err();
         assert_eq!(
             err,
@@ -548,7 +563,10 @@ mod tests {
         // is asking before they existed.
         let mut h = BlsKeyHistory::with_genesis([(nid(1), pk(0xA1))]);
         h.register(nid(5), 102, pk(0x55)).unwrap();
-        let vs = ValidatorSet::new(vec![nid(1), nid(5)]);
+        let vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(1)),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(5)),
+        ]);
 
         let err = h.pubkeys_for_set(&vs, 50).unwrap_err();
         assert_eq!(

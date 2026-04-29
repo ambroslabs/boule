@@ -247,7 +247,14 @@ impl SnapshotSync {
         if !self.policy.is_enabled() {
             return Vec::new();
         }
-        if !validator_set.contains(&proposer) {
+        // The proposer arrives over the wire as a `NodeId`. Today the
+        // validator set's stable ids are byte-equal to the active
+        // signing pubkey (no rotation has decoupled them yet); when
+        // key rotation lookups land here (#328 follow-up) this should
+        // resolve via `key_history.validator_for(...)` instead.
+        let proposer_id =
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(proposer);
+        if !validator_set.contains(&proposer_id) {
             return Vec::new();
         }
         match &mut self.state {
@@ -700,7 +707,12 @@ mod tests {
     use crate::replication::snapshot::{SnapshotManifest, chunk_snapshot};
 
     fn validator_set_4() -> ValidatorSet {
-        ValidatorSet::new(vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]])
+        ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([1u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([2u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([3u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([4u8; 32]),
+        ])
     }
 
     fn enabled_policy(interval: u64) -> SnapshotPolicy {
@@ -760,7 +772,7 @@ mod tests {
     }
 
     fn proposer(vs: &ValidatorSet, idx: usize) -> NodeId {
-        *vs.get(idx).unwrap()
+        vs.get(idx).unwrap().into_node_id()
     }
 
     fn extract_chunk_request(action: &SnapshotSyncAction) -> (NodeId, u64, u32) {
@@ -892,7 +904,12 @@ mod tests {
     fn manifest_verify_failure_aborts_with_distinct_reason() {
         let mut s = SnapshotSync::new(enabled_policy(50));
         let vs = validator_set_4();
-        let other_vs = ValidatorSet::new(vec![[10u8; 32], [11u8; 32], [12u8; 32], [13u8; 32]]);
+        let other_vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([10u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([11u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([12u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([13u8; 32]),
+        ]);
         let p0 = proposer(&vs, 0);
         let _ = s.observe_proposal(0, 100, p0, &vs);
         let payload: Vec<u8> = vec![0xAA; 16];

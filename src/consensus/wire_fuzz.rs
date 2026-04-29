@@ -97,7 +97,10 @@ fn signer_pool() -> &'static [NodeSigner; N_VALIDATORS] {
 /// by `ValidatorSet::new`; the order is opaque but deterministic
 /// across cases since the underlying signers are.
 fn pool_validator_set() -> ValidatorSet {
-    let ids: Vec<NodeId> = signer_pool().iter().map(|s| s.node_id()).collect();
+    let ids: Vec<crate::consensus::validator_set::ValidatorId> = signer_pool()
+        .iter()
+        .map(|s| crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(s.node_id()))
+        .collect();
     ValidatorSet::new(ids)
 }
 
@@ -308,7 +311,9 @@ proptest! {
 /// the existing `step::tests::property::validator_set` fixture so a
 /// reader who has seen one harness recognises the other.
 fn cluster_validator_set(n_total: usize) -> ValidatorSet {
-    let members: Vec<NodeId> = (1..=n_total as u8).map(|b| [b; 32]).collect();
+    let members: Vec<crate::consensus::validator_set::ValidatorId> = (1..=n_total as u8)
+        .map(|b| crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([b; 32]))
+        .collect();
     ValidatorSet::new(members)
 }
 
@@ -353,7 +358,7 @@ impl ReplicaSet {
         let genesis = Block::genesis([0; 32], [0; 32]);
         let cores: Vec<HotStuffCore> = (0..n)
             .map(|i| {
-                let nid = *validators.get(i).unwrap();
+                let nid = validators.get(i).unwrap().into_node_id();
                 let state = HotStuffState::new(validators.clone(), genesis.clone());
                 let builder = Arc::new(TestBlockBuilder { proposer: nid });
                 HotStuffCore::new(nid, state, builder)
@@ -394,7 +399,7 @@ impl ReplicaSet {
     }
 
     fn apply_actions(&mut self, source: usize, actions: Vec<Action>) {
-        let source_nid = *self.validators.get(source).unwrap();
+        let source_nid = self.validators.get(source).unwrap().into_node_id();
         for action in actions {
             match action {
                 Action::Broadcast(msg) => {
@@ -403,7 +408,11 @@ impl ReplicaSet {
                     }
                 }
                 Action::SendTo(target_id, msg) => {
-                    if let Some(target) = self.validators.index_of(&target_id) {
+                    let target_vid =
+                        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                            target_id,
+                        );
+                    if let Some(target) = self.validators.index_of(&target_vid) {
                         if target < self.cores.len() {
                             self.inboxes[target].push_back(event_from_msg(source_nid, msg));
                         }
@@ -476,7 +485,7 @@ fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
 fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
     let genesis_qc = replicas.synth_qc(0, replicas.genesis.hash());
     let leader_idx = 1 % replicas.len();
-    let leader_nid = *replicas.validators.get(leader_idx).unwrap();
+    let leader_nid = replicas.validators.get(leader_idx).unwrap().into_node_id();
     let builder = TestBlockBuilder {
         proposer: leader_nid,
     };
@@ -673,7 +682,7 @@ proptest! {
                     target, sender_idx, parent_hash_genesis,
                     view, height, justify_view, justify_block_hash,
                 } => {
-                    let sender = *replicas.validators.get(sender_idx).unwrap();
+                    let sender = replicas.validators.get(sender_idx).unwrap().into_node_id();
                     let signed = malformed_signed_proposal(MalformedProposalInputs {
                         n_validators,
                         sender,
@@ -687,7 +696,7 @@ proptest! {
                     replicas.inject(target, Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(signed)));
                 }
                 FuzzStep::InjectBytesVote { target, sender_idx, view, block_hash } => {
-                    let sender = *replicas.validators.get(sender_idx).unwrap();
+                    let sender = replicas.validators.get(sender_idx).unwrap().into_node_id();
                     let signed = Signed {
                         payload: Vote { view, block_hash },
                         signer: sender,
@@ -696,7 +705,7 @@ proptest! {
                     replicas.inject(target, Event::VoteReceived(crate::consensus::dispatch::Verified::unchecked(signed), None));
                 }
                 FuzzStep::InjectBytesNewView { target, sender_idx, qc_view, qc_block_hash } => {
-                    let sender = *replicas.validators.get(sender_idx).unwrap();
+                    let sender = replicas.validators.get(sender_idx).unwrap().into_node_id();
                     let mut high_qc = QuorumCertificate::new(
                         qc_view, qc_block_hash, n_validators,
                     );
@@ -796,7 +805,7 @@ proptest! {
     ) {
         let validators = cluster_validator_set(4);
         let genesis = Block::genesis([0; 32], [0; 32]);
-        let self_id = *validators.get(0).unwrap();
+        let self_id = validators.get(0).unwrap().into_node_id();
         let state = HotStuffState::new(validators.clone(), genesis.clone());
         let limits = CacheLimits {
             vote_bucket_capacity: FUZZ_VOTE_BUCKET_CAP,
@@ -818,16 +827,18 @@ proptest! {
         for step in steps {
             let event = match step {
                 CacheStep::Vote { signer_idx, view, block_hash } => {
-                    let signer = *validators.get(signer_idx).unwrap();
-                    Event::VoteReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
+                    let signer = validators.get(signer_idx).unwrap().into_node_id();
+                    Event::VoteReceived(
+                        crate::consensus::dispatch::Verified::unchecked(Signed {
                             payload: Vote { view, block_hash },
                             signer,
                             sig: [0u8; 64],
                         }),
-                        None,)
+                        None,
+                    )
                 }
                 CacheStep::ParkedProposal { sender_idx, view, height, parent_seed } => {
-                    let sender = *validators.get(sender_idx).unwrap();
+                    let sender = validators.get(sender_idx).unwrap().into_node_id();
                     let mut parent_hash = [0u8; 32];
                     parent_hash[0] = parent_seed;
                     parent_hash[1] = view as u8;
@@ -853,7 +864,7 @@ proptest! {
                     }))
                 }
                 CacheStep::GenesisChildProposal { sender_idx, view } => {
-                    let sender = *validators.get(sender_idx).unwrap();
+                    let sender = validators.get(sender_idx).unwrap().into_node_id();
                     let header = BlockHeader {
                         parent_hash: genesis.hash(),
                         height: 1,

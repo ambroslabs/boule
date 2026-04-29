@@ -27,7 +27,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
-use crate::consensus::validator_set::ValidatorSet;
+use crate::consensus::validator_set::{ValidatorId, ValidatorSet};
 use crate::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop, SignatureSchemeChoice};
 use crate::p2p::NodeId;
 
@@ -237,14 +237,24 @@ impl ReconfigCommand {
             );
         }
 
+        // Reconfig payloads come in over the wire as `NodeId` bytes;
+        // bridge to the typed `ValidatorId` for membership checks
+        // (#328). At reconfig-validation time the bytes haven't been
+        // promoted to a stable id yet, but the membership check is
+        // semantically "is this *node id* a current member" — and a
+        // current member's stable id has the same bytes by genesis
+        // construction, so the lookup is correct via
+        // `from_genesis_pubkey`.
         for n in &removes_seen {
-            if !current_set.contains(n) {
+            let vid = ValidatorId::from_genesis_pubkey(*n);
+            if !current_set.contains(&vid) {
                 anyhow::bail!("remove targets non-member: {}", hex::encode(n));
             }
         }
 
         for n in &adds_seen {
-            if current_set.contains(n) {
+            let vid = ValidatorId::from_genesis_pubkey(*n);
+            if current_set.contains(&vid) {
                 anyhow::bail!("add targets existing member: {}", hex::encode(n));
             }
         }
@@ -295,7 +305,7 @@ impl ReconfigCommand {
             }
         }
 
-        let mut next: Vec<NodeId> = current_set.iter().copied().collect();
+        let mut next: Vec<NodeId> = current_set.iter().map(|v| v.into_node_id()).collect();
         next.retain(|n| !removes_seen.contains(n));
         next.extend(adds_seen.iter().copied());
         next.sort_unstable();
@@ -321,6 +331,10 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> ValidatorId {
+        ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     fn addr(p: u16) -> SocketAddr {
         format!("127.0.0.1:{p}").parse().unwrap()
     }
@@ -335,11 +349,11 @@ mod tests {
 
     fn floor_set() -> ValidatorSet {
         // Smallest set the floor allows.
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)])
     }
 
     fn five_set() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(5)])
     }
 
     // ---------- codec ----------

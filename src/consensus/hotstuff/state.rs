@@ -270,9 +270,13 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> crate::consensus::validator_set::ValidatorId {
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     #[test]
     fn new_seeds_genesis_into_pending() {
-        let vs = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)]);
+        let vs = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)]);
         let genesis = Block::genesis([0x77; 32], [0; 32]);
         let g_hash = genesis.hash();
         let state = HotStuffState::new(vs.clone(), genesis.clone());
@@ -286,7 +290,7 @@ mod tests {
 
     #[test]
     fn insert_pending_is_idempotent() {
-        let vs = ValidatorSet::new(vec![nid(1)]);
+        let vs = ValidatorSet::new(vec![vid(1)]);
         let genesis = Block::genesis([0; 32], [0; 32]);
         let mut state = HotStuffState::new(vs, genesis.clone());
         let before = state.pending_blocks.len();

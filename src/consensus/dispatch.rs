@@ -41,6 +41,7 @@ use crate::consensus::node::WireMessage;
 use crate::consensus::pacemaker;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
+use crate::consensus::validator_set::Pubkey;
 use crate::crypto::sig_scheme::SignatureSchemeChoice;
 use crate::crypto::signed::{ChainId, Signed, SignedMessage, Signer, preimage};
 use crate::p2p::NodeId;
@@ -662,8 +663,14 @@ fn verify_signer_at(
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
 ) -> Result<(), IngressError> {
+    // Wire envelopes carry a `NodeId` as their `signer` field; at this
+    // boundary we re-tag the bytes as a `Pubkey` (the typed
+    // representation of "this is an ephemeral consensus signing key,
+    // not a stable validator id") and route through the key history's
+    // reverse index to land in the typed `ValidatorId` world.
+    let signer_pk = Pubkey::from_node_id(signer);
     let stable_id = key_history
-        .validator_for(&signer)
+        .validator_for(&signer_pk)
         .ok_or(IngressError::UnknownSigner(signer))?;
 
     if history.set_at(view).index_of(&stable_id).is_none() {
@@ -673,7 +680,7 @@ fn verify_signer_at(
     let active = key_history
         .key_at(&stable_id, view)
         .expect("validator with reverse-index entry has a non-empty history list");
-    if active != signer {
+    if active != signer_pk {
         return Err(IngressError::UnknownSigner(signer));
     }
 
@@ -825,9 +832,21 @@ fn verify_qc_if_requested(
             // view would have been signed. Resolve through the
             // per-historical-view key history so post-rotation lookups
             // pick up the right key.
+            //
+            // The `unwrap_or` falls back to the stable id's bytes when
+            // a validator has no recorded key at the QC's view — this
+            // is the same convention as before #328 (the stable id is
+            // the validator's genesis pubkey, so using its bytes as a
+            // pubkey here matches the pre-rotation case). The
+            // verifier itself works at the `NodeId` byte layer.
             let pubkeys: Vec<NodeId> = vs
                 .iter()
-                .map(|stable_id| key_history.key_at(stable_id, qc.view).unwrap_or(*stable_id))
+                .map(|stable_id| {
+                    key_history
+                        .key_at(stable_id, qc.view)
+                        .map(NodeId::from)
+                        .unwrap_or_else(|| stable_id.into_node_id())
+                })
                 .collect();
             qc.verify_aggregate(&vote_preimage, &pubkeys).map_err(|_| {
                 IngressError::InvalidQcAggregate {
@@ -1242,7 +1261,10 @@ mod tests {
     }
 
     fn make_vs_with_signers(signers: &[&NodeSigner]) -> ValidatorSet {
-        let ids: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
+        let ids: Vec<crate::consensus::validator_set::ValidatorId> = signers
+            .iter()
+            .map(|s| crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(s.node_id()))
+            .collect();
         ValidatorSet::new(ids)
     }
 
@@ -1619,7 +1641,12 @@ mod tests {
 
     fn sample_manifest_for_dispatch() -> SnapshotManifest {
         use crate::replication::block::{Block, BlockHeader};
-        let vs = ValidatorSet::new(vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
+        let vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([1u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([2u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([3u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([4u8; 32]),
+        ]);
         let parent_hash = Block::genesis([0u8; 32], [0; 32]).hash();
         let commands: Vec<bytes::Bytes> = Vec::new();
         let block = Block {
@@ -2538,7 +2565,14 @@ mod tests {
         block_hash: BlockHash,
     ) -> (Vec<NodeSigner>, ValidatorSet, QuorumCertificate) {
         let signers: Vec<NodeSigner> = (0..4).map(|_| fresh_signer()).collect();
-        let vs = ValidatorSet::new(signers.iter().map(|s| s.node_id()).collect());
+        let vs = ValidatorSet::new(
+            signers
+                .iter()
+                .map(|s| {
+                    crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(s.node_id())
+                })
+                .collect(),
+        );
 
         let vote = Vote { view, block_hash };
         let mut qc = QuorumCertificate::new(view, block_hash, vs.len());
@@ -2546,7 +2580,10 @@ mod tests {
         // sorted-NodeId order to match the bitmap layout the verifier
         // assumes.
         for stable_id in vs.iter().take(quorum_size_for_n(vs.len())) {
-            let signer = signers.iter().find(|s| &s.node_id() == stable_id).unwrap();
+            let signer = signers
+                .iter()
+                .find(|s| s.node_id() == stable_id.into_node_id())
+                .unwrap();
             let signed = Signed::sign(vote.clone(), signer, &ChainId::TEST).unwrap();
             let idx = vs.index_of(stable_id).unwrap();
             qc.add_signature(idx, signed.sig);

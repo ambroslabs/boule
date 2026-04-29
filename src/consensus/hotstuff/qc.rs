@@ -607,8 +607,12 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> crate::consensus::validator_set::ValidatorId {
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     fn four_validators() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)])
     }
 
     fn fresh_signer() -> NodeSigner {
@@ -931,8 +935,8 @@ mod tests {
     fn bls_qc_postcard_roundtrip_byte_size_constant_in_n() {
         // Aggregate is a fixed 96 bytes plus bitmap + metadata,
         // regardless of how many partials we fold in.
-        let vs_small = ValidatorSet::new((0..4u8).map(|b| nid(b + 1)).collect());
-        let vs_large = ValidatorSet::new((0..50u8).map(|b| nid(b + 1)).collect());
+        let vs_small = ValidatorSet::new((0..4u8).map(|b| vid(b + 1)).collect());
+        let vs_large = ValidatorSet::new((0..50u8).map(|b| vid(b + 1)).collect());
         let block_hash = [0xCC; 32];
 
         let mut qc_small = QuorumCertificate::new_bls(1, block_hash, vs_small.len());
