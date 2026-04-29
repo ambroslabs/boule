@@ -1028,7 +1028,7 @@ mod tests {
     }
 
     fn genesis() -> Block {
-        Block::genesis([0u8; 32])
+        Block::genesis([0u8; 32], [0; 32])
     }
 
     fn sample_qc() -> QuorumCertificate {
@@ -1414,7 +1414,7 @@ mod tests {
     fn sample_manifest_for_dispatch() -> SnapshotManifest {
         use crate::replication::block::{Block, BlockHeader};
         let vs = ValidatorSet::new(vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
-        let parent_hash = Block::genesis([0u8; 32]).hash();
+        let parent_hash = Block::genesis([0u8; 32], [0; 32]).hash();
         let commands: Vec<bytes::Bytes> = Vec::new();
         let block = Block {
             header: BlockHeader {
@@ -1424,6 +1424,7 @@ mod tests {
                 proposer: [0u8; 32],
                 state_commitment: [0xCD; 32],
                 commands_commitment: Block::commands_commitment(&commands),
+                validator_history_commitment: [0; 32],
             },
             commands,
         };
@@ -1769,6 +1770,7 @@ mod tests {
             proposer: new_signer.node_id(),
             state_commitment: [0u8; 32],
             commands_commitment: Block::commands_commitment(&[]),
+            validator_history_commitment: [0; 32],
         };
         let block = Block {
             header,
@@ -2163,6 +2165,7 @@ mod tests {
             proposer: new.node_id(),
             state_commitment: [0u8; 32],
             commands_commitment: Block::commands_commitment(&[]),
+            validator_history_commitment: [0; 32],
         };
         let proposal = Proposal {
             block: Block {
@@ -2359,6 +2362,7 @@ mod tests {
                 proposer: leader.node_id(),
                 state_commitment: [0; 32],
                 commands_commitment: [0; 32],
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };
@@ -2407,6 +2411,7 @@ mod tests {
                 proposer: leader.node_id(),
                 state_commitment: [0; 32],
                 commands_commitment: [0; 32],
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };
@@ -2757,6 +2762,7 @@ mod tests {
                 proposer: signer.node_id(),
                 state_commitment: [0; 32],
                 commands_commitment: [0; 32],
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };

@@ -371,7 +371,7 @@ impl SimCluster {
 
         // ValidatorSet sorts IDs ascending, establishing leader-rotation order.
         let vs = ValidatorSet::new(node_ids_unsorted);
-        let genesis = Block::genesis([0u8; 32]);
+        let genesis = Block::genesis([0u8; 32], [0; 32]);
 
         // Build a signer lookup by NodeId.
         let signer_map: HashMap<NodeId, Arc<dyn Signer>> = signers
@@ -1350,7 +1350,7 @@ impl SimCluster {
         let signers: Vec<NodeSigner> = (0..n).map(|_| fresh_signer()).collect();
         let node_ids_unsorted: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
         let vs = ValidatorSet::new(node_ids_unsorted);
-        let genesis = Block::genesis([0u8; 32]);
+        let genesis = Block::genesis([0u8; 32], [0; 32]);
 
         let mut signer_map: HashMap<NodeId, Arc<dyn Signer>> = HashMap::new();
         for s in signers {

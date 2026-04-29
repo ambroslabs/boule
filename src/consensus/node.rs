@@ -463,6 +463,7 @@ impl BlockBuilder for MempoolBlockBuilder {
                 proposer: self.self_id,
                 state_commitment,
                 commands_commitment,
+                validator_history_commitment: [0; 32],
             },
             commands,
         }
@@ -2052,12 +2053,28 @@ impl ConsensusNode {
             match action {
                 SafetyAction::Persist(_) => unreachable!(),
 
-                SafetyAction::Broadcast(msg) => {
+                SafetyAction::Broadcast(mut msg) => {
                     tracing::debug!(
                         target: TRACE_TARGET,
                         msg = msg_kind(&msg),
                         "outbound_broadcast",
                     );
+                    // #325 PR A: stamp the validator-history commitment
+                    // into outgoing proposals before the envelope is
+                    // signed. The block builder leaves the field at
+                    // [0; 32]; here we replace it with the v1 hash over
+                    // our current `(validator_history, key_history,
+                    // bls_key_history?)`. PR A only populates the field —
+                    // recovery-time and proposal-receive validation are
+                    // wired by follow-up PRs in the #325 stack.
+                    if let crate::consensus::hotstuff::ConsensusMsg::Proposal(ref mut p) = msg {
+                        p.block.header.validator_history_commitment =
+                            crate::consensus::history_commitment::validator_history_commitment_v1(
+                                &self.validator_history,
+                                &self.validator_key_history,
+                                self.bls_key_history.as_ref(),
+                            );
+                    }
                     let bls_signer = self.bls_signer.as_deref();
                     let (payload, loopback) = dispatch::egress_consensus_msg_with_loopback(
                         &msg,
@@ -3451,7 +3468,7 @@ mod tests {
     }
 
     fn genesis() -> Block {
-        Block::genesis([0u8; 32])
+        Block::genesis([0u8; 32], [0; 32])
     }
 
     fn test_config(vs: ValidatorSet) -> NodeConfigForConsensus {
@@ -3516,6 +3533,7 @@ mod tests {
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         }
@@ -3980,6 +3998,7 @@ mod tests {
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };
@@ -3991,6 +4010,7 @@ mod tests {
                 proposer: nid(2),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };
@@ -4300,6 +4320,7 @@ mod tests {
                 commands_commitment: crate::replication::block::Block::commands_commitment(
                     std::slice::from_ref(&cmd),
                 ),
+                validator_history_commitment: [0; 32],
             },
             commands: vec![cmd],
         };
@@ -4343,6 +4364,7 @@ mod tests {
             proposer,
             state_commitment: [0u8; 32],
             commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
+            validator_history_commitment: [0; 32],
         };
         crate::replication::block::Block { header, commands }
     }
@@ -4477,6 +4499,7 @@ mod tests {
             proposer: nid(1),
             state_commitment: [0u8; 32],
             commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
+            validator_history_commitment: [0; 32],
         };
         let block = crate::replication::block::Block { header, commands };
         node.apply_commit(block);
@@ -4607,6 +4630,7 @@ mod tests {
             proposer: nid(1),
             state_commitment: [0u8; 32],
             commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
+            validator_history_commitment: [0; 32],
         };
         let block = crate::replication::block::Block { header, commands };
         node.apply_commit(block);
@@ -4690,6 +4714,7 @@ mod tests {
                         proposer: nid(1),
                         state_commitment: [0u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
+                        validator_history_commitment: [0; 32],
                     },
                     commands: vec![],
                 };
@@ -4865,6 +4890,7 @@ mod tests {
                     commands_commitment: crate::replication::block::Block::commands_commitment(
                         &commands,
                     ),
+                    validator_history_commitment: [0; 32],
                 },
                 commands,
             }
@@ -5277,6 +5303,7 @@ mod tests {
                 proposer: signer.node_id(),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&commands),
+                validator_history_commitment: [0; 32],
             },
             commands,
         };
@@ -5360,6 +5387,7 @@ mod tests {
                     commands_commitment: crate::replication::block::Block::commands_commitment(
                         &commands,
                     ),
+                    validator_history_commitment: [0; 32],
                 },
                 commands,
             }
@@ -5697,6 +5725,7 @@ mod tests {
                     proposer: server_signer.node_id(),
                     state_commitment: [0xCD; 32],
                     commands_commitment: Block::commands_commitment(&commands),
+                    validator_history_commitment: [0; 32],
                 },
                 commands,
             }
@@ -5819,6 +5848,7 @@ mod tests {
                     commands_commitment: crate::replication::block::Block::commands_commitment(
                         &commands,
                     ),
+                    validator_history_commitment: [0; 32],
                 },
                 commands,
             }
@@ -6016,6 +6046,7 @@ mod tests {
                     commands_commitment: crate::replication::block::Block::commands_commitment(
                         &commands,
                     ),
+                    validator_history_commitment: [0; 32],
                 },
                 commands,
             }
@@ -6736,6 +6767,7 @@ mod tests {
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };
@@ -6913,6 +6945,69 @@ mod tests {
         );
         // No further traffic.
         assert!(send_rx.try_recv().is_err());
+    }
+
+    /// PR A of #325: outbound proposals must carry a real
+    /// `validator_history_commitment` — not the `[0; 32]` placeholder
+    /// the block builder stamps. The leader-side rewrite in
+    /// `apply_safety_actions` is what populates the field; this test
+    /// pins that wiring so a future refactor can't silently drop it.
+    ///
+    /// Bisect-confirmed by removing the rewrite block in
+    /// `apply_safety_actions`: the test then sees `[0; 32]` on the
+    /// wire and fails the equality assertion.
+    #[tokio::test]
+    async fn outbound_proposal_carries_validator_history_commitment() {
+        let ns = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&ns, 1);
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+
+        // Snapshot the expected commitment before triggering the
+        // broadcast — pre-block semantics, so this hash is what should
+        // appear on the wire.
+        let expected = crate::consensus::history_commitment::validator_history_commitment_v1(
+            &node.validator_history,
+            &node.validator_key_history,
+            node.bls_key_history.as_ref(),
+        );
+
+        let (broadcaster, mut send_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Become view-1 leader and let the safety core emit its
+        // single Action::Broadcast(Proposal). apply_safety_actions
+        // walks the action list and rewrites the proposal's
+        // validator_history_commitment before signing/broadcasting.
+        let actions = node.core.become_leader(1);
+        node.apply_safety_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .unwrap();
+
+        let outbound = send_rx
+            .try_recv()
+            .expect("Broadcast(Proposal) must be sent");
+        let payload = match outbound {
+            ProtocolOutbound::Broadcast(p) => p,
+            other => panic!("expected Broadcast, got {other:?}"),
+        };
+        let wire: WireMessage = postcard::from_bytes(&payload).expect("decode wire");
+        let signed = match wire {
+            WireMessage::Proposal(s) => s,
+            other => panic!("expected Proposal, got {other:?}"),
+        };
+
+        assert_eq!(
+            signed.payload.block.header.validator_history_commitment, expected,
+            "leader must stamp the real v1 commitment over its current histories, \
+             not leave the [0; 32] placeholder the block builder produces",
+        );
+        // Sanity: this is not just the all-zero default.
+        assert_ne!(
+            signed.payload.block.header.validator_history_commitment, [0u8; 32],
+            "the v1 commitment over a non-empty validator set must not collide \
+             with the all-zero placeholder",
+        );
     }
 
     /// Regression for issue #118: when this node is the next-view leader
@@ -7472,6 +7567,7 @@ mod tests {
                 proposer: [0u8; 32],
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&commands),
+                validator_history_commitment: [0; 32],
             },
             commands,
         }

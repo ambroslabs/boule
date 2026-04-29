@@ -33,6 +33,7 @@
 pub mod api;
 pub mod bls_key_history;
 pub mod dispatch;
+pub mod history_commitment;
 pub mod hotstuff;
 pub mod limits;
 pub mod node;
