@@ -34,8 +34,12 @@ jobs:
           mkdir -p target/bench
           # Run the bench in --release; capture stdout for both the
           # artifact upload and the table-regeneration step below.
+          # `--ignored` is a test-binary flag, not a cargo flag, so it
+          # has to live after the `--` separator. Without this fix the
+          # workflow exits 1 immediately with `unexpected argument
+          # '--ignored' found`.
           cargo test --release --locked --test qc_scheme_bandwidth \
-            --ignored -- --nocapture --test-threads=1 \
+            -- --ignored --nocapture --test-threads=1 \
             | tee target/bench/raw.txt
 
       - name: Upload raw output as artifact
