@@ -41,6 +41,7 @@ async fn driver_lifecycle_4_nodes() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
+        signature_scheme: ambros_p2p::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster");
@@ -138,6 +139,7 @@ async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
+        signature_scheme: ambros_p2p::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster");
@@ -225,6 +227,7 @@ async fn new_cluster_canonicalizes_relative_workdir() {
         binary: bin,
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
+        signature_scheme: ambros_p2p::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster with relative workdir");

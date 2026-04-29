@@ -144,6 +144,41 @@ $TESTNET down --workdir /tmp/regression-runs/a5; rm -rf /tmp/regression-runs/a5
 Pass: every command succeeds (catches relative-path / cwd-coupling
 regressions in the CLI).
 
+### A6. 4-node BLS chain happy path — 1 trial
+
+End-to-end smoke for the `bls_aggregated` signature scheme: every QC
+on the wire is a real BLS aggregate, partials are signed by each
+validator's BLS key, and the dispatch verifier accepts the aggregate
+under the per-historical-view BLS pubkey table seeded from genesis.
+Catches operator-side regressions in the BLS startup flow that the
+unit + sim tests can't see (production `with_bls_signer` wiring,
+`[node.bls_validator_identity]` config parse, on-disk PoP write, etc.).
+
+```sh
+WD=/tmp/regression-runs/a6
+$TESTNET new --nodes 4 --seed 42 --workdir $WD --ambros-bin $BIN \
+  --signature-scheme bls_aggregated
+$TESTNET up   --workdir $WD --ambros-bin $BIN
+$TESTNET wait --all-reach-height 5 --workdir $WD --timeout 30
+$TESTNET snap --workdir $WD
+$TESTNET verify-safety --workdir $WD
+$TESTNET telemetry --workdir $WD
+$TESTNET down --workdir $WD; rm -rf $WD
+```
+
+Pass: `wait` exit 0 (every node committed height ≥ 5 within 30 s);
+`verify-safety` exit 0; per-node `bls.key` files exist under
+`$WD/node{1..4}/bls.key`; the per-node `config.toml` carries
+`signature_scheme = "bls_aggregated"`, a 4-row
+`[[consensus.validators_bls]]` table, and a
+`[node.bls_validator_identity]` block.
+
+A startup-time refusal (e.g. `consensus.validators_bls is required`,
+`BLS PoP for validator … failed to verify`, `loaded BLS pubkey … does
+not match the genesis BLS pubkey`) means the BLS reconciliation in
+`reconcile_bls_identity` ([src/node.rs](src/node.rs)) caught a config
+inconsistency — capture the stderr in the failure dump.
+
 **If the budget is 15 min, stop here and write the report.**
 
 ---
@@ -232,6 +267,16 @@ $TESTNET down --workdir $WD; rm -rf $WD
 Pass: `wait` exit 0 *and* `verify-safety` exit 0 on every seed. A
 timeout, frozen heights, or `block_sync_request_emitted=0` on a lagging
 replica is a failure to investigate.
+
+### B6. 4-node BLS chain happy path — 3 seeds
+
+Repeat A6 across seeds `7 42 113`, fresh workdir each
+(`/tmp/regression-runs/b6-$SEED`). Same pass criteria as A6: `wait`
+exit 0 and `verify-safety` exit 0 every trial. Variance signal worth
+flagging: per-trial commit-height spread at the wait deadline. BLS
+keygen + PoP work runs once per node at `new` time and shouldn't
+materially affect post-warmup throughput; consistent height drift
+across seeds means CPU contention on the runner, not a BLS path bug.
 
 **If the budget is 30 min, stop here and write the report.**
 
