@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
 use crate::consensus::validator_set::ValidatorSet;
-use crate::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop};
+use crate::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop, SignatureSchemeChoice};
 use crate::p2p::NodeId;
 
 /// Magic prefix that tags a `Block.commands` entry as a reconfig payload.
@@ -166,11 +166,42 @@ impl ReconfigCommand {
     /// Wired through [`crate::consensus::node::NodeConfigForConsensus::min_v_eff_delay`]
     /// (#272) so deployments can require a longer "give the new
     /// validator time to state-sync" window than the consensus floor.
+    ///
+    /// This shim assumes [`SignatureSchemeChoice::Ed25519Collected`].
+    /// Use [`Self::validate_against_with_delay_and_scheme`] from any
+    /// call site that has the chain's scheme in hand to enforce the
+    /// "BLS chain → every `adds` entry needs a PoP" rule.
     pub fn validate_against_with_delay(
         &self,
         current_set: &ValidatorSet,
         current_view: View,
         min_v_eff_delay: View,
+    ) -> anyhow::Result<Vec<NodeId>> {
+        self.validate_against_with_delay_and_scheme(
+            current_set,
+            current_view,
+            min_v_eff_delay,
+            SignatureSchemeChoice::Ed25519Collected,
+        )
+    }
+
+    /// Scheme-aware variant of [`Self::validate_against_with_delay`].
+    /// Adds two checks driven by the chain's signature scheme (#334):
+    ///
+    /// - BLS chain: every `adds` entry must carry a `bls_pop`. Without
+    ///   one, a Byzantine proposer could seat a validator with no
+    ///   verifiable BLS pubkey and stall every QC the new committee
+    ///   tries to form.
+    /// - Ed25519 chain: no `adds` entry may carry a `bls_pop`. A BLS
+    ///   PoP on an Ed25519 chain has no semantic meaning; accepting it
+    ///   would mask a misconfigured operator who copied a BLS-chain
+    ///   payload onto an Ed25519 chain.
+    pub fn validate_against_with_delay_and_scheme(
+        &self,
+        current_set: &ValidatorSet,
+        current_view: View,
+        min_v_eff_delay: View,
+        scheme: SignatureSchemeChoice,
     ) -> anyhow::Result<Vec<NodeId>> {
         let effective_delay = std::cmp::max(min_v_eff_delay, MIN_V_EFF_DELAY);
         let min_v_eff = current_view.checked_add(effective_delay).ok_or_else(|| {
@@ -218,25 +249,49 @@ impl ReconfigCommand {
             }
         }
 
-        // Verify any embedded BLS proof-of-possession.
+        // Verify any embedded BLS proof-of-possession AND enforce the
+        // scheme-driven presence rule.
         //
-        // Any `adds` entry that carries a `bls_pop` is checked here so a
-        // malformed PoP is rejected pre-commit, regardless of the
-        // chain's signature scheme. Scheme-driven *requirement* (BLS
-        // chains must carry a PoP per add) is enforced by the call
-        // site in #293, when the rest of the BLS integration lands.
+        // Cryptographic check: every entry that carries a `bls_pop` is
+        // verified here so a malformed PoP is rejected pre-commit
+        // regardless of scheme.
+        //
+        // Presence check: on BLS chains, every `adds` entry MUST carry
+        // a PoP — otherwise the new validator would be seated with no
+        // verifiable BLS pubkey and the next QC would stall. On
+        // Ed25519 chains, no `adds` entry may carry one — a BLS PoP
+        // has no semantic meaning there, and silently accepting it
+        // would mask a misconfigured operator.
         for entry in &self.adds {
-            if let Some(pop) = &entry.bls_pop {
-                BlsAggregated::verify_pop(pop, &pop.pubkey).map_err(|e| match e {
-                    BlsKeyError::PopPubkeyMismatch => anyhow::anyhow!(
-                        "BLS PoP for validator {} has mismatched embedded pubkey",
+            match (&entry.bls_pop, scheme) {
+                (Some(pop), _) => {
+                    BlsAggregated::verify_pop(pop, &pop.pubkey).map_err(|e| match e {
+                        BlsKeyError::PopPubkeyMismatch => anyhow::anyhow!(
+                            "BLS PoP for validator {} has mismatched embedded pubkey",
+                            hex::encode(entry.node_id),
+                        ),
+                        BlsKeyError::Blst(err) => anyhow::anyhow!(
+                            "BLS PoP for validator {} failed to verify: {err:?}",
+                            hex::encode(entry.node_id),
+                        ),
+                    })?;
+                    if matches!(scheme, SignatureSchemeChoice::Ed25519Collected) {
+                        anyhow::bail!(
+                            "validator {} carries a BLS PoP but the chain's signature_scheme = \
+                             \"ed25519_collected\" — Ed25519 chains have no use for BLS keys.",
+                            hex::encode(entry.node_id),
+                        );
+                    }
+                }
+                (None, SignatureSchemeChoice::BlsAggregated) => {
+                    anyhow::bail!(
+                        "validator {} has no bls_pop but the chain's signature_scheme = \
+                         \"bls_aggregated\" — every BLS-chain `adds` entry must declare a \
+                         proof-of-possession.",
                         hex::encode(entry.node_id),
-                    ),
-                    BlsKeyError::Blst(err) => anyhow::anyhow!(
-                        "BLS PoP for validator {} failed to verify: {err:?}",
-                        hex::encode(entry.node_id),
-                    ),
-                })?;
+                    );
+                }
+                (None, SignatureSchemeChoice::Ed25519Collected) => {}
             }
         }
 
@@ -542,6 +597,18 @@ mod tests {
         }
     }
 
+    /// Validate `cmd` on a BLS chain. Helper for the PoP-cryptography
+    /// tests below — they all assume the BLS scheme (PoP-on-Ed25519 is
+    /// rejected by #334's presence check before the crypto runs).
+    fn validate_bls(cmd: &ReconfigCommand, cur: &ValidatorSet) -> anyhow::Result<Vec<NodeId>> {
+        cmd.validate_against_with_delay_and_scheme(
+            cur,
+            0,
+            MIN_V_EFF_DELAY,
+            SignatureSchemeChoice::BlsAggregated,
+        )
+    }
+
     #[test]
     fn add_with_valid_bls_pop_passes_validation() {
         let cur = floor_set();
@@ -550,7 +617,7 @@ mod tests {
             removes: vec![],
             v_eff: 10,
         };
-        let next = cmd.validate_against(&cur, 0).unwrap();
+        let next = validate_bls(&cmd, &cur).unwrap();
         assert!(next.contains(&nid(5)));
     }
 
@@ -566,7 +633,7 @@ mod tests {
             removes: vec![],
             v_eff: 10,
         };
-        let err = cmd.validate_against(&floor_set(), 0).unwrap_err();
+        let err = validate_bls(&cmd, &floor_set()).unwrap_err();
         assert!(err.to_string().contains("PoP"), "{err}");
     }
 
@@ -585,16 +652,14 @@ mod tests {
             removes: vec![],
             v_eff: 10,
         };
-        let err = cmd.validate_against(&floor_set(), 0).unwrap_err();
+        let err = validate_bls(&cmd, &floor_set()).unwrap_err();
         assert!(err.to_string().contains("PoP"), "{err}");
     }
 
     #[test]
-    fn add_without_pop_still_passes_validation_today() {
-        // Pre-#293: PoP is verified when present but not required. An
-        // Ed25519 chain's add has `bls_pop: None` and validation
-        // succeeds. #293 will add scheme-driven enforcement (BLS chain
-        // = PoP required) at the call site.
+    fn add_without_pop_passes_validation_on_ed25519_chain() {
+        // Default validate_against uses Ed25519Collected. An add with
+        // `bls_pop: None` on an Ed25519 chain is the normal case.
         let cur = floor_set();
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
@@ -602,6 +667,68 @@ mod tests {
             v_eff: 10,
         };
         cmd.validate_against(&cur, 0)
-            .expect("entries without PoP must still validate (Ed25519 chains)");
+            .expect("entries without PoP must validate on Ed25519 chains");
+    }
+
+    // ---------- Scheme-driven PoP enforcement (#334) ----------
+
+    #[test]
+    fn bls_chain_rejects_add_without_pop() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry(5, 7005)],
+            removes: vec![],
+            v_eff: 10,
+        };
+        let err = cmd
+            .validate_against_with_delay_and_scheme(
+                &cur,
+                0,
+                MIN_V_EFF_DELAY,
+                SignatureSchemeChoice::BlsAggregated,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("bls_aggregated") && err.to_string().contains("no bls_pop"),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn bls_chain_accepts_add_with_pop() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry_with_valid_pop(5, 7005)],
+            removes: vec![],
+            v_eff: 10,
+        };
+        let next = cmd
+            .validate_against_with_delay_and_scheme(
+                &cur,
+                0,
+                MIN_V_EFF_DELAY,
+                SignatureSchemeChoice::BlsAggregated,
+            )
+            .unwrap();
+        assert!(next.contains(&nid(5)));
+    }
+
+    #[test]
+    fn ed25519_chain_rejects_add_with_pop() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry_with_valid_pop(5, 7005)],
+            removes: vec![],
+            v_eff: 10,
+        };
+        let err = cmd
+            .validate_against_with_delay_and_scheme(
+                &cur,
+                0,
+                MIN_V_EFF_DELAY,
+                SignatureSchemeChoice::Ed25519Collected,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("ed25519_collected"), "{err}",);
     }
 }

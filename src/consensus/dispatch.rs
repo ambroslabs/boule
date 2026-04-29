@@ -33,14 +33,16 @@
 use bytes::Bytes;
 
 use crate::consensus::View;
+use crate::consensus::bls_key_history::BlsKeyHistory;
 use crate::consensus::hotstuff::ConsensusMsg;
-use crate::consensus::hotstuff::qc::TimeoutVote;
+use crate::consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote, Vote};
 use crate::consensus::hotstuff::step::Action as SafetyAction;
 use crate::consensus::node::WireMessage;
 use crate::consensus::pacemaker;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
-use crate::crypto::signed::{Signed, SignedMessage, Signer};
+use crate::crypto::sig_scheme::SignatureSchemeChoice;
+use crate::crypto::signed::{Signed, SignedMessage, Signer, preimage};
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 use crate::replication::snapshot::SnapshotManifest;
@@ -150,6 +152,15 @@ pub enum IngressError {
     MalformedHighQc {
         view: View,
     },
+    /// A QC's aggregate signature failed verification under the
+    /// per-historical-view validator set. Catches a Byzantine leader
+    /// who ships a Proposal whose `justify` aggregate doesn't actually
+    /// commit a quorum, or a Byzantine peer who forwards a NewView with
+    /// a forged `high_qc`. `scheme` names which variant rejected the QC.
+    InvalidQcAggregate {
+        view: View,
+        scheme: &'static str,
+    },
 }
 
 impl std::fmt::Display for IngressError {
@@ -164,6 +175,10 @@ impl std::fmt::Display for IngressError {
                 f,
                 "NewView's high_qc at view {view} is not well-formed under the historical validator set",
             ),
+            IngressError::InvalidQcAggregate { view, scheme } => write!(
+                f,
+                "QC at view {view} ({scheme}) failed aggregate verification under the historical validator set",
+            ),
         }
     }
 }
@@ -173,9 +188,32 @@ impl std::error::Error for IngressError {
         match self {
             IngressError::Decode(e) => Some(e),
             IngressError::InvalidSignature(e) => Some(e.as_ref()),
-            IngressError::UnknownSigner(_) | IngressError::MalformedHighQc { .. } => None,
+            IngressError::UnknownSigner(_)
+            | IngressError::MalformedHighQc { .. }
+            | IngressError::InvalidQcAggregate { .. } => None,
         }
     }
+}
+
+/// QC-aggregate verification policy for [`ingress_with_qc_verification`].
+///
+/// `Skip` is the default for tests that construct QCs with placeholder
+/// signatures (no actual cryptographic content) and for the legacy
+/// [`ingress`] entry point.
+///
+/// `Verify` is what production wires: every QC's aggregate is checked
+/// against the per-historical-view validator pubkeys before any
+/// `Dispatch` is emitted. This closes the Byzantine-leader-ships-a-bogus
+/// QC vector regardless of scheme.
+pub enum QcVerification<'a> {
+    Skip,
+    Verify {
+        scheme: SignatureSchemeChoice,
+        /// Required on BLS chains; ignored on Ed25519 chains. The
+        /// per-historical-view BLS pubkey lookup
+        /// [`QuorumCertificate::verify_aggregate_bls`] indexes through.
+        bls_key_history: Option<&'a BlsKeyHistory>,
+    },
 }
 
 impl From<postcard::Error> for IngressError {
@@ -219,8 +257,22 @@ pub fn ingress(
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
 ) -> Result<Vec<Dispatch>, IngressError> {
+    ingress_with_qc_verification(from, bytes, history, key_history, &QcVerification::Skip)
+}
+
+/// Decode + verify a wire frame, additionally checking embedded QC
+/// aggregates per `qc_verification`. Production callers pass
+/// [`QcVerification::Verify`] with the chain's scheme; tests that
+/// construct QCs with placeholder signatures pass [`QcVerification::Skip`].
+pub fn ingress_with_qc_verification(
+    from: NodeId,
+    bytes: &[u8],
+    history: &ValidatorSetHistory,
+    key_history: &ValidatorKeyHistory,
+    qc_verification: &QcVerification<'_>,
+) -> Result<Vec<Dispatch>, IngressError> {
     let msg: WireMessage = postcard::from_bytes(bytes)?;
-    ingress_wire(from, msg, history, key_history)
+    ingress_wire_with_qc_verification(from, msg, history, key_history, qc_verification)
 }
 
 /// Same as [`ingress`] but takes an already-decoded [`WireMessage`].
@@ -232,11 +284,29 @@ pub fn ingress_wire(
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
 ) -> Result<Vec<Dispatch>, IngressError> {
+    ingress_wire_with_qc_verification(from, msg, history, key_history, &QcVerification::Skip)
+}
+
+/// QC-verifying counterpart to [`ingress_wire`]. See [`QcVerification`]
+/// for the scheme-aware verification policy.
+pub fn ingress_wire_with_qc_verification(
+    from: NodeId,
+    msg: WireMessage,
+    history: &ValidatorSetHistory,
+    key_history: &ValidatorKeyHistory,
+    qc_verification: &QcVerification<'_>,
+) -> Result<Vec<Dispatch>, IngressError> {
     match msg {
         WireMessage::Proposal(signed) => {
             let view = signed.payload.block.header.view;
             verify_signer_at(signed.signer, view, history, key_history)?;
             verify_sig(&signed)?;
+            verify_qc_if_requested(
+                &signed.payload.justify,
+                history,
+                key_history,
+                qc_verification,
+            )?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::ProposalReceived(
                     signed,
@@ -275,6 +345,12 @@ pub fn ingress_wire(
             if !signed.payload.high_qc.is_well_formed(&vs) {
                 return Err(IngressError::MalformedHighQc { view: high_qc_view });
             }
+            verify_qc_if_requested(
+                &signed.payload.high_qc,
+                history,
+                key_history,
+                qc_verification,
+            )?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
                     signed,
@@ -389,6 +465,111 @@ where
     signed
         .verify(&signed.signer)
         .map_err(IngressError::InvalidSignature)
+}
+
+/// Verify a QC's aggregate signature per the requested
+/// [`QcVerification`] policy. Genesis-shaped QCs (no signers) are
+/// accepted unconditionally — the genesis QC is by construction
+/// signature-free, and rejecting it here would refuse to bootstrap.
+///
+/// On `Skip`, returns `Ok(())` without inspecting the QC. On `Verify`,
+/// the QC's scheme must match `scheme`; the per-historical-view
+/// validator pubkeys are resolved at `qc.view` via `key_history`
+/// (Ed25519) or `bls_key_history` (BLS); the corresponding
+/// `verify_aggregate` / `verify_aggregate_bls` is called against the
+/// canonical Vote pre-image `(qc.view, qc.block_hash)`.
+fn verify_qc_if_requested(
+    qc: &QuorumCertificate,
+    history: &ValidatorSetHistory,
+    key_history: &ValidatorKeyHistory,
+    qc_verification: &QcVerification<'_>,
+) -> Result<(), IngressError> {
+    let QcVerification::Verify {
+        scheme,
+        bls_key_history,
+    } = qc_verification
+    else {
+        return Ok(());
+    };
+
+    // Genesis QCs are a convention, not a cryptographic commitment:
+    // every honest replica builds the same QC at view 0 over the
+    // genesis block hash with all-zero placeholder signatures (see
+    // `crate::consensus::hotstuff::qc::genesis_qc`). Aggregate
+    // verification cannot succeed against placeholder sigs, and the
+    // safety core checks the QC's block_hash against the genesis hash
+    // downstream, so skipping at view 0 is safe.
+    //
+    // QCs with no signers at any other view also have nothing to
+    // verify cryptographically — accept them and let the safety core
+    // decide whether to act on a no-quorum QC.
+    if qc.view == 0 || qc.signer_count() == 0 {
+        return Ok(());
+    }
+
+    let vs = history.set_at(qc.view);
+    // Each partial in the QC is the Ed25519 / BLS signature on the
+    // domain-separated Signed<Vote> envelope preimage — the same bytes
+    // the voter signed in `Signed::sign(vote, signer)`. Reconstruct
+    // that preimage here so verify_aggregate sees what the signer saw.
+    let vote = Vote {
+        view: qc.view,
+        block_hash: qc.block_hash,
+    };
+    let vote_preimage = preimage::<Vote>(&vote).map_err(|_| IngressError::InvalidQcAggregate {
+        view: qc.view,
+        scheme: scheme.name(),
+    })?;
+
+    match scheme {
+        SignatureSchemeChoice::Ed25519Collected => {
+            if !qc.is_ed25519() {
+                return Err(IngressError::InvalidQcAggregate {
+                    view: qc.view,
+                    scheme: scheme.name(),
+                });
+            }
+            // The verifier needs one Ed25519 pubkey per validator slot
+            // at qc.view — the same pubkey under which a vote at that
+            // view would have been signed. Resolve through the
+            // per-historical-view key history so post-rotation lookups
+            // pick up the right key.
+            let pubkeys: Vec<NodeId> = vs
+                .iter()
+                .map(|stable_id| key_history.key_at(stable_id, qc.view).unwrap_or(*stable_id))
+                .collect();
+            qc.verify_aggregate(&vote_preimage, &pubkeys).map_err(|_| {
+                IngressError::InvalidQcAggregate {
+                    view: qc.view,
+                    scheme: scheme.name(),
+                }
+            })?;
+        }
+        SignatureSchemeChoice::BlsAggregated => {
+            if !qc.is_bls() {
+                return Err(IngressError::InvalidQcAggregate {
+                    view: qc.view,
+                    scheme: scheme.name(),
+                });
+            }
+            let bls_history = bls_key_history.ok_or(IngressError::InvalidQcAggregate {
+                view: qc.view,
+                scheme: scheme.name(),
+            })?;
+            let pubkeys = bls_history.pubkeys_for_set(&vs, qc.view).map_err(|_| {
+                IngressError::InvalidQcAggregate {
+                    view: qc.view,
+                    scheme: scheme.name(),
+                }
+            })?;
+            qc.verify_aggregate_bls(&vote_preimage, &pubkeys)
+                .map_err(|_| IngressError::InvalidQcAggregate {
+                    view: qc.view,
+                    scheme: scheme.name(),
+                })?;
+        }
+    }
+    Ok(())
 }
 
 // ── egress_safety ─────────────────────────────────────────────────────────────
@@ -1773,5 +1954,291 @@ mod tests {
             dispatches[0],
             Dispatch::Safety(SafetyEvent::VoteReceived(_))
         ));
+    }
+
+    // ── ingress: QC aggregate verification (#332) ────────────────────────────
+
+    /// Build a 4-validator setup, hand-fold real Vote signatures into a
+    /// QC over `(view, block_hash)`, and return the bundle the
+    /// verification tests below use.
+    fn build_real_ed25519_qc(
+        view: View,
+        block_hash: BlockHash,
+    ) -> (Vec<NodeSigner>, ValidatorSet, QuorumCertificate) {
+        let signers: Vec<NodeSigner> = (0..4).map(|_| fresh_signer()).collect();
+        let vs = ValidatorSet::new(signers.iter().map(|s| s.node_id()).collect());
+
+        let vote = Vote { view, block_hash };
+        let mut qc = QuorumCertificate::new(view, block_hash, vs.len());
+        // Fold the first 3 validators' signatures (n=4 → quorum=3) in
+        // sorted-NodeId order to match the bitmap layout the verifier
+        // assumes.
+        for stable_id in vs.iter().take(quorum_size_for_n(vs.len())) {
+            let signer = signers.iter().find(|s| &s.node_id() == stable_id).unwrap();
+            let signed = Signed::sign(vote.clone(), signer).unwrap();
+            let idx = vs.index_of(stable_id).unwrap();
+            qc.add_signature(idx, signed.sig);
+        }
+        (signers, vs, qc)
+    }
+
+    fn quorum_size_for_n(n: usize) -> usize {
+        // Mirror crate::consensus::hotstuff::qc::quorum_size: ceil(2n/3).
+        n.div_ceil(3) * 2 - if n % 3 == 0 { 1 } else { 0 }
+    }
+
+    #[test]
+    fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
+        let view: View = 5;
+        let block_hash = [0x55; 32];
+        let (signers, vs, qc) = build_real_ed25519_qc(view, block_hash);
+        let leader = &signers[0];
+
+        // Build a proposal at the next view that justifies on this QC.
+        let block = Block {
+            header: crate::replication::block::BlockHeader {
+                parent_hash: block_hash,
+                height: 1,
+                view: view + 1,
+                proposer: leader.node_id(),
+                state_commitment: [0; 32],
+                commands_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let proposal = Proposal { block, justify: qc };
+        let signed = Signed::sign(proposal, leader).unwrap();
+        let wire = WireMessage::Proposal(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let dispatches = ingress_with_qc_verification(
+            leader.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect("real Ed25519 QC must verify under the genesis pubkeys");
+        assert_eq!(dispatches.len(), 2);
+    }
+
+    #[test]
+    fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
+        let view: View = 5;
+        let block_hash = [0x55; 32];
+        let (signers, vs, mut qc) = build_real_ed25519_qc(view, block_hash);
+        let leader = &signers[0];
+
+        // Tamper the first signature inside the QC.
+        if let crate::consensus::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) =
+            &mut qc.signatures
+        {
+            sigs[0][0] ^= 0xFF;
+        }
+
+        let block = Block {
+            header: crate::replication::block::BlockHeader {
+                parent_hash: block_hash,
+                height: 1,
+                view: view + 1,
+                proposer: leader.node_id(),
+                state_commitment: [0; 32],
+                commands_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let proposal = Proposal { block, justify: qc };
+        let signed = Signed::sign(proposal, leader).unwrap();
+        let wire = WireMessage::Proposal(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let err = ingress_with_qc_verification(
+            leader.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect_err("tampered QC must be rejected");
+        assert!(matches!(
+            err,
+            IngressError::InvalidQcAggregate {
+                view: 5,
+                scheme: "ed25519_collected"
+            }
+        ));
+    }
+
+    #[test]
+    fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
+        let view: View = 7;
+        let block_hash = [0x77; 32];
+        let (signers, vs, mut high_qc) = build_real_ed25519_qc(view, block_hash);
+        let messenger = &signers[1];
+
+        if let crate::consensus::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) =
+            &mut high_qc.signatures
+        {
+            sigs[1][3] ^= 0xAA;
+        }
+
+        let nv = NewView { high_qc };
+        let signed = Signed::sign(nv, messenger).unwrap();
+        let wire = WireMessage::NewView(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let err = ingress_with_qc_verification(
+            messenger.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect_err("tampered high_qc must be rejected");
+        assert!(matches!(
+            err,
+            IngressError::InvalidQcAggregate {
+                view: 7,
+                scheme: "ed25519_collected"
+            }
+        ));
+    }
+
+    #[test]
+    fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
+        // The view-1 leader proposes with an empty justify == genesis QC.
+        // That QC has no signers; the verifier must let it through
+        // unchanged or no chain ever boots.
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+        let proposal = Proposal {
+            block: genesis(),
+            justify: sample_qc(),
+        };
+        let signed = Signed::sign(proposal, &signer).unwrap();
+        let wire = WireMessage::Proposal(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let dispatches = ingress_with_qc_verification(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect("genesis QC (no signers) must pass aggregate verification");
+        assert_eq!(dispatches.len(), 2);
+    }
+
+    #[test]
+    fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
+        // A QC carrying the BLS variant arriving on an Ed25519 chain is
+        // a structural mismatch — reject before pairing-check.
+        let view: View = 3;
+        let block_hash = [0x33; 32];
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+        // Build a real-shaped BLS QC so it survives is_well_formed:
+        // sign with a real BLS key and fold the partial in normally.
+        // The dispatch-layer scheme mismatch (Ed25519 chain receiving
+        // a BLS QC) is what we're exercising, not bytes-level forgery.
+        let mut ikm = [0u8; 32];
+        ikm[0] = 0xAB;
+        let (sk, _pk) = crate::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
+        let real_partial =
+            crate::crypto::sig_scheme::BlsAggregated::sign_partial(&sk, b"x").unwrap();
+        let mut bls_qc = QuorumCertificate::new_bls(view, block_hash, vs.len());
+        bls_qc.add_bls_partial(0, real_partial);
+
+        let block = Block {
+            header: crate::replication::block::BlockHeader {
+                parent_hash: block_hash,
+                height: 1,
+                view: view + 1,
+                proposer: signer.node_id(),
+                state_commitment: [0; 32],
+                commands_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let proposal = Proposal {
+            block,
+            justify: bls_qc,
+        };
+        let signed = Signed::sign(proposal, &signer).unwrap();
+        let wire = WireMessage::Proposal(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let err = ingress_with_qc_verification(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect_err("BLS QC on Ed25519 chain must be rejected");
+        assert!(matches!(
+            err,
+            IngressError::InvalidQcAggregate {
+                scheme: "ed25519_collected",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ingress_with_skip_lets_invalid_aggregate_through() {
+        // The default ingress path is `Skip` to preserve existing test
+        // fixtures that construct QCs with placeholder bytes. Document
+        // that behaviour explicitly so a future change doesn't tighten
+        // it without us noticing.
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+        let mut bogus_qc = QuorumCertificate::new(0, sample_qc().block_hash, vs.len());
+        bogus_qc.add_signature(0, [0xCC; 64]); // not a real Ed25519 sig
+        let proposal = Proposal {
+            block: genesis(),
+            justify: bogus_qc,
+        };
+        let signed = Signed::sign(proposal, &signer).unwrap();
+        let wire = WireMessage::Proposal(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        // Default ingress → QcVerification::Skip → no aggregate check.
+        let dispatches = ingress(signer.node_id(), &bytes, &history, &key_history)
+            .expect("Skip policy must not exercise aggregate verification");
+        assert_eq!(dispatches.len(), 2);
     }
 }
