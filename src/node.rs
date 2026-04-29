@@ -453,12 +453,15 @@ async fn start_consensus(
     )
     .await?;
 
-    // Resolve the BLS key history. On Ed25519 chains: None. On BLS
-    // chains: prefer the persisted form (#339), falling back to a
-    // fresh genesis seed if storage has nothing yet. Both branches
-    // re-validate the local node's BLS identity against the canonical
-    // genesis pubkey for that NodeId (#335).
-    let bls_key_history = reconcile_bls_identity(
+    // Resolve the BLS key history *and* signer. On Ed25519 chains:
+    // both `None`. On BLS chains: the BLS pubkey table (preferred
+    // from persistence per #339, falling back to a fresh genesis
+    // seed) plus the loaded validator identity wrapped in a
+    // `BlsPartialSignerImpl` so the dispatch layer can sign Vote
+    // partials (#354 step 2). Both branches re-validate the local
+    // node's BLS identity against the canonical genesis pubkey for
+    // that NodeId (#335).
+    let bls_setup = reconcile_bls_identity(
         cons_cfg,
         bls_identity_config,
         self_id,
@@ -468,8 +471,14 @@ async fn start_consensus(
 
     let mut node =
         ConsensusNode::recover(*self_id, node_cfg, state_machine, mempool, storage, wal)?;
-    if let Some(history) = bls_key_history {
+    if let Some(BlsBootstrap { history, identity }) = bls_setup {
         node = node.with_bls_key_history(history);
+        let bls_signer: Arc<
+            dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
+        > = Arc::new(crate::crypto::bls_key::BlsPartialSignerImpl::from_identity(
+            identity,
+        ));
+        node = node.with_bls_signer(bls_signer);
     }
 
     let initial_status = Arc::new(node.build_status());
@@ -495,6 +504,17 @@ async fn start_consensus(
     })
 }
 
+/// Bundle returned by [`reconcile_bls_identity`] on `bls_aggregated`
+/// chains: the per-historical-view pubkey table (consumed by the
+/// dispatch verifier on inbound QCs) plus the loaded validator
+/// identity (consumed by the dispatch signer on outbound votes,
+/// wrapped in `BlsPartialSignerImpl` in the caller).
+#[derive(Debug)]
+struct BlsBootstrap {
+    history: crate::consensus::bls_key_history::BlsKeyHistory,
+    identity: crate::crypto::bls_key::BlsValidatorIdentity,
+}
+
 /// Reconcile the node's local BLS identity with the chain's signature
 /// scheme (#335). Refuses to start in any of:
 ///
@@ -502,17 +522,19 @@ async fn start_consensus(
 /// - BLS chain whose configured BLS key isn't a genesis validator.
 /// - Ed25519 chain with `[node.bls_validator_identity]` set.
 ///
-/// On a BLS chain that passes the checks, returns the seeded
-/// [`crate::consensus::bls_key_history::BlsKeyHistory`] so the engine
-/// can verify per-historical-view BLS pubkeys at QC ingress.
-/// On an Ed25519 chain, returns `None`.
+/// On a BLS chain that passes the checks, returns a [`BlsBootstrap`]
+/// carrying both the seeded
+/// [`crate::consensus::bls_key_history::BlsKeyHistory`] (for QC
+/// verification at ingress) and the loaded
+/// [`crate::crypto::bls_key::BlsValidatorIdentity`] (for partial
+/// signing at egress). On an Ed25519 chain, returns `None`.
 fn reconcile_bls_identity(
     cons_cfg: &ConsensusConfig,
     bls_identity_config: Option<&BlsIdentityConfig>,
     self_id: &NodeId,
     genesis_bls: &[(NodeId, crate::crypto::sig_scheme::BlsPublicKey)],
     storage: &dyn crate::storage::Storage,
-) -> anyhow::Result<Option<crate::consensus::bls_key_history::BlsKeyHistory>> {
+) -> anyhow::Result<Option<BlsBootstrap>> {
     use crate::consensus::bls_key_history::PersistedBlsKeyHistory;
     use crate::consensus::node::STORAGE_KEY_BLS_KEY_HISTORY;
     use crate::crypto::sig_scheme::SignatureSchemeChoice;
@@ -594,7 +616,7 @@ fn reconcile_bls_identity(
                     genesis_bls.iter().copied(),
                 ),
             };
-            Ok(Some(history))
+            Ok(Some(BlsBootstrap { history, identity }))
         }
     }
 }
@@ -876,12 +898,13 @@ mod tests {
         let cfg = cons_cfg(SignatureSchemeChoice::BlsAggregated);
         let genesis = vec![(self_id, pk), (nid(8), [0xAB; 48])];
         let storage = empty_storage();
-        let history =
+        let bootstrap =
             reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis, storage.as_ref())
-                .expect("must succeed");
-        let history = history.expect("BLS chain must seed a history");
-        assert_eq!(history.len(), 2);
-        assert_eq!(history.key_at(&self_id, 0), Some(pk));
+                .expect("must succeed")
+                .expect("BLS chain must seed a history + identity");
+        assert_eq!(bootstrap.history.len(), 2);
+        assert_eq!(bootstrap.history.key_at(&self_id, 0), Some(pk));
+        assert_eq!(bootstrap.identity.public, pk);
     }
 
     #[test]
@@ -959,10 +982,15 @@ mod tests {
         let reloaded =
             reconcile_bls_identity(&cfg, Some(&bls_cfg), &self_id, &genesis, storage.as_ref())
                 .expect("must succeed")
-                .expect("BLS chain seeds a history");
+                .expect("BLS chain seeds a history + identity");
         // The post-rotation pubkey survived the persist/reload cycle.
-        assert_eq!(reloaded.key_at(&self_id, 100), Some([0xCC; 48]));
+        assert_eq!(reloaded.history.key_at(&self_id, 100), Some([0xCC; 48]));
         // And the genesis pubkey is still there for older views.
-        assert_eq!(reloaded.key_at(&self_id, 0), Some(pk));
+        assert_eq!(reloaded.history.key_at(&self_id, 0), Some(pk));
+        // The loaded identity is wired through alongside the history so
+        // the dispatch signer can produce real BLS partials on Vote
+        // frames (#354 step 2 — without this the production startup
+        // would silently boot a BLS validator that can't sign votes).
+        assert_eq!(reloaded.identity.public, pk);
     }
 }
