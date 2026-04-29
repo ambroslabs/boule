@@ -76,8 +76,12 @@ impl LeaderSelector for RoundRobinSelector {
         // `view % len as u64` before narrowing to usize so the rotation
         // is identical on 32- and 64-bit platforms.
         let idx = (view % vs.len() as u64) as usize;
-        *vs.get(idx)
+        // Round-robin returns the wire-form `NodeId` for the leader;
+        // the bytes are the validator's stable id (#328 keeps the
+        // bytes reusable across the typestate boundary).
+        vs.get(idx)
             .expect("modulo of non-zero length is always in bounds")
+            .into_node_id()
     }
 }
 
@@ -89,8 +93,16 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> crate::consensus::validator_set::ValidatorId {
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     fn sel(ids: Vec<NodeId>) -> RoundRobinSelector {
-        RoundRobinSelector::from_genesis_set(Arc::new(ValidatorSet::new(ids)))
+        let vids: Vec<_> = ids
+            .into_iter()
+            .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+            .collect();
+        RoundRobinSelector::from_genesis_set(Arc::new(ValidatorSet::new(vids)))
     }
 
     #[test]
@@ -139,8 +151,8 @@ mod tests {
     /// come from the new set.
     #[test]
     fn rotation_picks_pre_boundary_set_before_v_eff_and_post_at_or_after() {
-        let old_set = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)]);
-        let new_set = ValidatorSet::new(vec![nid(10), nid(20), nid(30)]);
+        let old_set = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)]);
+        let new_set = ValidatorSet::new(vec![vid(10), vid(20), vid(30)]);
         let v_eff: View = 7;
 
         let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
@@ -149,12 +161,12 @@ mod tests {
 
         // Pre-boundary leaders are the old set: idx = view % 4.
         for v in [0u64, 1, 2, 3, 4, 5, 6] {
-            let expected = *old_set.get((v % 4) as usize).unwrap();
+            let expected = old_set.get((v % 4) as usize).unwrap().into_node_id();
             assert_eq!(s.leader_for_view(v), expected, "pre-boundary leader at {v}");
         }
         // At and beyond v_eff the new set rotates: idx = view % 3.
         for v in [7u64, 8, 9, 10, 11] {
-            let expected = *new_set.get((v % 3) as usize).unwrap();
+            let expected = new_set.get((v % 3) as usize).unwrap().into_node_id();
             assert_eq!(
                 s.leader_for_view(v),
                 expected,
@@ -169,9 +181,9 @@ mod tests {
     /// through three regimes in order.
     #[test]
     fn multiple_boundaries_drive_rotation_through_each_regime() {
-        let g = ValidatorSet::new(vec![nid(1), nid(2)]);
-        let mid = ValidatorSet::new(vec![nid(3), nid(4), nid(5)]);
-        let post = ValidatorSet::new(vec![nid(6), nid(7), nid(8), nid(9)]);
+        let g = ValidatorSet::new(vec![vid(1), vid(2)]);
+        let mid = ValidatorSet::new(vec![vid(3), vid(4), vid(5)]);
+        let post = ValidatorSet::new(vec![vid(6), vid(7), vid(8), vid(9)]);
 
         let mut history = ValidatorSetHistory::from_genesis(g.clone());
         history.insert_boundary(5, mid.clone()).unwrap();
@@ -179,17 +191,17 @@ mod tests {
         let s = RoundRobinSelector::new(Arc::new(history));
 
         // Regime 1: views 0..=4 over the genesis set (size 2).
-        assert_eq!(s.leader_for_view(0), *g.get(0).unwrap());
-        assert_eq!(s.leader_for_view(1), *g.get(1).unwrap());
-        assert_eq!(s.leader_for_view(4), *g.get(0).unwrap());
+        assert_eq!(s.leader_for_view(0), g.get(0).unwrap().into_node_id());
+        assert_eq!(s.leader_for_view(1), g.get(1).unwrap().into_node_id());
+        assert_eq!(s.leader_for_view(4), g.get(0).unwrap().into_node_id());
 
         // Regime 2: views 5..=10 over the mid set (size 3).
-        assert_eq!(s.leader_for_view(5), *mid.get(2).unwrap()); // 5 % 3 = 2
-        assert_eq!(s.leader_for_view(6), *mid.get(0).unwrap()); // 6 % 3 = 0
-        assert_eq!(s.leader_for_view(10), *mid.get(1).unwrap()); // 10 % 3 = 1
+        assert_eq!(s.leader_for_view(5), mid.get(2).unwrap().into_node_id()); // 5 % 3 = 2
+        assert_eq!(s.leader_for_view(6), mid.get(0).unwrap().into_node_id()); // 6 % 3 = 0
+        assert_eq!(s.leader_for_view(10), mid.get(1).unwrap().into_node_id()); // 10 % 3 = 1
 
         // Regime 3: views 11.. over the post set (size 4).
-        assert_eq!(s.leader_for_view(11), *post.get(3).unwrap()); // 11 % 4 = 3
-        assert_eq!(s.leader_for_view(12), *post.get(0).unwrap()); // 12 % 4 = 0
+        assert_eq!(s.leader_for_view(11), post.get(3).unwrap().into_node_id()); // 11 % 4 = 3
+        assert_eq!(s.leader_for_view(12), post.get(0).unwrap().into_node_id()); // 12 % 4 = 0
     }
 }

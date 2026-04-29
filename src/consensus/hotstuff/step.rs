@@ -854,7 +854,20 @@ impl HotStuffCore {
         // a reconfig boundary are validated against the right
         // committee on either side.
         let vs_at_vote = self.state.validator_history.set_at(vote.view);
-        let Some(voter_idx) = vs_at_vote.index_of(&signed.signer) else {
+        // `signed.signer` is the wire pubkey. The integration layer's
+        // ingress (#249) has already verified this matches the active
+        // signing key for some validator at `vote.view`, and that the
+        // resolved stable id is in the historical set. The safety core
+        // doesn't own a `ValidatorKeyHistory` reference, so it relies
+        // on the convention that today the validator set's stable ids
+        // are byte-equal to the validator's genesis pubkey — same
+        // identity model the rest of the safety core uses against
+        // `validator_set`. When key-rotation lookups are threaded
+        // through here (#328 follow-up), this should resolve via
+        // `validator_for(pubkey)` instead of the direct re-tag.
+        let voter_id =
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(signed.signer);
+        let Some(voter_idx) = vs_at_vote.index_of(&voter_id) else {
             return Vec::new();
         };
 
@@ -1399,8 +1412,13 @@ impl HotStuffCore {
 fn round_robin_leader(vs: &ValidatorSet, view: View) -> NodeId {
     let len = vs.len();
     debug_assert!(len > 0, "validator set must be non-empty");
-    *vs.get((view as usize) % len)
+    // The round-robin leader lookup picks a stable id from the set;
+    // the wire layer (and the rest of the integration callers) work
+    // in `NodeId` space (#328 keeps the bytes reusable across the
+    // typestate boundary).
+    vs.get((view as usize) % len)
         .expect("validator set is non-empty")
+        .into_node_id()
 }
 
 /// Compute the view-gap to wait before the next `RequestBlock` retry
@@ -1449,16 +1467,22 @@ fn pick_block_sync_peer(
     if len == 0 {
         return original_sender;
     }
-    let sender_idx = validator_set.index_of(&original_sender).unwrap_or(0);
+    // Same byte-equality convention as `round_robin_leader`: today
+    // the wire `original_sender` and the validator set's stable id
+    // share bytes (no rotation has changed signer pubkeys yet).
+    let sender_vid =
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(original_sender);
+    let sender_idx = validator_set.index_of(&sender_vid).unwrap_or(0);
     // Build the rotation ring: every validator after `sender_idx`
     // (wrapping), skipping `self_id`. The ring is small (validator
     // sets are O(10s)), so a Vec is cheap and keeps the rotation
     // index arithmetic obvious.
     let mut ring: Vec<NodeId> = Vec::with_capacity(len);
     for offset in 1..=len {
-        let candidate = *validator_set
+        let candidate = validator_set
             .get((sender_idx + offset) % len)
-            .expect("validator_set indexing in bounds");
+            .expect("validator_set indexing in bounds")
+            .into_node_id();
         if candidate != self_id {
             ring.push(candidate);
         }
@@ -1507,10 +1531,14 @@ mod tests {
         [b; 32]
     }
 
+    pub(crate) fn vid(b: u8) -> crate::consensus::validator_set::ValidatorId {
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     /// The canonical four-validator set used across the step tests.
     /// Sorted order matches the byte value: `[nid(1), nid(2), nid(3), nid(4)]`.
     pub(crate) fn validators() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)])
     }
 
     /// Build a [`Signed<Vote>`] whose `sig` bytes are
@@ -2487,8 +2515,8 @@ mod tests {
         let bls_keys: Vec<(BlsSecretKey, BlsPublicKey)> = validators_set
             .iter()
             .enumerate()
-            .map(|(i, &nid)| {
-                let mut ikm = nid;
+            .map(|(i, validator_id)| {
+                let mut ikm = validator_id.into_node_id();
                 ikm[0] ^= i as u8;
                 BlsAggregated::keygen(&ikm).expect("BLS keygen for test")
             })
@@ -2957,7 +2985,7 @@ mod tests {
         // `validators()`. Boundary at v_eff = 5 swaps in a new set
         // that drops nid(4) and adds nid(5) + nid(6) to keep size 5.
         let v_eff: View = 5;
-        let new_set = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(5), nid(6)]);
+        let new_set = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(5), vid(6)]);
         core.state
             .validator_history
             .insert_boundary(v_eff, new_set)
@@ -2989,7 +3017,7 @@ mod tests {
     fn vote_before_boundary_signed_by_new_set_only_member_is_dropped() {
         let mut core = make_core(1);
         let v_eff: View = 5;
-        let new_set = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5)]);
+        let new_set = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(5)]);
         core.state
             .validator_history
             .insert_boundary(v_eff, new_set)
@@ -3020,7 +3048,7 @@ mod tests {
     fn vote_at_v_eff_signed_by_new_set_only_member_lands_in_bucket() {
         let mut core = make_core(1);
         let v_eff: View = 5;
-        let new_set = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(7)]);
+        let new_set = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(7)]);
         core.state
             .validator_history
             .insert_boundary(v_eff, new_set)
@@ -3617,7 +3645,7 @@ mod tests {
         /// having to drive a fully-instrumented pacemaker.
         #[test]
         fn pick_block_sync_peer_rotates_validator_ring_skipping_self() {
-            let validators = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)]);
+            let validators = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)]);
             let self_id = nid(1);
             let sender = nid(2);
             // per_peer = 1 forces a fresh round on every increment.
@@ -4355,7 +4383,9 @@ mod tests {
         /// matches `i.cmp(&j)` — the `RoundRobinSelector` inside each
         /// core maps view `v` to validator index `v % n`.
         pub(crate) fn validator_set(n: usize) -> ValidatorSet {
-            let members: Vec<NodeId> = (1..=n as u8).map(|b| [b; 32]).collect();
+            let members: Vec<crate::consensus::validator_set::ValidatorId> = (1..=n as u8)
+                .map(|b| crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([b; 32]))
+                .collect();
             ValidatorSet::new(members)
         }
 
@@ -4433,7 +4463,7 @@ mod tests {
                 let genesis = Block::genesis([0; 32], [0; 32]);
                 let cores: Vec<HotStuffCore> = (0..n_honest)
                     .map(|i| {
-                        let nid = *validators.get(i).unwrap();
+                        let nid = validators.get(i).unwrap().into_node_id();
                         let state = HotStuffState::new(validators.clone(), genesis.clone());
                         let builder = Arc::new(TestBlockBuilder { proposer: nid });
                         HotStuffCore::new(nid, state, builder).with_signature_scheme(scheme)
@@ -4508,7 +4538,7 @@ mod tests {
             pub fn byzantine_nids(&self) -> Vec<NodeId> {
                 let n_honest = self.cores.len();
                 (n_honest..n_honest + self.byzantine_count)
-                    .map(|i| *self.validators.get(i).unwrap())
+                    .map(|i| self.validators.get(i).unwrap().into_node_id())
                     .collect()
             }
 
@@ -4519,7 +4549,8 @@ mod tests {
             /// the adversary sees the message but doesn't process
             /// it through any harness-owned core.
             pub fn honest_index_of(&self, nid: &NodeId) -> Option<usize> {
-                let idx = self.validators.index_of(nid)?;
+                let vid = crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(*nid);
+                let idx = self.validators.index_of(&vid)?;
                 if idx < self.cores.len() {
                     Some(idx)
                 } else {
@@ -4552,7 +4583,7 @@ mod tests {
             }
 
             fn apply_actions(&mut self, source: usize, actions: Vec<Action>) {
-                let source_nid = *self.validators.get(source).unwrap();
+                let source_nid = self.validators.get(source).unwrap().into_node_id();
                 for action in actions {
                     match action {
                         Action::Broadcast(msg) => {
@@ -4675,9 +4706,13 @@ mod tests {
                         }),
                     ),
                     ConsensusMsg::Vote(payload) => {
+                        let source_vid =
+                            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                                source,
+                            );
                         let signer_idx = self
                             .validators
-                            .index_of(&source)
+                            .index_of(&source_vid)
                             .expect("event_from_msg called with unknown source NodeId");
                         let bls_partial = self.bls_partial_for_vote(signer_idx, &payload);
                         Event::VoteReceived(
@@ -4710,7 +4745,7 @@ mod tests {
         fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
             let genesis_qc = replicas.synth_qc(0, replicas.genesis.hash());
             let leader_idx = 1 % replicas.len();
-            let leader_nid = *replicas.validators.get(leader_idx).unwrap();
+            let leader_nid = replicas.validators.get(leader_idx).unwrap().into_node_id();
             let builder = TestBlockBuilder {
                 proposer: leader_nid,
             };
@@ -4933,9 +4968,11 @@ mod tests {
         ) {
             let mut replicas = ReplicaSet::new_with_byzantine_scheme(4, 1, scheme);
             let byz_nid = replicas.byzantine_nids()[0];
+            let byz_vid =
+                crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(byz_nid);
             let byz_idx = replicas
                 .validators
-                .index_of(&byz_nid)
+                .index_of(&byz_vid)
                 .expect("byzantine NodeId must appear in validator set");
             let kickoff = kickoff_proposal(&replicas);
             replicas.inject_all(Event::ProposalReceived(
@@ -5261,9 +5298,11 @@ mod tests {
         ) {
             let mut replicas = ReplicaSet::new_with_byzantine_scheme(4, 1, scheme);
             let byz_nid = replicas.byzantine_nids()[0];
+            let byz_vid =
+                crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(byz_nid);
             let byz_idx = replicas
                 .validators
-                .index_of(&byz_nid)
+                .index_of(&byz_vid)
                 .expect("byzantine NodeId must appear in validator set");
             let kickoff = kickoff_proposal(&replicas);
             replicas.inject_all(Event::ProposalReceived(

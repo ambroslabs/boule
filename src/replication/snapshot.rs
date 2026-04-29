@@ -216,7 +216,7 @@ impl SnapshotManifest {
             .len()
             .try_into()
             .expect("snapshot chunk count must fit in u32 — manifest layout pins this bound");
-        let validator_set: Vec<NodeId> = validator_set.iter().copied().collect();
+        let validator_set: Vec<NodeId> = validator_set.iter().map(|v| v.into_node_id()).collect();
         let height = block.header.height;
         let view = block.header.view;
         let block_hash = block.hash();
@@ -253,8 +253,20 @@ impl SnapshotManifest {
 
     /// Reconstruct a [`ValidatorSet`] from the embedded `validator_set`
     /// vector. Cheap; clones the underlying NodeIds once.
+    ///
+    /// Snapshots embed the wire-form `Vec<NodeId>`; reconstructing the
+    /// typed [`ValidatorSet`] promotes each entry to a [`ValidatorId`]
+    /// via [`ValidatorId::from_genesis_pubkey`]. This is allowed at
+    /// recovery time (the snapshot was built by an honest replica that
+    /// previously went through the legitimate seeding/reconfig paths).
     pub fn validator_set(&self) -> ValidatorSet {
-        ValidatorSet::new(self.validator_set.clone())
+        let members: Vec<crate::consensus::validator_set::ValidatorId> = self
+            .validator_set
+            .iter()
+            .copied()
+            .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+            .collect();
+        ValidatorSet::new(members)
     }
 
     /// Verify the manifest is internally consistent and trustworthy
@@ -291,8 +303,7 @@ impl SnapshotManifest {
                 expected: SNAPSHOT_FORMAT_VERSION,
             });
         }
-        let embedded: Vec<NodeId> = self.validator_set.clone();
-        let embedded_set = ValidatorSet::new(embedded);
+        let embedded_set = self.validator_set();
         if &embedded_set != local_validator_set {
             return Err(ManifestError::ValidatorSetMismatch);
         }
@@ -951,7 +962,11 @@ mod tests {
     use crate::storage::MemoryStorage;
 
     fn vs(n: u8) -> ValidatorSet {
-        ValidatorSet::new((0..n).map(|i| [i; 32]).collect())
+        ValidatorSet::new(
+            (0..n)
+                .map(|i| crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([i; 32]))
+                .collect(),
+        )
     }
 
     /// Build a `Block` whose header is structurally well-formed for a
@@ -1243,7 +1258,12 @@ mod tests {
         // Distinct, sorted node IDs so the embedded encoding is
         // stable and we can build a "different validator set" for
         // negative tests.
-        ValidatorSet::new(vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]])
+        ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([1u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([2u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([3u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([4u8; 32]),
+        ])
     }
 
     fn quorum_qc(vs: &ValidatorSet, block_hash: BlockHash) -> QuorumCertificate {
@@ -1325,7 +1345,12 @@ mod tests {
         let vs = validator_set_len_4();
         let m = manifest_for_verify(&vs);
         // Local set has different members.
-        let other = ValidatorSet::new(vec![[5u8; 32], [6u8; 32], [7u8; 32], [8u8; 32]]);
+        let other = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([5u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([6u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([7u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([8u8; 32]),
+        ]);
         assert_eq!(m.verify(&other), Err(ManifestError::ValidatorSetMismatch));
     }
 

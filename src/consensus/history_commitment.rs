@@ -186,11 +186,16 @@ pub fn apply_reconfig_commands_to_set_history(
             continue;
         }
 
-        let new_set = ValidatorSet::new(next_members);
+        let next_members_vid: Vec<crate::consensus::validator_set::ValidatorId> = next_members
+            .into_iter()
+            .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+            .collect();
+        let new_set = ValidatorSet::new(next_members_vid);
         // Snapshot the post-reconfig members for the key_history
         // mirror so we don't double-borrow `set_history` after the
         // boundary is inserted.
-        let new_members: Vec<crate::p2p::NodeId> = new_set.iter().copied().collect();
+        let new_members: Vec<crate::consensus::validator_set::ValidatorId> =
+            new_set.iter().copied().collect();
         if set_history.insert_boundary(cmd.v_eff, new_set).is_err() {
             continue;
         }
@@ -198,8 +203,10 @@ pub fn apply_reconfig_commands_to_set_history(
         // Failures (collision with an existing pubkey) are dropped
         // silently — `from_set_history` would skip them too.
         for member in new_members {
-            if !key_history.validators().any(|id| *id == member) {
-                let _ = key_history.add_validator(member, cmd.v_eff);
+            if !key_history.validators().any(|id| id == member) {
+                let pubkey =
+                    crate::consensus::validator_set::Pubkey::from_node_id(member.into_node_id());
+                let _ = key_history.add_validator(pubkey, cmd.v_eff);
             }
         }
     }
@@ -238,12 +245,14 @@ pub fn apply_rotation_commands_to_histories(
             Err(_) => continue,
         };
 
-        let current_key = match key_history.current_key(&envelope.payload.validator) {
+        let validator_pk =
+            crate::consensus::validator_set::Pubkey::from_node_id(envelope.payload.validator);
+        let current_key = match key_history.current_key(&validator_pk) {
             Some(k) => k,
             None => continue,
         };
 
-        if envelope.verify(&current_key, chain_id).is_err() {
+        if envelope.verify(current_key.as_node_id(), chain_id).is_err() {
             continue;
         }
 
@@ -258,7 +267,7 @@ pub fn apply_rotation_commands_to_histories(
         // Snapshot stable_id before mutating — same ordering as the
         // production code so the rebuild's branch is identical even
         // when validate_scheme_consistency fails after the lookup.
-        let stable_id = key_history.validator_for(&envelope.payload.validator);
+        let stable_id = key_history.validator_for(&validator_pk);
 
         if key_history
             .apply_rotation(&envelope.payload, block_view)
@@ -298,7 +307,11 @@ pub fn apply_rotation_commands_to_histories(
             // already mutated. We do the same — the Ed25519 mutation
             // already happened, leaving the rebuild in the same shape
             // the production code left it in.
-            let _ = bls_history.apply_rotation(stable_id, envelope.payload.v_eff, new_bls_pk);
+            let _ = bls_history.apply_rotation(
+                stable_id.into_node_id(),
+                envelope.payload.v_eff,
+                new_bls_pk,
+            );
         }
     }
 }
@@ -361,10 +374,19 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> crate::consensus::validator_set::ValidatorId {
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     fn fresh_histories(ids: &[NodeId]) -> (ValidatorSetHistory, ValidatorKeyHistory) {
-        let vs = ValidatorSet::new(ids.to_vec());
+        let vids: Vec<_> = ids
+            .iter()
+            .copied()
+            .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+            .collect();
+        let vs = ValidatorSet::new(vids.clone());
         let set = ValidatorSetHistory::from_genesis(vs);
-        let keys = ValidatorKeyHistory::new(ids.iter().copied());
+        let keys = ValidatorKeyHistory::new(vids);
         (set, keys)
     }
 
@@ -396,7 +418,7 @@ mod tests {
     fn v1_distinguishes_after_boundary_insert() {
         let (mut s, k) = fresh_histories(&[nid(1), nid(2), nid(3), nid(4)]);
         let before = validator_history_commitment_v1(&s, &k, None);
-        s.insert_boundary(10, ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(5)]))
+        s.insert_boundary(10, ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(5)]))
             .unwrap();
         let after = validator_history_commitment_v1(&s, &k, None);
         assert_ne!(before, after);

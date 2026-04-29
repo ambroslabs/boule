@@ -140,8 +140,12 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> crate::consensus::validator_set::ValidatorId {
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     fn validators() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)])
     }
 
     /// Chain the given view sequence, each block parented to its

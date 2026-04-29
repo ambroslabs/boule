@@ -367,10 +367,13 @@ impl SimCluster {
 
         // Create N fresh signers and collect their node IDs.
         let signers: Vec<NodeSigner> = (0..n).map(|_| fresh_signer()).collect();
-        let node_ids_unsorted: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
+        let validator_ids_unsorted: Vec<crate::consensus::validator_set::ValidatorId> = signers
+            .iter()
+            .map(|s| crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(s.node_id()))
+            .collect();
 
         // ValidatorSet sorts IDs ascending, establishing leader-rotation order.
-        let vs = ValidatorSet::new(node_ids_unsorted);
+        let vs = ValidatorSet::new(validator_ids_unsorted);
         let genesis = Block::genesis([0u8; 32], [0; 32]);
 
         // Build a signer lookup by NodeId.
@@ -390,7 +393,8 @@ impl SimCluster {
         ) = if scheme == crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
             let mut pubs = HashMap::new();
             let mut secs = HashMap::new();
-            for (i, &nid) in vs.iter().enumerate() {
+            for (i, validator_id) in vs.iter().enumerate() {
+                let nid: NodeId = validator_id.into_node_id();
                 // Seed BLS keys deterministically from sorted index XOR
                 // the validator's NodeId so a re-spawn under the same
                 // sorted vs produces byte-identical BLS keys; the sim's
@@ -429,14 +433,15 @@ impl SimCluster {
         // run() loop reads from its receiver.
         let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
         let mut event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
-        for &nid in vs.iter() {
+        for v in vs.iter() {
+            let nid = v.into_node_id();
             let (tx, rx) = mpsc::channel(1024);
             event_txs.insert(nid, tx);
             event_rxs.push((nid, rx));
         }
         let event_txs = Arc::new(event_txs);
 
-        let node_ids: Vec<NodeId> = vs.iter().copied().collect();
+        let node_ids: Vec<NodeId> = vs.iter().map(|v| v.into_node_id()).collect();
         let node_ids_arc: Arc<Vec<NodeId>> = Arc::new(node_ids.clone());
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
@@ -1348,8 +1353,11 @@ impl SimCluster {
         let topology = circulant_neighbors(n, target_degree);
 
         let signers: Vec<NodeSigner> = (0..n).map(|_| fresh_signer()).collect();
-        let node_ids_unsorted: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
-        let vs = ValidatorSet::new(node_ids_unsorted);
+        let validator_ids_unsorted: Vec<crate::consensus::validator_set::ValidatorId> = signers
+            .iter()
+            .map(|s| crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(s.node_id()))
+            .collect();
+        let vs = ValidatorSet::new(validator_ids_unsorted);
         let genesis = Block::genesis([0u8; 32], [0; 32]);
 
         let mut signer_map: HashMap<NodeId, Arc<dyn Signer>> = HashMap::new();
@@ -1366,7 +1374,8 @@ impl SimCluster {
         // `ProtocolEvent`s to the orchestrator's input here.
         let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
         let mut event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
-        for &nid in vs.iter() {
+        for v in vs.iter() {
+            let nid = v.into_node_id();
             let (tx, rx) = mpsc::channel(1024);
             event_txs.insert(nid, tx);
             event_rxs.push((nid, rx));
@@ -1376,7 +1385,7 @@ impl SimCluster {
         // Resolve sorted-index ordering so we can map NodeId → topology
         // index. ValidatorSet sorts ascending; circulant_neighbors uses
         // those indices directly.
-        let node_ids: Vec<NodeId> = vs.iter().copied().collect();
+        let node_ids: Vec<NodeId> = vs.iter().map(|v| v.into_node_id()).collect();
 
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
@@ -1664,9 +1673,14 @@ mod tests {
     impl BareRouting {
         fn new(n: usize) -> Self {
             let signers: Vec<_> = (0..n).map(|_| fresh_signer()).collect();
-            let unsorted: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
+            let unsorted: Vec<crate::consensus::validator_set::ValidatorId> = signers
+                .iter()
+                .map(|s| {
+                    crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(s.node_id())
+                })
+                .collect();
             let vs = ValidatorSet::new(unsorted);
-            let node_ids: Vec<NodeId> = vs.iter().copied().collect();
+            let node_ids: Vec<NodeId> = vs.iter().map(|v| v.into_node_id()).collect();
 
             let partitioned = Arc::new(Mutex::new(HashSet::new()));
             let link_cuts = Arc::new(Mutex::new(HashSet::new()));

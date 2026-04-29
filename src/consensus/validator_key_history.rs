@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use crate::consensus::View;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_rotation::{RotationStructuralError, ValidatorKeyRotation};
+use crate::consensus::validator_set::{Pubkey, ValidatorId};
 use crate::p2p::NodeId;
 
 /// One entry in a validator's key history: at view `v_eff` the validator
@@ -125,21 +126,24 @@ impl From<RotationStructuralError> for HistoryError {
 }
 
 impl ValidatorKeyHistory {
-    /// Build a history seeded with each genesis validator's pubkey
-    /// active from view 0. The supplied iterator may yield duplicates;
-    /// they are deduplicated, matching `ValidatorSet`'s convention.
-    pub fn new(genesis_validators: impl IntoIterator<Item = NodeId>) -> Self {
+    /// Build a history seeded with each genesis validator's stable id
+    /// active from view 0. The validator's stable id is also their
+    /// initial signing pubkey (genesis pubkey == stable id by
+    /// convention). The supplied iterator may yield duplicates; they
+    /// are deduplicated, matching `ValidatorSet`'s convention.
+    pub fn new(genesis_validators: impl IntoIterator<Item = ValidatorId>) -> Self {
         let mut h = Self::default();
         for v in genesis_validators {
+            let bytes: NodeId = v.into_node_id();
             // `or_insert_with` skips duplicates: a validator can't be
             // re-registered at genesis with a different history.
-            h.by_stable_id.entry(v).or_insert_with(|| {
+            h.by_stable_id.entry(bytes).or_insert_with(|| {
                 vec![KeyEntry {
                     v_eff: 0,
-                    pubkey: v,
+                    pubkey: bytes,
                 }]
             });
-            h.pubkey_to_stable_id.insert(v, v);
+            h.pubkey_to_stable_id.insert(bytes, bytes);
         }
         h
     }
@@ -161,15 +165,16 @@ impl ValidatorKeyHistory {
     pub fn from_set_history(set_history: &ValidatorSetHistory) -> Self {
         let mut h = Self::default();
         for (v_eff, set) in set_history.iter() {
-            for member in set.iter().copied() {
+            for member in set.iter() {
+                let bytes: NodeId = member.into_node_id();
                 if let std::collections::btree_map::Entry::Vacant(slot) =
-                    h.by_stable_id.entry(member)
+                    h.by_stable_id.entry(bytes)
                 {
                     slot.insert(vec![KeyEntry {
                         v_eff,
-                        pubkey: member,
+                        pubkey: bytes,
                     }]);
-                    h.pubkey_to_stable_id.insert(member, member);
+                    h.pubkey_to_stable_id.insert(bytes, bytes);
                 }
             }
         }
@@ -177,29 +182,35 @@ impl ValidatorKeyHistory {
     }
 
     /// Register a validator that joins via reconfig at `v_eff`. The
-    /// validator's initial signing key is `node_id` itself — same
+    /// new validator's stable id is the supplied pubkey — same
     /// identity model as genesis-seeded validators — and it becomes a
     /// valid signer starting at view `v_eff`.
     ///
-    /// Rejects if `node_id` is already known to this history under any
-    /// validator (collision with the reverse index would make
-    /// [`Self::validator_for`] ambiguous). Use [`Self::apply_rotation`]
-    /// for the case where a known validator is changing keys.
-    pub fn add_validator(&mut self, node_id: NodeId, v_eff: View) -> Result<(), HistoryError> {
-        if let Some(owner) = self.pubkey_to_stable_id.get(&node_id) {
+    /// Takes a [`Pubkey`] because the wire-layer reconfig command
+    /// arrives carrying raw `NodeId` bytes (re-tagged as a `Pubkey` at
+    /// the seam); this method is what *promotes* those bytes to a
+    /// fresh stable id, so it intentionally accepts the un-promoted
+    /// form. Rejects if the pubkey is already known to this history
+    /// under any validator (collision with the reverse index would
+    /// make [`Self::validator_for`] ambiguous). Use
+    /// [`Self::apply_rotation`] for the case where a known validator
+    /// is changing keys.
+    pub fn add_validator(&mut self, pubkey: Pubkey, v_eff: View) -> Result<(), HistoryError> {
+        let bytes: NodeId = pubkey.into_node_id();
+        if let Some(owner) = self.pubkey_to_stable_id.get(&bytes) {
             return Err(HistoryError::NewKeyCollidesWithOtherValidator {
-                new_pubkey: node_id,
+                new_pubkey: bytes,
                 owner: *owner,
             });
         }
         self.by_stable_id.insert(
-            node_id,
+            bytes,
             vec![KeyEntry {
                 v_eff,
-                pubkey: node_id,
+                pubkey: bytes,
             }],
         );
-        self.pubkey_to_stable_id.insert(node_id, node_id);
+        self.pubkey_to_stable_id.insert(bytes, bytes);
         Ok(())
     }
 
@@ -212,25 +223,27 @@ impl ValidatorKeyHistory {
     /// "signer pubkey on the wire" to "validator's stable id in the
     /// validator set" — without it, the post-rotation key wouldn't be
     /// recognizable as belonging to the same validator that was
-    /// originally seated.
-    pub fn validator_for(&self, pubkey: &NodeId) -> Option<NodeId> {
-        self.pubkey_to_stable_id.get(pubkey).copied()
+    /// originally seated. It is also the **only** way to land in
+    /// [`ValidatorId`] outside of the genesis-seeding constructor — the
+    /// load-bearing guard for #328.
+    pub fn validator_for(&self, pubkey: &Pubkey) -> Option<ValidatorId> {
+        self.pubkey_to_stable_id
+            .get(pubkey.as_node_id())
+            .copied()
+            .map(ValidatorId::from_genesis_pubkey)
     }
 
-    /// The active signing key for the validator identified by
-    /// `pubkey_anywhere_in_history`, evaluated as of view `view`.
+    /// The active signing key for `validator`, evaluated as of view
+    /// `view`. Takes the validator's stable id directly — callers that
+    /// only have a wire pubkey first resolve it via
+    /// [`Self::validator_for`].
     ///
-    /// `pubkey_anywhere_in_history` may be the validator's *current*
-    /// pubkey, its *genesis* pubkey, or any pubkey it has rotated
-    /// through in the past — the reverse index resolves all of them to
-    /// the same stable id, so the same answer comes back regardless of
-    /// which one the caller has in hand.
-    ///
-    /// Returns `None` if the pubkey is not associated with any
-    /// validator in this history.
-    pub fn key_at(&self, pubkey_anywhere_in_history: &NodeId, view: View) -> Option<NodeId> {
-        let stable_id = self.pubkey_to_stable_id.get(pubkey_anywhere_in_history)?;
-        let entries = self.by_stable_id.get(stable_id)?;
+    /// Returns `None` if the validator is not present in this history,
+    /// or (defensively) if no entry covers `view`. Spanning votes (a
+    /// late vote at an older view) verify against whichever pubkey was
+    /// active at that older view, which is what this method returns.
+    pub fn key_at(&self, validator: &ValidatorId, view: View) -> Option<Pubkey> {
+        let entries = self.by_stable_id.get(validator.as_node_id())?;
         // Entries are sorted by v_eff ascending; the active key at
         // `view` is the one from the entry with the largest v_eff that
         // is still <= view. Binary search for the partition point.
@@ -241,24 +254,39 @@ impl ValidatorKeyHistory {
             // returning None keeps lookup total and panic-free.
             return None;
         }
-        Some(entries[idx - 1].pubkey)
+        Some(Pubkey::from_node_id(entries[idx - 1].pubkey))
+    }
+
+    /// Same as [`Self::key_at`] but resolves the validator from any
+    /// pubkey it has ever used. Convenience for call sites that only
+    /// have a wire pubkey — equivalent to
+    /// `validator_for(p).and_then(|v| key_at(&v, view))`.
+    pub fn key_at_for_pubkey(&self, pubkey_anywhere: &Pubkey, view: View) -> Option<Pubkey> {
+        let validator = self.validator_for(pubkey_anywhere)?;
+        self.key_at(&validator, view)
     }
 
     /// The validator's current (most recently effective) signing key
     /// regardless of view. Convenience wrapper over the latest entry —
     /// useful for code paths that don't have a view in hand, like an
     /// admission-time check that the rotation tx is signed by *the*
-    /// current key.
-    pub fn current_key(&self, pubkey_anywhere_in_history: &NodeId) -> Option<NodeId> {
-        let stable_id = self.pubkey_to_stable_id.get(pubkey_anywhere_in_history)?;
+    /// current key. Resolves the validator from any pubkey it has ever
+    /// used.
+    pub fn current_key(&self, pubkey_anywhere_in_history: &Pubkey) -> Option<Pubkey> {
+        let stable_id = self
+            .pubkey_to_stable_id
+            .get(pubkey_anywhere_in_history.as_node_id())?;
         let entries = self.by_stable_id.get(stable_id)?;
-        entries.last().map(|e| e.pubkey)
+        entries.last().map(|e| Pubkey::from_node_id(e.pubkey))
     }
 
-    /// Iterate over the stable identifiers (genesis pubkeys) of every
-    /// validator in this history, in stable byte-lexicographic order.
-    pub fn validators(&self) -> impl Iterator<Item = &NodeId> {
-        self.by_stable_id.keys()
+    /// Iterate over the stable identifiers of every validator in this
+    /// history, in stable byte-lexicographic order.
+    pub fn validators(&self) -> impl Iterator<Item = ValidatorId> + '_ {
+        self.by_stable_id
+            .keys()
+            .copied()
+            .map(ValidatorId::from_genesis_pubkey)
     }
 
     /// Apply a rotation that has just been committed at `commit_view`.
@@ -439,6 +467,14 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> ValidatorId {
+        ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
+    fn pk(b: u8) -> Pubkey {
+        Pubkey::from_node_id(nid(b))
+    }
+
     fn rot(validator: NodeId, new_pubkey: NodeId, v_eff: View) -> ValidatorKeyRotation {
         ValidatorKeyRotation {
             validator,
@@ -453,76 +489,77 @@ mod tests {
 
     #[test]
     fn new_seeds_each_genesis_validator_at_view_0() {
-        let h = ValidatorKeyHistory::new([nid(1), nid(2), nid(3)]);
-        for v in [nid(1), nid(2), nid(3)] {
-            assert_eq!(h.key_at(&v, 0), Some(v));
-            assert_eq!(h.key_at(&v, 1_000), Some(v));
-            assert_eq!(h.current_key(&v), Some(v));
+        let h = ValidatorKeyHistory::new([vid(1), vid(2), vid(3)]);
+        for b in [1u8, 2, 3] {
+            assert_eq!(h.key_at(&vid(b), 0), Some(pk(b)));
+            assert_eq!(h.key_at(&vid(b), 1_000), Some(pk(b)));
+            assert_eq!(h.current_key(&pk(b)), Some(pk(b)));
         }
     }
 
     #[test]
     fn new_deduplicates_identical_genesis_entries() {
-        let h = ValidatorKeyHistory::new([nid(1), nid(1), nid(2)]);
+        let h = ValidatorKeyHistory::new([vid(1), vid(1), vid(2)]);
         assert_eq!(h.validators().count(), 2);
     }
 
     #[test]
     fn validators_iterates_in_byte_lexicographic_order() {
-        let h = ValidatorKeyHistory::new([nid(3), nid(1), nid(2)]);
-        let collected: Vec<_> = h.validators().copied().collect();
-        assert_eq!(collected, vec![nid(1), nid(2), nid(3)]);
+        let h = ValidatorKeyHistory::new([vid(3), vid(1), vid(2)]);
+        let collected: Vec<_> = h.validators().collect();
+        assert_eq!(collected, vec![vid(1), vid(2), vid(3)]);
     }
 
     #[test]
     fn key_at_returns_none_for_unknown_pubkey() {
-        let h = ValidatorKeyHistory::new([nid(1)]);
-        assert_eq!(h.key_at(&nid(99), 0), None);
-        assert_eq!(h.key_at(&nid(99), 1_000), None);
-        assert_eq!(h.current_key(&nid(99)), None);
+        let h = ValidatorKeyHistory::new([vid(1)]);
+        assert_eq!(h.key_at(&vid(99), 0), None);
+        assert_eq!(h.key_at(&vid(99), 1_000), None);
+        assert_eq!(h.current_key(&pk(99)), None);
     }
 
     // ── single rotation ───────────────────────────────────────────────────
 
     #[test]
     fn apply_rotation_records_new_key_at_v_eff() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         let r = rot(nid(1), nid(10), 100);
         h.apply_rotation(&r, 50).unwrap();
 
         // Strictly before v_eff, the old key is still active.
-        assert_eq!(h.key_at(&nid(1), 99), Some(nid(1)));
+        assert_eq!(h.key_at(&vid(1), 99), Some(pk(1)));
         // At v_eff and after, the new key is active.
-        assert_eq!(h.key_at(&nid(1), 100), Some(nid(10)));
-        assert_eq!(h.key_at(&nid(1), 1_000), Some(nid(10)));
+        assert_eq!(h.key_at(&vid(1), 100), Some(pk(10)));
+        assert_eq!(h.key_at(&vid(1), 1_000), Some(pk(10)));
     }
 
     #[test]
     fn lookup_resolves_through_either_old_or_new_pubkey_after_rotation() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
 
         // Spanning-vote scenario: a vote for view 50 was signed by
-        // nid(1); the verifier calls key_at(nid(1), 50) and gets back
-        // nid(1). It also calls key_at(nid(10), 50) — same stable id,
-        // same answer.
-        assert_eq!(h.key_at(&nid(1), 50), Some(nid(1)));
-        assert_eq!(h.key_at(&nid(10), 50), Some(nid(1)));
+        // pk(1); the verifier calls key_at(vid(1), 50) and gets back
+        // pk(1). validator_for(pk(10)) also resolves to vid(1) — same
+        // stable id, same answer.
+        assert_eq!(h.key_at(&vid(1), 50), Some(pk(1)));
+        assert_eq!(h.validator_for(&pk(10)), Some(vid(1)));
+        assert_eq!(h.key_at_for_pubkey(&pk(10), 50), Some(pk(1)));
 
         // Current-view lookup via either pubkey returns the new key.
-        assert_eq!(h.key_at(&nid(1), 200), Some(nid(10)));
-        assert_eq!(h.key_at(&nid(10), 200), Some(nid(10)));
+        assert_eq!(h.key_at(&vid(1), 200), Some(pk(10)));
+        assert_eq!(h.key_at_for_pubkey(&pk(10), 200), Some(pk(10)));
 
         // Convenience accessor agrees.
-        assert_eq!(h.current_key(&nid(1)), Some(nid(10)));
-        assert_eq!(h.current_key(&nid(10)), Some(nid(10)));
+        assert_eq!(h.current_key(&pk(1)), Some(pk(10)));
+        assert_eq!(h.current_key(&pk(10)), Some(pk(10)));
     }
 
     // ── rejection paths ───────────────────────────────────────────────────
 
     #[test]
     fn apply_rotation_rejects_structurally_invalid() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         // v_eff too soon (< commit_view + V_EFF_MIN_DELAY)
         let r = rot(nid(1), nid(10), 50);
         let err = h.apply_rotation(&r, 50).unwrap_err();
@@ -531,7 +568,7 @@ mod tests {
 
     #[test]
     fn apply_rotation_rejects_unknown_validator() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         let r = rot(nid(99), nid(10), 100);
         assert_eq!(
             h.apply_rotation(&r, 50),
@@ -541,7 +578,7 @@ mod tests {
 
     #[test]
     fn apply_rotation_rejects_v_eff_equal_to_previous() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
         // Second rotation must address the validator by its current
         // active key (nid(10)) and have a strictly-greater v_eff.
@@ -556,7 +593,7 @@ mod tests {
 
     #[test]
     fn apply_rotation_rejects_v_eff_less_than_previous() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         h.apply_rotation(&rot(nid(1), nid(10), 200), 50).unwrap();
         assert_eq!(
             h.apply_rotation(&rot(nid(10), nid(20), 150), 50),
@@ -569,7 +606,7 @@ mod tests {
 
     #[test]
     fn apply_rotation_rejects_new_key_owned_by_other_validator() {
-        let mut h = ValidatorKeyHistory::new([nid(1), nid(2)]);
+        let mut h = ValidatorKeyHistory::new([vid(1), vid(2)]);
         // nid(2)'s genesis pubkey is nid(2); nid(1) must not be able
         // to rotate into it.
         let r = rot(nid(1), nid(2), 100);
@@ -584,7 +621,7 @@ mod tests {
 
     #[test]
     fn apply_rotation_rejects_collision_with_other_validators_rotated_key() {
-        let mut h = ValidatorKeyHistory::new([nid(1), nid(2)]);
+        let mut h = ValidatorKeyHistory::new([vid(1), vid(2)]);
         // nid(2) rotates to nid(20). Now nid(1) attempts to rotate to
         // nid(20) — must be rejected.
         h.apply_rotation(&rot(nid(2), nid(20), 100), 50).unwrap();
@@ -602,96 +639,96 @@ mod tests {
         // K0 → K1 → K0 should be permitted: the reverse index already
         // points K0 at the right validator, so reinserting it is
         // idempotent rather than a cross-validator collision.
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
         h.apply_rotation(&rot(nid(10), nid(1), 200), 150).unwrap();
-        assert_eq!(h.key_at(&nid(1), 50), Some(nid(1)));
-        assert_eq!(h.key_at(&nid(1), 150), Some(nid(10)));
-        assert_eq!(h.key_at(&nid(1), 250), Some(nid(1)));
-        assert_eq!(h.current_key(&nid(1)), Some(nid(1)));
-        assert_eq!(h.current_key(&nid(10)), Some(nid(1)));
+        assert_eq!(h.key_at(&vid(1), 50), Some(pk(1)));
+        assert_eq!(h.key_at(&vid(1), 150), Some(pk(10)));
+        assert_eq!(h.key_at(&vid(1), 250), Some(pk(1)));
+        assert_eq!(h.current_key(&pk(1)), Some(pk(1)));
+        assert_eq!(h.current_key(&pk(10)), Some(pk(1)));
     }
 
     // ── multi-rotation timeline ───────────────────────────────────────────
 
     #[test]
     fn three_consecutive_rotations_keep_full_timeline_visible() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
         h.apply_rotation(&rot(nid(10), nid(20), 200), 150).unwrap();
         h.apply_rotation(&rot(nid(20), nid(30), 300), 250).unwrap();
 
         // Spanning-vote lookups for each historical era return the
         // right key, regardless of which pubkey the caller queries by.
-        for query in [nid(1), nid(10), nid(20), nid(30)] {
-            assert_eq!(h.key_at(&query, 0), Some(nid(1)));
-            assert_eq!(h.key_at(&query, 99), Some(nid(1)));
-            assert_eq!(h.key_at(&query, 100), Some(nid(10)));
-            assert_eq!(h.key_at(&query, 199), Some(nid(10)));
-            assert_eq!(h.key_at(&query, 200), Some(nid(20)));
-            assert_eq!(h.key_at(&query, 299), Some(nid(20)));
-            assert_eq!(h.key_at(&query, 300), Some(nid(30)));
-            assert_eq!(h.key_at(&query, 1_000), Some(nid(30)));
-            assert_eq!(h.current_key(&query), Some(nid(30)));
+        for query in [pk(1), pk(10), pk(20), pk(30)] {
+            assert_eq!(h.key_at_for_pubkey(&query, 0), Some(pk(1)));
+            assert_eq!(h.key_at_for_pubkey(&query, 99), Some(pk(1)));
+            assert_eq!(h.key_at_for_pubkey(&query, 100), Some(pk(10)));
+            assert_eq!(h.key_at_for_pubkey(&query, 199), Some(pk(10)));
+            assert_eq!(h.key_at_for_pubkey(&query, 200), Some(pk(20)));
+            assert_eq!(h.key_at_for_pubkey(&query, 299), Some(pk(20)));
+            assert_eq!(h.key_at_for_pubkey(&query, 300), Some(pk(30)));
+            assert_eq!(h.key_at_for_pubkey(&query, 1_000), Some(pk(30)));
+            assert_eq!(h.current_key(&query), Some(pk(30)));
         }
     }
 
     #[test]
     fn unknown_pubkey_after_rotations_still_returns_none() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
         h.apply_rotation(&rot(nid(10), nid(20), 200), 150).unwrap();
         // A pubkey nobody has used must not accidentally resolve to a
         // validator just because rotations happened in the meantime.
-        assert_eq!(h.key_at(&nid(99), 250), None);
-        assert_eq!(h.current_key(&nid(99)), None);
+        assert_eq!(h.validator_for(&pk(99)), None);
+        assert_eq!(h.current_key(&pk(99)), None);
     }
 
     // ── edge cases on the timeline ────────────────────────────────────────
 
     #[test]
     fn key_at_view_zero_returns_genesis_key() {
-        let mut h = ValidatorKeyHistory::new([nid(7)]);
+        let mut h = ValidatorKeyHistory::new([vid(7)]);
         h.apply_rotation(&rot(nid(7), nid(70), 100), 50).unwrap();
         // No matter how many rotations happen later, view 0 always
         // resolves to the genesis key — important for verifying the
         // very first QC ever produced.
-        assert_eq!(h.key_at(&nid(7), 0), Some(nid(7)));
-        assert_eq!(h.key_at(&nid(70), 0), Some(nid(7)));
+        assert_eq!(h.key_at(&vid(7), 0), Some(pk(7)));
+        assert_eq!(h.key_at_for_pubkey(&pk(70), 0), Some(pk(7)));
     }
 
     #[test]
     fn key_at_returns_old_key_at_v_eff_minus_one_and_new_at_v_eff() {
         // Boundary check: the contract is "active starting at v_eff",
         // i.e. inclusive at v_eff and exclusive below.
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         let r = rot(nid(1), nid(10), 100);
         h.apply_rotation(&r, 50).unwrap();
-        assert_eq!(h.key_at(&nid(1), 99), Some(nid(1)));
-        assert_eq!(h.key_at(&nid(1), 100), Some(nid(10)));
+        assert_eq!(h.key_at(&vid(1), 99), Some(pk(1)));
+        assert_eq!(h.key_at(&vid(1), 100), Some(pk(10)));
     }
 
     #[test]
     fn apply_rotation_at_minimum_legal_v_eff_succeeds() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         let commit_view = 50;
         let r = rot(nid(1), nid(10), commit_view + V_EFF_MIN_DELAY);
         h.apply_rotation(&r, commit_view).unwrap();
         assert_eq!(
-            h.key_at(&nid(1), commit_view + V_EFF_MIN_DELAY),
-            Some(nid(10))
+            h.key_at(&vid(1), commit_view + V_EFF_MIN_DELAY),
+            Some(pk(10))
         );
     }
 
     #[test]
     fn rejection_does_not_mutate_state() {
-        let mut h = ValidatorKeyHistory::new([nid(1), nid(2)]);
+        let mut h = ValidatorKeyHistory::new([vid(1), vid(2)]);
         h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
 
         let snapshot_before_reject = (
-            h.key_at(&nid(1), 1_000),
-            h.key_at(&nid(2), 1_000),
-            h.current_key(&nid(10)),
+            h.key_at(&vid(1), 1_000),
+            h.key_at(&vid(2), 1_000),
+            h.current_key(&pk(10)),
         );
 
         // Trigger every rejection path against the populated history.
@@ -701,9 +738,9 @@ mod tests {
         let _ = h.apply_rotation(&rot(nid(10), nid(200), 50), 100);
 
         let snapshot_after_reject = (
-            h.key_at(&nid(1), 1_000),
-            h.key_at(&nid(2), 1_000),
-            h.current_key(&nid(10)),
+            h.key_at(&vid(1), 1_000),
+            h.key_at(&vid(2), 1_000),
+            h.current_key(&pk(10)),
         );
         assert_eq!(snapshot_before_reject, snapshot_after_reject);
     }
@@ -712,47 +749,47 @@ mod tests {
 
     #[test]
     fn validator_for_resolves_genesis_pubkey() {
-        let h = ValidatorKeyHistory::new([nid(1), nid(2)]);
-        assert_eq!(h.validator_for(&nid(1)), Some(nid(1)));
-        assert_eq!(h.validator_for(&nid(2)), Some(nid(2)));
-        assert_eq!(h.validator_for(&nid(99)), None);
+        let h = ValidatorKeyHistory::new([vid(1), vid(2)]);
+        assert_eq!(h.validator_for(&pk(1)), Some(vid(1)));
+        assert_eq!(h.validator_for(&pk(2)), Some(vid(2)));
+        assert_eq!(h.validator_for(&pk(99)), None);
     }
 
     #[test]
     fn validator_for_resolves_post_rotation_pubkey_to_stable_id() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
         h.apply_rotation(&rot(nid(10), nid(20), 200), 150).unwrap();
         // Every key the validator has ever used resolves to the same
         // stable id — that's what bridges spanning-vote verification
         // back to the validator's identity in the validator set.
-        assert_eq!(h.validator_for(&nid(1)), Some(nid(1)));
-        assert_eq!(h.validator_for(&nid(10)), Some(nid(1)));
-        assert_eq!(h.validator_for(&nid(20)), Some(nid(1)));
-        assert_eq!(h.validator_for(&nid(99)), None);
+        assert_eq!(h.validator_for(&pk(1)), Some(vid(1)));
+        assert_eq!(h.validator_for(&pk(10)), Some(vid(1)));
+        assert_eq!(h.validator_for(&pk(20)), Some(vid(1)));
+        assert_eq!(h.validator_for(&pk(99)), None);
     }
 
     // ── add_validator ─────────────────────────────────────────────────────
 
     #[test]
     fn add_validator_makes_node_a_valid_signer_starting_at_v_eff() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
-        h.add_validator(nid(2), 10).unwrap();
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
+        h.add_validator(pk(2), 10).unwrap();
         // Before they joined, the validator has no active key.
-        assert_eq!(h.key_at(&nid(2), 9), None);
+        assert_eq!(h.key_at(&vid(2), 9), None);
         // From v_eff onwards, they're a valid signer using their own
         // pubkey as the initial key.
-        assert_eq!(h.key_at(&nid(2), 10), Some(nid(2)));
-        assert_eq!(h.key_at(&nid(2), 1_000), Some(nid(2)));
+        assert_eq!(h.key_at(&vid(2), 10), Some(pk(2)));
+        assert_eq!(h.key_at(&vid(2), 1_000), Some(pk(2)));
         // And the reverse index resolves them.
-        assert_eq!(h.validator_for(&nid(2)), Some(nid(2)));
+        assert_eq!(h.validator_for(&pk(2)), Some(vid(2)));
     }
 
     #[test]
     fn add_validator_rejects_pubkey_already_known() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
         // Genesis validator's pubkey collides.
-        let err = h.add_validator(nid(1), 10).unwrap_err();
+        let err = h.add_validator(pk(1), 10).unwrap_err();
         assert!(matches!(
             err,
             HistoryError::NewKeyCollidesWithOtherValidator { .. }
@@ -761,13 +798,13 @@ mod tests {
 
     #[test]
     fn add_validator_then_apply_rotation_works_for_added_validator() {
-        let mut h = ValidatorKeyHistory::new([nid(1)]);
-        h.add_validator(nid(2), 10).unwrap();
+        let mut h = ValidatorKeyHistory::new([vid(1)]);
+        h.add_validator(pk(2), 10).unwrap();
         // Newly-added validator can subsequently rotate keys.
         h.apply_rotation(&rot(nid(2), nid(20), 100), 50).unwrap();
-        assert_eq!(h.key_at(&nid(2), 50), Some(nid(2)));
-        assert_eq!(h.key_at(&nid(2), 100), Some(nid(20)));
-        assert_eq!(h.validator_for(&nid(20)), Some(nid(2)));
+        assert_eq!(h.key_at(&vid(2), 50), Some(pk(2)));
+        assert_eq!(h.key_at(&vid(2), 100), Some(pk(20)));
+        assert_eq!(h.validator_for(&pk(20)), Some(vid(2)));
     }
 
     // ── from_set_history ──────────────────────────────────────────────────
@@ -775,32 +812,32 @@ mod tests {
     #[test]
     fn from_set_history_genesis_only_matches_new() {
         use crate::consensus::validator_set::ValidatorSet;
-        let vs = ValidatorSet::new(vec![nid(1), nid(2), nid(3)]);
+        let vs = ValidatorSet::new(vec![vid(1), vid(2), vid(3)]);
         let sh = ValidatorSetHistory::from_genesis(vs);
 
         let h = ValidatorKeyHistory::from_set_history(&sh);
-        for v in [nid(1), nid(2), nid(3)] {
-            assert_eq!(h.key_at(&v, 0), Some(v));
-            assert_eq!(h.key_at(&v, 1_000), Some(v));
-            assert_eq!(h.validator_for(&v), Some(v));
+        for b in [1u8, 2, 3] {
+            assert_eq!(h.key_at(&vid(b), 0), Some(pk(b)));
+            assert_eq!(h.key_at(&vid(b), 1_000), Some(pk(b)));
+            assert_eq!(h.validator_for(&pk(b)), Some(vid(b)));
         }
     }
 
     #[test]
     fn from_set_history_picks_up_validators_added_via_reconfig() {
         use crate::consensus::validator_set::ValidatorSet;
-        let mut sh = ValidatorSetHistory::from_genesis(ValidatorSet::new(vec![nid(1), nid(2)]));
-        sh.insert_boundary(10, ValidatorSet::new(vec![nid(1), nid(2), nid(3)]))
+        let mut sh = ValidatorSetHistory::from_genesis(ValidatorSet::new(vec![vid(1), vid(2)]));
+        sh.insert_boundary(10, ValidatorSet::new(vec![vid(1), vid(2), vid(3)]))
             .unwrap();
 
         let h = ValidatorKeyHistory::from_set_history(&sh);
         // Genesis validators get entries at v_eff = 0.
-        assert_eq!(h.key_at(&nid(1), 0), Some(nid(1)));
-        assert_eq!(h.key_at(&nid(2), 0), Some(nid(2)));
+        assert_eq!(h.key_at(&vid(1), 0), Some(pk(1)));
+        assert_eq!(h.key_at(&vid(2), 0), Some(pk(2)));
         // Reconfig-added validator only becomes a valid signer at v_eff.
-        assert_eq!(h.key_at(&nid(3), 9), None);
-        assert_eq!(h.key_at(&nid(3), 10), Some(nid(3)));
-        assert_eq!(h.key_at(&nid(3), 1_000), Some(nid(3)));
+        assert_eq!(h.key_at(&vid(3), 9), None);
+        assert_eq!(h.key_at(&vid(3), 10), Some(pk(3)));
+        assert_eq!(h.key_at(&vid(3), 1_000), Some(pk(3)));
         // Validators that left the set (none in this test) would still
         // appear in key history forever — they're tracked for spanning
         // votes against their tenure, even if removed later.
@@ -809,47 +846,47 @@ mod tests {
     #[test]
     fn from_set_history_does_not_re_add_validators_present_in_multiple_boundaries() {
         use crate::consensus::validator_set::ValidatorSet;
-        let mut sh = ValidatorSetHistory::from_genesis(ValidatorSet::new(vec![nid(1), nid(2)]));
-        sh.insert_boundary(10, ValidatorSet::new(vec![nid(1), nid(2), nid(3)]))
+        let mut sh = ValidatorSetHistory::from_genesis(ValidatorSet::new(vec![vid(1), vid(2)]));
+        sh.insert_boundary(10, ValidatorSet::new(vec![vid(1), vid(2), vid(3)]))
             .unwrap();
-        sh.insert_boundary(20, ValidatorSet::new(vec![nid(1), nid(3)]))
-            .unwrap(); // nid(2) removed
+        sh.insert_boundary(20, ValidatorSet::new(vec![vid(1), vid(3)]))
+            .unwrap(); // vid(2) removed
 
         let h = ValidatorKeyHistory::from_set_history(&sh);
-        // nid(1) appears in every boundary; the entry stays at v_eff = 0
+        // vid(1) appears in every boundary; the entry stays at v_eff = 0
         // (its earliest appearance), not bumped forward by later
         // boundaries.
-        assert_eq!(h.key_at(&nid(1), 0), Some(nid(1)));
-        // nid(2) was in genesis + first reconfig but removed at 20.
+        assert_eq!(h.key_at(&vid(1), 0), Some(pk(1)));
+        // vid(2) was in genesis + first reconfig but removed at 20.
         // The key history retains its entry at v_eff = 0 — needed so
         // late spanning votes from view < 20 still verify.
-        assert_eq!(h.key_at(&nid(2), 0), Some(nid(2)));
-        assert_eq!(h.key_at(&nid(2), 19), Some(nid(2)));
-        // nid(3) joined at 10.
-        assert_eq!(h.key_at(&nid(3), 10), Some(nid(3)));
+        assert_eq!(h.key_at(&vid(2), 0), Some(pk(2)));
+        assert_eq!(h.key_at(&vid(2), 19), Some(pk(2)));
+        // vid(3) joined at 10.
+        assert_eq!(h.key_at(&vid(3), 10), Some(pk(3)));
     }
 
     // ── persistence (#260) ────────────────────────────────────────────────
 
     #[test]
     fn round_trips_through_persisted_form_genesis_only() {
-        let h = ValidatorKeyHistory::new([nid(1), nid(2), nid(3)]);
+        let h = ValidatorKeyHistory::new([vid(1), vid(2), vid(3)]);
         let persisted = h.to_persisted();
         let bytes = postcard::to_stdvec(&persisted).unwrap();
         let decoded: PersistedValidatorKeyHistory = postcard::from_bytes(&bytes).unwrap();
         let restored = ValidatorKeyHistory::from_persisted(decoded).unwrap();
 
         // Same lookups as the original.
-        for v in [nid(1), nid(2), nid(3)] {
-            assert_eq!(restored.key_at(&v, 0), Some(v));
-            assert_eq!(restored.key_at(&v, 1_000), Some(v));
-            assert_eq!(restored.validator_for(&v), Some(v));
+        for b in [1u8, 2, 3] {
+            assert_eq!(restored.key_at(&vid(b), 0), Some(pk(b)));
+            assert_eq!(restored.key_at(&vid(b), 1_000), Some(pk(b)));
+            assert_eq!(restored.validator_for(&pk(b)), Some(vid(b)));
         }
     }
 
     #[test]
     fn round_trips_through_persisted_form_with_rotations() {
-        let mut h = ValidatorKeyHistory::new([nid(1), nid(2)]);
+        let mut h = ValidatorKeyHistory::new([vid(1), vid(2)]);
         h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
         h.apply_rotation(&rot(nid(10), nid(20), 200), 150).unwrap();
         h.apply_rotation(&rot(nid(2), nid(30), 300), 250).unwrap();
@@ -860,17 +897,17 @@ mod tests {
         let restored = ValidatorKeyHistory::from_persisted(decoded).unwrap();
 
         // Spanning queries reach back through every era.
-        for query in [nid(1), nid(10), nid(20)] {
-            assert_eq!(restored.key_at(&query, 0), Some(nid(1)));
-            assert_eq!(restored.key_at(&query, 99), Some(nid(1)));
-            assert_eq!(restored.key_at(&query, 100), Some(nid(10)));
-            assert_eq!(restored.key_at(&query, 199), Some(nid(10)));
-            assert_eq!(restored.key_at(&query, 200), Some(nid(20)));
+        for query in [pk(1), pk(10), pk(20)] {
+            assert_eq!(restored.key_at_for_pubkey(&query, 0), Some(pk(1)));
+            assert_eq!(restored.key_at_for_pubkey(&query, 99), Some(pk(1)));
+            assert_eq!(restored.key_at_for_pubkey(&query, 100), Some(pk(10)));
+            assert_eq!(restored.key_at_for_pubkey(&query, 199), Some(pk(10)));
+            assert_eq!(restored.key_at_for_pubkey(&query, 200), Some(pk(20)));
         }
-        for query in [nid(2), nid(30)] {
-            assert_eq!(restored.key_at(&query, 0), Some(nid(2)));
-            assert_eq!(restored.key_at(&query, 299), Some(nid(2)));
-            assert_eq!(restored.key_at(&query, 300), Some(nid(30)));
+        for query in [pk(2), pk(30)] {
+            assert_eq!(restored.key_at_for_pubkey(&query, 0), Some(pk(2)));
+            assert_eq!(restored.key_at_for_pubkey(&query, 299), Some(pk(2)));
+            assert_eq!(restored.key_at_for_pubkey(&query, 300), Some(pk(30)));
         }
     }
 

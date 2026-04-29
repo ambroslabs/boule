@@ -779,7 +779,16 @@ fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Resul
             node_id_to_base58(self_id),
         );
     }
-    Ok(ValidatorSet::new(ids))
+    // Genesis-time seeding: at config-load time, the validator's
+    // stable id is its initial signing pubkey (#328 / audit finding
+    // 5-F1). This is the single legitimate site for promoting raw
+    // bytes to a `ValidatorId` without going through the key history's
+    // reverse-index lookup.
+    let validator_ids: Vec<crate::consensus::validator_set::ValidatorId> = ids
+        .into_iter()
+        .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+        .collect();
+    Ok(ValidatorSet::new(validator_ids))
 }
 
 /// Build the genesis block from the optional `genesis_seed_hex` config

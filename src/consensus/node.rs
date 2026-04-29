@@ -981,7 +981,7 @@ impl ConsensusNode {
         let validator_set: Vec<String> = self
             .validator_set
             .iter()
-            .map(crate::p2p::tls::node_id_to_base58)
+            .map(|v| crate::p2p::tls::node_id_to_base58(v.as_node_id()))
             .collect();
 
         ConsensusStatus {
@@ -1335,7 +1335,7 @@ impl ConsensusNode {
         // *block*'s stamped commitment (which was hashed over the
         // *real* members at chain birth). The mismatch fires the
         // rejection.
-        let genesis_members: Vec<NodeId> = self
+        let genesis_members: Vec<crate::consensus::validator_set::ValidatorId> = self
             .validator_history
             .iter()
             .next()
@@ -2806,8 +2806,14 @@ impl ConsensusNode {
 
         // Defence-in-depth: ingress already rejected unknown signers,
         // but asserting here lets tests hand-construct Signed<TimeoutVote>
-        // without going through ingress.
-        if !self.validator_set.contains(&signed.signer) {
+        // without going through ingress. The wire envelope carries a
+        // pubkey; resolve to the validator's stable id before the
+        // membership check (#328).
+        let signer_pk = crate::consensus::validator_set::Pubkey::from_node_id(signed.signer);
+        let Some(stable_id) = self.validator_key_history.validator_for(&signer_pk) else {
+            return Ok(());
+        };
+        if !self.validator_set.contains(&stable_id) {
             return Ok(());
         }
 
@@ -3260,7 +3266,11 @@ impl ConsensusNode {
                 continue;
             }
 
-            let new_set = ValidatorSet::new(next_members);
+            let next_members_vid: Vec<crate::consensus::validator_set::ValidatorId> = next_members
+                .into_iter()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect();
+            let new_set = ValidatorSet::new(next_members_vid);
 
             // Insert the boundary into the integration-layer history
             // (used by `dispatch::ingress`).
@@ -3416,10 +3426,9 @@ impl ConsensusNode {
             // resolving here gives us the pubkey for the cryptographic
             // dual-signature check first, which is the more informative
             // failure to log when both would fire.
-            let current_key = match self
-                .validator_key_history
-                .current_key(&envelope.payload.validator)
-            {
+            let validator_pk =
+                crate::consensus::validator_set::Pubkey::from_node_id(envelope.payload.validator);
+            let current_key = match self.validator_key_history.current_key(&validator_pk) {
                 Some(k) => k,
                 None => {
                     tracing::warn!(
@@ -3438,7 +3447,7 @@ impl ConsensusNode {
             // smuggled in a single-signed rotation can't make it
             // take effect — every replica re-runs this check
             // independently before mutating the history.
-            if let Err(e) = envelope.verify(&current_key, &self.chain_id) {
+            if let Err(e) = envelope.verify(current_key.as_node_id(), &self.chain_id) {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     height = block.header.height,
@@ -3476,9 +3485,7 @@ impl ConsensusNode {
             // pre-rotation key) to the validator's stable id, but
             // computing it before the mutation is the simpler proof
             // of correctness.
-            let stable_id = self
-                .validator_key_history
-                .validator_for(&envelope.payload.validator);
+            let stable_id = self.validator_key_history.validator_for(&validator_pk);
 
             // History-invariant check (structural + monotone v_eff +
             // no cross-validator key collision). Logs and drops on
@@ -3519,9 +3526,11 @@ impl ConsensusNode {
                     .expect("BLS chain must have a BlsKeyHistory at apply_committed_rotations");
                 let stable_id =
                     stable_id.expect("validator_for resolved before apply_rotation succeeded");
-                if let Err(e) =
-                    bls_history.apply_rotation(stable_id, envelope.payload.v_eff, new_bls_pk)
-                {
+                if let Err(e) = bls_history.apply_rotation(
+                    stable_id.into_node_id(),
+                    envelope.payload.v_eff,
+                    new_bls_pk,
+                ) {
                     // Rare but bounded: the validator_key_history
                     // accepted the rotation but the BLS history
                     // rejected it. The likeliest cause is a manual
@@ -3917,7 +3926,7 @@ fn self_role_string(validator_set: &ValidatorSet, self_id: &NodeId, view: View) 
     }
     let idx = (view % validator_set.len() as u64) as usize;
     match validator_set.get(idx) {
-        Some(leader) if leader == self_id => format!("leader(view={view})"),
+        Some(leader) if leader.as_node_id() == self_id => format!("leader(view={view})"),
         _ => "replica".to_string(),
     }
 }
@@ -4017,8 +4026,12 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> crate::consensus::validator_set::ValidatorId {
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     fn four_validators() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)])
     }
 
     fn genesis() -> Block {
@@ -4967,11 +4980,11 @@ mod tests {
     // ── #272: commit-time reconfig application ────────────────────────────────
 
     fn five_validators() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(5)])
     }
 
     fn six_validators() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5), nid(6)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(5), vid(6)])
     }
 
     /// Build a Block at `(height, view)` that carries a single tagged
@@ -5034,8 +5047,10 @@ mod tests {
         // The pacemaker selector now picks leaders from the post-
         // boundary set at and after v_eff.
         let leader_at_v_eff = node.pacemaker.leader_for_view(v_eff);
+        let leader_vid =
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(leader_at_v_eff);
         assert!(
-            five_validators().contains(&leader_at_v_eff),
+            five_validators().contains(&leader_vid),
             "leader at v_eff must come from post-boundary set",
         );
     }
@@ -5213,8 +5228,11 @@ mod tests {
         // The pacemaker selector built during `recover` rotates over
         // the recovered history — leaders at v_eff come from the post-
         // boundary set.
+        let leader_v_eff_vid = crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+            recovered.pacemaker.leader_for_view(v_eff),
+        );
         assert!(
-            five_validators().contains(&recovered.pacemaker.leader_for_view(v_eff)),
+            five_validators().contains(&leader_v_eff_vid),
             "recovered selector must rotate over post-boundary committee",
         );
     }
@@ -5982,10 +6000,16 @@ mod tests {
         let other1_signer = fresh_signer();
         let other2_signer = fresh_signer();
         let vs = ValidatorSet::new(vec![
-            server_node_id,
-            joiner_signer.node_id(),
-            other1_signer.node_id(),
-            other2_signer.node_id(),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(server_node_id),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                joiner_signer.node_id(),
+            ),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                other1_signer.node_id(),
+            ),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                other2_signer.node_id(),
+            ),
         ]);
 
         // ── Build the server with a populated SnapshotStore ────────────
@@ -6306,10 +6330,12 @@ mod tests {
         let other1 = fresh_signer();
         let other2 = fresh_signer();
         let vs = ValidatorSet::new(vec![
-            server_node_id,
-            joiner_signer.node_id(),
-            other1.node_id(),
-            other2.node_id(),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(server_node_id),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                joiner_signer.node_id(),
+            ),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(other1.node_id()),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(other2.node_id()),
         ]);
 
         let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -6352,7 +6378,12 @@ mod tests {
         // Build a *tampered* manifest: validator set field doesn't
         // match the joiner's `vs`. The joiner's verifier rejects
         // this as `ValidatorSetMismatch`.
-        let bad_vs = ValidatorSet::new(vec![[10u8; 32], [11u8; 32], [12u8; 32], [13u8; 32]]);
+        let bad_vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([10u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([11u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([12u8; 32]),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey([13u8; 32]),
+        ]);
         let tampered_block = {
             use crate::replication::block::{Block, BlockHeader};
             let parent_hash = genesis().hash();
@@ -6456,7 +6487,13 @@ mod tests {
         let joiner_signer = fresh_signer();
         let mut all_ids = server_ids.clone();
         all_ids.push(joiner_signer.node_id());
-        let vs = ValidatorSet::new(all_ids);
+        let vs = ValidatorSet::new(
+            all_ids
+                .iter()
+                .copied()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect(),
+        );
 
         // Seed the SM via `restore` to a large counter value so
         // the postcard-encoded snapshot is wide enough to slice
@@ -6663,7 +6700,13 @@ mod tests {
         let joiner_signer = fresh_signer();
         let mut all_ids = server_ids.clone();
         all_ids.push(joiner_signer.node_id());
-        let vs = ValidatorSet::new(all_ids);
+        let vs = ValidatorSet::new(
+            all_ids
+                .iter()
+                .copied()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect(),
+        );
 
         let big_value: u64 = u64::MAX;
         let snapshot_payload = bytes::Bytes::from(postcard::to_stdvec(&big_value).unwrap());
@@ -6971,14 +7014,19 @@ mod tests {
     async fn timeout_vote_single_signer_does_not_advance_pacemaker_view() {
         let self_signer = fresh_signer();
         let peer_signer = fresh_signer();
-        let mut ids = vec![
+        let ids = vec![
             self_signer.node_id(),
             peer_signer.node_id(),
             nid(0xA1),
             nid(0xA2),
         ];
-        ids.sort();
-        let vs = ValidatorSet::new(ids);
+        // ValidatorSet::new sorts internally; the local ids.sort() is
+        // redundant but kept for parity with the pre-#328 fixture.
+        let vs = ValidatorSet::new(
+            ids.into_iter()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect(),
+        );
         let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
         let mut node = ConsensusNode::new(
             self_signer.node_id(),
@@ -7045,14 +7093,19 @@ mod tests {
         let self_signer = fresh_signer();
         let peer_a = fresh_signer();
         let peer_b = fresh_signer();
-        let mut ids = vec![
+        let ids = vec![
             self_signer.node_id(),
             peer_a.node_id(),
             peer_b.node_id(),
             nid(0xA1),
         ];
-        ids.sort();
-        let vs = ValidatorSet::new(ids);
+        // ValidatorSet::new sorts internally; the local ids.sort() is
+        // redundant but kept for parity with the pre-#328 fixture.
+        let vs = ValidatorSet::new(
+            ids.into_iter()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect(),
+        );
         let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
         let mut node = ConsensusNode::new(
             self_signer.node_id(),
@@ -7129,14 +7182,19 @@ mod tests {
         // n = 4 → quorum = 3, f + 1 = 2.
         let self_signer = fresh_signer();
         let byzantine = fresh_signer();
-        let mut ids = vec![
+        let ids = vec![
             self_signer.node_id(),
             byzantine.node_id(),
             nid(0xA1),
             nid(0xA2),
         ];
-        ids.sort();
-        let vs = ValidatorSet::new(ids);
+        // ValidatorSet::new sorts internally; the local ids.sort() is
+        // redundant but kept for parity with the pre-#328 fixture.
+        let vs = ValidatorSet::new(
+            ids.into_iter()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect(),
+        );
         let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
         let mut node = ConsensusNode::new(
             self_signer.node_id(),
@@ -7270,14 +7328,19 @@ mod tests {
     async fn stale_timeout_vote_replies_with_new_view_to_wedged_peer() {
         let self_signer = fresh_signer();
         let wedged_peer = fresh_signer();
-        let mut ids = vec![
+        let ids = vec![
             self_signer.node_id(),
             wedged_peer.node_id(),
             nid(0xA1),
             nid(0xA2),
         ];
-        ids.sort();
-        let vs = ValidatorSet::new(ids);
+        // ValidatorSet::new sorts internally; the local ids.sort() is
+        // redundant but kept for parity with the pre-#328 fixture.
+        let vs = ValidatorSet::new(
+            ids.into_iter()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect(),
+        );
         let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
         let mut node = ConsensusNode::new(
             self_signer.node_id(),
@@ -7516,7 +7579,12 @@ mod tests {
                 ids.push(*ph.next().unwrap());
             }
         }
-        let vs = ValidatorSet::new(ids);
+        let vs = ValidatorSet::new(
+            ids.iter()
+                .copied()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect(),
+        );
         let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
         let node = ConsensusNode::new(
             self_id,
@@ -7701,7 +7769,7 @@ mod tests {
         let (mut node, vs) = make_node_with_signer(&ns, 0);
         let signer: Arc<dyn Signer> = Arc::new(ns);
         // A placeholder peer that is *not* self.
-        let peer = *vs.get(1).unwrap();
+        let peer = vs.get(1).unwrap().into_node_id();
         assert_ne!(peer, node.self_id);
 
         let (broadcaster, mut send_rx) = make_test_broadcaster();
@@ -7763,7 +7831,12 @@ mod tests {
                 ids.push(*ph.next().unwrap());
             }
         }
-        let vs = ValidatorSet::new(ids);
+        let vs = ValidatorSet::new(
+            ids.iter()
+                .copied()
+                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+                .collect(),
+        );
         let mut limits = CacheLimits::unbounded_for_tests();
         limits.timeout_buckets_capacity = cap;
         let mut cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
@@ -7797,7 +7870,7 @@ mod tests {
         // exercise the foreign-vote ingress path and never trip the
         // self-loopback shortcut. View 0 must be skipped — `view <
         // current_view` would short-circuit before the bucket insert.
-        let voter = *vs.get(1).unwrap();
+        let voter = vs.get(1).unwrap().into_node_id();
         let n = (2 * cap) as View;
         for view in 1..=n {
             let payload = TimeoutVote {
@@ -7963,11 +8036,15 @@ mod tests {
         // some other index; the leader sends us a Proposal we'll vote on.
         let self_signer = fresh_signer();
         let leader_signer = fresh_signer();
-        let mut ids: Vec<NodeId> = vec![
-            self_signer.node_id(),
-            leader_signer.node_id(),
-            nid(0xA1),
-            nid(0xA2),
+        let mut ids: Vec<crate::consensus::validator_set::ValidatorId> = vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                self_signer.node_id(),
+            ),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                leader_signer.node_id(),
+            ),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(0xA1)),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(0xA2)),
         ];
         ids.sort();
         let vs = ValidatorSet::new(ids);
@@ -9058,7 +9135,7 @@ mod tests {
             .iter()
             .copied()
             .enumerate()
-            .map(|(i, id)| (id, bls_pk(0xA0 + i as u8)))
+            .map(|(i, id)| (id.into_node_id(), bls_pk(0xA0 + i as u8)))
             .collect();
         let bls_history = BlsKeyHistory::with_genesis(genesis_bls.iter().copied());
 

@@ -32,7 +32,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
-use crate::consensus::validator_set::ValidatorSet;
+use crate::consensus::validator_set::{ValidatorId, ValidatorSet};
 use crate::p2p::NodeId;
 
 /// One boundary in the history: the view at which `set` becomes
@@ -140,7 +140,7 @@ impl ValidatorSetHistory {
             .iter()
             .map(|(v_eff, set)| PersistedBoundary {
                 v_eff,
-                members: set.iter().copied().collect(),
+                members: set.iter().map(|v| v.into_node_id()).collect(),
             })
             .collect();
         PersistedValidatorHistory { boundaries }
@@ -149,6 +149,12 @@ impl ValidatorSetHistory {
     /// Rebuild a history from its persisted form (#254). The first
     /// boundary must be the genesis boundary at `v_eff = 0`; subsequent
     /// entries must be in strictly increasing `v_eff` order.
+    ///
+    /// Each persisted `NodeId` is promoted back to a [`ValidatorId`]
+    /// via [`ValidatorId::from_genesis_pubkey`]. This is allowed at
+    /// recovery time for the same reason it is allowed at genesis-load
+    /// time: we are reconstructing state authored by an honest replica
+    /// that already went through the legitimate seeding/reconfig paths.
     pub fn from_persisted(persisted: PersistedValidatorHistory) -> anyhow::Result<Self> {
         let mut iter = persisted.boundaries.into_iter();
         let genesis = iter
@@ -160,9 +166,19 @@ impl ValidatorSetHistory {
                 genesis.v_eff
             );
         }
-        let mut history = Self::from_genesis(ValidatorSet::new(genesis.members));
+        let genesis_members: Vec<ValidatorId> = genesis
+            .members
+            .into_iter()
+            .map(ValidatorId::from_genesis_pubkey)
+            .collect();
+        let mut history = Self::from_genesis(ValidatorSet::new(genesis_members));
         for boundary in iter {
-            history.insert_boundary(boundary.v_eff, ValidatorSet::new(boundary.members))?;
+            let members: Vec<ValidatorId> = boundary
+                .members
+                .into_iter()
+                .map(ValidatorId::from_genesis_pubkey)
+                .collect();
+            history.insert_boundary(boundary.v_eff, ValidatorSet::new(members))?;
         }
         Ok(history)
     }
@@ -196,16 +212,20 @@ mod tests {
         [b; 32]
     }
 
+    fn vid(b: u8) -> ValidatorId {
+        ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
     fn genesis() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)])
     }
 
     fn five() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(5)])
     }
 
     fn six() -> ValidatorSet {
-        ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4), nid(5), nid(6)])
+        ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(5), vid(6)])
     }
 
     #[test]
@@ -335,6 +355,18 @@ mod tests {
         };
         let err = ValidatorSetHistory::from_persisted(bad).unwrap_err();
         assert!(err.to_string().contains("v_eff = 0"));
+    }
+
+    /// Wire format must be byte-identical to the pre-#328 shape: the
+    /// `members` field of `PersistedBoundary` is a `Vec<NodeId>` of
+    /// 32-byte arrays, and the `ValidatorId`-typed `ValidatorSet`
+    /// flattens to the same bytes via `into_node_id()` on persist.
+    #[test]
+    fn persisted_boundary_wire_format_unchanged() {
+        let h = ValidatorSetHistory::from_genesis(genesis());
+        let persisted = h.to_persisted();
+        let expected_members: Vec<NodeId> = vec![nid(1), nid(2), nid(3), nid(4)];
+        assert_eq!(persisted.boundaries[0].members, expected_members);
     }
 
     #[test]
