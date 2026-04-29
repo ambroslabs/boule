@@ -2401,7 +2401,7 @@ mod tests {
             view: 3,
             block_hash: block_v3_hash,
         };
-        let preimg = preimage::<Vote>(&vote).unwrap();
+        let preimg = preimage::<Vote>(&vote, &crate::crypto::signed::ChainId::TEST).unwrap();
         let voters = [(1, nid(2)), (2, nid(3)), (3, nid(4))];
 
         let mut step_actions = Vec::new();
@@ -4290,8 +4290,11 @@ mod tests {
                 if self.signature_scheme != SignatureSchemeChoice::BlsAggregated {
                     return None;
                 }
-                let preimg = crate::crypto::signed::preimage::<Vote>(vote)
-                    .expect("preimage of a fixed-shape Vote must succeed");
+                let preimg = crate::crypto::signed::preimage::<Vote>(
+                    vote,
+                    &crate::crypto::signed::ChainId::TEST,
+                )
+                .expect("preimage of a fixed-shape Vote must succeed");
                 let sk = &self.bls_keys[signer_idx].0;
                 Some(
                     crate::crypto::sig_scheme::BlsAggregated::sign_partial(sk, &preimg)
@@ -4439,8 +4442,11 @@ mod tests {
                         let mut qc =
                             QuorumCertificate::new_bls(view, block_hash, self.validators.len());
                         let vote = Vote { view, block_hash };
-                        let preimg = crate::crypto::signed::preimage::<Vote>(&vote)
-                            .expect("Vote preimage must succeed");
+                        let preimg = crate::crypto::signed::preimage::<Vote>(
+                            &vote,
+                            &crate::crypto::signed::ChainId::TEST,
+                        )
+                        .expect("Vote preimage must succeed");
                         for i in 0..self.validators.len() {
                             let sk = &self.bls_keys[i].0;
                             let partial =

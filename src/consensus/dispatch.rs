@@ -42,7 +42,7 @@ use crate::consensus::pacemaker;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
 use crate::crypto::sig_scheme::SignatureSchemeChoice;
-use crate::crypto::signed::{Signed, SignedMessage, Signer, preimage};
+use crate::crypto::signed::{ChainId, Signed, SignedMessage, Signer, preimage};
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 use crate::replication::snapshot::SnapshotManifest;
@@ -289,8 +289,16 @@ pub fn ingress(
     bytes: &[u8],
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
+    chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
-    ingress_with_qc_verification(from, bytes, history, key_history, &QcVerification::Skip)
+    ingress_with_qc_verification(
+        from,
+        bytes,
+        history,
+        key_history,
+        &QcVerification::Skip,
+        chain_id,
+    )
 }
 
 /// Decode + verify a wire frame, additionally checking embedded QC
@@ -303,9 +311,10 @@ pub fn ingress_with_qc_verification(
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
     qc_verification: &QcVerification<'_>,
+    chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
     let msg: WireMessage = postcard::from_bytes(bytes)?;
-    ingress_wire_with_qc_verification(from, msg, history, key_history, qc_verification)
+    ingress_wire_with_qc_verification(from, msg, history, key_history, qc_verification, chain_id)
 }
 
 /// Same as [`ingress`] but takes an already-decoded [`WireMessage`].
@@ -316,8 +325,16 @@ pub fn ingress_wire(
     msg: WireMessage,
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
+    chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
-    ingress_wire_with_qc_verification(from, msg, history, key_history, &QcVerification::Skip)
+    ingress_wire_with_qc_verification(
+        from,
+        msg,
+        history,
+        key_history,
+        &QcVerification::Skip,
+        chain_id,
+    )
 }
 
 /// QC-verifying counterpart to [`ingress_wire`]. See [`QcVerification`]
@@ -328,17 +345,19 @@ pub fn ingress_wire_with_qc_verification(
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
     qc_verification: &QcVerification<'_>,
+    chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
     match msg {
         WireMessage::Proposal(signed) => {
             let view = signed.payload.block.header.view;
             verify_signer_at(signed.signer, view, history, key_history)?;
-            verify_sig(&signed)?;
+            verify_sig(&signed, chain_id)?;
             verify_qc_if_requested(
                 &signed.payload.justify,
                 history,
                 key_history,
                 qc_verification,
+                chain_id,
             )?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::ProposalReceived(
@@ -350,8 +369,13 @@ pub fn ingress_wire_with_qc_verification(
 
         WireMessage::Vote(signed, bls_partial) => {
             verify_signer_at(signed.signer, signed.payload.view, history, key_history)?;
-            verify_sig(&signed)?;
-            verify_bls_partial_if_required(&signed, bls_partial.as_ref(), qc_verification)?;
+            verify_sig(&signed, chain_id)?;
+            verify_bls_partial_if_required(
+                &signed,
+                bls_partial.as_ref(),
+                qc_verification,
+                chain_id,
+            )?;
             Ok(vec![Dispatch::Safety(
                 crate::consensus::hotstuff::step::Event::VoteReceived(signed, bls_partial),
             )])
@@ -368,7 +392,7 @@ pub fn ingress_wire_with_qc_verification(
             // all match the historical set, not the current one.
             let high_qc_view = signed.payload.high_qc.view;
             verify_signer_at(signed.signer, high_qc_view, history, key_history)?;
-            verify_sig(&signed)?;
+            verify_sig(&signed, chain_id)?;
             // #250: well-formedness of the embedded high_qc against the
             // set authoritative at `high_qc.view`. A NewView whose
             // high_qc was constructed against a different set size
@@ -384,6 +408,7 @@ pub fn ingress_wire_with_qc_verification(
                 history,
                 key_history,
                 qc_verification,
+                chain_id,
             )?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
@@ -397,7 +422,7 @@ pub fn ingress_wire_with_qc_verification(
 
         WireMessage::TimeoutVote(signed) => {
             verify_signer_at(signed.signer, signed.payload.view, history, key_history)?;
-            verify_sig(&signed)?;
+            verify_sig(&signed, chain_id)?;
             // The round-sync hint that closes the #218 wedge fires
             // at the integration layer (`on_timeout_vote`), not here:
             // it only kicks in once the local timeout bucket has
@@ -425,6 +450,7 @@ pub fn ingress_wire_with_qc_verification(
                 history,
                 key_history,
                 qc_verification,
+                chain_id,
             );
             Ok(vec![Dispatch::TimeoutVote {
                 signed,
@@ -513,12 +539,12 @@ fn verify_signer_at(
 }
 
 /// Verify the Ed25519 signature on a `Signed<T>` envelope.
-fn verify_sig<T>(signed: &Signed<T>) -> Result<(), IngressError>
+fn verify_sig<T>(signed: &Signed<T>, chain_id: &ChainId) -> Result<(), IngressError>
 where
     T: serde::Serialize + SignedMessage,
 {
     signed
-        .verify(&signed.signer)
+        .verify(&signed.signer, chain_id)
         .map_err(IngressError::InvalidSignature)
 }
 
@@ -539,6 +565,7 @@ fn verify_bls_partial_if_required(
     signed: &Signed<Vote>,
     bls_partial: Option<&crate::crypto::sig_scheme::BlsPartialSig>,
     qc_verification: &QcVerification<'_>,
+    chain_id: &ChainId,
 ) -> Result<(), IngressError> {
     let QcVerification::Verify {
         scheme,
@@ -570,11 +597,12 @@ fn verify_bls_partial_if_required(
             signer: signed.signer,
         })?;
 
-    let vote_preimage =
-        preimage::<Vote>(&signed.payload).map_err(|_| IngressError::InvalidBlsPartial {
+    let vote_preimage = preimage::<Vote>(&signed.payload, chain_id).map_err(|_| {
+        IngressError::InvalidBlsPartial {
             view: signed.payload.view,
             signer: signed.signer,
-        })?;
+        }
+    })?;
 
     crate::crypto::sig_scheme::BlsAggregated::verify_partial(&bls_pubkey, &vote_preimage, partial)
         .map_err(|_| IngressError::InvalidBlsPartial {
@@ -600,6 +628,7 @@ fn verify_qc_if_requested(
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
     qc_verification: &QcVerification<'_>,
+    chain_id: &ChainId,
 ) -> Result<(), IngressError> {
     let QcVerification::Verify {
         scheme,
@@ -633,10 +662,11 @@ fn verify_qc_if_requested(
         view: qc.view,
         block_hash: qc.block_hash,
     };
-    let vote_preimage = preimage::<Vote>(&vote).map_err(|_| IngressError::InvalidQcAggregate {
-        view: qc.view,
-        scheme: scheme.name(),
-    })?;
+    let vote_preimage =
+        preimage::<Vote>(&vote, chain_id).map_err(|_| IngressError::InvalidQcAggregate {
+            view: qc.view,
+            scheme: scheme.name(),
+        })?;
 
     match scheme {
         SignatureSchemeChoice::Ed25519Collected => {
@@ -715,6 +745,7 @@ fn verify_high_qc_piggyback(
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
     qc_verification: &QcVerification<'_>,
+    chain_id: &ChainId,
 ) -> bool {
     let Some(qc) = high_qc else {
         return true;
@@ -729,7 +760,7 @@ fn verify_high_qc_piggyback(
     if !qc.is_well_formed(&vs) {
         return false;
     }
-    verify_qc_if_requested(qc, history, key_history, qc_verification).is_ok()
+    verify_qc_if_requested(qc, history, key_history, qc_verification, chain_id).is_ok()
 }
 
 // ── egress_safety ─────────────────────────────────────────────────────────────
@@ -749,10 +780,11 @@ pub fn egress_safety(
     bls_signer: Option<
         &dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
     >,
+    chain_id: &ChainId,
 ) -> anyhow::Result<Option<Outbound>> {
     match action {
         SafetyAction::Broadcast(msg) => {
-            let wire = sign_consensus_msg(msg, signer, bls_signer)?;
+            let wire = sign_consensus_msg(msg, signer, bls_signer, chain_id)?;
             let payload = postcard::to_stdvec(&wire)
                 .map(Bytes::from)
                 .map_err(anyhow::Error::from)?;
@@ -760,7 +792,7 @@ pub fn egress_safety(
         }
 
         SafetyAction::SendTo(target, msg) => {
-            let wire = sign_consensus_msg(msg, signer, bls_signer)?;
+            let wire = sign_consensus_msg(msg, signer, bls_signer, chain_id)?;
             let payload = postcard::to_stdvec(&wire)
                 .map(Bytes::from)
                 .map_err(anyhow::Error::from)?;
@@ -873,17 +905,18 @@ fn sign_consensus_msg(
     bls_signer: Option<
         &dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
     >,
+    chain_id: &ChainId,
 ) -> anyhow::Result<WireMessage> {
     match msg {
         ConsensusMsg::Proposal(p) => {
-            let signed = Signed::sign(p.clone(), signer)?;
+            let signed = Signed::sign(p.clone(), signer, chain_id)?;
             Ok(WireMessage::Proposal(signed))
         }
         ConsensusMsg::Vote(v) => {
-            let signed = Signed::sign(v.clone(), signer)?;
+            let signed = Signed::sign(v.clone(), signer, chain_id)?;
             let bls_partial = match bls_signer {
                 Some(bs) => {
-                    let bytes = preimage::<Vote>(v)?;
+                    let bytes = preimage::<Vote>(v, chain_id)?;
                     Some(bs.sign_partial(&bytes))
                 }
                 None => None,
@@ -891,7 +924,7 @@ fn sign_consensus_msg(
             Ok(WireMessage::Vote(signed, bls_partial))
         }
         ConsensusMsg::NewView(nv) => {
-            let signed = Signed::sign(nv.clone(), signer)?;
+            let signed = Signed::sign(nv.clone(), signer, chain_id)?;
             Ok(WireMessage::NewView(signed))
         }
     }
@@ -920,8 +953,9 @@ pub fn egress_consensus_msg_with_loopback(
     bls_signer: Option<
         &dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
     >,
+    chain_id: &ChainId,
 ) -> anyhow::Result<(Bytes, Vec<Dispatch>)> {
-    let wire = sign_consensus_msg(msg, signer, bls_signer)?;
+    let wire = sign_consensus_msg(msg, signer, bls_signer, chain_id)?;
     let payload = postcard::to_stdvec(&wire)
         .map(Bytes::from)
         .map_err(anyhow::Error::from)?;
@@ -1034,7 +1068,7 @@ mod tests {
     ) -> Result<Vec<Dispatch>, IngressError> {
         let history = ValidatorSetHistory::from_genesis(vs.clone());
         let key_history = key_history_from_set(vs);
-        ingress(from, bytes, &history, &key_history)
+        ingress(from, bytes, &history, &key_history, &ChainId::TEST)
     }
 
     // ── ingress: Proposal ────────────────────────────────────────────────────
@@ -1048,7 +1082,7 @@ mod tests {
             block: genesis(),
             justify: sample_qc(),
         };
-        let signed = Signed::sign(proposal.clone(), &signer).unwrap();
+        let signed = Signed::sign(proposal.clone(), &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -1074,7 +1108,7 @@ mod tests {
             block: genesis(),
             justify: sample_qc(),
         };
-        let signed = Signed::sign(proposal, &signer).unwrap();
+        let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -1091,7 +1125,7 @@ mod tests {
             block: genesis(),
             justify: sample_qc(),
         };
-        let mut signed = Signed::sign(proposal, &signer).unwrap();
+        let mut signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
         signed.sig[0] ^= 0xFF; // corrupt the signature
 
         let wire = WireMessage::Proposal(signed);
@@ -1112,7 +1146,7 @@ mod tests {
             view: 3,
             block_hash: [0xAB; 32],
         };
-        let signed = Signed::sign(vote, &signer).unwrap();
+        let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -1134,7 +1168,7 @@ mod tests {
         let mut high_qc = QuorumCertificate::new(7, [0xCD; 32], 1);
         high_qc.add_signature(0, [0x11; 64]);
         let nv = NewView { high_qc };
-        let signed = Signed::sign(nv, &signer).unwrap();
+        let signed = Signed::sign(nv, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::NewView(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -1161,7 +1195,7 @@ mod tests {
             view: 7,
             high_qc: Some(sample_qc()),
         };
-        let signed = Signed::sign(tv, &signer).unwrap();
+        let signed = Signed::sign(tv, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -1186,7 +1220,7 @@ mod tests {
             view: 3,
             high_qc: None,
         };
-        let signed = Signed::sign(tv, &signer).unwrap();
+        let signed = Signed::sign(tv, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -1203,7 +1237,7 @@ mod tests {
             view: 1,
             high_qc: None,
         };
-        let mut signed = Signed::sign(tv, &signer).unwrap();
+        let mut signed = Signed::sign(tv, &signer, &ChainId::TEST).unwrap();
         signed.sig[0] ^= 0xFF;
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
@@ -1266,7 +1300,9 @@ mod tests {
         };
         let action = SafetyAction::Broadcast(ConsensusMsg::Proposal(proposal));
 
-        let out = egress_safety(&action, &signer, None).unwrap().unwrap();
+        let out = egress_safety(&action, &signer, None, &ChainId::TEST)
+            .unwrap()
+            .unwrap();
         let Outbound::Broadcast(payload) = out else {
             panic!("expected Broadcast");
         };
@@ -1285,7 +1321,9 @@ mod tests {
         };
         let action = SafetyAction::SendTo(target, ConsensusMsg::Vote(vote));
 
-        let out = egress_safety(&action, &signer, None).unwrap().unwrap();
+        let out = egress_safety(&action, &signer, None, &ChainId::TEST)
+            .unwrap()
+            .unwrap();
         let Outbound::SendTo { to, payload } = out else {
             panic!("expected SendTo");
         };
@@ -1299,7 +1337,7 @@ mod tests {
         let signer = fresh_signer();
         use crate::consensus::hotstuff::step::StateUpdate;
         let action = SafetyAction::Persist(StateUpdate::VotedInView { view: 1 });
-        let out = egress_safety(&action, &signer, None).unwrap();
+        let out = egress_safety(&action, &signer, None, &ChainId::TEST).unwrap();
         assert!(out.is_none());
     }
 
@@ -1307,7 +1345,7 @@ mod tests {
     fn egress_commit_returns_none() {
         let signer = fresh_signer();
         let action = SafetyAction::Commit(genesis());
-        let out = egress_safety(&action, &signer, None).unwrap();
+        let out = egress_safety(&action, &signer, None, &ChainId::TEST).unwrap();
         assert!(out.is_none());
     }
 
@@ -1322,7 +1360,9 @@ mod tests {
             expected_height: 41,
             reason: crate::consensus::hotstuff::step::BlockSyncReason::UnknownParentOnProposal,
         };
-        let out = egress_safety(&action, &signer, None).unwrap().unwrap();
+        let out = egress_safety(&action, &signer, None, &ChainId::TEST)
+            .unwrap()
+            .unwrap();
         let Outbound::SendTo { to, payload } = out else {
             panic!("expected SendTo");
         };
@@ -1343,7 +1383,9 @@ mod tests {
             justify: sample_qc(),
         };
         let action = SafetyAction::Broadcast(ConsensusMsg::Proposal(proposal.clone()));
-        let Outbound::Broadcast(payload) = egress_safety(&action, &signer, None).unwrap().unwrap()
+        let Outbound::Broadcast(payload) = egress_safety(&action, &signer, None, &ChainId::TEST)
+            .unwrap()
+            .unwrap()
         else {
             panic!("expected Broadcast");
         };
@@ -1612,13 +1654,20 @@ mod tests {
             view: v_eff,
             block_hash: [0xAB; 32],
         };
-        let signed = Signed::sign(vote, &new_signer).unwrap();
+        let signed = Signed::sign(vote, &new_signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         // Succeeds against the history that contains the boundary.
         let key_history = key_history_for(&history);
-        let dispatches = ingress(new_signer.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            new_signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert!(matches!(
             dispatches[0],
             Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
@@ -1640,7 +1689,7 @@ mod tests {
             view: 5,
             block_hash: [0xAB; 32],
         };
-        let signed = Signed::sign(vote, &new_signer).unwrap();
+        let signed = Signed::sign(vote, &new_signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -1649,6 +1698,7 @@ mod tests {
             &bytes,
             &history_without_boundary,
             &key_history,
+            &ChainId::TEST,
         )
         .unwrap_err();
         assert!(
@@ -1677,11 +1727,18 @@ mod tests {
             view: v_eff - 1,
             block_hash: [0xCD; 32],
         };
-        let signed = Signed::sign(vote, &old_signer).unwrap();
+        let signed = Signed::sign(vote, &old_signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(old_signer.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            old_signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert!(matches!(
             dispatches[0],
             Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
@@ -1722,11 +1779,18 @@ mod tests {
             block,
             justify: sample_qc(),
         };
-        let signed = Signed::sign(proposal, &new_signer).unwrap();
+        let signed = Signed::sign(proposal, &new_signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(new_signer.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            new_signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert!(matches!(
             dispatches[0],
             Dispatch::Safety(SafetyEvent::ProposalReceived(_))
@@ -1761,11 +1825,18 @@ mod tests {
         assert!(high_qc.is_well_formed(&old_set));
 
         let nv = NewView { high_qc };
-        let signed = Signed::sign(nv, &old_a).unwrap();
+        let signed = Signed::sign(nv, &old_a, &ChainId::TEST).unwrap();
         let wire = WireMessage::NewView(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(old_a.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            old_a.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 2);
         assert!(matches!(
             dispatches[0],
@@ -1808,11 +1879,18 @@ mod tests {
         // Envelope signer must verify first; pick someone in the old set
         // so we exercise the high_qc check rather than the signer check.
         let nv = NewView { high_qc };
-        let signed = Signed::sign(nv, &old_a).unwrap();
+        let signed = Signed::sign(nv, &old_a, &ChainId::TEST).unwrap();
         let wire = WireMessage::NewView(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(old_a.node_id(), &bytes, &history, &key_history).unwrap_err();
+        let err = ingress(
+            old_a.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, IngressError::MalformedHighQc { view } if view == v_eff - 1),
             "expected MalformedHighQc at v_eff - 1, got {err:?}",
@@ -1833,11 +1911,18 @@ mod tests {
         let mut high_qc = QuorumCertificate::new(7, [0xCD; 32], vs.len());
         high_qc.add_signature(0, [0x11; 64]);
         let nv = NewView { high_qc };
-        let signed = Signed::sign(nv, &signer).unwrap();
+        let signed = Signed::sign(nv, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::NewView(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(signer.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 2);
         assert!(matches!(
             dispatches[0],
@@ -1902,11 +1987,18 @@ mod tests {
             view: 100,
             block_hash: [0xAB; 32],
         };
-        let signed = Signed::sign(vote, &new).unwrap();
+        let signed = Signed::sign(vote, &new, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(new.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            new.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert!(matches!(
             dispatches[0],
             Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
@@ -1932,11 +2024,18 @@ mod tests {
             view: 50,
             block_hash: [0xCD; 32],
         };
-        let signed = Signed::sign(vote, &old).unwrap();
+        let signed = Signed::sign(vote, &old, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(old.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            old.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert!(matches!(
             dispatches[0],
             Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
@@ -1960,11 +2059,18 @@ mod tests {
             view: 100,
             block_hash: [0xEF; 32],
         };
-        let signed = Signed::sign(vote, &old).unwrap();
+        let signed = Signed::sign(vote, &old, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(old.node_id(), &bytes, &history, &key_history).unwrap_err();
+        let err = ingress(
+            old.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, IngressError::UnknownSigner(_)),
             "expected UnknownSigner for stale-key vote, got {err:?}"
@@ -1988,11 +2094,18 @@ mod tests {
             view: 50,
             block_hash: [0x12; 32],
         };
-        let signed = Signed::sign(vote, &new).unwrap();
+        let signed = Signed::sign(vote, &new, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(new.node_id(), &bytes, &history, &key_history).unwrap_err();
+        let err = ingress(
+            new.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, IngressError::UnknownSigner(_)),
             "expected UnknownSigner for future-key vote, got {err:?}"
@@ -2015,11 +2128,18 @@ mod tests {
             view: 5,
             block_hash: [0x77; 32],
         };
-        let signed = Signed::sign(vote, &attacker).unwrap();
+        let signed = Signed::sign(vote, &attacker, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(attacker.node_id(), &bytes, &history, &key_history).unwrap_err();
+        let err = ingress(
+            attacker.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap_err();
         assert!(matches!(err, IngressError::UnknownSigner(_)));
     }
 
@@ -2051,11 +2171,18 @@ mod tests {
             },
             justify: sample_qc(),
         };
-        let signed = Signed::sign(proposal, &new).unwrap();
+        let signed = Signed::sign(proposal, &new, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(new.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            new.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert!(matches!(
             dispatches[0],
             Dispatch::Safety(SafetyEvent::ProposalReceived(_))
@@ -2074,11 +2201,18 @@ mod tests {
             view: 100,
             high_qc: None,
         };
-        let signed = Signed::sign(tv, &new).unwrap();
+        let signed = Signed::sign(tv, &new, &ChainId::TEST).unwrap();
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(new.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            new.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert!(matches!(dispatches[0], Dispatch::TimeoutVote { .. }));
     }
 
@@ -2099,11 +2233,18 @@ mod tests {
         let mut high_qc = QuorumCertificate::new(100, [0xCD; 32], vs.len());
         high_qc.add_signature(0, [0x11; 64]);
         let nv = NewView { high_qc };
-        let signed = Signed::sign(nv, &new).unwrap();
+        let signed = Signed::sign(nv, &new, &ChainId::TEST).unwrap();
         let wire = WireMessage::NewView(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(new.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            new.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert_eq!(dispatches.len(), 2);
         assert!(matches!(
             dispatches[0],
@@ -2133,11 +2274,18 @@ mod tests {
             view: v_eff,
             block_hash: [0xAB; 32],
         };
-        let signed = Signed::sign(vote, &removed).unwrap();
+        let signed = Signed::sign(vote, &removed, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let err = ingress(removed.node_id(), &bytes, &history, &key_history).unwrap_err();
+        let err = ingress(
+            removed.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap_err();
         assert!(matches!(err, IngressError::UnknownSigner(_)));
 
         // Spanning vote at view < v_eff is still accepted — the
@@ -2146,11 +2294,18 @@ mod tests {
             view: v_eff - 1,
             block_hash: [0xCD; 32],
         };
-        let signed = Signed::sign(vote, &removed).unwrap();
+        let signed = Signed::sign(vote, &removed, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let dispatches = ingress(removed.node_id(), &bytes, &history, &key_history).unwrap();
+        let dispatches = ingress(
+            removed.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .unwrap();
         assert!(matches!(
             dispatches[0],
             Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
@@ -2176,7 +2331,7 @@ mod tests {
         // assumes.
         for stable_id in vs.iter().take(quorum_size_for_n(vs.len())) {
             let signer = signers.iter().find(|s| &s.node_id() == stable_id).unwrap();
-            let signed = Signed::sign(vote.clone(), signer).unwrap();
+            let signed = Signed::sign(vote.clone(), signer, &ChainId::TEST).unwrap();
             let idx = vs.index_of(stable_id).unwrap();
             qc.add_signature(idx, signed.sig);
         }
@@ -2208,7 +2363,7 @@ mod tests {
             commands: vec![],
         };
         let proposal = Proposal { block, justify: qc };
-        let signed = Signed::sign(proposal, leader).unwrap();
+        let signed = Signed::sign(proposal, leader, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2224,6 +2379,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect("real Ed25519 QC must verify under the genesis pubkeys");
         assert_eq!(dispatches.len(), 2);
@@ -2255,7 +2411,7 @@ mod tests {
             commands: vec![],
         };
         let proposal = Proposal { block, justify: qc };
-        let signed = Signed::sign(proposal, leader).unwrap();
+        let signed = Signed::sign(proposal, leader, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2271,6 +2427,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect_err("tampered QC must be rejected");
         assert!(matches!(
@@ -2296,7 +2453,7 @@ mod tests {
         }
 
         let nv = NewView { high_qc };
-        let signed = Signed::sign(nv, messenger).unwrap();
+        let signed = Signed::sign(nv, messenger, &ChainId::TEST).unwrap();
         let wire = WireMessage::NewView(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2312,6 +2469,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect_err("tampered high_qc must be rejected");
         assert!(matches!(
@@ -2341,7 +2499,7 @@ mod tests {
             view: qc_view + 3,
             high_qc: Some(qc),
         };
-        let signed = Signed::sign(tv, voter).unwrap();
+        let signed = Signed::sign(tv, voter, &ChainId::TEST).unwrap();
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2357,6 +2515,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect("real Ed25519 piggyback must verify under the genesis pubkeys");
         assert_eq!(dispatches.len(), 1);
@@ -2401,7 +2560,7 @@ mod tests {
             view: qc_view + 3,
             high_qc: Some(qc),
         };
-        let signed = Signed::sign(tv, voter).unwrap();
+        let signed = Signed::sign(tv, voter, &ChainId::TEST).unwrap();
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2417,6 +2576,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect("envelope must still be accepted even when the piggyback is forged");
         assert_eq!(dispatches.len(), 1);
@@ -2463,7 +2623,7 @@ mod tests {
             view: qc_view + 3,
             high_qc: Some(malformed),
         };
-        let signed = Signed::sign(tv, voter).unwrap();
+        let signed = Signed::sign(tv, voter, &ChainId::TEST).unwrap();
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2479,6 +2639,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect("envelope must still be accepted even when the piggyback is malformed");
         assert!(
@@ -2507,7 +2668,7 @@ mod tests {
             view: 9,
             high_qc: None,
         };
-        let signed = Signed::sign(tv, &voter).unwrap();
+        let signed = Signed::sign(tv, &voter, &ChainId::TEST).unwrap();
         let wire = WireMessage::TimeoutVote(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2523,6 +2684,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .unwrap();
         assert!(matches!(
@@ -2545,7 +2707,7 @@ mod tests {
             block: genesis(),
             justify: sample_qc(),
         };
-        let signed = Signed::sign(proposal, &signer).unwrap();
+        let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2561,6 +2723,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect("genesis QC (no signers) must pass aggregate verification");
         assert_eq!(dispatches.len(), 2);
@@ -2601,7 +2764,7 @@ mod tests {
             block,
             justify: bls_qc,
         };
-        let signed = Signed::sign(proposal, &signer).unwrap();
+        let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2617,6 +2780,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect_err("BLS QC on Ed25519 chain must be rejected");
         assert!(matches!(
@@ -2656,10 +2820,10 @@ mod tests {
         block_hash: BlockHash,
     ) -> (Signed<Vote>, crate::crypto::sig_scheme::BlsPartialSig) {
         let vote = Vote { view, block_hash };
-        let preimage = preimage::<Vote>(&vote).unwrap();
+        let preimage = preimage::<Vote>(&vote, &ChainId::TEST).unwrap();
         let partial =
             crate::crypto::sig_scheme::BlsAggregated::sign_partial(bls_sk, &preimage).unwrap();
-        let signed = Signed::sign(vote, signer).unwrap();
+        let signed = Signed::sign(vote, signer, &ChainId::TEST).unwrap();
         (signed, partial)
     }
 
@@ -2689,6 +2853,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect("valid BLS partial must pass ingress on a BLS chain");
         assert_eq!(dispatches.len(), 1);
@@ -2707,7 +2872,7 @@ mod tests {
 
         // Vote with no BLS partial attached (None).
         let vote = Vote { view, block_hash };
-        let signed = Signed::sign(vote, &signer).unwrap();
+        let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2725,6 +2890,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect_err("missing BLS partial on BLS chain must be rejected");
         let expected_signer = signer.node_id();
@@ -2761,6 +2927,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect_err("tampered BLS partial must be rejected");
         assert!(matches!(
@@ -2782,7 +2949,7 @@ mod tests {
         let block_hash = [0xDD; 32];
 
         let (signed, _) = make_signed_vote_with_bls_partial(&signer, &bls_sk_b, view, block_hash);
-        let preimage = preimage::<Vote>(&signed.payload).unwrap();
+        let preimage = preimage::<Vote>(&signed.payload, &ChainId::TEST).unwrap();
         let partial =
             crate::crypto::sig_scheme::BlsAggregated::sign_partial(&bls_sk_b, &preimage).unwrap();
         let wire = WireMessage::Vote(signed, Some(partial));
@@ -2805,6 +2972,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect_err("partial signed under the wrong BLS key must be rejected");
         assert!(matches!(
@@ -2825,7 +2993,7 @@ mod tests {
 
         // Ship a junk BLS partial alongside the vote — it must be ignored.
         let vote = Vote { view, block_hash };
-        let signed = Signed::sign(vote, &signer).unwrap();
+        let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Vote(signed, Some([0xFFu8; 96]));
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
@@ -2842,6 +3010,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect("Ed25519 chain must ignore the optional BLS partial field");
         assert_eq!(dispatches.len(), 1);
@@ -2880,6 +3049,7 @@ mod tests {
             &history,
             &key_history,
             &qc_verify,
+            &ChainId::TEST,
         )
         .expect_err("BLS chain without bls_key_history must reject");
         assert!(matches!(
@@ -2901,7 +3071,7 @@ mod tests {
             view: 2,
             block_hash: [0x77; 32],
         };
-        let signed = Signed::sign(vote, &signer).unwrap();
+        let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
         // Junk BLS partial — would not verify under any pubkey.
         let wire = WireMessage::Vote(signed, Some([0u8; 96]));
         let bytes = postcard::to_stdvec(&wire).unwrap();
@@ -2925,15 +3095,21 @@ mod tests {
             block: genesis(),
             justify: bogus_qc,
         };
-        let signed = Signed::sign(proposal, &signer).unwrap();
+        let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let history = ValidatorSetHistory::from_genesis(vs.clone());
         let key_history = key_history_from_set(&vs);
         // Default ingress → QcVerification::Skip → no aggregate check.
-        let dispatches = ingress(signer.node_id(), &bytes, &history, &key_history)
-            .expect("Skip policy must not exercise aggregate verification");
+        let dispatches = ingress(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &ChainId::TEST,
+        )
+        .expect("Skip policy must not exercise aggregate verification");
         assert_eq!(dispatches.len(), 2);
     }
 }

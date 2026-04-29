@@ -54,7 +54,7 @@ use crate::consensus::hotstuff::step::{Action, BlockBuilder, Event, HotStuffCore
 use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
 use crate::consensus::node::WireMessage;
 use crate::consensus::validator_set::ValidatorSet;
-use crate::crypto::signed::{NodeSigner, Signed, Signer};
+use crate::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
 use crate::p2p::NodeId;
 use crate::p2p::identity::NodeIdentity;
 use crate::replication::block::{Block, BlockHash, BlockHeader};
@@ -207,28 +207,28 @@ fn arb_signed_wire_bytes_and_signer() -> impl Strategy<Value = (Vec<u8>, NodeId)
     prop_oneof![
         (arb_signer_idx(), arb_proposal(genesis_hash)).prop_map(|(idx, p)| {
             let signer = &signer_pool()[idx];
-            let signed = Signed::sign(p, signer).expect("sign Proposal");
+            let signed = Signed::sign(p, signer, &ChainId::TEST).expect("sign Proposal");
             let bytes = postcard::to_stdvec(&WireMessage::Proposal(signed))
                 .expect("encode WireMessage::Proposal");
             (bytes, signer.node_id())
         }),
         (arb_signer_idx(), arb_vote()).prop_map(|(idx, v)| {
             let signer = &signer_pool()[idx];
-            let signed = Signed::sign(v, signer).expect("sign Vote");
+            let signed = Signed::sign(v, signer, &ChainId::TEST).expect("sign Vote");
             let bytes = postcard::to_stdvec(&WireMessage::Vote(signed, None))
                 .expect("encode WireMessage::Vote");
             (bytes, signer.node_id())
         }),
         (arb_signer_idx(), arb_new_view()).prop_map(|(idx, nv)| {
             let signer = &signer_pool()[idx];
-            let signed = Signed::sign(nv, signer).expect("sign NewView");
+            let signed = Signed::sign(nv, signer, &ChainId::TEST).expect("sign NewView");
             let bytes = postcard::to_stdvec(&WireMessage::NewView(signed))
                 .expect("encode WireMessage::NewView");
             (bytes, signer.node_id())
         }),
         (arb_signer_idx(), arb_timeout_vote()).prop_map(|(idx, tv)| {
             let signer = &signer_pool()[idx];
-            let signed = Signed::sign(tv, signer).expect("sign TimeoutVote");
+            let signed = Signed::sign(tv, signer, &ChainId::TEST).expect("sign TimeoutVote");
             let bytes = postcard::to_stdvec(&WireMessage::TimeoutVote(signed))
                 .expect("encode WireMessage::TimeoutVote");
             (bytes, signer.node_id())
@@ -267,7 +267,7 @@ proptest! {
             crate::consensus::validator_key_history::ValidatorKeyHistory::from_set_history(
                 &history,
             );
-        let _ = ingress(from, &bytes, &history, &key_history);
+        let _ = ingress(from, &bytes, &history, &key_history, &ChainId::TEST);
     }
 
     /// A `WireMessage` whose payload is structurally adversarial —
@@ -288,7 +288,7 @@ proptest! {
             crate::consensus::validator_key_history::ValidatorKeyHistory::from_set_history(
                 &history,
             );
-        let _ = ingress(from, &bytes, &history, &key_history);
+        let _ = ingress(from, &bytes, &history, &key_history, &ChainId::TEST);
     }
 }
 

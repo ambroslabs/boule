@@ -53,7 +53,7 @@ use super::sim::{Adversary, AdversaryCtx, SimCluster, assert_no_conflicts};
 use crate::consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote};
 use crate::consensus::hotstuff::{NewView, Proposal};
 use crate::consensus::node::WireMessage;
-use crate::crypto::signed::Signed;
+use crate::crypto::signed::{ChainId, Signed};
 use crate::p2p::{NodeId, ProtocolOutbound};
 use crate::replication::block::Block;
 
@@ -123,7 +123,7 @@ impl Adversary for EquivocatorAdversary {
             block: block_b,
             justify: signed_a.payload.justify.clone(),
         };
-        let signed_b = Signed::sign(proposal_b, ctx.signer.as_ref())
+        let signed_b = Signed::sign(proposal_b, ctx.signer.as_ref(), &ChainId::TEST)
             .expect("equivocator re-signing must not fail (own signer is healthy)");
         let payload_b = encode(&WireMessage::Proposal(signed_b));
 
@@ -285,7 +285,7 @@ impl Adversary for ForgedQcAdversary {
         let nv = NewView {
             high_qc: Self::forged_qc(ctx.validators.len()),
         };
-        let signed = Signed::sign(nv, ctx.signer.as_ref())
+        let signed = Signed::sign(nv, ctx.signer.as_ref(), &ChainId::TEST)
             .expect("forged-QC adversary signing must not fail");
         let payload = encode(&WireMessage::NewView(signed));
         vec![outbound, ProtocolOutbound::Broadcast(payload)]
@@ -325,8 +325,8 @@ impl Adversary for TimeoutSpammerAdversary {
             view: u64::from(*counter),
             high_qc: None,
         };
-        let signed =
-            Signed::sign(tv, ctx.signer.as_ref()).expect("timeout-spammer signing must not fail");
+        let signed = Signed::sign(tv, ctx.signer.as_ref(), &ChainId::TEST)
+            .expect("timeout-spammer signing must not fail");
         let payload = encode(&WireMessage::TimeoutVote(signed));
         vec![outbound, ProtocolOutbound::Broadcast(payload)]
     }
@@ -407,7 +407,7 @@ impl Adversary for ForgedPiggybackAdversary {
             view: u64::from(*counter),
             high_qc: Some(Self::forged_piggyback_qc(ctx.validators.len())),
         };
-        let signed = Signed::sign(tv, ctx.signer.as_ref())
+        let signed = Signed::sign(tv, ctx.signer.as_ref(), &ChainId::TEST)
             .expect("forged-piggyback adversary signing must not fail");
         let payload = encode(&WireMessage::TimeoutVote(signed));
         vec![outbound, ProtocolOutbound::Broadcast(payload)]

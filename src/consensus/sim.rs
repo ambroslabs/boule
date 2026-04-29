@@ -1639,7 +1639,7 @@ mod tests {
 
     use super::{LinkCut, SimCluster, assert_no_conflicts, fresh_signer, spawn_route_task};
     use crate::consensus::validator_set::ValidatorSet;
-    use crate::crypto::signed::Signer;
+    use crate::crypto::signed::{ChainId, Signer};
     use crate::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
     use crate::replication::block::Block;
 
@@ -3372,6 +3372,7 @@ mod tests {
                     },
                     &*current,
                     &*new_signer,
+                    &ChainId::TEST,
                 )
                 .expect("rotation envelope sign");
                 let payload = envelope.encode_command();
@@ -4156,8 +4157,9 @@ mod tests {
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
-        let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer)
-            .expect("constructing rotation envelope must succeed");
+        let envelope =
+            DualSignedRotation::sign(payload, &*current_signer, &*new_signer, &ChainId::TEST)
+                .expect("constructing rotation envelope must succeed");
         let cmd_bytes = envelope.encode_command();
 
         // Drop the encoded rotation into every node's mempool so
@@ -4280,8 +4282,9 @@ mod tests {
             new_bls_pubkey: Some(new_bls_pk),
             new_bls_pop: Some(new_bls_pop),
         };
-        let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer)
-            .expect("constructing BLS rotation envelope must succeed");
+        let envelope =
+            DualSignedRotation::sign(payload, &*current_signer, &*new_signer, &ChainId::TEST)
+                .expect("constructing BLS rotation envelope must succeed");
         let cmd_bytes = envelope.encode_command();
 
         for mp in &cluster.mempools {
@@ -4376,7 +4379,7 @@ mod tests {
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
-        let env = DualSignedRotation::sign(payload, &*current, &*new_signer)
+        let env = DualSignedRotation::sign(payload, &*current, &*new_signer, &ChainId::TEST)
             .expect("constructing rotation envelope must succeed");
         (env, new_signer)
     }
@@ -4522,6 +4525,7 @@ mod tests {
             },
             &*current,
             &*new_signer,
+            &ChainId::TEST,
         )
         .unwrap();
         let bad_bytes = env.encode_command();

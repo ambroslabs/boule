@@ -15,12 +15,19 @@
 //! representation of the envelope. That pre-image is:
 //!
 //! ```text
-//! be_u32(|domain|) || domain || postcard(payload)
+//! chain_id || be_u32(|domain|) || domain || postcard(payload)
 //! ```
 //!
 //! The domain tag is fixed per payload type via [`SignedMessage::DOMAIN`],
 //! preventing a signature produced in one context from being replayed in
 //! another (e.g. a vote signature reinterpreted as a proposal signature).
+//! The 32-byte [`ChainId`] is fixed per deployment (see #324, audit
+//! finding 7-F1) and prevents cross-deployment signature replay: an
+//! Ed25519 keypair shared between two chains can no longer have
+//! identically-shaped vote/proposal/timeout/rotation payloads accepted
+//! across deployments. The ChainId is not length-prefixed — it is a
+//! fixed-size 32-byte tag, so no ambiguity is possible at the boundary.
+//!
 //! Postcard is deterministic for the fixed-shape payloads we sign —
 //! structs, enums, primitives, arrays. Callers should avoid payloads
 //! whose serialization is order-dependent (e.g. `HashMap`); prefer
@@ -111,6 +118,47 @@ pub trait PartialSigner<S: SignatureScheme>: Send + Sync {
     fn sign_partial(&self, msg: &[u8]) -> S::PartialSig;
 }
 
+/// 32-byte deployment-scoped identifier mixed into every signing
+/// pre-image (issue #324, audit finding 7-F1).
+///
+/// A `ChainId` is defined at network-genesis time and never changes for
+/// the life of the chain. The recommended construction is
+/// `ChainId(genesis_block.hash())` — that ties the deployment's
+/// identity to its genesis bytes, so a fork that changes any field of
+/// the genesis block becomes a distinct chain by definition. Two
+/// deployments that happen to share a validator key cannot accept the
+/// same signed payload across their boundary, because the signing
+/// pre-image differs in the leading 32 bytes.
+///
+/// `ChainId` is fixed-size and not length-prefixed in the pre-image.
+/// Sign/verify symmetry requires that every honest participant on a
+/// deployment use the same value; misconfiguration manifests as
+/// "every signature fails" rather than as silent cross-chain replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChainId(pub [u8; 32]);
+
+impl ChainId {
+    /// Build a `ChainId` from the canonical genesis block hash. Pass
+    /// `genesis_block.hash()` — see the type-level comment for why
+    /// genesis bytes are the right binding.
+    pub const fn from_genesis_hash(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+
+    /// Borrow the 32-byte tag.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Test sentinel: an all-zero `ChainId`. Production callers must
+    /// derive their `ChainId` from the genesis block — this constant
+    /// exists only to keep test fixtures terse, and a real deployment
+    /// with the all-zero `ChainId` would still get the cross-deployment
+    /// guarantee against any *other* deployment that follows the
+    /// recommendation.
+    pub const TEST: Self = Self([0u8; 32]);
+}
+
 /// Payloads that can be placed inside a [`Signed`] envelope.
 ///
 /// The associated `DOMAIN` string is mixed into the signing pre-image so
@@ -135,7 +183,14 @@ impl<T> Signed<T>
 where
     T: Serialize + SignedMessage,
 {
-    /// Produce a signed envelope over `payload`.
+    /// Produce a signed envelope over `payload`, scoped to `chain_id`.
+    ///
+    /// The 32-byte `chain_id` is mixed into the signing pre-image
+    /// (#324) so a signature produced on one deployment cannot be
+    /// replayed on another even if the same `NodeId` is in both
+    /// validator sets. Callers should pass the same `ChainId`
+    /// everywhere within one deployment — typically derived once at
+    /// startup from the genesis block hash.
     ///
     /// # Example
     ///
@@ -144,7 +199,7 @@ where
     /// any other type, even when the byte layout happens to match.
     ///
     /// ```
-    /// use ambros_p2p::crypto::signed::{NodeSigner, Signed, SignedMessage, Signer};
+    /// use ambros_p2p::crypto::signed::{ChainId, NodeSigner, Signed, SignedMessage, Signer};
     /// use ambros_p2p::p2p::identity::NodeIdentity;
     /// use rcgen::{KeyPair, PKCS_ED25519};
     /// use serde::{Deserialize, Serialize};
@@ -162,12 +217,13 @@ where
     /// let signer = NodeSigner::from_identity(&identity).unwrap();
     ///
     /// let vote = Vote { round: 7, block_hash: [0xAB; 32] };
-    /// let signed = Signed::sign(vote, &signer).unwrap();
+    /// let chain_id = ChainId([0x42; 32]);
+    /// let signed = Signed::sign(vote, &signer, &chain_id).unwrap();
     ///
-    /// signed.verify(&signer.node_id()).unwrap();
+    /// signed.verify(&signer.node_id(), &chain_id).unwrap();
     /// ```
-    pub fn sign<S: Signer + ?Sized>(payload: T, signer: &S) -> Result<Self> {
-        let bytes = preimage::<T>(&payload)?;
+    pub fn sign<S: Signer + ?Sized>(payload: T, signer: &S, chain_id: &ChainId) -> Result<Self> {
+        let bytes = preimage::<T>(&payload, chain_id)?;
         let sig = signer.sign(&bytes);
         Ok(Self {
             payload,
@@ -176,38 +232,52 @@ where
         })
     }
 
-    /// Verify the signature against an *explicitly claimed* [`NodeId`].
+    /// Verify the signature against an *explicitly claimed* [`NodeId`]
+    /// under `chain_id`.
     ///
     /// Returns `Ok(())` only if all three hold:
     /// 1. `self.signer == *expected_signer` (no implicit trust in the envelope's own claim),
     /// 2. `self.sig` is a valid Ed25519 signature over the domain-separated pre-image of `payload`
-    ///    under `expected_signer`,
+    ///    bound to `chain_id` under `expected_signer`,
     /// 3. the pre-image can be reproduced (re-serialization succeeds).
-    pub fn verify(&self, expected_signer: &NodeId) -> Result<()> {
+    ///
+    /// A signature minted for a different `chain_id` fails step 2 even
+    /// if the payload bytes are byte-identical (#324).
+    pub fn verify(&self, expected_signer: &NodeId, chain_id: &ChainId) -> Result<()> {
         if &self.signer != expected_signer {
             bail!("signer mismatch: envelope claims a different NodeId");
         }
-        let bytes = preimage::<T>(&self.payload)?;
+        let bytes = preimage::<T>(&self.payload, chain_id)?;
         UnparsedPublicKey::new(&ED25519, expected_signer as &[u8])
             .verify(&bytes, &self.sig)
             .map_err(|_| anyhow::anyhow!("signature verification failed"))
     }
 }
 
-/// Canonical signing pre-image: `be_u32(|domain|) || domain || postcard(payload)`.
+/// Canonical signing pre-image:
+/// `chain_id || be_u32(|domain|) || domain || postcard(payload)`.
 ///
 /// Exposed at crate visibility so envelopes that carry more than one
 /// signature over the same payload (e.g. the dual-signed validator-key
-/// rotation tx in [`crate::consensus::validator_rotation`]) reuse this
-/// exact framing instead of duplicating it. Reusing the helper keeps a
-/// single source of truth for "what bytes are signed".
-pub(crate) fn preimage<T: Serialize + SignedMessage>(payload: &T) -> Result<Vec<u8>> {
+/// rotation tx in [`crate::consensus::validator_rotation`]) and
+/// off-envelope signatures over the same payload (the per-signer
+/// partial signatures aggregated into a [`crate::consensus::hotstuff::qc::QuorumCertificate`])
+/// reuse this exact framing instead of duplicating it. Reusing the
+/// helper keeps a single source of truth for "what bytes are signed".
+///
+/// The `chain_id` is the 32-byte deployment-scoped tag from #324; see
+/// the module-level docs.
+pub(crate) fn preimage<T: Serialize + SignedMessage>(
+    payload: &T,
+    chain_id: &ChainId,
+) -> Result<Vec<u8>> {
     let domain = T::DOMAIN.as_bytes();
     if domain.len() > u32::MAX as usize {
         bail!("domain tag too long");
     }
     let body = postcard::to_stdvec(payload).context("serializing payload for signing")?;
-    let mut out = Vec::with_capacity(4 + domain.len() + body.len());
+    let mut out = Vec::with_capacity(32 + 4 + domain.len() + body.len());
+    out.extend_from_slice(chain_id.as_bytes());
     out.extend_from_slice(&(domain.len() as u32).to_be_bytes());
     out.extend_from_slice(domain);
     out.extend_from_slice(&body);
@@ -286,7 +356,7 @@ mod tests {
             round: 42,
             block_hash: [0xAB; 32],
         };
-        let signed = Signed::sign(vote.clone(), &signer).unwrap();
+        let signed = Signed::sign(vote.clone(), &signer, &ChainId::TEST).unwrap();
 
         // Serialize the envelope, deserialize it, verify on the reconstructed copy.
         let wire = postcard::to_stdvec(&signed).unwrap();
@@ -294,7 +364,7 @@ mod tests {
 
         assert_eq!(recovered.payload, vote);
         assert_eq!(recovered.signer, signer.node_id());
-        recovered.verify(&signer.node_id()).unwrap();
+        recovered.verify(&signer.node_id(), &ChainId::TEST).unwrap();
     }
 
     #[test]
@@ -306,12 +376,15 @@ mod tests {
                 block_hash: [1; 32],
             },
             &signer,
+            &ChainId::TEST,
         )
         .unwrap();
 
         signed.payload.round = 999;
 
-        let err = signed.verify(&signer.node_id()).unwrap_err();
+        let err = signed
+            .verify(&signer.node_id(), &ChainId::TEST)
+            .unwrap_err();
         assert!(format!("{err}").contains("signature verification failed"));
     }
 
@@ -324,12 +397,15 @@ mod tests {
                 block_hash: [1; 32],
             },
             &signer,
+            &ChainId::TEST,
         )
         .unwrap();
 
         signed.sig[0] ^= 0x01;
 
-        let err = signed.verify(&signer.node_id()).unwrap_err();
+        let err = signed
+            .verify(&signer.node_id(), &ChainId::TEST)
+            .unwrap_err();
         assert!(format!("{err}").contains("signature verification failed"));
     }
 
@@ -343,12 +419,13 @@ mod tests {
                 block_hash: [7; 32],
             },
             &alice,
+            &ChainId::TEST,
         )
         .unwrap();
 
         // Passing bob's NodeId as the expected signer must fail even though the
         // signature is real — it's real for alice, not bob.
-        let err = signed.verify(&bob.node_id()).unwrap_err();
+        let err = signed.verify(&bob.node_id(), &ChainId::TEST).unwrap_err();
         assert!(format!("{err}").contains("signer mismatch"));
     }
 
@@ -362,13 +439,60 @@ mod tests {
                 block_hash: [9; 32],
             },
             &alice,
+            &ChainId::TEST,
         )
         .unwrap();
 
         // Attacker rewrites the envelope to claim bob signed it, keeping alice's sig.
         signed.signer = bob.node_id();
-        let err = signed.verify(&bob.node_id()).unwrap_err();
+        let err = signed.verify(&bob.node_id(), &ChainId::TEST).unwrap_err();
         assert!(format!("{err}").contains("signature verification failed"));
+    }
+
+    /// Cross-deployment replay rejection (issue #324, audit finding 7-F1):
+    /// a vote signed under `chain_id` A does not verify against a verifier
+    /// configured for `chain_id` B, even when the payload bytes are
+    /// byte-identical and the signer's `NodeId` is in both deployments'
+    /// validator sets. This is the property the new pre-image segment
+    /// exists to enforce.
+    #[test]
+    fn chain_id_separation_prevents_cross_deployment_replay() {
+        let signer = fresh_signer();
+        let chain_a = ChainId([0xAA; 32]);
+        let chain_b = ChainId([0xBB; 32]);
+
+        let vote = Vote {
+            round: 11,
+            block_hash: [0x11; 32],
+        };
+        let signed_on_a = Signed::sign(vote.clone(), &signer, &chain_a).unwrap();
+
+        // Same envelope bytes — verifier on chain B rejects.
+        let err = signed_on_a.verify(&signer.node_id(), &chain_b).unwrap_err();
+        assert!(
+            format!("{err}").contains("signature verification failed"),
+            "cross-chain replay must fail at the signature check, got {err}",
+        );
+
+        // Sanity: verification under the original chain_id still works.
+        signed_on_a.verify(&signer.node_id(), &chain_a).unwrap();
+
+        // Hand-craft a "Signed<Vote>" that copies the chain-A signature
+        // and claims to be on chain B — i.e. a literal replay attempt
+        // by an attacker who saw an honest A-vote and re-broadcasts it
+        // to a B replica. The B replica must reject. This stresses the
+        // fact that the chain_id is only present in the *pre-image*,
+        // not on the wire — an attacker cannot rewrite a single field
+        // to launder the signature.
+        let replay: Signed<Vote> = Signed {
+            payload: vote.clone(),
+            signer: signed_on_a.signer,
+            sig: signed_on_a.sig,
+        };
+        assert!(
+            replay.verify(&signer.node_id(), &chain_b).is_err(),
+            "a verbatim replay of an A-chain vote must not verify under chain B",
+        );
     }
 
     #[test]
@@ -379,7 +503,7 @@ mod tests {
             round: 3,
             block_hash: [3; 32],
         };
-        let signed_vote = Signed::sign(vote.clone(), &signer).unwrap();
+        let signed_vote = Signed::sign(vote.clone(), &signer, &ChainId::TEST).unwrap();
 
         // Hand-craft a Signed<Proposal> that reuses the signature from the Vote.
         // Even though the struct layouts are identical, the domain separator
@@ -394,7 +518,9 @@ mod tests {
             sig: signed_vote.sig,
         };
 
-        let err = forged.verify(&signer.node_id()).unwrap_err();
+        let err = forged
+            .verify(&signer.node_id(), &ChainId::TEST)
+            .unwrap_err();
         assert!(format!("{err}").contains("signature verification failed"));
     }
 
@@ -411,12 +537,12 @@ mod tests {
                 round: rng.random(),
                 block_hash: rng.random(),
             };
-            let signed = Signed::sign(payload, &signer).unwrap();
-            signed.verify(&signer.node_id()).unwrap();
+            let signed = Signed::sign(payload, &signer, &ChainId::TEST).unwrap();
+            signed.verify(&signer.node_id(), &ChainId::TEST).unwrap();
 
             let mut tampered = signed.clone();
             tampered.payload.round = tampered.payload.round.wrapping_add(1);
-            assert!(tampered.verify(&signer.node_id()).is_err());
+            assert!(tampered.verify(&signer.node_id(), &ChainId::TEST).is_err());
         }
     }
 
@@ -443,14 +569,14 @@ mod tests {
         fn prop_sign_verify_round_trip(round in any::<u64>(), hash in any::<[u8; 32]>()) {
             let signer = shared_signer();
             let vote = Vote { round, block_hash: hash };
-            let signed = Signed::sign(vote.clone(), signer).unwrap();
-            signed.verify(&signer.node_id()).unwrap();
+            let signed = Signed::sign(vote.clone(), signer, &ChainId::TEST).unwrap();
+            signed.verify(&signer.node_id(), &ChainId::TEST).unwrap();
 
             let wire = postcard::to_stdvec(&signed).unwrap();
             let back: Signed<Vote> = postcard::from_bytes(&wire).unwrap();
             prop_assert_eq!(&back.payload, &vote);
             prop_assert_eq!(back.signer, signer.node_id());
-            back.verify(&signer.node_id()).unwrap();
+            back.verify(&signer.node_id(), &ChainId::TEST).unwrap();
         }
 
         // Any random 64-byte "signature" other than one the real signer would
@@ -465,11 +591,11 @@ mod tests {
         ) {
             let signer = shared_signer();
             let vote = Vote { round, block_hash: hash };
-            let real = Signed::sign(vote.clone(), signer).unwrap();
+            let real = Signed::sign(vote.clone(), signer, &ChainId::TEST).unwrap();
             prop_assume!(forged != real.sig);
 
             let tampered = Signed::<Vote> { payload: vote, signer: signer.node_id(), sig: forged };
-            prop_assert!(tampered.verify(&signer.node_id()).is_err());
+            prop_assert!(tampered.verify(&signer.node_id(), &ChainId::TEST).is_err());
         }
 
         // A signature produced by one signer must not verify under a different
@@ -482,15 +608,15 @@ mod tests {
             prop_assume!(alice.node_id() != bob.node_id());
 
             let vote = Vote { round, block_hash: hash };
-            let mut signed = Signed::sign(vote, alice).unwrap();
+            let mut signed = Signed::sign(vote, alice, &ChainId::TEST).unwrap();
 
             // Passing bob as expected without rewriting the envelope: mismatch.
-            prop_assert!(signed.verify(&bob.node_id()).is_err());
+            prop_assert!(signed.verify(&bob.node_id(), &ChainId::TEST).is_err());
 
             // Rewriting the envelope's `signer` claim to bob while keeping
             // alice's signature: the ed25519 check must still fail.
             signed.signer = bob.node_id();
-            prop_assert!(signed.verify(&bob.node_id()).is_err());
+            prop_assert!(signed.verify(&bob.node_id(), &ChainId::TEST).is_err());
         }
     }
 
@@ -506,15 +632,15 @@ mod tests {
 
         let sign_start = std::time::Instant::now();
         let iterations = 200;
-        let signed = Signed::sign(payload.clone(), &signer).unwrap();
+        let signed = Signed::sign(payload.clone(), &signer, &ChainId::TEST).unwrap();
         for _ in 0..iterations {
-            let _ = Signed::sign(payload.clone(), &signer).unwrap();
+            let _ = Signed::sign(payload.clone(), &signer, &ChainId::TEST).unwrap();
         }
         let sign_avg = sign_start.elapsed() / (iterations + 1);
 
         let verify_start = std::time::Instant::now();
         for _ in 0..iterations {
-            signed.verify(&signer.node_id()).unwrap();
+            signed.verify(&signer.node_id(), &ChainId::TEST).unwrap();
         }
         let verify_avg = verify_start.elapsed() / iterations;
 

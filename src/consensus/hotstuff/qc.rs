@@ -597,7 +597,7 @@ pub fn genesis_qc_bls(genesis: &Block, validator_set_len: usize) -> QuorumCertif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::signed::{NodeSigner, Signed, Signer};
+    use crate::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
     use crate::p2p::NodeId;
     use crate::p2p::identity::NodeIdentity;
     use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
@@ -802,13 +802,13 @@ mod tests {
             block: Block::genesis([0; 32]),
             justify,
         };
-        let signed = Signed::sign(proposal.clone(), &signer).unwrap();
-        signed.verify(&signer.node_id()).unwrap();
+        let signed = Signed::sign(proposal.clone(), &signer, &ChainId::TEST).unwrap();
+        signed.verify(&signer.node_id(), &ChainId::TEST).unwrap();
 
         let wire = postcard::to_stdvec(&signed).unwrap();
         let back: Signed<Proposal> = postcard::from_bytes(&wire).unwrap();
         assert_eq!(back.payload, proposal);
-        back.verify(&signer.node_id()).unwrap();
+        back.verify(&signer.node_id(), &ChainId::TEST).unwrap();
     }
 
     #[test]
@@ -818,13 +818,13 @@ mod tests {
             view: 7,
             block_hash: [0x77; 32],
         };
-        let signed = Signed::sign(vote.clone(), &signer).unwrap();
-        signed.verify(&signer.node_id()).unwrap();
+        let signed = Signed::sign(vote.clone(), &signer, &ChainId::TEST).unwrap();
+        signed.verify(&signer.node_id(), &ChainId::TEST).unwrap();
 
         let wire = postcard::to_stdvec(&signed).unwrap();
         let back: Signed<Vote> = postcard::from_bytes(&wire).unwrap();
         assert_eq!(back.payload, vote);
-        back.verify(&signer.node_id()).unwrap();
+        back.verify(&signer.node_id(), &ChainId::TEST).unwrap();
     }
 
     #[test]
@@ -834,8 +834,8 @@ mod tests {
         let mut high_qc = QuorumCertificate::new(11, [0xCC; 32], vs.len());
         high_qc.add_signature(1, [0xAA; 64]);
         let nv = NewView { high_qc };
-        let signed = Signed::sign(nv.clone(), &signer).unwrap();
-        signed.verify(&signer.node_id()).unwrap();
+        let signed = Signed::sign(nv.clone(), &signer, &ChainId::TEST).unwrap();
+        signed.verify(&signer.node_id(), &ChainId::TEST).unwrap();
     }
 
     #[test]
@@ -851,7 +851,7 @@ mod tests {
             view: 3,
             block_hash: [0x33; 32],
         };
-        let signed_vote = Signed::sign(vote.clone(), &signer).unwrap();
+        let signed_vote = Signed::sign(vote.clone(), &signer, &ChainId::TEST).unwrap();
 
         // Hand-craft a Signed<Proposal> reusing Vote's signature + signer
         // on any reasonable Proposal payload. Even if the inner byte
@@ -867,7 +867,7 @@ mod tests {
             signer: signed_vote.signer,
             sig: signed_vote.sig,
         };
-        assert!(forged.verify(&signer.node_id()).is_err());
+        assert!(forged.verify(&signer.node_id(), &ChainId::TEST).is_err());
     }
 
     #[test]
