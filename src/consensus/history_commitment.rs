@@ -303,6 +303,54 @@ pub fn apply_rotation_commands_to_histories(
     }
 }
 
+/// Compute the v1 commitment over the **post-block** state: forks the
+/// given histories, applies any reconfig/rotation commands in `block`,
+/// and hashes (#325 PR C).
+///
+/// The same value is computed by:
+///
+/// - the leader at proposal-build time, to stamp the block's
+///   [`crate::replication::block::BlockHeader::validator_history_commitment`]
+///   field;
+/// - the follower at proposal-receive time (in
+///   [`crate::consensus::dispatch::ingress`]), to verify the leader's
+///   stamped value matches what the follower would compute over its
+///   own histories under the proposed block's commands.
+///
+/// Soundness-of-comparison rests on this function being a pure
+/// deterministic function of `(block, current_histories, chain_id,
+/// scheme, min_v_eff_delay)`: any honest replica fed the same inputs
+/// produces the same output. Disagreement between leader and follower
+/// can only come from a Byzantine leader stamping a value its own
+/// post-block state would not produce, or from divergent state
+/// histories (which is itself the rollback condition #325 PR B
+/// catches at recovery).
+///
+/// **Why post-block, not pre-block.** A pre-block stamp's value
+/// depends on the producer's commit position — a leader that has
+/// committed an extra ancestor produces a different pre-block hash
+/// than a follower at a less-advanced commit position, even when both
+/// are honest. Post-block hashing over the same chain content makes
+/// the commitment a function of the block content alone, so
+/// follower-side verification is sound regardless of the relative
+/// commit positions of leader and follower.
+pub fn compute_post_block_commitment(
+    block: &Block,
+    set_history: &ValidatorSetHistory,
+    key_history: &ValidatorKeyHistory,
+    bls_key_history: Option<&BlsKeyHistory>,
+    chain_id: &ChainId,
+    scheme: SignatureSchemeChoice,
+    min_v_eff_delay: View,
+) -> [u8; 32] {
+    let mut set = set_history.clone();
+    let mut key = key_history.clone();
+    let mut bls = bls_key_history.cloned();
+    apply_reconfig_commands_to_set_history(block, &mut set, &mut key, scheme, min_v_eff_delay);
+    apply_rotation_commands_to_histories(block, &set, &mut key, bls.as_mut(), chain_id, scheme);
+    validator_history_commitment_v1(&set, &key, bls.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
