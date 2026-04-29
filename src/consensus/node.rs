@@ -429,7 +429,12 @@ impl MempoolBlockBuilder {
 }
 
 impl BlockBuilder for MempoolBlockBuilder {
-    fn build(&self, parent: &Block, view: View, _high_qc: &QuorumCertificate) -> Block {
+    fn build(
+        &self,
+        parent: &Block,
+        view: View,
+        _high_qc: &QuorumCertificate,
+    ) -> anyhow::Result<Block> {
         let commands = self.mempool.propose(self.propose_limit);
 
         // Fork the committed SM state: snapshot, apply candidate commands,
@@ -448,14 +453,34 @@ impl BlockBuilder for MempoolBlockBuilder {
                 }
             }
 
-            // Restore SM to committed state regardless of outcome.
-            sm.restore(&snap)
-                .expect("restore from own snapshot must not fail");
+            // Restore SM to committed state regardless of outcome. On
+            // the happy path this is the inverse of `sm.snapshot()`
+            // captured a few lines above and never fails; in the
+            // pathological case (corrupt redb table, half-finished
+            // migration, version skew across an upgrade, on-disk
+            // bit-flip) the round trip can fail. Surface the error
+            // to the safety core so it skips this view's proposal —
+            // the next-view leader takes over — rather than
+            // panicking. Audit finding 4-F3, issue #326.
+            let snap_len = snap.len();
+            if let Err(e) = sm.restore(&snap) {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    view,
+                    parent_height = parent.header.height,
+                    snap_bytes = snap_len,
+                    error = %e,
+                    "block_builder_restore_failed",
+                );
+                anyhow::bail!(
+                    "MempoolBlockBuilder: state-machine restore from own snapshot failed: {e}",
+                );
+            }
             commitment
         };
 
         let commands_commitment = Block::commands_commitment(&commands);
-        Block {
+        Ok(Block {
             header: BlockHeader {
                 parent_hash: parent.hash(),
                 height: parent.header.height + 1,
@@ -466,7 +491,7 @@ impl BlockBuilder for MempoolBlockBuilder {
                 validator_history_commitment: [0; 32],
             },
             commands,
-        }
+        })
     }
 }
 
@@ -4214,7 +4239,9 @@ mod tests {
         let parent = genesis();
         let qc = sample_qc();
 
-        let block = builder.build(&parent, 3, &qc);
+        let block = builder
+            .build(&parent, 3, &qc)
+            .expect("test builder must not fail");
 
         assert_eq!(block.header.parent_hash, parent.hash());
         assert_eq!(block.header.height, 1);
@@ -4232,7 +4259,9 @@ mod tests {
 
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
-        let block = builder.build(&genesis(), 1, &sample_qc());
+        let block = builder
+            .build(&genesis(), 1, &sample_qc())
+            .expect("test builder must not fail");
 
         assert_eq!(block.commands.len(), 2);
     }
@@ -4249,8 +4278,12 @@ mod tests {
         let parent = genesis();
         let qc = sample_qc();
 
-        let b1 = builder.build(&parent, 1, &qc);
-        let b2 = builder.build(&parent, 1, &qc);
+        let b1 = builder
+            .build(&parent, 1, &qc)
+            .expect("test builder must not fail");
+        let b2 = builder
+            .build(&parent, 1, &qc)
+            .expect("test builder must not fail");
 
         assert_eq!(b1.hash(), b2.hash(), "build must be deterministic");
     }
@@ -4268,7 +4301,9 @@ mod tests {
         let before = sm.lock().state_commitment();
 
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
-        builder.build(&genesis(), 1, &sample_qc());
+        builder
+            .build(&genesis(), 1, &sample_qc())
+            .expect("test builder must not fail");
 
         let after = sm.lock().state_commitment();
         assert_eq!(
@@ -4287,7 +4322,9 @@ mod tests {
 
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
-        let block = builder.build(&genesis(), 1, &sample_qc());
+        let block = builder
+            .build(&genesis(), 1, &sample_qc())
+            .expect("test builder must not fail");
 
         // Manually apply the same command and check commitment matches.
         let mut reference_sm = CounterStateMachine::new();
@@ -4308,10 +4345,71 @@ mod tests {
 
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
-        let block = builder.build(&genesis(), 1, &sample_qc());
+        let block = builder
+            .build(&genesis(), 1, &sample_qc())
+            .expect("test builder must not fail");
 
         let recomputed = Block::commands_commitment(&block.commands);
         assert_eq!(block.header.commands_commitment, recomputed);
+    }
+
+    /// Issue #326 / audit finding 4-F3: a [`StateMachine::restore`]
+    /// failure inside [`MempoolBlockBuilder::build`] must surface as
+    /// `Err`, not panic. Pre-fix the build path called
+    /// `expect("restore from own snapshot must not fail")` — a corrupt
+    /// redb table or version skew would crash the node and trip a
+    /// panic-on-startup loop. Now `build` returns `anyhow::Result`,
+    /// the safety core's `build_proposal_at_view` skips the proposal
+    /// at this view on `Err`, and the next-view leader takes over.
+    ///
+    /// **Bisect-confirmed**: reverting the `?`/`bail!` to the original
+    /// `.expect(...)` makes this test fail with a panic instead of
+    /// the expected `Err`.
+    #[test]
+    fn builder_propagates_state_machine_restore_failure() {
+        use crate::replication::StateMachine;
+        use bytes::Bytes;
+
+        /// Test-only state machine whose `restore` always fails. The
+        /// other methods are minimal — only `snapshot` + `restore` are
+        /// on the build path that PR #326 cares about.
+        struct FailingRestoreSm;
+
+        impl StateMachine for FailingRestoreSm {
+            fn apply(&mut self, _cmd: &[u8]) -> anyhow::Result<Bytes> {
+                Ok(Bytes::new())
+            }
+
+            fn state_commitment(&self) -> [u8; 32] {
+                [0xAB; 32]
+            }
+
+            fn snapshot(&self) -> Bytes {
+                // Any non-empty bytes — the builder feeds this back into
+                // restore on the same instance, where we then fail.
+                Bytes::from_static(b"snap-bytes")
+            }
+
+            fn restore(&mut self, _snap: &[u8]) -> anyhow::Result<()> {
+                anyhow::bail!("simulated restore failure (#326 test)")
+            }
+        }
+
+        let sm: Arc<Mutex<Box<dyn StateMachine>>> =
+            Arc::new(Mutex::new(Box::new(FailingRestoreSm)));
+        let mp: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(16));
+        let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
+
+        // The fork-and-restore round trip inside `build` triggers our
+        // simulated failure. The builder must surface this as `Err`,
+        // not panic.
+        let result = builder.build(&genesis(), 1, &sample_qc());
+        let err = result.expect_err("builder must propagate restore failure as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("simulated restore failure"),
+            "error must surface the underlying state-machine failure, got {msg}",
+        );
     }
 
     // ── C-series: durability bridge ──────────────────────────────────────────
