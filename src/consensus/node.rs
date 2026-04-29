@@ -236,7 +236,23 @@ pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireMessage {
     Proposal(Signed<crate::consensus::hotstuff::Proposal>),
-    Vote(Signed<crate::consensus::hotstuff::qc::Vote>),
+    /// A signed vote, optionally carrying a BLS partial signature
+    /// alongside the Ed25519 envelope.
+    ///
+    /// The optional second field carries one validator's contribution to
+    /// a future BLS QC aggregate. It is `Some(_)` on `bls_aggregated`
+    /// chains and `None` on `ed25519_collected` chains. The partial sits
+    /// **outside** the [`Signed<Vote>`] envelope so the postcard bytes
+    /// of `Vote { view, block_hash }` — and therefore the canonical
+    /// signing pre-image — stay byte-stable across schemes. Persisted
+    /// `last_voted_view` envelopes and snapshot QCs continue to verify
+    /// unchanged. See [`crate::consensus::dispatch`] for the ingress
+    /// validation rule that enforces presence per chain scheme.
+    Vote(
+        Signed<crate::consensus::hotstuff::qc::Vote>,
+        #[serde(with = "serde_optional_bls_partial")]
+        Option<crate::crypto::sig_scheme::BlsPartialSig>,
+    ),
     NewView(Signed<crate::consensus::hotstuff::NewView>),
     /// A replica's signed notice that it is giving up on a view. A
     /// quorum of these forms the timeout certificate that advances
@@ -267,6 +283,36 @@ pub enum WireMessage {
         chunk_idx: u32,
         payload: Option<Bytes>,
     },
+}
+
+/// Serde adapter for `Option<BlsPartialSig>` — a 96-byte fixed array that
+/// serde does not auto-derive past N=32. Mirrors the byte-sequence
+/// shape used by [`crate::crypto::sig_scheme::BlsPop`] so the two BLS
+/// wire fields encode the same way (length-prefixed byte sequence
+/// inside an `Option`).
+mod serde_optional_bls_partial {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    use crate::crypto::sig_scheme::BlsPartialSig;
+
+    pub fn serialize<S: Serializer>(opt: &Option<BlsPartialSig>, s: S) -> Result<S::Ok, S::Error> {
+        match opt {
+            Some(sig) => s.serialize_some(&sig[..]),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<BlsPartialSig>, D::Error> {
+        let opt: Option<Vec<u8>> = Option::deserialize(d)?;
+        match opt {
+            Some(v) => v
+                .as_slice()
+                .try_into()
+                .map(Some)
+                .map_err(|_| D::Error::custom("BLS partial must be exactly 96 bytes")),
+            None => Ok(None),
+        }
+    }
 }
 
 // ── Node configuration ───────────────────────────────────────────────────────
@@ -3321,14 +3367,36 @@ mod tests {
     #[test]
     fn wire_message_vote_roundtrip() {
         use crate::consensus::hotstuff::qc::Vote;
-        let msg = WireMessage::Vote(Signed {
-            payload: Vote {
-                view: 7,
-                block_hash: [0xAB; 32],
+        let msg = WireMessage::Vote(
+            Signed {
+                payload: Vote {
+                    view: 7,
+                    block_hash: [0xAB; 32],
+                },
+                signer: nid(2),
+                sig: dummy_sig(),
             },
-            signer: nid(2),
-            sig: dummy_sig(),
-        });
+            None,
+        );
+        let encoded = postcard::to_stdvec(&msg).unwrap();
+        let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn wire_message_vote_with_bls_partial_roundtrip() {
+        use crate::consensus::hotstuff::qc::Vote;
+        let msg = WireMessage::Vote(
+            Signed {
+                payload: Vote {
+                    view: 7,
+                    block_hash: [0xAB; 32],
+                },
+                signer: nid(2),
+                sig: dummy_sig(),
+            },
+            Some([0xCDu8; 96]),
+        );
         let encoded = postcard::to_stdvec(&msg).unwrap();
         let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, msg);
@@ -6571,7 +6639,7 @@ mod tests {
             ProtocolOutbound::SendTo { node_id, payload } => {
                 assert_eq!(node_id, peer);
                 let decoded: WireMessage = postcard::from_bytes(&payload).unwrap();
-                assert!(matches!(decoded, WireMessage::Vote(_)));
+                assert!(matches!(decoded, WireMessage::Vote(_, _)));
             }
             other => panic!("expected SendTo to peer, got {other:?}"),
         }

@@ -161,6 +161,18 @@ pub enum IngressError {
         view: View,
         scheme: &'static str,
     },
+    /// On a `bls_aggregated` chain, a [`WireMessage::Vote`] frame either
+    /// omitted the BLS partial signature (the optional second tuple
+    /// field was `None`) or carried one that did not verify against the
+    /// signer's BLS pubkey at `view` over the canonical
+    /// `(view, block_hash)` pre-image. Catches a Byzantine voter who
+    /// ships a vote with no usable BLS contribution — folding such a
+    /// vote into the aggregate would later make the QC fail
+    /// `verify_aggregate_bls`, so we reject up-front at ingress.
+    InvalidBlsPartial {
+        view: View,
+        signer: NodeId,
+    },
 }
 
 impl std::fmt::Display for IngressError {
@@ -179,6 +191,10 @@ impl std::fmt::Display for IngressError {
                 f,
                 "QC at view {view} ({scheme}) failed aggregate verification under the historical validator set",
             ),
+            IngressError::InvalidBlsPartial { view, signer } => write!(
+                f,
+                "BLS partial on Vote at view {view} from signer {signer:?} is missing or did not verify under the historical BLS pubkey",
+            ),
         }
     }
 }
@@ -190,7 +206,8 @@ impl std::error::Error for IngressError {
             IngressError::InvalidSignature(e) => Some(e.as_ref()),
             IngressError::UnknownSigner(_)
             | IngressError::MalformedHighQc { .. }
-            | IngressError::InvalidQcAggregate { .. } => None,
+            | IngressError::InvalidQcAggregate { .. }
+            | IngressError::InvalidBlsPartial { .. } => None,
         }
     }
 }
@@ -315,9 +332,10 @@ pub fn ingress_wire_with_qc_verification(
             ])
         }
 
-        WireMessage::Vote(signed) => {
+        WireMessage::Vote(signed, bls_partial) => {
             verify_signer_at(signed.signer, signed.payload.view, history, key_history)?;
             verify_sig(&signed)?;
+            verify_bls_partial_if_required(&signed, bls_partial.as_ref(), qc_verification)?;
             Ok(vec![Dispatch::Safety(
                 crate::consensus::hotstuff::step::Event::VoteReceived(signed),
             )])
@@ -465,6 +483,68 @@ where
     signed
         .verify(&signed.signer)
         .map_err(IngressError::InvalidSignature)
+}
+
+/// On `bls_aggregated` chains, require an attached BLS partial signature
+/// on every inbound `Vote` and verify it against the signer's BLS pubkey
+/// at `signed.payload.view`. On `ed25519_collected` chains (or under
+/// [`QcVerification::Skip`]) the optional partial is ignored.
+///
+/// The BLS partial signs the same canonical pre-image that the QC
+/// aggregate verifier reconstructs over `(view, block_hash)`: the
+/// domain-separated `postcard(Vote { view, block_hash })` bytes (see
+/// [`crate::crypto::signed::preimage`]). Folding a partial that doesn't
+/// verify into the aggregate would later cause `verify_aggregate_bls`
+/// to fail on the formed QC, so we reject up-front at ingress with a
+/// dedicated [`IngressError::InvalidBlsPartial`] variant for log
+/// triage.
+fn verify_bls_partial_if_required(
+    signed: &Signed<Vote>,
+    bls_partial: Option<&crate::crypto::sig_scheme::BlsPartialSig>,
+    qc_verification: &QcVerification<'_>,
+) -> Result<(), IngressError> {
+    let QcVerification::Verify {
+        scheme,
+        bls_key_history,
+    } = qc_verification
+    else {
+        return Ok(());
+    };
+    if *scheme != SignatureSchemeChoice::BlsAggregated {
+        return Ok(());
+    }
+
+    let Some(partial) = bls_partial else {
+        return Err(IngressError::InvalidBlsPartial {
+            view: signed.payload.view,
+            signer: signed.signer,
+        });
+    };
+
+    let bls_history = bls_key_history.ok_or(IngressError::InvalidBlsPartial {
+        view: signed.payload.view,
+        signer: signed.signer,
+    })?;
+
+    let bls_pubkey = bls_history
+        .key_at(&signed.signer, signed.payload.view)
+        .ok_or(IngressError::InvalidBlsPartial {
+            view: signed.payload.view,
+            signer: signed.signer,
+        })?;
+
+    let vote_preimage =
+        preimage::<Vote>(&signed.payload).map_err(|_| IngressError::InvalidBlsPartial {
+            view: signed.payload.view,
+            signer: signed.signer,
+        })?;
+
+    crate::crypto::sig_scheme::BlsAggregated::verify_partial(&bls_pubkey, &vote_preimage, partial)
+        .map_err(|_| IngressError::InvalidBlsPartial {
+            view: signed.payload.view,
+            signer: signed.signer,
+        })?;
+    Ok(())
 }
 
 /// Verify a QC's aggregate signature per the requested
@@ -696,6 +776,14 @@ pub fn egress_snapshot_chunk_response(
 
 /// Sign a [`ConsensusMsg`] and wrap it in the appropriate [`WireMessage`]
 /// variant.
+///
+/// The `Vote` variant's optional BLS partial is left as `None` here. The
+/// leader-side BLS signing path (the engine work tracked under #354) will
+/// populate it from a `PartialSigner<BlsAggregated>` plumbed through the
+/// dispatch layer; that work lives in a separate PR. Until then the wire
+/// format is stable but BLS chains will fail at the ingress layer added
+/// in [`verify_bls_partial_if_required`] — exactly the gap this issue is
+/// chartered to close.
 fn sign_consensus_msg(msg: &ConsensusMsg, signer: &dyn Signer) -> anyhow::Result<WireMessage> {
     match msg {
         ConsensusMsg::Proposal(p) => {
@@ -704,7 +792,7 @@ fn sign_consensus_msg(msg: &ConsensusMsg, signer: &dyn Signer) -> anyhow::Result
         }
         ConsensusMsg::Vote(v) => {
             let signed = Signed::sign(v.clone(), signer)?;
-            Ok(WireMessage::Vote(signed))
+            Ok(WireMessage::Vote(signed, None))
         }
         ConsensusMsg::NewView(nv) => {
             let signed = Signed::sign(nv.clone(), signer)?;
@@ -748,7 +836,7 @@ pub fn egress_consensus_msg_with_loopback(
                 Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
             ]
         }
-        WireMessage::Vote(signed) => {
+        WireMessage::Vote(signed, _bls_partial) => {
             vec![Dispatch::Safety(
                 crate::consensus::hotstuff::step::Event::VoteReceived(signed.clone()),
             )]
@@ -921,7 +1009,7 @@ mod tests {
             block_hash: [0xAB; 32],
         };
         let signed = Signed::sign(vote, &signer).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap();
@@ -1093,7 +1181,7 @@ mod tests {
         };
         assert_eq!(to, target);
         let decoded: WireMessage = postcard::from_bytes(&payload).unwrap();
-        assert!(matches!(decoded, WireMessage::Vote(_)));
+        assert!(matches!(decoded, WireMessage::Vote(_, _)));
     }
 
     #[test]
@@ -1414,7 +1502,7 @@ mod tests {
             block_hash: [0xAB; 32],
         };
         let signed = Signed::sign(vote, &new_signer).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         // Succeeds against the history that contains the boundary.
@@ -1442,7 +1530,7 @@ mod tests {
             block_hash: [0xAB; 32],
         };
         let signed = Signed::sign(vote, &new_signer).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let err = ingress(
@@ -1479,7 +1567,7 @@ mod tests {
             block_hash: [0xCD; 32],
         };
         let signed = Signed::sign(vote, &old_signer).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let dispatches = ingress(old_signer.node_id(), &bytes, &history, &key_history).unwrap();
@@ -1702,7 +1790,7 @@ mod tests {
             block_hash: [0xAB; 32],
         };
         let signed = Signed::sign(vote, &new).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let dispatches = ingress(new.node_id(), &bytes, &history, &key_history).unwrap();
@@ -1732,7 +1820,7 @@ mod tests {
             block_hash: [0xCD; 32],
         };
         let signed = Signed::sign(vote, &old).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let dispatches = ingress(old.node_id(), &bytes, &history, &key_history).unwrap();
@@ -1760,7 +1848,7 @@ mod tests {
             block_hash: [0xEF; 32],
         };
         let signed = Signed::sign(vote, &old).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let err = ingress(old.node_id(), &bytes, &history, &key_history).unwrap_err();
@@ -1788,7 +1876,7 @@ mod tests {
             block_hash: [0x12; 32],
         };
         let signed = Signed::sign(vote, &new).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let err = ingress(new.node_id(), &bytes, &history, &key_history).unwrap_err();
@@ -1815,7 +1903,7 @@ mod tests {
             block_hash: [0x77; 32],
         };
         let signed = Signed::sign(vote, &attacker).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let err = ingress(attacker.node_id(), &bytes, &history, &key_history).unwrap_err();
@@ -1933,7 +2021,7 @@ mod tests {
             block_hash: [0xAB; 32],
         };
         let signed = Signed::sign(vote, &removed).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let err = ingress(removed.node_id(), &bytes, &history, &key_history).unwrap_err();
@@ -1946,7 +2034,7 @@ mod tests {
             block_hash: [0xCD; 32],
         };
         let signed = Signed::sign(vote, &removed).unwrap();
-        let wire = WireMessage::Vote(signed);
+        let wire = WireMessage::Vote(signed, None);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let dispatches = ingress(removed.node_id(), &bytes, &history, &key_history).unwrap();
@@ -2214,6 +2302,289 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── ingress: BLS partial on Vote (#354 step 1) ───────────────────────────
+
+    /// Build a BLS-keyed signer pair: an Ed25519 NodeSigner for the
+    /// envelope plus a BLS keypair registered against that signer's
+    /// NodeId. Returns `(ed25519_signer, bls_secret, bls_pubkey)`.
+    fn fresh_bls_signer(
+        seed: u8,
+    ) -> (
+        NodeSigner,
+        crate::crypto::sig_scheme::BlsSecretKey,
+        crate::crypto::sig_scheme::BlsPublicKey,
+    ) {
+        let signer = fresh_signer();
+        let mut ikm = [0u8; 32];
+        ikm.fill(seed);
+        let (sk, pk) = crate::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
+        (signer, sk, pk)
+    }
+
+    /// Signed vote + valid BLS partial under `bls_sk` over the canonical
+    /// Vote pre-image.
+    fn make_signed_vote_with_bls_partial(
+        signer: &NodeSigner,
+        bls_sk: &crate::crypto::sig_scheme::BlsSecretKey,
+        view: View,
+        block_hash: BlockHash,
+    ) -> (Signed<Vote>, crate::crypto::sig_scheme::BlsPartialSig) {
+        let vote = Vote { view, block_hash };
+        let preimage = preimage::<Vote>(&vote).unwrap();
+        let partial =
+            crate::crypto::sig_scheme::BlsAggregated::sign_partial(bls_sk, &preimage).unwrap();
+        let signed = Signed::sign(vote, signer).unwrap();
+        (signed, partial)
+    }
+
+    #[test]
+    fn ingress_vote_on_bls_chain_accepts_valid_bls_partial() {
+        let (signer, bls_sk, bls_pk) = fresh_bls_signer(0x11);
+        let vs = make_vs_with_signers(&[&signer]);
+        let view: View = 5;
+        let block_hash = [0xAA; 32];
+
+        let (signed, partial) =
+            make_signed_vote_with_bls_partial(&signer, &bls_sk, view, block_hash);
+        let wire = WireMessage::Vote(signed, Some(partial));
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let bls_history = BlsKeyHistory::with_genesis([(signer.node_id(), bls_pk)]);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::BlsAggregated,
+            bls_key_history: Some(&bls_history),
+        };
+
+        let dispatches = ingress_with_qc_verification(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect("valid BLS partial must pass ingress on a BLS chain");
+        assert_eq!(dispatches.len(), 1);
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+        ));
+    }
+
+    #[test]
+    fn ingress_vote_on_bls_chain_rejects_missing_bls_partial() {
+        let (signer, _bls_sk, bls_pk) = fresh_bls_signer(0x22);
+        let vs = make_vs_with_signers(&[&signer]);
+        let view: View = 4;
+        let block_hash = [0xBB; 32];
+
+        // Vote with no BLS partial attached (None).
+        let vote = Vote { view, block_hash };
+        let signed = Signed::sign(vote, &signer).unwrap();
+        let wire = WireMessage::Vote(signed, None);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let bls_history = BlsKeyHistory::with_genesis([(signer.node_id(), bls_pk)]);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::BlsAggregated,
+            bls_key_history: Some(&bls_history),
+        };
+
+        let err = ingress_with_qc_verification(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect_err("missing BLS partial on BLS chain must be rejected");
+        let expected_signer = signer.node_id();
+        assert!(matches!(
+            err,
+            IngressError::InvalidBlsPartial { view: 4, signer: s } if s == expected_signer,
+        ));
+    }
+
+    #[test]
+    fn ingress_vote_on_bls_chain_rejects_tampered_bls_partial() {
+        let (signer, bls_sk, bls_pk) = fresh_bls_signer(0x33);
+        let vs = make_vs_with_signers(&[&signer]);
+        let view: View = 6;
+        let block_hash = [0xCC; 32];
+
+        let (signed, mut partial) =
+            make_signed_vote_with_bls_partial(&signer, &bls_sk, view, block_hash);
+        partial[10] ^= 0xFF;
+        let wire = WireMessage::Vote(signed, Some(partial));
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let bls_history = BlsKeyHistory::with_genesis([(signer.node_id(), bls_pk)]);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::BlsAggregated,
+            bls_key_history: Some(&bls_history),
+        };
+
+        let err = ingress_with_qc_verification(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect_err("tampered BLS partial must be rejected");
+        assert!(matches!(
+            err,
+            IngressError::InvalidBlsPartial { view: 6, .. }
+        ));
+    }
+
+    #[test]
+    fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
+        // Voter's NodeId is the legitimate one, the envelope's Ed25519
+        // sig is real, but the BLS partial was produced under some
+        // other validator's BLS secret. Aggregating it would later make
+        // the QC fail `verify_aggregate_bls`, so we reject up-front.
+        let (signer, _bls_sk_a, bls_pk_a) = fresh_bls_signer(0x44);
+        let (_, bls_sk_b, _bls_pk_b) = fresh_bls_signer(0x45);
+        let vs = make_vs_with_signers(&[&signer]);
+        let view: View = 8;
+        let block_hash = [0xDD; 32];
+
+        let (signed, _) = make_signed_vote_with_bls_partial(&signer, &bls_sk_b, view, block_hash);
+        let preimage = preimage::<Vote>(&signed.payload).unwrap();
+        let partial =
+            crate::crypto::sig_scheme::BlsAggregated::sign_partial(&bls_sk_b, &preimage).unwrap();
+        let wire = WireMessage::Vote(signed, Some(partial));
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        // History only knows the legitimate signer's pubkey (pk_a), but
+        // the partial was produced under sk_b — verify_partial under
+        // pk_a must reject.
+        let bls_history = BlsKeyHistory::with_genesis([(signer.node_id(), bls_pk_a)]);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::BlsAggregated,
+            bls_key_history: Some(&bls_history),
+        };
+
+        let err = ingress_with_qc_verification(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect_err("partial signed under the wrong BLS key must be rejected");
+        assert!(matches!(
+            err,
+            IngressError::InvalidBlsPartial { view: 8, .. }
+        ));
+    }
+
+    #[test]
+    fn ingress_vote_on_ed25519_chain_ignores_bls_partial_field() {
+        // On an Ed25519 chain, the optional BLS partial is metadata —
+        // present or absent, valid or junk, ingress accepts the vote.
+        // (The QC verifier only consults the inner Ed25519 sig.)
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+        let view: View = 9;
+        let block_hash = [0xEE; 32];
+
+        // Ship a junk BLS partial alongside the vote — it must be ignored.
+        let vote = Vote { view, block_hash };
+        let signed = Signed::sign(vote, &signer).unwrap();
+        let wire = WireMessage::Vote(signed, Some([0xFFu8; 96]));
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+
+        let dispatches = ingress_with_qc_verification(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect("Ed25519 chain must ignore the optional BLS partial field");
+        assert_eq!(dispatches.len(), 1);
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+        ));
+    }
+
+    #[test]
+    fn ingress_vote_on_bls_chain_rejects_when_bls_history_absent() {
+        // Defense-in-depth: a BLS chain misconfigured to ship
+        // `QcVerification::Verify` without a `bls_key_history` must not
+        // silently let votes through. The verifier rejects because it
+        // can't resolve the signer's historical BLS pubkey.
+        let (signer, bls_sk, _bls_pk) = fresh_bls_signer(0x55);
+        let vs = make_vs_with_signers(&[&signer]);
+        let view: View = 11;
+        let block_hash = [0x11; 32];
+
+        let (signed, partial) =
+            make_signed_vote_with_bls_partial(&signer, &bls_sk, view, block_hash);
+        let wire = WireMessage::Vote(signed, Some(partial));
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::BlsAggregated,
+            bls_key_history: None,
+        };
+
+        let err = ingress_with_qc_verification(
+            signer.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect_err("BLS chain without bls_key_history must reject");
+        assert!(matches!(
+            err,
+            IngressError::InvalidBlsPartial { view: 11, .. }
+        ));
+    }
+
+    #[test]
+    fn ingress_vote_with_skip_does_not_validate_bls_partial() {
+        // The Skip policy means tests construct QCs with placeholder
+        // bytes — it must also tolerate junk BLS partials on Vote
+        // frames. Document that tightening this would break the
+        // existing test fixtures.
+        let signer = fresh_signer();
+        let vs = make_vs_with_signers(&[&signer]);
+
+        let vote = Vote {
+            view: 2,
+            block_hash: [0x77; 32],
+        };
+        let signed = Signed::sign(vote, &signer).unwrap();
+        // Junk BLS partial — would not verify under any pubkey.
+        let wire = WireMessage::Vote(signed, Some([0u8; 96]));
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs)
+            .expect("Skip policy must not exercise BLS partial verification");
+        assert_eq!(dispatches.len(), 1);
     }
 
     #[test]
