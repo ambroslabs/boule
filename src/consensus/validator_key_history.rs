@@ -444,6 +444,8 @@ mod tests {
             validator,
             new_pubkey,
             v_eff,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         }
     }
 
