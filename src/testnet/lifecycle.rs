@@ -38,6 +38,12 @@ pub struct NewArgs {
     /// well under a second.
     pub timeout_base_ms: u64,
     pub timeout_max_ms: u64,
+    /// Chain-level signature scheme (#360). On
+    /// `SignatureSchemeChoice::BlsAggregated` the cluster setup mints
+    /// a BLS keypair per node, computes per-validator PoPs, and writes
+    /// a `[consensus.validators_bls]` genesis table + a
+    /// `[node.bls_validator_identity]` reference per node config.
+    pub signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice,
 }
 
 /// `testnet new`: lay out the workdir, generate the topology, mint
@@ -51,6 +57,7 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
         binary,
         timeout_base_ms,
         timeout_max_ms,
+        signature_scheme,
     } = args;
 
     spec.validate()?;
@@ -118,8 +125,14 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
     }
     nodes.sort_by_key(|n| n.index);
 
-    // Phase 2: write the final per-node config with the full
-    // [consensus] section + sparse [[peers]] block.
+    // Phase 2a: on BLS chains, mint each node's BLS validator key now
+    // (so we can pre-compute the genesis BLS table and bake the path
+    // into the final config). On Ed25519 chains this is a no-op.
+    let bls_genesis = mint_bls_keys_if_needed(signature_scheme, &mut nodes)?;
+
+    // Phase 2b: write the final per-node config with the full
+    // [consensus] section + sparse [[peers]] block. On BLS chains the
+    // `bls_genesis` table is woven in alongside the validator list.
     let validator_ids: Vec<String> = nodes
         .iter()
         .map(|n| n.node_id.clone().expect("node_id populated in phase 1"))
@@ -132,6 +145,8 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
             spec.target_degree,
             timeout_base_ms,
             timeout_max_ms,
+            signature_scheme,
+            bls_genesis.as_deref(),
         )?;
     }
 
@@ -166,7 +181,69 @@ fn node_layout(workdir: &Path, index: usize, bootstrap_peers: Vec<usize>) -> Nod
         node_id: None,
         p2p_addr: None,
         api_addr: None,
+        bls_key_path: None,
     }
+}
+
+/// One genesis-table entry built by [`mint_bls_keys_if_needed`].
+/// Mirrors the `[consensus.validators_bls]` row shape — base58 NodeId,
+/// hex-encoded 48-byte BLS pubkey, hex-encoded 96-byte PoP signature
+/// over that pubkey.
+struct BlsGenesisEntry {
+    node_id: String,
+    bls_pubkey_hex: String,
+    bls_pop_hex: String,
+}
+
+/// On `bls_aggregated` chains: per-node, generate a fresh BLS keypair
+/// and persist it to `<node_dir>/bls.key` via the same `BlsKeyFile`
+/// provider production uses. Returns the ordered genesis table — one
+/// entry per validator, in the same order as `nodes` (which is sorted
+/// by index, matching the `[consensus] validators` ordering written to
+/// every node's config). On Ed25519 chains: returns `None` and skips
+/// all work.
+///
+/// Mutates each node's `NodeLayout::bls_key_path` so the final-config
+/// writer can reference the on-disk path under
+/// `[node.bls_validator_identity]`.
+fn mint_bls_keys_if_needed(
+    scheme: crate::crypto::sig_scheme::SignatureSchemeChoice,
+    nodes: &mut [NodeLayout],
+) -> anyhow::Result<Option<Vec<BlsGenesisEntry>>> {
+    use crate::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
+    use crate::crypto::sig_scheme::SignatureSchemeChoice;
+    if scheme == SignatureSchemeChoice::Ed25519Collected {
+        return Ok(None);
+    }
+    let mut genesis = Vec::with_capacity(nodes.len());
+    for n in nodes.iter_mut() {
+        let dir = n
+            .config_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("config_path has no parent for {}", n.display_name()))?;
+        let bls_path = dir.join("bls.key");
+        // The testnet driver runs on the same machine as the node
+        // binary; `BlsKeyFile::load_or_init` writes mode 0600 and
+        // generates a fresh key on first call. Subsequent calls reload
+        // the same key — this matters if `testnet new` is ever rerun
+        // against an existing workdir (which `new_cluster` already
+        // refuses, but the helper is idempotent regardless).
+        let provider = BlsKeyFile::new(bls_path.clone());
+        let identity = provider
+            .load_or_init()
+            .with_context(|| format!("minting BLS key for {}", n.display_name()))?;
+        let node_id = n
+            .node_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("node_id missing for {}", n.display_name()))?;
+        genesis.push(BlsGenesisEntry {
+            node_id,
+            bls_pubkey_hex: hex::encode(identity.public),
+            bls_pop_hex: hex::encode(identity.pop.sig),
+        });
+        n.bls_key_path = Some(bls_path);
+    }
+    Ok(Some(genesis))
 }
 
 fn write_minimal_config(layout: &NodeLayout) -> anyhow::Result<()> {
@@ -190,6 +267,7 @@ fn write_minimal_config(layout: &NodeLayout) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_final_config(
     n: &NodeLayout,
     all: &[NodeLayout],
@@ -197,7 +275,10 @@ fn write_final_config(
     target_degree: usize,
     timeout_base_ms: u64,
     timeout_max_ms: u64,
+    signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice,
+    bls_genesis: Option<&[BlsGenesisEntry]>,
 ) -> anyhow::Result<()> {
+    use crate::crypto::sig_scheme::SignatureSchemeChoice;
     use std::fmt::Write as _;
     let p2p = n
         .p2p_addr
@@ -225,6 +306,49 @@ fn write_final_config(
         .unwrap();
     }
 
+    // BLS genesis table (#360): on `bls_aggregated` chains, emit the
+    // `[consensus] signature_scheme` field, the
+    // `[[consensus.validators_bls]]` rows that the genesis validator
+    // set requires (`ConsensusConfig::resolve_genesis_bls_keys`), and
+    // a `[node.bls_validator_identity]` block pointing at this node's
+    // on-disk BLS key file. Ed25519 chains skip all three.
+    let mut bls_consensus_toml = String::new();
+    let mut bls_node_identity_toml = String::new();
+    if signature_scheme == SignatureSchemeChoice::BlsAggregated {
+        let entries = bls_genesis.ok_or_else(|| {
+            anyhow::anyhow!(
+                "bls_aggregated chain reached write_final_config without a BLS genesis table",
+            )
+        })?;
+        write!(
+            bls_consensus_toml,
+            "\nsignature_scheme = \"bls_aggregated\"\n",
+        )
+        .unwrap();
+        for e in entries {
+            write!(
+                bls_consensus_toml,
+                "\n[[consensus.validators_bls]]\nnode_id    = \"{nid}\"\nbls_pubkey = \"{pk}\"\nbls_pop    = \"{pop}\"\n",
+                nid = e.node_id,
+                pk = e.bls_pubkey_hex,
+                pop = e.bls_pop_hex,
+            )
+            .unwrap();
+        }
+        let bls_path = n.bls_key_path.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "bls_aggregated chain but {} has no bls_key_path; mint phase did not run",
+                n.display_name(),
+            )
+        })?;
+        write!(
+            bls_node_identity_toml,
+            "\n[node.bls_validator_identity]\nbackend = \"file\"\npath    = \"{path}\"\n",
+            path = bls_path.display(),
+        )
+        .unwrap();
+    }
+
     // Bake the api_addr discovered in phase 1 into the final config
     // (rather than re-binding to port 0). Otherwise `up` would land on
     // a fresh dynamic port and the api_addr in `state.json` would be
@@ -240,7 +364,7 @@ fn write_final_config(
          [node.identity]\n\
          backend = \"file\"\n\
          path    = \"{key}\"\n\
-         \n\
+         {bls_node_identity_toml}\n\
          [api]\n\
          listen_addr = \"{api}\"\n\
          cleanup_interval_secs = 60\n\
@@ -254,6 +378,7 @@ fn write_final_config(
          storage_dir      = \"{storage}\"\n\
          timeout_base_ms  = {timeout_base_ms}\n\
          timeout_max_ms   = {timeout_max_ms}\n\
+         {bls_consensus_toml}\
          {peers_toml}",
         addr = n.addr_path.display(),
         key = n.key_path.display(),

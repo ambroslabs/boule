@@ -58,6 +58,11 @@ pub struct NodeLayout {
     pub p2p_addr: Option<SocketAddr>,
     #[serde(default)]
     pub api_addr: Option<SocketAddr>,
+    /// Path to this node's BLS validator key file. Populated only on
+    /// `bls_aggregated` chains (#360); otherwise absent. Read by the
+    /// node binary via `[node.bls_validator_identity] backend = "file"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bls_key_path: Option<PathBuf>,
 }
 
 impl NodeLayout {
@@ -193,6 +198,7 @@ mod tests {
             node_id: Some("foo".to_string()),
             p2p_addr: "127.0.0.1:7000".parse().ok(),
             api_addr: "127.0.0.1:8000".parse().ok(),
+            bls_key_path: None,
         };
         let state = State {
             spec: PersistedSpec {
