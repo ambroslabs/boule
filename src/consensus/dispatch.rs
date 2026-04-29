@@ -41,7 +41,7 @@ use crate::consensus::node::WireMessage;
 use crate::consensus::pacemaker;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
-use crate::consensus::validator_set::Pubkey;
+use crate::consensus::validator_set::{Pubkey, ValidatorId};
 use crate::crypto::sig_scheme::SignatureSchemeChoice;
 use crate::crypto::signed::{ChainId, Signed, SignedMessage, Signer, preimage};
 use crate::p2p::NodeId;
@@ -257,26 +257,37 @@ impl std::error::Error for IngressError {
 }
 
 /// Compile-time witness that a wire-driven payload has passed
-/// [`ingress`]'s verification gates (#371).
+/// [`ingress`]'s verification gates **and** that the signer has been
+/// resolved to a stable [`ValidatorId`] (#371, #394).
 ///
 /// `Verified<T>` is constructed only by:
 ///
 /// - the dispatch verifiers (`ingress` / `ingress_with_qc_verification`
 ///   and friends) on their way out — these wrap their fully-verified
 ///   `Signed<Proposal>`, `Signed<Vote>`, and `Signed<NewView>` values
-///   via [`Verified::wrap_after_verify`] before constructing the
-///   corresponding [`crate::consensus::hotstuff::step::Event`] variant;
-/// - explicit [`Verified::unchecked`] calls in unit tests that bypass
-///   ingress for test-construction reasons (locally-built proposals,
+///   via [`Verified::wrap_after_verify_with_signer`] before
+///   constructing the corresponding
+///   [`crate::consensus::hotstuff::step::Event`] variant. The signer
+///   id is the [`ValidatorId`] that
+///   [`verify_signer_at`] resolved through
+///   [`ValidatorKeyHistory::validator_for`], so a vote signed under a
+///   post-rotation key is still recognized as belonging to the
+///   validator originally seated;
+/// - explicit [`Verified::unchecked`] /
+///   [`Verified::unchecked_with_signer`] calls in unit tests that
+///   bypass ingress for test-fixture reasons (locally-built proposals,
 ///   hand-crafted Vote events feeding the safety core directly).
 ///
 /// The audit's runtime-invariant-promoted-to-types pattern: the
 /// [`Event`](crate::consensus::hotstuff::step::Event) variants that
 /// originate on the wire take `Verified<...>`, so a future ingress
 /// path that skipped a check (or a refactor that reordered
-/// verification) cannot construct them and will fail to compile.
-/// Sibling of #328 (ValidatorId / Pubkey typestate) on a different
-/// axis: verification status rather than identity kind.
+/// verification) cannot construct them and will fail to compile. The
+/// stamped [`ValidatorId`] further ensures the safety core consumes
+/// the already-resolved stable id rather than re-deriving from raw
+/// wire bytes — the post-rotation hazard #394 names. Sibling of #328
+/// (ValidatorId / Pubkey typestate) on a different axis: verification
+/// status rather than identity kind.
 ///
 /// # Compile-time enforcement
 ///
@@ -297,42 +308,88 @@ impl std::error::Error for IngressError {
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Verified<T>(T);
+pub struct Verified<T> {
+    value: T,
+    signer_validator_id: ValidatorId,
+}
 
 impl<T> Verified<T> {
-    /// Wrap `value` as verified. Crate-private — only the dispatch
-    /// verifiers call this on the way out, after every gate
+    /// Wrap `value` as verified, recording the stable [`ValidatorId`]
+    /// resolved by [`verify_signer_at`]. Crate-private — only the
+    /// dispatch verifiers call this on the way out, after every gate
     /// (`verify_signer_at`, `verify_sig`, `verify_qc_if_requested`,
     /// `verify_proposal_history_commitment_if_requested`,
     /// `verify_bls_partial_if_required`) has returned `Ok`. Outside
     /// the crate, callers must go through [`ingress`] to land here.
-    pub(crate) fn wrap_after_verify(value: T) -> Self {
-        Self(value)
+    pub(crate) fn wrap_after_verify_with_signer(
+        value: T,
+        signer_validator_id: ValidatorId,
+    ) -> Self {
+        Self {
+            value,
+            signer_validator_id,
+        }
     }
 
-    /// Construct a `Verified<T>` without running any verification.
-    /// Reserved for unit tests that bypass ingress for test-fixture
-    /// reasons — e.g. a test that hand-crafts an `Event` and feeds
-    /// it directly to `HotStuffCore::step` to exercise a specific
-    /// branch.
+    /// Construct a `Verified<T>` without running any verification,
+    /// stamping the caller-provided [`ValidatorId`]. Reserved for
+    /// unit tests that bypass ingress for test-fixture reasons — e.g.
+    /// a post-rotation regression test that wants to demonstrate the
+    /// safety core consuming a stable id whose bytes differ from the
+    /// wire signer pubkey.
     ///
     /// **Production code MUST NOT call this.** Every call site is
     /// auditable by name, and a code review or grep can catch any
     /// production caller that snuck in.
-    pub fn unchecked(value: T) -> Self {
-        Self(value)
+    pub fn unchecked_with_signer(value: T, signer_validator_id: ValidatorId) -> Self {
+        Self {
+            value,
+            signer_validator_id,
+        }
     }
 
     /// Borrow the inner value.
     pub fn inner(&self) -> &T {
-        &self.0
+        &self.value
     }
 
     /// Consume and unwrap. Used by the safety core's `step()` to
     /// pull the wire payload out before dispatching to the matching
     /// `on_*_received` handler.
     pub fn into_inner(self) -> T {
-        self.0
+        self.value
+    }
+
+    /// The stable [`ValidatorId`] resolved by ingress (via
+    /// [`ValidatorKeyHistory::validator_for`]) for the signer of this
+    /// payload. The safety core reads this directly to look up the
+    /// signer's bitmap index — instead of re-deriving from wire
+    /// bytes, which would silently drop post-rotation votes (#394).
+    pub fn signer_validator_id(&self) -> ValidatorId {
+        self.signer_validator_id
+    }
+
+    /// Consume and split into payload + resolved signer id.
+    pub fn into_parts(self) -> (T, ValidatorId) {
+        (self.value, self.signer_validator_id)
+    }
+}
+
+impl<T> Verified<Signed<T>> {
+    /// Test convenience: derive `signer_validator_id` from the wire
+    /// signer pubkey via [`ValidatorId::from_genesis_pubkey`]. Matches
+    /// the pre-rotation identity convention every existing test
+    /// fixture relies on (the validator set's stable ids are
+    /// byte-equal to the genesis pubkey). For the post-rotation case,
+    /// where the wire signer is a freshly-rotated key whose bytes
+    /// differ from the stable id, use
+    /// [`Verified::unchecked_with_signer`] explicitly.
+    ///
+    /// **Production code MUST NOT call this** — same audit gate as
+    /// [`Verified::unchecked_with_signer`].
+    pub fn unchecked(value: Signed<T>) -> Self {
+        let signer_validator_id = ValidatorId::from_genesis_pubkey(value.signer);
+        Self::unchecked_with_signer(value, signer_validator_id)
     }
 }
 
@@ -475,7 +532,7 @@ pub fn ingress_wire_with_qc_verification(
     match msg {
         WireMessage::Proposal(signed) => {
             let view = signed.payload.block.header.view;
-            verify_signer_at(signed.signer, view, history, key_history)?;
+            let signer_validator_id = verify_signer_at(signed.signer, view, history, key_history)?;
             verify_sig(&signed, chain_id)?;
             verify_qc_if_requested(
                 &signed.payload.justify,
@@ -501,14 +558,15 @@ pub fn ingress_wire_with_qc_verification(
             )?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::ProposalReceived(
-                    Verified::wrap_after_verify(signed),
+                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
                 )),
                 Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
             ])
         }
 
         WireMessage::Vote(signed, bls_partial) => {
-            verify_signer_at(signed.signer, signed.payload.view, history, key_history)?;
+            let signer_validator_id =
+                verify_signer_at(signed.signer, signed.payload.view, history, key_history)?;
             verify_sig(&signed, chain_id)?;
             verify_bls_partial_if_required(
                 &signed,
@@ -518,7 +576,7 @@ pub fn ingress_wire_with_qc_verification(
             )?;
             Ok(vec![Dispatch::Safety(
                 crate::consensus::hotstuff::step::Event::VoteReceived(
-                    Verified::wrap_after_verify(signed),
+                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
                     bls_partial,
                 ),
             )])
@@ -534,7 +592,8 @@ pub fn ingress_wire_with_qc_verification(
             // bitmap shape, signature count, and quorum threshold must
             // all match the historical set, not the current one.
             let high_qc_view = signed.payload.high_qc.view;
-            verify_signer_at(signed.signer, high_qc_view, history, key_history)?;
+            let signer_validator_id =
+                verify_signer_at(signed.signer, high_qc_view, history, key_history)?;
             verify_sig(&signed, chain_id)?;
             // #250: well-formedness of the embedded high_qc against the
             // set authoritative at `high_qc.view`. A NewView whose
@@ -555,7 +614,7 @@ pub fn ingress_wire_with_qc_verification(
             )?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
-                    Verified::wrap_after_verify(signed),
+                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
                 )),
                 // Inform the pacemaker that we've seen a QC up to `high_qc_view`.
                 // It ignores stale events, so this is always safe to emit.
@@ -657,12 +716,20 @@ pub fn ingress_wire_with_qc_verification(
 /// from "you used the wrong key for this view" — both indicate the
 /// message has no business being processed. Splitting the variants for
 /// internal telemetry is a follow-up.
+///
+/// On success, returns the stable [`ValidatorId`] the wire signer
+/// pubkey resolves to. The dispatch arms thread this id through
+/// [`Verified::wrap_after_verify_with_signer`] so the safety core can
+/// look up the bitmap index by the same stable id ingress validated
+/// against — closing the post-rotation hazard #394 names where
+/// `from_genesis_pubkey(signed.signer)` would silently drop a vote
+/// signed under the validator's freshly-rotated active key.
 fn verify_signer_at(
     signer: NodeId,
     view: View,
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
-) -> Result<(), IngressError> {
+) -> Result<ValidatorId, IngressError> {
     // Wire envelopes carry a `NodeId` as their `signer` field; at this
     // boundary we re-tag the bytes as a `Pubkey` (the typed
     // representation of "this is an ephemeral consensus signing key,
@@ -684,7 +751,7 @@ fn verify_signer_at(
         return Err(IngressError::UnknownSigner(signer));
     }
 
-    Ok(())
+    Ok(stable_id)
 }
 
 /// Verify the Ed25519 signature on a `Signed<T>` envelope.
@@ -1161,22 +1228,49 @@ fn sign_consensus_msg(
 ///
 /// Signature verification is skipped for the local-loopback dispatches:
 /// the envelope was just produced by `signer`, so re-verifying is
-/// redundant work. The returned `Dispatch` items otherwise match the
-/// output of [`ingress_wire`] for this frame arriving from
-/// `signer.node_id()`.
+/// redundant work. `key_history` is still consulted to resolve the
+/// signer pubkey to its stable [`ValidatorId`] (#394), which is
+/// stamped on the [`Verified`] envelope so the safety core's bitmap
+/// lookup matches the wire path's resolution after a rotation. The
+/// returned `Dispatch` items otherwise match the output of
+/// [`ingress_wire`] for this frame arriving from `signer.node_id()`.
 pub fn egress_consensus_msg_with_loopback(
     msg: &ConsensusMsg,
     signer: &dyn Signer,
     bls_signer: Option<
         &dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
     >,
+    key_history: &ValidatorKeyHistory,
     chain_id: &ChainId,
 ) -> anyhow::Result<(Bytes, Vec<Dispatch>)> {
     let wire = sign_consensus_msg(msg, signer, bls_signer, chain_id)?;
     let payload = postcard::to_stdvec(&wire)
         .map(Bytes::from)
         .map_err(anyhow::Error::from)?;
-    let dispatches = match &wire {
+    // Resolve `signer.node_id()` to its stable `ValidatorId` exactly
+    // as the wire path does in `verify_signer_at`. Using
+    // `from_genesis_pubkey` directly would silently desync from the
+    // wire path after a rotation: on Ed25519 chains the leader's
+    // self-vote wouldn't fold into the QC bucket because the
+    // bitmap-index lookup would compute the wrong stable id (#394).
+    //
+    // The fallback to `from_genesis_pubkey` covers tests where the
+    // local signer's pubkey is not registered in `key_history` (e.g.
+    // a `fresh_signer` whose bytes were never seeded into the
+    // genesis set). Pre-#394 the loopback always re-tagged, so the
+    // safety core would compute a `ValidatorId` whose bytes are not
+    // in the validator set and silently drop the message at the
+    // bitmap lookup. Falling back here preserves that
+    // byte-identical behaviour: production validators are always
+    // registered (their genesis pubkey seeds the key history at
+    // boot), so the registered branch is taken; tests with an
+    // unregistered local signer follow the same drop-at-safety-core
+    // path they always did.
+    let signer_pk = Pubkey::from_node_id(signer.node_id());
+    let signer_validator_id = key_history
+        .validator_for(&signer_pk)
+        .unwrap_or_else(|| ValidatorId::from_genesis_pubkey(signer.node_id()));
+    let dispatches = match wire {
         WireMessage::Proposal(signed) => {
             let view = signed.payload.block.header.view;
             vec![
@@ -1185,8 +1279,10 @@ pub fn egress_consensus_msg_with_loopback(
                     // `sign_consensus_msg`, so it is verified by
                     // construction (the doc comment above explicitly
                     // notes signature verification is skipped on
-                    // loopback). Wrap to satisfy the typestate.
-                    Verified::wrap_after_verify(signed.clone()),
+                    // loopback). Wrap to satisfy the typestate, with
+                    // the same `ValidatorId` resolution the wire path
+                    // would compute.
+                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
                 )),
                 Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
             ]
@@ -1199,8 +1295,8 @@ pub fn egress_consensus_msg_with_loopback(
             // like any peer's vote (#118 + #354 step 2).
             vec![Dispatch::Safety(
                 crate::consensus::hotstuff::step::Event::VoteReceived(
-                    Verified::wrap_after_verify(signed.clone()),
-                    *bls_partial,
+                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
+                    bls_partial,
                 ),
             )]
         }
@@ -1208,7 +1304,7 @@ pub fn egress_consensus_msg_with_loopback(
             let high_qc_view = signed.payload.high_qc.view;
             vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
-                    Verified::wrap_after_verify(signed.clone()),
+                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
                 )),
                 Dispatch::Pacemaker(pacemaker::Event::OnQc(high_qc_view)),
             ]
@@ -2217,6 +2313,15 @@ mod tests {
     /// signed by the *new* key is accepted: the verifier resolves the
     /// new pubkey to the validator's stable id and confirms it's the
     /// active key for that view.
+    ///
+    /// Also pins the #394 fix: the resolved stable
+    /// [`ValidatorId`](crate::consensus::validator_set::ValidatorId)
+    /// is stamped on the [`Verified`] envelope, with bytes equal to
+    /// the validator's *original* (genesis) pubkey — not the wire
+    /// signer's freshly-rotated pubkey. The safety core consumes the
+    /// stamped id directly, so the bitmap-index lookup hits the
+    /// validator's bitmap slot regardless of how many rotations have
+    /// happened since.
     #[test]
     fn vote_after_rotation_signed_with_new_key_accepted() {
         let old = fresh_signer();
@@ -2241,10 +2346,37 @@ mod tests {
             &ChainId::TEST,
         )
         .unwrap();
-        assert!(matches!(
-            dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
-        ));
+        let SafetyEvent::VoteReceived(verified, _bls_partial) = (match &dispatches[0] {
+            Dispatch::Safety(ev) => ev.clone(),
+            other => panic!("expected Dispatch::Safety(VoteReceived), got {other:?}"),
+        }) else {
+            panic!("expected SafetyEvent::VoteReceived, got something else");
+        };
+
+        // Wire signer is the rotated `new` pubkey; stamped id is the
+        // pre-rotation stable id (genesis pubkey of `old`). The
+        // pre-#394 derivation `from_genesis_pubkey(signed.signer)`
+        // would have stamped `new.node_id()` — verifying that the
+        // stamped bytes are NOT the wire bytes is the load-bearing
+        // assertion this test contributes over the existing
+        // accept-or-reject coverage.
+        let stamped = verified.signer_validator_id();
+        let expected =
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(old.node_id());
+        assert_eq!(
+            stamped, expected,
+            "Verified envelope must stamp the resolved stable ValidatorId (#394)",
+        );
+        assert_ne!(
+            stamped.into_node_id(),
+            new.node_id(),
+            "stamped id must NOT be the rotated wire pubkey — pre-#394 derivation",
+        );
+        assert!(
+            history.set_at(100).index_of(&stamped).is_some(),
+            "stamped id must index into the validator set so the safety core's \
+             bitmap lookup succeeds",
+        );
     }
 
     /// Spanning vote: a late vote for a *pre-rotation* view, signed by
