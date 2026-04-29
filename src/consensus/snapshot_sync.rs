@@ -748,8 +748,14 @@ mod tests {
         let chunks: Vec<Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
         let block = sample_block(height, view);
         let qc = quorum_qc(vs.len(), block.hash());
-        let manifest =
-            SnapshotManifest::build(block, vs, chunk_size, chunk_hashes, qc, 1_700_000_000);
+        let manifest = SnapshotManifest::build_for_test_genesis_histories(
+            block,
+            vs,
+            chunk_size,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        );
         (manifest, chunks)
     }
 

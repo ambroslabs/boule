@@ -1547,7 +1547,14 @@ mod tests {
         let payload = b"chunky payload".repeat(8);
         let chunks = crate::replication::snapshot::chunk_snapshot(&payload, 32);
         let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|(_, h)| *h).collect();
-        SnapshotManifest::build(block, &vs, 32, chunk_hashes, qc, 1_700_000_000)
+        SnapshotManifest::build_for_test_genesis_histories(
+            block,
+            &vs,
+            32,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        )
     }
 
     #[test]

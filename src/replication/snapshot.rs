@@ -118,6 +118,27 @@ pub struct SnapshotManifest {
     /// Wall-clock seconds-since-Unix-epoch at creation. Informational
     /// only — verifiers do not key safety on this field.
     pub created_unix_secs: u64,
+    /// Persisted form of the producer's `ValidatorSetHistory` at
+    /// snapshot height (#325 PR D). The joiner installs this verbatim
+    /// during restore; without it, the joiner's history would remain
+    /// genesis-only and diverge from the block's stamped
+    /// `validator_history_commitment` (which is the post-block hash
+    /// over the *real* history). [`Self::verify`] cross-checks this
+    /// triple against `block.header.validator_history_commitment` and
+    /// rejects forgery.
+    pub validator_history: crate::consensus::validator_history::PersistedValidatorHistory,
+    /// Persisted form of the producer's `ValidatorKeyHistory` at
+    /// snapshot height (#325 PR D). See [`Self::validator_history`].
+    pub validator_key_history:
+        crate::consensus::validator_key_history::PersistedValidatorKeyHistory,
+    /// Persisted form of the producer's `BlsKeyHistory` at snapshot
+    /// height on BLS chains; `None` on Ed25519 chains (#325 PR D).
+    /// The Some/None discriminant must match the chain's signature
+    /// scheme — a chain-scheme mismatch is detected via the same
+    /// commitment check as any other history tampering, since
+    /// [`crate::consensus::history_commitment::validator_history_commitment_v1`]
+    /// mixes the discriminant into its hash.
+    pub bls_key_history: Option<crate::consensus::bls_key_history::PersistedBlsKeyHistory>,
 }
 
 impl SnapshotManifest {
@@ -130,6 +151,55 @@ impl SnapshotManifest {
     /// Given identical inputs, two callers produce byte-identical
     /// manifests; the only non-deterministic field is
     /// `created_unix_secs`, supplied by the caller.
+    /// `#[cfg(test)]`-only convenience constructor that synthesizes
+    /// the three persisted-history forms over `validator_set` as if
+    /// no reconfig or rotation had ever committed (genesis-only
+    /// triple), AND patches `block.header.validator_history_commitment`
+    /// to the matching v1 hash so the resulting manifest verifies
+    /// against itself. Note that this changes the block's hash, so
+    /// the caller must rebuild any `commit_qc` that referenced the
+    /// pre-patch block_hash — pass `commit_qc` whose `block_hash` is
+    /// `block.hash()` *after* the synthesis. The simplest pattern in
+    /// tests is: build the block with `[0; 32]` placeholder commitment,
+    /// build the QC over the (yet-to-be-patched) hash, then call this
+    /// helper which produces a manifest that re-targets the QC to
+    /// the patched hash.
+    #[cfg(test)]
+    pub fn build_for_test_genesis_histories(
+        mut block: Block,
+        validator_set: &ValidatorSet,
+        chunk_size: u32,
+        chunk_hashes: Vec<[u8; 32]>,
+        mut commit_qc: QuorumCertificate,
+        created_unix_secs: u64,
+    ) -> Self {
+        let set_hist = crate::consensus::validator_history::ValidatorSetHistory::from_genesis(
+            validator_set.clone(),
+        );
+        let key_hist = crate::consensus::validator_key_history::ValidatorKeyHistory::new(
+            validator_set.iter().copied(),
+        );
+        let commitment = crate::consensus::history_commitment::validator_history_commitment_v1(
+            &set_hist, &key_hist, None,
+        );
+        block.header.validator_history_commitment = commitment;
+        // `commit_qc.block_hash` may have been built against the
+        // pre-patch block hash; re-target it so the manifest's
+        // `commit_qc.block_hash == block.hash()` invariant holds.
+        commit_qc.block_hash = block.hash();
+        Self::build(
+            block,
+            validator_set,
+            chunk_size,
+            chunk_hashes,
+            commit_qc,
+            created_unix_secs,
+            set_hist.to_persisted(),
+            key_hist.to_persisted(),
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         block: Block,
@@ -138,6 +208,9 @@ impl SnapshotManifest {
         chunk_hashes: Vec<[u8; 32]>,
         commit_qc: QuorumCertificate,
         created_unix_secs: u64,
+        validator_history: crate::consensus::validator_history::PersistedValidatorHistory,
+        validator_key_history: crate::consensus::validator_key_history::PersistedValidatorKeyHistory,
+        bls_key_history: Option<crate::consensus::bls_key_history::PersistedBlsKeyHistory>,
     ) -> Self {
         let chunk_count: u32 = chunk_hashes
             .len()
@@ -161,6 +234,9 @@ impl SnapshotManifest {
             commit_qc,
             block,
             created_unix_secs,
+            validator_history,
+            validator_key_history,
+            bls_key_history,
         }
     }
 
@@ -259,6 +335,39 @@ impl SnapshotManifest {
         if self.block.header.state_commitment != self.state_commitment {
             return Err(ManifestError::BlockStateCommitmentMismatch);
         }
+        // #325 PR D: cross-check the embedded validator-history triple
+        // against the snapshot block's stamped
+        // `validator_history_commitment`. The block was minted under
+        // the producer's post-block histories (PR C); the joiner
+        // installs the embedded persisted forms verbatim and verifies
+        // their v1 hash here. A mismatch means the producer published
+        // a snapshot whose histories do not agree with what the
+        // chain's committed block claims — defensively reject before
+        // any durable state is touched.
+        let rebuilt_set = crate::consensus::validator_history::ValidatorSetHistory::from_persisted(
+            self.validator_history.clone(),
+        )
+        .map_err(|_| ManifestError::ValidatorHistoryCommitmentMismatch)?;
+        let rebuilt_key =
+            crate::consensus::validator_key_history::ValidatorKeyHistory::from_persisted(
+                self.validator_key_history.clone(),
+            )
+            .map_err(|_| ManifestError::ValidatorHistoryCommitmentMismatch)?;
+        let rebuilt_bls = match &self.bls_key_history {
+            Some(p) => Some(
+                crate::consensus::bls_key_history::BlsKeyHistory::from_persisted(p.clone())
+                    .map_err(|_| ManifestError::ValidatorHistoryCommitmentMismatch)?,
+            ),
+            None => None,
+        };
+        let actual = crate::consensus::history_commitment::validator_history_commitment_v1(
+            &rebuilt_set,
+            &rebuilt_key,
+            rebuilt_bls.as_ref(),
+        );
+        if actual != self.block.header.validator_history_commitment {
+            return Err(ManifestError::ValidatorHistoryCommitmentMismatch);
+        }
         Ok(())
     }
 }
@@ -293,6 +402,15 @@ pub enum ManifestError {
     BlockViewMismatch,
     /// `manifest.block.header.state_commitment != manifest.state_commitment`.
     BlockStateCommitmentMismatch,
+    /// The v1 hash over the manifest's embedded `(validator_history,
+    /// validator_key_history, bls_key_history?)` triple does not
+    /// match `manifest.block.header.validator_history_commitment`,
+    /// or one of the persisted forms failed to round-trip into its
+    /// in-memory form. The audit's snapshot-bypass concern (#325 PR
+    /// D / 7-F2): a joiner restoring from a tampered manifest would
+    /// otherwise install a divergent history without the chain's
+    /// committed block having signed off on it.
+    ValidatorHistoryCommitmentMismatch,
 }
 
 impl std::fmt::Display for ManifestError {
@@ -340,6 +458,12 @@ impl std::fmt::Display for ManifestError {
             Self::BlockStateCommitmentMismatch => write!(
                 f,
                 "manifest.block.header.state_commitment does not match manifest.state_commitment",
+            ),
+            Self::ValidatorHistoryCommitmentMismatch => write!(
+                f,
+                "manifest's embedded validator-history triple does not match \
+                 block.header.validator_history_commitment (snapshot tampered or rolled back; \
+                 audit #325 PR D / 7-F2)",
             ),
         }
     }
@@ -869,7 +993,7 @@ mod tests {
         let chunks_with_hashes = chunk_snapshot(&payload, 100_000);
         let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
         let chunks: Vec<Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
-        let manifest = SnapshotManifest::build(
+        let manifest = SnapshotManifest::build_for_test_genesis_histories(
             block,
             &validator_set,
             100_000,
@@ -1137,7 +1261,14 @@ mod tests {
         let payload = b"snapshot payload".repeat(4);
         let chunks = chunk_snapshot(&payload, 16);
         let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|(_, h)| *h).collect();
-        SnapshotManifest::build(block, vs, 16, chunk_hashes, qc, 1_700_000_000)
+        SnapshotManifest::build_for_test_genesis_histories(
+            block,
+            vs,
+            16,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        )
     }
 
     #[test]
@@ -1145,6 +1276,34 @@ mod tests {
         let vs = validator_set_len_4();
         let m = manifest_for_verify(&vs);
         m.verify(&vs).unwrap();
+    }
+
+    /// PR D of #325: a manifest whose embedded validator-history
+    /// triple does not match `block.header.validator_history_commitment`
+    /// must be rejected at `verify()` with the new
+    /// `ValidatorHistoryCommitmentMismatch` variant. Bisect-confirmed
+    /// (see PR D summary): removing the check in `verify()` lets the
+    /// tampered manifest pass and the joiner installs a divergent
+    /// history.
+    #[test]
+    fn verify_rejects_validator_history_commitment_mismatch() {
+        let vs = validator_set_len_4();
+        let mut m = manifest_for_verify(&vs);
+        // Tamper: append a fabricated boundary at v_eff = 999. The
+        // helper produces a manifest whose embedded set-history is
+        // genesis-only, so the v1 hash over (genesis-only) matches
+        // the snapshot block's commitment. Adding a boundary
+        // diverges the rebuild's hash from the block's claim.
+        m.validator_history.boundaries.push(
+            crate::consensus::validator_history::PersistedBoundary {
+                v_eff: 999,
+                members: vec![[0xFFu8; 32]; 4],
+            },
+        );
+        assert_eq!(
+            m.verify(&vs),
+            Err(ManifestError::ValidatorHistoryCommitmentMismatch),
+        );
     }
 
     #[test]
