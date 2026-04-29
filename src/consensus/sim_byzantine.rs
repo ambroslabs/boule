@@ -169,7 +169,7 @@ impl Adversary for VoteWithholderAdversary {
     fn intercept(&self, _ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound> {
         let payload = outbound_payload(&outbound);
         match decode(&payload) {
-            Some(WireMessage::Vote(_)) => Vec::new(),
+            Some(WireMessage::Vote(_, _)) => Vec::new(),
             _ => vec![outbound],
         }
     }
@@ -215,7 +215,7 @@ impl Adversary for StaleReplayerAdversary {
         let mut s = self.state.lock();
         if matches!(
             decode(&payload),
-            Some(WireMessage::Proposal(_) | WireMessage::Vote(_) | WireMessage::NewView(_))
+            Some(WireMessage::Proposal(_) | WireMessage::Vote(_, _) | WireMessage::NewView(_),)
         ) && s.history.len() < 64
         {
             s.history.push(payload);

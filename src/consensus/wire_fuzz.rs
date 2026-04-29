@@ -215,8 +215,8 @@ fn arb_signed_wire_bytes_and_signer() -> impl Strategy<Value = (Vec<u8>, NodeId)
         (arb_signer_idx(), arb_vote()).prop_map(|(idx, v)| {
             let signer = &signer_pool()[idx];
             let signed = Signed::sign(v, signer).expect("sign Vote");
-            let bytes =
-                postcard::to_stdvec(&WireMessage::Vote(signed)).expect("encode WireMessage::Vote");
+            let bytes = postcard::to_stdvec(&WireMessage::Vote(signed, None))
+                .expect("encode WireMessage::Vote");
             (bytes, signer.node_id())
         }),
         (arb_signer_idx(), arb_new_view()).prop_map(|(idx, nv)| {
