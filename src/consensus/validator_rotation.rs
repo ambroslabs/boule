@@ -29,6 +29,7 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
+use crate::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
 use crate::crypto::signed::{SignedMessage, Signer, preimage};
 use crate::p2p::NodeId;
 
@@ -55,11 +56,31 @@ pub const V_EFF_MIN_DELAY: View = 2;
 /// validator address this field's interpretation tightens but the wire
 /// shape is unchanged). `new_pubkey` is the consensus key the validator
 /// proposes to sign under starting at view `v_eff`.
+///
+/// On `bls_aggregated` chains every rotation must atomically swap both
+/// halves of the validator's identity: `new_bls_pubkey` carries the new
+/// BLS12-381 G1 pubkey and `new_bls_pop` is its proof-of-possession
+/// (matching the `add-validator` reconfig contract from #291). On
+/// `ed25519_collected` chains both fields must be absent. Splitting the
+/// two halves into independent rotations would let the histories
+/// disagree at a single view (#358 out-of-scope item).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorKeyRotation {
     pub validator: NodeId,
     pub new_pubkey: NodeId,
     pub v_eff: View,
+    /// New BLS pubkey (#358). Required on BLS chains, must be `None`
+    /// on Ed25519 chains; the consistency check is in
+    /// [`Self::validate_scheme_consistency`].
+    #[serde(default, with = "serde_optional_bls_pubkey")]
+    pub new_bls_pubkey: Option<BlsPublicKey>,
+    /// Proof-of-possession over `new_bls_pubkey` (#358). Required when
+    /// `new_bls_pubkey` is `Some`; must be `None` otherwise. Verified
+    /// by [`Self::validate_scheme_consistency`] under
+    /// [`BlsAggregated::verify_pop`] before the rotation can be
+    /// applied to [`crate::consensus::bls_key_history::BlsKeyHistory`].
+    #[serde(default)]
+    pub new_bls_pop: Option<BlsPop>,
 }
 
 impl SignedMessage for ValidatorKeyRotation {
@@ -91,8 +112,27 @@ pub struct DualSignedRotation {
 /// equally at admission time and at block-validation time.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RotationStructuralError {
-    EffectiveViewTooSoon { current_view: View, v_eff: View },
+    EffectiveViewTooSoon {
+        current_view: View,
+        v_eff: View,
+    },
     NewKeyEqualsValidator,
+    /// On a `bls_aggregated` chain a rotation must carry both
+    /// `new_bls_pubkey` and `new_bls_pop`; on `ed25519_collected` it
+    /// must carry neither (#358). Splitting the two halves into
+    /// independent rotations would leave the Ed25519 and BLS
+    /// histories transiently disagreeing at a single view.
+    BlsFieldsInconsistentWithScheme {
+        scheme: SignatureSchemeChoice,
+        bls_pubkey_present: bool,
+        bls_pop_present: bool,
+    },
+    /// On a BLS chain, the proof-of-possession in `new_bls_pop` did
+    /// not verify under `new_bls_pubkey`. Catches a rotator who
+    /// supplies a BLS pubkey they don't actually hold the secret half
+    /// of — the same rogue-key-attack defense the registration path
+    /// runs (#291).
+    BlsPopVerificationFailed,
 }
 
 impl std::fmt::Display for RotationStructuralError {
@@ -112,6 +152,20 @@ impl std::fmt::Display for RotationStructuralError {
                     "rotation new_pubkey equals current validator key (no-op rotation)"
                 )
             }
+            Self::BlsFieldsInconsistentWithScheme {
+                scheme,
+                bls_pubkey_present,
+                bls_pop_present,
+            } => write!(
+                f,
+                "rotation BLS fields inconsistent with chain scheme {scheme}: \
+                 new_bls_pubkey={bls_pubkey_present}, new_bls_pop={bls_pop_present}; \
+                 BLS chains require both, Ed25519 chains require neither",
+            ),
+            Self::BlsPopVerificationFailed => f.write_str(
+                "rotation new_bls_pop does not verify under new_bls_pubkey \
+                 (rogue-key-attack defense)",
+            ),
         }
     }
 }
@@ -143,6 +197,44 @@ impl ValidatorKeyRotation {
             return Err(RotationStructuralError::NewKeyEqualsValidator);
         }
         Ok(())
+    }
+
+    /// Check that the BLS half of this rotation matches the chain's
+    /// signature scheme, and (on BLS chains) that `new_bls_pop`
+    /// verifies under `new_bls_pubkey` (#358).
+    ///
+    /// Separate from [`Self::validate_structural`] because the chain
+    /// scheme isn't part of the rotation payload — it's a property of
+    /// the chain the rotation is being applied to. Callers thread the
+    /// scheme in from `NodeConfigForConsensus.signature_scheme` (or
+    /// `ConsensusNode.signature_scheme` post-construction).
+    pub fn validate_scheme_consistency(
+        &self,
+        scheme: SignatureSchemeChoice,
+    ) -> Result<(), RotationStructuralError> {
+        match scheme {
+            SignatureSchemeChoice::Ed25519Collected => {
+                if self.new_bls_pubkey.is_some() || self.new_bls_pop.is_some() {
+                    return Err(RotationStructuralError::BlsFieldsInconsistentWithScheme {
+                        scheme,
+                        bls_pubkey_present: self.new_bls_pubkey.is_some(),
+                        bls_pop_present: self.new_bls_pop.is_some(),
+                    });
+                }
+                Ok(())
+            }
+            SignatureSchemeChoice::BlsAggregated => {
+                let (Some(pk), Some(pop)) = (&self.new_bls_pubkey, &self.new_bls_pop) else {
+                    return Err(RotationStructuralError::BlsFieldsInconsistentWithScheme {
+                        scheme,
+                        bls_pubkey_present: self.new_bls_pubkey.is_some(),
+                        bls_pop_present: self.new_bls_pop.is_some(),
+                    });
+                };
+                BlsAggregated::verify_pop(pop, pk)
+                    .map_err(|_| RotationStructuralError::BlsPopVerificationFailed)
+            }
+        }
     }
 }
 
@@ -281,6 +373,35 @@ impl DualSignedRotation {
     }
 }
 
+/// Serde adapter for `Option<BlsPublicKey>` — a 48-byte fixed array that
+/// serde does not auto-derive past N=32. Mirrors the byte-sequence
+/// shape used by `Option<BlsPartialSig>` in
+/// [`crate::consensus::node::WireMessage::Vote`] (#355).
+mod serde_optional_bls_pubkey {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    use crate::crypto::sig_scheme::BlsPublicKey;
+
+    pub fn serialize<S: Serializer>(opt: &Option<BlsPublicKey>, s: S) -> Result<S::Ok, S::Error> {
+        match opt {
+            Some(pk) => s.serialize_some(&pk[..]),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<BlsPublicKey>, D::Error> {
+        let opt: Option<Vec<u8>> = Option::deserialize(d)?;
+        match opt {
+            Some(v) => v
+                .as_slice()
+                .try_into()
+                .map(Some)
+                .map_err(|_| D::Error::custom("BLS pubkey must be exactly 48 bytes")),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Mirror of `crypto::signed::serde_sig` for the two raw signatures held
 /// by [`DualSignedRotation`]. Kept private here so the envelope's wire
 /// format stays decoupled from the `Signed<T>` envelope's internals.
@@ -325,6 +446,8 @@ mod tests {
             validator: nid(1),
             new_pubkey: nid(2),
             v_eff: 100,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         }
     }
 
@@ -429,6 +552,8 @@ mod tests {
             validator: nid(1),
             new_pubkey: nid(2),
             v_eff: 10 + V_EFF_MIN_DELAY,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         assert!(p.validate_structural(10).is_ok());
     }
@@ -439,6 +564,8 @@ mod tests {
             validator: nid(1),
             new_pubkey: nid(2),
             v_eff: u64::MAX,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         assert!(p.validate_structural(0).is_ok());
     }
@@ -449,6 +576,8 @@ mod tests {
             validator: nid(1),
             new_pubkey: nid(2),
             v_eff: 11,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         assert_eq!(
             p.validate_structural(10),
@@ -465,6 +594,8 @@ mod tests {
             validator: nid(1),
             new_pubkey: nid(2),
             v_eff: 10,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         assert!(matches!(
             p.validate_structural(10),
@@ -478,6 +609,8 @@ mod tests {
             validator: nid(1),
             new_pubkey: nid(2),
             v_eff: 5,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         assert!(matches!(
             p.validate_structural(10),
@@ -491,6 +624,8 @@ mod tests {
             validator: nid(7),
             new_pubkey: nid(7),
             v_eff: 1_000,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         assert_eq!(
             p.validate_structural(0),
@@ -508,6 +643,8 @@ mod tests {
             validator: nid(1),
             new_pubkey: nid(2),
             v_eff: u64::MAX,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         // Even at this extreme, v_eff == saturating_add result, so the
         // check passes (>= holds).
@@ -539,6 +676,8 @@ mod tests {
             validator: current.node_id(),
             new_pubkey: new.node_id(),
             v_eff: 100,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         let env = DualSignedRotation::sign(payload, &current, &new).unwrap();
         (env, current.node_id(), new.node_id())
@@ -615,6 +754,8 @@ mod tests {
             validator: current.node_id(),
             new_pubkey: new.node_id(),
             v_eff: 100,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         let other_payload = ValidatorKeyRotation {
             v_eff: 999,
@@ -693,6 +834,8 @@ mod tests {
             validator: current.node_id(),
             new_pubkey: new.node_id(),
             v_eff: 100,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         let err = DualSignedRotation::sign(payload, &current, &wrong_new).unwrap_err();
         assert!(format!("{err}").contains("new signer's node_id does not match"));
@@ -729,5 +872,166 @@ mod tests {
         let mut c = base.clone();
         c.v_eff = c.v_eff.wrapping_add(1);
         assert_ne!(postcard::to_stdvec(&c).unwrap(), base_bytes);
+    }
+
+    // ── validate_scheme_consistency (#358) ───────────────────────────────
+
+    fn bls_keypair(
+        seed: u8,
+    ) -> (
+        crate::crypto::sig_scheme::BlsSecretKey,
+        crate::crypto::sig_scheme::BlsPublicKey,
+    ) {
+        let mut ikm = [0u8; 32];
+        ikm[0] = seed;
+        BlsAggregated::keygen(&ikm).expect("test BLS keygen")
+    }
+
+    #[test]
+    fn validate_scheme_consistency_ed25519_chain_accepts_no_bls_fields() {
+        let p = sample_payload();
+        assert_eq!(
+            p.validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_scheme_consistency_ed25519_chain_rejects_bls_pubkey_present() {
+        let (_sk, pk) = bls_keypair(0xA0);
+        let mut p = sample_payload();
+        p.new_bls_pubkey = Some(pk);
+        let err = p
+            .validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RotationStructuralError::BlsFieldsInconsistentWithScheme {
+                scheme: SignatureSchemeChoice::Ed25519Collected,
+                bls_pubkey_present: true,
+                bls_pop_present: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_scheme_consistency_ed25519_chain_rejects_bls_pop_present() {
+        let (sk, _pk) = bls_keypair(0xA1);
+        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let mut p = sample_payload();
+        p.new_bls_pop = Some(pop);
+        let err = p
+            .validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RotationStructuralError::BlsFieldsInconsistentWithScheme {
+                bls_pubkey_present: false,
+                bls_pop_present: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_scheme_consistency_bls_chain_accepts_valid_pop() {
+        let (sk, pk) = bls_keypair(0xB0);
+        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let mut p = sample_payload();
+        p.new_bls_pubkey = Some(pk);
+        p.new_bls_pop = Some(pop);
+        assert_eq!(
+            p.validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_scheme_consistency_bls_chain_rejects_missing_bls_pubkey() {
+        let p = sample_payload();
+        let err = p
+            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RotationStructuralError::BlsFieldsInconsistentWithScheme {
+                scheme: SignatureSchemeChoice::BlsAggregated,
+                bls_pubkey_present: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_scheme_consistency_bls_chain_rejects_missing_pop() {
+        let (_sk, pk) = bls_keypair(0xB1);
+        let mut p = sample_payload();
+        p.new_bls_pubkey = Some(pk);
+        let err = p
+            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RotationStructuralError::BlsFieldsInconsistentWithScheme {
+                scheme: SignatureSchemeChoice::BlsAggregated,
+                bls_pubkey_present: true,
+                bls_pop_present: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_scheme_consistency_bls_chain_rejects_pop_under_wrong_pubkey() {
+        // Rotator supplies a PoP signed by sk_a but claims a different
+        // BLS pubkey pk_b. Caught by `BlsAggregated::verify_pop`'s
+        // PopPubkeyMismatch check, surfaced here as
+        // `BlsPopVerificationFailed`. Same rogue-key-attack defense
+        // the registration path runs (#291).
+        let (sk_a, _pk_a) = bls_keypair(0xC0);
+        let (_sk_b, pk_b) = bls_keypair(0xC1);
+        let pop_under_a = BlsAggregated::sign_pop(&sk_a).unwrap();
+        let mut p = sample_payload();
+        p.new_bls_pubkey = Some(pk_b);
+        p.new_bls_pop = Some(pop_under_a);
+        let err = p
+            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RotationStructuralError::BlsPopVerificationFailed
+        ));
+    }
+
+    #[test]
+    fn validate_scheme_consistency_bls_chain_rejects_tampered_pop_signature() {
+        let (sk, pk) = bls_keypair(0xD0);
+        let mut pop = BlsAggregated::sign_pop(&sk).unwrap();
+        pop.sig[0] ^= 0xFF;
+        let mut p = sample_payload();
+        p.new_bls_pubkey = Some(pk);
+        p.new_bls_pop = Some(pop);
+        let err = p
+            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RotationStructuralError::BlsPopVerificationFailed
+        ));
+    }
+
+    #[test]
+    fn rotation_with_bls_fields_round_trips_through_postcard() {
+        // Wire-format sanity: the new optional BLS fields encode +
+        // decode via the `serde_optional_bls_pubkey` adapter and the
+        // existing `BlsPop` serde modules. Catches a layout regression
+        // in either path before the payload ever reaches a chain.
+        let (sk, pk) = bls_keypair(0xE0);
+        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let mut p = sample_payload();
+        p.new_bls_pubkey = Some(pk);
+        p.new_bls_pop = Some(pop);
+        let bytes = postcard::to_stdvec(&p).unwrap();
+        let back: ValidatorKeyRotation = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, p);
     }
 }
