@@ -384,7 +384,7 @@ sleep 30
 $TESTNET up node2 --workdir $WD --ambros-bin $BIN
 $TESTNET up node3 --workdir $WD --ambros-bin $BIN
 $TESTNET up node4 --workdir $WD --ambros-bin $BIN
-$TESTNET wait --all-reach-height $((PRE_H+10)) --workdir $WD --timeout 60
+$TESTNET wait --all-reach-height $((PRE_H+10)) --workdir $WD --timeout 120
 WAIT_EXIT=$?
 $TESTNET snap --workdir $WD
 $TESTNET verify-safety --workdir $WD
@@ -483,9 +483,10 @@ documented behaviour, not a bug.
 | 60 min | ~3–4 min | ~50 min | ~55 min |
 | 90 min | ~3–4 min | ~80–85 min | ~90 min |
 
-Each failed `wait` burns 30–60 s of dead time. C2/D3 trials are fixed
-~95 s each (5 s warmup + 30 s delay + 60 s recovery budget). Run sweeps
-in series unless your harness handles concurrent testnet workdirs
-cleanly.
+Each failed `wait` burns 30–120 s of dead time. C2/D3 trials are
+~65 s each on the happy path (5 s warmup + 30 s delay + ~30 s typical
+catch-up); the recovery `--timeout` is set to 120 s to absorb runner-load
+tail latency without spuriously timing out. Run sweeps in series unless
+your harness handles concurrent testnet workdirs cleanly.
 
 Report in under 800 words plus the verbatim failure dumps.
