@@ -569,6 +569,31 @@ pub fn genesis_qc(genesis: &Block, validator_set_len: usize) -> QuorumCertificat
     qc
 }
 
+/// BLS-flavored counterpart to [`genesis_qc`]. Returns the empty BLS QC
+/// over the genesis block: an empty signer bitmap and the
+/// `BLS_EMPTY_AGGREGATE_SENTINEL` aggregate.
+///
+/// **The bitmap is left empty intentionally.** The `Ed25519Collected`
+/// genesis QC fills its bitmap with `quorum_size` placeholder
+/// signatures because the verifier's well-formedness invariant
+/// requires `signatures.len() == signers.count()`. The BLS variant
+/// does not need this because its well-formedness check (#338) is the
+/// dual `(empty bitmap) ↔ (empty-aggregate sentinel)` invariant — and
+/// the dispatch-layer QC verifier (#345/#353) treats `signer_count == 0`
+/// as the genesis-skip condition in addition to `view == 0`. Mirroring
+/// the Ed25519 placeholder fill here would set bits without folding
+/// any real partials, leaving the aggregate at the empty sentinel and
+/// failing the `(non-empty bitmap) ↔ (non-sentinel aggregate)` half of
+/// the well-formedness check.
+///
+/// Every honest replica on a `bls_aggregated` chain derives the same
+/// QC from the shared `(genesis, validator_set_len)` pair, so the
+/// view-1 leader's proposal — justified by this QC — is byte-identical
+/// across replicas.
+pub fn genesis_qc_bls(genesis: &Block, validator_set_len: usize) -> QuorumCertificate {
+    QuorumCertificate::new_bls(0, genesis.hash(), validator_set_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,5 +1040,33 @@ mod tests {
         let qc_bls = QuorumCertificate::new_bls(0, [0; 32], 4);
         assert_eq!(qc_ed.signatures.scheme_name(), "ed25519_collected");
         assert_eq!(qc_bls.signatures.scheme_name(), "bls_aggregated");
+    }
+
+    // ── genesis_qc_bls (#354 step 2) ───────────────────────────────────
+
+    #[test]
+    fn genesis_qc_bls_is_well_formed_under_validator_set() {
+        // The empty-bitmap, empty-aggregate-sentinel shape must satisfy
+        // `is_well_formed` so the dispatch verifier accepts it under
+        // its `signer_count == 0` genesis-skip condition.
+        let vs = four_validators();
+        let genesis = Block::genesis([0; 32]);
+        let qc = genesis_qc_bls(&genesis, vs.len());
+        assert!(qc.is_well_formed(&vs));
+        assert_eq!(qc.signer_count(), 0);
+        assert!(qc.is_bls());
+        assert_eq!(qc.view, 0);
+        assert_eq!(qc.block_hash, genesis.hash());
+    }
+
+    #[test]
+    fn genesis_qc_bls_aggregate_is_empty_sentinel() {
+        let vs = four_validators();
+        let genesis = Block::genesis([7; 32]);
+        let qc = genesis_qc_bls(&genesis, vs.len());
+        let QcSignatures::BlsAggregated(agg) = &qc.signatures else {
+            panic!("genesis_qc_bls must produce a BLS QC");
+        };
+        assert!(BlsAggregated::is_empty_aggregate(agg));
     }
 }

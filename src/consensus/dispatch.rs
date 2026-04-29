@@ -337,7 +337,7 @@ pub fn ingress_wire_with_qc_verification(
             verify_sig(&signed)?;
             verify_bls_partial_if_required(&signed, bls_partial.as_ref(), qc_verification)?;
             Ok(vec![Dispatch::Safety(
-                crate::consensus::hotstuff::step::Event::VoteReceived(signed),
+                crate::consensus::hotstuff::step::Event::VoteReceived(signed, bls_partial),
             )])
         }
 
@@ -666,10 +666,13 @@ fn verify_qc_if_requested(
 pub fn egress_safety(
     action: &SafetyAction,
     signer: &dyn Signer,
+    bls_signer: Option<
+        &dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
+    >,
 ) -> anyhow::Result<Option<Outbound>> {
     match action {
         SafetyAction::Broadcast(msg) => {
-            let wire = sign_consensus_msg(msg, signer)?;
+            let wire = sign_consensus_msg(msg, signer, bls_signer)?;
             let payload = postcard::to_stdvec(&wire)
                 .map(Bytes::from)
                 .map_err(anyhow::Error::from)?;
@@ -677,7 +680,7 @@ pub fn egress_safety(
         }
 
         SafetyAction::SendTo(target, msg) => {
-            let wire = sign_consensus_msg(msg, signer)?;
+            let wire = sign_consensus_msg(msg, signer, bls_signer)?;
             let payload = postcard::to_stdvec(&wire)
                 .map(Bytes::from)
                 .map_err(anyhow::Error::from)?;
@@ -777,14 +780,20 @@ pub fn egress_snapshot_chunk_response(
 /// Sign a [`ConsensusMsg`] and wrap it in the appropriate [`WireMessage`]
 /// variant.
 ///
-/// The `Vote` variant's optional BLS partial is left as `None` here. The
-/// leader-side BLS signing path (the engine work tracked under #354) will
-/// populate it from a `PartialSigner<BlsAggregated>` plumbed through the
-/// dispatch layer; that work lives in a separate PR. Until then the wire
-/// format is stable but BLS chains will fail at the ingress layer added
-/// in [`verify_bls_partial_if_required`] — exactly the gap this issue is
-/// chartered to close.
-fn sign_consensus_msg(msg: &ConsensusMsg, signer: &dyn Signer) -> anyhow::Result<WireMessage> {
+/// On `bls_aggregated` chains, `bls_signer` must be `Some(_)` and is
+/// consulted whenever a `Vote` is being signed: the BLS partial is
+/// produced over the same canonical pre-image that the QC-aggregate
+/// verifier reconstructs over `(view, block_hash)` — i.e.
+/// [`preimage`]`(&Vote { view, block_hash })`. On `ed25519_collected`
+/// chains, `bls_signer` is `None` and the optional second wire field
+/// is left empty.
+fn sign_consensus_msg(
+    msg: &ConsensusMsg,
+    signer: &dyn Signer,
+    bls_signer: Option<
+        &dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
+    >,
+) -> anyhow::Result<WireMessage> {
     match msg {
         ConsensusMsg::Proposal(p) => {
             let signed = Signed::sign(p.clone(), signer)?;
@@ -792,7 +801,14 @@ fn sign_consensus_msg(msg: &ConsensusMsg, signer: &dyn Signer) -> anyhow::Result
         }
         ConsensusMsg::Vote(v) => {
             let signed = Signed::sign(v.clone(), signer)?;
-            Ok(WireMessage::Vote(signed, None))
+            let bls_partial = match bls_signer {
+                Some(bs) => {
+                    let bytes = preimage::<Vote>(v)?;
+                    Some(bs.sign_partial(&bytes))
+                }
+                None => None,
+            };
+            Ok(WireMessage::Vote(signed, bls_partial))
         }
         ConsensusMsg::NewView(nv) => {
             let signed = Signed::sign(nv.clone(), signer)?;
@@ -821,8 +837,11 @@ fn sign_consensus_msg(msg: &ConsensusMsg, signer: &dyn Signer) -> anyhow::Result
 pub fn egress_consensus_msg_with_loopback(
     msg: &ConsensusMsg,
     signer: &dyn Signer,
+    bls_signer: Option<
+        &dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
+    >,
 ) -> anyhow::Result<(Bytes, Vec<Dispatch>)> {
-    let wire = sign_consensus_msg(msg, signer)?;
+    let wire = sign_consensus_msg(msg, signer, bls_signer)?;
     let payload = postcard::to_stdvec(&wire)
         .map(Bytes::from)
         .map_err(anyhow::Error::from)?;
@@ -836,9 +855,14 @@ pub fn egress_consensus_msg_with_loopback(
                 Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
             ]
         }
-        WireMessage::Vote(signed, _bls_partial) => {
+        WireMessage::Vote(signed, bls_partial) => {
+            // Carry the BLS partial through the loopback so the
+            // self-vote on a BLS chain folds the partial into the
+            // leader's QC bucket — the next-view leader voting on
+            // its own proposal must contribute its BLS partial just
+            // like any peer's vote (#118 + #354 step 2).
             vec![Dispatch::Safety(
-                crate::consensus::hotstuff::step::Event::VoteReceived(signed.clone()),
+                crate::consensus::hotstuff::step::Event::VoteReceived(signed.clone(), *bls_partial),
             )]
         }
         WireMessage::NewView(signed) => {
@@ -1016,7 +1040,7 @@ mod tests {
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
         ));
     }
 
@@ -1156,7 +1180,7 @@ mod tests {
         };
         let action = SafetyAction::Broadcast(ConsensusMsg::Proposal(proposal));
 
-        let out = egress_safety(&action, &signer).unwrap().unwrap();
+        let out = egress_safety(&action, &signer, None).unwrap().unwrap();
         let Outbound::Broadcast(payload) = out else {
             panic!("expected Broadcast");
         };
@@ -1175,7 +1199,7 @@ mod tests {
         };
         let action = SafetyAction::SendTo(target, ConsensusMsg::Vote(vote));
 
-        let out = egress_safety(&action, &signer).unwrap().unwrap();
+        let out = egress_safety(&action, &signer, None).unwrap().unwrap();
         let Outbound::SendTo { to, payload } = out else {
             panic!("expected SendTo");
         };
@@ -1189,7 +1213,7 @@ mod tests {
         let signer = fresh_signer();
         use crate::consensus::hotstuff::step::StateUpdate;
         let action = SafetyAction::Persist(StateUpdate::VotedInView { view: 1 });
-        let out = egress_safety(&action, &signer).unwrap();
+        let out = egress_safety(&action, &signer, None).unwrap();
         assert!(out.is_none());
     }
 
@@ -1197,7 +1221,7 @@ mod tests {
     fn egress_commit_returns_none() {
         let signer = fresh_signer();
         let action = SafetyAction::Commit(genesis());
-        let out = egress_safety(&action, &signer).unwrap();
+        let out = egress_safety(&action, &signer, None).unwrap();
         assert!(out.is_none());
     }
 
@@ -1212,7 +1236,7 @@ mod tests {
             expected_height: 41,
             reason: crate::consensus::hotstuff::step::BlockSyncReason::UnknownParentOnProposal,
         };
-        let out = egress_safety(&action, &signer).unwrap().unwrap();
+        let out = egress_safety(&action, &signer, None).unwrap().unwrap();
         let Outbound::SendTo { to, payload } = out else {
             panic!("expected SendTo");
         };
@@ -1233,7 +1257,8 @@ mod tests {
             justify: sample_qc(),
         };
         let action = SafetyAction::Broadcast(ConsensusMsg::Proposal(proposal.clone()));
-        let Outbound::Broadcast(payload) = egress_safety(&action, &signer).unwrap().unwrap() else {
+        let Outbound::Broadcast(payload) = egress_safety(&action, &signer, None).unwrap().unwrap()
+        else {
             panic!("expected Broadcast");
         };
 
@@ -1510,7 +1535,7 @@ mod tests {
         let dispatches = ingress(new_signer.node_id(), &bytes, &history, &key_history).unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
         ));
     }
 
@@ -1573,7 +1598,7 @@ mod tests {
         let dispatches = ingress(old_signer.node_id(), &bytes, &history, &key_history).unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
         ));
     }
 
@@ -1796,7 +1821,7 @@ mod tests {
         let dispatches = ingress(new.node_id(), &bytes, &history, &key_history).unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
         ));
     }
 
@@ -1826,7 +1851,7 @@ mod tests {
         let dispatches = ingress(old.node_id(), &bytes, &history, &key_history).unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
         ));
     }
 
@@ -2040,7 +2065,7 @@ mod tests {
         let dispatches = ingress(removed.node_id(), &bytes, &history, &key_history).unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
         ));
     }
 
@@ -2370,7 +2395,7 @@ mod tests {
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
         ));
     }
 
@@ -2523,7 +2548,7 @@ mod tests {
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
         ));
     }
 

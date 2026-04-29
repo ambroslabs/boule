@@ -444,11 +444,14 @@ fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
             signer: source,
             sig,
         }),
-        ConsensusMsg::Vote(payload) => Event::VoteReceived(Signed {
-            payload,
-            signer: source,
-            sig,
-        }),
+        ConsensusMsg::Vote(payload) => Event::VoteReceived(
+            Signed {
+                payload,
+                signer: source,
+                sig,
+            },
+            None,
+        ),
         ConsensusMsg::NewView(payload) => Event::NewViewReceived(Signed {
             payload,
             signer: source,
@@ -676,7 +679,7 @@ proptest! {
                         signer: sender,
                         sig: [0u8; 64],
                     };
-                    replicas.inject(target, Event::VoteReceived(signed));
+                    replicas.inject(target, Event::VoteReceived(signed, None));
                 }
                 FuzzStep::InjectBytesNewView { target, sender_idx, qc_view, qc_block_hash } => {
                     let sender = *replicas.validators.get(sender_idx).unwrap();
@@ -802,11 +805,14 @@ proptest! {
             let event = match step {
                 CacheStep::Vote { signer_idx, view, block_hash } => {
                     let signer = *validators.get(signer_idx).unwrap();
-                    Event::VoteReceived(Signed {
-                        payload: Vote { view, block_hash },
-                        signer,
-                        sig: [0u8; 64],
-                    })
+                    Event::VoteReceived(
+                        Signed {
+                            payload: Vote { view, block_hash },
+                            signer,
+                            sig: [0u8; 64],
+                        },
+                        None,
+                    )
                 }
                 CacheStep::ParkedProposal { sender_idx, view, height, parent_seed } => {
                     let sender = *validators.get(sender_idx).unwrap();
