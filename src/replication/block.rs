@@ -60,6 +60,23 @@ pub struct BlockHeader {
     /// sequence. Binds the header to its payload so tampering with any
     /// command bytes invalidates the block.
     pub commands_commitment: [u8; 32],
+
+    /// Cryptographic commitment over the validator-history state at this
+    /// block (#325, audit finding 7-F2 anti-rollback). The commitment
+    /// covers the active `(ValidatorSetHistory, ValidatorKeyHistory,
+    /// BlsKeyHistory?)` triple as observable when this block was built;
+    /// see [`crate::consensus::history_commitment::validator_history_commitment_v1`]
+    /// for the canonical hash. Each block's signature therefore
+    /// implicitly attests to the validator-history timeline that
+    /// produced it, so a replica restoring from a tampered or
+    /// rolled-back persisted history blob can detect the divergence
+    /// against the chain's latest committed block.
+    ///
+    /// PR A populates this field at the leader and stamps a deterministic
+    /// value at genesis. Validation at recovery and at proposal-receive
+    /// time is wired in by follow-up PRs in the #325 stack — until those
+    /// land, the field is informational and never cross-checked.
+    pub validator_history_commitment: [u8; 32],
 }
 
 impl BlockHeader {
@@ -93,12 +110,19 @@ impl Block {
 
     /// The canonical genesis block: height 0, view 0, all-zero parent hash,
     /// no commands. `state_commitment` is the caller-supplied commitment
-    /// over the initial state machine.
+    /// over the initial state machine. `validator_history_commitment` is
+    /// the caller-supplied commitment over the genesis-time validator
+    /// history (see #325 / [`BlockHeader::validator_history_commitment`]) —
+    /// production callers compute this via
+    /// [`crate::consensus::history_commitment::validator_history_commitment_v1`]
+    /// over the freshly-constructed `(ValidatorSetHistory,
+    /// ValidatorKeyHistory, BlsKeyHistory?)`; tests that don't exercise
+    /// the recovery-time check can pass `[0; 32]`.
     ///
     /// The `proposer` field is all-zero on genesis. Consensus treats
     /// genesis as unsigned and validates it out-of-band against the
     /// configured initial state commitment.
-    pub fn genesis(state_commitment: [u8; 32]) -> Self {
+    pub fn genesis(state_commitment: [u8; 32], validator_history_commitment: [u8; 32]) -> Self {
         let commands: Vec<Bytes> = Vec::new();
         Self {
             header: BlockHeader {
@@ -108,6 +132,7 @@ impl Block {
                 proposer: [0u8; 32],
                 state_commitment,
                 commands_commitment: Self::commands_commitment(&commands),
+                validator_history_commitment,
             },
             commands,
         }
@@ -200,6 +225,7 @@ mod tests {
             proposer: [0x22; 32],
             state_commitment: [0x33; 32],
             commands_commitment: Block::commands_commitment(&cmds(&[b"a", b"b"])),
+            validator_history_commitment: [0; 32],
         }
     }
 
@@ -211,23 +237,30 @@ mod tests {
             proposer: [0x44; 32],
             state_commitment: [0x55; 32],
             commands_commitment: Block::commands_commitment(&commands),
+            validator_history_commitment: [0; 32],
         };
         Block { header, commands }
     }
 
     #[test]
     fn genesis_is_stable_and_zero_parent() {
-        let g = Block::genesis([0x77; 32]);
+        let g = Block::genesis([0x77; 32], [0x88; 32]);
         assert_eq!(g.header.parent_hash, [0u8; 32]);
         assert_eq!(g.header.height, 0);
         assert_eq!(g.header.view, 0);
         assert_eq!(g.header.state_commitment, [0x77; 32]);
+        assert_eq!(g.header.validator_history_commitment, [0x88; 32]);
         assert!(g.commands.is_empty());
 
         // Stable across calls.
         let h1 = g.hash();
-        let h2 = Block::genesis([0x77; 32]).hash();
+        let h2 = Block::genesis([0x77; 32], [0x88; 32]).hash();
         assert_eq!(h1, h2);
+
+        // Different validator_history_commitment ⇒ different genesis hash:
+        // genesis identity binds to the validator history at v=0.
+        let other = Block::genesis([0x77; 32], [0x99; 32]).hash();
+        assert_ne!(h1, other);
     }
 
     #[test]
@@ -267,8 +300,12 @@ mod tests {
         perturbed.state_commitment[0] ^= 0xFF;
         assert_ne!(perturbed.hash(), original);
 
-        let mut perturbed = h;
+        let mut perturbed = h.clone();
         perturbed.commands_commitment[0] ^= 0xFF;
+        assert_ne!(perturbed.hash(), original);
+
+        let mut perturbed = h;
+        perturbed.validator_history_commitment[0] ^= 0xFF;
         assert_ne!(perturbed.hash(), original);
     }
 

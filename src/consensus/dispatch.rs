@@ -189,6 +189,19 @@ pub enum IngressError {
         view: View,
         signer: NodeId,
     },
+    /// A `Proposal`'s stamped `validator_history_commitment` does not
+    /// match what the follower would compute over the block's
+    /// reconfig/rotation commands (#325 PR C, audit finding 7-F2).
+    /// Catches a Byzantine leader who proposes blocks with a forged
+    /// commitment, before any honest replica votes — PR B's recovery
+    /// check would catch the same class at restart, but rejecting at
+    /// ingress closes the window between propose and restart.
+    InvalidValidatorHistoryCommitment {
+        view: View,
+        height: u64,
+        claimed: [u8; 32],
+        actual: [u8; 32],
+    },
 }
 
 impl std::fmt::Display for IngressError {
@@ -211,6 +224,19 @@ impl std::fmt::Display for IngressError {
                 f,
                 "BLS partial on Vote at view {view} from signer {signer:?} is missing or did not verify under the historical BLS pubkey",
             ),
+            IngressError::InvalidValidatorHistoryCommitment {
+                view,
+                height,
+                claimed,
+                actual,
+            } => write!(
+                f,
+                "validator_history_commitment mismatch on Proposal at height={height} view={view}: \
+                 leader stamped {} but follower computes {} over the block's reconfig/rotation \
+                 commands (audit #325/7-F2)",
+                hex::encode(claimed),
+                hex::encode(actual),
+            ),
         }
     }
 }
@@ -223,12 +249,13 @@ impl std::error::Error for IngressError {
             IngressError::UnknownSigner(_)
             | IngressError::MalformedHighQc { .. }
             | IngressError::InvalidQcAggregate { .. }
-            | IngressError::InvalidBlsPartial { .. } => None,
+            | IngressError::InvalidBlsPartial { .. }
+            | IngressError::InvalidValidatorHistoryCommitment { .. } => None,
         }
     }
 }
 
-/// QC-aggregate verification policy for [`ingress_with_qc_verification`].
+/// Chain-level verification context for [`ingress_with_qc_verification`].
 ///
 /// `Skip` is the default for tests that construct QCs with placeholder
 /// signatures (no actual cryptographic content) and for the legacy
@@ -236,16 +263,33 @@ impl std::error::Error for IngressError {
 ///
 /// `Verify` is what production wires: every QC's aggregate is checked
 /// against the per-historical-view validator pubkeys before any
-/// `Dispatch` is emitted. This closes the Byzantine-leader-ships-a-bogus
-/// QC vector regardless of scheme.
+/// `Dispatch` is emitted (closes the Byzantine-leader-ships-a-bogus-QC
+/// vector regardless of scheme), and every `Proposal`'s
+/// `validator_history_commitment` is checked against what the follower
+/// would compute over the block's reconfig/rotation commands (#325 PR
+/// C; closes the Byzantine-leader-ships-a-bogus-history-commitment
+/// vector before any vote is cast).
+///
+/// The historical name reflects QC verification, but the variant
+/// carries every chain-level parameter needed for both checks:
+/// `scheme`, `bls_key_history`, and `min_v_eff_delay` are all read by
+/// the proposal-receive validator alongside the QC verifier.
 pub enum QcVerification<'a> {
     Skip,
     Verify {
         scheme: SignatureSchemeChoice,
-        /// Required on BLS chains; ignored on Ed25519 chains. The
-        /// per-historical-view BLS pubkey lookup
-        /// [`QuorumCertificate::verify_aggregate_bls`] indexes through.
+        /// Required on BLS chains; ignored on Ed25519 chains. Used by
+        /// both the QC aggregate verifier and the proposal-receive
+        /// history-commitment verifier (#325 PR C).
         bls_key_history: Option<&'a BlsKeyHistory>,
+        /// Minimum gap between a reconfig-carrying block's view and
+        /// the reconfig's `v_eff`. Used by the proposal-receive
+        /// history-commitment verifier (#325 PR C) so its
+        /// fork-and-apply mirror of `apply_committed_reconfigs`
+        /// rejects/accepts reconfigs identically. In production this
+        /// is `crate::consensus::reconfig::MIN_V_EFF_DELAY`; tests
+        /// may pass a different value to exercise edge cases.
+        min_v_eff_delay: View,
     },
 }
 
@@ -354,6 +398,21 @@ pub fn ingress_wire_with_qc_verification(
             verify_sig(&signed, chain_id)?;
             verify_qc_if_requested(
                 &signed.payload.justify,
+                history,
+                key_history,
+                qc_verification,
+                chain_id,
+            )?;
+            // #325 PR C: verify the leader's stamped
+            // `validator_history_commitment` matches what we would
+            // compute over the proposed block's reconfig/rotation
+            // commands. Catches a Byzantine leader who proposes
+            // blocks with a forged commitment, before any honest
+            // replica votes on the block. PR B catches the same
+            // class of forgery at recovery time; PR C closes the
+            // window between propose and restart.
+            verify_proposal_history_commitment_if_requested(
+                &signed.payload.block,
                 history,
                 key_history,
                 qc_verification,
@@ -570,6 +629,7 @@ fn verify_bls_partial_if_required(
     let QcVerification::Verify {
         scheme,
         bls_key_history,
+        min_v_eff_delay: _,
     } = qc_verification
     else {
         return Ok(());
@@ -633,6 +693,7 @@ fn verify_qc_if_requested(
     let QcVerification::Verify {
         scheme,
         bls_key_history,
+        min_v_eff_delay: _,
     } = qc_verification
     else {
         return Ok(());
@@ -761,6 +822,60 @@ fn verify_high_qc_piggyback(
         return false;
     }
     verify_qc_if_requested(qc, history, key_history, qc_verification, chain_id).is_ok()
+}
+
+/// Verify a `Proposal`'s stamped `validator_history_commitment`
+/// matches what the follower would compute over the block's
+/// reconfig/rotation commands (#325 PR C).
+///
+/// The check is gated by [`QcVerification`] so the same dispatch path
+/// exercised by tests with placeholder commitments (the `Skip`
+/// variant) does not require every test fixture to compute the real
+/// hash. Production wires `Verify` and runs the check.
+///
+/// Soundness: [`crate::consensus::history_commitment::compute_post_block_commitment`]
+/// is a deterministic function of `(block, current_histories,
+/// chain_id, scheme, min_v_eff_delay)`. Any honest follower with the
+/// same histories and chain config produces the same value. A
+/// Byzantine leader who stamps a value its own post-block state
+/// would not produce is rejected here. A follower whose histories
+/// diverge from the leader's (e.g., rolled-back blob, different
+/// commit position with reconfig in flight) would also reject — but
+/// that's the rollback condition #325 PR B catches at recovery, so
+/// such a follower would have refused to start anyway.
+fn verify_proposal_history_commitment_if_requested(
+    block: &crate::replication::block::Block,
+    history: &ValidatorSetHistory,
+    key_history: &ValidatorKeyHistory,
+    qc_verification: &QcVerification<'_>,
+    chain_id: &ChainId,
+) -> Result<(), IngressError> {
+    let QcVerification::Verify {
+        scheme,
+        bls_key_history,
+        min_v_eff_delay,
+    } = qc_verification
+    else {
+        return Ok(());
+    };
+    let actual = crate::consensus::history_commitment::compute_post_block_commitment(
+        block,
+        history,
+        key_history,
+        *bls_key_history,
+        chain_id,
+        *scheme,
+        *min_v_eff_delay,
+    );
+    if actual != block.header.validator_history_commitment {
+        return Err(IngressError::InvalidValidatorHistoryCommitment {
+            view: block.header.view,
+            height: block.header.height,
+            claimed: block.header.validator_history_commitment,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 // ── egress_safety ─────────────────────────────────────────────────────────────
@@ -1028,7 +1143,7 @@ mod tests {
     }
 
     fn genesis() -> Block {
-        Block::genesis([0u8; 32])
+        Block::genesis([0u8; 32], [0; 32])
     }
 
     fn sample_qc() -> QuorumCertificate {
@@ -1414,7 +1529,7 @@ mod tests {
     fn sample_manifest_for_dispatch() -> SnapshotManifest {
         use crate::replication::block::{Block, BlockHeader};
         let vs = ValidatorSet::new(vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]);
-        let parent_hash = Block::genesis([0u8; 32]).hash();
+        let parent_hash = Block::genesis([0u8; 32], [0; 32]).hash();
         let commands: Vec<bytes::Bytes> = Vec::new();
         let block = Block {
             header: BlockHeader {
@@ -1424,6 +1539,7 @@ mod tests {
                 proposer: [0u8; 32],
                 state_commitment: [0xCD; 32],
                 commands_commitment: Block::commands_commitment(&commands),
+                validator_history_commitment: [0; 32],
             },
             commands,
         };
@@ -1431,7 +1547,14 @@ mod tests {
         let payload = b"chunky payload".repeat(8);
         let chunks = crate::replication::snapshot::chunk_snapshot(&payload, 32);
         let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|(_, h)| *h).collect();
-        SnapshotManifest::build(block, &vs, 32, chunk_hashes, qc, 1_700_000_000)
+        SnapshotManifest::build_for_test_genesis_histories(
+            block,
+            &vs,
+            32,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        )
     }
 
     #[test]
@@ -1769,6 +1892,7 @@ mod tests {
             proposer: new_signer.node_id(),
             state_commitment: [0u8; 32],
             commands_commitment: Block::commands_commitment(&[]),
+            validator_history_commitment: [0; 32],
         };
         let block = Block {
             header,
@@ -2163,6 +2287,7 @@ mod tests {
             proposer: new.node_id(),
             state_commitment: [0u8; 32],
             commands_commitment: Block::commands_commitment(&[]),
+            validator_history_commitment: [0; 32],
         };
         let proposal = Proposal {
             block: Block {
@@ -2350,8 +2475,15 @@ mod tests {
         let (signers, vs, qc) = build_real_ed25519_qc(view, block_hash);
         let leader = &signers[0];
 
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+
         // Build a proposal at the next view that justifies on this QC.
-        let block = Block {
+        // #325 PR C: stamp the post-block validator_history_commitment
+        // so the proposal-receive verifier accepts it. The block has
+        // no reconfig/rotation commands, so post-block == pre-block ==
+        // the v1 hash over the genesis-time histories.
+        let mut block = Block {
             header: crate::replication::block::BlockHeader {
                 parent_hash: block_hash,
                 height: 1,
@@ -2359,19 +2491,29 @@ mod tests {
                 proposer: leader.node_id(),
                 state_commitment: [0; 32],
                 commands_commitment: [0; 32],
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };
+        block.header.validator_history_commitment =
+            crate::consensus::history_commitment::compute_post_block_commitment(
+                &block,
+                &history,
+                &key_history,
+                None,
+                &ChainId::TEST,
+                SignatureSchemeChoice::Ed25519Collected,
+                crate::consensus::reconfig::MIN_V_EFF_DELAY,
+            );
         let proposal = Proposal { block, justify: qc };
         let signed = Signed::sign(proposal, leader, &ChainId::TEST).unwrap();
         let wire = WireMessage::Proposal(signed);
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
-        let history = ValidatorSetHistory::from_genesis(vs.clone());
-        let key_history = key_history_from_set(&vs);
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let dispatches = ingress_with_qc_verification(
             leader.node_id(),
@@ -2383,6 +2525,77 @@ mod tests {
         )
         .expect("real Ed25519 QC must verify under the genesis pubkeys");
         assert_eq!(dispatches.len(), 2);
+    }
+
+    /// PR C of #325: a Byzantine leader stamps a `Proposal` with a
+    /// `validator_history_commitment` that doesn't match the
+    /// post-block hash any honest follower would compute. The
+    /// proposal-receive verifier must reject before any safety-core
+    /// event fires, with a `InvalidValidatorHistoryCommitment`
+    /// error. Bisect-confirmed by removing the
+    /// `verify_proposal_history_commitment_if_requested` call from
+    /// the Proposal ingress arm — the test then sees the proposal
+    /// dispatched and `expect_err` panics.
+    #[test]
+    fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_proposal() {
+        let view: View = 5;
+        let block_hash = [0x55; 32];
+        let (signers, vs, qc) = build_real_ed25519_qc(view, block_hash);
+        let leader = &signers[0];
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+
+        // The block's validator_history_commitment is filled with a
+        // distinctive sentinel that no honest replica would ever
+        // compute over genesis-time histories with no commands. The
+        // QC justify is real, so the QC verifier passes — the only
+        // remaining gate is the proposal-receive history-commitment
+        // verifier (#325 PR C).
+        let forged_commitment: [u8; 32] = [0xDE; 32];
+        let block = Block {
+            header: crate::replication::block::BlockHeader {
+                parent_hash: block_hash,
+                height: 1,
+                view: view + 1,
+                proposer: leader.node_id(),
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: forged_commitment,
+            },
+            commands: vec![],
+        };
+        let proposal = Proposal { block, justify: qc };
+        let signed = Signed::sign(proposal, leader, &ChainId::TEST).unwrap();
+        let wire = WireMessage::Proposal(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        };
+        let err = ingress_with_qc_verification(
+            leader.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+            &ChainId::TEST,
+        )
+        .expect_err("forged validator_history_commitment must be rejected at ingress");
+        assert!(
+            matches!(
+                err,
+                IngressError::InvalidValidatorHistoryCommitment {
+                    height: 1,
+                    view: 6,
+                    claimed,
+                    ..
+                } if claimed == forged_commitment
+            ),
+            "expected InvalidValidatorHistoryCommitment with the forged sentinel, got {err:?}",
+        );
     }
 
     #[test]
@@ -2407,6 +2620,7 @@ mod tests {
                 proposer: leader.node_id(),
                 state_commitment: [0; 32],
                 commands_commitment: [0; 32],
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };
@@ -2420,6 +2634,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let err = ingress_with_qc_verification(
             leader.node_id(),
@@ -2462,6 +2677,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let err = ingress_with_qc_verification(
             messenger.node_id(),
@@ -2508,6 +2724,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let dispatches = ingress_with_qc_verification(
             voter.node_id(),
@@ -2569,6 +2786,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let dispatches = ingress_with_qc_verification(
             voter.node_id(),
@@ -2632,6 +2850,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let dispatches = ingress_with_qc_verification(
             voter.node_id(),
@@ -2677,6 +2896,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let dispatches = ingress_with_qc_verification(
             voter.node_id(),
@@ -2703,8 +2923,25 @@ mod tests {
         // unchanged or no chain ever boots.
         let signer = fresh_signer();
         let vs = make_vs_with_signers(&[&signer]);
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        // #325 PR C: stamp the genesis block's
+        // validator_history_commitment so the proposal-receive
+        // verifier matches. Genesis has no commands, so the post-block
+        // hash equals the v1 hash of the genesis-time histories.
+        let mut block = genesis();
+        block.header.validator_history_commitment =
+            crate::consensus::history_commitment::compute_post_block_commitment(
+                &block,
+                &history,
+                &key_history,
+                None,
+                &ChainId::TEST,
+                SignatureSchemeChoice::Ed25519Collected,
+                crate::consensus::reconfig::MIN_V_EFF_DELAY,
+            );
         let proposal = Proposal {
-            block: genesis(),
+            block,
             justify: sample_qc(),
         };
         let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
@@ -2716,6 +2953,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let dispatches = ingress_with_qc_verification(
             signer.node_id(),
@@ -2757,6 +2995,7 @@ mod tests {
                 proposer: signer.node_id(),
                 state_commitment: [0; 32],
                 commands_commitment: [0; 32],
+                validator_history_commitment: [0; 32],
             },
             commands: vec![],
         };
@@ -2773,6 +3012,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let err = ingress_with_qc_verification(
             signer.node_id(),
@@ -2845,6 +3085,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::BlsAggregated,
             bls_key_history: Some(&bls_history),
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
 
         let dispatches = ingress_with_qc_verification(
@@ -2882,6 +3123,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::BlsAggregated,
             bls_key_history: Some(&bls_history),
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
 
         let err = ingress_with_qc_verification(
@@ -2919,6 +3161,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::BlsAggregated,
             bls_key_history: Some(&bls_history),
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
 
         let err = ingress_with_qc_verification(
@@ -2964,6 +3207,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::BlsAggregated,
             bls_key_history: Some(&bls_history),
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
 
         let err = ingress_with_qc_verification(
@@ -3002,6 +3246,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
 
         let dispatches = ingress_with_qc_verification(
@@ -3041,6 +3286,7 @@ mod tests {
         let qc_verify = QcVerification::Verify {
             scheme: SignatureSchemeChoice::BlsAggregated,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
 
         let err = ingress_with_qc_verification(

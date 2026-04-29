@@ -799,7 +799,7 @@ mod tests {
         justify.add_signature(1, [0x02; 64]);
         justify.add_signature(2, [0x03; 64]);
         let proposal = Proposal {
-            block: Block::genesis([0; 32]),
+            block: Block::genesis([0; 32], [0; 32]),
             justify,
         };
         let signed = Signed::sign(proposal.clone(), &signer, &ChainId::TEST).unwrap();
@@ -861,7 +861,7 @@ mod tests {
         let vs = four_validators();
         let forged: Signed<Proposal> = Signed {
             payload: Proposal {
-                block: Block::genesis([0; 32]),
+                block: Block::genesis([0; 32], [0; 32]),
                 justify: QuorumCertificate::new(vote.view, vote.block_hash, vs.len()),
             },
             signer: signed_vote.signer,
@@ -876,7 +876,7 @@ mod tests {
         let mut justify = QuorumCertificate::new(0, [0; 32], vs.len());
         justify.add_signature(0, [0xFE; 64]);
         let msg = ConsensusMsg::Proposal(Proposal {
-            block: Block::genesis([0; 32]),
+            block: Block::genesis([0; 32], [0; 32]),
             justify,
         });
         let wire = postcard::to_stdvec(&msg).unwrap();
@@ -1050,7 +1050,7 @@ mod tests {
         // `is_well_formed` so the dispatch verifier accepts it under
         // its `signer_count == 0` genesis-skip condition.
         let vs = four_validators();
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let qc = genesis_qc_bls(&genesis, vs.len());
         assert!(qc.is_well_formed(&vs));
         assert_eq!(qc.signer_count(), 0);
@@ -1062,7 +1062,7 @@ mod tests {
     #[test]
     fn genesis_qc_bls_aggregate_is_empty_sentinel() {
         let vs = four_validators();
-        let genesis = Block::genesis([7; 32]);
+        let genesis = Block::genesis([7; 32], [0; 32]);
         let qc = genesis_qc_bls(&genesis, vs.len());
         let QcSignatures::BlsAggregated(agg) = &qc.signatures else {
             panic!("genesis_qc_bls must produce a BLS QC");

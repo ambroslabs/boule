@@ -382,9 +382,6 @@ async fn start_consensus(
         validator_set.len()
     );
 
-    let genesis = build_genesis(cons_cfg)?;
-    info!("consensus: genesis hash = {:?}", genesis.hash());
-
     // Resolve genesis BLS keys + reconcile this node's local BLS
     // identity with the chain's scheme (#335). This catches three
     // misconfigurations at startup, before any wire traffic flows:
@@ -393,9 +390,17 @@ async fn start_consensus(
     //   - BLS chain whose loaded BLS pubkey is not a genesis validator
     //   - Ed25519 chain with `[node.bls_validator_identity]` set
     //     (BLS keys have no role on an Ed25519 chain)
+    //
+    // Resolved *before* `build_genesis` so the genesis block can carry
+    // a real `validator_history_commitment` (#325 PR B), computed over
+    // the genesis-time `(set_history, key_history, bls_key_history?)`
+    // triple.
     let genesis_bls = cons_cfg
         .resolve_genesis_bls_keys()
         .context("validating genesis BLS validator table")?;
+
+    let genesis = build_genesis(cons_cfg, &validator_set, &genesis_bls)?;
+    info!("consensus: genesis hash = {:?}", genesis.hash());
 
     let (storage, wal): (Arc<dyn Storage>, Arc<dyn Wal>) = match &cons_cfg.storage_dir {
         Some(dir) => {
@@ -480,6 +485,16 @@ async fn start_consensus(
         ));
         node = node.with_bls_signer(bls_signer);
     }
+
+    // #325 PR B: gate startup on rebuild-from-chain validation. The
+    // BLS history (if any) has been wired in immediately above, so
+    // every history table the commitment covers is in place — the
+    // walk can compare each block's stamped commitment against the
+    // rebuilt triple and assert end-of-walk equality with what was
+    // loaded from storage. A divergence here means the persisted
+    // blob was tampered with or rolled back, and we refuse to start.
+    node.verify_persisted_history_consistency()
+        .context("verifying persisted validator histories against committed chain (#325 PR B)")?;
 
     let initial_status = Arc::new(node.build_status());
     let (status_tx, status_rx) = watch::channel(initial_status);
@@ -769,14 +784,59 @@ fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Resul
 
 /// Build the genesis block from the optional `genesis_seed_hex` config
 /// field. Defaults to all-zeros when unset.
-fn build_genesis(cfg: &ConsensusConfig) -> anyhow::Result<Block> {
+///
+/// `validator_history_commitment` is computed from the genesis-time
+/// validator-set / key / BLS-key histories so a recovering node can
+/// cross-check its persisted history blobs against the chain's claim
+/// (#325 PR B). The triple is the canonical input to
+/// [`crate::consensus::history_commitment::validator_history_commitment_v1`].
+fn build_genesis(
+    cfg: &ConsensusConfig,
+    validator_set: &ValidatorSet,
+    genesis_bls: &[(NodeId, crate::crypto::sig_scheme::BlsPublicKey)],
+) -> anyhow::Result<Block> {
     let mut seed = [0u8; 32];
     if let Some(hex) = &cfg.genesis_seed_hex {
         let bytes = decode_hex32(hex)
             .ok_or_else(|| anyhow::anyhow!("genesis_seed_hex must be 64 hex chars (32 bytes)"))?;
         seed = bytes;
     }
-    Ok(Block::genesis(seed))
+    let commitment = compute_genesis_validator_history_commitment(
+        validator_set,
+        cfg.signature_scheme,
+        genesis_bls,
+    );
+    Ok(Block::genesis(seed, commitment))
+}
+
+/// Compute the canonical genesis-time `validator_history_commitment`
+/// (#325 PR B). Shared between [`build_genesis`] and the recovery
+/// path's "what should the genesis block's commitment be?" derivation
+/// so both produce byte-identical hashes from the same inputs.
+fn compute_genesis_validator_history_commitment(
+    validator_set: &ValidatorSet,
+    scheme: crate::crypto::sig_scheme::SignatureSchemeChoice,
+    genesis_bls: &[(NodeId, crate::crypto::sig_scheme::BlsPublicKey)],
+) -> [u8; 32] {
+    let set_hist = crate::consensus::validator_history::ValidatorSetHistory::from_genesis(
+        validator_set.clone(),
+    );
+    let key_hist = crate::consensus::validator_key_history::ValidatorKeyHistory::new(
+        validator_set.iter().copied(),
+    );
+    let bls_hist = match scheme {
+        crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => Some(
+            crate::consensus::bls_key_history::BlsKeyHistory::with_genesis(
+                genesis_bls.iter().copied(),
+            ),
+        ),
+        crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => None,
+    };
+    crate::consensus::history_commitment::validator_history_commitment_v1(
+        &set_hist,
+        &key_hist,
+        bls_hist.as_ref(),
+    )
 }
 
 fn decode_hex32(s: &str) -> Option<[u8; 32]> {

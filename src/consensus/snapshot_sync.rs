@@ -720,7 +720,7 @@ mod tests {
     }
 
     fn sample_block(height: u64, view: u64) -> Block {
-        let parent_hash = Block::genesis([0u8; 32]).hash();
+        let parent_hash = Block::genesis([0u8; 32], [0; 32]).hash();
         let commands: Vec<Bytes> = Vec::new();
         Block {
             header: BlockHeader {
@@ -730,6 +730,7 @@ mod tests {
                 proposer: [0u8; 32],
                 state_commitment: [0xCD; 32],
                 commands_commitment: Block::commands_commitment(&commands),
+                validator_history_commitment: [0; 32],
             },
             commands,
         }
@@ -747,8 +748,14 @@ mod tests {
         let chunks: Vec<Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
         let block = sample_block(height, view);
         let qc = quorum_qc(vs.len(), block.hash());
-        let manifest =
-            SnapshotManifest::build(block, vs, chunk_size, chunk_hashes, qc, 1_700_000_000);
+        let manifest = SnapshotManifest::build_for_test_genesis_histories(
+            block,
+            vs,
+            chunk_size,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+        );
         (manifest, chunks)
     }
 
