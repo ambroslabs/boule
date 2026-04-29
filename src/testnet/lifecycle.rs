@@ -104,7 +104,7 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
         layouts.push(layout);
     }
     let bin_clone = binary.clone();
-    let discoveries = futures_util::future::try_join_all(layouts.iter().cloned().map(|layout| {
+    let discoveries = futures_util::future::try_join_all(layouts.into_iter().map(|layout| {
         let bin = bin_clone.clone();
         async move {
             let info = launch_once_for_discovery(&bin, &layout)
