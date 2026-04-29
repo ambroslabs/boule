@@ -55,3 +55,16 @@ blst              = "0.3"
 [dev-dependencies]
 tokio             = { version = "1", features = ["full", "test-util"] }
 proptest          = { version = "1", default-features = false, features = ["std", "bit-set"] }
+
+# Profile used by CI test runs. Inherits release-level optimization so
+# crypto-heavy and large-N consensus simulation tests finish in
+# reasonable wall-clock, while keeping `debug_assert!` and integer
+# overflow checks active so the suite still surfaces invariants the
+# default debug profile would have caught. Local `cargo test` continues
+# to use the default `dev` profile; CI explicitly opts into this one
+# via `--cargo-profile test-release` (nextest) and `--profile test-release`
+# (doctests).
+[profile.test-release]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

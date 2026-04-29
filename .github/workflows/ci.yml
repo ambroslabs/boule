@@ -99,13 +99,13 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
       - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'heavy'
         name: Heavy shard (compute-bound, serialized)
-        run: cargo nextest run --locked --all-targets -E "$HEAVY_FILTER" --test-threads=1
+        run: cargo nextest run --cargo-profile test-release --locked --all-targets -E "$HEAVY_FILTER" --test-threads=1
       - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'default'
         name: Default shard (everything else, parallel)
-        run: cargo nextest run --locked --all-targets -E "not ($HEAVY_FILTER)" --test-threads=$(nproc)
+        run: cargo nextest run --cargo-profile test-release --locked --all-targets -E "not ($HEAVY_FILTER)" --test-threads=$(nproc)
       - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'default'
         name: Doctests
-        run: cargo test --locked --doc -- --test-threads=$(nproc)
+        run: cargo test --profile test-release --locked --doc -- --test-threads=$(nproc)
 
   deny:
     name: Deny (licenses + advisories)
