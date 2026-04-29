@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consensus::View;
 use crate::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
-use crate::crypto::signed::{SignedMessage, Signer, preimage};
+use crate::crypto::signed::{ChainId, SignedMessage, Signer, preimage};
 use crate::p2p::NodeId;
 
 /// Magic prefix that tags a `Block.commands` entry as a tagged
@@ -328,6 +328,7 @@ impl DualSignedRotation {
         payload: ValidatorKeyRotation,
         current: &dyn Signer,
         new: &dyn Signer,
+        chain_id: &ChainId,
     ) -> Result<Self> {
         if new.node_id() != payload.new_pubkey {
             anyhow::bail!(
@@ -335,7 +336,7 @@ impl DualSignedRotation {
                  sig_new would never verify"
             );
         }
-        let bytes = preimage::<ValidatorKeyRotation>(&payload)?;
+        let bytes = preimage::<ValidatorKeyRotation>(&payload, chain_id)?;
         let sig_old = current.sign(&bytes);
         let sig_new = new.sign(&bytes);
         Ok(Self {
@@ -348,17 +349,23 @@ impl DualSignedRotation {
     /// Verify both signatures: `sig_old` under `current_pubkey` (the
     /// validator's currently-active consensus key, looked up by the
     /// caller against the live validator set), and `sig_new` under
-    /// `self.payload.new_pubkey`. Both must verify.
+    /// `self.payload.new_pubkey`. Both must verify against `chain_id`.
     ///
     /// This is the cryptographic half of the self-attestation property
     /// from #142: it proves the validator controls both keys at the
     /// moment the rotation was signed, so a compromise of only the old
     /// key cannot rotate to a key the legitimate operator does not hold.
+    /// `chain_id` (#324) scopes the rotation to the deployment so a
+    /// rotation signed for chain A cannot be replayed against chain B.
     /// Structural validation ([`ValidatorKeyRotation::validate_structural`])
     /// is independent — callers should run it first because it's
     /// strictly cheaper.
-    pub fn verify(&self, current_pubkey: &NodeId) -> Result<(), RotationVerifyError> {
-        let bytes = preimage::<ValidatorKeyRotation>(&self.payload)
+    pub fn verify(
+        &self,
+        current_pubkey: &NodeId,
+        chain_id: &ChainId,
+    ) -> Result<(), RotationVerifyError> {
+        let bytes = preimage::<ValidatorKeyRotation>(&self.payload, chain_id)
             .map_err(|e| RotationVerifyError::Preimage(e.to_string()))?;
 
         UnparsedPublicKey::new(&ED25519, current_pubkey as &[u8])
@@ -679,14 +686,14 @@ mod tests {
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
-        let env = DualSignedRotation::sign(payload, &current, &new).unwrap();
+        let env = DualSignedRotation::sign(payload, &current, &new, &ChainId::TEST).unwrap();
         (env, current.node_id(), new.node_id())
     }
 
     #[test]
     fn verify_accepts_valid_dual_signed_rotation() {
         let (env, current_pubkey, _) = valid_envelope();
-        env.verify(&current_pubkey).unwrap();
+        env.verify(&current_pubkey, &ChainId::TEST).unwrap();
     }
 
     #[test]
@@ -696,7 +703,7 @@ mod tests {
         let (mut env, current_pubkey, _) = valid_envelope();
         env.sig_old = [0u8; 64];
         assert_eq!(
-            env.verify(&current_pubkey),
+            env.verify(&current_pubkey, &ChainId::TEST),
             Err(RotationVerifyError::InvalidOldSignature)
         );
     }
@@ -706,7 +713,7 @@ mod tests {
         let (mut env, current_pubkey, _) = valid_envelope();
         env.sig_new = [0u8; 64];
         assert_eq!(
-            env.verify(&current_pubkey),
+            env.verify(&current_pubkey, &ChainId::TEST),
             Err(RotationVerifyError::InvalidNewSignature)
         );
     }
@@ -719,11 +726,11 @@ mod tests {
         // exercising the verification check, not the equality check.
         let (env, current_pubkey, _) = valid_envelope();
         let attacker = fresh_signer();
-        let bytes = preimage::<ValidatorKeyRotation>(&env.payload).unwrap();
+        let bytes = preimage::<ValidatorKeyRotation>(&env.payload, &ChainId::TEST).unwrap();
         let mut tampered = env;
         tampered.sig_old = attacker.sign(&bytes);
         assert_eq!(
-            tampered.verify(&current_pubkey),
+            tampered.verify(&current_pubkey, &ChainId::TEST),
             Err(RotationVerifyError::InvalidOldSignature)
         );
     }
@@ -733,11 +740,11 @@ mod tests {
         // Mirror of the previous case: "signed only by the old key".
         let (env, current_pubkey, _) = valid_envelope();
         let attacker = fresh_signer();
-        let bytes = preimage::<ValidatorKeyRotation>(&env.payload).unwrap();
+        let bytes = preimage::<ValidatorKeyRotation>(&env.payload, &ChainId::TEST).unwrap();
         let mut tampered = env;
         tampered.sig_new = attacker.sign(&bytes);
         assert_eq!(
-            tampered.verify(&current_pubkey),
+            tampered.verify(&current_pubkey, &ChainId::TEST),
             Err(RotationVerifyError::InvalidNewSignature)
         );
     }
@@ -761,16 +768,16 @@ mod tests {
             v_eff: 999,
             ..payload.clone()
         };
-        let other_bytes = preimage::<ValidatorKeyRotation>(&other_payload).unwrap();
+        let other_bytes = preimage::<ValidatorKeyRotation>(&other_payload, &ChainId::TEST).unwrap();
         let bad_sig_new = new.sign(&other_bytes);
-        let bytes = preimage::<ValidatorKeyRotation>(&payload).unwrap();
+        let bytes = preimage::<ValidatorKeyRotation>(&payload, &ChainId::TEST).unwrap();
         let env = DualSignedRotation {
             payload,
             sig_old: current.sign(&bytes),
             sig_new: bad_sig_new,
         };
         assert_eq!(
-            env.verify(&current.node_id()),
+            env.verify(&current.node_id(), &ChainId::TEST),
             Err(RotationVerifyError::InvalidNewSignature)
         );
     }
@@ -784,8 +791,44 @@ mod tests {
         let (env, _, _) = valid_envelope();
         let unrelated = fresh_signer();
         assert_eq!(
-            env.verify(&unrelated.node_id()),
+            env.verify(&unrelated.node_id(), &ChainId::TEST),
             Err(RotationVerifyError::InvalidOldSignature)
+        );
+    }
+
+    /// Cross-deployment replay rejection for rotation envelopes (#324):
+    /// a [`DualSignedRotation`] minted under chain_id A must not verify
+    /// against chain_id B even when both signatures are real and the
+    /// payload bytes are byte-identical. Without the chain_id mix-in
+    /// an attacker could capture a rotation tx from a testnet and
+    /// replay it against mainnet to roll the legitimate operator's
+    /// consensus key forward to whatever `new_pubkey` the testnet
+    /// rotation chose.
+    #[test]
+    fn verify_rejects_cross_chain_rotation_replay() {
+        let chain_a = ChainId([0xAA; 32]);
+        let chain_b = ChainId([0xBB; 32]);
+        let current = fresh_signer();
+        let new = fresh_signer();
+        let payload = ValidatorKeyRotation {
+            validator: current.node_id(),
+            new_pubkey: new.node_id(),
+            v_eff: 100,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        };
+        let env = DualSignedRotation::sign(payload, &current, &new, &chain_a).unwrap();
+
+        // Verifying under chain A succeeds (sanity).
+        env.verify(&current.node_id(), &chain_a).unwrap();
+        // Verifying under chain B fails — the chain_id mix-in changed
+        // the bytes both signers signed under, so neither real
+        // signature reproduces against the chain-B pre-image. The
+        // verifier reports `sig_old` first because that's the fixed
+        // check order in `DualSignedRotation::verify`.
+        assert_eq!(
+            env.verify(&current.node_id(), &chain_b),
+            Err(RotationVerifyError::InvalidOldSignature),
         );
     }
 
@@ -799,7 +842,7 @@ mod tests {
         let (mut env, current_pubkey, _) = valid_envelope();
         env.payload.v_eff = env.payload.v_eff.wrapping_add(1);
         assert!(matches!(
-            env.verify(&current_pubkey),
+            env.verify(&current_pubkey, &ChainId::TEST),
             Err(RotationVerifyError::InvalidOldSignature)
         ));
     }
@@ -816,7 +859,7 @@ mod tests {
         env.payload.new_pubkey = attacker.node_id();
         // sig_old was over the original new_pubkey, so it now fails first.
         assert!(matches!(
-            env.verify(&current_pubkey),
+            env.verify(&current_pubkey, &ChainId::TEST),
             Err(RotationVerifyError::InvalidOldSignature)
         ));
     }
@@ -837,7 +880,8 @@ mod tests {
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
-        let err = DualSignedRotation::sign(payload, &current, &wrong_new).unwrap_err();
+        let err =
+            DualSignedRotation::sign(payload, &current, &wrong_new, &ChainId::TEST).unwrap_err();
         assert!(format!("{err}").contains("new signer's node_id does not match"));
     }
 
@@ -849,7 +893,7 @@ mod tests {
         let bytes = postcard::to_stdvec(&env).unwrap();
         let back: DualSignedRotation = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, env);
-        back.verify(&current_pubkey).unwrap();
+        back.verify(&current_pubkey, &ChainId::TEST).unwrap();
     }
 
     #[test]

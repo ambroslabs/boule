@@ -64,6 +64,7 @@ use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::view_timer::ViewTimer;
+use crate::crypto::signed::ChainId;
 use crate::crypto::signed::Signed;
 use crate::crypto::signed::Signer;
 use crate::p2p::NodeId;
@@ -608,6 +609,13 @@ pub struct ConsensusNode {
     /// restore state. Disabled (no-op) when the policy's
     /// `interval_blocks == 0`.
     snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync,
+    /// Deployment-scoped 32-byte tag (#324) mixed into every signing
+    /// pre-image we produce or verify. Derived once from the genesis
+    /// block hash so every honest replica with the same genesis
+    /// converges on the same value; cross-deployment signature replay
+    /// fails because a sibling deployment with a different genesis has
+    /// a different `ChainId`.
+    chain_id: ChainId,
 }
 
 /// Bounded LRU-by-insertion cache of QCs keyed by block hash.
@@ -701,6 +709,13 @@ impl ConsensusNode {
         ));
 
         let validator_set_len = config.validator_set.len();
+        // #324: bind the deployment's signing tag to its genesis block
+        // hash. Compute before moving `config.genesis` into the safety
+        // core. Every honest replica with the same genesis derives the
+        // same value; sibling deployments with different genesis bytes
+        // get a different tag, so a Vote/Proposal/NewView signed on one
+        // chain cannot be replayed on another.
+        let chain_id = ChainId::from_genesis_hash(config.genesis.hash());
         // Pick the genesis QC shape that matches the chain's signature
         // scheme. The Ed25519 path's all-zero placeholder sigs would
         // panic if folded into a BLS aggregate (see #338's
@@ -764,6 +779,7 @@ impl ConsensusNode {
             snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync::new(
                 config.snapshot_policy,
             ),
+            chain_id,
         }
     }
 
@@ -1096,6 +1112,10 @@ impl ConsensusNode {
             None => ValidatorKeyHistory::from_set_history(&validator_history),
         };
 
+        // #324: same derivation as `ConsensusNode::new` — recover paths
+        // must produce the same `ChainId` as a fresh boot, since both
+        // share the same genesis bytes.
+        let chain_id = ChainId::from_genesis_hash(config.genesis.hash());
         Ok(Self {
             self_id,
             core,
@@ -1127,6 +1147,7 @@ impl ConsensusNode {
             snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync::new(
                 config.snapshot_policy,
             ),
+            chain_id,
         })
     }
 
@@ -1421,6 +1442,7 @@ impl ConsensusNode {
                                 &self.validator_history,
                                 &self.validator_key_history,
                                 &qc_verification,
+                                &self.chain_id,
                             ) {
                                 Ok(dispatches) => {
                                     for d in dispatches {
@@ -2041,6 +2063,7 @@ impl ConsensusNode {
                         &msg,
                         signer.as_ref(),
                         bls_signer,
+                        &self.chain_id,
                     )?;
                     send_outbound(broadcaster, Outbound::Broadcast(payload)).await;
                     self.deliver_loopback(loopback, broadcaster, view_timer, signer)
@@ -2053,6 +2076,7 @@ impl ConsensusNode {
                         &msg,
                         signer.as_ref(),
                         bls_signer,
+                        &self.chain_id,
                     )?;
                     if target == self.self_id {
                         tracing::debug!(
@@ -2325,7 +2349,8 @@ impl ConsensusNode {
     ) -> anyhow::Result<()> {
         let high_qc = self.core.state().high_qc.clone();
         let payload = TimeoutVote { view, high_qc };
-        let signed = Signed::sign(payload, signer.as_ref()).context("signing TimeoutVote")?;
+        let signed = Signed::sign(payload, signer.as_ref(), &self.chain_id)
+            .context("signing TimeoutVote")?;
 
         // Put the signed frame on the wire.
         let wire = WireMessage::TimeoutVote(signed.clone());
@@ -2389,7 +2414,7 @@ impl ConsensusNode {
         if view < self.pacemaker.current_view() {
             if let Some(high_qc) = self.core.state().high_qc.clone() {
                 let nv = NewView { high_qc };
-                let signed_nv = Signed::sign(nv, signer.as_ref())
+                let signed_nv = Signed::sign(nv, signer.as_ref(), &self.chain_id)
                     .context("signing catch-up NewView for stale TimeoutVote")?;
                 let wire = WireMessage::NewView(signed_nv);
                 let payload = postcard::to_stdvec(&wire)
@@ -2525,8 +2550,8 @@ impl ConsensusNode {
         // originals that fed the bucket).
         if let Some(qc) = adopt_qc {
             let nv = NewView { high_qc: qc };
-            let self_signed =
-                Signed::sign(nv, signer.as_ref()).context("signing self-NewView for TC adopt")?;
+            let self_signed = Signed::sign(nv, signer.as_ref(), &self.chain_id)
+                .context("signing self-NewView for TC adopt")?;
             let safety_actions = self.step_safety(SafetyEvent::NewViewReceived(self_signed));
             self.apply_safety_actions(safety_actions, broadcaster, view_timer, signer)
                 .await?;
@@ -2948,7 +2973,7 @@ impl ConsensusNode {
             // smuggled in a single-signed rotation can't make it
             // take effect — every replica re-runs this check
             // independently before mutating the history.
-            if let Err(e) = envelope.verify(&current_key) {
+            if let Err(e) = envelope.verify(&current_key, &self.chain_id) {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     height = block.header.height,
@@ -5113,6 +5138,7 @@ mod tests {
             &req_bytes,
             &ValidatorSetHistory::from_genesis(four_validators()),
             &ValidatorKeyHistory::new(four_validators().iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .unwrap();
         assert_eq!(dispatches.len(), 1);
@@ -5142,6 +5168,7 @@ mod tests {
                 &req_bytes,
                 &ValidatorSetHistory::from_genesis(four_validators()),
                 &ValidatorKeyHistory::new(four_validators().iter().copied()),
+                &crate::crypto::signed::ChainId::TEST,
             )
             .unwrap();
             for d in dispatches {
@@ -5259,7 +5286,7 @@ mod tests {
         // `signed.signer`, both of which we control.
         let justify = genesis_qc(&genesis(), 4);
         let proposal = Proposal { block, justify };
-        let signed = Signed::sign(proposal, signer).expect("sign proposal");
+        let signed = Signed::sign(proposal, signer, &ChainId::TEST).expect("sign proposal");
         Dispatch::Safety(SafetyEvent::ProposalReceived(signed))
     }
 
@@ -5450,6 +5477,7 @@ mod tests {
             &req_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .expect("ingress manifest request");
         for d in dispatches {
@@ -5480,6 +5508,7 @@ mod tests {
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -5511,6 +5540,7 @@ mod tests {
                 &chunk_req_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
+                &crate::crypto::signed::ChainId::TEST,
             )
             .expect("ingress chunk request");
             for d in dispatches {
@@ -5534,6 +5564,7 @@ mod tests {
                 &chunk_resp_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
+                &crate::crypto::signed::ChainId::TEST,
             )
             .expect("ingress chunk response");
             for d in dispatches {
@@ -5693,6 +5724,7 @@ mod tests {
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .expect("ingress tampered manifest");
         for d in dispatches {
@@ -5859,6 +5891,7 @@ mod tests {
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -5906,6 +5939,7 @@ mod tests {
                 &resp_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
+                &crate::crypto::signed::ChainId::TEST,
             )
             .expect("ingress chunk response");
             for d in dispatches {
@@ -6043,6 +6077,7 @@ mod tests {
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -6080,6 +6115,7 @@ mod tests {
             &resp_bytes,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .unwrap();
         for d in dispatches {
@@ -6152,6 +6188,7 @@ mod tests {
                 &resp_bytes,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
+                &crate::crypto::signed::ChainId::TEST,
             )
             .unwrap();
             for d in dispatches {
@@ -6283,8 +6320,12 @@ mod tests {
             view: 42,
             high_qc: None,
         };
-        let signed =
-            crate::crypto::signed::Signed::sign(tv, &peer_signer).expect("sign TimeoutVote");
+        let signed = crate::crypto::signed::Signed::sign(
+            tv,
+            &peer_signer,
+            &crate::crypto::signed::ChainId::TEST,
+        )
+        .expect("sign TimeoutVote");
         let wire = WireMessage::TimeoutVote(signed);
         let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
 
@@ -6293,6 +6334,7 @@ mod tests {
             &payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .expect("ingress");
         let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
@@ -6360,7 +6402,12 @@ mod tests {
                 view: 42,
                 high_qc: None,
             };
-            let signed = crate::crypto::signed::Signed::sign(tv, peer).expect("sign TimeoutVote");
+            let signed = crate::crypto::signed::Signed::sign(
+                tv,
+                peer,
+                &crate::crypto::signed::ChainId::TEST,
+            )
+            .expect("sign TimeoutVote");
             let wire = WireMessage::TimeoutVote(signed);
             let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
             let dispatches = crate::consensus::dispatch::ingress(
@@ -6368,6 +6415,7 @@ mod tests {
                 &payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
+                &crate::crypto::signed::ChainId::TEST,
             )
             .expect("ingress");
             for d in dispatches {
@@ -6449,7 +6497,12 @@ mod tests {
             view: attack_view,
             high_qc: Some(forged),
         };
-        let signed = crate::crypto::signed::Signed::sign(tv, &byzantine).expect("sign TimeoutVote");
+        let signed = crate::crypto::signed::Signed::sign(
+            tv,
+            &byzantine,
+            &crate::crypto::signed::ChainId::TEST,
+        )
+        .expect("sign TimeoutVote");
         let wire = WireMessage::TimeoutVote(signed);
         let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
 
@@ -6465,6 +6518,7 @@ mod tests {
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
             &qc_verification,
+            &crate::crypto::signed::ChainId::TEST,
         )
         .expect("envelope is honest; ingress must accept and emit Dispatch::TimeoutVote");
 
@@ -6593,8 +6647,12 @@ mod tests {
             view: 5,
             high_qc: None,
         };
-        let signed =
-            crate::crypto::signed::Signed::sign(tv, &wedged_peer).expect("sign TimeoutVote");
+        let signed = crate::crypto::signed::Signed::sign(
+            tv,
+            &wedged_peer,
+            &crate::crypto::signed::ChainId::TEST,
+        )
+        .expect("sign TimeoutVote");
         let wire = WireMessage::TimeoutVote(signed);
         let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
 
@@ -6603,6 +6661,7 @@ mod tests {
             &payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
+            &crate::crypto::signed::ChainId::TEST,
         )
         .expect("ingress");
         for d in dispatches {
