@@ -140,6 +140,15 @@ struct SpawnExtras {
     /// Per-node adversary hooks (issue #132). Indexed by sorted node
     /// order; `None` slots run the honest protocol unchanged.
     adversaries: Option<Vec<Option<Arc<dyn Adversary>>>>,
+    /// Chain-level signature scheme override (#354 step 2). When
+    /// `Some(BlsAggregated)`, [`SimCluster::spawn_inner`] generates a
+    /// BLS keypair per validator, seeds each node's
+    /// [`crate::consensus::bls_key_history::BlsKeyHistory`] from
+    /// genesis, and plumbs the corresponding
+    /// [`crate::crypto::bls_key::BlsPartialSignerImpl`] onto each
+    /// node so leaders can produce real BLS partials on Vote frames.
+    /// `None` keeps the default Ed25519 cluster shape.
+    signature_scheme: Option<crate::crypto::sig_scheme::SignatureSchemeChoice>,
 }
 
 /// An in-memory cluster of N consensus nodes connected by channel-backed
@@ -239,6 +248,46 @@ impl SimCluster {
             .0
     }
 
+    /// Spawn `n` honest nodes configured for the BLS-aggregated chain
+    /// scheme (#354 step 2).
+    ///
+    /// Each node gets:
+    ///
+    /// - `signature_scheme = "bls_aggregated"` in its
+    ///   [`NodeConfigForConsensus`].
+    /// - A freshly-generated BLS keypair, registered into a shared
+    ///   [`BlsKeyHistory`] at `v_eff = 0` against the validator's
+    ///   `NodeId`.
+    /// - A [`crate::crypto::bls_key::BlsPartialSignerImpl`] plumbed
+    ///   via [`ConsensusNode::with_bls_signer`] so the leader-side
+    ///   vote-emission path can sign real BLS partials.
+    ///
+    /// The genesis QC is the BLS-flavored
+    /// [`crate::consensus::hotstuff::qc::genesis_qc_bls`] (empty
+    /// bitmap + empty-aggregate sentinel), and the dispatch-layer
+    /// QC verifier accepts BLS QCs against
+    /// [`BlsKeyHistory::pubkeys_for_set`] at every committed view.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n < 4` (minimum BFT cluster size for `f = 1`) or if
+    /// any BLS keygen fails (which it should not under fresh IKM).
+    pub async fn spawn_bls(n: usize, timeout_base: Duration) -> Self {
+        Self::spawn_inner(
+            n,
+            timeout_base,
+            SpawnExtras {
+                rate_limits: None,
+                adversaries: None,
+                signature_scheme: Some(
+                    crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
+                ),
+            },
+        )
+        .await
+        .0
+    }
+
     /// Spawn `n` honest nodes plus a per-node Byzantine [`Adversary`]
     /// hook (issue #132). `adversaries` must have length `n`; entries
     /// indexed in [`SimCluster::node_ids`] order. `None` slots run the
@@ -267,6 +316,7 @@ impl SimCluster {
             SpawnExtras {
                 rate_limits: None,
                 adversaries: Some(adversaries),
+                signature_scheme: None,
             },
         )
         .await
@@ -293,6 +343,7 @@ impl SimCluster {
             SpawnExtras {
                 rate_limits: Some(rate_limits),
                 adversaries: None,
+                signature_scheme: None,
             },
         )
         .await
@@ -306,7 +357,9 @@ impl SimCluster {
         let SpawnExtras {
             rate_limits,
             adversaries,
+            signature_scheme,
         } = extras;
+        let scheme = signature_scheme.unwrap_or_default();
         if let Some(adv) = adversaries.as_ref() {
             assert_eq!(adv.len(), n, "adversary slots must equal n");
         }
@@ -325,6 +378,39 @@ impl SimCluster {
             .into_iter()
             .map(|s| (s.node_id(), Arc::new(s) as Arc<dyn Signer>))
             .collect();
+
+        // BLS chains: generate a per-validator BLS keypair and seed
+        // each node's `BlsKeyHistory` from genesis (#354 step 2).
+        // `bls_pubkeys` is the shared genesis table; `bls_secret_for`
+        // is consulted per-node when wiring the
+        // `BlsPartialSignerImpl`.
+        let (bls_pubkeys, bls_secret_for): (
+            HashMap<NodeId, crate::crypto::sig_scheme::BlsPublicKey>,
+            HashMap<NodeId, crate::crypto::sig_scheme::BlsSecretKey>,
+        ) = if scheme == crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
+            let mut pubs = HashMap::new();
+            let mut secs = HashMap::new();
+            for (i, &nid) in vs.iter().enumerate() {
+                // Seed BLS keys deterministically from sorted index XOR
+                // the validator's NodeId so a re-spawn under the same
+                // sorted vs produces byte-identical BLS keys; the sim's
+                // existing Ed25519 signers come from `fresh_signer`,
+                // which is the randomized boundary in this constructor.
+                // BLS IKM must be ≥ 32 bytes per the IETF spec.
+                let mut ikm = nid;
+                let idx_bytes = (i as u64).to_le_bytes();
+                for (j, b) in idx_bytes.iter().enumerate() {
+                    ikm[j] ^= *b;
+                }
+                let (sk, pk) = crate::crypto::sig_scheme::BlsAggregated::keygen(&ikm)
+                    .unwrap_or_else(|e| panic!("sim BLS keygen must not fail: {e:?}"));
+                pubs.insert(nid, pk);
+                secs.insert(nid, sk);
+            }
+            (pubs, secs)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
 
         // Shared partition set: routing tasks check this before forwarding.
         let partitioned: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -380,7 +466,7 @@ impl SimCluster {
                 limits: CacheLimits::unbounded_for_tests(),
                 snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
-                signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
+                signature_scheme: scheme,
             };
 
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -399,6 +485,35 @@ impl SimCluster {
             // genesis QC; no explicit with_genesis_qc override here.
             let mut node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
                 .with_commit_observer(commit_tx);
+
+            // BLS plumbing (#354 step 2). Each node gets:
+            // (1) a `BlsKeyHistory` populated from the shared genesis
+            //     `bls_pubkeys` table so the dispatch-layer QC verifier
+            //     can resolve per-historical-view BLS pubkeys, and
+            // (2) its own `BlsPartialSignerImpl` so the dispatch-layer
+            //     vote signer can produce real BLS partials on Vote
+            //     frames the leader emits or loops back through #118.
+            if scheme == crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
+                let bls_history = crate::consensus::bls_key_history::BlsKeyHistory::with_genesis(
+                    bls_pubkeys.iter().map(|(id, pk)| (*id, *pk)),
+                );
+                node = node.with_bls_key_history(bls_history);
+                let sk = bls_secret_for[&nid];
+                let pk = bls_pubkeys[&nid];
+                let identity = crate::crypto::bls_key::BlsValidatorIdentity {
+                    secret: zeroize::Zeroizing::new(sk),
+                    public: pk,
+                    pop: crate::crypto::sig_scheme::BlsAggregated::sign_pop(&sk).unwrap(),
+                };
+                let bls_signer: Arc<
+                    dyn crate::crypto::signed::PartialSigner<
+                            crate::crypto::sig_scheme::BlsAggregated,
+                        >,
+                > = Arc::new(crate::crypto::bls_key::BlsPartialSignerImpl::from_identity(
+                    identity,
+                ));
+                node = node.with_bls_signer(bls_signer);
+            }
 
             // Optional rate-limiter (issue #134). The sim has no real
             // peer manager so we plumb `peer_cmd_tx = None`; tests
@@ -1659,6 +1774,68 @@ mod tests {
         assert!(
             num_committed >= 3,
             "expected >= 3 nodes to have committed, got {num_committed}",
+        );
+    }
+
+    // ── BLS happy path (#354 step 2) ──────────────────────────────────────────
+
+    /// Four honest nodes on a `bls_aggregated` chain commit at least
+    /// one block, with every formed QC riding the BLS aggregate path
+    /// end-to-end.
+    ///
+    /// Acceptance for #354 step 2: the dispatch-layer QC verifier
+    /// accepts a real BLS QC at view ≥ 1, which can only happen if
+    /// (a) the leader-side egress signs each Vote with a real BLS
+    /// partial, (b) `on_vote_received` folds those partials via
+    /// `add_bls_partial`, and (c) the formed `QcSignatures::BlsAggregated`
+    /// aggregate verifies against the per-historical-view BLS pubkey
+    /// table seeded from genesis.
+    #[tokio::test]
+    async fn four_honest_bls_nodes_commit_at_least_one_block() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn_bls(4, Duration::from_millis(50)).await;
+
+        // Same poll-with-budget shape as the Ed25519 happy-path test.
+        // BLS partials are larger but the per-view round count is
+        // identical — the cluster reaches the first commit in roughly
+        // the same number of yields.
+        for _ in 0..500 {
+            yield_now().await;
+            let heights = cluster.peek_commit_heights();
+            if heights.iter().filter(|&&h| h > 0).count() >= 3 {
+                break;
+            }
+        }
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        let num_committed = committed.iter().filter(|c| !c.is_empty()).count();
+        assert!(
+            num_committed >= 3,
+            "expected >= 3 nodes to commit on a BLS chain, got {num_committed}",
+        );
+
+        // Pick the first non-empty commit and confirm it is committed
+        // by at least 3 nodes — i.e. the cluster agreed on the same
+        // block via a real BLS QC. The QC verifier in the run loop
+        // would have rejected any node's inbound proposal whose
+        // `justify` carried a malformed BLS aggregate, so the very
+        // fact that 3 nodes committed the same block implies the BLS
+        // QC formed and verified end-to-end.
+        let committed_hash = committed
+            .iter()
+            .find(|c| !c.is_empty())
+            .map(|c| c[0].hash())
+            .expect("at least one node committed a block");
+        let same_block_count = committed
+            .iter()
+            .filter(|c| c.first().map(|b| b.hash()) == Some(committed_hash))
+            .count();
+        assert!(
+            same_block_count >= 3,
+            "expected >= 3 nodes to agree on the first BLS-committed block hash, got {same_block_count}",
         );
     }
 

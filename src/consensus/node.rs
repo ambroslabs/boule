@@ -44,6 +44,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use crate::consensus::View;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
 use crate::consensus::hotstuff::Locked;
+use crate::consensus::hotstuff::qc::genesis_qc_bls;
 use crate::consensus::hotstuff::qc::{ConsensusMsg, TimeoutVote, quorum_size};
 use crate::consensus::hotstuff::step::{
     Action as SafetyAction, BlockBuilder, Event as SafetyEvent, HotStuffCore, StateUpdate,
@@ -515,6 +516,19 @@ pub struct ConsensusNode {
     /// aggregate verification (#332) to resolve per-historical-view
     /// BLS pubkeys for `verify_aggregate_bls`.
     pub bls_key_history: Option<crate::consensus::bls_key_history::BlsKeyHistory>,
+    /// This validator's BLS partial signer (#354 step 2). `Some` on
+    /// `bls_aggregated` chains where the operator loaded a
+    /// `BlsValidatorIdentity` at boot; `None` on Ed25519 chains and on
+    /// non-validator BLS-chain participants. Wrapped in `Arc` so the
+    /// dispatch layer can cheaply hold a borrow across `await`
+    /// suspension points alongside the existing Ed25519 `signer`.
+    /// Consumed by [`crate::consensus::dispatch::sign_consensus_msg`]
+    /// when signing a `Vote` on a BLS chain — the produced
+    /// `BlsPartialSig` rides on the wire alongside the Ed25519
+    /// envelope.
+    pub bls_signer: Option<
+        Arc<dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>>,
+    >,
     /// Chain-level signature scheme (#288). Fixed for the lifetime of
     /// the chain; consulted at ingress time to dispatch QC aggregate
     /// verification through the right `verify_aggregate` /
@@ -687,7 +701,20 @@ impl ConsensusNode {
         ));
 
         let validator_set_len = config.validator_set.len();
-        let boot_qc = genesis_qc(&config.genesis, validator_set_len);
+        // Pick the genesis QC shape that matches the chain's signature
+        // scheme. The Ed25519 path's all-zero placeholder sigs would
+        // panic if folded into a BLS aggregate (see #338's
+        // well-formedness invariant); the BLS variant returns an
+        // empty-bitmap, empty-aggregate QC that the dispatch verifier
+        // accepts via its `signer_count == 0` genesis-skip path.
+        let boot_qc = match config.signature_scheme {
+            crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => {
+                genesis_qc(&config.genesis, validator_set_len)
+            }
+            crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => {
+                genesis_qc_bls(&config.genesis, validator_set_len)
+            }
+        };
         let mut hs_state = HotStuffState::new(config.validator_set.clone(), config.genesis);
         // Seed the cluster-agreed genesis QC so the view-1 leader can
         // build a proposal on first boot without waiting for a QC-forming
@@ -701,7 +728,8 @@ impl ConsensusNode {
             builder as Arc<dyn BlockBuilder>,
             config.limits,
             eviction_counters.clone(),
-        );
+        )
+        .with_signature_scheme(config.signature_scheme);
 
         let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         let validator_key_history = ValidatorKeyHistory::new(config.validator_set.iter().copied());
@@ -717,6 +745,7 @@ impl ConsensusNode {
             validator_history,
             validator_key_history,
             bls_key_history: None,
+            bls_signer: None,
             signature_scheme: config.signature_scheme,
             timeout_policy,
             timeout_buckets: HashMap::new(),
@@ -747,6 +776,27 @@ impl ConsensusNode {
         bls_key_history: crate::consensus::bls_key_history::BlsKeyHistory,
     ) -> Self {
         self.bls_key_history = Some(bls_key_history);
+        self
+    }
+
+    /// Attach this validator's BLS partial signer (#354 step 2).
+    ///
+    /// Used at boot on `bls_aggregated` chains, when the operator has
+    /// loaded a `BlsValidatorIdentity` for this node — see
+    /// [`crate::crypto::bls_key::BlsPartialSignerImpl::from_identity`].
+    /// The dispatch layer consults this signer when this node emits a
+    /// `Vote`, producing the 96-byte BLS partial that rides on the
+    /// wire alongside the Ed25519 envelope. On Ed25519 chains this
+    /// stays unset; on BLS chains where this node is not a validator
+    /// (or the operator booted without an identity), this also stays
+    /// unset and the node will receive but never emit votes.
+    pub fn with_bls_signer(
+        mut self,
+        bls_signer: Arc<
+            dyn crate::crypto::signed::PartialSigner<crate::crypto::sig_scheme::BlsAggregated>,
+        >,
+    ) -> Self {
+        self.bls_signer = Some(bls_signer);
         self
     }
 
@@ -1010,7 +1060,8 @@ impl ConsensusNode {
             builder as Arc<dyn BlockBuilder>,
             config.limits,
             eviction_counters.clone(),
-        );
+        )
+        .with_signature_scheme(config.signature_scheme);
 
         // #254: replay each post-genesis boundary into the safety
         // core's history so vote tally / QC sizing / proposal-time
@@ -1057,6 +1108,7 @@ impl ConsensusNode {
             validator_history,
             validator_key_history,
             bls_key_history: None,
+            bls_signer: None,
             signature_scheme: config.signature_scheme,
             timeout_policy,
             timeout_buckets: HashMap::new(),
@@ -1981,16 +2033,24 @@ impl ConsensusNode {
                         msg = msg_kind(&msg),
                         "outbound_broadcast",
                     );
-                    let (payload, loopback) =
-                        dispatch::egress_consensus_msg_with_loopback(&msg, signer.as_ref())?;
+                    let bls_signer = self.bls_signer.as_deref();
+                    let (payload, loopback) = dispatch::egress_consensus_msg_with_loopback(
+                        &msg,
+                        signer.as_ref(),
+                        bls_signer,
+                    )?;
                     send_outbound(broadcaster, Outbound::Broadcast(payload)).await;
                     self.deliver_loopback(loopback, broadcaster, view_timer, signer)
                         .await?;
                 }
 
                 SafetyAction::SendTo(target, msg) => {
-                    let (payload, loopback) =
-                        dispatch::egress_consensus_msg_with_loopback(&msg, signer.as_ref())?;
+                    let bls_signer = self.bls_signer.as_deref();
+                    let (payload, loopback) = dispatch::egress_consensus_msg_with_loopback(
+                        &msg,
+                        signer.as_ref(),
+                        bls_signer,
+                    )?;
                     if target == self.self_id {
                         tracing::debug!(
                             target: TRACE_TARGET,
@@ -2167,7 +2227,7 @@ impl ConsensusNode {
                 view: signed.payload.block.header.view,
                 height: signed.payload.block.header.height,
             }),
-            SafetyEvent::VoteReceived(signed) => Some(SafetyLogCtx::Vote {
+            SafetyEvent::VoteReceived(signed, _bls_partial) => Some(SafetyLogCtx::Vote {
                 voter: signed.signer,
                 view: signed.payload.view,
             }),

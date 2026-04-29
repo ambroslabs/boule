@@ -38,6 +38,7 @@ use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
 use super::safety_rules::{safe_to_vote, should_update_high_qc, three_chain_commit};
 use super::state::{HotStuffState, Locked};
 use crate::consensus::validator_set::ValidatorSet;
+use crate::crypto::sig_scheme::{BlsPartialSig, SignatureSchemeChoice};
 
 /// Tracing target shared with the integration layer; lifted here so
 /// safety-core eviction logs flow through the same `RUST_LOG` filter
@@ -59,7 +60,17 @@ pub enum Event {
     ProposalReceived(Signed<Proposal>),
     /// A signed vote arrived on the wire. Only meaningful to the leader
     /// of `vote.view + 1`; other replicas drop it in [`HotStuffCore::step`].
-    VoteReceived(Signed<Vote>),
+    ///
+    /// The optional second field is the BLS partial signature carried
+    /// alongside the Ed25519 envelope on `bls_aggregated` chains
+    /// (#354 step 1). On Ed25519 chains it is always `None` and ignored.
+    /// On BLS chains it is `Some(_)` and folded into the QC bucket via
+    /// [`QuorumCertificate::add_bls_partial`]; the ingress layer
+    /// (`crate::consensus::dispatch::verify_bls_partial_if_required`)
+    /// has already verified the partial against the signer's
+    /// per-historical-view BLS pubkey, so the safety core treats it as
+    /// trusted bytes ready to fold.
+    VoteReceived(Signed<Vote>, Option<BlsPartialSig>),
     /// A signed `NewView` arrived on the wire.
     NewViewReceived(Signed<NewView>),
     /// The pacemaker has advanced the local view. Never emitted by the
@@ -264,6 +275,12 @@ pub struct HotStuffCore {
     /// snapshot. Cloned into the integration layer so the
     /// timeout-bucket handler can share a single counter handle.
     eviction_counters: CacheEvictionCounters,
+    /// Chain-level signature scheme. Drives `on_vote_received`'s choice
+    /// between Ed25519 envelope-sig folding and BLS partial folding.
+    /// Set at boot via [`Self::with_signature_scheme`]; defaults to
+    /// `Ed25519Collected` so direct-construction unit tests behave as
+    /// they always have.
+    signature_scheme: SignatureSchemeChoice,
 }
 
 /// Per-parent-hash retry accounting for `RequestBlock`. See
@@ -332,7 +349,19 @@ impl HotStuffCore {
             builder,
             limits,
             eviction_counters,
+            signature_scheme: SignatureSchemeChoice::Ed25519Collected,
         }
+    }
+
+    /// Set the chain's signature scheme. The integration layer calls
+    /// this once at boot from `NodeConfigForConsensus.signature_scheme`;
+    /// it controls whether `on_vote_received` folds a BLS partial via
+    /// `add_bls_partial` or a 64-byte Ed25519 envelope sig via
+    /// `add_signature`. Defaults to `Ed25519Collected` so unit tests
+    /// that drive the safety core directly behave unchanged.
+    pub fn with_signature_scheme(mut self, scheme: SignatureSchemeChoice) -> Self {
+        self.signature_scheme = scheme;
+        self
     }
 
     /// Borrow the eviction counters this core increments. The
@@ -558,7 +587,7 @@ impl HotStuffCore {
     pub fn step(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::ProposalReceived(signed) => self.on_proposal_received(signed),
-            Event::VoteReceived(signed) => self.on_vote_received(signed),
+            Event::VoteReceived(signed, bls_partial) => self.on_vote_received(signed, bls_partial),
             Event::NewViewReceived(signed) => self.on_new_view_received(signed),
             Event::PacemakerAdvance(v) => self.on_pacemaker_advance(v),
         }
@@ -750,7 +779,11 @@ impl HotStuffCore {
     /// round-robin still commits when one validator is permanently
     /// down (otherwise every fourth view's QC would never form and
     /// the 3-chain commit rule would never fire).
-    fn on_vote_received(&mut self, signed: Signed<Vote>) -> Vec<Action> {
+    fn on_vote_received(
+        &mut self,
+        signed: Signed<Vote>,
+        bls_partial: Option<BlsPartialSig>,
+    ) -> Vec<Action> {
         let vote = &signed.payload;
         let next_view = vote.view + 1;
 
@@ -767,8 +800,19 @@ impl HotStuffCore {
             return Vec::new();
         };
 
+        // BLS chains require an attached partial; the ingress layer
+        // already enforces this at the wire boundary (#354 step 1), but
+        // a self-loopback that forgot to plumb the partial through is
+        // the failure mode this defends against. Drop silently rather
+        // than fold an Ed25519 sig into a BLS aggregate — that would
+        // panic in `add_bls_partial` and crash the safety core.
+        if self.signature_scheme == SignatureSchemeChoice::BlsAggregated && bls_partial.is_none() {
+            return Vec::new();
+        }
+
         // Accumulate into the bucket for this `(view, block_hash)`
-        // pair. `QuorumCertificate::add_signature` is idempotent on
+        // pair. `QuorumCertificate::add_signature` and
+        // `QuorumCertificate::add_bls_partial` are both idempotent on
         // the set-bit — duplicate votes from the same signer are
         // no-ops. The bucket is sized to the set authoritative at
         // `vote.view` so the bitmap and quorum threshold match what
@@ -783,11 +827,28 @@ impl HotStuffCore {
         if !self.vote_bucket.contains_key(&key) {
             self.evict_vote_buckets_to_fit_one();
         }
-        let qc = self.vote_bucket.entry(key).or_insert_with(|| {
-            QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len)
+        let scheme = self.signature_scheme;
+        let qc = self.vote_bucket.entry(key).or_insert_with(|| match scheme {
+            SignatureSchemeChoice::Ed25519Collected => {
+                QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len)
+            }
+            SignatureSchemeChoice::BlsAggregated => {
+                QuorumCertificate::new_bls(vote.view, vote.block_hash, validator_set_len)
+            }
         });
         let had_quorum = qc.has_quorum(&vs_at_vote);
-        qc.add_signature(voter_idx, signed.sig);
+        match scheme {
+            SignatureSchemeChoice::Ed25519Collected => {
+                qc.add_signature(voter_idx, signed.sig);
+            }
+            SignatureSchemeChoice::BlsAggregated => {
+                // Unwrap is safe: the early-return above rejects BLS
+                // votes without a partial. The ingress layer has
+                // already verified the partial against the voter's
+                // per-historical-view BLS pubkey.
+                qc.add_bls_partial(voter_idx, bls_partial.expect("BLS chain require partial"));
+            }
+        }
         let has_quorum_now = qc.has_quorum(&vs_at_vote);
 
         // Only fire on the transition from sub-quorum to quorum.
@@ -2182,7 +2243,7 @@ mod tests {
         let block_hash: BlockHash = [0xAA; 32];
         let vote = signed_vote(2, block_hash, nid(2));
 
-        let actions = core.step(Event::VoteReceived(vote));
+        let actions = core.step(Event::VoteReceived(vote, None));
 
         assert!(actions.is_empty(), "sub-quorum vote is silent: {actions:?}");
         let bucket = core
@@ -2206,10 +2267,16 @@ mod tests {
         let mut core = make_core(1);
         let block_hash: BlockHash = [0xAA; 32];
 
-        let step1 = core.step(Event::VoteReceived(signed_vote(3, block_hash, nid(2))));
+        let step1 = core.step(Event::VoteReceived(
+            signed_vote(3, block_hash, nid(2)),
+            None,
+        ));
         assert!(step1.is_empty(), "first sub-quorum vote is silent");
 
-        let step2 = core.step(Event::VoteReceived(signed_vote(3, block_hash, nid(3))));
+        let step2 = core.step(Event::VoteReceived(
+            signed_vote(3, block_hash, nid(3)),
+            None,
+        ));
         assert!(step2.is_empty(), "second sub-quorum vote is silent");
 
         let bucket = core
@@ -2240,8 +2307,14 @@ mod tests {
         core.state.insert_pending(block_v3.clone());
 
         // First two votes accumulate silently.
-        let step1 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
-        let step2 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3))));
+        let step1 = core.step(Event::VoteReceived(
+            signed_vote(3, block_v3_hash, nid(2)),
+            None,
+        ));
+        let step2 = core.step(Event::VoteReceived(
+            signed_vote(3, block_v3_hash, nid(3)),
+            None,
+        ));
         assert!(step1.is_empty(), "first sub-quorum vote silent: {step1:?}");
         assert!(step2.is_empty(), "second sub-quorum vote silent: {step2:?}");
 
@@ -2267,7 +2340,10 @@ mod tests {
             commands: Vec::new(),
         };
 
-        let step3 = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4))));
+        let step3 = core.step(Event::VoteReceived(
+            signed_vote(3, block_v3_hash, nid(4)),
+            None,
+        ));
 
         assert_eq!(
             step3,
@@ -2281,6 +2357,107 @@ mod tests {
             "quorum transition emits HighQc persist then Broadcast(Proposal)",
         );
         assert_eq!(core.state().high_qc.as_ref(), Some(&expected_qc));
+    }
+
+    // ── BLS QC formation (#354 step 2) ──────────────────────────────
+
+    #[test]
+    fn bls_quorum_emits_high_qc_with_real_aggregate_that_verifies() {
+        // Self = nid(1), leader of view 4. The core is configured for
+        // `bls_aggregated`, so each Vote we feed must carry a real BLS
+        // partial under the voter's BLS key. After three valid votes
+        // (the n=4 quorum) the formed QC must carry a non-sentinel
+        // aggregate that verifies via `verify_aggregate_bls` against
+        // the genesis BLS pubkey table — the same path the dispatch
+        // verifier uses on inbound proposals.
+        use crate::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
+        use crate::crypto::signed::preimage;
+
+        let validators_set = validators();
+        // Generate one BLS keypair per validator, deterministic in
+        // the validator's NodeId so the test is reproducible.
+        let bls_keys: Vec<(BlsSecretKey, BlsPublicKey)> = validators_set
+            .iter()
+            .enumerate()
+            .map(|(i, &nid)| {
+                let mut ikm = nid;
+                ikm[0] ^= i as u8;
+                BlsAggregated::keygen(&ikm).expect("BLS keygen for test")
+            })
+            .collect();
+        let genesis = Block::genesis([0; 32]);
+        let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
+        let block_v3_hash = block_v3.hash();
+
+        let state = HotStuffState::new(validators_set.clone(), Block::genesis([0; 32]));
+        let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
+        let mut core = HotStuffCore::new(nid(1), state, builder)
+            .with_signature_scheme(SignatureSchemeChoice::BlsAggregated);
+        core.state.insert_pending(block_v3.clone());
+
+        // Build one BLS partial per voter at indices 1, 2, 3
+        // (validators nid(2..4)) over the canonical Vote pre-image.
+        let vote = Vote {
+            view: 3,
+            block_hash: block_v3_hash,
+        };
+        let preimg = preimage::<Vote>(&vote).unwrap();
+        let voters = [(1, nid(2)), (2, nid(3)), (3, nid(4))];
+
+        let mut step_actions = Vec::new();
+        for (idx, signer_id) in voters.iter() {
+            let partial = BlsAggregated::sign_partial(&bls_keys[*idx].0, &preimg).unwrap();
+            let signed = Signed {
+                payload: vote.clone(),
+                signer: *signer_id,
+                sig: [signer_id[0]; 64],
+            };
+            step_actions = core.step(Event::VoteReceived(signed, Some(partial)));
+        }
+
+        // Quorum-emit branch: Persist(HighQc(_)) + Broadcast(Proposal(_))
+        let formed_qc = match step_actions.first() {
+            Some(Action::Persist(StateUpdate::HighQc(qc))) => qc.clone(),
+            other => panic!("expected HighQc persist as first action, got {other:?}"),
+        };
+        assert!(formed_qc.is_bls(), "formed QC must be BLS-flavored");
+        assert_eq!(formed_qc.signer_count(), 3, "all three partials folded");
+        assert!(formed_qc.is_well_formed(&validators_set));
+
+        // The load-bearing assertion: the formed BLS aggregate
+        // verifies against the per-validator BLS pubkey table at
+        // view 3. This is what the dispatch verifier runs on every
+        // inbound proposal whose `justify` is a BLS QC.
+        let pubkeys: Vec<BlsPublicKey> = bls_keys.iter().map(|(_, pk)| *pk).collect();
+        formed_qc
+            .verify_aggregate_bls(&preimg, &pubkeys)
+            .expect("real BLS aggregate must verify under genesis pubkeys");
+    }
+
+    #[test]
+    fn bls_vote_without_partial_is_dropped_silently() {
+        // Defense-in-depth: on a BLS chain a Vote that arrives at the
+        // safety core without a partial (a loopback that forgot to
+        // plumb it, or a corner-case test wiring) must be dropped
+        // rather than panic in `add_bls_partial` or fold an Ed25519
+        // sig into the BLS aggregate.
+        let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+        let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
+        let mut core = HotStuffCore::new(nid(1), state, builder)
+            .with_signature_scheme(SignatureSchemeChoice::BlsAggregated);
+
+        let actions = core.step(Event::VoteReceived(
+            signed_vote(3, [0xAA; 32], nid(2)),
+            None,
+        ));
+        assert!(
+            actions.is_empty(),
+            "BLS vote without partial silently dropped"
+        );
+        assert!(
+            core.vote_bucket.is_empty(),
+            "no QC bucket created for an unusable vote",
+        );
     }
 
     // ── D8: PacemakerAdvance base contract ──────────────────────────
@@ -2584,13 +2761,25 @@ mod tests {
         core.state.insert_pending(block_v3.clone());
 
         // Drive to quorum: first three votes.
-        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
-        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3))));
-        let _ = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4))));
+        let _ = core.step(Event::VoteReceived(
+            signed_vote(3, block_v3_hash, nid(2)),
+            None,
+        ));
+        let _ = core.step(Event::VoteReceived(
+            signed_vote(3, block_v3_hash, nid(3)),
+            None,
+        ));
+        let _ = core.step(Event::VoteReceived(
+            signed_vote(3, block_v3_hash, nid(4)),
+            None,
+        ));
 
         // Late vote from a new signer — still a no-op at the dispatch
         // surface even though the bucket grows to 4 sigs.
-        let step_late_new = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(1))));
+        let step_late_new = core.step(Event::VoteReceived(
+            signed_vote(3, block_v3_hash, nid(1)),
+            None,
+        ));
         assert!(
             step_late_new.is_empty(),
             "late vote from new signer must not re-broadcast: {step_late_new:?}",
@@ -2598,7 +2787,10 @@ mod tests {
 
         // Duplicate vote from an existing signer — `add_signature` is
         // a no-op on the set-bit; dispatch also early-returns.
-        let step_dup = core.step(Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))));
+        let step_dup = core.step(Event::VoteReceived(
+            signed_vote(3, block_v3_hash, nid(2)),
+            None,
+        ));
         assert!(
             step_dup.is_empty(),
             "duplicate vote must not re-broadcast: {step_dup:?}",
@@ -2626,7 +2818,7 @@ mod tests {
         let mut core = make_core(1);
         let vote = signed_vote(3, [0xAA; 32], nid(99));
 
-        let actions = core.step(Event::VoteReceived(vote));
+        let actions = core.step(Event::VoteReceived(vote, None));
 
         assert!(
             actions.is_empty(),
@@ -2659,7 +2851,7 @@ mod tests {
 
         // Vote at view = v_eff signed by the old-only member.
         let vote = signed_vote(v_eff, [0xAA; 32], nid(4));
-        let actions = core.step(Event::VoteReceived(vote));
+        let actions = core.step(Event::VoteReceived(vote, None));
 
         assert!(
             actions.is_empty(),
@@ -2688,7 +2880,7 @@ mod tests {
 
         // Vote at view = v_eff - 1 signed by the new-only member.
         let vote = signed_vote(v_eff - 1, [0xBB; 32], nid(5));
-        let actions = core.step(Event::VoteReceived(vote));
+        let actions = core.step(Event::VoteReceived(vote, None));
 
         assert!(
             actions.is_empty(),
@@ -2716,7 +2908,7 @@ mod tests {
 
         let block_hash: BlockHash = [0xCC; 32];
         let vote = signed_vote(v_eff, block_hash, nid(7));
-        let _ = core.step(Event::VoteReceived(vote));
+        let _ = core.step(Event::VoteReceived(vote, None));
 
         let bucket = core
             .vote_bucket
@@ -3500,9 +3692,9 @@ mod tests {
                     dummy_qc(2, block_v2_hash),
                     nid(2),
                 )),
-                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2))),
-                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3))),
-                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4))),
+                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(2)), None),
+                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(3)), None),
+                Event::VoteReceived(signed_vote(3, block_v3_hash, nid(4)), None),
                 Event::NewViewReceived(signed_newview(dummy_qc(99, [0x99; 32]), nid(4))),
                 Event::PacemakerAdvance(100),
             ]
@@ -4164,11 +4356,14 @@ mod tests {
                     signer: source,
                     sig,
                 }),
-                ConsensusMsg::Vote(payload) => Event::VoteReceived(Signed {
-                    payload,
-                    signer: source,
-                    sig,
-                }),
+                ConsensusMsg::Vote(payload) => Event::VoteReceived(
+                    Signed {
+                        payload,
+                        signer: source,
+                        sig,
+                    },
+                    None,
+                ),
                 ConsensusMsg::NewView(payload) => Event::NewViewReceived(Signed {
                     payload,
                     signer: source,
@@ -4395,7 +4590,7 @@ mod tests {
                                 signer: byz_nid,
                                 sig: [0u8; 64],
                             };
-                            replicas.inject(target_honest, Event::VoteReceived(vote));
+                            replicas.inject(target_honest, Event::VoteReceived(vote, None));
                         }
                     }
                 }
@@ -4641,7 +4836,7 @@ mod tests {
                                 signer: byz_nid,
                                 sig: [0u8; 64],
                             };
-                            replicas.inject(target_honest, Event::VoteReceived(vote));
+                            replicas.inject(target_honest, Event::VoteReceived(vote, None));
                         }
                         MixedStep::InjectProposal {
                             parent_hash,
@@ -4756,7 +4951,7 @@ mod tests {
                 let block_hash: BlockHash = [i as u8 + 1; 32];
                 let signer = signers[i % signers.len()];
                 let signed = signed_vote(view, block_hash, signer);
-                core.step(Event::VoteReceived(signed));
+                core.step(Event::VoteReceived(signed, None));
                 assert!(
                     core.vote_bucket.len() <= cap,
                     "vote_bucket grew past cap after insert {i}: len={}",
@@ -4784,7 +4979,10 @@ mod tests {
             let signer = nid(2);
             for view in 0..10 {
                 let block_hash: BlockHash = [view as u8 + 1; 32];
-                core.step(Event::VoteReceived(signed_vote(view, block_hash, signer)));
+                core.step(Event::VoteReceived(
+                    signed_vote(view, block_hash, signer),
+                    None,
+                ));
             }
             assert_eq!(core.vote_bucket.len(), 10);
             assert_eq!(core.eviction_counters().vote_bucket(), 0);
@@ -4807,16 +5005,16 @@ mod tests {
             let cap = 2usize;
             let mut core = make_core_with_limits(1, cap_only_vote_bucket(cap));
             // Fill to cap with two distinct tuples first.
-            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(2))));
-            let _ = core.step(Event::VoteReceived(signed_vote(1, [2; 32], nid(2))));
+            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(2)), None));
+            let _ = core.step(Event::VoteReceived(signed_vote(1, [2; 32], nid(2)), None));
             assert_eq!(core.vote_bucket.len(), cap);
             assert_eq!(core.eviction_counters().vote_bucket(), 0);
 
             // Three more votes on the SAME (view, block_hash) tuples
             // from different signers — bucket-update path, no growth.
-            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(3))));
-            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(4))));
-            let _ = core.step(Event::VoteReceived(signed_vote(1, [2; 32], nid(3))));
+            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(3)), None));
+            let _ = core.step(Event::VoteReceived(signed_vote(0, [1; 32], nid(4)), None));
+            let _ = core.step(Event::VoteReceived(signed_vote(1, [2; 32], nid(3)), None));
             assert_eq!(core.vote_bucket.len(), cap);
             assert_eq!(core.eviction_counters().vote_bucket(), 0);
         }
