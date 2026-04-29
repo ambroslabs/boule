@@ -776,7 +776,8 @@ fn build_genesis(cfg: &ConsensusConfig) -> anyhow::Result<Block> {
             .ok_or_else(|| anyhow::anyhow!("genesis_seed_hex must be 64 hex chars (32 bytes)"))?;
         seed = bytes;
     }
-    Ok(Block::genesis(seed))
+    // TODO(#325 PR B): compute real validator_history_commitment from genesis-time histories.
+    Ok(Block::genesis(seed, [0; 32]))
 }
 
 fn decode_hex32(s: &str) -> Option<[u8; 32]> {

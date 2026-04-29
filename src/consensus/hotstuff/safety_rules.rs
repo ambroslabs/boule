@@ -159,6 +159,7 @@ mod tests {
                 proposer: nid(1),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             };
             let block = Block {
                 header,
@@ -186,7 +187,7 @@ mod tests {
 
     #[test]
     fn extends_is_reflexive() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let state = HotStuffState::new(validators(), g.clone());
         let h = g.hash();
         assert!(extends(&h, &h, &state.pending_blocks));
@@ -194,7 +195,7 @@ mod tests {
 
     #[test]
     fn extends_finds_direct_parent() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1]);
         let state = state_with_chain(&chain, g.clone());
         assert!(extends(&chain[0].hash(), &g.hash(), &state.pending_blocks));
@@ -202,7 +203,7 @@ mod tests {
 
     #[test]
     fn extends_finds_grandparent() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1, 2]);
         let state = state_with_chain(&chain, g.clone());
         assert!(extends(&chain[1].hash(), &g.hash(), &state.pending_blocks));
@@ -210,7 +211,7 @@ mod tests {
 
     #[test]
     fn extends_rejects_unrelated_sibling() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain_a = chain_from_genesis(&g, &[1]);
         // Build a sibling at view 2 rooted on g as well (parent = genesis).
         let sibling = Block {
@@ -221,6 +222,7 @@ mod tests {
                 proposer: nid(2),
                 state_commitment: [1; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -238,7 +240,7 @@ mod tests {
 
     #[test]
     fn extends_returns_false_when_ancestor_unknown() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1]);
         let state = state_with_chain(&chain, g);
         assert!(!extends(
@@ -251,7 +253,7 @@ mod tests {
     #[test]
     fn extends_returns_false_on_missing_link() {
         // Insert grandchild but not its parent — walk stops at missing.
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1, 2]);
         let mut state = HotStuffState::new(validators(), g.clone());
         state.insert_pending(chain[1].clone()); // note: not chain[0]
@@ -273,6 +275,7 @@ mod tests {
                 proposer: nid(1),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -284,6 +287,7 @@ mod tests {
                 proposer: nid(1),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -303,7 +307,7 @@ mod tests {
 
     #[test]
     fn safe_to_vote_rejects_view_not_greater_than_last_voted() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[5]);
         let mut state = state_with_chain(&chain, g.clone());
         state.last_voted_view = 5;
@@ -313,7 +317,7 @@ mod tests {
 
     #[test]
     fn safe_to_vote_accepts_fresh_view_when_unlocked() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1]);
         let state = state_with_chain(&chain, g.clone());
         let p = proposal(chain[0].clone(), dummy_qc(0, g.hash()));
@@ -324,7 +328,7 @@ mod tests {
     fn safe_to_vote_accepts_when_extends_locked() {
         // Lock is on block at view 3. Propose a new block whose chain
         // extends that block: extension rule fires.
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[3, 4]);
         let locked_block = &chain[0];
         let new_block = &chain[1];
@@ -343,7 +347,7 @@ mod tests {
     fn safe_to_vote_rejects_when_doesnt_extend_and_justify_stale() {
         // Locked on view 5, propose a sibling at view 6 with justify.view=3
         // that doesn't extend the locked block → neither rule fires.
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let locked_block = chain_from_genesis(&g, &[5])[0].clone();
         // Fork: different block at view 6 rooted on genesis directly.
         let fork = Block {
@@ -354,6 +358,7 @@ mod tests {
                 proposer: nid(3),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -375,7 +380,7 @@ mod tests {
     #[test]
     fn safe_to_vote_accepts_liveness_rule_when_justify_fresher() {
         // Same setup as above but the justify is view 9 > locked.view = 5.
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let locked_block = chain_from_genesis(&g, &[5])[0].clone();
         let fork = Block {
             header: BlockHeader {
@@ -385,6 +390,7 @@ mod tests {
                 proposer: nid(3),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -407,13 +413,13 @@ mod tests {
 
     #[test]
     fn should_update_high_qc_when_empty() {
-        let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+        let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
         assert!(should_update_high_qc(&dummy_qc(0, [0; 32]), &state));
     }
 
     #[test]
     fn should_update_high_qc_requires_strictly_greater_view() {
-        let mut state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+        let mut state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
         state.high_qc = Some(dummy_qc(5, [1; 32]));
         assert!(!should_update_high_qc(&dummy_qc(5, [2; 32]), &state));
         assert!(!should_update_high_qc(&dummy_qc(4, [2; 32]), &state));
@@ -424,7 +430,7 @@ mod tests {
 
     #[test]
     fn three_chain_commit_commits_grandparent_on_consecutive_views() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1, 2, 3]);
         let state = state_with_chain(&chain, g);
         let new_qc = dummy_qc(3, chain[2].hash());
@@ -436,7 +442,7 @@ mod tests {
 
     #[test]
     fn three_chain_commit_returns_none_on_view_gap() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         // Views 1, 2, 5 — not strictly consecutive (gap between 2 and 5).
         let chain = chain_from_genesis(&g, &[1, 2, 5]);
         let state = state_with_chain(&chain, g);
@@ -451,7 +457,7 @@ mod tests {
         // genesis has view 0 and first block has view 1, so
         // 0 + 1 == 1 holds. This test uses non-consecutive gap
         // between genesis view 0 and first block view 2.
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[2, 3]);
         let state = state_with_chain(&chain, g);
         let new_qc = dummy_qc(3, chain[1].hash());
@@ -462,7 +468,7 @@ mod tests {
 
     #[test]
     fn three_chain_commit_returns_none_on_unknown_qc_block() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let state = HotStuffState::new(validators(), g);
         let new_qc = dummy_qc(7, [0xAB; 32]);
         assert!(three_chain_commit(&new_qc, &state).is_none());
@@ -470,7 +476,7 @@ mod tests {
 
     #[test]
     fn three_chain_commit_returns_none_on_view_block_mismatch() {
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1, 2, 3]);
         let state = state_with_chain(&chain, g);
         // QC claims view 9 over a block whose header view is 3 → malformed.
@@ -482,7 +488,7 @@ mod tests {
     fn three_chain_commit_handles_genesis_rooted_three_chain() {
         // Views 1, 2, 3 with genesis as parent of view 1. b1 = block at
         // view 1, committed when we QC view 3.
-        let g = Block::genesis([0; 32]);
+        let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1, 2, 3]);
         let state = state_with_chain(&chain, g);
         let new_qc = dummy_qc(3, chain[2].hash());

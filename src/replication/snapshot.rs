@@ -835,7 +835,7 @@ mod tests {
     /// `parent_hash` defaults to genesis's hash; tests that need a
     /// specific parent can build their own Block.
     fn sample_block(height: u64, view: u64, state_commitment: [u8; 32]) -> Block {
-        let parent_hash = Block::genesis([0u8; 32]).hash();
+        let parent_hash = Block::genesis([0u8; 32], [0; 32]).hash();
         let commands: Vec<Bytes> = Vec::new();
         Block {
             header: BlockHeader {
@@ -845,6 +845,7 @@ mod tests {
                 proposer: [0u8; 32],
                 state_commitment,
                 commands_commitment: Block::commands_commitment(&commands),
+                validator_history_commitment: [0; 32],
             },
             commands,
         }

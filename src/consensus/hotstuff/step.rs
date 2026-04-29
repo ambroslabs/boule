@@ -1523,6 +1523,7 @@ mod tests {
                 proposer,
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             };
             let block = Block {
                 header,
@@ -1551,6 +1552,7 @@ mod tests {
                 proposer: self.proposer,
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             };
             Block {
                 header,
@@ -1563,7 +1565,7 @@ mod tests {
     /// over the canonical four-validator set, rooted at a standard
     /// all-zero-state-commitment genesis block.
     pub(crate) fn make_core(self_byte: u8) -> HotStuffCore {
-        let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+        let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
         let builder = Arc::new(TestBlockBuilder {
             proposer: nid(self_byte),
         });
@@ -1581,6 +1583,7 @@ mod tests {
             proposer,
             state_commitment: [0; 32],
             commands_commitment: Block::commands_commitment(&[]),
+            validator_history_commitment: [0; 32],
         };
         Block {
             header,
@@ -1666,7 +1669,7 @@ mod tests {
     #[test]
     fn first_proposal_emits_persist_vote_and_adopts_high_qc() {
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let block = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
         let block_hash = block.hash();
         let justify = dummy_qc(0, genesis.hash());
@@ -1699,7 +1702,7 @@ mod tests {
     #[test]
     fn second_proposal_at_same_view_emits_no_vote() {
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let justify = dummy_qc(0, genesis.hash());
 
         // First proposal at view 1 — vote emitted.
@@ -1725,6 +1728,7 @@ mod tests {
                 proposer: nid(2),
                 state_commitment: [0xFF; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -1756,6 +1760,7 @@ mod tests {
                 proposer: nid(3),
                 state_commitment: [view as u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         }
@@ -1764,7 +1769,7 @@ mod tests {
     #[test]
     fn refuses_to_vote_when_not_extending_lock_and_justify_stale() {
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
 
         // Lock the core on a block at view 5.
         let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
@@ -1818,7 +1823,7 @@ mod tests {
         // not extend the locked block. Without this path, a slow
         // node that locked on a dead branch would never catch up.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
 
         let locked_block = chain_from_genesis(&genesis, &[5], nid(2))[0].clone();
         let locked_hash = locked_block.hash();
@@ -1871,7 +1876,7 @@ mod tests {
         // which is the lower bound the safety core needs to uphold
         // regardless of what the integration layer (#24) filters.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let justify = dummy_qc(0, genesis.hash());
 
         // The legitimate view-1 leader (nid(2)) proposes first.
@@ -1900,6 +1905,7 @@ mod tests {
                 proposer: nid(3),
                 state_commitment: [0xCC; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -1935,7 +1941,7 @@ mod tests {
         // consecutive views 2←1←0 — so `Commit(genesis)` is also
         // emitted after B4's `Persist(Locked)`.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let prefix = chain_from_genesis(&genesis, &[1, 2], nid(2));
         let block1 = prefix[0].clone();
         let block2 = prefix[1].clone();
@@ -1991,7 +1997,7 @@ mod tests {
         // view instead of height could also silently rewrite the
         // lock.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let prefix = chain_from_genesis(&genesis, &[1, 2], nid(2));
         core.state.insert_pending(prefix[0].clone());
         core.state.insert_pending(prefix[1].clone());
@@ -2013,6 +2019,7 @@ mod tests {
                 proposer: nid(2),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -2041,7 +2048,7 @@ mod tests {
         // strictly consecutive, so B5 commits v2 and prunes everything
         // at height ≤ 2.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&genesis, &[1, 2, 3, 4], nid(2));
         for block in &chain {
             core.state.insert_pending(block.clone());
@@ -2096,7 +2103,7 @@ mod tests {
         // particular stays. Appendix B.1 ("Why direct parent") makes
         // this the one arm of `update` that must remain strict.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&genesis, &[1, 2, 5], nid(2));
         for block in &chain {
             core.state.insert_pending(block.clone());
@@ -2135,7 +2142,7 @@ mod tests {
         // unit test above holds one step; D2 is the only test that
         // pins the cross-step behavior end-to-end.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
         let block_v1 = chain[0].clone();
         let block_v2 = chain[1].clone();
@@ -2301,7 +2308,7 @@ mod tests {
         // where `new_v4` is what the `TestBlockBuilder` stamps over
         // block_v3 at view 4.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
         let block_v3_hash = block_v3.hash();
         core.state.insert_pending(block_v3.clone());
@@ -2336,6 +2343,7 @@ mod tests {
                 proposer: nid(1),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -2385,11 +2393,11 @@ mod tests {
                 BlsAggregated::keygen(&ikm).expect("BLS keygen for test")
             })
             .collect();
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
         let block_v3_hash = block_v3.hash();
 
-        let state = HotStuffState::new(validators_set.clone(), Block::genesis([0; 32]));
+        let state = HotStuffState::new(validators_set.clone(), Block::genesis([0; 32], [0; 32]));
         let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
         let mut core = HotStuffCore::new(nid(1), state, builder)
             .with_signature_scheme(SignatureSchemeChoice::BlsAggregated);
@@ -2441,7 +2449,7 @@ mod tests {
         // plumb it, or a corner-case test wiring) must be dropped
         // rather than panic in `add_bls_partial` or fold an Ed25519
         // sig into the BLS aggregate.
-        let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+        let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
         let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
         let mut core = HotStuffCore::new(nid(1), state, builder)
             .with_signature_scheme(SignatureSchemeChoice::BlsAggregated);
@@ -2514,7 +2522,7 @@ mod tests {
         // 4] = validators[1] = nid(2), so we own the propose path for
         // view 5.
         let mut core = make_core(2);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         // Build a chain so we have a concrete `high_qc` target block
         // to point at without inserting it into `pending_blocks`.
         let chain = chain_from_genesis(&genesis, &[1, 2, 3, 4], nid(1));
@@ -2720,7 +2728,7 @@ mod tests {
     #[test]
     fn newview_with_known_block_hash_does_not_request_block() {
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let block_v1 = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
         let block_v1_hash = block_v1.hash();
         core.state.insert_pending(block_v1);
@@ -2755,7 +2763,7 @@ mod tests {
         // late deliveries land in it as idempotent sinks rather than
         // re-materializing an empty QC and re-firing.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
         let block_v3_hash = block_v3.hash();
         core.state.insert_pending(block_v3.clone());
@@ -2934,7 +2942,7 @@ mod tests {
         // and then broadcasts `NewView` carrying the just-adopted
         // high_qc.
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
         let block_v1 = chain[0].clone();
         let block_v2 = chain[1].clone();
@@ -3000,7 +3008,7 @@ mod tests {
     #[test]
     fn still_parked_proposal_re_emits_request_block_on_pacemaker_advance() {
         let mut core = make_core(1);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
         let block_v1 = chain[0].clone();
         let block_v2 = chain[1].clone();
@@ -3139,7 +3147,7 @@ mod tests {
             limits.block_sync_per_peer_attempts = per_peer_attempts;
             limits.block_sync_max_attempts = max_attempts;
             // Backoff stays at 0/0: rotation cadence is the focus.
-            let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             let builder = Arc::new(TestBlockBuilder {
                 proposer: nid(self_byte),
             });
@@ -3231,7 +3239,7 @@ mod tests {
         #[test]
         fn parent_arrival_via_insert_pending_block_clears_inflight_entry() {
             let mut core = make_rotation_core(1, 2, 8);
-            let genesis = Block::genesis([0; 32]);
+            let genesis = Block::genesis([0; 32], [0; 32]);
             let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
             let parent_block = chain[0].clone();
             let child_block = chain[1].clone();
@@ -3265,7 +3273,7 @@ mod tests {
         #[test]
         fn parent_arrival_via_proposal_clears_inflight_entry() {
             let mut core = make_rotation_core(1, 2, 8);
-            let genesis = Block::genesis([0; 32]);
+            let genesis = Block::genesis([0; 32], [0; 32]);
             let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
             let parent_block = chain[0].clone();
             let child_block = chain[1].clone();
@@ -3375,7 +3383,7 @@ mod tests {
             let mut limits = CacheLimits::unbounded_for_tests();
             limits.block_sync_initial_backoff_views = 2;
             limits.block_sync_max_backoff_views = 2;
-            let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
             let mut core = HotStuffCore::with_limits(
                 nid(1),
@@ -3428,7 +3436,7 @@ mod tests {
             let mut limits = CacheLimits::unbounded_for_tests();
             limits.block_sync_initial_backoff_views = 4;
             limits.block_sync_max_backoff_views = 4;
-            let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
             let mut core = HotStuffCore::with_limits(
                 nid(1),
@@ -3508,7 +3516,7 @@ mod tests {
         #[test]
         fn high_qc_block_arrival_via_insert_pending_block_clears_inflight_entry() {
             let mut core = make_rotation_core(1, 2, 8);
-            let genesis = Block::genesis([0; 32]);
+            let genesis = Block::genesis([0; 32], [0; 32]);
             let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
             let block_v3_hash = block_v3.hash();
             let qc_v3 = dummy_qc(3, block_v3_hash);
@@ -3669,7 +3677,7 @@ mod tests {
         // drives a commit and a quorum-triggered broadcast, so the
         // action vectors across steps vary in shape.
         fn build_trace() -> Vec<Event> {
-            let genesis = Block::genesis([0; 32]);
+            let genesis = Block::genesis([0; 32], [0; 32]);
             let chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
             let block_v1_hash = chain[0].hash();
             let block_v2_hash = chain[1].hash();
@@ -3766,7 +3774,7 @@ mod tests {
             high_qc: Option<QuorumCertificate>,
             pending: &[Block],
         ) -> HotStuffCore {
-            let mut state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let mut state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             state.last_voted_view = last_voted_view;
             state.locked = locked;
             state.high_qc = high_qc;
@@ -3798,7 +3806,7 @@ mod tests {
         #[test]
         fn restart_does_not_revote_at_already_voted_view() {
             // Pre-restart: vote at view 1.
-            let genesis = Block::genesis([0; 32]);
+            let genesis = Block::genesis([0; 32], [0; 32]);
             let block_v1 = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
             let justify_v0 = dummy_qc(0, genesis.hash());
             let signed = signed_proposal(block_v1.clone(), justify_v0, nid(2));
@@ -3864,7 +3872,7 @@ mod tests {
         #[test]
         fn restart_with_locked_qc_refuses_proposal_breaking_lock() {
             // Pre-restart: drive to a lock at height 1.
-            let genesis = Block::genesis([0; 32]);
+            let genesis = Block::genesis([0; 32], [0; 32]);
             let chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
             let block_v1 = chain[0].clone();
             let block_v2 = chain[1].clone();
@@ -3923,6 +3931,7 @@ mod tests {
                     proposer: nid(3),
                     state_commitment: [0xCC; 32],
                     commands_commitment: Block::commands_commitment(&[]),
+                    validator_history_commitment: [0; 32],
                 },
                 commands: Vec::new(),
             };
@@ -3962,7 +3971,7 @@ mod tests {
         /// regression of `state.high_qc.view`.
         #[test]
         fn restart_does_not_adopt_stale_high_qc_via_newview() {
-            let genesis = Block::genesis([0; 32]);
+            let genesis = Block::genesis([0; 32], [0; 32]);
             let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
             let block_v1 = chain[0].clone();
             let block_v2 = chain[1].clone();
@@ -4033,7 +4042,7 @@ mod tests {
         /// "unflushed entry may disappear" clause.
         #[test]
         fn restart_with_persisted_vote_but_missing_high_qc_is_safe() {
-            let genesis = Block::genesis([0; 32]);
+            let genesis = Block::genesis([0; 32], [0; 32]);
             let block_v1 = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
             let justify_v0 = dummy_qc(0, genesis.hash());
             let signed_v1 = signed_proposal(block_v1.clone(), justify_v0, nid(2));
@@ -4235,7 +4244,7 @@ mod tests {
                 );
                 let n_honest = n_total - byzantine_count;
                 let validators = validator_set(n_total);
-                let genesis = Block::genesis([0; 32]);
+                let genesis = Block::genesis([0; 32], [0; 32]);
                 let cores: Vec<HotStuffCore> = (0..n_honest)
                     .map(|i| {
                         let nid = *validators.get(i).unwrap();
@@ -4862,6 +4871,7 @@ mod tests {
                 proposer: byz_nid,
                 state_commitment: [view as u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
             };
             let block = Block {
                 header,
@@ -5161,7 +5171,7 @@ mod tests {
         /// four; cap fields are passed as a literal so each test can
         /// scale them independently.
         fn make_core_with_limits(self_byte: u8, limits: CacheLimits) -> HotStuffCore {
-            let state = HotStuffState::new(validators(), Block::genesis([0; 32]));
+            let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             let builder = Arc::new(TestBlockBuilder {
                 proposer: nid(self_byte),
             });
@@ -5449,6 +5459,7 @@ mod tests {
                     proposer: nid(3),
                     state_commitment: [0xC0 + i as u8; 32],
                     commands_commitment: Block::commands_commitment(&[]),
+                    validator_history_commitment: [0; 32],
                 };
                 let fork = Block {
                     header,

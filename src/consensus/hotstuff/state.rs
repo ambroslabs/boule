@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn new_seeds_genesis_into_pending() {
         let vs = ValidatorSet::new(vec![nid(1), nid(2), nid(3), nid(4)]);
-        let genesis = Block::genesis([0x77; 32]);
+        let genesis = Block::genesis([0x77; 32], [0; 32]);
         let g_hash = genesis.hash();
         let state = HotStuffState::new(vs.clone(), genesis.clone());
         assert_eq!(state.current_view, 0);
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn insert_pending_is_idempotent() {
         let vs = ValidatorSet::new(vec![nid(1)]);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let mut state = HotStuffState::new(vs, genesis.clone());
         let before = state.pending_blocks.len();
         state.insert_pending(genesis.clone());

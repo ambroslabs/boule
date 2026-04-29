@@ -720,7 +720,7 @@ mod tests {
     }
 
     fn sample_block(height: u64, view: u64) -> Block {
-        let parent_hash = Block::genesis([0u8; 32]).hash();
+        let parent_hash = Block::genesis([0u8; 32], [0; 32]).hash();
         let commands: Vec<Bytes> = Vec::new();
         Block {
             header: BlockHeader {
@@ -730,6 +730,7 @@ mod tests {
                 proposer: [0u8; 32],
                 state_commitment: [0xCD; 32],
                 commands_commitment: Block::commands_commitment(&commands),
+                validator_history_commitment: [0; 32],
             },
             commands,
         }

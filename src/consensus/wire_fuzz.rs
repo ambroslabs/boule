@@ -169,6 +169,7 @@ fn arb_block(genesis_hash: BlockHash) -> impl Strategy<Value = Block> {
                     proposer,
                     state_commitment,
                     commands_commitment: Block::commands_commitment(&commands),
+                    validator_history_commitment: [0; 32],
                 };
                 Block { header, commands }
             },
@@ -203,7 +204,7 @@ fn arb_signer_idx() -> impl Strategy<Value = usize> {
 /// NodeId. Signature verification will pass for the resulting frame —
 /// the fuzz target is everything *past* signature verification.
 fn arb_signed_wire_bytes_and_signer() -> impl Strategy<Value = (Vec<u8>, NodeId)> {
-    let genesis_hash = Block::genesis([0; 32]).hash();
+    let genesis_hash = Block::genesis([0; 32], [0; 32]).hash();
     prop_oneof![
         (arb_signer_idx(), arb_proposal(genesis_hash)).prop_map(|(idx, p)| {
             let signer = &signer_pool()[idx];
@@ -238,7 +239,7 @@ fn arb_signed_wire_bytes_and_signer() -> impl Strategy<Value = (Vec<u8>, NodeId)
                 .expect("encode WireMessage::BlockRequest");
             (bytes, [0u8; 32])
         }),
-        prop::option::of(arb_block(Block::genesis([0; 32]).hash())).prop_map(|maybe| {
+        prop::option::of(arb_block(Block::genesis([0; 32], [0; 32]).hash())).prop_map(|maybe| {
             let bytes = postcard::to_stdvec(&WireMessage::BlockResponse(maybe))
                 .expect("encode WireMessage::BlockResponse");
             (bytes, [0u8; 32])
@@ -324,6 +325,7 @@ impl BlockBuilder for TestBlockBuilder {
             proposer: self.proposer,
             state_commitment: [0; 32],
             commands_commitment: Block::commands_commitment(&[]),
+            validator_history_commitment: [0; 32],
         };
         Block {
             header,
@@ -343,7 +345,7 @@ struct ReplicaSet {
 impl ReplicaSet {
     fn new(n: usize) -> Self {
         let validators = cluster_validator_set(n);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let cores: Vec<HotStuffCore> = (0..n)
             .map(|i| {
                 let nid = *validators.get(i).unwrap();
@@ -605,6 +607,7 @@ fn malformed_signed_proposal(p: MalformedProposalInputs) -> Signed<Proposal> {
         proposer: p.sender,
         state_commitment: [p.view as u8; 32],
         commands_commitment: Block::commands_commitment(&[]),
+        validator_history_commitment: [0; 32],
     };
     let block = Block {
         header,
@@ -781,7 +784,7 @@ proptest! {
         steps in prop::collection::vec(cache_step_strategy(4), 1..=200),
     ) {
         let validators = cluster_validator_set(4);
-        let genesis = Block::genesis([0; 32]);
+        let genesis = Block::genesis([0; 32], [0; 32]);
         let self_id = *validators.get(0).unwrap();
         let state = HotStuffState::new(validators.clone(), genesis.clone());
         let limits = CacheLimits {
@@ -827,6 +830,7 @@ proptest! {
                         proposer: sender,
                         state_commitment: [view as u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
+                        validator_history_commitment: [0; 32],
                     };
                     let block = Block { header, commands: Vec::new() };
                     let mut justify = QuorumCertificate::new(0, [0; 32], validators.len());
@@ -848,6 +852,7 @@ proptest! {
                         proposer: sender,
                         state_commitment: [view as u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
+                        validator_history_commitment: [0; 32],
                     };
                     let block = Block { header, commands: Vec::new() };
                     let mut justify = QuorumCertificate::new(0, genesis.hash(), validators.len());
