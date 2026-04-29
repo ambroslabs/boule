@@ -51,6 +51,23 @@ Unit tests (when present):
 cargo test --lib
 ```
 
+### Compute-heavy tests
+
+CI splits the test suite across two shards: a `heavy` shard that runs
+CPU-bound tests one at a time, and a `default` shard that runs the rest in
+parallel. This keeps cryptographic tests (BLS pairing / PoP) and large
+consensus simulations from starving each other on a shared runner.
+
+If your new test is CPU-bound *and* its isolated wall-clock is longer than a
+few seconds, classify it as heavy. Two places to update — keep them in sync:
+
+- `.config/nextest.toml` — `[[profile.default.overrides]].filter`
+- `.github/workflows/ci.yml` — the `HEAVY_FILTER` env in the `test` job
+
+The leading comment in `.config/nextest.toml` documents the convention. New
+tests that match an existing pattern (for example, anything in
+`crypto::bls_key::tests`) are picked up automatically.
+
 ## Code Style
 
 Formatting and linting are enforced in CI. Before pushing, run:
