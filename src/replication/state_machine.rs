@@ -79,8 +79,23 @@ pub trait StateMachine: Send + Sync {
     /// Overwrite state from a snapshot previously produced by
     /// [`StateMachine::snapshot`].
     ///
-    /// On `Err`, the receiver's state is left in an implementation-defined
-    /// but type-valid condition — callers that need atomicity should
-    /// restore into a fresh instance and swap only on success.
+    /// # Contract
+    ///
+    /// - **MUST** succeed on any snapshot produced by this same
+    ///   `StateMachine` instance's [`Self::snapshot`] on the same
+    ///   version of the state machine — the round trip is the basis
+    ///   for the proposal-time fork-and-restore in
+    ///   [`crate::consensus::node::MempoolBlockBuilder`].
+    /// - **MAY** return `Err` on (a) a snapshot produced by a
+    ///   *different* version of the state machine (cross-version
+    ///   migration), (b) bytes corrupted on disk or in transit, or
+    ///   (c) resource exhaustion. Callers treat `Err` as
+    ///   recoverable: the consensus loop skips this view's proposal
+    ///   rather than panicking the node, and the next-view leader
+    ///   takes over (issue #326, audit finding 4-F3).
+    /// - On `Err`, the receiver's state is left in an
+    ///   implementation-defined but type-valid condition — callers
+    ///   that need atomicity should restore into a fresh instance
+    ///   and swap only on success.
     fn restore(&mut self, snap: &[u8]) -> anyhow::Result<()>;
 }
