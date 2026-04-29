@@ -89,7 +89,23 @@ pub enum Dispatch {
     /// A signed [`TimeoutVote`] arrived. The integration layer feeds
     /// it into its timeout-certificate bucket; on reaching quorum the
     /// bucket emits [`pacemaker::Event::OnTimeoutCert`] directly.
-    TimeoutVote(Signed<TimeoutVote>),
+    ///
+    /// `high_qc_trusted` says whether the integration layer may consume
+    /// `signed.payload.high_qc` (true) or must treat the piggyback as
+    /// untrusted noise and ignore it (false). Ingress verifies the
+    /// piggybacked QC's well-formedness and aggregate signature against
+    /// the validator set authoritative at `high_qc.view`; on failure the
+    /// flag is cleared but the envelope is still emitted, because the
+    /// timeout-vote *signal* itself is signed by a known validator and
+    /// must not be suppressible by attaching a forged piggyback (audit
+    /// finding 10-F3, issue #321). On
+    /// [`QcVerification::Skip`] the flag is always `true`, preserving
+    /// the historical contract for test fixtures that build QCs with
+    /// placeholder signatures.
+    TimeoutVote {
+        signed: Signed<TimeoutVote>,
+        high_qc_trusted: bool,
+    },
     /// Peer asked for a snapshot manifest (latest if `height = None`,
     /// or at exact height). The integration layer looks the manifest
     /// up in its [`crate::replication::SnapshotStore`] and replies
@@ -392,7 +408,28 @@ pub fn ingress_wire_with_qc_verification(
             // replicas' `current_view` arbitrarily forward by
             // broadcasting `TimeoutVote(view = u64::MAX)`. The
             // bucket-driven path keeps the trust gradient honest.
-            Ok(vec![Dispatch::TimeoutVote(signed)])
+            //
+            // The piggybacked `high_qc` *is* checked here (audit
+            // finding 10-F3, issue #321): a Byzantine voter who
+            // attaches a forged fresher-view QC to an otherwise honest
+            // timeout vote would otherwise launder the QC through the
+            // bucket's `best_high_qc` and the TC self-NewView loopback
+            // straight into the safety core's `state.high_qc`. We
+            // verify the piggyback at ingress and surface the result
+            // as `high_qc_trusted` rather than rejecting the envelope:
+            // dropping the whole timeout vote on a bad piggyback would
+            // hand a Byzantine peer a way to suppress honest timeout
+            // signal by attaching garbage to it.
+            let high_qc_trusted = verify_high_qc_piggyback(
+                signed.payload.high_qc.as_ref(),
+                history,
+                key_history,
+                qc_verification,
+            );
+            Ok(vec![Dispatch::TimeoutVote {
+                signed,
+                high_qc_trusted,
+            }])
         }
 
         WireMessage::BlockRequest(hash) => Ok(vec![Dispatch::ServeBlock { hash, to: from }]),
@@ -650,6 +687,49 @@ fn verify_qc_if_requested(
         }
     }
     Ok(())
+}
+
+/// Soft-verify the `high_qc` piggyback on a [`TimeoutVote`].
+///
+/// Returns `true` if the piggyback is either absent, accompanied by a
+/// [`QcVerification::Skip`] policy (legacy / test fixture path), or
+/// passes both well-formedness and aggregate-signature verification
+/// against the validator set authoritative at `qc.view`. Returns
+/// `false` if the piggyback is structurally malformed or fails
+/// aggregate verification — the caller must then drop the piggyback
+/// (treat it as if the timeout vote carried `high_qc: None`) but
+/// **not** the envelope itself.
+///
+/// Why soft: an attacker who broadcasts `TimeoutVote { view, high_qc:
+/// Some(forged) }` over their genuine timeout signal must not be able
+/// to suppress that signal by attaching garbage. The envelope is
+/// already authenticated by [`verify_signer_at`] and [`verify_sig`];
+/// the piggyback is the additional, separable, cryptographically
+/// scoped object — and it's the *only* part the bucket logic
+/// in `on_timeout_vote` propagates into safety-core state. Refusing
+/// the bad piggyback while accepting the timeout-quorum signal keeps
+/// `state.high_qc` honest without giving a Byzantine voter a DoS
+/// vector against the round-advance machinery.
+fn verify_high_qc_piggyback(
+    high_qc: Option<&QuorumCertificate>,
+    history: &ValidatorSetHistory,
+    key_history: &ValidatorKeyHistory,
+    qc_verification: &QcVerification<'_>,
+) -> bool {
+    let Some(qc) = high_qc else {
+        return true;
+    };
+    if matches!(qc_verification, QcVerification::Skip) {
+        return true;
+    }
+    // The piggyback's bitmap is sized for the validator set authoritative
+    // at `qc.view` (the same set that voted to mint the QC). Reject
+    // bitmap-shape divergence before paying for an aggregate verify.
+    let vs = history.set_at(qc.view);
+    if !qc.is_well_formed(&vs) {
+        return false;
+    }
+    verify_qc_if_requested(qc, history, key_history, qc_verification).is_ok()
 }
 
 // ── egress_safety ─────────────────────────────────────────────────────────────
@@ -1087,7 +1167,13 @@ mod tests {
 
         let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap();
         assert_eq!(dispatches.len(), 1);
-        assert!(matches!(dispatches[0], Dispatch::TimeoutVote(_)));
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::TimeoutVote {
+                high_qc_trusted: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1993,7 +2079,7 @@ mod tests {
         let bytes = postcard::to_stdvec(&wire).unwrap();
 
         let dispatches = ingress(new.node_id(), &bytes, &history, &key_history).unwrap();
-        assert!(matches!(dispatches[0], Dispatch::TimeoutVote(_)));
+        assert!(matches!(dispatches[0], Dispatch::TimeoutVote { .. }));
     }
 
     /// NewView at view >= v_eff signed by the new key: signer check
@@ -2233,6 +2319,217 @@ mod tests {
             IngressError::InvalidQcAggregate {
                 view: 7,
                 scheme: "ed25519_collected"
+            }
+        ));
+    }
+
+    /// Happy path for the TimeoutVote piggyback verifier (issue #321):
+    /// a real, properly-aggregated `high_qc` rides along on a timeout
+    /// vote and ingress flags it as trusted so `on_timeout_vote` will
+    /// fold it into the bucket's `best_high_qc`.
+    #[test]
+    fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
+        let qc_view: View = 4;
+        let block_hash = [0x44; 32];
+        let (signers, vs, qc) = build_real_ed25519_qc(qc_view, block_hash);
+        let voter = &signers[0];
+
+        // Timeout vote at a *later* view than its piggybacked QC — the
+        // typical pattern: the voter is timing out at the current view
+        // and reporting the freshest QC they've seen so far.
+        let tv = TimeoutVote {
+            view: qc_view + 3,
+            high_qc: Some(qc),
+        };
+        let signed = Signed::sign(tv, voter).unwrap();
+        let wire = WireMessage::TimeoutVote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let dispatches = ingress_with_qc_verification(
+            voter.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect("real Ed25519 piggyback must verify under the genesis pubkeys");
+        assert_eq!(dispatches.len(), 1);
+        assert!(
+            matches!(
+                dispatches[0],
+                Dispatch::TimeoutVote {
+                    high_qc_trusted: true,
+                    ..
+                }
+            ),
+            "real piggyback must be flagged trusted, got {:?}",
+            dispatches[0]
+        );
+    }
+
+    /// Defence-in-depth for the TimeoutVote piggyback verifier (issue
+    /// #321): a Byzantine voter attaches a tampered aggregate to a
+    /// genuine timeout vote. The envelope is still emitted (suppressing
+    /// the timeout signal would let an attacker mute honest replicas
+    /// by attaching garbage), but `high_qc_trusted` is `false`, so
+    /// `on_timeout_vote` will not adopt the forged QC into
+    /// `bucket.best_high_qc` — closing the TC self-NewView loopback
+    /// laundering vector.
+    #[test]
+    fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback() {
+        let qc_view: View = 4;
+        let block_hash = [0x44; 32];
+        let (signers, vs, mut qc) = build_real_ed25519_qc(qc_view, block_hash);
+        let voter = &signers[0];
+
+        // Tamper one byte of the first signature in the aggregate. The
+        // bitmap and signature count remain consistent, so this slips
+        // past `is_well_formed` and only fails at `verify_aggregate`.
+        if let crate::consensus::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) =
+            &mut qc.signatures
+        {
+            sigs[0][0] ^= 0xFF;
+        }
+
+        let tv = TimeoutVote {
+            view: qc_view + 3,
+            high_qc: Some(qc),
+        };
+        let signed = Signed::sign(tv, voter).unwrap();
+        let wire = WireMessage::TimeoutVote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let dispatches = ingress_with_qc_verification(
+            voter.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect("envelope must still be accepted even when the piggyback is forged");
+        assert_eq!(dispatches.len(), 1);
+        match &dispatches[0] {
+            Dispatch::TimeoutVote {
+                signed: emitted,
+                high_qc_trusted,
+            } => {
+                assert!(!high_qc_trusted, "tampered piggyback must not be trusted");
+                assert_eq!(
+                    emitted.payload.view,
+                    qc_view + 3,
+                    "the timeout vote envelope must reach the integration layer unchanged",
+                );
+            }
+            other => panic!("expected Dispatch::TimeoutVote, got {other:?}"),
+        }
+    }
+
+    /// Structural malformation of the piggyback (bitmap shape doesn't
+    /// match the validator set authoritative at `high_qc.view`) takes
+    /// the same drop-piggyback-keep-envelope branch as a tampered
+    /// aggregate. This ensures the `is_well_formed` gate inside
+    /// `verify_high_qc_piggyback` actually runs — without it, a stray
+    /// bitmap could panic the aggregate verifier (or pass the wrong
+    /// number of pubkeys through).
+    #[test]
+    fn ingress_with_verify_drops_malformed_high_qc_in_timeout_vote_piggyback() {
+        let qc_view: View = 4;
+        let block_hash = [0x44; 32];
+        let (signers, vs, qc) = build_real_ed25519_qc(qc_view, block_hash);
+        let voter = &signers[0];
+
+        // Construct a wrongly-sized QC for the same view — the bitmap
+        // is 1 bit wide rather than `vs.len()` (= 4) bits. Real-set
+        // ingress will see a bitmap-set-mismatch on `is_well_formed`.
+        let mut malformed = QuorumCertificate::new(qc_view, block_hash, 1);
+        malformed.add_signature(0, [0u8; 64]);
+        // Sanity: the aggregate from the real QC also exists, but we
+        // don't reuse its sigs — the verifier never gets that far.
+        drop(qc);
+
+        let tv = TimeoutVote {
+            view: qc_view + 3,
+            high_qc: Some(malformed),
+        };
+        let signed = Signed::sign(tv, voter).unwrap();
+        let wire = WireMessage::TimeoutVote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let dispatches = ingress_with_qc_verification(
+            voter.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .expect("envelope must still be accepted even when the piggyback is malformed");
+        assert!(
+            matches!(
+                dispatches[0],
+                Dispatch::TimeoutVote {
+                    high_qc_trusted: false,
+                    ..
+                }
+            ),
+            "malformed piggyback must clear high_qc_trusted, got {:?}",
+            dispatches[0]
+        );
+    }
+
+    /// `high_qc: None` is the common pre-genesis-seed case: a peer
+    /// timing out before they've seen any QC. Verification is vacuous
+    /// and `high_qc_trusted` is `true`. Codifying this so a future
+    /// refactor doesn't accidentally flip `None`-piggyback flagging.
+    #[test]
+    fn ingress_with_verify_emits_high_qc_trusted_for_timeout_vote_with_no_piggyback() {
+        let voter = fresh_signer();
+        let vs = make_vs_with_signers(&[&voter]);
+
+        let tv = TimeoutVote {
+            view: 9,
+            high_qc: None,
+        };
+        let signed = Signed::sign(tv, &voter).unwrap();
+        let wire = WireMessage::TimeoutVote(signed);
+        let bytes = postcard::to_stdvec(&wire).unwrap();
+
+        let history = ValidatorSetHistory::from_genesis(vs.clone());
+        let key_history = key_history_from_set(&vs);
+        let qc_verify = QcVerification::Verify {
+            scheme: SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let dispatches = ingress_with_qc_verification(
+            voter.node_id(),
+            &bytes,
+            &history,
+            &key_history,
+            &qc_verify,
+        )
+        .unwrap();
+        assert!(matches!(
+            dispatches[0],
+            Dispatch::TimeoutVote {
+                high_qc_trusted: true,
+                ..
             }
         ));
     }

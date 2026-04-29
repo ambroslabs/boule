@@ -332,6 +332,88 @@ impl Adversary for TimeoutSpammerAdversary {
     }
 }
 
+// ── Forged-piggyback timeout-vote spammer ────────────────────────────────────
+
+/// Adversary 6 (issue #321 acceptance): broadcasts an extra
+/// [`TimeoutVote`] every K-th outbound, but unlike
+/// [`TimeoutSpammerAdversary`] this one *attaches a forged
+/// fresher-view `high_qc` piggyback*.
+///
+/// The threat model the verifier closes (audit finding 10-F3): without
+/// ingress-side aggregate verification of the piggyback, the bucket
+/// logic in [`crate::consensus::node::ConsensusNode::on_timeout_vote`]
+/// folds the freshest piggybacked QC across all signers in the bucket
+/// into `bucket.best_high_qc`, and on TC formation laundering it
+/// through a self-signed NewView straight into the safety core's
+/// `state.high_qc`. With `f + 1` honest replicas joining the same
+/// bucket on a real timeout, the byzantine's `view = u64::MAX - 1`
+/// piggyback is the freshest in the bucket, the TC fires, and every
+/// honest replica's `state.high_qc.view` jumps to a fake view with no
+/// real ancestor block. Safety breaks: subsequent proposals justify on
+/// the fake QC, the three-chain commit walk runs over an unverified
+/// ancestor, and liveness wedges (no real block hashes match what the
+/// safety core thinks it has committed against).
+///
+/// With #321's verifier wired in, `verify_high_qc_piggyback` rejects
+/// the forged aggregate before the envelope reaches `on_timeout_vote`,
+/// the bucket sees the timeout signal but ignores the QC, and
+/// `bucket.best_high_qc` only ever takes on values from honest
+/// piggybacks. The cluster's safety + liveness invariants then hold
+/// under the same `run_one_property` harness as the other adversaries.
+///
+/// The forged QC is *well-formed* (quorum-count bits set, matching
+/// signature slot count, structurally consistent bitmap) so it slips
+/// past `is_well_formed` — the only thing left to drop it is the
+/// aggregate signature check, which is exactly the path #321 wires.
+pub struct ForgedPiggybackAdversary {
+    counter: Mutex<u32>,
+    every: u32,
+}
+
+impl ForgedPiggybackAdversary {
+    pub fn new(every_n_emissions: u32) -> Self {
+        Self {
+            counter: Mutex::new(0),
+            every: every_n_emissions.max(1),
+        }
+    }
+
+    /// Build a bitmap-quorum, zero-signature QC at a fresher view than
+    /// honest replicas could plausibly hold, over a sentinel block hash
+    /// no honest block ever produces. Well-formed under the cluster's
+    /// validator set, so the structural gate passes; aggregate verify
+    /// is what rejects it.
+    fn forged_piggyback_qc(validators_len: usize) -> QuorumCertificate {
+        // u64::MAX - 1 keeps the value distinguishable from genuine
+        // `u64::MAX` should the constant ever appear elsewhere, while
+        // staying strictly fresher than any view honest replicas reach.
+        let mut qc = QuorumCertificate::new(u64::MAX - 1, [0xDE; 32], validators_len);
+        let quorum = crate::consensus::hotstuff::qc::quorum_size(validators_len);
+        for idx in 0..quorum {
+            qc.add_signature(idx, [0u8; 64]);
+        }
+        qc
+    }
+}
+
+impl Adversary for ForgedPiggybackAdversary {
+    fn intercept(&self, ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound> {
+        let mut counter = self.counter.lock();
+        *counter = counter.wrapping_add(1);
+        if *counter % self.every != 0 {
+            return vec![outbound];
+        }
+        let tv = TimeoutVote {
+            view: u64::from(*counter),
+            high_qc: Some(Self::forged_piggyback_qc(ctx.validators.len())),
+        };
+        let signed = Signed::sign(tv, ctx.signer.as_ref())
+            .expect("forged-piggyback adversary signing must not fail");
+        let payload = encode(&WireMessage::TimeoutVote(signed));
+        vec![outbound, ProtocolOutbound::Broadcast(payload)]
+    }
+}
+
 // ── Tests / proptest properties ──────────────────────────────────────────────
 
 #[cfg(test)]
@@ -361,6 +443,7 @@ mod tests {
         StaleReplayer,
         ForgedQc,
         TimeoutSpammer,
+        ForgedPiggyback,
     }
 
     fn build_adversary(kind: AdvKind) -> Arc<dyn Adversary> {
@@ -374,6 +457,7 @@ mod tests {
             AdvKind::StaleReplayer => Arc::new(StaleReplayerAdversary::new(2)),
             AdvKind::ForgedQc => Arc::new(ForgedQcAdversary::new(2)),
             AdvKind::TimeoutSpammer => Arc::new(TimeoutSpammerAdversary::new(2)),
+            AdvKind::ForgedPiggyback => Arc::new(ForgedPiggybackAdversary::new(2)),
         }
     }
 
@@ -384,6 +468,7 @@ mod tests {
             AdvKind::StaleReplayer => "stale-replayer",
             AdvKind::ForgedQc => "forged-qc",
             AdvKind::TimeoutSpammer => "timeout-spammer",
+            AdvKind::ForgedPiggyback => "forged-piggyback",
         }
     }
 
@@ -559,15 +644,42 @@ mod tests {
             })?;
         }
 
-        /// **Mixed adversary** — randomly pick one of the five
+        /// **Forged-piggyback timeout-vote spammer** (issue #321) —
+        /// Byzantine attaches a well-formed but cryptographically
+        /// bogus `high_qc` at `view = u64::MAX - 1` to its timeout
+        /// votes. Without ingress aggregate verification, the bucket
+        /// would adopt this piggyback as `best_high_qc` once `f + 1`
+        /// honest replicas timed out into the same view, and the TC
+        /// self-NewView loopback would launder it into every honest
+        /// replica's `state.high_qc`. Safety would then break: the
+        /// safety core would commit on a chain whose ancestor QC is
+        /// unauthenticated. With the verifier wired in, the forged
+        /// piggyback is dropped at ingress (`high_qc_trusted == false`
+        /// in the resulting `Dispatch::TimeoutVote`), the bucket
+        /// ignores the QC, and the cluster's safety + liveness floors
+        /// hold. The same `assert_no_conflicts` + honest-floor
+        /// pattern as the other adversaries is sufficient: a forged
+        /// QC adoption would either fork the committed chain or wedge
+        /// liveness as honest replicas fail to converge to a fake
+        /// future view.
+        #[test]
+        fn proptest_forged_piggyback_preserves_safety_and_liveness(
+            victim in 0usize..4,
+        ) {
+            run_paused(|| async move {
+                run_one_property(victim, AdvKind::ForgedPiggyback).await
+            })?;
+        }
+
+        /// **Mixed adversary** — randomly pick one of the six
         /// adversary kinds for the single Byzantine slot. Verifies
-        /// that property-1..5's invariants hold across the union of
+        /// that property-1..6's invariants hold across the union of
         /// adversaries (no implicit interaction breaks safety or
         /// liveness when the adversary is selected uniformly).
         #[test]
         fn proptest_mixed_adversary_preserves_safety_and_liveness(
             victim in 0usize..4,
-            kind_selector in 0usize..5,
+            kind_selector in 0usize..6,
         ) {
             run_paused(|| async move {
                 let kind = match kind_selector {
@@ -575,7 +687,8 @@ mod tests {
                     1 => AdvKind::VoteWithholder,
                     2 => AdvKind::StaleReplayer,
                     3 => AdvKind::ForgedQc,
-                    _ => AdvKind::TimeoutSpammer,
+                    4 => AdvKind::TimeoutSpammer,
+                    _ => AdvKind::ForgedPiggyback,
                 };
                 run_one_property(victim, kind).await
             })?;

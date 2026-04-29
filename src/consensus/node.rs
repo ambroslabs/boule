@@ -1653,8 +1653,11 @@ impl ConsensusNode {
                 );
             }
 
-            Dispatch::TimeoutVote(signed) => {
-                self.on_timeout_vote(signed, broadcaster, view_timer, signer)
+            Dispatch::TimeoutVote {
+                signed,
+                high_qc_trusted,
+            } => {
+                self.on_timeout_vote(signed, high_qc_trusted, broadcaster, view_timer, signer)
                     .await?;
             }
 
@@ -2332,8 +2335,12 @@ impl ConsensusNode {
         send_outbound(broadcaster, Outbound::Broadcast(bytes)).await;
 
         // Count our own timeout locally so we don't depend on
-        // broadcast-to-self semantics from the p2p layer.
-        self.on_timeout_vote(signed, broadcaster, view_timer, signer)
+        // broadcast-to-self semantics from the p2p layer. The
+        // piggybacked `high_qc` came straight from our own safety-core
+        // state above and was never on the wire, so it's trusted by
+        // construction — bypass the ingress verifier for the self-feed
+        // path.
+        self.on_timeout_vote(signed, true, broadcaster, view_timer, signer)
             .await
     }
 
@@ -2354,6 +2361,7 @@ impl ConsensusNode {
     async fn on_timeout_vote(
         &mut self,
         signed: Signed<TimeoutVote>,
+        high_qc_trusted: bool,
         broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
@@ -2430,13 +2438,24 @@ impl ConsensusNode {
             // Remember the freshest high_qc reported so far. `None`
             // here means the sender had never seen a QC (rare after
             // genesis-QC seeding); we just leave `best_high_qc` as-is.
-            if let Some(qc) = signed.payload.high_qc {
-                let fresher = match &bucket.best_high_qc {
-                    Some(cur) => qc.view > cur.view,
-                    None => true,
-                };
-                if fresher {
-                    bucket.best_high_qc = Some(qc);
+            //
+            // `high_qc_trusted == false` means ingress saw a piggyback
+            // but rejected it (forged signatures, malformed bitmap, or
+            // wrong validator set). The bucket treats it the same as
+            // `high_qc: None`: the timeout-vote signal is still real
+            // and counts toward the bucket's signer set, but the
+            // forged QC must not flow through `best_high_qc` and into
+            // the TC self-NewView loopback that ultimately feeds
+            // `state.high_qc`. Audit finding 10-F3 / issue #321.
+            if high_qc_trusted {
+                if let Some(qc) = signed.payload.high_qc {
+                    let fresher = match &bucket.best_high_qc {
+                        Some(cur) => qc.view > cur.view,
+                        None => true,
+                    };
+                    if fresher {
+                        bucket.best_high_qc = Some(qc);
+                    }
                 }
             }
 
@@ -6371,6 +6390,139 @@ mod tests {
         );
     }
 
+    /// Issue #321 regression: a Byzantine peer's `TimeoutVote` with a
+    /// well-formed but cryptographically forged `high_qc` piggyback
+    /// must not flow into `bucket.best_high_qc`. The dispatch verifier
+    /// (`verify_high_qc_piggyback`) clears `high_qc_trusted`, and
+    /// `on_timeout_vote`'s bucket update reads that flag and skips the
+    /// piggyback entirely, treating the envelope as `high_qc: None`.
+    ///
+    /// Without this gate, an attacker could broadcast a single
+    /// timeout vote with `view = u64::MAX - 1, high_qc = forged(...)`
+    /// and once `f + 1` honest replicas joined the same bucket on a
+    /// real timeout, the TC self-NewView loopback would launder the
+    /// forged QC into every honest replica's `state.high_qc`.
+    #[tokio::test]
+    async fn forged_piggyback_on_timeout_vote_does_not_taint_bucket_best_high_qc() {
+        // n = 4 → quorum = 3, f + 1 = 2.
+        let self_signer = fresh_signer();
+        let byzantine = fresh_signer();
+        let mut ids = vec![
+            self_signer.node_id(),
+            byzantine.node_id(),
+            nid(0xA1),
+            nid(0xA2),
+        ];
+        ids.sort();
+        let vs = ValidatorSet::new(ids);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        let mut node = ConsensusNode::new(
+            self_signer.node_id(),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Build a *well-formed* but cryptographically bogus QC at a
+        // very-fresh view. Quorum-many bits set, quorum-many zero
+        // signatures — passes is_well_formed, fails verify_aggregate.
+        let bogus_view: View = u64::MAX - 1;
+        let bogus_block_hash = [0xDE; 32];
+        let mut forged = crate::consensus::hotstuff::qc::QuorumCertificate::new(
+            bogus_view,
+            bogus_block_hash,
+            vs.len(),
+        );
+        let quorum = crate::consensus::hotstuff::qc::quorum_size(vs.len());
+        for idx in 0..quorum {
+            forged.add_signature(idx, [0u8; 64]);
+        }
+
+        // The byzantine signs a real timeout vote at a future view
+        // and piggybacks the forged QC. The envelope itself is valid
+        // (real signature over real payload bytes), so envelope
+        // verification at ingress will pass.
+        let attack_view: View = 42;
+        let tv = crate::consensus::hotstuff::qc::TimeoutVote {
+            view: attack_view,
+            high_qc: Some(forged),
+        };
+        let signed = crate::crypto::signed::Signed::sign(tv, &byzantine).expect("sign TimeoutVote");
+        let wire = WireMessage::TimeoutVote(signed);
+        let payload = postcard::to_stdvec(&wire).expect("encode WireMessage");
+
+        // Run through the production verify path — this is the same
+        // policy the live event loop wires (node.rs apply_dispatch).
+        let qc_verification = crate::consensus::dispatch::QcVerification::Verify {
+            scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+        };
+        let dispatches = crate::consensus::dispatch::ingress_with_qc_verification(
+            byzantine.node_id(),
+            &payload,
+            &ValidatorSetHistory::from_genesis(vs.clone()),
+            &ValidatorKeyHistory::new(vs.iter().copied()),
+            &qc_verification,
+        )
+        .expect("envelope is honest; ingress must accept and emit Dispatch::TimeoutVote");
+
+        // Ingress must emit exactly one TimeoutVote dispatch with the
+        // piggyback flagged untrusted — the public contract that
+        // on_timeout_vote relies on.
+        assert_eq!(dispatches.len(), 1);
+        match &dispatches[0] {
+            crate::consensus::dispatch::Dispatch::TimeoutVote {
+                signed,
+                high_qc_trusted,
+            } => {
+                assert!(
+                    !high_qc_trusted,
+                    "forged piggyback must not be flagged as trusted",
+                );
+                assert_eq!(signed.payload.view, attack_view);
+                // The envelope is unchanged — the integration layer
+                // will look at signed.payload.high_qc but must ignore
+                // it because the flag is false.
+                assert!(signed.payload.high_qc.is_some());
+            }
+            other => panic!("expected Dispatch::TimeoutVote, got {other:?}"),
+        }
+
+        let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+        for d in dispatches {
+            node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer_arc)
+                .await
+                .expect("apply_dispatch");
+        }
+
+        // The byzantine's timeout vote was real, so the bucket records
+        // the signer (one entry, below the f+1 honesty threshold). But
+        // bucket.best_high_qc must be None — the forged piggyback was
+        // dropped at ingress and never reached the freshness compare.
+        let bucket = node
+            .timeout_buckets
+            .get(&attack_view)
+            .expect("byzantine's timeout vote at attack_view created the bucket");
+        assert_eq!(
+            bucket.signers.len(),
+            1,
+            "the byzantine's signer must still count toward the bucket — \
+             dropping the envelope outright would let an attacker mute \
+             honest timeout signal by attaching garbage piggybacks",
+        );
+        assert!(
+            bucket.best_high_qc.is_none(),
+            "bucket.best_high_qc must remain None — the forged QC must \
+             not be eligible for the TC self-NewView loopback that \
+             feeds state.high_qc",
+        );
+    }
+
     /// Issue #222 regression: a peer's `TimeoutVote(view=V)` where
     /// `V < self.current_view` is the cleanest signal that the peer is
     /// wedged (typically post-restart, stuck at its persisted
@@ -6859,7 +7011,7 @@ mod tests {
                 signer: voter,
                 sig: [0u8; 64],
             };
-            node.on_timeout_vote(signed, broadcaster.as_ref(), &mut view_timer, &signer)
+            node.on_timeout_vote(signed, true, broadcaster.as_ref(), &mut view_timer, &signer)
                 .await
                 .unwrap();
             assert!(
