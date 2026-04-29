@@ -190,6 +190,15 @@ pub const STORAGE_KEY_VALIDATOR_HISTORY: &[u8] = b"consensus/validator_history";
 /// than a journal, traded for simpler recovery.
 pub const STORAGE_KEY_VALIDATOR_KEY_HISTORY: &[u8] = b"consensus/validator_key_history";
 
+/// Storage key for the persisted [`crate::consensus::bls_key_history::BlsKeyHistory`]
+/// (#339). Written alongside [`STORAGE_KEY_VALIDATOR_KEY_HISTORY`]
+/// after every successful commit-time rotation application on BLS
+/// chains; read at startup so the per-validator BLS pubkey timeline
+/// persists across restarts. Without this, an old QC verified after
+/// a restart would index against a stale post-genesis pubkey set
+/// because the rotations are reseeded from genesis only.
+pub const STORAGE_KEY_BLS_KEY_HISTORY: &[u8] = b"consensus/bls_key_history";
+
 /// Protocol ID registered with the p2p multiplexer for consensus traffic.
 /// Gossip uses `0x01`, ping-RPC uses `0x02`.
 pub const PROTOCOL_ID: u8 = 0x03;
@@ -2629,10 +2638,11 @@ impl ConsensusNode {
             // so all replicas accept or reject identically.
             let block_view = block.header.view;
             let current_set = self.validator_history.set_at(block_view);
-            let next_members = match cmd.validate_against_with_delay(
+            let next_members = match cmd.validate_against_with_delay_and_scheme(
                 &current_set,
                 block_view,
                 self.min_v_eff_delay,
+                self.signature_scheme,
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -2882,6 +2892,29 @@ impl ConsensusNode {
                         error = %e,
                         "validator_key_history_encode_failed",
                     );
+                }
+            }
+            // Mirror the persist for the parallel BLS history (#339).
+            // No-op on Ed25519 chains where bls_key_history is None.
+            if let Some(bls) = self.bls_key_history.as_ref() {
+                let persisted = bls.to_persisted();
+                match postcard::to_stdvec(&persisted) {
+                    Ok(bytes) => {
+                        if let Err(e) = self.storage.put(STORAGE_KEY_BLS_KEY_HISTORY, &bytes) {
+                            tracing::error!(
+                                target: TRACE_TARGET,
+                                error = %e,
+                                "bls_key_history_persist_failed",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "bls_key_history_encode_failed",
+                        );
+                    }
                 }
             }
         }

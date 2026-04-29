@@ -44,6 +44,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::consensus::View;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::sig_scheme::BlsPublicKey;
@@ -268,6 +270,110 @@ impl BlsKeyHistory {
     pub fn is_empty(&self) -> bool {
         self.by_stable_id.is_empty()
     }
+
+    /// Snapshot the history into a serializable wire form, suitable
+    /// for durable persistence across restarts (#339). Mirrors
+    /// [`crate::consensus::validator_key_history::ValidatorKeyHistory::to_persisted`]
+    /// in shape so the two histories can be flushed side-by-side at
+    /// each commit.
+    pub fn to_persisted(&self) -> PersistedBlsKeyHistory {
+        let validators = self
+            .by_stable_id
+            .iter()
+            .map(|(stable_id, entries)| PersistedBlsValidator {
+                stable_id: *stable_id,
+                entries: entries
+                    .iter()
+                    .map(|e| PersistedBlsKeyEntry {
+                        v_eff: e.v_eff,
+                        bls_pubkey: e.bls_pubkey,
+                    })
+                    .collect(),
+            })
+            .collect();
+        PersistedBlsKeyHistory { validators }
+    }
+
+    /// Rebuild a history from its persisted form. Validates that
+    /// every validator has at least one entry and that entries are
+    /// in strictly-increasing `v_eff` order.
+    pub fn from_persisted(persisted: PersistedBlsKeyHistory) -> anyhow::Result<Self> {
+        let mut h = Self::default();
+        for v in persisted.validators {
+            if v.entries.is_empty() {
+                anyhow::bail!(
+                    "persisted BLS validator {} has no entries",
+                    hex::encode(v.stable_id),
+                );
+            }
+            let mut last_v_eff: Option<View> = None;
+            let mut local: Vec<BlsKeyEntry> = Vec::with_capacity(v.entries.len());
+            for entry in v.entries {
+                if let Some(prev) = last_v_eff
+                    && entry.v_eff <= prev
+                {
+                    anyhow::bail!(
+                        "persisted BLS validator {}'s entries not strictly v_eff-increasing: \
+                         got {} after {}",
+                        hex::encode(v.stable_id),
+                        entry.v_eff,
+                        prev,
+                    );
+                }
+                last_v_eff = Some(entry.v_eff);
+                local.push(BlsKeyEntry {
+                    v_eff: entry.v_eff,
+                    bls_pubkey: entry.bls_pubkey,
+                });
+            }
+            h.by_stable_id.insert(v.stable_id, local);
+        }
+        Ok(h)
+    }
+}
+
+/// One persisted entry in a BLS validator's key timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBlsKeyEntry {
+    pub v_eff: View,
+    /// 48-byte BLS pubkey. Serde's derive stops auto-implementing
+    /// `Deserialize` for `[u8; N]` at N=32; use the byte-slice
+    /// adapter so the wire format stays compact.
+    #[serde(with = "serde_bls_pubkey")]
+    pub bls_pubkey: BlsPublicKey,
+}
+
+/// Length-prefixed bytes encoding for [`BlsPublicKey`] (48 bytes).
+/// Mirrors the `serde_g2_aggregate` module in
+/// [`crate::consensus::hotstuff::qc`].
+mod serde_bls_pubkey {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(pk: &[u8; 48], s: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&pk[..], s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 48], D::Error> {
+        let v: Vec<u8> = Vec::<u8>::deserialize(d)?;
+        v.as_slice()
+            .try_into()
+            .map_err(|_| D::Error::custom("BLS pubkey must be exactly 48 bytes"))
+    }
+}
+
+/// One BLS validator's full timeline in the persisted form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBlsValidator {
+    pub stable_id: NodeId,
+    pub entries: Vec<PersistedBlsKeyEntry>,
+}
+
+/// Serializable snapshot of a [`BlsKeyHistory`]. Encoded via postcard
+/// at storage write time, written under a chain-scoped storage key
+/// alongside the Ed25519 [`crate::consensus::validator_key_history::PersistedValidatorKeyHistory`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedBlsKeyHistory {
+    pub validators: Vec<PersistedBlsValidator>,
 }
 
 #[cfg(test)]
@@ -456,6 +562,83 @@ mod tests {
         // After registration, both resolve.
         let keys = h.pubkeys_for_set(&vs, 102).unwrap();
         assert_eq!(keys, vec![pk(0xA1), pk(0x55)]);
+    }
+
+    // ── Persistence (#339) ──────────────────────────────────────
+
+    #[test]
+    fn persisted_round_trip_preserves_genesis_only_history() {
+        let h = BlsKeyHistory::with_genesis([
+            (nid(1), pk(0xA1)),
+            (nid(2), pk(0xA2)),
+            (nid(3), pk(0xA3)),
+        ]);
+        let persisted = h.to_persisted();
+        let bytes = postcard::to_stdvec(&persisted).unwrap();
+        let decoded: PersistedBlsKeyHistory = postcard::from_bytes(&bytes).unwrap();
+        let restored = BlsKeyHistory::from_persisted(decoded).unwrap();
+        assert_eq!(restored.len(), 3);
+        for (id, pk_expected) in [(nid(1), pk(0xA1)), (nid(2), pk(0xA2)), (nid(3), pk(0xA3))] {
+            assert_eq!(restored.key_at(&id, 0), Some(pk_expected));
+        }
+    }
+
+    #[test]
+    fn persisted_round_trip_preserves_rotations() {
+        let mut h = BlsKeyHistory::with_genesis([(nid(1), pk(0xA1))]);
+        h.apply_rotation(nid(1), 100, pk(0xB1)).unwrap();
+        h.apply_rotation(nid(1), 200, pk(0xC1)).unwrap();
+        h.register(nid(2), 150, pk(0xA2)).unwrap();
+
+        let persisted = h.to_persisted();
+        let bytes = postcard::to_stdvec(&persisted).unwrap();
+        let decoded: PersistedBlsKeyHistory = postcard::from_bytes(&bytes).unwrap();
+        let restored = BlsKeyHistory::from_persisted(decoded).unwrap();
+
+        // Validator 1 timeline survives all three views.
+        assert_eq!(restored.key_at(&nid(1), 50), Some(pk(0xA1)));
+        assert_eq!(restored.key_at(&nid(1), 100), Some(pk(0xB1)));
+        assert_eq!(restored.key_at(&nid(1), 199), Some(pk(0xB1)));
+        assert_eq!(restored.key_at(&nid(1), 200), Some(pk(0xC1)));
+        // Validator 2 not visible before its registration view.
+        assert_eq!(restored.key_at(&nid(2), 100), None);
+        assert_eq!(restored.key_at(&nid(2), 150), Some(pk(0xA2)));
+    }
+
+    #[test]
+    fn from_persisted_rejects_non_monotonic_v_eff() {
+        let bad = PersistedBlsKeyHistory {
+            validators: vec![PersistedBlsValidator {
+                stable_id: nid(1),
+                entries: vec![
+                    PersistedBlsKeyEntry {
+                        v_eff: 100,
+                        bls_pubkey: pk(0xA1),
+                    },
+                    PersistedBlsKeyEntry {
+                        v_eff: 50, // earlier than the previous entry
+                        bls_pubkey: pk(0xA2),
+                    },
+                ],
+            }],
+        };
+        let err = BlsKeyHistory::from_persisted(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("not strictly v_eff-increasing"),
+            "{err}",
+        );
+    }
+
+    #[test]
+    fn from_persisted_rejects_empty_validator_entries() {
+        let bad = PersistedBlsKeyHistory {
+            validators: vec![PersistedBlsValidator {
+                stable_id: nid(1),
+                entries: vec![],
+            }],
+        };
+        let err = BlsKeyHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("no entries"), "{err}");
     }
 
     #[test]
