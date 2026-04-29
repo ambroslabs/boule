@@ -70,9 +70,24 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
   test:
-    name: Test
+    # Two shards on separate runners to isolate CPU-bound tests from the rest
+    # of the suite. The `heavy` shard runs compute-heavy tests serially
+    # (`--test-threads=1`); the `default` shard runs everything else at the
+    # runner's natural parallelism (no oversubscription).
+    #
+    # `HEAVY_FILTER` is the canonical filter expression that selects the
+    # heavy cohort. KEEP IN SYNC with `.config/nextest.toml`'s
+    # `[[profile.default.overrides]].filter` — see the comment in that file
+    # for the convention.
+    name: Test (${{ matrix.shard }})
     needs: changes
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [heavy, default]
+    env:
+      HEAVY_FILTER: 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/)'
     steps:
       - uses: actions/checkout@v4
       - if: needs.changes.outputs.rust == 'true'
@@ -82,10 +97,15 @@ jobs:
       - if: needs.changes.outputs.rust == 'true'
         name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
-      - if: needs.changes.outputs.rust == 'true'
-        run: cargo nextest run --locked --all-targets --test-threads=$((4 * $(nproc)))
-      - if: needs.changes.outputs.rust == 'true'
-        run: cargo test --locked --doc -- --test-threads=$((4 * $(nproc)))
+      - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'heavy'
+        name: Heavy shard (compute-bound, serialized)
+        run: cargo nextest run --locked --all-targets -E "$HEAVY_FILTER" --test-threads=1
+      - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'default'
+        name: Default shard (everything else, parallel)
+        run: cargo nextest run --locked --all-targets -E "not ($HEAVY_FILTER)" --test-threads=$(nproc)
+      - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'default'
+        name: Doctests
+        run: cargo test --locked --doc -- --test-threads=$(nproc)
 
   deny:
     name: Deny (licenses + advisories)

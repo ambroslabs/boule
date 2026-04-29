@@ -1,0 +1,38 @@
+# cargo-nextest configuration.
+#
+# # Test groups
+#
+# `heavy-compute` is the cohort of CPU-bound tests that should never share a
+# physical core with another heavy test. `max-threads = 1` means at most one
+# test from this group runs at a time on a given runner; this keeps local
+# `cargo nextest run` invocations honest and is the source of truth that the
+# CI shard split mirrors.
+#
+# # Adding a new heavy test
+#
+# A test is "heavy" when it is CPU-bound *and* its isolated wall-clock is
+# longer than a few seconds. Examples currently in the suite:
+#
+#   - 25-node consensus simulations (paused virtual time, but heavy routing
+#     fan-out per yield).
+#   - BLS pairing and proof-of-possession verification.
+#
+# To classify a new test as heavy:
+#
+#   1. Make sure its fully-qualified name matches one of the patterns in the
+#      `filter` field below — either by naming convention (e.g. it lives in
+#      `crypto::bls_key::tests`) or by adding a new pattern here.
+#   2. If you added or changed a pattern, mirror it into the `HEAVY_FILTER`
+#      env var in `.github/workflows/ci.yml`. CI uses the same expression to
+#      route the test onto the dedicated shard.
+#
+# Keep the two filter expressions in sync. They are intentionally duplicated:
+# this file governs local execution, the workflow governs CI sharding, and
+# nextest does not expose a way to share the expression between them.
+
+[test-groups]
+heavy-compute = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/)'
+test-group = 'heavy-compute'
