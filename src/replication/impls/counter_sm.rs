@@ -153,6 +153,31 @@ mod tests {
         assert_eq!(sm.state_commitment(), before);
     }
 
+    /// Issue #326 / audit finding 4-F3: `restore` is contractually
+    /// allowed to return `Err` on corrupt input (bit-flip, half-finished
+    /// migration, version skew). This test pins the contract:
+    /// shape-violating snapshot bytes must produce `Err`, never panic.
+    #[test]
+    fn restore_returns_err_on_tampered_snapshot_bytes() {
+        // Continuation-marker bytes with no following payload form an
+        // invalid postcard varint: each 0x80 byte signals "more bytes
+        // follow", and the decoder eventually hits EOF. Surfaces as
+        // `Err`, no panic.
+        let invalid = [0x80u8; 16];
+        let mut a = CounterStateMachine::new();
+        let err = a.restore(&invalid).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("decoding snapshot"),
+            "expected restore error to mention decoding, got {msg}",
+        );
+
+        // Empty input is the degenerate boundary: also `Err`, also no
+        // panic.
+        let mut b = CounterStateMachine::new();
+        assert!(b.restore(&[]).is_err());
+    }
+
     #[test]
     fn snapshot_restore_round_trip() {
         let mut a = CounterStateMachine::new();
