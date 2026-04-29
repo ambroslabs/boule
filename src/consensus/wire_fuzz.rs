@@ -441,24 +441,28 @@ impl ReplicaSet {
 fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
     let sig = [0u8; 64];
     match msg {
-        ConsensusMsg::Proposal(payload) => Event::ProposalReceived(Signed {
-            payload,
-            signer: source,
-            sig,
-        }),
-        ConsensusMsg::Vote(payload) => Event::VoteReceived(
-            Signed {
+        ConsensusMsg::Proposal(payload) => {
+            Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
                 payload,
                 signer: source,
                 sig,
-            },
+            }))
+        }
+        ConsensusMsg::Vote(payload) => Event::VoteReceived(
+            crate::consensus::dispatch::Verified::unchecked(Signed {
+                payload,
+                signer: source,
+                sig,
+            }),
             None,
         ),
-        ConsensusMsg::NewView(payload) => Event::NewViewReceived(Signed {
-            payload,
-            signer: source,
-            sig,
-        }),
+        ConsensusMsg::NewView(payload) => {
+            Event::NewViewReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
+                payload,
+                signer: source,
+                sig,
+            }))
+        }
     }
 }
 
@@ -651,7 +655,7 @@ proptest! {
         let n_validators = replicas.validators.len();
         let genesis_hash = replicas.genesis.hash();
         let kickoff = kickoff_proposal(&replicas);
-        replicas.inject_all(Event::ProposalReceived(kickoff));
+        replicas.inject_all(Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(kickoff)));
 
         for step in schedule {
             match step {
@@ -673,7 +677,7 @@ proptest! {
                         justify_view,
                         justify_block_hash,
                     });
-                    replicas.inject(target, Event::ProposalReceived(signed));
+                    replicas.inject(target, Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(signed)));
                 }
                 FuzzStep::InjectBytesVote { target, sender_idx, view, block_hash } => {
                     let sender = *replicas.validators.get(sender_idx).unwrap();
@@ -682,7 +686,7 @@ proptest! {
                         signer: sender,
                         sig: [0u8; 64],
                     };
-                    replicas.inject(target, Event::VoteReceived(signed, None));
+                    replicas.inject(target, Event::VoteReceived(crate::consensus::dispatch::Verified::unchecked(signed), None));
                 }
                 FuzzStep::InjectBytesNewView { target, sender_idx, qc_view, qc_block_hash } => {
                     let sender = *replicas.validators.get(sender_idx).unwrap();
@@ -697,7 +701,7 @@ proptest! {
                         signer: sender,
                         sig: [0u8; 64],
                     };
-                    replicas.inject(target, Event::NewViewReceived(signed));
+                    replicas.inject(target, Event::NewViewReceived(crate::consensus::dispatch::Verified::unchecked(signed)));
                 }
             }
         }
@@ -808,14 +812,12 @@ proptest! {
             let event = match step {
                 CacheStep::Vote { signer_idx, view, block_hash } => {
                     let signer = *validators.get(signer_idx).unwrap();
-                    Event::VoteReceived(
-                        Signed {
+                    Event::VoteReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
                             payload: Vote { view, block_hash },
                             signer,
                             sig: [0u8; 64],
-                        },
-                        None,
-                    )
+                        }),
+                        None,)
                 }
                 CacheStep::ParkedProposal { sender_idx, view, height, parent_seed } => {
                     let sender = *validators.get(sender_idx).unwrap();
@@ -837,11 +839,11 @@ proptest! {
                     for i in 0..validators.len() {
                         justify.add_signature(i, [i as u8 + 1; 64]);
                     }
-                    Event::ProposalReceived(Signed {
+                    Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
                         payload: Proposal { block, justify },
                         signer: sender,
                         sig: [0u8; 64],
-                    })
+                    }))
                 }
                 CacheStep::GenesisChildProposal { sender_idx, view } => {
                     let sender = *validators.get(sender_idx).unwrap();
@@ -859,11 +861,11 @@ proptest! {
                     for i in 0..validators.len() {
                         justify.add_signature(i, [i as u8 + 1; 64]);
                     }
-                    Event::ProposalReceived(Signed {
+                    Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
                         payload: Proposal { block, justify },
                         signer: sender,
                         sig: [0u8; 64],
-                    })
+                    }))
                 }
             };
             let _ = core.step(event);

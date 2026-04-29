@@ -1847,6 +1847,7 @@ impl ConsensusNode {
                 // the snapshot-fetch state machine can decide
                 // whether to fast-path the joiner past block-sync.
                 if let SafetyEvent::ProposalReceived(signed) = &ev {
+                    let signed = signed.inner();
                     let proposer = signed.signer;
                     let proposal_height = signed.payload.block.header.height;
                     let actions = self.snapshot_sync.observe_proposal(
@@ -2635,17 +2636,17 @@ impl ConsensusNode {
         // re-borrow after.
         let log_ctx = match &ev {
             SafetyEvent::ProposalReceived(signed) => Some(SafetyLogCtx::Proposal {
-                proposer: signed.signer,
-                view: signed.payload.block.header.view,
-                height: signed.payload.block.header.height,
+                proposer: signed.inner().signer,
+                view: signed.inner().payload.block.header.view,
+                height: signed.inner().payload.block.header.height,
             }),
             SafetyEvent::VoteReceived(signed, _bls_partial) => Some(SafetyLogCtx::Vote {
-                voter: signed.signer,
-                view: signed.payload.view,
+                voter: signed.inner().signer,
+                view: signed.inner().payload.view,
             }),
             SafetyEvent::NewViewReceived(signed) => Some(SafetyLogCtx::NewView {
-                sender: signed.signer,
-                high_qc_view: signed.payload.high_qc.view,
+                sender: signed.inner().signer,
+                high_qc_view: signed.inner().payload.high_qc.view,
             }),
             SafetyEvent::PacemakerAdvance(_) => None,
         };
@@ -2937,7 +2938,12 @@ impl ConsensusNode {
             let nv = NewView { high_qc: qc };
             let self_signed = Signed::sign(nv, signer.as_ref(), &self.chain_id)
                 .context("signing self-NewView for TC adopt")?;
-            let safety_actions = self.step_safety(SafetyEvent::NewViewReceived(self_signed));
+            // Trusted by construction: we just signed `self_signed` ourselves
+            // from a `high_qc` that was assembled out of ingress-verified
+            // partials. Wrap to satisfy the typestate gate (#371).
+            let safety_actions = self.step_safety(SafetyEvent::NewViewReceived(
+                crate::consensus::dispatch::Verified::wrap_after_verify(self_signed),
+            ));
             self.apply_safety_actions(safety_actions, broadcaster, view_timer, signer)
                 .await?;
         }
@@ -5843,7 +5849,9 @@ mod tests {
         let justify = genesis_qc(&genesis(), 4);
         let proposal = Proposal { block, justify };
         let signed = Signed::sign(proposal, signer, &ChainId::TEST).expect("sign proposal");
-        Dispatch::Safety(SafetyEvent::ProposalReceived(signed))
+        Dispatch::Safety(SafetyEvent::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed),
+        ))
     }
 
     /// Joiner happy path (#229 acceptance criteria 1):
