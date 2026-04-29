@@ -33,7 +33,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 use zeroize::Zeroizing;
 
-use crate::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, BlsSecretKey};
+use crate::crypto::sig_scheme::{BlsAggregated, BlsPartialSig, BlsPop, BlsPublicKey, BlsSecretKey};
+use crate::crypto::signed::PartialSigner;
 
 /// Format version stamped at the head of the on-disk key file.
 /// Bump when the layout changes; old files are then either migrated
@@ -94,6 +95,53 @@ impl std::fmt::Debug for BlsValidatorIdentity {
             .field("public", &hex::encode(self.public))
             .field("pop", &"<computed>")
             .finish()
+    }
+}
+
+/// In-memory [`PartialSigner<BlsAggregated>`] backed by a loaded
+/// [`BlsValidatorIdentity`]. Holds the secret in a [`Zeroizing`] buffer
+/// for the lifetime of the signer; drop the signer to wipe the key.
+///
+/// Construct with [`Self::from_identity`]; do not reconstruct from raw
+/// secret bytes, so the only way in is via a [`BlsKeyProvider`].
+pub struct BlsPartialSignerImpl {
+    secret: Zeroizing<BlsSecretKey>,
+    public: BlsPublicKey,
+}
+
+impl BlsPartialSignerImpl {
+    /// Build a signer from a freshly-loaded validator identity.
+    /// Consumes the identity to avoid leaving two copies of the secret
+    /// material in memory.
+    pub fn from_identity(id: BlsValidatorIdentity) -> Self {
+        Self {
+            secret: id.secret,
+            public: id.public,
+        }
+    }
+}
+
+impl std::fmt::Debug for BlsPartialSignerImpl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlsPartialSignerImpl")
+            .field("secret", &"<redacted>")
+            .field("public", &hex::encode(self.public))
+            .finish()
+    }
+}
+
+impl PartialSigner<BlsAggregated> for BlsPartialSignerImpl {
+    fn pubkey(&self) -> BlsPublicKey {
+        self.public
+    }
+
+    fn sign_partial(&self, msg: &[u8]) -> BlsPartialSig {
+        // `sign_partial` only fails on malformed secret-key bytes, and
+        // those would have been rejected at load time by
+        // `BlsKeyProvider::load_or_init`. Treat as infallible at this
+        // layer — same posture as `Signer::sign` for Ed25519.
+        BlsAggregated::sign_partial(&self.secret, msg)
+            .expect("loaded BLS secret keys must produce signatures")
     }
 }
 
@@ -301,6 +349,26 @@ mod tests {
         let provider = BlsKeyFile::new(dir.path().join("bls.key"));
         let id = provider.load_or_init().unwrap();
         BlsAggregated::verify_pop(&id.pop, &id.public).expect("self-PoP must verify");
+    }
+
+    #[test]
+    fn partial_signer_round_trips_under_registered_pubkey() {
+        // The acceptance criterion for #330: a validator on a BLS chain
+        // can produce a partial signature that BlsAggregated::verify_partial
+        // accepts under the validator's registered BLS pubkey.
+        let dir = TempDir::new().unwrap();
+        let provider = BlsKeyFile::new(dir.path().join("bls.key"));
+        let id = provider.load_or_init().unwrap();
+        let pubkey_after_load = id.public;
+        let signer = BlsPartialSignerImpl::from_identity(id);
+
+        // The pubkey reported by the signer matches what the loader returned.
+        assert_eq!(signer.pubkey(), pubkey_after_load);
+
+        let msg = b"vote(view=11,block=0xAB...)";
+        let partial = signer.sign_partial(msg);
+        BlsAggregated::verify_partial(&signer.pubkey(), msg, &partial)
+            .expect("partial must verify under the signer's own pubkey");
     }
 
     #[test]

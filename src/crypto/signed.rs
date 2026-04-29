@@ -30,6 +30,7 @@ use anyhow::{Context as _, Result, bail};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::sig_scheme::SignatureScheme;
 use crate::p2p::NodeId;
 use crate::p2p::identity::NodeIdentity;
 
@@ -77,6 +78,37 @@ impl Signer for NodeSigner {
         out.copy_from_slice(sig.as_ref());
         out
     }
+}
+
+/// A key that can produce one validator's contribution to a
+/// QC-flavored aggregate, parameterized over the chain's
+/// [`SignatureScheme`].
+///
+/// Distinct from [`Signer`] because the two cover different layers:
+///
+/// * [`Signer`] signs the **envelope** around every consensus message
+///   (votes/proposals/new-views) using the validator's long-term Ed25519
+///   network identity. Always returns `[u8; 64]`.
+/// * [`PartialSigner<S>`] signs the **vote pre-image** that the leader
+///   will fold into a QC aggregate. The shape of the partial is dictated
+///   by the chain's scheme: `[u8; 64]` under
+///   [`Ed25519Collected`](crate::crypto::sig_scheme::Ed25519Collected)
+///   (a re-export of the envelope sig), `[u8; 96]` under
+///   [`BlsAggregated`](crate::crypto::sig_scheme::BlsAggregated).
+///
+/// Keeping the two traits separate lets the network identity stay
+/// Ed25519-only forever (TLS handshake, peer-id) while the QC scheme
+/// is swappable per chain at genesis (#287, #288).
+pub trait PartialSigner<S: SignatureScheme>: Send + Sync {
+    /// The validator's public key under the chain's scheme. Used at
+    /// `BlsKeyHistory::register` time and for client-side
+    /// `verify_partial` round-trips in tests.
+    fn pubkey(&self) -> S::PublicKey;
+
+    /// Produce one validator's contribution to a QC aggregate over
+    /// `msg`. Callers should pass `postcard(Vote { view, block_hash })`
+    /// — the same pre-image the verifier will reconstruct.
+    fn sign_partial(&self, msg: &[u8]) -> S::PartialSig;
 }
 
 /// Payloads that can be placed inside a [`Signed`] envelope.
