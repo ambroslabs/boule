@@ -255,6 +255,86 @@ impl std::error::Error for IngressError {
     }
 }
 
+/// Compile-time witness that a wire-driven payload has passed
+/// [`ingress`]'s verification gates (#371).
+///
+/// `Verified<T>` is constructed only by:
+///
+/// - the dispatch verifiers (`ingress` / `ingress_with_qc_verification`
+///   and friends) on their way out — these wrap their fully-verified
+///   `Signed<Proposal>`, `Signed<Vote>`, and `Signed<NewView>` values
+///   via [`Verified::wrap_after_verify`] before constructing the
+///   corresponding [`crate::consensus::hotstuff::step::Event`] variant;
+/// - explicit [`Verified::unchecked`] calls in unit tests that bypass
+///   ingress for test-construction reasons (locally-built proposals,
+///   hand-crafted Vote events feeding the safety core directly).
+///
+/// The audit's runtime-invariant-promoted-to-types pattern: the
+/// [`Event`](crate::consensus::hotstuff::step::Event) variants that
+/// originate on the wire take `Verified<...>`, so a future ingress
+/// path that skipped a check (or a refactor that reordered
+/// verification) cannot construct them and will fail to compile.
+/// Sibling of #328 (ValidatorId / Pubkey typestate) on a different
+/// axis: verification status rather than identity kind.
+///
+/// # Compile-time enforcement
+///
+/// Constructing [`Event::ProposalReceived`](crate::consensus::hotstuff::step::Event::ProposalReceived)
+/// from a raw `Signed<Proposal>` fails to compile — only
+/// `Verified<Signed<Proposal>>` is accepted by the variant. The
+/// `compile_fail` doctest below pins this property: it passes if and
+/// only if the snippet fails to compile. Treat any future change that
+/// makes this snippet compile as a regression of the typestate gate.
+///
+/// ```compile_fail
+/// use ambros_p2p::consensus::hotstuff::Proposal;
+/// use ambros_p2p::consensus::hotstuff::step::Event;
+/// use ambros_p2p::crypto::signed::Signed;
+/// fn forbidden(signed: Signed<Proposal>) -> Event {
+///     // expected `Verified<Signed<Proposal>>`, found `Signed<Proposal>`
+///     Event::ProposalReceived(signed)
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified<T>(T);
+
+impl<T> Verified<T> {
+    /// Wrap `value` as verified. Crate-private — only the dispatch
+    /// verifiers call this on the way out, after every gate
+    /// (`verify_signer_at`, `verify_sig`, `verify_qc_if_requested`,
+    /// `verify_proposal_history_commitment_if_requested`,
+    /// `verify_bls_partial_if_required`) has returned `Ok`. Outside
+    /// the crate, callers must go through [`ingress`] to land here.
+    pub(crate) fn wrap_after_verify(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Construct a `Verified<T>` without running any verification.
+    /// Reserved for unit tests that bypass ingress for test-fixture
+    /// reasons — e.g. a test that hand-crafts an `Event` and feeds
+    /// it directly to `HotStuffCore::step` to exercise a specific
+    /// branch.
+    ///
+    /// **Production code MUST NOT call this.** Every call site is
+    /// auditable by name, and a code review or grep can catch any
+    /// production caller that snuck in.
+    pub fn unchecked(value: T) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the inner value.
+    pub fn inner(&self) -> &T {
+        &self.0
+    }
+
+    /// Consume and unwrap. Used by the safety core's `step()` to
+    /// pull the wire payload out before dispatching to the matching
+    /// `on_*_received` handler.
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 /// Chain-level verification context for [`ingress_with_qc_verification`].
 ///
 /// `Skip` is the default for tests that construct QCs with placeholder
@@ -420,7 +500,7 @@ pub fn ingress_wire_with_qc_verification(
             )?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::ProposalReceived(
-                    signed,
+                    Verified::wrap_after_verify(signed),
                 )),
                 Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
             ])
@@ -436,7 +516,10 @@ pub fn ingress_wire_with_qc_verification(
                 chain_id,
             )?;
             Ok(vec![Dispatch::Safety(
-                crate::consensus::hotstuff::step::Event::VoteReceived(signed, bls_partial),
+                crate::consensus::hotstuff::step::Event::VoteReceived(
+                    Verified::wrap_after_verify(signed),
+                    bls_partial,
+                ),
             )])
         }
 
@@ -471,7 +554,7 @@ pub fn ingress_wire_with_qc_verification(
             )?;
             Ok(vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
-                    signed,
+                    Verified::wrap_after_verify(signed),
                 )),
                 // Inform the pacemaker that we've seen a QC up to `high_qc_view`.
                 // It ignores stale events, so this is always safe to emit.
@@ -1079,7 +1162,12 @@ pub fn egress_consensus_msg_with_loopback(
             let view = signed.payload.block.header.view;
             vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::ProposalReceived(
-                    signed.clone(),
+                    // Loopback: we just signed `signed` ourselves via
+                    // `sign_consensus_msg`, so it is verified by
+                    // construction (the doc comment above explicitly
+                    // notes signature verification is skipped on
+                    // loopback). Wrap to satisfy the typestate.
+                    Verified::wrap_after_verify(signed.clone()),
                 )),
                 Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
             ]
@@ -1091,14 +1179,17 @@ pub fn egress_consensus_msg_with_loopback(
             // its own proposal must contribute its BLS partial just
             // like any peer's vote (#118 + #354 step 2).
             vec![Dispatch::Safety(
-                crate::consensus::hotstuff::step::Event::VoteReceived(signed.clone(), *bls_partial),
+                crate::consensus::hotstuff::step::Event::VoteReceived(
+                    Verified::wrap_after_verify(signed.clone()),
+                    *bls_partial,
+                ),
             )]
         }
         WireMessage::NewView(signed) => {
             let high_qc_view = signed.payload.high_qc.view;
             vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::NewViewReceived(
-                    signed.clone(),
+                    Verified::wrap_after_verify(signed.clone()),
                 )),
                 Dispatch::Pacemaker(pacemaker::Event::OnQc(high_qc_view)),
             ]
@@ -1510,7 +1601,7 @@ mod tests {
         assert_eq!(dispatches.len(), 2);
         match &dispatches[0] {
             Dispatch::Safety(SafetyEvent::ProposalReceived(s)) => {
-                assert_eq!(s.payload.block, proposal.block);
+                assert_eq!(s.inner().payload.block, proposal.block);
             }
             other => panic!("unexpected first dispatch: {other:?}"),
         }
