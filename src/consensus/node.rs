@@ -2474,6 +2474,7 @@ impl ConsensusNode {
                         &msg,
                         signer.as_ref(),
                         bls_signer,
+                        &self.validator_key_history,
                         &self.chain_id,
                     )?;
                     send_outbound(broadcaster, Outbound::Broadcast(payload)).await;
@@ -2487,6 +2488,7 @@ impl ConsensusNode {
                         &msg,
                         signer.as_ref(),
                         bls_signer,
+                        &self.validator_key_history,
                         &self.chain_id,
                     )?;
                     if target == self.self_id {
@@ -2971,9 +2973,30 @@ impl ConsensusNode {
                 .context("signing self-NewView for TC adopt")?;
             // Trusted by construction: we just signed `self_signed` ourselves
             // from a `high_qc` that was assembled out of ingress-verified
-            // partials. Wrap to satisfy the typestate gate (#371).
+            // partials. Resolve the local signer's stable `ValidatorId`
+            // through the same `ValidatorKeyHistory` lookup the wire
+            // path uses (#394) so the safety core's bitmap-index
+            // resolution remains correct after a key rotation. The
+            // `from_genesis_pubkey` fallback covers tests where the
+            // local signer's pubkey is not registered in
+            // `validator_key_history` (and pre-#394 the same call was
+            // unconditional); production validators are seeded at boot,
+            // so the registered branch is taken there.
+            let signer_node_id = signer.as_ref().node_id();
+            let signer_pk = crate::consensus::validator_set::Pubkey::from_node_id(signer_node_id);
+            let signer_validator_id = self
+                .validator_key_history
+                .validator_for(&signer_pk)
+                .unwrap_or_else(|| {
+                    crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                        signer_node_id,
+                    )
+                });
             let safety_actions = self.step_safety(SafetyEvent::NewViewReceived(
-                crate::consensus::dispatch::Verified::wrap_after_verify(self_signed),
+                crate::consensus::dispatch::Verified::wrap_after_verify_with_signer(
+                    self_signed,
+                    signer_validator_id,
+                ),
             ));
             self.apply_safety_actions(safety_actions, broadcaster, view_timer, signer)
                 .await?;
