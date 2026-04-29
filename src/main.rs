@@ -111,12 +111,17 @@ fn print_usage() {
     println!("      snapshot store. Verifies chunk hashes against the manifest.");
     println!();
     println!("  reconfig add-validator --pubkey <base58> --addr <socketaddr> --v-eff <view>");
+    println!("                         [--bls-pop-file <path> | --bls-key-file <path>]");
+    println!("                         [--config <path>]");
     println!("      Build a tagged ReconfigCommand payload that adds a validator");
     println!("      to the active committee at view `v_eff` and print it as hex");
     println!("      on stdout. Operators inject the resulting bytes into a");
-    println!("      cluster member's mempool to propose the reconfig. The");
+    println!("      cluster member's mempool to propose the reconfig.");
+    println!("      On BLS chains pass --bls-pop-file (hex `<pubkey>:<sig>`) or");
+    println!("      --bls-key-file (a BlsKeyFile to derive PoP from). When --config");
+    println!("      is supplied, the chain's signature_scheme is cross-checked.");
     println!(
-        "      consensus floor is {} validators after applying;",
+        "      The consensus floor is {} validators after applying;",
         ambros_p2p::consensus::reconfig::MIN_VALIDATOR_FLOOR,
     );
     println!(
@@ -993,6 +998,18 @@ struct ReconfigArgs {
     pubkey: Option<String>,
     addr: Option<String>,
     v_eff: Option<u64>,
+    /// Path to a hex-encoded `<pubkey_hex>:<pop_hex>` file (48-byte
+    /// BLS pubkey + 96-byte PoP signature) for the new validator.
+    /// Mutually exclusive with `--bls-key-file`.
+    bls_pop_file: Option<PathBuf>,
+    /// Path to a `BlsKeyFile` (33-byte format-versioned secret key) on
+    /// disk. The CLI derives the pubkey + PoP locally before printing
+    /// the payload. Mutually exclusive with `--bls-pop-file`.
+    bls_key_file: Option<PathBuf>,
+    /// Optional config path; when set the CLI cross-checks the chain's
+    /// `signature_scheme` against the BLS-flag presence and refuses to
+    /// build a payload that would be rejected at commit time (#334).
+    config_path: Option<PathBuf>,
 }
 
 fn parse_reconfig_args(args: &[String]) -> anyhow::Result<ReconfigArgs> {
@@ -1026,6 +1043,27 @@ fn parse_reconfig_args(args: &[String]) -> anyhow::Result<ReconfigArgs> {
                         .map_err(|e| anyhow::anyhow!("invalid --v-eff {raw:?}: {e}"))?,
                 );
             }
+            "--bls-pop-file" => {
+                i += 1;
+                out.bls_pop_file =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--bls-pop-file requires a path")
+                    })?));
+            }
+            "--bls-key-file" => {
+                i += 1;
+                out.bls_key_file =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--bls-key-file requires a path")
+                    })?));
+            }
+            "--config" | "-c" => {
+                i += 1;
+                out.config_path =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--config requires a path")
+                    })?));
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -1038,7 +1076,8 @@ fn parse_reconfig_args(args: &[String]) -> anyhow::Result<ReconfigArgs> {
 }
 
 fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
-    use ambros_p2p::consensus::reconfig::ReconfigCommand;
+    use ambros_p2p::consensus::reconfig::{ReconfigCommand, ValidatorEntry};
+    use ambros_p2p::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
     use ambros_p2p::p2p::tls::base58_to_node_id;
 
     let a = parse_reconfig_args(args)?;
@@ -1053,6 +1092,11 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
     let v_eff = a
         .v_eff
         .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --v-eff <view>"))?;
+    if a.bls_pop_file.is_some() && a.bls_key_file.is_some() {
+        anyhow::bail!(
+            "--bls-pop-file and --bls-key-file are mutually exclusive — pass one or the other.",
+        );
+    }
 
     let node_id = base58_to_node_id(pubkey_b58)
         .map_err(|e| anyhow::anyhow!("--pubkey {pubkey_b58:?} is not a valid NodeId: {e}"))?;
@@ -1060,9 +1104,120 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("--addr {addr_str:?} is not a valid socket address: {e}"))?;
 
-    let payload = ReconfigCommand::build_add_validator_payload(node_id, addr, v_eff);
+    // Resolve the BLS proof-of-possession from whichever flag the
+    // operator passed (or none, for an Ed25519 chain).
+    let bls_pop = if let Some(path) = &a.bls_pop_file {
+        Some(read_bls_pop_file(path)?)
+    } else if let Some(path) = &a.bls_key_file {
+        Some(derive_bls_pop_from_key_file(path)?)
+    } else {
+        None
+    };
+
+    // Local cryptographic check: a malformed PoP would be rejected at
+    // commit time anyway, but operators want a fast-fail before they
+    // distribute the payload bytes to other operators.
+    if let Some(pop) = &bls_pop {
+        BlsAggregated::verify_pop(pop, &pop.pubkey).map_err(|e| {
+            anyhow::anyhow!(
+                "BLS PoP failed verification under its embedded pubkey: {e:?}. \
+                 Re-derive with --bls-key-file pointing at the validator's BLS key.",
+            )
+        })?;
+    }
+
+    // Optional scheme cross-check: when --config is supplied, refuse
+    // to build a payload that would be rejected at commit time by
+    // #334's scheme-driven enforcement.
+    if let Some(cfg_path) = &a.config_path {
+        let cfg = config::load(cfg_path)?;
+        let cons = cfg.consensus.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--config {} has no [consensus] section — cannot infer scheme",
+                cfg_path.display(),
+            )
+        })?;
+        match (cons.signature_scheme, &bls_pop) {
+            (SignatureSchemeChoice::BlsAggregated, None) => {
+                anyhow::bail!(
+                    "--config declares signature_scheme = \"bls_aggregated\" but no \
+                     --bls-pop-file or --bls-key-file was supplied. Every BLS-chain `adds` \
+                     entry must carry a proof-of-possession.",
+                );
+            }
+            (SignatureSchemeChoice::Ed25519Collected, Some(_)) => {
+                anyhow::bail!(
+                    "--config declares signature_scheme = \"ed25519_collected\" but a \
+                     --bls-pop-file or --bls-key-file was supplied. Ed25519 chains have no \
+                     use for BLS keys; remove the BLS flag.",
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let cmd = ReconfigCommand {
+        adds: vec![ValidatorEntry {
+            node_id,
+            addr,
+            bls_pop,
+        }],
+        removes: vec![],
+        v_eff,
+    };
+    let payload = cmd.encode();
     println!("{}", hex::encode(&payload));
     Ok(())
+}
+
+/// Read a `<pubkey_hex>:<pop_hex>` file (48-byte BLS pubkey + 96-byte
+/// PoP signature). Whitespace at either end is ignored.
+fn read_bls_pop_file(path: &Path) -> anyhow::Result<ambros_p2p::crypto::sig_scheme::BlsPop> {
+    use ambros_p2p::crypto::sig_scheme::BlsPop;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading --bls-pop-file {}: {e}", path.display()))?;
+    let trimmed = raw.trim();
+    let (pk_hex, sig_hex) = trimmed.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is not in the expected `<pubkey_hex>:<pop_hex>` format",
+            path.display(),
+        )
+    })?;
+    let pk_bytes = hex::decode(pk_hex.trim())
+        .map_err(|e| anyhow::anyhow!("--bls-pop-file pubkey is not valid hex: {e}"))?;
+    let sig_bytes = hex::decode(sig_hex.trim())
+        .map_err(|e| anyhow::anyhow!("--bls-pop-file pop signature is not valid hex: {e}"))?;
+    if pk_bytes.len() != 48 {
+        anyhow::bail!(
+            "--bls-pop-file pubkey is {} bytes, expected 48",
+            pk_bytes.len(),
+        );
+    }
+    if sig_bytes.len() != 96 {
+        anyhow::bail!(
+            "--bls-pop-file pop signature is {} bytes, expected 96",
+            sig_bytes.len(),
+        );
+    }
+    let mut pubkey = [0u8; 48];
+    pubkey.copy_from_slice(&pk_bytes);
+    let mut sig = [0u8; 96];
+    sig.copy_from_slice(&sig_bytes);
+    Ok(BlsPop { pubkey, sig })
+}
+
+/// Load a [`BlsKeyFile`] from disk and derive (pubkey, PoP) on the
+/// fly. The CLI uses this to let an operator generate an add-validator
+/// payload from a freshly-provisioned BLS key file in one step.
+fn derive_bls_pop_from_key_file(
+    path: &Path,
+) -> anyhow::Result<ambros_p2p::crypto::sig_scheme::BlsPop> {
+    use ambros_p2p::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    let provider = BlsKeyFile::new(path.to_path_buf());
+    let id = provider
+        .load_or_init()
+        .map_err(|e| anyhow::anyhow!("loading BLS key from {}: {e}", path.display()))?;
+    Ok(id.pop)
 }
 
 fn handle_reconfig_remove(args: &[String]) -> anyhow::Result<()> {
@@ -1113,4 +1268,80 @@ fn open_snapshot_store_for_cli(
     Ok(ambros_p2p::replication::snapshot::SnapshotStore::new(
         storage,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ambros_p2p::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use ambros_p2p::crypto::sig_scheme::BlsAggregated;
+    use tempfile::TempDir;
+
+    #[test]
+    fn read_bls_pop_file_round_trips_with_valid_pop() {
+        // Write a valid `<pubkey_hex>:<pop_hex>` file and confirm the
+        // helper reads back a structurally-identical PoP that verifies.
+        let mut ikm = [0u8; 32];
+        ikm[0] = 0x42;
+        let (sk, pk) = BlsAggregated::keygen(&ikm).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pop.txt");
+        std::fs::write(
+            &path,
+            format!("{}:{}\n", hex::encode(pk), hex::encode(pop.sig)),
+        )
+        .unwrap();
+
+        let parsed = read_bls_pop_file(&path).expect("must parse");
+        assert_eq!(parsed.pubkey, pop.pubkey);
+        assert_eq!(parsed.sig, pop.sig);
+        BlsAggregated::verify_pop(&parsed, &pk).expect("must still verify after round-trip");
+    }
+
+    #[test]
+    fn read_bls_pop_file_rejects_wrong_lengths() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.txt");
+        // Pubkey of wrong length (only 32 bytes).
+        std::fs::write(
+            &path,
+            format!("{}:{}", hex::encode([0u8; 32]), hex::encode([0u8; 96])),
+        )
+        .unwrap();
+        let err = read_bls_pop_file(&path).unwrap_err();
+        assert!(err.to_string().contains("48"), "{err}");
+
+        // Sig of wrong length (only 32 bytes).
+        std::fs::write(
+            &path,
+            format!("{}:{}", hex::encode([0u8; 48]), hex::encode([0u8; 32])),
+        )
+        .unwrap();
+        let err = read_bls_pop_file(&path).unwrap_err();
+        assert!(err.to_string().contains("96"), "{err}");
+    }
+
+    #[test]
+    fn read_bls_pop_file_rejects_missing_separator() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nosep.txt");
+        std::fs::write(&path, "deadbeef").unwrap();
+        let err = read_bls_pop_file(&path).unwrap_err();
+        assert!(err.to_string().contains("expected"), "{err}");
+    }
+
+    #[test]
+    fn derive_bls_pop_from_key_file_produces_verifiable_pop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bls.key");
+        // Provision the key file via the standard provider.
+        let provider = BlsKeyFile::new(path.clone());
+        let id = provider.load_or_init().unwrap();
+
+        let derived = derive_bls_pop_from_key_file(&path).expect("must succeed");
+        assert_eq!(derived.pubkey, id.public);
+        BlsAggregated::verify_pop(&derived, &id.public).expect("derived PoP must verify");
+    }
 }
