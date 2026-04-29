@@ -10,6 +10,10 @@ opinionated crosswalk between the paper's vocabulary and our code, plus the
 design decisions where the paper leaves us a choice. Read the paper itself if
 you want the full argument.
 
+Looking for an introduction rather than a crosswalk? See
+[hotstuff-walkthrough.md](hotstuff-walkthrough.md), a ~45-minute pedagogical
+tour aimed at engineers new to BFT consensus.
+
 ## Paper reference
 
 - Yin, Malkhi, Reiter, Golan Gueta, Abraham. *HotStuff: BFT Consensus in the
