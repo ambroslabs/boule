@@ -2941,6 +2941,36 @@ impl ConsensusNode {
                 continue;
             }
 
+            // Scheme-consistency check (#358): on BLS chains the
+            // rotation must atomically rotate both keys (with a
+            // verified PoP for the new BLS pubkey); on Ed25519 chains
+            // the BLS fields must be absent. Splitting the two halves
+            // would leave the histories transiently disagreeing.
+            if let Err(e) = envelope
+                .payload
+                .validate_scheme_consistency(self.signature_scheme)
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height,
+                    view = block_view,
+                    validator = ?envelope.payload.validator,
+                    error = %e,
+                    "rotation_scheme_consistency_failed",
+                );
+                continue;
+            }
+
+            // Snapshot the stable id BEFORE mutating
+            // `validator_key_history` — `validator_for` resolves any
+            // historical key (including the soon-to-be-stale
+            // pre-rotation key) to the validator's stable id, but
+            // computing it before the mutation is the simpler proof
+            // of correctness.
+            let stable_id = self
+                .validator_key_history
+                .validator_for(&envelope.payload.validator);
+
             // History-invariant check (structural + monotone v_eff +
             // no cross-validator key collision). Logs and drops on
             // failure — the in-memory state is unchanged.
@@ -2959,6 +2989,53 @@ impl ConsensusNode {
                     "rotation_history_apply_failed",
                 );
                 continue;
+            }
+
+            // BLS half (#358): mirror the rotation into
+            // `bls_key_history`. The Ed25519 apply just succeeded and
+            // `validate_scheme_consistency` already verified the PoP,
+            // so `apply_rotation` here can only fail on the
+            // monotone-`v_eff` invariant — same failure mode the
+            // Ed25519 path already covers, but in the parallel BLS
+            // history. Log + roll back if it does.
+            if self.signature_scheme
+                == crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated
+            {
+                let new_bls_pk = envelope.payload.new_bls_pubkey.expect(
+                    "BLS chain rotation passed scheme consistency must carry new_bls_pubkey",
+                );
+                let bls_history = self
+                    .bls_key_history
+                    .as_mut()
+                    .expect("BLS chain must have a BlsKeyHistory at apply_committed_rotations");
+                let stable_id =
+                    stable_id.expect("validator_for resolved before apply_rotation succeeded");
+                if let Err(e) =
+                    bls_history.apply_rotation(stable_id, envelope.payload.v_eff, new_bls_pk)
+                {
+                    // Rare but bounded: the validator_key_history
+                    // accepted the rotation but the BLS history
+                    // rejected it. The likeliest cause is a manual
+                    // mis-seeding where `bls_key_history` lacks the
+                    // validator's genesis entry. Drop the rotation
+                    // and continue — the cluster is now in an
+                    // inconsistent state for this validator (Ed25519
+                    // rotated, BLS not), so loud-warn so an operator
+                    // notices.
+                    tracing::error!(
+                        target: TRACE_TARGET,
+                        height = block.header.height,
+                        view = block_view,
+                        validator = ?envelope.payload.validator,
+                        stable_id = ?stable_id,
+                        new_bls_pubkey = ?new_bls_pk,
+                        v_eff = envelope.payload.v_eff,
+                        error = %e,
+                        "bls_rotation_history_apply_failed_after_ed25519_apply_succeeded",
+                    );
+                    // Don't continue — the Ed25519 mutation already
+                    // happened and we still want to flush + log.
+                }
             }
 
             tracing::info!(

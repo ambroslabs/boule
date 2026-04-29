@@ -3367,6 +3367,8 @@ mod tests {
                         validator: cluster.node_ids[target],
                         new_pubkey: new_signer.node_id(),
                         v_eff,
+                        new_bls_pubkey: None,
+                        new_bls_pop: None,
                     },
                     &*current,
                     &*new_signer,
@@ -4151,6 +4153,8 @@ mod tests {
             validator: rotated_validator,
             new_pubkey,
             v_eff,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer)
             .expect("constructing rotation envelope must succeed");
@@ -4214,6 +4218,126 @@ mod tests {
         );
     }
 
+    // ── #358: BLS-chain rotation end-to-end ───────────────────────────────
+
+    /// 4-node BLS cluster commits a dual-key rotation tx (Ed25519 +
+    /// BLS together) and continues making progress past `v_eff`.
+    /// Acceptance for #358: post-rotation votes need to fold under
+    /// the validator's NEW BLS key, which only works if
+    /// `apply_committed_rotations` has called
+    /// `bls_key_history.apply_rotation` alongside the Ed25519 apply.
+    /// Without that mirror call, the dispatch-layer QC verifier
+    /// would still resolve the post-rotation BLS pubkey as the
+    /// pre-rotation one and reject every QC partial — the cluster
+    /// would silently stall past `v_eff` with only n-1 = 3 honest
+    /// validators (quorum holds at exactly 3-of-4 in this corner,
+    /// but only as long as the rotated validator is also offline,
+    /// which it isn't — it's just wrong about its own BLS key).
+    #[tokio::test(start_paused = true)]
+    async fn bls_cluster_commits_dual_key_rotation_and_makes_progress() {
+        use crate::consensus::View;
+        use crate::consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+        use crate::crypto::sig_scheme::BlsAggregated;
+
+        let mut cluster = SimCluster::spawn_bls(4, Duration::from_millis(50)).await;
+
+        // Warm up under the genesis identity so the chain has real
+        // depth before the rotation tx lands. BLS partials are
+        // exercised on every Vote during this phase, which proves
+        // the pre-rotation engine path is healthy.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 2
+            })
+            .await;
+        assert!(warmed, "BLS cluster failed to commit warm-up blocks");
+
+        // Pick validator at sorted-index 1 to rotate (non-leader of
+        // view 0, same rationale as the Ed25519 sibling test).
+        let rotated_idx = 1;
+        let rotated_validator = cluster.node_ids[rotated_idx];
+        let current_signer = cluster
+            .signer(rotated_idx)
+            .expect("regular SimCluster captures Ed25519 signers");
+
+        // Mint the NEW Ed25519 + BLS keys for the rotation target.
+        // Both must be real keypairs: the dual-signed envelope's
+        // `sig_new` verifies under `new_pubkey`, and the PoP we
+        // attach must verify under `new_bls_pubkey`.
+        let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
+        let new_pubkey = new_signer.node_id();
+        let mut bls_ikm = [0u8; 32];
+        bls_ikm[0] = 0x42; // deterministic across re-runs of this test
+        bls_ikm[1] = rotated_idx as u8;
+        let (new_bls_sk, new_bls_pk) = BlsAggregated::keygen(&bls_ikm).unwrap();
+        let new_bls_pop = BlsAggregated::sign_pop(&new_bls_sk).unwrap();
+
+        let v_eff: View = 60;
+        let payload = ValidatorKeyRotation {
+            validator: rotated_validator,
+            new_pubkey,
+            v_eff,
+            new_bls_pubkey: Some(new_bls_pk),
+            new_bls_pop: Some(new_bls_pop),
+        };
+        let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer)
+            .expect("constructing BLS rotation envelope must succeed");
+        let cmd_bytes = envelope.encode_command();
+
+        for mp in &cluster.mempools {
+            let _ = mp.insert(cmd_bytes.clone());
+        }
+
+        // Drive past v_eff. As in the Ed25519 sibling test, the
+        // rotated validator's signer doesn't get swapped in this
+        // sim — it stays effectively offline post-boundary, so n=4
+        // quorum=3 just barely holds via the other three. The
+        // budget is identical, on the assumption that BLS pairing
+        // overhead is dominated by the inter-view round trips.
+        let crossed = cluster
+            .advance_and_yield_until(Duration::from_secs(12), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff + 5
+            })
+            .await;
+        assert!(
+            crossed,
+            "BLS cluster failed to commit past v_eff = {v_eff} within budget",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // Some node committed at view >= v_eff: the post-boundary
+        // regime is reached, which means at least one quorum of
+        // BLS partials verified under the post-rotation BLS pubkey
+        // table on the dispatch verifier (#332/#356). If
+        // `apply_committed_rotations` had skipped the BLS half, the
+        // verifier would resolve the rotated validator's BLS
+        // pubkey as the pre-rotation one and reject post-`v_eff`
+        // QC aggregates whenever the rotated validator's slot
+        // contributed.
+        let any_post_boundary = committed
+            .iter()
+            .any(|node_blocks| node_blocks.iter().any(|b| b.header.view >= v_eff));
+        assert!(
+            any_post_boundary,
+            "expected at least one committed block at view >= v_eff",
+        );
+
+        // The rotation tx itself made it onto the chain.
+        let rotation_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|cmd| DualSignedRotation::is_rotation_payload(cmd))
+            })
+        });
+        assert!(
+            rotation_committed,
+            "expected at least one committed block to carry the BLS rotation tx",
+        );
+    }
+
     // ── #261: rotation rejection sim tests ────────────────────────────────
     //
     // The dispatch-level signer check (PR #286) and the post-commit
@@ -4249,6 +4373,8 @@ mod tests {
             validator: cluster.node_ids[idx],
             new_pubkey: new_signer.node_id(),
             v_eff,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
         };
         let env = DualSignedRotation::sign(payload, &*current, &*new_signer)
             .expect("constructing rotation envelope must succeed");
@@ -4391,6 +4517,8 @@ mod tests {
                 validator: cluster.node_ids[1],
                 new_pubkey: new_signer.node_id(),
                 v_eff: 0,
+                new_bls_pubkey: None,
+                new_bls_pop: None,
             },
             &*current,
             &*new_signer,
