@@ -4181,21 +4181,54 @@ mod tests {
             /// Byzantine. Honest validator indices are `0..n_honest`
             /// where `n_honest = validators.len() - byzantine_count`.
             pub byzantine_count: usize,
+            /// Chain-level signature scheme this set runs under
+            /// (#354 step 3). Drives whether `event_from_msg`
+            /// produces a BLS partial alongside each Vote and which
+            /// genesis-QC shape `kickoff_proposal` uses.
+            pub signature_scheme: SignatureSchemeChoice,
+            /// Per-validator BLS keypair. Length matches
+            /// `validators.len()` on BLS chains and is empty on
+            /// Ed25519 chains. Indexed parallel to validator order
+            /// (sorted ascending), so `bls_keys[i]` belongs to
+            /// `validators.get(i)` — Byzantine slots included so
+            /// adversarial helpers can sign forged Vote partials
+            /// under the Byzantine validator's own BLS key.
+            pub bls_keys: Vec<(
+                crate::crypto::sig_scheme::BlsSecretKey,
+                crate::crypto::sig_scheme::BlsPublicKey,
+            )>,
         }
 
         impl ReplicaSet {
-            /// Build `n` all-honest replicas. Shorthand for
-            /// `new_with_byzantine(n, 0)`.
+            /// Build `n` all-honest replicas under `Ed25519Collected`.
+            /// Shorthand for `new_with_byzantine(n, 0)`.
             pub fn new(n: usize) -> Self {
                 Self::new_with_byzantine(n, 0)
             }
 
             /// Build `n_total` validators with the last `byzantine_count`
-            /// treated as Byzantine: their NodeIds appear in
-            /// `validators` for leader-election purposes, but no
-            /// honest core runs for them, and messages addressed to
-            /// them via `SendTo` are dropped (adversarial void).
+            /// treated as Byzantine, under `Ed25519Collected`.
+            /// Shorthand for [`Self::new_with_byzantine_scheme`].
             pub fn new_with_byzantine(n_total: usize, byzantine_count: usize) -> Self {
+                Self::new_with_byzantine_scheme(
+                    n_total,
+                    byzantine_count,
+                    SignatureSchemeChoice::Ed25519Collected,
+                )
+            }
+
+            /// Build `n_total` validators with the last `byzantine_count`
+            /// treated as Byzantine on a chain configured for `scheme`.
+            ///
+            /// On BLS chains every validator (including Byzantine slots)
+            /// gets a deterministic BLS keypair seeded from its sorted
+            /// index, so the same `n_total` always produces byte-identical
+            /// keys across runs of the proptest harness.
+            pub fn new_with_byzantine_scheme(
+                n_total: usize,
+                byzantine_count: usize,
+                scheme: SignatureSchemeChoice,
+            ) -> Self {
                 assert!(
                     byzantine_count < n_total,
                     "byzantine_count must be strictly less than n_total",
@@ -4208,11 +4241,29 @@ mod tests {
                         let nid = *validators.get(i).unwrap();
                         let state = HotStuffState::new(validators.clone(), genesis.clone());
                         let builder = Arc::new(TestBlockBuilder { proposer: nid });
-                        HotStuffCore::new(nid, state, builder)
+                        HotStuffCore::new(nid, state, builder).with_signature_scheme(scheme)
                     })
                     .collect();
                 let inboxes = (0..n_honest).map(|_| VecDeque::new()).collect();
                 let commits = (0..n_honest).map(|_| BTreeMap::new()).collect();
+                let bls_keys: Vec<_> = if scheme == SignatureSchemeChoice::BlsAggregated {
+                    (0..n_total)
+                        .map(|i| {
+                            let mut ikm = [0u8; 32];
+                            // Spread i across the IKM so different
+                            // validator indices produce distinct
+                            // pubkeys; XOR with a salt so a
+                            // collision against any other test's
+                            // seed scheme is unlikely.
+                            ikm[0] = (i as u8) ^ 0xA0;
+                            ikm[1] = ((i >> 8) as u8) ^ 0x5A;
+                            crate::crypto::sig_scheme::BlsAggregated::keygen(&ikm)
+                                .expect("proptest BLS keygen must not fail")
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 Self {
                     cores,
                     inboxes,
@@ -4220,7 +4271,32 @@ mod tests {
                     validators,
                     genesis,
                     byzantine_count,
+                    signature_scheme: scheme,
+                    bls_keys,
                 }
+            }
+
+            /// Sign a BLS partial over the canonical Vote pre-image
+            /// using validator `signer_idx`'s BLS key. Returns `None`
+            /// on Ed25519 chains (where the optional partial field
+            /// rides as `None`). Panics on BLS chains if `signer_idx`
+            /// is out of range — the caller should index validators
+            /// directly.
+            pub fn bls_partial_for_vote(
+                &self,
+                signer_idx: usize,
+                vote: &Vote,
+            ) -> Option<crate::crypto::sig_scheme::BlsPartialSig> {
+                if self.signature_scheme != SignatureSchemeChoice::BlsAggregated {
+                    return None;
+                }
+                let preimg = crate::crypto::signed::preimage::<Vote>(vote)
+                    .expect("preimage of a fixed-shape Vote must succeed");
+                let sk = &self.bls_keys[signer_idx].0;
+                Some(
+                    crate::crypto::sig_scheme::BlsAggregated::sign_partial(sk, &preimg)
+                        .expect("BLS partial signing must not fail under valid inputs"),
+                )
             }
 
             /// Number of honest replicas the harness is running.
@@ -4283,10 +4359,14 @@ mod tests {
                     match action {
                         Action::Broadcast(msg) => {
                             // Only honest replicas have inboxes;
-                            // Byzantine "receipt" is a no-op.
+                            // Byzantine "receipt" is a no-op. The
+                            // event is built once per target so the
+                            // immutable `self` borrow inside
+                            // `event_from_msg` doesn't race the
+                            // mutable `self.inboxes` borrow.
                             for target in 0..self.cores.len() {
-                                self.inboxes[target]
-                                    .push_back(event_from_msg(source_nid, msg.clone()));
+                                let event = self.event_from_msg(source_nid, msg.clone());
+                                self.inboxes[target].push_back(event);
                             }
                         }
                         Action::SendTo(target_id, msg) => {
@@ -4296,7 +4376,8 @@ mod tests {
                             // do with it beyond the strategies in
                             // the property tests.
                             if let Some(target) = self.honest_index_of(&target_id) {
-                                self.inboxes[target].push_back(event_from_msg(source_nid, msg));
+                                let event = self.event_from_msg(source_nid, msg);
+                                self.inboxes[target].push_back(event);
                             }
                         }
                         Action::Commit(block) => {
@@ -4333,42 +4414,84 @@ mod tests {
             /// Seed a fully-signed QC over `(view, block_hash)` —
             /// exactly what `HotStuff::add_signature` would produce
             /// from `n` real validators voting. Used for crafting
-            /// the kickoff proposal; not something the safety core
-            /// would ever build internally.
+            /// the kickoff proposal and Byzantine forged QCs; not
+            /// something the safety core would ever build internally.
+            ///
+            /// On BLS chains the bitmap is filled the same way but
+            /// the aggregate is folded from real per-validator BLS
+            /// partials over the `(view, block_hash)` pre-image, so
+            /// the resulting QC is structurally well-formed and
+            /// `verify_aggregate_bls`-checkable. The safety core only
+            /// reads `view`, `block_hash`, and `has_quorum`, but
+            /// keeping the QC well-formed mirrors what an honest
+            /// integration layer would produce.
             pub fn synth_qc(&self, view: View, block_hash: BlockHash) -> QuorumCertificate {
-                let mut qc = QuorumCertificate::new(view, block_hash, self.validators.len());
-                for i in 0..self.validators.len() {
-                    qc.add_signature(i, [i as u8 + 1; 64]);
+                match self.signature_scheme {
+                    SignatureSchemeChoice::Ed25519Collected => {
+                        let mut qc =
+                            QuorumCertificate::new(view, block_hash, self.validators.len());
+                        for i in 0..self.validators.len() {
+                            qc.add_signature(i, [i as u8 + 1; 64]);
+                        }
+                        qc
+                    }
+                    SignatureSchemeChoice::BlsAggregated => {
+                        let mut qc =
+                            QuorumCertificate::new_bls(view, block_hash, self.validators.len());
+                        let vote = Vote { view, block_hash };
+                        let preimg = crate::crypto::signed::preimage::<Vote>(&vote)
+                            .expect("Vote preimage must succeed");
+                        for i in 0..self.validators.len() {
+                            let sk = &self.bls_keys[i].0;
+                            let partial =
+                                crate::crypto::sig_scheme::BlsAggregated::sign_partial(sk, &preimg)
+                                    .expect("BLS partial signing must not fail");
+                            qc.add_bls_partial(i, partial);
+                        }
+                        qc
+                    }
                 }
-                qc
             }
         }
 
-        /// Wrap a `ConsensusMsg` from `source` in the corresponding
-        /// `Signed<_>` envelope and promote it to the matching
-        /// `Event` kind. Signatures aren't verified by the safety
-        /// core, so we stamp a zero sig.
-        fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
-            let sig = [0u8; 64];
-            match msg {
-                ConsensusMsg::Proposal(payload) => Event::ProposalReceived(Signed {
-                    payload,
-                    signer: source,
-                    sig,
-                }),
-                ConsensusMsg::Vote(payload) => Event::VoteReceived(
-                    Signed {
+        impl ReplicaSet {
+            /// Wrap a `ConsensusMsg` from `source` in the corresponding
+            /// `Signed<_>` envelope and promote it to the matching
+            /// `Event` kind. Signatures aren't verified by the safety
+            /// core, so we stamp a zero sig — but on BLS chains we
+            /// *do* attach a real BLS partial under `source`'s BLS
+            /// key, because `add_bls_partial` panics on bad bytes
+            /// (see `BlsAggregated::add_partial` in
+            /// `crate::crypto::sig_scheme`).
+            fn event_from_msg(&self, source: NodeId, msg: ConsensusMsg) -> Event {
+                let sig = [0u8; 64];
+                match msg {
+                    ConsensusMsg::Proposal(payload) => Event::ProposalReceived(Signed {
                         payload,
                         signer: source,
                         sig,
-                    },
-                    None,
-                ),
-                ConsensusMsg::NewView(payload) => Event::NewViewReceived(Signed {
-                    payload,
-                    signer: source,
-                    sig,
-                }),
+                    }),
+                    ConsensusMsg::Vote(payload) => {
+                        let signer_idx = self
+                            .validators
+                            .index_of(&source)
+                            .expect("event_from_msg called with unknown source NodeId");
+                        let bls_partial = self.bls_partial_for_vote(signer_idx, &payload);
+                        Event::VoteReceived(
+                            Signed {
+                                payload,
+                                signer: source,
+                                sig,
+                            },
+                            bls_partial,
+                        )
+                    }
+                    ConsensusMsg::NewView(payload) => Event::NewViewReceived(Signed {
+                        payload,
+                        signer: source,
+                        sig,
+                    }),
+                }
             }
         }
 
@@ -4498,20 +4621,45 @@ mod tests {
 
         use proptest::prelude::*;
 
+        /// Shared body for `honest_replicas_never_conflict_under_random_delivery`
+        /// across `Ed25519Collected` and `BlsAggregated` schemes (#354 step 3).
+        /// Builds a fresh `ReplicaSet` with the requested scheme, kicks off
+        /// view 1, then drains the random delivery schedule and asserts the
+        /// no-conflicting-commits invariant. The same property must hold
+        /// under both schemes — the BLS branching in `on_vote_received`
+        /// does not change which blocks the honest cores commit, only
+        /// how they fold partials.
+        fn run_honest_replicas_never_conflict(scheme: SignatureSchemeChoice, schedule: Vec<usize>) {
+            let mut replicas = ReplicaSet::new_with_byzantine_scheme(4, 0, scheme);
+            let kickoff = kickoff_proposal(&replicas);
+            replicas.inject_all(Event::ProposalReceived(kickoff));
+
+            for replica in schedule {
+                replicas.deliver_one(replica);
+            }
+
+            assert_no_conflicting_commits(&replicas);
+        }
+
         proptest! {
             #[test]
             fn honest_replicas_never_conflict_under_random_delivery(
                 schedule in proptest::collection::vec(0usize..4, 1..=200),
             ) {
-                let mut replicas = ReplicaSet::new(4);
-                let kickoff = kickoff_proposal(&replicas);
-                replicas.inject_all(Event::ProposalReceived(kickoff));
+                run_honest_replicas_never_conflict(
+                    SignatureSchemeChoice::Ed25519Collected,
+                    schedule,
+                );
+            }
 
-                for replica in schedule {
-                    replicas.deliver_one(replica);
-                }
-
-                assert_no_conflicting_commits(&replicas);
+            #[test]
+            fn bls_honest_replicas_never_conflict_under_random_delivery(
+                schedule in proptest::collection::vec(0usize..4, 1..=200),
+            ) {
+                run_honest_replicas_never_conflict(
+                    SignatureSchemeChoice::BlsAggregated,
+                    schedule,
+                );
             }
         }
 
@@ -4562,6 +4710,50 @@ mod tests {
             ]
         }
 
+        /// Shared body for the Byzantine-vote proptest across schemes.
+        /// On BLS chains the Byzantine vote carries a real BLS partial
+        /// signed under the Byzantine validator's BLS key — without it
+        /// the safety core's `on_vote_received` would silently drop the
+        /// vote (defense-in-depth from #354 step 2), erasing the test's
+        /// adversarial signal.
+        fn run_byzantine_votes_never_break_safety(
+            scheme: SignatureSchemeChoice,
+            schedule: Vec<ByzantineVoteStep>,
+        ) {
+            let mut replicas = ReplicaSet::new_with_byzantine_scheme(4, 1, scheme);
+            let byz_nid = replicas.byzantine_nids()[0];
+            let byz_idx = replicas
+                .validators
+                .index_of(&byz_nid)
+                .expect("byzantine NodeId must appear in validator set");
+            let kickoff = kickoff_proposal(&replicas);
+            replicas.inject_all(Event::ProposalReceived(kickoff));
+
+            for step in schedule {
+                match step {
+                    ByzantineVoteStep::Deliver(i) => {
+                        replicas.deliver_one(i);
+                    }
+                    ByzantineVoteStep::InjectVote {
+                        view,
+                        block_hash,
+                        target_honest,
+                    } => {
+                        let vote_payload = Vote { view, block_hash };
+                        let bls_partial = replicas.bls_partial_for_vote(byz_idx, &vote_payload);
+                        let vote = Signed {
+                            payload: vote_payload,
+                            signer: byz_nid,
+                            sig: [0u8; 64],
+                        };
+                        replicas.inject(target_honest, Event::VoteReceived(vote, bls_partial));
+                    }
+                }
+            }
+
+            assert_no_conflicting_commits(&replicas);
+        }
+
         proptest! {
             #[test]
             fn byzantine_votes_never_break_safety(
@@ -4570,32 +4762,23 @@ mod tests {
                     1..=200,
                 ),
             ) {
-                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
-                let byz_nid = replicas.byzantine_nids()[0];
-                let kickoff = kickoff_proposal(&replicas);
-                replicas.inject_all(Event::ProposalReceived(kickoff));
+                run_byzantine_votes_never_break_safety(
+                    SignatureSchemeChoice::Ed25519Collected,
+                    schedule,
+                );
+            }
 
-                for step in schedule {
-                    match step {
-                        ByzantineVoteStep::Deliver(i) => {
-                            replicas.deliver_one(i);
-                        }
-                        ByzantineVoteStep::InjectVote {
-                            view,
-                            block_hash,
-                            target_honest,
-                        } => {
-                            let vote = Signed {
-                                payload: Vote { view, block_hash },
-                                signer: byz_nid,
-                                sig: [0u8; 64],
-                            };
-                            replicas.inject(target_honest, Event::VoteReceived(vote, None));
-                        }
-                    }
-                }
-
-                assert_no_conflicting_commits(&replicas);
+            #[test]
+            fn bls_byzantine_votes_never_break_safety(
+                schedule in proptest::collection::vec(
+                    byzantine_vote_step_strategy(3),
+                    1..=200,
+                ),
+            ) {
+                run_byzantine_votes_never_break_safety(
+                    SignatureSchemeChoice::BlsAggregated,
+                    schedule,
+                );
             }
         }
 
@@ -4654,9 +4837,12 @@ mod tests {
         /// Assemble a `Signed<Proposal>` from a Byzantine adversary:
         /// arbitrary block over `parent_hash` at `view`, arbitrary
         /// justify-QC with the claimed signatures the safety core
-        /// won't actually verify.
+        /// won't actually verify. Scheme-aware so the embedded QC
+        /// matches the chain's flavor — `synth_qc` builds a real BLS
+        /// aggregate on BLS chains, mirroring what the integration
+        /// layer would feed to the safety core.
         fn byzantine_proposal(
-            n_validators: usize,
+            replicas: &ReplicaSet,
             byz_nid: NodeId,
             parent_hash: BlockHash,
             view: View,
@@ -4675,19 +4861,50 @@ mod tests {
                 header,
                 commands: Vec::new(),
             };
-            let mut justify =
-                QuorumCertificate::new(justify_view, justify_block_hash, n_validators);
-            // Synthesize a full set of fake signatures. The safety
-            // core doesn't verify them; this just clears
-            // `has_quorum` so the core treats the QC as legitimate.
-            for i in 0..n_validators {
-                justify.add_signature(i, [i as u8 + 1; 64]);
-            }
+            let justify = replicas.synth_qc(justify_view, justify_block_hash);
             Signed {
                 payload: Proposal { block, justify },
                 signer: byz_nid,
                 sig: [0u8; 64],
             }
+        }
+
+        /// Shared body for the Byzantine-proposal proptest across schemes.
+        fn run_byzantine_proposals_never_break_safety(
+            scheme: SignatureSchemeChoice,
+            schedule: Vec<ByzantineProposalStep>,
+        ) {
+            let mut replicas = ReplicaSet::new_with_byzantine_scheme(4, 1, scheme);
+            let byz_nid = replicas.byzantine_nids()[0];
+            let kickoff = kickoff_proposal(&replicas);
+            replicas.inject_all(Event::ProposalReceived(kickoff));
+
+            for step in schedule {
+                match step {
+                    ByzantineProposalStep::Deliver(i) => {
+                        replicas.deliver_one(i);
+                    }
+                    ByzantineProposalStep::InjectProposal {
+                        parent_hash,
+                        view,
+                        justify_view,
+                        justify_block_hash,
+                        target_honest,
+                    } => {
+                        let proposal = byzantine_proposal(
+                            &replicas,
+                            byz_nid,
+                            parent_hash,
+                            view,
+                            justify_view,
+                            justify_block_hash,
+                        );
+                        replicas.inject(target_honest, Event::ProposalReceived(proposal));
+                    }
+                }
+            }
+
+            assert_no_conflicting_commits(&replicas);
         }
 
         proptest! {
@@ -4698,38 +4915,33 @@ mod tests {
                     1..=200,
                 ),
             ) {
-                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
-                let byz_nid = replicas.byzantine_nids()[0];
-                let n_validators = replicas.validators.len();
-                let kickoff = kickoff_proposal(&replicas);
-                replicas.inject_all(Event::ProposalReceived(kickoff));
+                run_byzantine_proposals_never_break_safety(
+                    SignatureSchemeChoice::Ed25519Collected,
+                    schedule,
+                );
+            }
+        }
 
-                for step in schedule {
-                    match step {
-                        ByzantineProposalStep::Deliver(i) => {
-                            replicas.deliver_one(i);
-                        }
-                        ByzantineProposalStep::InjectProposal {
-                            parent_hash,
-                            view,
-                            justify_view,
-                            justify_block_hash,
-                            target_honest,
-                        } => {
-                            let proposal = byzantine_proposal(
-                                n_validators,
-                                byz_nid,
-                                parent_hash,
-                                view,
-                                justify_view,
-                                justify_block_hash,
-                            );
-                            replicas.inject(target_honest, Event::ProposalReceived(proposal));
-                        }
-                    }
-                }
+        // Same wall-clock-budget rationale as the BLS mixed proptest
+        // below: BLS pairing-check + per-validator partial signing
+        // pushes the per-case cost well above the Ed25519 variant.
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 96,
+                .. ProptestConfig::default()
+            })]
 
-                assert_no_conflicting_commits(&replicas);
+            #[test]
+            fn bls_byzantine_proposals_never_break_safety(
+                schedule in proptest::collection::vec(
+                    byzantine_proposal_step_strategy(3),
+                    1..=120,
+                ),
+            ) {
+                run_byzantine_proposals_never_break_safety(
+                    SignatureSchemeChoice::BlsAggregated,
+                    schedule,
+                );
             }
         }
 
@@ -4810,72 +5022,115 @@ mod tests {
             ]
         }
 
+        /// Shared body for the mixed-Byzantine-events proptest across
+        /// schemes. Builds Byzantine vote / proposal / NewView events
+        /// using the scheme-aware helpers (`bls_partial_for_vote`,
+        /// `synth_qc`) so the BLS branch sees real partials and real
+        /// BLS QCs, mirroring what an integration-layer-fed safety
+        /// core would receive.
+        fn run_mixed_byzantine_events_never_break_safety(
+            scheme: SignatureSchemeChoice,
+            schedule: Vec<MixedStep>,
+        ) {
+            let mut replicas = ReplicaSet::new_with_byzantine_scheme(4, 1, scheme);
+            let byz_nid = replicas.byzantine_nids()[0];
+            let byz_idx = replicas
+                .validators
+                .index_of(&byz_nid)
+                .expect("byzantine NodeId must appear in validator set");
+            let kickoff = kickoff_proposal(&replicas);
+            replicas.inject_all(Event::ProposalReceived(kickoff));
+
+            for step in schedule {
+                match step {
+                    MixedStep::Deliver(i) => {
+                        replicas.deliver_one(i);
+                    }
+                    MixedStep::InjectVote {
+                        view,
+                        block_hash,
+                        target_honest,
+                    } => {
+                        let vote_payload = Vote { view, block_hash };
+                        let bls_partial = replicas.bls_partial_for_vote(byz_idx, &vote_payload);
+                        let vote = Signed {
+                            payload: vote_payload,
+                            signer: byz_nid,
+                            sig: [0u8; 64],
+                        };
+                        replicas.inject(target_honest, Event::VoteReceived(vote, bls_partial));
+                    }
+                    MixedStep::InjectProposal {
+                        parent_hash,
+                        view,
+                        justify_view,
+                        justify_block_hash,
+                        target_honest,
+                    } => {
+                        let proposal = byzantine_proposal(
+                            &replicas,
+                            byz_nid,
+                            parent_hash,
+                            view,
+                            justify_view,
+                            justify_block_hash,
+                        );
+                        replicas.inject(target_honest, Event::ProposalReceived(proposal));
+                    }
+                    MixedStep::InjectNewView {
+                        qc_view,
+                        qc_block_hash,
+                        target_honest,
+                    } => {
+                        let qc = replicas.synth_qc(qc_view, qc_block_hash);
+                        let nv = Signed {
+                            payload: NewView { high_qc: qc },
+                            signer: byz_nid,
+                            sig: [0u8; 64],
+                        };
+                        replicas.inject(target_honest, Event::NewViewReceived(nv));
+                    }
+                }
+            }
+
+            assert_no_conflicting_commits(&replicas);
+        }
+
         proptest! {
             #[test]
             fn mixed_byzantine_events_never_break_safety(
                 schedule in proptest::collection::vec(mixed_step_strategy(3), 1..=300),
             ) {
-                let mut replicas = ReplicaSet::new_with_byzantine(4, 1);
-                let byz_nid = replicas.byzantine_nids()[0];
-                let n_validators = replicas.validators.len();
-                let kickoff = kickoff_proposal(&replicas);
-                replicas.inject_all(Event::ProposalReceived(kickoff));
+                run_mixed_byzantine_events_never_break_safety(
+                    SignatureSchemeChoice::Ed25519Collected,
+                    schedule,
+                );
+            }
+        }
 
-                for step in schedule {
-                    match step {
-                        MixedStep::Deliver(i) => {
-                            replicas.deliver_one(i);
-                        }
-                        MixedStep::InjectVote {
-                            view,
-                            block_hash,
-                            target_honest,
-                        } => {
-                            let vote = Signed {
-                                payload: Vote { view, block_hash },
-                                signer: byz_nid,
-                                sig: [0u8; 64],
-                            };
-                            replicas.inject(target_honest, Event::VoteReceived(vote, None));
-                        }
-                        MixedStep::InjectProposal {
-                            parent_hash,
-                            view,
-                            justify_view,
-                            justify_block_hash,
-                            target_honest,
-                        } => {
-                            let proposal = byzantine_proposal(
-                                n_validators,
-                                byz_nid,
-                                parent_hash,
-                                view,
-                                justify_view,
-                                justify_block_hash,
-                            );
-                            replicas.inject(target_honest, Event::ProposalReceived(proposal));
-                        }
-                        MixedStep::InjectNewView {
-                            qc_view,
-                            qc_block_hash,
-                            target_honest,
-                        } => {
-                            let mut qc =
-                                QuorumCertificate::new(qc_view, qc_block_hash, n_validators);
-                            for i in 0..n_validators {
-                                qc.add_signature(i, [i as u8 + 1; 64]);
-                            }
-                            let nv = Signed {
-                                payload: NewView { high_qc: qc },
-                                signer: byz_nid,
-                                sig: [0u8; 64],
-                            };
-                            replicas.inject(target_honest, Event::NewViewReceived(nv));
-                        }
-                    }
-                }
+        // The BLS proptest does ~32× more crypto work per case than its
+        // Ed25519 sibling (BLS pairing-check verifies vs. ring-Ed25519,
+        // and BLS partial signing per vote). The Ed25519 variant runs
+        // 256 cases × 300 events; the BLS variant trims the schedule
+        // bound and case count so a single test stays under the 15-s
+        // wall-clock budget on the default GitHub-hosted runner. The
+        // honest+Byzantine attack-vector coverage is unchanged: every
+        // strategy in `mixed_step_strategy` is still sampled, just with
+        // a smaller envelope.
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 64,
+                .. ProptestConfig::default()
+            })]
 
-                assert_no_conflicting_commits(&replicas);
+            #[test]
+            fn bls_mixed_byzantine_events_never_break_safety(
+                schedule in proptest::collection::vec(mixed_step_strategy(3), 1..=150),
+            ) {
+                run_mixed_byzantine_events_never_break_safety(
+                    SignatureSchemeChoice::BlsAggregated,
+                    schedule,
+                );
             }
         }
     }
