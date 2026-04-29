@@ -59,6 +59,13 @@ pub struct NodeConfig {
     /// enabled. Both slots accept any of the same backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator_identity: Option<IdentityConfig>,
+    /// BLS validator-signing identity backend. Required when the chain's
+    /// `signature_scheme = "bls_aggregated"` (#288); rejected when the
+    /// chain is `ed25519_collected` so a misconfigured node refuses to
+    /// start rather than booting in an inconsistent state. Today only a
+    /// `file` backend is supported. See [`BlsIdentityConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bls_validator_identity: Option<BlsIdentityConfig>,
     /// Deprecated alias for `[node.identity] backend = "file" path = ...`.
     /// Retained for backward compatibility; emits a warning at startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,6 +122,34 @@ impl IdentityConfig {
             Self::Keyring { .. } => "keyring",
             Self::EncryptedFile { .. } => "encrypted-file",
             Self::Exec { .. } => "exec",
+        }
+    }
+}
+
+/// Where the node's BLS validator-signing key lives. Distinct from
+/// [`IdentityConfig`] because BLS keys aren't an X.509 algorithm —
+/// they're 32 raw secret-key bytes with a 1-byte format-version
+/// header (see [`crate::crypto::bls_key::BlsKeyFile`]). PEM/PKCS#8
+/// framing would only obscure the wire-format invariants.
+///
+/// Only `file` is implemented today; `env` and `exec` would mirror
+/// their [`IdentityConfig`] counterparts when the need arises.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "backend", rename_all = "kebab-case")]
+pub enum BlsIdentityConfig {
+    /// Raw 33-byte secret-key file on disk, mode 0600.
+    File {
+        path: PathBuf,
+        /// Skip the 0o077 permission check on read (dev escape hatch).
+        #[serde(default)]
+        allow_insecure_perms: bool,
+    },
+}
+
+impl BlsIdentityConfig {
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::File { .. } => "file",
         }
     }
 }
@@ -990,6 +1025,27 @@ pub fn resolve_identity(node: &NodeConfig) -> Option<IdentityConfig> {
 /// warning), preserving the historical single-key behavior.
 pub fn resolve_validator_identity(node: &NodeConfig) -> Option<IdentityConfig> {
     node.validator_identity.clone()
+}
+
+/// Resolve the BLS validator-signing identity. Returns `None` when the
+/// `[node.bls_validator_identity]` table is absent.
+pub fn resolve_bls_validator_identity(node: &NodeConfig) -> Option<BlsIdentityConfig> {
+    node.bls_validator_identity.clone()
+}
+
+/// Build a [`crate::crypto::bls_key::BlsKeyProvider`] from a config.
+pub fn build_bls_provider(
+    cfg: &BlsIdentityConfig,
+) -> anyhow::Result<Arc<dyn crate::crypto::bls_key::BlsKeyProvider>> {
+    match cfg {
+        BlsIdentityConfig::File {
+            path,
+            allow_insecure_perms,
+        } => Ok(Arc::new(
+            crate::crypto::bls_key::BlsKeyFile::new(path.clone())
+                .with_allow_insecure_perms(*allow_insecure_perms),
+        )),
+    }
 }
 
 /// Build a `KeyProvider` for the given identity config.
