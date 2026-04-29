@@ -7726,6 +7726,242 @@ mod tests {
         assert_eq!(surviving, expected);
     }
 
+    /// Issue #327 / audit finding 4-F1 / 12-F3 (Tendermint amnesia
+    /// regression guard).
+    ///
+    /// HotStuff safety requires that before a `Vote` envelope leaves the
+    /// process, the `last_voted_view` field is durable on disk. If the
+    /// order is reversed (vote sent, then crash before persist), the
+    /// restarted replica will re-vote at the same view — potentially on
+    /// a conflicting block — which is the Tendermint amnesia attack
+    /// class.
+    ///
+    /// The current implementation gets this right by emission ordering
+    /// in `step()` (`Action::Persist(VotedInView)` before
+    /// `Action::Broadcast(Vote)`) and by `apply_safety_actions` flushing
+    /// the persist buffer synchronously via `storage.batch(...)` before
+    /// any non-Persist action runs. **This ordering is correct today.**
+    /// The test below pins it: a future refactor that reorders
+    /// `step()`'s emissions or that defers the `persist_buf.flush()`
+    /// past the first `Broadcast` would fail this test.
+    ///
+    /// Approach: wrap [`Storage`] and [`Broadcaster`] in
+    /// timestamp-recording shells that share an ordered log. Drive a
+    /// fresh node (single-replica) to vote on a hand-crafted Proposal,
+    /// then assert the log records `PersistVotedInView(V)` before
+    /// `BroadcastVoteFor(V)` for the same view.
+    #[tokio::test]
+    async fn vote_persist_returns_before_send_called() {
+        use bytes::Bytes;
+        use parking_lot::Mutex as PlMutex;
+
+        use crate::clock::BoxFuture;
+        use crate::consensus::dispatch::ingress_with_qc_verification;
+        use crate::consensus::hotstuff::Proposal;
+        use crate::p2p::overlay::Broadcaster;
+        use crate::storage::{Storage, WriteBatch};
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum OrderEvent {
+            PersistVotedInView(View),
+            BroadcastVoteFor(View),
+        }
+
+        /// `Storage` wrapper that appends `PersistVotedInView(V)` to a
+        /// shared log when (and only when) `apply_batch` returns `Ok`
+        /// after writing `STORAGE_KEY_LAST_VOTED_VIEW`. Other batches
+        /// pass through unchanged. Records *after* delegation so the
+        /// log entry corresponds to "persist returned" rather than
+        /// "persist started".
+        struct OrderingStorage {
+            inner: Arc<dyn Storage>,
+            log: Arc<PlMutex<Vec<OrderEvent>>>,
+        }
+        impl Storage for OrderingStorage {
+            fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+                self.inner.put(key, value)
+            }
+            fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+                self.inner.delete(key)
+            }
+            fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+                self.inner.scan_prefix(prefix)
+            }
+            fn apply_batch(&self, batch: WriteBatch) -> anyhow::Result<()> {
+                // Snapshot the view-write (if any) before consuming the
+                // batch; record only after the inner write succeeds.
+                let mut written_view: Option<View> = None;
+                for op in &batch.ops {
+                    if let crate::storage::WriteOp::Put(key, value) = op {
+                        if key.as_slice() == STORAGE_KEY_LAST_VOTED_VIEW {
+                            if let Ok(v) = decode_voted_view(value) {
+                                written_view = Some(v);
+                            }
+                        }
+                    }
+                }
+                let result = self.inner.apply_batch(batch);
+                if result.is_ok() {
+                    if let Some(v) = written_view {
+                        self.log.lock().push(OrderEvent::PersistVotedInView(v));
+                    }
+                }
+                result
+            }
+            fn compare_and_swap(
+                &self,
+                key: &[u8],
+                expected: Option<&[u8]>,
+                new: Option<&[u8]>,
+            ) -> anyhow::Result<bool> {
+                self.inner.compare_and_swap(key, expected, new)
+            }
+        }
+
+        /// `Broadcaster` wrapper that appends `BroadcastVoteFor(V)` to
+        /// the shared log *before* delegating to the inner. The log
+        /// entry corresponds to "send was called", which is the
+        /// observable timestamp the audit cares about.
+        struct OrderingBroadcaster {
+            inner: Arc<dyn Broadcaster>,
+            log: Arc<PlMutex<Vec<OrderEvent>>>,
+        }
+        impl Broadcaster for OrderingBroadcaster {
+            fn broadcast(&self, payload: Bytes) -> BoxFuture<'_, ()> {
+                if let Ok(WireMessage::Vote(signed, _)) =
+                    postcard::from_bytes::<WireMessage>(&payload)
+                {
+                    self.log
+                        .lock()
+                        .push(OrderEvent::BroadcastVoteFor(signed.payload.view));
+                }
+                self.inner.broadcast(payload)
+            }
+            fn send_to(&self, target: NodeId, payload: Bytes) -> BoxFuture<'_, ()> {
+                self.inner.send_to(target, payload)
+            }
+        }
+
+        // ── Setup ──────────────────────────────────────────────────────
+        let log: Arc<PlMutex<Vec<OrderEvent>>> = Arc::new(PlMutex::new(Vec::new()));
+        let inner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let storage: Arc<dyn Storage> = Arc::new(OrderingStorage {
+            inner: Arc::clone(&inner_storage),
+            log: Arc::clone(&log),
+        });
+
+        // Self at index 1, leader of the proposal at view 1 sits at
+        // some other index; the leader sends us a Proposal we'll vote on.
+        let self_signer = fresh_signer();
+        let leader_signer = fresh_signer();
+        let mut ids: Vec<NodeId> = vec![
+            self_signer.node_id(),
+            leader_signer.node_id(),
+            nid(0xA1),
+            nid(0xA2),
+        ];
+        ids.sort();
+        let vs = ValidatorSet::new(ids);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        let mut node = ConsensusNode::new(
+            self_signer.node_id(),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let signer: Arc<dyn Signer> = Arc::new(self_signer);
+
+        let (inner_bc, _outbound_rx) = make_test_broadcaster();
+        let broadcaster: Arc<dyn Broadcaster> = Arc::new(OrderingBroadcaster {
+            inner: inner_bc,
+            log: Arc::clone(&log),
+        });
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // ── Drive a vote ───────────────────────────────────────────────
+        // Hand-craft a view-1 proposal extending genesis with empty
+        // commands. The leader is whichever validator at index 1 in
+        // the round-robin set; we sign with `leader_signer` and route
+        // through ingress to verify the safety-core path.
+        let leader_id = leader_signer.node_id();
+        let parent = genesis();
+        let mut block = Block {
+            header: BlockHeader {
+                parent_hash: parent.hash(),
+                height: 1,
+                view: 1,
+                proposer: leader_id,
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        // Stamp the post-block commitment (#325 PR C) so the ingress
+        // verifier accepts the proposal. With no commands the value
+        // equals the v1 hash of the genesis-time histories.
+        block.header.validator_history_commitment =
+            crate::consensus::history_commitment::compute_post_block_commitment(
+                &block,
+                &node.validator_history,
+                &node.validator_key_history,
+                node.bls_key_history.as_ref(),
+                &node.chain_id,
+                node.signature_scheme,
+                node.min_v_eff_delay,
+            );
+        let justify = crate::consensus::hotstuff::qc::genesis_qc(&parent, vs.len());
+        let proposal = Proposal { block, justify };
+        let signed_proposal =
+            Signed::sign(proposal, &leader_signer, &node.chain_id).expect("sign proposal");
+        let wire = WireMessage::Proposal(signed_proposal);
+        let payload = postcard::to_stdvec(&wire).expect("encode wire");
+        let qc_verification = crate::consensus::dispatch::QcVerification::Verify {
+            scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+            bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        };
+        let dispatches = ingress_with_qc_verification(
+            leader_id,
+            &payload,
+            &node.validator_history,
+            &node.validator_key_history,
+            &qc_verification,
+            &node.chain_id,
+        )
+        .expect("ingress accepts the leader's proposal");
+        for d in dispatches {
+            node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
+                .await
+                .expect("apply_dispatch");
+        }
+
+        // ── Assert ordering ────────────────────────────────────────────
+        let recorded = log.lock().clone();
+        let persist_idx = recorded
+            .iter()
+            .position(|e| matches!(e, OrderEvent::PersistVotedInView(1)));
+        let broadcast_idx = recorded
+            .iter()
+            .position(|e| matches!(e, OrderEvent::BroadcastVoteFor(1)));
+        let persist_idx =
+            persist_idx.expect("VotedInView{view: 1} must be persisted (storage.batch must run)");
+        let broadcast_idx = broadcast_idx
+            .expect("Vote{view: 1} must be broadcast (Action::Broadcast(Vote) must fire)");
+        assert!(
+            persist_idx < broadcast_idx,
+            "persist must return before broadcast is called: \
+             PersistVotedInView at index {persist_idx}, BroadcastVoteFor at index \
+             {broadcast_idx}, full log = {recorded:?}",
+        );
+    }
+
     /// A self-addressed `RequestBlock` is degenerate — we can't service
     /// a block request from ourselves. It must be dropped locally rather
     /// than leaking to the p2p layer as "SendTo unknown peer SELF".
