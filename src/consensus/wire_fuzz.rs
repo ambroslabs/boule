@@ -317,7 +317,12 @@ struct TestBlockBuilder {
 }
 
 impl BlockBuilder for TestBlockBuilder {
-    fn build(&self, parent: &Block, view: View, _high_qc: &QuorumCertificate) -> Block {
+    fn build(
+        &self,
+        parent: &Block,
+        view: View,
+        _high_qc: &QuorumCertificate,
+    ) -> anyhow::Result<Block> {
         let header = BlockHeader {
             parent_hash: parent.hash(),
             height: parent.header.height + 1,
@@ -327,10 +332,10 @@ impl BlockBuilder for TestBlockBuilder {
             commands_commitment: Block::commands_commitment(&[]),
             validator_history_commitment: [0; 32],
         };
-        Block {
+        Ok(Block {
             header,
             commands: Vec::new(),
-        }
+        })
     }
 }
 
@@ -475,7 +480,9 @@ fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
     let builder = TestBlockBuilder {
         proposer: leader_nid,
     };
-    let block_v1 = builder.build(&replicas.genesis, 1, &genesis_qc);
+    let block_v1 = builder
+        .build(&replicas.genesis, 1, &genesis_qc)
+        .expect("test builder must not fail");
     Signed {
         payload: Proposal {
             block: block_v1,
