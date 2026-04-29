@@ -414,6 +414,58 @@ impl Adversary for ForgedPiggybackAdversary {
     }
 }
 
+// ── Forged-history-commitment leader ─────────────────────────────────────────
+
+/// Adversary 7 (issue #325 PR C acceptance): when this node would
+/// broadcast a Proposal as leader, mutate `block.header.
+/// validator_history_commitment` to a sentinel `[0xDE; 32]` value
+/// before re-signing.
+///
+/// Threat: without proposal-receive validation of the commitment, an
+/// honest follower votes on the proposal, the QC forms, the block
+/// commits, and the chain advances with a block whose stamped
+/// commitment doesn't match the histories that produced it. PR B
+/// catches this at the next restart (rebuild walk diverges); PR C
+/// catches it at receive time and never lets the bogus block reach
+/// the safety core. Honest leaders at the next view recover
+/// liveness.
+///
+/// All non-Proposal outbounds (Vote, NewView, TimeoutVote,
+/// BlockRequest / BlockResponse) pass through unchanged. The
+/// envelope is re-signed with the byzantine's own key so envelope
+/// verification at recipients still passes — the rejection comes
+/// from the new commitment check, not from the signer.
+pub struct ForgedHistoryCommitmentAdversary;
+
+impl Adversary for ForgedHistoryCommitmentAdversary {
+    fn intercept(&self, ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound> {
+        let payload = match &outbound {
+            ProtocolOutbound::Broadcast(p) => p.clone(),
+            _ => return vec![outbound],
+        };
+        let Some(WireMessage::Proposal(signed)) = decode(&payload) else {
+            return vec![outbound];
+        };
+
+        let mut block = signed.payload.block.clone();
+        // Sentinel: a value no honest replica would compute over any
+        // real history triple. The 0xDE byte is shared with the
+        // ForgedPiggybackAdversary's forged-QC sentinel so adversary
+        // outputs are easy to distinguish from honest values when
+        // grepping logs.
+        block.header.validator_history_commitment = [0xDE; 32];
+        let proposal = Proposal {
+            block,
+            justify: signed.payload.justify.clone(),
+        };
+        let signed_b = Signed::sign(proposal, ctx.signer.as_ref(), &ChainId::TEST)
+            .expect("forged-commitment adversary re-signing must not fail");
+        vec![ProtocolOutbound::Broadcast(encode(&WireMessage::Proposal(
+            signed_b,
+        )))]
+    }
+}
+
 // ── Tests / proptest properties ──────────────────────────────────────────────
 
 #[cfg(test)]
@@ -444,6 +496,7 @@ mod tests {
         ForgedQc,
         TimeoutSpammer,
         ForgedPiggyback,
+        ForgedHistoryCommitment,
     }
 
     fn build_adversary(kind: AdvKind) -> Arc<dyn Adversary> {
@@ -458,6 +511,7 @@ mod tests {
             AdvKind::ForgedQc => Arc::new(ForgedQcAdversary::new(2)),
             AdvKind::TimeoutSpammer => Arc::new(TimeoutSpammerAdversary::new(2)),
             AdvKind::ForgedPiggyback => Arc::new(ForgedPiggybackAdversary::new(2)),
+            AdvKind::ForgedHistoryCommitment => Arc::new(ForgedHistoryCommitmentAdversary),
         }
     }
 
@@ -469,6 +523,7 @@ mod tests {
             AdvKind::ForgedQc => "forged-qc",
             AdvKind::TimeoutSpammer => "timeout-spammer",
             AdvKind::ForgedPiggyback => "forged-piggyback",
+            AdvKind::ForgedHistoryCommitment => "forged-history-commitment",
         }
     }
 
@@ -671,15 +726,39 @@ mod tests {
             })?;
         }
 
-        /// **Mixed adversary** — randomly pick one of the six
+        /// **Forged history-commitment leader** (issue #325 PR C) —
+        /// when this byzantine is leader, every Proposal it
+        /// broadcasts has its `block.header.validator_history_commitment`
+        /// rewritten to a sentinel `[0xDE; 32]` value before being
+        /// re-signed. Without proposal-receive validation in
+        /// `dispatch::ingress`, honest followers vote on the
+        /// proposal, the QC forms, and the chain commits a block
+        /// whose stamped commitment doesn't match the histories
+        /// that produced it. With the verifier wired in (PR C),
+        /// every forged-commitment proposal is rejected with
+        /// `IngressError::InvalidValidatorHistoryCommitment` before
+        /// reaching the safety core; honest leaders at the next
+        /// view recover liveness. Safety + the honest-floor liveness
+        /// invariant hold under the same `run_one_property`
+        /// harness.
+        #[test]
+        fn proptest_forged_history_commitment_preserves_safety_and_liveness(
+            victim in 0usize..4,
+        ) {
+            run_paused(|| async move {
+                run_one_property(victim, AdvKind::ForgedHistoryCommitment).await
+            })?;
+        }
+
+        /// **Mixed adversary** — randomly pick one of the seven
         /// adversary kinds for the single Byzantine slot. Verifies
-        /// that property-1..6's invariants hold across the union of
+        /// that property-1..7's invariants hold across the union of
         /// adversaries (no implicit interaction breaks safety or
         /// liveness when the adversary is selected uniformly).
         #[test]
         fn proptest_mixed_adversary_preserves_safety_and_liveness(
             victim in 0usize..4,
-            kind_selector in 0usize..6,
+            kind_selector in 0usize..7,
         ) {
             run_paused(|| async move {
                 let kind = match kind_selector {
@@ -688,7 +767,8 @@ mod tests {
                     2 => AdvKind::StaleReplayer,
                     3 => AdvKind::ForgedQc,
                     4 => AdvKind::TimeoutSpammer,
-                    _ => AdvKind::ForgedPiggyback,
+                    5 => AdvKind::ForgedPiggyback,
+                    _ => AdvKind::ForgedHistoryCommitment,
                 };
                 run_one_property(victim, kind).await
             })?;

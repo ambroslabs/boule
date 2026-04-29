@@ -1344,21 +1344,13 @@ impl ConsensusNode {
         let mut rebuilt_bls = self.bls_key_history.as_ref().map(genesis_only_bls_seed);
 
         for block in &chain {
-            let claimed = block.header.validator_history_commitment;
-            let actual =
-                validator_history_commitment_v1(&rebuilt_set, &rebuilt_key, rebuilt_bls.as_ref());
-            if claimed != actual {
-                anyhow::bail!(
-                    "validator_history_commitment mismatch at block height={} view={} hash={}: \
-                     block claims {} but rebuild from chain produces {} — persisted history \
-                     blob may be tampered or rolled back (audit #325/7-F2)",
-                    block.header.height,
-                    block.header.view,
-                    hex::encode(block.hash()),
-                    hex::encode(claimed),
-                    hex::encode(actual),
-                );
-            }
+            // #325 PR C semantics: each block's stamped commitment is
+            // the **post-block** v1 hash — the histories *after*
+            // applying this block's reconfig/rotation commands. So
+            // apply first, then hash, then compare. Genesis is a
+            // no-op for the apply step (zero commands), and its
+            // stamped commitment equals the genesis-seed hash, so
+            // the comparison still holds at N=0.
             apply_reconfig_commands_to_set_history(
                 block,
                 &mut rebuilt_set,
@@ -1374,6 +1366,21 @@ impl ConsensusNode {
                 &self.chain_id,
                 self.signature_scheme,
             );
+            let claimed = block.header.validator_history_commitment;
+            let actual =
+                validator_history_commitment_v1(&rebuilt_set, &rebuilt_key, rebuilt_bls.as_ref());
+            if claimed != actual {
+                anyhow::bail!(
+                    "validator_history_commitment mismatch at block height={} view={} hash={}: \
+                     block claims {} but rebuild from chain produces {} — persisted history \
+                     blob may be tampered or rolled back (audit #325/7-F2)",
+                    block.header.height,
+                    block.header.view,
+                    hex::encode(block.hash()),
+                    hex::encode(claimed),
+                    hex::encode(actual),
+                );
+            }
         }
 
         // End-of-walk equality: the loaded blobs must match the
@@ -1710,6 +1717,7 @@ impl ConsensusNode {
                             let qc_verification = dispatch::QcVerification::Verify {
                                 scheme: self.signature_scheme,
                                 bls_key_history: self.bls_key_history.as_ref(),
+                                min_v_eff_delay: self.min_v_eff_delay,
                             };
                             match dispatch::ingress_with_qc_verification(
                                 from,
@@ -2334,20 +2342,33 @@ impl ConsensusNode {
                         msg = msg_kind(&msg),
                         "outbound_broadcast",
                     );
-                    // #325 PR A: stamp the validator-history commitment
-                    // into outgoing proposals before the envelope is
-                    // signed. The block builder leaves the field at
-                    // [0; 32]; here we replace it with the v1 hash over
-                    // our current `(validator_history, key_history,
-                    // bls_key_history?)`. PR A only populates the field —
-                    // recovery-time and proposal-receive validation are
-                    // wired by follow-up PRs in the #325 stack.
+                    // #325 PR A/C: stamp the validator-history
+                    // commitment into outgoing proposals before the
+                    // envelope is signed. The block builder leaves the
+                    // field at [0; 32]; here we replace it with the
+                    // v1 hash over the **post-block** histories: fork
+                    // our current `(validator_history,
+                    // validator_key_history, bls_key_history?)`, apply
+                    // this block's reconfig/rotation commands to the
+                    // fork, and hash the result. Post-block hashing
+                    // (PR C) makes the commitment a deterministic
+                    // function of the chain content rather than the
+                    // producer's commit position, so a follower at a
+                    // less-advanced commit position can still verify
+                    // the leader's stamp by running the same fork on
+                    // its own histories — see
+                    // [`crate::consensus::history_commitment::compute_post_block_commitment`]
+                    // and the proposal-receive verifier in `dispatch`.
                     if let crate::consensus::hotstuff::ConsensusMsg::Proposal(ref mut p) = msg {
                         p.block.header.validator_history_commitment =
-                            crate::consensus::history_commitment::validator_history_commitment_v1(
+                            crate::consensus::history_commitment::compute_post_block_commitment(
+                                &p.block,
                                 &self.validator_history,
                                 &self.validator_key_history,
                                 self.bls_key_history.as_ref(),
+                                &self.chain_id,
+                                self.signature_scheme,
+                                self.min_v_eff_delay,
                             );
                     }
                     let bls_signer = self.bls_signer.as_deref();
@@ -6958,6 +6979,7 @@ mod tests {
         let qc_verification = crate::consensus::dispatch::QcVerification::Verify {
             scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         };
         let dispatches = crate::consensus::dispatch::ingress_with_qc_verification(
             byzantine.node_id(),
@@ -8235,7 +8257,9 @@ mod tests {
 
     /// Build a genesis block whose `validator_history_commitment` is
     /// the real v1 hash over the genesis-time histories — what the
-    /// production `build_genesis` does (#325 PR B).
+    /// production `build_genesis` does (#325 PR B). For genesis the
+    /// post-block hash (#325 PR C) equals the pre-block hash because
+    /// genesis has no commands to apply.
     fn genesis_with_real_commitment(vs: &ValidatorSet) -> Block {
         let set_hist = ValidatorSetHistory::from_genesis(vs.clone());
         let key_hist = ValidatorKeyHistory::new(vs.iter().copied());
@@ -8243,6 +8267,25 @@ mod tests {
             &set_hist, &key_hist, None,
         );
         Block::genesis([0u8; 32], commitment)
+    }
+
+    /// Patch `block.header.validator_history_commitment` so it equals
+    /// the v1 hash of the post-block histories, computed by forking
+    /// the node's current `(set, key, bls?)` triple and applying the
+    /// block's commands (#325 PR C). Mirrors what the leader-side
+    /// stamp in `apply_safety_actions` does at proposal time, and
+    /// what the proposal-receive verifier in `dispatch` checks.
+    fn stamp_post_block_commitment(block: &mut Block, node: &ConsensusNode) {
+        block.header.validator_history_commitment =
+            crate::consensus::history_commitment::compute_post_block_commitment(
+                block,
+                &node.validator_history,
+                &node.validator_key_history,
+                node.bls_key_history.as_ref(),
+                &node.chain_id,
+                node.signature_scheme,
+                node.min_v_eff_delay,
+            );
     }
 
     /// Like [`block_with_reconfig`] but takes an explicit genesis hash
@@ -8290,15 +8333,9 @@ mod tests {
             Arc::clone(&storage),
             Arc::new(MemoryWal::new()),
         );
-        // Block 1 carries a reconfig — its claimed commitment is the
-        // pre-block hash (genesis-time triple) since the leader
-        // stamps before the block's commands apply.
-        let pre_block_commitment =
-            crate::consensus::history_commitment::validator_history_commitment_v1(
-                &node.validator_history,
-                &node.validator_key_history,
-                None,
-            );
+        // Block 1 carries a reconfig. Stamp the post-block commitment
+        // (#325 PR C) so the recovery walk's apply-then-hash check
+        // matches.
         let v_eff = MIN_V_EFF_DELAY + 5;
         let cmd = ReconfigCommand {
             adds: vec![ValidatorEntry {
@@ -8309,8 +8346,8 @@ mod tests {
             removes: vec![],
             v_eff,
         };
-        let block1 =
-            block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, pre_block_commitment);
+        let mut block1 = block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, [0u8; 32]);
+        stamp_post_block_commitment(&mut block1, &node);
         node.apply_commit(block1);
         // Sanity: the reconfig must have applied so the recovered
         // history has 2 boundaries.
@@ -8355,12 +8392,6 @@ mod tests {
             Arc::clone(&storage),
             Arc::new(MemoryWal::new()),
         );
-        let pre_block_commitment =
-            crate::consensus::history_commitment::validator_history_commitment_v1(
-                &node.validator_history,
-                &node.validator_key_history,
-                None,
-            );
         let v_eff = MIN_V_EFF_DELAY + 5;
         let cmd = ReconfigCommand {
             adds: vec![ValidatorEntry {
@@ -8371,8 +8402,8 @@ mod tests {
             removes: vec![],
             v_eff,
         };
-        let block1 =
-            block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, pre_block_commitment);
+        let mut block1 = block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, [0u8; 32]);
+        stamp_post_block_commitment(&mut block1, &node);
         node.apply_commit(block1);
         drop(node);
 
