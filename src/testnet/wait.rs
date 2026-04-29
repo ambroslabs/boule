@@ -181,8 +181,18 @@ async fn all_healthy_check(state: &State, within: u64) -> anyhow::Result<bool> {
 }
 
 /// `--node X --catch-up-to-cluster --tolerance T`: the named node's
-/// `last_committed_height` is within `tolerance` of the maximum across
-/// the rest of the live cluster.
+/// `last_committed_height` is within `tolerance` of the median
+/// `last_committed_height` across the rest of the live cluster.
+///
+/// Comparing against the median rather than the max is what makes the
+/// predicate robust to bursty commits. The 3-chain commit rule means a
+/// single new QC can extend `last_committed_height` by several blocks
+/// at once, and proposals reach replicas at slightly different times,
+/// so `max(others) - mine` routinely jumps to 5+ for a single sample
+/// even on a healthy cluster (issue #396). The median tracks the
+/// cluster body, which is what "X has caught up" actually wants to
+/// assert: not "X is at the leader's instantaneous tip" (the leader is
+/// always ahead by definition) but "X is in the cluster body".
 pub async fn node_caught_up(
     state: &State,
     node: &NodeLayout,
@@ -198,30 +208,43 @@ pub async fn node_caught_up(
             Some(s) => s.last_committed_height,
             None => return Ok(false),
         };
-        let mut others_max = 0u64;
-        let mut saw_other = false;
+        let mut others_heights: Vec<u64> = Vec::new();
         for n in state.nodes.iter().filter(|n| n.index != node.index) {
             if super::lifecycle::pid_alive(n).is_none() {
                 continue;
             }
-            saw_other = true;
             let api = match n.api_addr {
                 Some(a) => a,
                 None => return Ok(false),
             };
             if let Some(s) = admin::maybe_consensus_status(api).await? {
-                others_max = others_max.max(s.last_committed_height);
+                others_heights.push(s.last_committed_height);
             } else {
                 return Ok(false);
             }
         }
-        if !saw_other {
-            // Single-node cluster — vacuously caught up.
-            return Ok(true);
-        }
-        Ok(mine + tolerance >= others_max)
+        Ok(caught_up_predicate(mine, &mut others_heights, tolerance))
     })
     .await
+}
+
+/// Predicate for [`node_caught_up`], factored out for testability.
+///
+/// Returns `true` if `mine` is within `tolerance` of the median of
+/// `others`. Mutates `others` (sorts in place) — callers don't need it
+/// preserved. With an empty `others` (single-node cluster) the result
+/// is vacuously `true`.
+///
+/// The median is the lower of the two middle elements on an even-sized
+/// sample. With three others — the typical 4-node-cluster case for
+/// this helper — that's the unambiguous middle replica.
+fn caught_up_predicate(mine: u64, others: &mut [u64], tolerance: u64) -> bool {
+    if others.is_empty() {
+        return true;
+    }
+    others.sort_unstable();
+    let target = others[(others.len() - 1) / 2];
+    mine + tolerance >= target
 }
 
 /// `--quiescent --for SECS`: every live node reports its
@@ -281,4 +304,86 @@ fn live_nodes(state: &State) -> Vec<NodeLayout> {
         .filter(|n| super::lifecycle::pid_alive(n).is_some())
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::caught_up_predicate;
+
+    fn caught_up(mine: u64, mut others: Vec<u64>, tolerance: u64) -> bool {
+        caught_up_predicate(mine, &mut others, tolerance)
+    }
+
+    #[test]
+    fn empty_others_is_vacuously_caught_up() {
+        // Single-node cluster: nothing to lag behind.
+        assert!(caught_up(42, vec![], 0));
+        assert!(caught_up(0, vec![], 0));
+    }
+
+    #[test]
+    fn issue_396_a2_post_restart_passes_with_median() {
+        // Heights captured in #396: node1=1381 (laggard survivor),
+        // node2=1382 (restarted, queried), node3=1384, node4=1387
+        // (leader). With tolerance=2, max(others)=1387 fails
+        // (1382+2=1384 < 1387). Median(1381, 1384, 1387) = 1384,
+        // 1382+2 >= 1384 — passes.
+        assert!(caught_up(1382, vec![1381, 1384, 1387], 2));
+    }
+
+    #[test]
+    fn issue_396_b2_seed1_post_restart_passes_with_median() {
+        // Heights captured in #396 B2 seed=1: node1=1365, node2=1366
+        // (queried), node3=1368, node4=1370.
+        assert!(caught_up(1366, vec![1365, 1368, 1370], 2));
+    }
+
+    #[test]
+    fn permanent_lag_still_fails() {
+        // Restored node permanently 5 behind a 4-node cluster: median
+        // of survivors is around the cluster tip, mine + tolerance
+        // doesn't reach it.
+        assert!(!caught_up(95, vec![100, 101, 101], 2));
+        // And not even with tolerance up to 5.
+        assert!(!caught_up(95, vec![100, 101, 101], 5));
+        // tolerance=6 finally accepts it (median=101).
+        assert!(caught_up(95, vec![100, 101, 101], 6));
+    }
+
+    #[test]
+    fn ahead_of_cluster_is_caught_up() {
+        // Queried node leading the others: predicate trivially holds
+        // because the gap is non-positive.
+        assert!(caught_up(110, vec![100, 100, 100], 0));
+    }
+
+    #[test]
+    fn outlier_leader_does_not_drag_median() {
+        // One leader far ahead, two replicas at the body: median picks
+        // the body element, so a node sitting at the body is caught
+        // up even with tolerance=0.
+        assert!(caught_up(100, vec![100, 100, 200], 0));
+    }
+
+    #[test]
+    fn floor_median_on_even_count() {
+        // Six others evenly split: floor median picks index 2 of
+        // sorted [10, 10, 10, 11, 11, 11] -> 10. Queried at 10 is
+        // caught up at tolerance=0; at 9 it isn't.
+        assert!(caught_up(10, vec![11, 10, 11, 10, 11, 10], 0));
+        assert!(!caught_up(9, vec![11, 10, 11, 10, 11, 10], 0));
+        assert!(caught_up(9, vec![11, 10, 11, 10, 11, 10], 1));
+    }
+
+    #[test]
+    fn two_others_picks_lower() {
+        // After a second kill mid-wait, others_heights might be just
+        // two. Floor median picks the lower one — least surprising
+        // because that's how the predicate was already lenient under
+        // partial cluster outages.
+        assert!(caught_up(10, vec![10, 12], 0));
+        assert!(caught_up(10, vec![12, 10], 0));
+        // Genuinely 4 behind both is not caught up.
+        assert!(!caught_up(8, vec![12, 12], 2));
+    }
 }

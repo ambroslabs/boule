@@ -714,10 +714,17 @@ sequence of `kill` / `up` / `wait` calls:
 The `wait --catch-up-to-cluster` predicate is the answer to "how
 long do I sleep after a restart?" — it polls
 `last_committed_height` on the restarted node and the rest of the
-live cluster, and returns when the gap closes within `--tolerance`.
-Block-sync walks back one parent per pacemaker tick, so the wait time
-is still bounded by the gap (issue #185 tracks the planned bulk-range
-RPC + dedicated retry timer), but the driver no longer
+live cluster, and returns when the named node is within `--tolerance`
+of the *median* survivor height. Comparing against the median (rather
+than the leader's instantaneous tip) is what keeps the predicate
+robust to bursty commits: a single new QC can extend
+`last_committed_height` by several blocks at once under the 3-chain
+commit rule, so `max(others) − mine` routinely jumps to 5+ for a
+single sample even on a healthy cluster (issue #396). The median
+tracks the cluster body, which is what "X has caught up" really
+means. Block-sync walks back one parent per pacemaker tick, so the
+wait time is still bounded by the gap (issue #185 tracks the planned
+bulk-range RPC + dedicated retry timer), but the driver no longer
 under-or-overshoots a fixed sleep.
 
 The block-sync round-trip is visible at `RUST_LOG=info`; `telemetry`
