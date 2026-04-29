@@ -1641,6 +1641,7 @@ mod tests {
     use crate::consensus::validator_set::ValidatorSet;
     use crate::crypto::signed::Signer;
     use crate::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
+    use crate::replication::block::Block;
 
     /// Bare routing harness: spawns only the per-node routing tasks and
     /// hands the caller the outbound sender + inbound receiver for each
@@ -1836,6 +1837,68 @@ mod tests {
         assert!(
             same_block_count >= 3,
             "expected >= 3 nodes to agree on the first BLS-committed block hash, got {same_block_count}",
+        );
+    }
+
+    /// Stronger BLS acceptance (#354 step 3): the cluster reaches a
+    /// *three-chain* commit — three blocks committed at consecutive
+    /// heights by ≥ 3 nodes. This is the load-bearing path the BLS
+    /// QC bandwidth/CPU savings are supposed to deliver, and the only
+    /// end-to-end signal that the dispatch verifier accepts real
+    /// (non-genesis) BLS QCs at every committed view in the chain.
+    #[tokio::test]
+    async fn four_honest_bls_nodes_reach_three_chain_commit() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn_bls(4, Duration::from_millis(50)).await;
+
+        // Run long enough for three consecutive commits per node.
+        // Each block requires roughly 5 yield rounds on the happy
+        // path; budget generously to absorb scheduling jitter.
+        for _ in 0..2000 {
+            yield_now().await;
+            let heights = cluster.peek_commit_heights();
+            if heights.iter().filter(|&&h| h >= 3).count() >= 3 {
+                break;
+            }
+        }
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // ≥ 3 nodes must each have ≥ 3 commits.
+        let nodes_with_three_commits = committed.iter().filter(|c| c.len() >= 3).count();
+        assert!(
+            nodes_with_three_commits >= 3,
+            "expected ≥ 3 nodes to reach a 3-chain commit on a BLS chain; got {nodes_with_three_commits} (per-node lengths: {:?})",
+            committed.iter().map(|c| c.len()).collect::<Vec<_>>(),
+        );
+
+        // The first 3 committed blocks must agree across the ≥ 3 nodes
+        // that reached three-chain depth — i.e. the dispatch-layer BLS
+        // verifier accepted real BLS QCs at every committed view along
+        // the chain. Heights must also be strictly consecutive.
+        let three_chain_nodes: Vec<&Vec<Block>> =
+            committed.iter().filter(|c| c.len() >= 3).collect();
+        let reference: Vec<_> = three_chain_nodes[0]
+            .iter()
+            .take(3)
+            .map(|b| (b.header.height, b.hash()))
+            .collect();
+        for (i, node_commits) in three_chain_nodes.iter().enumerate().skip(1) {
+            let theirs: Vec<_> = node_commits
+                .iter()
+                .take(3)
+                .map(|b| (b.header.height, b.hash()))
+                .collect();
+            assert_eq!(
+                theirs, reference,
+                "three-chain prefix diverges between three-chain node 0 and three-chain node {i}",
+            );
+        }
+        assert!(
+            reference.windows(2).all(|w| w[1].0 == w[0].0 + 1),
+            "three-chain heights must be strictly consecutive: {reference:?}",
         );
     }
 
