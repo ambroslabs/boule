@@ -107,6 +107,17 @@ jobs:
         if: ${{ inputs.open_pr == 'true' }}
         uses: peter-evans/create-pull-request@v6
         with:
+          # Prefer a fine-grained PAT in `BENCH_PR_TOKEN` so PR
+          # creation works even when the repo's
+          # "Settings → Actions → General → Allow GitHub Actions to
+          # create and approve pull requests" setting is disabled
+          # (the default). Falls back to `GITHUB_TOKEN`, which only
+          # succeeds with that setting enabled. With neither path
+          # working, this step errors but the branch
+          # `bench/qc-scheme-<run_id>` is already pushed — the
+          # operator can open the PR by hand against it. See #365 for
+          # the operator setup instructions.
+          token: ${{ secrets.BENCH_PR_TOKEN || secrets.GITHUB_TOKEN }}
           branch: bench/qc-scheme-${{ github.run_id }}
           commit-message: "docs: refresh QC scheme bandwidth numbers"
           title: "docs: refresh QC scheme bandwidth numbers"
