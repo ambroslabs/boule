@@ -716,12 +716,26 @@ impl HotStuffCore {
     /// branches aren't in place yet return an empty vector (a harmless
     /// safe-by-default).
     pub fn step(&mut self, event: Event) -> Vec<Action> {
-        match event {
+        let actions = match event {
             Event::ProposalReceived(verified) => self.on_proposal_received(verified.into_inner()),
             Event::VoteReceived(variant) => self.on_vote_received(variant),
             Event::NewViewReceived(verified) => self.on_new_view_received(verified.into_inner()),
             Event::PacemakerAdvance(v) => self.on_pacemaker_advance(v),
-        }
+        };
+
+        // Audit invariant I4 (lock durable before unlock window):
+        // within a single `step` output, `Persist(StateUpdate::Locked)`
+        // must precede every `Broadcast(ConsensusMsg::Vote)`. The
+        // integration layer's persist-before-send discipline flushes
+        // every preceding `Persist(...)` before each non-`Persist`
+        // action; if a `Vote` broadcast appeared before the lock's
+        // persist, a crash in that window would leave disk with a
+        // stale lock and an advanced `last_voted_view` — the canonical
+        // Tendermint amnesia hole audit finding 4-1 (#405) closes.
+        #[cfg(debug_assertions)]
+        debug_assert_lock_durable_before_vote(&actions);
+
+        actions
     }
 
     /// Handle an inbound [`Proposal`]. Branches land in separate
@@ -771,7 +785,15 @@ impl HotStuffCore {
         self.state.insert_pending(signed.payload.block.clone());
 
         let mut actions = Vec::new();
-        if safe_to_vote(&signed.payload, &self.state) {
+        // The vote, if `safe_to_vote` fires, is built here but its
+        // `Action::Broadcast(...)` is deferred until *after* B4's lock
+        // promotion has been pushed onto `actions`. The integration
+        // layer's persist-before-send discipline flushes any
+        // `Persist(...)` items that precede a non-`Persist` action; a
+        // crash between vote-broadcast and lock-persist would otherwise
+        // leave the on-disk lock stale while `last_voted_view` advanced —
+        // the canonical Tendermint amnesia hole (audit finding 4-1, #405).
+        let vote_to_broadcast = if safe_to_vote(&signed.payload, &self.state) {
             let view = signed.payload.block.header.view;
             let block_hash = signed.payload.block.hash();
 
@@ -794,24 +816,10 @@ impl HotStuffCore {
                 actions.push(Action::Persist(StateUpdate::HighQc(qc)));
             }
 
-            // Broadcast the vote so every replica — not just the
-            // next-view leader — can aggregate it. This is what
-            // gives chained HotStuff f=1 liveness under round-robin
-            // leadership: if the next-view leader is down, any other
-            // live replica that gathers quorum can still form the QC
-            // and propagate it (via its NewView at the next pacemaker
-            // advance, or as `justify` when it becomes leader later).
-            // Historically the paper's Algorithm 4 addresses the vote
-            // specifically to the next leader for bandwidth, but a
-            // deterministic round-robin under a single crash means
-            // every fourth view's vote-target is permanently dead and
-            // no QC would ever form for those views — starving the
-            // 3-chain commit rule forever (#124).
-            actions.push(Action::Broadcast(ConsensusMsg::Vote(Vote {
-                view,
-                block_hash,
-            })));
-        }
+            Some(Vote { view, block_hash })
+        } else {
+            None
+        };
 
         // B4: Two-Chain lock promotion.
         //
@@ -833,6 +841,11 @@ impl HotStuffCore {
         // let a Byzantine proposer wedge us with a short chain
         // claiming a huge view. See
         // `docs/consensus/hotstuff-notes.md#the-chain-rules`.
+        //
+        // Emission order: this `Persist(Locked)` is pushed *before*
+        // B3's deferred `Broadcast(Vote)` so the integration layer
+        // flushes the new lock to disk before the vote reaches the
+        // wire — see the deferral comment on `vote_to_broadcast`.
         let two_chain_candidate: Option<Locked> = self
             .state
             .pending_blocks
@@ -858,6 +871,23 @@ impl HotStuffCore {
                 self.state.locked = Some(candidate);
                 actions.push(Action::Persist(StateUpdate::Locked(candidate)));
             }
+        }
+
+        // B3 (deferred): broadcast the vote so every replica — not
+        // just the next-view leader — can aggregate it. This is what
+        // gives chained HotStuff f=1 liveness under round-robin
+        // leadership: if the next-view leader is down, any other
+        // live replica that gathers quorum can still form the QC
+        // and propagate it (via its NewView at the next pacemaker
+        // advance, or as `justify` when it becomes leader later).
+        // Historically the paper's Algorithm 4 addresses the vote
+        // specifically to the next leader for bandwidth, but a
+        // deterministic round-robin under a single crash means
+        // every fourth view's vote-target is permanently dead and
+        // no QC would ever form for those views — starving the
+        // 3-chain commit rule forever (#124).
+        if let Some(vote) = vote_to_broadcast {
+            actions.push(Action::Broadcast(ConsensusMsg::Vote(vote)));
         }
 
         // B5: Three-Chain commit.
@@ -1461,6 +1491,43 @@ impl HotStuffCore {
                 size_after = self.parked_proposals.len(),
                 "consensus_cache_evicted",
             );
+        }
+    }
+}
+
+/// Audit invariant I4: within a single `step()` output,
+/// `Persist(StateUpdate::Locked)` precedes every
+/// `Broadcast(ConsensusMsg::Vote)`. The integration layer
+/// (`apply_safety_actions` in `consensus::node`) flushes every preceding
+/// `Persist(...)` before each non-`Persist` action; pinning this order
+/// here is the safety-core half of the persist-before-send contract for
+/// the lock state. Violation would re-open the Tendermint amnesia hole
+/// audit finding 4-1 (#405) closed: a crash between vote-broadcast and
+/// lock-persist would leave disk with a stale lock and an advanced
+/// `last_voted_view`.
+///
+/// Debug-only — release builds skip the walk to keep `step()` allocation-
+/// free in production.
+#[cfg(debug_assertions)]
+fn debug_assert_lock_durable_before_vote(actions: &[Action]) {
+    let mut seen_vote_at: Option<usize> = None;
+    for (i, action) in actions.iter().enumerate() {
+        match action {
+            Action::Broadcast(ConsensusMsg::Vote(_)) => {
+                seen_vote_at.get_or_insert(i);
+            }
+            Action::Persist(StateUpdate::Locked(_)) => {
+                debug_assert!(
+                    seen_vote_at.is_none(),
+                    "audit invariant I4 violated: Persist(StateUpdate::Locked) at index {i} \
+                     emitted after Broadcast(Vote) at index {} in the same step output \
+                     ({} actions). The lock would persist after the vote leaves the wire, \
+                     re-opening the amnesia window of audit finding 4-1 (#405): {actions:?}",
+                    seen_vote_at.unwrap(),
+                    actions.len(),
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -2140,18 +2207,24 @@ mod tests {
             height: 1,
             block_hash: block1.hash(),
         };
-        // Emission order: B2/B3 (VotedInView, HighQc, Broadcast(Vote)),
-        // then B4 (Persist(Locked)), then B5 (Commit(genesis)).
+        // Emission order: B2/B3 vote-prep persists (VotedInView,
+        // HighQc), then B4 (Persist(Locked)), then B3's deferred
+        // Broadcast(Vote), then B5 (Commit(genesis)). The Locked
+        // persist precedes the Vote broadcast so the integration
+        // layer's persist-before-send discipline flushes the new
+        // lock to disk before the vote leaves the wire — the
+        // Tendermint amnesia hole closed by audit finding 4-1
+        // (#405).
         assert_eq!(
             actions,
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 3 }),
                 Action::Persist(StateUpdate::HighQc(justify)),
+                Action::Persist(StateUpdate::Locked(expected_lock)),
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
                     view: 3,
                     block_hash: block3_hash,
                 })),
-                Action::Persist(StateUpdate::Locked(expected_lock)),
                 Action::Commit(genesis.clone()),
             ],
             "B2/B3/B4/B5 emissions in order",
@@ -2162,6 +2235,53 @@ mod tests {
         // Above the commit height survives.
         assert!(core.state().pending_blocks.contains_key(&block1.hash()));
         assert!(core.state().pending_blocks.contains_key(&block2.hash()));
+    }
+
+    #[test]
+    fn lock_persist_precedes_vote_broadcast_for_same_proposal() {
+        // Audit invariant I4 / audit finding 4-1 (#405): when a single
+        // `step()` produces both `Persist(StateUpdate::Locked)` (B4) and
+        // `Broadcast(ConsensusMsg::Vote)` (B3) for the same proposal,
+        // the Locked persist must come first. The integration layer
+        // flushes every preceding `Persist` before each non-`Persist`
+        // action, so this ordering is what guarantees the lock hits
+        // disk before the vote leaves the wire — the Tendermint
+        // amnesia hole closes only if both fragments hold.
+        //
+        // The shape mirrors `two_chain_promotes_lock_to_grandparent`,
+        // but the assertion is structural rather than positional so
+        // it survives unrelated additions to the action vector.
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let prefix = chain_from_genesis(&genesis, &[1, 2], nid(2));
+        let block1 = prefix[0].clone();
+        let block2 = prefix[1].clone();
+        core.state.insert_pending(block1.clone());
+        core.state.insert_pending(block2.clone());
+
+        let full_chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
+        let block3 = full_chain[2].clone();
+        let justify = dummy_qc(2, block2.hash());
+        let signed = signed_proposal(block3, justify, nid(2));
+
+        let actions = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed),
+        ));
+
+        let lock_idx = actions
+            .iter()
+            .position(|a| matches!(a, Action::Persist(StateUpdate::Locked(_))))
+            .expect("two-chain promotion must emit Persist(Locked)");
+        let vote_idx = actions
+            .iter()
+            .position(|a| matches!(a, Action::Broadcast(ConsensusMsg::Vote(_))))
+            .expect("safe-to-vote must emit Broadcast(Vote)");
+        assert!(
+            lock_idx < vote_idx,
+            "audit invariant I4 violated: Persist(Locked) at index {lock_idx} must precede \
+             Broadcast(Vote) at index {vote_idx}; otherwise a crash between vote-broadcast \
+             and lock-persist would leave disk amnesiac. actions = {actions:?}",
+        );
     }
 
     #[test]
@@ -2391,6 +2511,10 @@ mod tests {
         // baseline is 0, so candidate h=1 wins. Persist(Locked(v1)).
         // B5 fires: walk v2 → v1 → genesis with consecutive views
         // 2,1,0. Commit genesis; prune height ≤ 0.
+        //
+        // Persist(Locked) lands before the deferred Broadcast(Vote)
+        // — see the deferral comment in `on_proposal_received` and
+        // audit finding 4-1 (#405).
         let expected_lock = Locked {
             view: 1,
             height: 1,
@@ -2401,11 +2525,11 @@ mod tests {
             vec![
                 Action::Persist(StateUpdate::VotedInView { view: 3 }),
                 Action::Persist(StateUpdate::HighQc(justify_v2)),
+                Action::Persist(StateUpdate::Locked(expected_lock)),
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
                     view: 3,
                     block_hash: block_v3.hash(),
                 })),
-                Action::Persist(StateUpdate::Locked(expected_lock)),
                 Action::Commit(genesis.clone()),
             ],
             "third proposal: vote + high_qc + lock promote + Commit(genesis)",
