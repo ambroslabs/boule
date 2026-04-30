@@ -2014,11 +2014,15 @@ impl ConsensusNode {
                             }
                             // Verify QC aggregates at ingress per the chain's scheme
                             // (#332). Closes the Byzantine-leader-ships-bogus-QC
-                            // vector for both Ed25519 and BLS chains.
+                            // vector for both Ed25519 and BLS chains. The
+                            // `genesis_hash` is threaded so the verifier can
+                            // reject view-0 QCs over an attacker-chosen block
+                            // hash (#418, audit finding 7-4).
                             let qc_verification = dispatch::QcVerification::Verify {
                                 scheme: self.signature_scheme,
                                 bls_key_history: self.bls_key_history.as_ref(),
                                 min_v_eff_delay: self.min_v_eff_delay,
+                                genesis_hash: self.core.state().genesis_hash,
                             };
                             match dispatch::ingress_with_qc_verification(
                                 from,
@@ -9152,6 +9156,7 @@ mod tests {
             scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
             min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+            genesis_hash: node.core.state().genesis_hash,
         };
         let dispatches = crate::consensus::dispatch::ingress_with_qc_verification(
             byzantine.node_id(),
@@ -10035,6 +10040,7 @@ mod tests {
             scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
             min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+            genesis_hash: node.core.state().genesis_hash,
         };
         let dispatches = ingress_with_qc_verification(
             leader_id,

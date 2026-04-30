@@ -1554,6 +1554,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let dispatches = ingress_with_qc_verification(
         leader.node_id(),
@@ -1614,6 +1615,7 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let err = ingress_with_qc_verification(
         leader.node_id(),
@@ -1674,6 +1676,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let err = ingress_with_qc_verification(
         leader.node_id(),
@@ -1717,6 +1720,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let err = ingress_with_qc_verification(
         messenger.node_id(),
@@ -1764,6 +1768,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let dispatches = ingress_with_qc_verification(
         voter.node_id(),
@@ -1825,6 +1830,7 @@ fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback()
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let dispatches = ingress_with_qc_verification(
         voter.node_id(),
@@ -1889,6 +1895,7 @@ fn ingress_with_verify_drops_malformed_high_qc_in_timeout_vote_piggyback() {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let dispatches = ingress_with_qc_verification(
         voter.node_id(),
@@ -1935,6 +1942,7 @@ fn ingress_with_verify_emits_high_qc_trusted_for_timeout_vote_with_no_piggyback(
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let dispatches = ingress_with_qc_verification(
         voter.node_id(),
@@ -1992,6 +2000,7 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let dispatches = ingress_with_qc_verification(
         signer.node_id(),
@@ -2003,6 +2012,68 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
     )
     .expect("genesis QC (no signers) must pass aggregate verification");
     assert_eq!(dispatches.len(), 3);
+}
+
+/// Audit finding 7-4 (issue #418): a Byzantine peer ships a Proposal
+/// whose `justify` is a "genesis-shaped" QC — `view == 0`, no signers
+/// — but over an attacker-chosen `block_hash` that is not the real
+/// genesis. The genesis-skip in `verify_qc_if_requested` would have
+/// otherwise let it past aggregate verification (placeholder sigs
+/// can't be verified anyway). Ingress must reject the malformed
+/// envelope at the boundary rather than relying on the safety core's
+/// parent-walk to refuse to extend the chain downstream.
+#[test]
+fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
+    let signer = fresh_signer();
+    let vs = make_vs_with_signers(&[&signer]);
+    let history = ValidatorSetHistory::from_genesis(vs.clone());
+    let key_history = key_history_from_set(&vs);
+
+    // Forged "genesis QC": view 0 with no signers, but the block_hash
+    // is an attacker-chosen value, not the real genesis hash. This
+    // shape passes the `view == 0 || signer_count() == 0` skip and
+    // would slip through without the new check.
+    let forged_block_hash = [0xDE; 32];
+    assert_ne!(
+        forged_block_hash,
+        genesis().hash(),
+        "test fixture is meaningful only when the forged hash is not the real genesis",
+    );
+    let forged_justify = QuorumCertificate::new(0, forged_block_hash, vs.len());
+
+    let proposal = Proposal {
+        block: genesis(),
+        justify: forged_justify,
+    };
+    let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
+    let wire = WireMessage::Proposal(signed);
+    let bytes = postcard::to_stdvec(&wire).unwrap();
+
+    let qc_verify = QcVerification::Verify {
+        scheme: SignatureSchemeChoice::Ed25519Collected,
+        bls_key_history: None,
+        min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
+    };
+    let err = ingress_with_qc_verification(
+        signer.node_id(),
+        &bytes,
+        &history,
+        &key_history,
+        &qc_verify,
+        &ChainId::TEST,
+    )
+    .expect_err("forged view-0 QC over non-genesis block_hash must be rejected at ingress");
+    assert!(
+        matches!(
+            err,
+            IngressError::InvalidQcAggregate {
+                view: 0,
+                scheme: "ed25519_collected",
+            }
+        ),
+        "expected InvalidQcAggregate at view 0, got {err:?}",
+    );
 }
 
 #[test]
@@ -2050,6 +2121,7 @@ fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
     let err = ingress_with_qc_verification(
         signer.node_id(),
@@ -2122,6 +2194,7 @@ fn ingress_vote_on_bls_chain_accepts_valid_bls_partial() {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
 
     let dispatches = ingress_with_qc_verification(
@@ -2160,6 +2233,7 @@ fn ingress_vote_on_bls_chain_rejects_missing_bls_partial() {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
 
     let err = ingress_with_qc_verification(
@@ -2198,6 +2272,7 @@ fn ingress_vote_on_bls_chain_rejects_tampered_bls_partial() {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
 
     let err = ingress_with_qc_verification(
@@ -2245,6 +2320,7 @@ fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
 
     let err = ingress_with_qc_verification(
@@ -2284,6 +2360,7 @@ fn ingress_vote_on_ed25519_chain_ignores_bls_partial_field() {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
 
     let dispatches = ingress_with_qc_verification(
@@ -2323,6 +2400,7 @@ fn ingress_vote_on_bls_chain_rejects_when_bls_history_absent() {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+        genesis_hash: genesis().hash(),
     };
 
     let err = ingress_with_qc_verification(

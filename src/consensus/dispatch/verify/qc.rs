@@ -42,18 +42,34 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
         scheme,
         bls_key_history,
         min_v_eff_delay: _,
+        genesis_hash,
     } = qc_verification
     else {
         return Ok(());
     };
+
+    // Audit finding 7-4 (issue #418): a view-0 QC is the genesis
+    // convention — every honest replica builds the same QC over the
+    // genesis block hash. Reject view-0 QCs over any other block hash
+    // here at ingress, before the unconditional skip below would
+    // otherwise let a forged "genesis QC" past. The safety core's
+    // parent walk catches this downstream too, but defense-in-depth
+    // says reject the malformed envelope at the boundary rather than
+    // relying on the safety core.
+    if qc.view == 0 && qc.block_hash != *genesis_hash {
+        return Err(IngressError::InvalidQcAggregate {
+            view: 0,
+            scheme: scheme.name(),
+        });
+    }
 
     // Genesis QCs are a convention, not a cryptographic commitment:
     // every honest replica builds the same QC at view 0 over the
     // genesis block hash with all-zero placeholder signatures (see
     // `crate::consensus::hotstuff::qc::genesis_qc`). Aggregate
     // verification cannot succeed against placeholder sigs, and the
-    // safety core checks the QC's block_hash against the genesis hash
-    // downstream, so skipping at view 0 is safe.
+    // block_hash check above pins the QC to the real genesis, so
+    // skipping at view 0 is safe.
     //
     // QCs with no signers at any other view also have nothing to
     // verify cryptographically — accept them and let the safety core

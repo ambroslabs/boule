@@ -37,6 +37,7 @@ pub(in crate::consensus::dispatch) fn verify_bls_partial_if_required(
         scheme,
         bls_key_history,
         min_v_eff_delay: _,
+        genesis_hash: _,
     } = qc_verification
     else {
         return Ok(());
