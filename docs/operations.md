@@ -3,6 +3,8 @@
 Operational guidance for running an `ambros-p2p` validator. The
 [testnet walkthrough](testnet-local.md) covers the local-cluster
 driver; this document focuses on production-deployment concerns.
+For the system-wide queue / channel inventory and the chosen overflow
+policy on each path, see [`backpressure.md`](backpressure.md).
 
 ## Running behind NAT (issue #138)
 
