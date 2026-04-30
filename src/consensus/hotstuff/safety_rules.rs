@@ -95,7 +95,7 @@ pub fn safe_to_vote(proposal: &Proposal, state: &HotStuffState) -> bool {
 pub fn should_update_high_qc(qc: &QuorumCertificate, state: &HotStuffState) -> bool {
     match &state.high_qc {
         None => true,
-        Some(existing) => qc.view > existing.view,
+        Some(existing) => qc.view > existing.view(),
     }
 }
 
@@ -424,7 +424,9 @@ mod tests {
     #[test]
     fn should_update_high_qc_requires_strictly_greater_view() {
         let mut state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-        state.high_qc = Some(dummy_qc(5, [1; 32]));
+        state.high_qc = Some(super::super::qc::VerifiedQc::unchecked(dummy_qc(
+            5, [1; 32],
+        )));
         assert!(!should_update_high_qc(&dummy_qc(5, [2; 32]), &state));
         assert!(!should_update_high_qc(&dummy_qc(4, [2; 32]), &state));
         assert!(should_update_high_qc(&dummy_qc(6, [2; 32]), &state));
