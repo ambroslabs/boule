@@ -169,27 +169,103 @@ impl From<Pubkey> for NodeId {
     }
 }
 
-/// An ordered, deduplicated set of [`ValidatorId`]s.
+/// An ordered, deduplicated set of [`ValidatorId`]s with a `u64`
+/// voting weight per member.
 ///
 /// Members are sorted ascending (byte-lexicographic over the underlying
-/// `NodeId` bytes) and contain no duplicates. Clone is zero-cost — the
-/// set is `Arc`-backed — so callers can hold `Arc<ValidatorSet>` on hot
-/// paths without copying.
+/// `NodeId` bytes) and contain no duplicates. Weights live in a parallel
+/// array indexed identically to `members`: `weight_at(i)` is the weight
+/// of `members[i]`. Clone is zero-cost — both arrays are `Arc`-backed —
+/// so callers can hold `Arc<ValidatorSet>` on hot paths without copying.
+///
+/// # Weights
+///
+/// Subtask 1 of #144 (weighted voting power). The data structure carries
+/// per-validator weights, but every protocol predicate (`has_quorum`,
+/// `honesty_threshold`, leader rotation) is still count-based at this
+/// point — the predicates switch to weight-based in subtask 2 (#461).
+/// Until that lands, every constructor that doesn't take explicit
+/// weights defaults each member's weight to `1`, which is the degenerate
+/// case where weighted quorum reduces exactly to count-based quorum.
+///
+/// # Why weight 0 is forbidden at construction
+///
+/// `ValidatorSet::with_weights` returns `Err(WeightedSetError::ZeroWeight)`
+/// for any weight of zero. The reconfig payload (#462) already has an
+/// explicit "remove" path; allowing `weight = 0` would create a second
+/// way to spell removal and a divide-by-zero footgun for future
+/// stake-proportional features. The codebase has one canonical
+/// representation of "this validator is no longer voting": it is not in
+/// the set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorSet {
     members: Arc<[ValidatorId]>,
+    weights: Arc<[u64]>,
 }
+
+/// Errors returned by [`ValidatorSet::with_weights`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WeightedSetError {
+    /// A weight entry was zero. Use the reconfig "remove" path instead.
+    ZeroWeight { index: usize },
+}
+
+impl std::fmt::Display for WeightedSetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeightedSetError::ZeroWeight { index } => write!(
+                f,
+                "validator at input index {index} has weight 0; weight 0 is reserved — \
+                 remove the validator via reconfig instead"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WeightedSetError {}
 
 impl ValidatorSet {
     /// Construct a validator set from `members`, sorting ascending and
-    /// removing duplicates. Two calls with the same underlying nodes in
+    /// removing duplicates. Every member's weight defaults to `1`, so
+    /// the weighted-quorum predicate reduces exactly to the count-based
+    /// `2n/3 + 1` form. Two calls with the same underlying nodes in
     /// different input orders produce equal sets.
     pub fn new(mut members: Vec<ValidatorId>) -> Self {
         members.sort_unstable();
         members.dedup();
+        let n = members.len();
         Self {
             members: members.into(),
+            weights: vec![1u64; n].into(),
         }
+    }
+
+    /// Construct a weighted validator set. `entries` is sorted by
+    /// [`ValidatorId`] and deduplicated; on collision the *first*
+    /// entry's weight wins (deterministic).
+    ///
+    /// Returns [`WeightedSetError::ZeroWeight`] if any entry has weight
+    /// 0; see the type-level docs for why zero is forbidden.
+    pub fn with_weights(mut entries: Vec<(ValidatorId, u64)>) -> Result<Self, WeightedSetError> {
+        for (i, (_, w)) in entries.iter().enumerate() {
+            if *w == 0 {
+                return Err(WeightedSetError::ZeroWeight { index: i });
+            }
+        }
+        // Stable sort so first-wins on dedup is well-defined: equal
+        // ValidatorIds keep the order they were supplied in.
+        entries.sort_by_key(|e| e.0);
+        entries.dedup_by(|a, b| a.0 == b.0);
+        let mut members = Vec::with_capacity(entries.len());
+        let mut weights = Vec::with_capacity(entries.len());
+        for (id, w) in entries {
+            members.push(id);
+            weights.push(w);
+        }
+        Ok(Self {
+            members: members.into(),
+            weights: weights.into(),
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -214,6 +290,35 @@ impl ValidatorSet {
 
     pub fn iter(&self) -> std::slice::Iter<'_, ValidatorId> {
         self.members.iter()
+    }
+
+    /// Voting weight at sorted index `idx`. Panics on out-of-range,
+    /// mirroring the `members[idx]` convention.
+    pub fn weight_at(&self, idx: usize) -> u64 {
+        self.weights[idx]
+    }
+
+    /// Voting weight for `id`, or `None` if not a member.
+    pub fn weight_for(&self, id: &ValidatorId) -> Option<u64> {
+        self.index_of(id).map(|i| self.weights[i])
+    }
+
+    /// Sum of all member weights. Returns `u128` so weights summing
+    /// near `u64::MAX` (the issue's overflow case) don't wrap.
+    pub fn total_weight(&self) -> u128 {
+        self.weights.iter().map(|w| u128::from(*w)).sum()
+    }
+
+    /// Iterate `(&ValidatorId, u64)` pairs in sorted order. Used by the
+    /// weighted-quorum predicate (subtask 2) and by persistence.
+    pub fn iter_weighted(&self) -> impl Iterator<Item = (&ValidatorId, u64)> + '_ {
+        self.members.iter().zip(self.weights.iter().copied())
+    }
+
+    /// Borrow the parallel weights slice. Same length and ordering as
+    /// the member slice.
+    pub fn weights(&self) -> &[u64] {
+        &self.weights
     }
 }
 
@@ -293,5 +398,74 @@ mod tests {
             postcard::to_stdvec(&pk).unwrap(),
             postcard::to_stdvec(&inner).unwrap(),
         );
+    }
+
+    // ── #460: per-validator weight ──────────────────────────────────────
+
+    #[test]
+    fn new_defaults_all_weights_to_one() {
+        let v = ValidatorSet::new(vec![vid(3), vid(1), vid(2)]);
+        for i in 0..v.len() {
+            assert_eq!(v.weight_at(i), 1);
+        }
+        assert_eq!(v.total_weight(), 3u128);
+    }
+
+    #[test]
+    fn with_weights_sorts_and_aligns_weights() {
+        // Insertion-order weights paired with arbitrary ValidatorIds:
+        // after sort by id, weights must follow the members.
+        let v = ValidatorSet::with_weights(vec![(vid(3), 30), (vid(1), 10), (vid(2), 20)]).unwrap();
+        assert_eq!(v.get(0), Some(&vid(1)));
+        assert_eq!(v.get(1), Some(&vid(2)));
+        assert_eq!(v.get(2), Some(&vid(3)));
+        assert_eq!(v.weight_at(0), 10);
+        assert_eq!(v.weight_at(1), 20);
+        assert_eq!(v.weight_at(2), 30);
+        assert_eq!(v.weight_for(&vid(2)), Some(20));
+        assert_eq!(v.weight_for(&vid(99)), None);
+        assert_eq!(v.total_weight(), 60u128);
+    }
+
+    #[test]
+    fn with_weights_dedups_keeping_first_weight_supplied() {
+        // First-wins on duplicates. Stable sort preserves input order
+        // among equal ValidatorIds, so the first input weight survives.
+        let v = ValidatorSet::with_weights(vec![(vid(1), 7), (vid(1), 99), (vid(2), 5)]).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.weight_at(0), 7); // not 99
+        assert_eq!(v.weight_at(1), 5);
+    }
+
+    #[test]
+    fn with_weights_rejects_zero_weight() {
+        let err =
+            ValidatorSet::with_weights(vec![(vid(1), 1), (vid(2), 0), (vid(3), 1)]).unwrap_err();
+        assert!(matches!(err, WeightedSetError::ZeroWeight { index: 1 }));
+    }
+
+    #[test]
+    fn total_weight_is_u128_and_does_not_wrap_near_u64_max() {
+        // Two u64::MAX weights sum to 2 * u64::MAX, which fits in u128.
+        // Asserting against the literal u128 sum rules out a u64 wrap.
+        let v =
+            ValidatorSet::with_weights(vec![(vid(1), u64::MAX), (vid(2), u64::MAX), (vid(3), 1)])
+                .unwrap();
+        let expected: u128 = (u64::MAX as u128) * 2 + 1;
+        assert_eq!(v.total_weight(), expected);
+    }
+
+    #[test]
+    fn iter_weighted_yields_sorted_pairs() {
+        let v = ValidatorSet::with_weights(vec![(vid(5), 50), (vid(2), 20), (vid(8), 80)]).unwrap();
+        let pairs: Vec<(ValidatorId, u64)> = v.iter_weighted().map(|(id, w)| (*id, w)).collect();
+        assert_eq!(pairs, vec![(vid(2), 20), (vid(5), 50), (vid(8), 80)]);
+    }
+
+    #[test]
+    fn weights_slice_matches_members_slice_length() {
+        let v = ValidatorSet::with_weights(vec![(vid(1), 1), (vid(2), 7)]).unwrap();
+        assert_eq!(v.weights().len(), v.len());
+        assert_eq!(v.weights(), &[1, 7]);
     }
 }

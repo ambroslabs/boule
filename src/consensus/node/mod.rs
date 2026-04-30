@@ -7645,6 +7645,7 @@ mod tests {
         tampered.boundaries.push(PersistedBoundary {
             v_eff: View(999), // Past anything in the committed chain.
             members: vec![nid(1), nid(2), nid(3), nid(4), nid(99)],
+            weights: vec![1; 5],
         });
         let bytes = postcard::to_stdvec(&tampered).unwrap();
         storage.put(STORAGE_KEY_VALIDATOR_HISTORY, &bytes).unwrap();
