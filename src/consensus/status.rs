@@ -158,6 +158,18 @@ pub struct ConsensusStatus {
     /// consensus caches. See [`CacheEvictionStatus`].
     #[serde(default)]
     pub cache_evictions: CacheEvictionStatus,
+    /// Cumulative count of commands the local
+    /// [`crate::consensus::node::MempoolBlockBuilder`] dropped
+    /// because `StateMachine::apply` returned `Err` (decode error,
+    /// bad command kind, or app-level rejection — issue #376). The
+    /// commands themselves still ride the proposed block; replicas
+    /// hit the same deterministic failure and the commitment
+    /// converges. Monotonic for the lifetime of the node — resets on
+    /// restart but never decrements during a run. A non-zero value
+    /// is not itself a fault (a single malformed mempool entry
+    /// counts), but sustained growth is a signal worth surfacing.
+    #[serde(default)]
+    pub dropped_commands: u64,
 }
 
 /// How far on either side of `current_view` to include in the bucket
@@ -220,6 +232,7 @@ mod tests {
                 pending_blocks: 1,
                 timeout_buckets: 0,
             },
+            dropped_commands: 11,
         }
     }
 
@@ -271,6 +284,9 @@ mod tests {
         assert_eq!(json["cache_evictions"]["parked_proposals"], 3);
         assert_eq!(json["cache_evictions"]["pending_blocks"], 1);
         assert_eq!(json["cache_evictions"]["timeout_buckets"], 0);
+
+        // Block-builder dropped-command counter (#376).
+        assert_eq!(json["dropped_commands"], 11);
     }
 
     #[test]
@@ -326,6 +342,7 @@ mod tests {
             validator_set: Vec::new(),
             mempool_size: 0,
             cache_evictions: CacheEvictionStatus::default(),
+            dropped_commands: 0,
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["current_view"], 0);
@@ -336,5 +353,6 @@ mod tests {
         assert_eq!(json["cache_evictions"]["parked_proposals"], 0);
         assert_eq!(json["cache_evictions"]["pending_blocks"], 0);
         assert_eq!(json["cache_evictions"]["timeout_buckets"], 0);
+        assert_eq!(json["dropped_commands"], 0);
     }
 }
