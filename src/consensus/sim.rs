@@ -98,6 +98,14 @@ use zeroize::Zeroizing;
 /// (outbound links from a Byzantine replica cut, inbound intact).
 type LinkCut = (NodeId, NodeId);
 
+/// Capacity of each per-node commit channel. The harness drains via
+/// [`SimCluster::drain_commits`], typically once per assertion. Sized
+/// generously above the worst-case burst we've observed in long-run
+/// tests so that under normal use the bound never trips; on overflow
+/// the [`MpscCommitNotifier`] bumps a counter the harness can poll.
+/// See `docs/backpressure.md`.
+pub const SIM_COMMIT_CHANNEL_CAP: usize = 4096;
+
 // ── Per-replica vote-uniqueness observer (issue #422) ────────────────────────
 
 /// How the route task should peel framing off an outbound payload before
@@ -342,7 +350,16 @@ struct SpawnExtras {
 /// Dropping the cluster sends shutdown to all still-running nodes.
 pub struct SimCluster {
     /// Per-node commit receivers, in ascending [`NodeId`] (sorted) order.
-    pub commit_rxs: Vec<mpsc::UnboundedReceiver<Block>>,
+    /// Bounded at [`SIM_COMMIT_CHANNEL_CAP`]; if a test fails to drain in
+    /// time the [`MpscCommitNotifier`] drops blocks and bumps the counter
+    /// in [`Self::commit_overflow_counters`] so the wedge is loud rather
+    /// than silent. (Pre-#485 this was an unbounded channel; tests that
+    /// don't drain accumulate committed blocks indefinitely in RAM.)
+    pub commit_rxs: Vec<mpsc::Receiver<Block>>,
+    /// Per-node clones of [`MpscCommitNotifier::overflow_counter`], in
+    /// the same order as [`Self::commit_rxs`]. Tests can read these to
+    /// assert no commit blocks were dropped due to a slow drain.
+    pub commit_overflow_counters: Vec<Arc<AtomicU64>>,
     /// Node IDs in the same sorted order as `commit_rxs`.
     pub node_ids: Vec<NodeId>,
     /// Set of partitioned nodes. Routing tasks drop all messages to/from
@@ -723,7 +740,8 @@ impl SimCluster {
 
         let node_ids: Vec<NodeId> = vs.iter().map(|v| v.into_node_id()).collect();
         let node_ids_arc: Arc<Vec<NodeId>> = Arc::new(node_ids.clone());
-        let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
+        let mut commit_rxs: Vec<mpsc::Receiver<Block>> = Vec::new();
+        let mut commit_overflow_counters: Vec<Arc<AtomicU64>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut limiters: Vec<Arc<crate::p2p::limits::RateLimiter>> = Vec::new();
         // Per-node fire-once crashpoint slots. One per node, in
@@ -774,10 +792,11 @@ impl SimCluster {
             storages_for_restart.push(Arc::clone(&storage));
             wals_for_restart.push(Arc::clone(&wal));
 
-            let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
+            let (commit_tx, commit_rx) = mpsc::channel::<Block>(SIM_COMMIT_CHANNEL_CAP);
             commit_rxs.push(commit_rx);
-            let commit_notifier: Arc<dyn CommitNotifier> =
-                Arc::new(MpscCommitNotifier::new(commit_tx));
+            let notifier = MpscCommitNotifier::new(commit_tx);
+            commit_overflow_counters.push(notifier.overflow_counter());
+            let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
 
             // ConsensusNode::new already auto-seeds the cluster-agreed
             // genesis QC; no explicit with_genesis_qc override here.
@@ -897,6 +916,7 @@ impl SimCluster {
 
         let cluster = SimCluster {
             commit_rxs,
+            commit_overflow_counters,
             node_ids,
             partitioned,
             link_cuts,
@@ -1338,7 +1358,8 @@ impl SimCluster {
         // Phase 3: re-spawn each node via `recover`. Same per-index
         // order as the captured signers / storages / wals so node N
         // post-restart inherits node N's pre-restart on-disk state.
-        let mut new_commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
+        let mut new_commit_rxs: Vec<mpsc::Receiver<Block>> = Vec::new();
+        let mut new_commit_overflow_counters: Vec<Arc<AtomicU64>> = Vec::new();
         let mut new_shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut new_mempools: Vec<Arc<dyn Mempool>> = Vec::new();
         let mut new_crash_slots: Vec<crate::consensus::crashpoint::CrashSlot> =
@@ -1370,10 +1391,11 @@ impl SimCluster {
             let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(256));
             new_mempools.push(Arc::clone(&mempool));
 
-            let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
+            let (commit_tx, commit_rx) = mpsc::channel::<Block>(SIM_COMMIT_CHANNEL_CAP);
             new_commit_rxs.push(commit_rx);
-            let commit_notifier: Arc<dyn CommitNotifier> =
-                Arc::new(MpscCommitNotifier::new(commit_tx));
+            let notifier = MpscCommitNotifier::new(commit_tx);
+            new_commit_overflow_counters.push(notifier.overflow_counter());
+            let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
 
             let node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)
                 .expect("recover must succeed against the same storage that just persisted")
@@ -1423,6 +1445,7 @@ impl SimCluster {
         }
 
         self.commit_rxs = new_commit_rxs;
+        self.commit_overflow_counters = new_commit_overflow_counters;
         self.shutdown_txs = new_shutdown_txs;
         self.mempools = new_mempools;
         self.crash_slots = new_crash_slots;
@@ -1591,14 +1614,16 @@ impl SimCluster {
         let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(256));
         self.mempools[idx] = Arc::clone(&mempool);
 
-        let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
+        let (commit_tx, commit_rx) = mpsc::channel::<Block>(SIM_COMMIT_CHANNEL_CAP);
         self.commit_rxs[idx] = commit_rx;
         // Reset the per-node commit cache for the reborn slot — old
         // pre-crash commits already returned via earlier
         // `drain_commits` calls; the `recover` path replays from
         // durable state and starts a new in-memory log.
         self.commit_cache[idx].clear();
-        let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(MpscCommitNotifier::new(commit_tx));
+        let notifier = MpscCommitNotifier::new(commit_tx);
+        self.commit_overflow_counters[idx] = notifier.overflow_counter();
+        let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
 
         let node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)?
             .with_commit_notifier(commit_notifier);
@@ -1656,6 +1681,22 @@ impl SimCluster {
                 cache.push(b);
             }
         }
+    }
+
+    /// Total number of commit blocks dropped across all per-node
+    /// channels because [`MpscCommitNotifier::on_commit`] hit a full
+    /// channel. Sums the [`Self::commit_overflow_counters`] values.
+    ///
+    /// In a healthy test this is always zero — the harness drains
+    /// `commit_rxs` faster than commits arrive. A non-zero value means
+    /// either the test forgot to drain, or it deliberately delays
+    /// draining and the burst exceeded [`SIM_COMMIT_CHANNEL_CAP`]. In
+    /// the latter case bump the cap; in the former, fix the test.
+    pub fn total_commit_overflows(&self) -> u64 {
+        self.commit_overflow_counters
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Panic if the per-replica [`VoteObserver`] recorded any vote
@@ -2021,7 +2062,8 @@ impl SimCluster {
         // those indices directly.
         let node_ids: Vec<NodeId> = vs.iter().map(|v| v.into_node_id()).collect();
 
-        let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
+        let mut commit_rxs: Vec<mpsc::Receiver<Block>> = Vec::new();
+        let mut commit_overflow_counters: Vec<Arc<AtomicU64>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut mempools_captured_gossip: Vec<Arc<dyn Mempool>> = Vec::new();
         let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
@@ -2069,10 +2111,11 @@ impl SimCluster {
             let storage = Arc::new(MemoryStorage::new());
             let wal = Arc::new(MemoryWal::new());
 
-            let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
+            let (commit_tx, commit_rx) = mpsc::channel::<Block>(SIM_COMMIT_CHANNEL_CAP);
             commit_rxs.push(commit_rx);
-            let commit_notifier: Arc<dyn CommitNotifier> =
-                Arc::new(MpscCommitNotifier::new(commit_tx));
+            let notifier = MpscCommitNotifier::new(commit_tx);
+            commit_overflow_counters.push(notifier.overflow_counter());
+            let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
 
             let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
                 .with_commit_notifier(commit_notifier);
@@ -2224,6 +2267,7 @@ impl SimCluster {
 
         SimCluster {
             commit_rxs,
+            commit_overflow_counters,
             node_ids,
             partitioned,
             link_cuts,
