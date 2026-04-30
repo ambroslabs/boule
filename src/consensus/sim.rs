@@ -4229,28 +4229,26 @@ mod tests {
         /// weights — code paths that pre-#144 trivially behaved
         /// because every weight collapsed to 1 (#463 acceptance).
         ///
-        /// Weight range capped at `[1, 100]` rather than the issue's
-        /// `[1, 1000]` to keep the case budget under the 15-s
-        /// per-test wall-clock floor (CLAUDE.md). The arithmetic
-        /// cared about by the predicate is the same; smaller numbers
-        /// still exercise non-uniform-weight quorum subsets.
+        /// Weight range and committee-size widened to the parent
+        /// issue's spec (`n ∈ [4, 7]`, weights ∈ `[1, 1000]`) under
+        /// #469. The earlier 4-validator + `[1, 100]` shape was a
+        /// time-budget compromise on PR #467; #469 audited it and
+        /// pushed the scope back out. The arithmetic surface is the
+        /// same; the wider range exercises rarer quorum-subset
+        /// arrangements (e.g. one validator carrying ~50% of total
+        /// weight, ties at the strict-`>` boundary).
         #[test]
         fn proptest_weighted_committee_preserves_safety_and_liveness(
-            // 4-validator cluster: the smallest BFT committee.
-            // Wider clusters (n=5..7) work but blow the per-case
-            // simulator-setup time budget; the property exercised here
-            // is arithmetic, and 4 validators with non-uniform weights
-            // already covers the predicate's degenerate and non-
-            // degenerate cases.
-            w0 in 1u64..=100,
-            w1 in 1u64..=100,
-            w2 in 1u64..=100,
-            w3 in 1u64..=100,
+            n in 4usize..=7,
+            // Generate up to 7 weights and slice to `n` below; this
+            // sidesteps the `prop_flat_map` plumbing for a strategy
+            // whose length depends on a sibling strategy.
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
         ) {
             run_paused(|| async move {
-                let weights = vec![w0, w1, w2, w3];
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
                 let mut cluster =
-                    SimCluster::spawn_with_weights(4, Duration::from_millis(50), weights.clone())
+                    SimCluster::spawn_with_weights(n, Duration::from_millis(50), weights.clone())
                         .await;
 
                 // Warm-up: drive simulated time until at least one
@@ -4262,7 +4260,7 @@ mod tests {
                     .await;
                 prop_assert!(
                     warmed,
-                    "L5: weighted cluster failed to commit any block (weights={weights:?})",
+                    "L5: weighted cluster failed to commit any block (n={n}, weights={weights:?})",
                 );
 
                 // Run a bit longer so the chain advances past the
@@ -4273,6 +4271,109 @@ mod tests {
                         c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 3
                     })
                     .await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                Ok(())
+            })?;
+        }
+
+        /// **L7 — non-uniform weights with a Byzantine-weight kill
+        /// set ≤ `floor(total_weight / 3)` preserve safety and
+        /// liveness** (#469).
+        ///
+        /// Pick a Byzantine subset by *weight-descending* greedy
+        /// selection: keep adding the heaviest unpicked validator to
+        /// the kill set while the next addition would not exceed
+        /// `floor(total_weight / 3)`. This maximizes Byzantine
+        /// influence within the bound and stresses the predicate's
+        /// strict-`>` boundary. Killed validators are silenced (the
+        /// simplest weighted-Byzantine fault model — equivalent to a
+        /// crash-fault subset in the weighted setting).
+        ///
+        /// Honest weight is `total_weight - byzantine_weight ≥ total
+        /// - floor(total/3) > 2/3 * total`, so the weighted-quorum
+        /// predicate (`3*signer > 2*total`) is satisfiable on the
+        /// honest subset alone. The cluster must commit at least one
+        /// block; safety must hold across the run.
+        #[test]
+        fn proptest_weighted_byzantine_committee_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                let total: u128 = weights.iter().map(|w| u128::from(*w)).sum();
+                let byzantine_cap: u128 = total / 3;
+
+                let mut cluster =
+                    SimCluster::spawn_with_weights(n, Duration::from_millis(50), weights.clone())
+                        .await;
+
+                // `weights[i]` is the weight of the validator at
+                // sorted index `i` (the same order `cluster.node_ids`
+                // uses). Pick the kill set greedily: heaviest first,
+                // while the running sum stays at or below the cap.
+                let mut indexed: Vec<(usize, u64)> =
+                    weights.iter().copied().enumerate().collect();
+                indexed.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
+                let mut byzantine_indices: Vec<usize> = Vec::new();
+                let mut byzantine_weight: u128 = 0;
+                for (idx, w) in indexed {
+                    let next = byzantine_weight + u128::from(w);
+                    if next <= byzantine_cap {
+                        byzantine_indices.push(idx);
+                        byzantine_weight = next;
+                    }
+                }
+
+                // Sort kill indices ascending; `kill_node` operates
+                // on sorted-validator-order indices and the order we
+                // call it in doesn't change the outcome but stable
+                // ordering helps shrink output read like a diff.
+                byzantine_indices.sort();
+
+                // Brief warm-up under the full committee so the
+                // chain advances past genesis BEFORE we silence the
+                // Byzantine subset. This mirrors how a real cluster
+                // would discover and tolerate faults — they appear
+                // mid-run, not at boot.
+                let warmed = cluster
+                    .advance_and_yield_until(PHASE_CAP, |c| {
+                        c.peek_commit_heights().iter().any(|&h| h > 0)
+                    })
+                    .await;
+                prop_assert!(
+                    warmed,
+                    "L7: warm-up did not produce a commit before kills \
+                     (n={n}, weights={weights:?})",
+                );
+
+                for idx in &byzantine_indices {
+                    cluster.kill_node(*idx);
+                }
+
+                // Honest weight strictly exceeds 2/3 of total, so the
+                // surviving cluster must commit at least one fresh
+                // block under the weighted-quorum predicate.
+                let pre_kill_heights = cluster.peek_commit_heights();
+                let post_kill_committed = cluster
+                    .advance_and_yield_until(Duration::from_secs(8), |c| {
+                        let h = c.peek_commit_heights();
+                        // Some honest replica gained a height after kills.
+                        (0..n)
+                            .filter(|i| !byzantine_indices.contains(i))
+                            .any(|i| h[i] > pre_kill_heights[i])
+                    })
+                    .await;
+                prop_assert!(
+                    post_kill_committed,
+                    "L7: honest survivors gained 0 commits after silencing \
+                     Byzantine subset (byzantine_indices={byzantine_indices:?}, \
+                     byzantine_weight={byzantine_weight}, total={total}, \
+                     weights={weights:?})",
+                );
 
                 let committed = cluster.drain_commits();
                 assert_no_conflicts(&committed);
