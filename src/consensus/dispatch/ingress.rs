@@ -161,6 +161,12 @@ pub fn ingress_wire_with_qc_verification(
 /// liveness signal. Runs (in order) signer membership, envelope
 /// signature, the `Proposal.justify` QC aggregate, and the
 /// `validator_history_commitment` post-block check.
+///
+/// Also emits `OnQc(justify.view)` so a future-view proposal whose
+/// QC we never saw directly (packet loss raced the proposal) still
+/// advances the pacemaker — without it, `OnProposalReceived(v)` is
+/// dropped when `v != current_view` and the replica wedges until the
+/// timer fires (issue #436). Mirrors the NewView arm below.
 pub fn ingress_proposal(
     signed: Signed<Proposal>,
     history: &ValidatorSetHistory,
@@ -169,6 +175,7 @@ pub fn ingress_proposal(
     chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
     let view = signed.payload.block.header.view;
+    let justify_view = signed.payload.justify.view;
     let signer_validator_id = verify_signer_at(signed.signer, view, history, key_history)?;
     verify_sig(&signed, chain_id)?;
     verify_qc_if_requested(
@@ -197,6 +204,7 @@ pub fn ingress_proposal(
             Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
         )),
         Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
+        Dispatch::Pacemaker(pacemaker::Event::OnQc(justify_view)),
     ])
 }
 
