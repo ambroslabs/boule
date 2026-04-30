@@ -803,19 +803,29 @@ mod tests {
     /// The numeric discriminants below are part of the wire contract:
     /// [`crate::consensus::node::WireMessage`] is postcard-encoded, and
     /// postcard emits the variant index as a varint at byte 0
-    /// (single-byte for the six variants here). Changing the order of
+    /// (single-byte for the variants here). Changing the order of
     /// `WireMessage` without updating `MessageKind::from_wire_tag` would
     /// silently misclassify every frame, so we lock the mapping in via a
-    /// real-encode test on the two simplest variants (the rest carry
-    /// `Signed<…>` payloads that need a keypair to construct).
+    /// real-encode test on the simple variants (the consensus
+    /// `Signed<…>` variants need a keypair to construct, but
+    /// `BlockResponse` can be hand-built with a placeholder signature
+    /// since postcard encoding does not verify).
     #[test]
     fn wire_tag_layout_locked() {
-        use crate::consensus::node::WireMessage;
+        use crate::consensus::node::{BlockResponsePayload, WireMessage};
+        use crate::crypto::signed::Signed;
         let req = WireMessage::BlockRequest([0u8; 32]);
         let bytes = postcard::to_allocvec(&req).expect("encode");
         assert_eq!(bytes[0], 4, "BlockRequest must serialize at tag 4");
 
-        let resp = WireMessage::BlockResponse(None);
+        let resp = WireMessage::BlockResponse(Signed {
+            payload: BlockResponsePayload {
+                requested_hash: [0u8; 32],
+                block: None,
+            },
+            signer: [0u8; 32],
+            sig: [0u8; 64],
+        });
         let bytes = postcard::to_allocvec(&resp).expect("encode");
         assert_eq!(bytes[0], 5, "BlockResponse must serialize at tag 5");
 

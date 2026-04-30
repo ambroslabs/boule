@@ -17,7 +17,7 @@ use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
 use crate::crypto::signed::{ChainId, Signed};
 use crate::p2p::NodeId;
-use crate::replication::block::{Block, BlockHash};
+use crate::replication::block::BlockHash;
 use crate::replication::snapshot::SnapshotManifest;
 
 use super::codec;
@@ -136,7 +136,9 @@ pub fn ingress_wire_with_qc_verification(
             ingress_timeout_vote(signed, history, key_history, qc_verification, chain_id)
         }
         WireMessage::BlockRequest(hash) => Ok(ingress_block_request(hash, from)),
-        WireMessage::BlockResponse(block) => Ok(ingress_block_response(block, from)),
+        WireMessage::BlockResponse(signed) => {
+            ingress_block_response(signed, from, key_history, chain_id)
+        }
         WireMessage::SnapshotManifestRequest { height } => {
             Ok(ingress_snapshot_manifest_request(height, from))
         }
@@ -323,9 +325,41 @@ pub fn ingress_block_request(hash: BlockHash, from: NodeId) -> Vec<Dispatch> {
     vec![Dispatch::ServeBlock { hash, to: from }]
 }
 
-/// Convert an inbound `BlockResponse` into a [`Dispatch::ReceiveBlock`].
-pub fn ingress_block_response(block: Option<Block>, from: NodeId) -> Vec<Dispatch> {
-    vec![Dispatch::ReceiveBlock { block, from }]
+/// Convert an inbound signed `BlockResponse` into a
+/// [`Dispatch::ReceiveBlock`].
+///
+/// Verifies the responder's pubkey is known to `key_history` (i.e.
+/// resolves to a stable [`crate::consensus::validator_set::ValidatorId`]
+/// — past or present validator) and that the envelope signature is
+/// valid. Membership-at-current-view is intentionally not checked: the
+/// requester may be at a different view than the responder, and the
+/// signature's only job here is *attribution* so a wrong-hash answer is
+/// later slashable. Hash verification (`block.hash() == requested_hash`
+/// and `requested_hash` matches an outstanding `block_sync_inflight`
+/// entry) lives in the [`Dispatch::ReceiveBlock`] handler in
+/// [`crate::consensus::node::Node::apply_dispatch`] because the inflight
+/// tracker lives on the integration layer, not in ingress.
+pub fn ingress_block_response(
+    signed: Signed<crate::consensus::node::BlockResponsePayload>,
+    from: NodeId,
+    key_history: &ValidatorKeyHistory,
+    chain_id: &ChainId,
+) -> Result<Vec<Dispatch>, IngressError> {
+    use crate::consensus::validator_set::Pubkey;
+    let signer_pk = Pubkey::from_node_id(signed.signer);
+    if key_history.validator_for(&signer_pk).is_none() {
+        return Err(IngressError::UnknownSigner(signed.signer));
+    }
+    verify_sig(&signed, chain_id)?;
+    let crate::consensus::node::BlockResponsePayload {
+        requested_hash,
+        block,
+    } = signed.payload;
+    Ok(vec![Dispatch::ReceiveBlock {
+        requested_hash,
+        block,
+        from,
+    }])
 }
 
 /// Convert an inbound `SnapshotManifestRequest` into a
