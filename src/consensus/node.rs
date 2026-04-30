@@ -2649,6 +2649,9 @@ impl ConsensusNode {
                         "VotedInView" => crashpoint!("after_persist_voted_view"),
                         "Locked" => crashpoint!("after_persist_locked"),
                         "HighQc" => crashpoint!("after_persist_high_qc"),
+                        "ProposedInView" => {
+                            crashpoint!("after_persist_proposed_in_view")
+                        }
                         _ => {}
                     }
                 }
@@ -2822,6 +2825,7 @@ impl ConsensusNode {
                     "VotedInView" => crashpoint!("after_persist_voted_view"),
                     "Locked" => crashpoint!("after_persist_locked"),
                     "HighQc" => crashpoint!("after_persist_high_qc"),
+                    "ProposedInView" => crashpoint!("after_persist_proposed_in_view"),
                     _ => {}
                 }
             }

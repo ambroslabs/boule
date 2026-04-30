@@ -1170,6 +1170,26 @@ impl SimCluster {
         self.crash_slots[idx].peek()
     }
 
+    /// Borrow node `idx`'s durable [`Storage`] handle so a
+    /// crashpoint-driven regression can read persisted control-plane
+    /// keys (`STORAGE_KEY_LAST_VOTED_VIEW`, `STORAGE_KEY_PROPOSED_IN_VIEW`,
+    /// etc.) post-restart and assert the survived state matches the
+    /// invariant the fix locks down. Same `Arc` the cluster keeps for
+    /// [`Self::restart_node_with_recover`], so reads here see exactly
+    /// what `recover()` would consume.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is out of range or if the cluster was spawned
+    /// without captured storages (gossip-mode harness).
+    pub fn peek_storage(&self, idx: usize) -> Arc<dyn Storage> {
+        let storages = self
+            .storages
+            .as_ref()
+            .expect("peek_storage requires a mesh-mode SimCluster");
+        Arc::clone(&storages[idx])
+    }
+
     /// Crash one specific node and bring it back via
     /// [`ConsensusNode::recover`] against the same on-disk state.
     ///

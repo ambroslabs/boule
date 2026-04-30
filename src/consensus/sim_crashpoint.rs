@@ -199,25 +199,38 @@ async fn after_adopt_snapshot_persist_arms_without_disturbing_happy_path() {
 
 // ── Issue #407 / audit finding 4-3: proposed_in_view across restart ───────
 
-/// Regression harness for issue #407 (`proposed_in_view` is in-memory
-/// only; a restart re-broadcasting a proposal at the same view is
+/// Regression for issue #407 (`proposed_in_view` is in-memory only; a
+/// restart re-broadcasting a proposal at the same view is
 /// indistinguishable from Byzantine equivocation).
 ///
 /// Scenario: arm `after_send_outbound_for_proposal` on the view-1
 /// leader (sorted index 1). The leader builds and broadcasts the
 /// view-1 proposal; the crashpoint fires the moment those bytes are
 /// on the wire. The crash is tightly aligned with the bug: the
-/// in-memory `proposed_in_view = 1` mutation is dropped with the
-/// task, but the proposal was already observed by every peer.
-/// `recover()` re-instantiates the leader with `proposed_in_view = 0`,
-/// and the test asserts the cluster still converges without observing
-/// two distinct view-1 proposals (no conflicting commits).
+/// in-memory `proposed_in_view = 1` mutation would be dropped with
+/// the task, but the proposal was already observed by every peer.
 ///
-/// Once #407 lands, the test will additionally read the recovered
-/// leader's persisted `proposed_in_view` (or in-flight proposal
-/// snapshot) and assert it survived the restart.
+/// Pre-fix the in-memory guard would reset to `0` on restart, leaving
+/// nothing on disk to stop a re-mint at view 1. The fix routes
+/// `proposed_in_view` through a new `StateUpdate::ProposedInView`
+/// variant that the safety core emits *before* the matching
+/// `Broadcast(Proposal)`, so the dispatcher's persist-flush-before-
+/// non-Persist contract puts the value under
+/// `STORAGE_KEY_PROPOSED_IN_VIEW` before the proposal bytes leave.
+/// `ConsensusNode::recover` reads it back and threads it into the
+/// safety core via `HotStuffCore::with_proposed_in_view`, so the
+/// in-memory guard re-fires on the next `try_propose_as_leader(1)`.
+///
+/// Two assertions pin the fix:
+/// 1. After `restart_node_with_recover`, the leader's storage carries
+///    `STORAGE_KEY_PROPOSED_IN_VIEW = 1` — the durable mirror landed
+///    before the crashpoint fired.
+/// 2. The cluster converges without committing conflicting blocks —
+///    the existing safety property the harness already covered.
 #[tokio::test]
 async fn after_send_outbound_for_proposal_crashpoint_fires_on_view_1_leader() {
+    use crate::consensus::node::{STORAGE_KEY_PROPOSED_IN_VIEW, decode_proposed_in_view};
+
     tokio::time::pause();
 
     let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
@@ -232,6 +245,26 @@ async fn after_send_outbound_for_proposal_crashpoint_fires_on_view_1_leader() {
     assert!(
         fired,
         "after_send_outbound_for_proposal must fire on the view-1 leader's first broadcast",
+    );
+
+    // The crashpoint fires *after* `send_outbound` returns for the
+    // Broadcast(Proposal). Since `apply_safety_actions` flushes the
+    // Persist buffer before any non-Persist action runs, the
+    // ProposedInView write must already be on disk by the time the
+    // proposal bytes left — and so it must survive the panic.
+    let raw = cluster
+        .peek_storage(leader_idx)
+        .get(STORAGE_KEY_PROPOSED_IN_VIEW)
+        .expect("storage.get must not error")
+        .expect(
+            "STORAGE_KEY_PROPOSED_IN_VIEW must be persisted before the proposal \
+             broadcast leaves: the audit-4-3 / #407 self-equivocation guard relies \
+             on this value surviving the crash",
+        );
+    assert_eq!(
+        decode_proposed_in_view(&raw).expect("decode proposed_in_view"),
+        1,
+        "the leader minted at view 1, so the persisted guard must equal 1",
     );
 
     cluster
