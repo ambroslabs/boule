@@ -156,12 +156,18 @@ impl ValidatorSetHistory {
     /// Snapshot the history into a serializable wire form (#254). The
     /// genesis boundary at `v_eff = 0` is included so a fresh node can
     /// restore the full chain of committee changes from a single blob.
+    ///
+    /// Per-validator weights ride alongside the member list as a
+    /// parallel `Vec<u64>` (#460). With every weight defaulted to 1
+    /// (the pre-#144 case), the weights vector is byte-cheap to encode
+    /// — postcard's varint length-prefix plus one byte per validator.
     pub fn to_persisted(&self) -> PersistedValidatorHistory {
         let boundaries: Vec<PersistedBoundary> = self
             .iter()
             .map(|(v_eff, set)| PersistedBoundary {
                 v_eff,
                 members: set.iter().map(|v| v.into_node_id()).collect(),
+                weights: set.weights().to_vec(),
             })
             .collect();
         PersistedValidatorHistory { boundaries }
@@ -176,6 +182,11 @@ impl ValidatorSetHistory {
     /// recovery time for the same reason it is allowed at genesis-load
     /// time: we are reconstructing state authored by an honest replica
     /// that already went through the legitimate seeding/reconfig paths.
+    ///
+    /// Per-boundary `members.len() == weights.len()` is required (#460);
+    /// a mismatched-length boundary indicates corrupted storage and the
+    /// recovery path bails out so the rebuild loop in `recover` can
+    /// fall through to its from-genesis reseed.
     pub fn from_persisted(persisted: PersistedValidatorHistory) -> anyhow::Result<Self> {
         let mut iter = persisted.boundaries.into_iter();
         let genesis = iter
@@ -187,22 +198,34 @@ impl ValidatorSetHistory {
                 genesis.v_eff
             );
         }
-        let genesis_members: Vec<ValidatorId> = genesis
-            .members
-            .into_iter()
-            .map(ValidatorId::from_genesis_pubkey)
-            .collect();
-        let mut history = Self::from_genesis(ValidatorSet::new(genesis_members));
+        let mut history = Self::from_genesis(boundary_to_set(genesis)?);
         for boundary in iter {
-            let members: Vec<ValidatorId> = boundary
-                .members
-                .into_iter()
-                .map(ValidatorId::from_genesis_pubkey)
-                .collect();
-            history.insert_boundary(boundary.v_eff, ValidatorSet::new(members))?;
+            let v_eff = boundary.v_eff;
+            history.insert_boundary(v_eff, boundary_to_set(boundary)?)?;
         }
         Ok(history)
     }
+}
+
+/// Turn a [`PersistedBoundary`] into a [`ValidatorSet`], validating the
+/// `members.len() == weights.len()` invariant and rejecting weight 0.
+fn boundary_to_set(b: PersistedBoundary) -> anyhow::Result<ValidatorSet> {
+    if b.members.len() != b.weights.len() {
+        anyhow::bail!(
+            "persisted boundary at v_eff {}: members.len() {} != weights.len() {}",
+            b.v_eff,
+            b.members.len(),
+            b.weights.len(),
+        );
+    }
+    let entries: Vec<(ValidatorId, u64)> = b
+        .members
+        .into_iter()
+        .map(ValidatorId::from_genesis_pubkey)
+        .zip(b.weights)
+        .collect();
+    ValidatorSet::with_weights(entries)
+        .map_err(|e| anyhow::anyhow!("persisted boundary at v_eff {}: {e}", b.v_eff))
 }
 
 /// View-tagged result of [`ValidatorSetHistory::set_at`].
@@ -255,10 +278,18 @@ impl ValidatorSetAt {
 /// against the previous boundary can be derived but isn't part of the
 /// wire shape — the format trades a few extra bytes per boundary for
 /// validation simplicity at recovery time.
+///
+/// `weights` is the parallel per-validator voting weight vector (#460).
+/// Length must equal `members.len()`; mismatch is a structural error
+/// (caught by [`ValidatorSetHistory::from_persisted`]). This field is
+/// new at #460 and bumps the on-disk format — pre-#460 storage will
+/// fail to decode and the caller will recover by replaying from
+/// genesis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedBoundary {
     pub v_eff: View,
     pub members: Vec<NodeId>,
+    pub weights: Vec<u64>,
 }
 
 /// Serializable snapshot of a [`ValidatorSetHistory`] (#254). Encoded
@@ -438,22 +469,80 @@ mod tests {
             boundaries: vec![PersistedBoundary {
                 v_eff: View(5),
                 members: vec![nid(1), nid(2), nid(3), nid(4)],
+                weights: vec![1, 1, 1, 1],
             }],
         };
         let err = ValidatorSetHistory::from_persisted(bad).unwrap_err();
         assert!(err.to_string().contains("v_eff = 0"));
     }
 
-    /// Wire format must be byte-identical to the pre-#328 shape: the
-    /// `members` field of `PersistedBoundary` is a `Vec<NodeId>` of
-    /// 32-byte arrays, and the `ValidatorId`-typed `ValidatorSet`
-    /// flattens to the same bytes via `into_node_id()` on persist.
+    /// `members` is still emitted as `Vec<NodeId>` (32-byte arrays)
+    /// and the `ValidatorId`-typed `ValidatorSet` flattens to the same
+    /// bytes via `into_node_id()` on persist. #460 adds a parallel
+    /// `weights: Vec<u64>` field.
     #[test]
-    fn persisted_boundary_wire_format_unchanged() {
+    fn persisted_boundary_emits_members_and_weights() {
         let h = ValidatorSetHistory::from_genesis(genesis());
         let persisted = h.to_persisted();
         let expected_members: Vec<NodeId> = vec![nid(1), nid(2), nid(3), nid(4)];
         assert_eq!(persisted.boundaries[0].members, expected_members);
+        assert_eq!(persisted.boundaries[0].weights, vec![1u64; 4]);
+    }
+
+    #[test]
+    fn from_persisted_rejects_mismatched_members_and_weights_lengths() {
+        let bad = PersistedValidatorHistory {
+            boundaries: vec![PersistedBoundary {
+                v_eff: View::ZERO,
+                members: vec![nid(1), nid(2), nid(3), nid(4)],
+                weights: vec![1, 1, 1], // length mismatch
+            }],
+        };
+        let err = ValidatorSetHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("members.len()"));
+    }
+
+    #[test]
+    fn from_persisted_rejects_zero_weight_in_a_boundary() {
+        let bad = PersistedValidatorHistory {
+            boundaries: vec![PersistedBoundary {
+                v_eff: View::ZERO,
+                members: vec![nid(1), nid(2), nid(3), nid(4)],
+                weights: vec![1, 0, 1, 1], // weight 0 not allowed
+            }],
+        };
+        let err = ValidatorSetHistory::from_persisted(bad).unwrap_err();
+        assert!(err.to_string().contains("weight 0"));
+    }
+
+    #[test]
+    fn round_trips_a_history_with_non_uniform_weights() {
+        // #460: end-to-end round-trip through postcard with weights
+        // present on every boundary. Non-uniform per-boundary weights
+        // exercise the parallel-array invariant at boundary count > 1.
+        use crate::consensus::validator_set::ValidatorSet;
+        let genesis_set =
+            ValidatorSet::with_weights(vec![(vid(1), 5), (vid(2), 3), (vid(3), 1), (vid(4), 1)])
+                .unwrap();
+        let later = ValidatorSet::with_weights(vec![
+            (vid(1), 5),
+            (vid(2), 3),
+            (vid(3), 1),
+            (vid(4), 1),
+            (vid(5), 7),
+        ])
+        .unwrap();
+        let mut h = ValidatorSetHistory::from_genesis(genesis_set.clone());
+        h.insert_boundary(7, later.clone()).unwrap();
+
+        let bytes = postcard::to_stdvec(&h.to_persisted()).unwrap();
+        let decoded: PersistedValidatorHistory = postcard::from_bytes(&bytes).unwrap();
+        let restored = ValidatorSetHistory::from_persisted(decoded).unwrap();
+
+        assert_eq!(*restored.set_at(0).for_view(0), genesis_set);
+        assert_eq!(restored.set_at(0).for_view(0).weight_for(&vid(1)), Some(5));
+        assert_eq!(*restored.set_at(7).for_view(7), later);
+        assert_eq!(restored.set_at(7).for_view(7).weight_for(&vid(5)), Some(7));
     }
 
     #[test]
@@ -463,15 +552,18 @@ mod tests {
                 PersistedBoundary {
                     v_eff: View(0),
                     members: vec![nid(1), nid(2), nid(3), nid(4)],
+                    weights: vec![1, 1, 1, 1],
                 },
                 PersistedBoundary {
                     v_eff: View(10),
                     members: vec![nid(1), nid(2), nid(3), nid(4), nid(5)],
+                    weights: vec![1, 1, 1, 1, 1],
                 },
                 // Out-of-order: v_eff 5 < previous 10.
                 PersistedBoundary {
                     v_eff: View(5),
                     members: vec![nid(1), nid(2), nid(3), nid(4)],
+                    weights: vec![1, 1, 1, 1],
                 },
             ],
         };

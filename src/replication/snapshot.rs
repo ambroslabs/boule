@@ -1426,6 +1426,7 @@ mod tests {
             crate::consensus::validator_history::PersistedBoundary {
                 v_eff: View(999),
                 members: vec![[0xFFu8; 32]; 4],
+                weights: vec![1; 4],
             },
         );
         assert_eq!(
