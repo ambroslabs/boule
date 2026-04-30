@@ -4466,6 +4466,81 @@ mod tests {
         }
     }
 
+    // ── #476: WeightedAccumulatorSelector is the production default ──
+    //
+    // The cluster spawned via `SimCluster::spawn_with_weights` runs
+    // through the same `ConsensusNode::new` path as production, which
+    // installs `WeightedAccumulatorSelector` as the pacemaker leader
+    // selector. With a heavily skewed weight distribution like
+    // `[10, 1, 1, 1]` the heaviest validator should propose roughly
+    // 10/13 ≈ 77% of views — and therefore most committed blocks.
+    //
+    // This test exercises the wire-up: it asserts (a) liveness holds
+    // (the cluster commits ≥ 5 blocks), and (b) the heaviest validator
+    // proposed strictly more committed blocks than any single peer.
+    // The frequency test is loose on purpose — short windows have
+    // ±1-block variance per the accumulator's exact-frequency bound,
+    // so "strictly more" rather than ">= 70%" keeps the test stable.
+
+    /// L8 — heavily-skewed weights: weighted-accumulator default makes
+    /// the heaviest validator the dominant proposer.
+    #[tokio::test(start_paused = true)]
+    async fn weighted_accumulator_default_makes_heaviest_validator_dominant_proposer() {
+        let weights = vec![10u64, 1, 1, 1];
+        let total: u128 = weights.iter().map(|w| u128::from(*w)).sum();
+        let mut cluster =
+            SimCluster::spawn_with_weights(4, Duration::from_millis(50), weights.clone()).await;
+
+        // Drive until the slowest replica has committed ≥ 5 blocks —
+        // enough for the accumulator's per-period (13 views) frequency
+        // distribution to surface.
+        let reached = cluster
+            .advance_and_yield_until(Duration::from_secs(10), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 5
+            })
+            .await;
+        assert!(
+            reached,
+            "L8: weighted cluster failed to commit ≥ 5 blocks per replica within budget",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // Count proposers across the committed prefix on replica 0.
+        // All replicas commit the same block at each height (safety),
+        // so one replica's view is enough.
+        let heaviest = cluster.node_ids[0]; // sorted-index 0 = heaviest by construction.
+        let mut counts: HashMap<NodeId, u32> = HashMap::new();
+        for block in &committed[0] {
+            // Skip the genesis stub at height 0 — its `proposer` is
+            // [0; 32] and not a real validator.
+            if block.header.height.0 == 0 {
+                continue;
+            }
+            *counts.entry(block.header.proposer).or_insert(0) += 1;
+        }
+        let total_blocks: u32 = counts.values().copied().sum();
+        assert!(
+            total_blocks >= 5,
+            "L8: expected ≥ 5 committed non-genesis blocks, got {total_blocks}",
+        );
+
+        let heaviest_count = counts.get(&heaviest).copied().unwrap_or(0);
+        let max_other_count = counts
+            .iter()
+            .filter(|(id, _)| **id != heaviest)
+            .map(|(_, c)| *c)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            heaviest_count > max_other_count,
+            "L8: heaviest validator (weight 10/{total}) proposed {heaviest_count} blocks but \
+             some peer proposed {max_other_count} (counts={counts:?}). The weighted accumulator \
+             default is not in effect, or the test budget produced too few commits.",
+        );
+    }
+
     // ── Vote-uniqueness property (issue #422 / audit finding 14-3) ────────────
 
     /// Dedicated property test for the per-replica `vote_once`
