@@ -149,13 +149,15 @@ impl ChainId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+}
 
-    /// Test sentinel: an all-zero `ChainId`. Production callers must
-    /// derive their `ChainId` from the genesis block — this constant
-    /// exists only to keep test fixtures terse, and a real deployment
-    /// with the all-zero `ChainId` would still get the cross-deployment
-    /// guarantee against any *other* deployment that follows the
-    /// recommendation.
+#[cfg(test)]
+impl ChainId {
+    /// Test sentinel: an all-zero `ChainId`. Gated to `cfg(test)` so a
+    /// production deployment cannot accidentally select the all-zero
+    /// chain id (which would be replay-compatible with every other
+    /// deployment that did the same). Production callers must derive
+    /// their `ChainId` from the genesis block via [`from_genesis_hash`].
     pub const TEST: Self = Self([0u8; 32]);
 }
 

@@ -48,6 +48,38 @@ pub mod timeout;
 #[cfg(test)]
 mod tests;
 
+/// Type-level proof that a bucket of distinct timeout-vote signers has
+/// reached the BFT honesty threshold (`f + 1`) for some view — at least
+/// one signer in the bucket is honest under the standard `n = 3f + 1`
+/// assumption, so the view is not Byzantine fabrication. Required by
+/// [`Event::OnRoundSync`]: a future second producer of round-sync hints
+/// (snapshot-sync peer, admin RPC, test fixture) cannot construct one
+/// without first running the threshold check, so the gate cannot be
+/// silently bypassed (audit finding 2-3 / issue #419).
+///
+/// Use [`HonestyThresholdEvidence::from_bucket`] — the inner field is
+/// private, so this is the sole construction path.
+///
+/// ```compile_fail
+/// use ambros_p2p::consensus::pacemaker::HonestyThresholdEvidence;
+/// // Direct construction is rejected — the inner field is private,
+/// // forcing callers through `from_bucket` and the threshold check.
+/// let _ = HonestyThresholdEvidence(());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HonestyThresholdEvidence(());
+
+impl HonestyThresholdEvidence {
+    /// Mint evidence iff `bucket_size >= honesty_threshold`. The
+    /// integration's `on_timeout_vote` bucket loop in `node.rs` is the
+    /// sole intended caller; both arguments must be computed at the
+    /// call site so the threshold rule is visible at every construction
+    /// site.
+    pub fn from_bucket(bucket_size: usize, honesty_threshold: usize) -> Option<Self> {
+        (bucket_size >= honesty_threshold).then_some(Self(()))
+    }
+}
+
 /// Inputs the pacemaker reacts to.
 ///
 /// All variants carry only the [`View`] the event pertains to — the
@@ -84,7 +116,15 @@ pub enum Event {
     /// for QC adoption (`high_qc_view` tracking and the QC's
     /// implicit chain-justification both require quorum-of-evidence).
     /// Splitting the events keeps the trust gradients honest.
-    OnRoundSync(View),
+    ///
+    /// `evidence` is a sealed token only mintable via
+    /// [`HonestyThresholdEvidence::from_bucket`] — any future producer
+    /// of this event must also pass the `f + 1` distinct-signer check
+    /// or the code won't compile (audit finding 2-3 / issue #419).
+    OnRoundSync {
+        view: View,
+        evidence: HonestyThresholdEvidence,
+    },
 }
 
 /// Why the pacemaker advanced to a new view. Plumbed through on
@@ -254,7 +294,14 @@ impl Pacemaker {
                     self.policy.timeout(self.consecutive_failures),
                 )]
             }
-            Event::OnRoundSync(v) => {
+            Event::OnRoundSync { view: v, evidence } => {
+                // The evidence token is consumed but unused here — its
+                // purpose is type-level: only the `f + 1` honesty
+                // threshold check can mint one (audit finding 2-3 /
+                // issue #419), so by the time we reach this arm the
+                // caller has already proven the view is honest-bucket
+                // backed.
+                let _ = evidence;
                 // Round sync is "I should be at this view" — jump *to*
                 // `v`, not `v + 1`. Idempotent for stale or current
                 // values: the only way to advance is strict `>`.

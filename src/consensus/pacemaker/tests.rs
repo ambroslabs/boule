@@ -15,7 +15,9 @@ use std::time::Duration;
 use crate::consensus::View;
 use crate::consensus::pacemaker::leader::{LeaderSelector, RoundRobinSelector};
 use crate::consensus::pacemaker::timeout::{ExponentialBackoff, TimeoutPolicy};
-use crate::consensus::pacemaker::{Action, AdvanceCause, Event, Pacemaker};
+use crate::consensus::pacemaker::{
+    Action, AdvanceCause, Event, HonestyThresholdEvidence, Pacemaker,
+};
 use crate::consensus::validator_set::ValidatorSet;
 use crate::p2p::NodeId;
 
@@ -65,6 +67,13 @@ fn find_reset_timer(actions: &[Action]) -> Option<Duration> {
         Action::ResetTimer(d) => Some(*d),
         _ => None,
     })
+}
+
+/// Mint an `OnRoundSync` evidence token for tests by feeding a bucket
+/// at the threshold (1, 1) — exercises the same `from_bucket` API the
+/// integration uses without depending on `n / 3 + 1` arithmetic here.
+fn round_sync_evidence() -> HonestyThresholdEvidence {
+    HonestyThresholdEvidence::from_bucket(1, 1).expect("threshold met")
 }
 
 // ---------------------------------------------------------------------
@@ -221,7 +230,10 @@ fn proposal_received_resets_timer_at_current_backoff() {
 #[test]
 fn round_sync_jumps_to_v_not_v_plus_one_for_future_view() {
     let mut pm = make_pm(1);
-    let actions = pm.step(Event::OnRoundSync(7));
+    let actions = pm.step(Event::OnRoundSync {
+        view: 7,
+        evidence: round_sync_evidence(),
+    });
     assert_eq!(pm.current_view(), 7, "advance is *to* v, not to v + 1");
     assert!(
         actions.iter().any(|a| matches!(
@@ -246,7 +258,10 @@ fn round_sync_for_current_or_stale_view_is_noop() {
     assert_eq!(pm.current_view(), 5);
 
     // Stale.
-    let actions = pm.step(Event::OnRoundSync(3));
+    let actions = pm.step(Event::OnRoundSync {
+        view: 3,
+        evidence: round_sync_evidence(),
+    });
     assert!(
         actions.is_empty(),
         "stale round-sync is a no-op: {actions:?}"
@@ -254,7 +269,10 @@ fn round_sync_for_current_or_stale_view_is_noop() {
     assert_eq!(pm.current_view(), 5);
 
     // Current.
-    let actions = pm.step(Event::OnRoundSync(5));
+    let actions = pm.step(Event::OnRoundSync {
+        view: 5,
+        evidence: round_sync_evidence(),
+    });
     assert!(
         actions.is_empty(),
         "current-view round-sync is a no-op: {actions:?}"
@@ -272,12 +290,40 @@ fn round_sync_does_not_advance_high_qc_view() {
     let _ = pm.step(Event::OnQc(2));
     assert_eq!(pm.high_qc_view(), 2);
 
-    let _ = pm.step(Event::OnRoundSync(7));
+    let _ = pm.step(Event::OnRoundSync {
+        view: 7,
+        evidence: round_sync_evidence(),
+    });
     assert_eq!(pm.current_view(), 7);
     assert_eq!(
         pm.high_qc_view(),
         2,
         "round-sync must leave high_qc_view untouched — only OnQc moves it",
+    );
+}
+
+/// Audit finding 2-3 (issue #419): the honesty-threshold gate is typed
+/// into the API. `HonestyThresholdEvidence::from_bucket` returns `None`
+/// when the bucket is below the threshold, so a future producer cannot
+/// construct an `OnRoundSync` payload without observing `f + 1`
+/// distinct signers — the bucket-size *is* the gate.
+#[test]
+fn honesty_threshold_evidence_below_bucket_is_none() {
+    assert!(
+        HonestyThresholdEvidence::from_bucket(0, 1).is_none(),
+        "0 < 1: no evidence",
+    );
+    assert!(
+        HonestyThresholdEvidence::from_bucket(1, 2).is_none(),
+        "1 < 2: no evidence",
+    );
+    assert!(
+        HonestyThresholdEvidence::from_bucket(2, 2).is_some(),
+        "2 >= 2: evidence",
+    );
+    assert!(
+        HonestyThresholdEvidence::from_bucket(5, 2).is_some(),
+        "above-threshold buckets also yield evidence",
     );
 }
 
