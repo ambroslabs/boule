@@ -8,6 +8,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::consensus::hotstuff::qc::quorum_size;
+use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::status::{
     BUCKET_VIEW_WINDOW, CacheEvictionStatus, ConsensusStatus, LockedStatus, ParkedProposalStatus,
     QcStatus, TimeoutBucketStatus, VoteBucketStatus,
@@ -19,19 +20,18 @@ use crate::p2p::NodeId;
 use super::ConsensusNode;
 
 /// Compute the `self_role` string for a [`ConsensusStatus`]: either
-/// `"leader(view=N)"` when `self_id` is the round-robin proposer for
-/// `view`, or `"replica"` otherwise.
+/// `"leader(view=N)"` when `self_id` is the proposer for `view`
+/// according to the installed leader selector, or `"replica"` otherwise.
 ///
-/// Kept module-private and free-standing so
-/// [`ConsensusNode::build_status`] doesn't have to hold a
-/// [`crate::consensus::pacemaker::leader::RoundRobinSelector`]: the
-/// round-robin rule (`validators[view % len]`) is the selector the
-/// rest of the integration layer uses, and duplicating that one-liner
-/// here keeps `ConsensusNode` from threading the selector through every
-/// call. See
-/// [`crate::consensus::pacemaker::leader::RoundRobinSelector`] for the
-/// authoritative implementation.
+/// Resolves the leader through [`Pacemaker::leader_for_view`] so the
+/// status string honors whichever selector is in effect (round-robin,
+/// weighted accumulator, or any future impl). When the selector is the
+/// production default [`crate::consensus::pacemaker::leader::WeightedAccumulatorSelector`]
+/// the role string tracks stake-weighted leadership exactly; under
+/// [`crate::consensus::pacemaker::leader::RoundRobinSelector`] it
+/// reduces to the previous `validators[view % len]` rule.
 pub(super) fn self_role_string(
+    pacemaker: &Pacemaker,
     validator_set: &ValidatorSet,
     self_id: &NodeId,
     view: View,
@@ -39,10 +39,11 @@ pub(super) fn self_role_string(
     if validator_set.is_empty() {
         return "replica".to_string();
     }
-    let idx = (view.0 % validator_set.len() as u64) as usize;
-    match validator_set.get(idx) {
-        Some(leader) if leader.as_node_id() == self_id => format!("leader(view={view})"),
-        _ => "replica".to_string(),
+    let leader = pacemaker.leader_for_view(view);
+    if &leader == self_id {
+        format!("leader(view={view})")
+    } else {
+        "replica".to_string()
     }
 }
 
@@ -60,7 +61,12 @@ impl ConsensusNode {
         let vs_len = self.validator_set.len();
         let quorum = quorum_size(vs_len);
 
-        let self_role = self_role_string(&self.validator_set, &self.self_id, current_view);
+        let self_role = self_role_string(
+            &self.pacemaker,
+            &self.validator_set,
+            &self.self_id,
+            current_view,
+        );
 
         let locked = state.locked.as_ref().map(|l| LockedStatus {
             view: l.view,
