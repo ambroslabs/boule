@@ -183,7 +183,7 @@ pub fn apply_reconfig_commands_to_set_history(
         // effect.
         let conflict = set_history
             .iter()
-            .any(|(v_eff, _)| v_eff != 0 && v_eff > block_view);
+            .any(|(v_eff, _)| v_eff != View::ZERO && v_eff > block_view);
         if conflict {
             continue;
         }

@@ -28,8 +28,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::consensus::View;
 use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
+use crate::consensus::{Height, View};
 use crate::crypto::signed::Signed;
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
@@ -222,7 +222,7 @@ pub enum Action {
     RequestBlock {
         hash: BlockHash,
         peer: NodeId,
-        expected_height: u64,
+        expected_height: Height,
         reason: BlockSyncReason,
     },
     /// A validator just signed a vote at `view` for `block_b` after
@@ -460,7 +460,7 @@ struct BlockSyncInflight {
     /// every retry's `expected_height` field. Cached here so the
     /// retry loop doesn't have to re-walk `parked_proposals` to
     /// reassemble the action.
-    expected_height: u64,
+    expected_height: Height,
 }
 
 impl HotStuffCore {
@@ -503,7 +503,7 @@ impl HotStuffCore {
             vote_dedupe: HashMap::new(),
             parked_proposals: HashMap::new(),
             block_sync_inflight: HashMap::new(),
-            proposed_in_view: 0,
+            proposed_in_view: View::ZERO,
             builder,
             limits,
             eviction_counters,
@@ -642,7 +642,7 @@ impl HotStuffCore {
         &mut self,
         hash: BlockHash,
         original_sender: NodeId,
-        expected_height: u64,
+        expected_height: Height,
     ) {
         self.block_sync_inflight.insert(
             hash,
@@ -774,7 +774,8 @@ impl HotStuffCore {
     /// - the parent block the QC refers to is not in `pending_blocks`
     ///   (block-sync not yet complete; a later `PacemakerAdvance`
     ///   will retry once the block arrives — see issue #243).
-    pub fn become_leader(&mut self, view: View) -> Vec<Action> {
+    pub fn become_leader(&mut self, view: impl Into<View>) -> Vec<Action> {
+        let view = view.into();
         self.build_proposal_at_view(view)
     }
 
@@ -817,8 +818,8 @@ impl HotStuffCore {
                 Err(e) => {
                     tracing::warn!(
                         target: TRACE_TARGET,
-                        view,
-                        parent_height = parent.header.height,
+                        view = view.0,
+                        parent_height = parent.header.height.0,
                         error = %e,
                         "block_builder_build_failed",
                     );
@@ -907,7 +908,7 @@ impl HotStuffCore {
             // saturating_sub guards against the (unreachable) genesis-
             // child case so the field stays sane even if a malformed
             // proposal claims height 0.
-            let expected_height = signed.payload.block.header.height.saturating_sub(1);
+            let expected_height = signed.payload.block.header.height.saturating_sub(Height(1));
             // Make room before insert: idempotent re-park of an
             // already-known child_hash doesn't grow the map, so the
             // cap check only fires on genuinely new entries.
@@ -1026,7 +1027,7 @@ impl HotStuffCore {
             // check: the paper initializes `block ← b0` (genesis,
             // height 0), so promoting to a positive-height `b'`
             // matches, and locking on genesis stays a no-op.
-            let current_height = self.state.locked.map(|l| l.height).unwrap_or(0);
+            let current_height = self.state.locked.map(|l| l.height).unwrap_or(Height::ZERO);
             if candidate.height > current_height {
                 self.state.locked = Some(candidate);
                 actions.push(Action::Persist(StateUpdate::Locked(candidate)));
@@ -1290,7 +1291,7 @@ impl HotStuffCore {
             actions.extend(self.try_emit_block_sync_retry(
                 block_hash,
                 sender,
-                0,
+                Height::ZERO,
                 BlockSyncReason::UnknownHighQcOnNewView,
             ));
         }
@@ -1477,7 +1478,7 @@ impl HotStuffCore {
         &mut self,
         parent_hash: BlockHash,
         original_sender: NodeId,
-        expected_height: u64,
+        expected_height: Height,
         reason: BlockSyncReason,
     ) -> Vec<Action> {
         // First sighting: install the tracker and emit the initial
@@ -1519,7 +1520,7 @@ impl HotStuffCore {
             .state
             .current_view
             .saturating_sub(snapshot.last_asked_view);
-        if elapsed < backoff {
+        if elapsed.0 < backoff {
             return Vec::new();
         }
         let peer = pick_block_sync_peer(
@@ -1637,7 +1638,7 @@ impl HotStuffCore {
                 target: TRACE_TARGET,
                 cache = "vote_bucket",
                 policy = "gc_below",
-                gc_below,
+                gc_below = gc_below.0,
                 dropped,
                 size_after = self.vote_bucket.len(),
                 "consensus_cache_evicted",
@@ -1667,7 +1668,7 @@ impl HotStuffCore {
                 target: TRACE_TARGET,
                 cache = "vote_bucket",
                 policy = "cap",
-                evicted_view = victim_key.0,
+                evicted_view = victim_key.0.0,
                 cap = self.limits.vote_bucket_capacity,
                 size_after = self.vote_bucket.len(),
                 "consensus_cache_evicted",
@@ -1699,7 +1700,7 @@ impl HotStuffCore {
                 target: TRACE_TARGET,
                 cache = "parked_proposals",
                 policy = "cap",
-                evicted_view = victim_view,
+                evicted_view = victim_view.0,
                 cap = self.limits.parked_proposals_capacity,
                 size_after = self.parked_proposals.len(),
                 "consensus_cache_evicted",
@@ -1758,7 +1759,7 @@ fn round_robin_leader(vs: &ValidatorSet, view: View) -> NodeId {
     // the wire layer (and the rest of the integration callers) work
     // in `NodeId` space (#328 keeps the bytes reusable across the
     // typestate boundary).
-    vs.get((view as usize) % len)
+    vs.get((view.0 as usize) % len)
         .expect("validator set is non-empty")
         .into_node_id()
 }
@@ -1887,7 +1888,12 @@ mod tests {
     /// `[sender[0]; 64]` — distinct per sender so tests can inspect
     /// QC signature ordering if needed. The core doesn't verify
     /// signatures; any byte pattern is accepted.
-    pub(crate) fn signed_vote(view: View, block_hash: BlockHash, sender: NodeId) -> Signed<Vote> {
+    pub(crate) fn signed_vote(
+        view: impl Into<View>,
+        block_hash: BlockHash,
+        sender: NodeId,
+    ) -> Signed<Vote> {
+        let view = view.into();
         Signed {
             payload: Vote { view, block_hash },
             signer: sender,
@@ -1924,7 +1930,8 @@ mod tests {
     /// hash, no signatures populated — sized for the canonical
     /// four-validator set. Adequate for the safety-rule predicates
     /// because they only read `view` / `block_hash`.
-    pub(crate) fn dummy_qc(view: View, block_hash: BlockHash) -> QuorumCertificate {
+    pub(crate) fn dummy_qc(view: impl Into<View>, block_hash: BlockHash) -> QuorumCertificate {
+        let view = view.into();
         QuorumCertificate::new(view, block_hash, validators().len())
     }
 
@@ -1937,13 +1944,14 @@ mod tests {
     /// per-block proposer can mutate the returned blocks.
     pub(crate) fn chain_from_genesis(
         genesis: &Block,
-        views: &[View],
+        views: &[u64],
         proposer: NodeId,
     ) -> Vec<Block> {
         let mut out = Vec::with_capacity(views.len());
         let mut parent_hash = genesis.hash();
         for (i, &view) in views.iter().enumerate() {
-            let height = genesis.header.height + (i as u64) + 1;
+            let height = genesis.header.height + Height((i as u64) + 1);
+            let view = View(view);
             let header = BlockHeader {
                 parent_hash,
                 height,
@@ -2009,10 +2017,11 @@ mod tests {
     /// Build an orphan block whose `parent_hash` is `orphan_parent` and
     /// whose own contents are deterministic given the view. Used to
     /// exercise the missing-parent dispatch branch.
-    fn orphan_child(orphan_parent: BlockHash, view: View, proposer: NodeId) -> Block {
+    fn orphan_child(orphan_parent: BlockHash, view: impl Into<View>, proposer: NodeId) -> Block {
+        let view = view.into();
         let header = BlockHeader {
             parent_hash: orphan_parent,
-            height: 1,
+            height: Height(1),
             view,
             proposer,
             state_commitment: [0; 32],
@@ -2038,7 +2047,7 @@ mod tests {
         // Justify can be any QC — dispatch doesn't inspect it on the
         // missing-parent branch because it returns before the
         // safe-to-vote check.
-        let justify = dummy_qc(0, core.state().genesis_hash);
+        let justify = dummy_qc(View(0), core.state().genesis_hash);
         let signed = signed_proposal(child, justify, sender);
 
         let actions = core.step(Event::ProposalReceived(
@@ -2053,12 +2062,12 @@ mod tests {
             vec![Action::RequestBlock {
                 hash: orphan_parent,
                 peer: sender,
-                expected_height: 0,
+                expected_height: Height(0),
                 reason: BlockSyncReason::UnknownParentOnProposal,
             }],
         );
         assert!(core.parked_proposals.contains_key(&child_hash));
-        assert_eq!(core.state().last_voted_view, 0);
+        assert_eq!(core.state().last_voted_view, View(0));
         assert!(core.state().locked.is_none());
         assert!(core.state().high_qc.is_none());
     }
@@ -2073,7 +2082,7 @@ mod tests {
         let sender = nid(2);
         let orphan_parent: BlockHash = [0xAA; 32];
         let child = orphan_child(orphan_parent, 1, nid(3));
-        let justify = dummy_qc(0, core.state().genesis_hash);
+        let justify = dummy_qc(View(0), core.state().genesis_hash);
         let signed = signed_proposal(child, justify, sender);
 
         let _ = core.step(Event::ProposalReceived(
@@ -2088,7 +2097,7 @@ mod tests {
             vec![Action::RequestBlock {
                 hash: orphan_parent,
                 peer: sender,
-                expected_height: 0,
+                expected_height: Height(0),
                 reason: BlockSyncReason::UnknownParentOnProposal,
             }],
             "re-delivery must still produce a RequestBlock so the \
@@ -2112,7 +2121,7 @@ mod tests {
         let genesis = Block::genesis([0; 32], [0; 32]);
         let block = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
         let block_hash = block.hash();
-        let justify = dummy_qc(0, genesis.hash());
+        let justify = dummy_qc(View(0), genesis.hash());
         let signed = signed_proposal(block, justify.clone(), nid(2));
 
         let actions = core.step(Event::ProposalReceived(
@@ -2122,19 +2131,19 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                Action::Persist(StateUpdate::VotedInView { view: 1 }),
+                Action::Persist(StateUpdate::VotedInView { view: View(1) }),
                 Action::Persist(StateUpdate::HighQc(justify)),
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
-                    view: 1,
+                    view: View(1),
                     block_hash,
                 })),
             ],
             "happy-path emission order is VotedInView → HighQc → Broadcast(Vote)",
         );
-        assert_eq!(core.state().last_voted_view, 1);
+        assert_eq!(core.state().last_voted_view, View(1));
         assert_eq!(
             core.state().high_qc.as_ref().map(|q| q.view()),
-            Some(0),
+            Some(View(0)),
             "high_qc adopted from the proposal's justify",
         );
     }
@@ -2145,7 +2154,7 @@ mod tests {
     fn second_proposal_at_same_view_emits_no_vote() {
         let mut core = make_core(1);
         let genesis = Block::genesis([0; 32], [0; 32]);
-        let justify = dummy_qc(0, genesis.hash());
+        let justify = dummy_qc(View(0), genesis.hash());
 
         // First proposal at view 1 — vote emitted.
         let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
@@ -2156,7 +2165,7 @@ mod tests {
                 nid(2),
             )),
         ));
-        assert_eq!(core.state().last_voted_view, 1);
+        assert_eq!(core.state().last_voted_view, View(1));
 
         // Second proposal at view 1 with a DIFFERENT block. Same
         // view, different state_commitment → different hash. This is
@@ -2167,8 +2176,8 @@ mod tests {
         let block_b = Block {
             header: BlockHeader {
                 parent_hash: genesis.hash(),
-                height: 1,
-                view: 1,
+                height: Height(1),
+                view: View(1),
                 proposer: nid(2),
                 state_commitment: [0xFF; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -2186,7 +2195,7 @@ mod tests {
             second.is_empty(),
             "a second proposal at the same view must emit no actions: {second:?}",
         );
-        assert_eq!(core.state().last_voted_view, 1);
+        assert_eq!(core.state().last_voted_view, View(1));
         // The forked block IS inserted into pending_blocks — the
         // core tracks the fork even though it won't vote on it —
         // which matters for the three-chain commit rule later.
@@ -2197,14 +2206,15 @@ mod tests {
 
     /// Build a "fork at `view`, rooted on genesis" — the canonical
     /// shape the safety-rule tests use to exercise non-extension.
-    fn fork_rooted_on_genesis(genesis_hash: BlockHash, view: View) -> Block {
+    fn fork_rooted_on_genesis(genesis_hash: BlockHash, view: impl Into<View>) -> Block {
+        let view = view.into();
         Block {
             header: BlockHeader {
                 parent_hash: genesis_hash,
-                height: 1,
+                height: Height(1),
                 view,
                 proposer: nid(3),
-                state_commitment: [view as u8; 32],
+                state_commitment: [view.0 as u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
             },
@@ -2223,11 +2233,11 @@ mod tests {
         let locked_height = locked_block.header.height;
         core.state.insert_pending(locked_block);
         core.state.locked = Some(Locked {
-            view: 5,
+            view: View(5),
             height: locked_height,
             block_hash: locked_hash,
         });
-        core.state.last_voted_view = 5;
+        core.state.last_voted_view = View(5);
 
         // Fork at view 6 rooted directly on genesis (does NOT extend
         // the locked block at view 5) with a justify at view 3 —
@@ -2235,7 +2245,7 @@ mod tests {
         // nor the liveness rule fires; safe_to_vote returns false.
         let fork = fork_rooted_on_genesis(genesis.hash(), 6);
         let fork_hash = fork.hash();
-        let stale_justify = dummy_qc(3, genesis.hash());
+        let stale_justify = dummy_qc(View(3), genesis.hash());
         let signed = signed_proposal(fork, stale_justify, nid(3));
 
         let actions = core.step(Event::ProposalReceived(
@@ -2248,12 +2258,12 @@ mod tests {
         );
         assert_eq!(
             core.state().last_voted_view,
-            5,
+            View(5),
             "last_voted_view untouched when refusing to vote",
         );
         assert_eq!(
             core.state().locked.map(|l| l.view),
-            Some(5),
+            Some(View(5)),
             "lock is not disturbed by a refused proposal",
         );
         // The fork IS inserted into pending_blocks — a later proposal
@@ -2278,15 +2288,15 @@ mod tests {
         let locked_height = locked_block.header.height;
         core.state.insert_pending(locked_block);
         core.state.locked = Some(Locked {
-            view: 5,
+            view: View(5),
             height: locked_height,
             block_hash: locked_hash,
         });
-        core.state.last_voted_view = 5;
+        core.state.last_voted_view = View(5);
 
         let fork = fork_rooted_on_genesis(genesis.hash(), 10);
         let fork_hash = fork.hash();
-        let fresh_justify = dummy_qc(9, [0xEE; 32]);
+        let fresh_justify = dummy_qc(View(9), [0xEE; 32]);
         let signed = signed_proposal(fork, fresh_justify.clone(), nid(3));
 
         let actions = core.step(Event::ProposalReceived(
@@ -2296,20 +2306,23 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                Action::Persist(StateUpdate::VotedInView { view: 10 }),
+                Action::Persist(StateUpdate::VotedInView { view: View(10) }),
                 Action::Persist(StateUpdate::HighQc(fresh_justify)),
                 // Votes are broadcast (not addressed to the next
                 // leader) so that QC formation survives the next
                 // leader being crashed — see `on_proposal_received`
                 // (#124).
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
-                    view: 10,
+                    view: View(10),
                     block_hash: fork_hash,
                 })),
             ],
         );
-        assert_eq!(core.state().last_voted_view, 10);
-        assert_eq!(core.state().high_qc.as_ref().map(|q| q.view()), Some(9));
+        assert_eq!(core.state().last_voted_view, View(10));
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.view()),
+            Some(View(9))
+        );
     }
 
     // ── D5: Byzantine fork at same view from different proposers ─────
@@ -2327,7 +2340,7 @@ mod tests {
         // regardless of what the integration layer (#24) filters.
         let mut core = make_core(1);
         let genesis = Block::genesis([0; 32], [0; 32]);
-        let justify = dummy_qc(0, genesis.hash());
+        let justify = dummy_qc(View(0), genesis.hash());
 
         // The legitimate view-1 leader (nid(2)) proposes first.
         let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
@@ -2352,8 +2365,8 @@ mod tests {
         let block_b = Block {
             header: BlockHeader {
                 parent_hash: genesis.hash(),
-                height: 1,
-                view: 1,
+                height: Height(1),
+                view: View(1),
                 proposer: nid(3),
                 state_commitment: [0xCC; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -2374,7 +2387,7 @@ mod tests {
             second.is_empty(),
             "Byzantine fork must not extract a second vote: {second:?}",
         );
-        assert_eq!(core.state().last_voted_view, 1);
+        assert_eq!(core.state().last_voted_view, View(1));
         // Both branches of the fork stay tracked in pending_blocks:
         // a future three-chain walk might need either of them, and
         // removing a block because we didn't vote on it would be a
@@ -2408,7 +2421,7 @@ mod tests {
         let full_chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
         let block3 = full_chain[2].clone();
         let block3_hash = block3.hash();
-        let justify = dummy_qc(2, block2.hash());
+        let justify = dummy_qc(View(2), block2.hash());
         let signed = signed_proposal(block3, justify.clone(), nid(2));
 
         let actions = core.step(Event::ProposalReceived(
@@ -2416,8 +2429,8 @@ mod tests {
         ));
 
         let expected_lock = Locked {
-            view: 1,
-            height: 1,
+            view: View(1),
+            height: Height(1),
             block_hash: block1.hash(),
         };
         // Emission order: B2/B3 vote-prep persists (VotedInView,
@@ -2431,11 +2444,11 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                Action::Persist(StateUpdate::VotedInView { view: 3 }),
+                Action::Persist(StateUpdate::VotedInView { view: View(3) }),
                 Action::Persist(StateUpdate::HighQc(justify)),
                 Action::Persist(StateUpdate::Locked(expected_lock)),
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
-                    view: 3,
+                    view: View(3),
                     block_hash: block3_hash,
                 })),
                 Action::Commit(genesis.clone()),
@@ -2474,7 +2487,7 @@ mod tests {
 
         let full_chain = chain_from_genesis(&genesis, &[1, 2, 3], nid(2));
         let block3 = full_chain[2].clone();
-        let justify = dummy_qc(2, block2.hash());
+        let justify = dummy_qc(View(2), block2.hash());
         let signed = signed_proposal(block3, justify, nid(2));
 
         let actions = core.step(Event::ProposalReceived(
@@ -2512,8 +2525,8 @@ mod tests {
         core.state.insert_pending(prefix[1].clone());
 
         let preset = Locked {
-            view: 99,
-            height: 99,
+            view: View(99),
+            height: Height(99),
             block_hash: [0xAB; 32],
         };
         core.state.locked = Some(preset);
@@ -2523,8 +2536,8 @@ mod tests {
         let block3 = Block {
             header: BlockHeader {
                 parent_hash: prefix[1].hash(),
-                height: 3,
-                view: 100,
+                height: Height(3),
+                view: View(100),
                 proposer: nid(2),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -2532,7 +2545,7 @@ mod tests {
             },
             commands: Vec::new(),
         };
-        let justify = dummy_qc(2, prefix[1].hash());
+        let justify = dummy_qc(View(2), prefix[1].hash());
         let signed = signed_proposal(block3, justify, nid(2));
 
         let actions = core.step(Event::ProposalReceived(
@@ -2571,7 +2584,7 @@ mod tests {
 
         let full = chain_from_genesis(&genesis, &[1, 2, 3, 4, 5], nid(2));
         let block_v5 = full[4].clone();
-        let justify = dummy_qc(4, block_v4.hash());
+        let justify = dummy_qc(View(4), block_v4.hash());
         let signed = signed_proposal(block_v5.clone(), justify, nid(2));
 
         let actions = core.step(Event::ProposalReceived(
@@ -2625,7 +2638,7 @@ mod tests {
         // Proposal at view 6, parent=v5, justify=QC(v5).
         let full = chain_from_genesis(&genesis, &[1, 2, 5, 6], nid(2));
         let block_v6 = full[3].clone();
-        let justify = dummy_qc(5, chain[2].hash());
+        let justify = dummy_qc(View(5), chain[2].hash());
         let signed = signed_proposal(block_v6, justify, nid(2));
 
         let actions = core.step(Event::ProposalReceived(
@@ -2664,7 +2677,7 @@ mod tests {
         let block_v3 = chain[2].clone();
 
         // ── Step 1 — proposal at view 1, parent=genesis ────────────
-        let justify_v0 = dummy_qc(0, genesis.hash());
+        let justify_v0 = dummy_qc(View(0), genesis.hash());
         let signed_v1 = signed_proposal(block_v1.clone(), justify_v0.clone(), nid(2));
         let step1 = core.step(Event::ProposalReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_v1),
@@ -2675,20 +2688,20 @@ mod tests {
         assert_eq!(
             step1,
             vec![
-                Action::Persist(StateUpdate::VotedInView { view: 1 }),
+                Action::Persist(StateUpdate::VotedInView { view: View(1) }),
                 Action::Persist(StateUpdate::HighQc(justify_v0)),
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
-                    view: 1,
+                    view: View(1),
                     block_hash: block_v1.hash(),
                 })),
             ],
             "first proposal: vote + high_qc only",
         );
         assert!(core.state().locked.is_none());
-        assert_eq!(core.state().last_voted_view, 1);
+        assert_eq!(core.state().last_voted_view, View(1));
 
         // ── Step 2 — proposal at view 2, parent=block_v1 ───────────
-        let justify_v1 = dummy_qc(1, block_v1.hash());
+        let justify_v1 = dummy_qc(View(1), block_v1.hash());
         let signed_v2 = signed_proposal(block_v2.clone(), justify_v1.clone(), nid(2));
         let step2 = core.step(Event::ProposalReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_v2),
@@ -2701,20 +2714,20 @@ mod tests {
         assert_eq!(
             step2,
             vec![
-                Action::Persist(StateUpdate::VotedInView { view: 2 }),
+                Action::Persist(StateUpdate::VotedInView { view: View(2) }),
                 Action::Persist(StateUpdate::HighQc(justify_v1)),
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
-                    view: 2,
+                    view: View(2),
                     block_hash: block_v2.hash(),
                 })),
             ],
             "second proposal: still vote + high_qc only",
         );
         assert!(core.state().locked.is_none());
-        assert_eq!(core.state().last_voted_view, 2);
+        assert_eq!(core.state().last_voted_view, View(2));
 
         // ── Step 3 — proposal at view 3, parent=block_v2 ───────────
-        let justify_v2 = dummy_qc(2, block_v2.hash());
+        let justify_v2 = dummy_qc(View(2), block_v2.hash());
         let signed_v3 = signed_proposal(block_v3.clone(), justify_v2.clone(), nid(2));
         let step3 = core.step(Event::ProposalReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_v3),
@@ -2729,25 +2742,25 @@ mod tests {
         // — see the deferral comment in `on_proposal_received` and
         // audit finding 4-1 (#405).
         let expected_lock = Locked {
-            view: 1,
-            height: 1,
+            view: View(1),
+            height: Height(1),
             block_hash: block_v1.hash(),
         };
         assert_eq!(
             step3,
             vec![
-                Action::Persist(StateUpdate::VotedInView { view: 3 }),
+                Action::Persist(StateUpdate::VotedInView { view: View(3) }),
                 Action::Persist(StateUpdate::HighQc(justify_v2)),
                 Action::Persist(StateUpdate::Locked(expected_lock)),
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
-                    view: 3,
+                    view: View(3),
                     block_hash: block_v3.hash(),
                 })),
                 Action::Commit(genesis.clone()),
             ],
             "third proposal: vote + high_qc + lock promote + Commit(genesis)",
         );
-        assert_eq!(core.state().last_voted_view, 3);
+        assert_eq!(core.state().last_voted_view, View(3));
         assert_eq!(core.state().locked, Some(expected_lock));
         // Genesis pruned; v1, v2, v3 remain.
         let pending = &core.state().pending_blocks;
@@ -2782,7 +2795,7 @@ mod tests {
         assert!(actions.is_empty(), "sub-quorum vote is silent: {actions:?}");
         let bucket = core
             .vote_bucket
-            .get(&(2, block_hash))
+            .get(&(View(2), block_hash))
             .expect("non-leader still accumulates into its local bucket");
         assert_eq!(
             bucket.signer_count(),
@@ -2813,7 +2826,7 @@ mod tests {
 
         let bucket = core
             .vote_bucket
-            .get(&(3, block_hash))
+            .get(&(View(3), block_hash))
             .expect("bucket keyed by (view, block_hash) must exist after two votes");
         assert_eq!(bucket.signer_count(), 2, "both signatures recorded",);
         assert!(
@@ -2862,7 +2875,7 @@ mod tests {
             header: BlockHeader {
                 parent_hash: block_v3_hash,
                 height: block_v3.header.height + 1,
-                view: 4,
+                view: View(4),
                 proposer: nid(1),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -2879,7 +2892,7 @@ mod tests {
             step3,
             vec![
                 Action::Persist(StateUpdate::HighQc(expected_qc.clone())),
-                Action::Persist(StateUpdate::ProposedInView { view: 4 }),
+                Action::Persist(StateUpdate::ProposedInView { view: View(4) }),
                 Action::Broadcast(ConsensusMsg::Proposal(Proposal {
                     block: expected_new_block,
                     justify: expected_qc.clone(),
@@ -2891,7 +2904,7 @@ mod tests {
             core.state().high_qc.as_ref().map(|q| q.inner()),
             Some(&expected_qc)
         );
-        assert_eq!(core.proposed_in_view(), 4);
+        assert_eq!(core.proposed_in_view(), View(4));
     }
 
     // ── BLS QC formation (#354 step 2) ──────────────────────────────
@@ -2933,7 +2946,7 @@ mod tests {
         // Build one BLS partial per voter at indices 1, 2, 3
         // (validators nid(2..4)) over the canonical Vote pre-image.
         let vote = Vote {
-            view: 3,
+            view: View(3),
             block_hash: block_v3_hash,
         };
         let preimg = preimage::<Vote>(&vote, &crate::crypto::signed::ChainId::TEST).unwrap();
@@ -2985,32 +2998,32 @@ mod tests {
     #[test]
     fn pacemaker_advance_updates_view_and_broadcasts_new_view_when_high_qc_known() {
         let mut core = make_core(1);
-        assert_eq!(core.state().current_view, 0);
+        assert_eq!(core.state().current_view, View(0));
 
         // Early: no high_qc yet → view updates but we skip the
         // broadcast. The skip window only exists between construction
         // and the first proposal landing.
-        let early = core.step(Event::PacemakerAdvance(1));
+        let early = core.step(Event::PacemakerAdvance(View(1)));
         assert!(
             early.is_empty(),
             "no high_qc yet → no NewView broadcast: {early:?}",
         );
-        assert_eq!(core.state().current_view, 1);
+        assert_eq!(core.state().current_view, View(1));
 
         // Seed a high_qc as if a proposal had adopted one.
-        let qc = dummy_qc(5, [0xAA; 32]);
+        let qc = dummy_qc(View(5), [0xAA; 32]);
         core.state.high_qc = Some(VerifiedQc::unchecked(qc.clone()));
 
         // Later PacemakerAdvance → view updates AND the broadcast
         // carries the current high_qc.
-        let later = core.step(Event::PacemakerAdvance(7));
+        let later = core.step(Event::PacemakerAdvance(View(7)));
         assert_eq!(
             later,
             vec![Action::Broadcast(ConsensusMsg::NewView(NewView {
                 high_qc: qc,
             }))],
         );
-        assert_eq!(core.state().current_view, 7);
+        assert_eq!(core.state().current_view, View(7));
     }
 
     // ── #243: leader catches up via block-sync, then proposes ───────
@@ -3040,7 +3053,7 @@ mod tests {
         let chain = chain_from_genesis(&genesis, &[1, 2, 3, 4], nid(1));
         let high_qc_block = chain[3].clone(); // view 4, height 4
         let high_qc_hash = high_qc_block.hash();
-        let high_qc = dummy_qc(4, high_qc_hash);
+        let high_qc = dummy_qc(View(4), high_qc_hash);
 
         // Mimic the post-restart wedge: NewView from a peer adopts a
         // fresh high_qc, but block-sync hasn't delivered the block
@@ -3053,8 +3066,8 @@ mod tests {
             BlockSyncInflight {
                 original_sender: nid(3),
                 attempts: 1,
-                last_asked_view: 0,
-                expected_height: 0,
+                last_asked_view: View(0),
+                expected_height: Height(0),
             },
         );
 
@@ -3063,7 +3076,7 @@ mod tests {
         // yet. The actions must include NewView (we have a high_qc to
         // advertise) and a block-sync retry (because we have an
         // outstanding inflight entry the pacemaker drives).
-        let advance_to_5 = core.step(Event::PacemakerAdvance(5));
+        let advance_to_5 = core.step(Event::PacemakerAdvance(View(5)));
         let proposed_now = advance_to_5
             .iter()
             .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
@@ -3097,7 +3110,7 @@ mod tests {
         // `node.rs::Dispatch::ReceiveBlock`). Now that the parent is
         // available the safety core MUST broadcast the leader's
         // proposal — this is the recovery path issue #243 needs.
-        let recovery = core.step(Event::PacemakerAdvance(5));
+        let recovery = core.step(Event::PacemakerAdvance(View(5)));
         let proposal = recovery.iter().find_map(|a| match a {
             Action::Broadcast(ConsensusMsg::Proposal(p)) => Some(p.clone()),
             _ => None,
@@ -3109,7 +3122,8 @@ mod tests {
             )
         });
         assert_eq!(
-            proposal.block.header.view, 5,
+            proposal.block.header.view,
+            View(5),
             "proposal must be at the leader's current view"
         );
         assert_eq!(
@@ -3131,7 +3145,7 @@ mod tests {
         // re-propose. Re-proposing would split votes across two
         // leader proposals at the same view and is indistinguishable
         // from Byzantine equivocation.
-        let dup = core.step(Event::PacemakerAdvance(5));
+        let dup = core.step(Event::PacemakerAdvance(View(5)));
         let dup_proposed = dup
             .iter()
             .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
@@ -3156,7 +3170,7 @@ mod tests {
 
         // Empty `high_qc` → any incoming QC is strictly fresher and
         // adopted. Emission: single `Persist(HighQc(qc))`.
-        let qc_v5 = dummy_qc(5, block_hash);
+        let qc_v5 = dummy_qc(View(5), block_hash);
         let fresh = core.step(Event::NewViewReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_newview(qc_v5.clone(), nid(2))),
         ));
@@ -3171,7 +3185,7 @@ mod tests {
 
         // Same view — `should_update_high_qc` requires strictly
         // greater, so no action, no state change.
-        let qc_v5_alt = dummy_qc(5, [0x22; 32]);
+        let qc_v5_alt = dummy_qc(View(5), [0x22; 32]);
         let same = core.step(Event::NewViewReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_newview(qc_v5_alt, nid(3))),
         ));
@@ -3182,7 +3196,7 @@ mod tests {
         );
 
         // Strictly older — dropped.
-        let qc_v3 = dummy_qc(3, [0x33; 32]);
+        let qc_v3 = dummy_qc(View(3), [0x33; 32]);
         let stale = core.step(Event::NewViewReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_newview(qc_v3, nid(4))),
         ));
@@ -3194,7 +3208,7 @@ mod tests {
 
         // Strictly newer over the genesis hash again — adopted,
         // overwriting the previous, still no block-sync (block known).
-        let qc_v9 = dummy_qc(9, block_hash);
+        let qc_v9 = dummy_qc(View(9), block_hash);
         let newer = core.step(Event::NewViewReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_newview(qc_v9.clone(), nid(2))),
         ));
@@ -3219,7 +3233,7 @@ mod tests {
     fn newview_with_unknown_block_hash_seeds_block_sync() {
         let mut core = make_core(1);
         let unknown_hash: BlockHash = [0xC0; 32];
-        let qc_v7 = dummy_qc(7, unknown_hash);
+        let qc_v7 = dummy_qc(View(7), unknown_hash);
         let sender = nid(2);
 
         let actions = core.step(Event::NewViewReceived(
@@ -3233,7 +3247,7 @@ mod tests {
                 Action::RequestBlock {
                     hash: unknown_hash,
                     peer: sender,
-                    expected_height: 0,
+                    expected_height: Height(0),
                     reason: BlockSyncReason::UnknownHighQcOnNewView,
                 },
             ],
@@ -3261,7 +3275,7 @@ mod tests {
         let block_v1_hash = block_v1.hash();
         core.state.insert_pending(block_v1);
 
-        let qc_v1 = dummy_qc(1, block_v1_hash);
+        let qc_v1 = dummy_qc(View(1), block_v1_hash);
         let actions = core.step(Event::NewViewReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_newview(qc_v1.clone(), nid(2))),
         ));
@@ -3331,7 +3345,7 @@ mod tests {
         // quorum. The duplicate didn't bump the count.
         let bucket = core
             .vote_bucket
-            .get(&(3, block_v3_hash))
+            .get(&(View(3), block_v3_hash))
             .expect("bucket keyed by (3, block_v3_hash) must still exist");
         assert_eq!(bucket.signer_count(), 4);
         assert!(bucket.has_quorum(&core.state.validator_set));
@@ -3374,7 +3388,7 @@ mod tests {
         // Old genesis set is `[nid(1), nid(2), nid(3), nid(4)]` from
         // `validators()`. Boundary at v_eff = 5 swaps in a new set
         // that drops nid(4) and adds nid(5) + nid(6) to keep size 5.
-        let v_eff: View = 5;
+        let v_eff: View = View(5);
         let new_set = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(5), vid(6)]);
         core.state
             .validator_history
@@ -3405,7 +3419,7 @@ mod tests {
     #[test]
     fn vote_before_boundary_signed_by_new_set_only_member_is_dropped() {
         let mut core = make_core(1);
-        let v_eff: View = 5;
+        let v_eff: View = View(5);
         let new_set = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(5)]);
         core.state
             .validator_history
@@ -3435,7 +3449,7 @@ mod tests {
     #[test]
     fn vote_at_v_eff_signed_by_new_set_only_member_lands_in_bucket() {
         let mut core = make_core(1);
-        let v_eff: View = 5;
+        let v_eff: View = View(5);
         let new_set = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(7)]);
         core.state
             .validator_history
@@ -3476,7 +3490,7 @@ mod tests {
         // Validator set is the canonical four, identified by the
         // genesis pubkey bytes (vid(1..=4)).
         let mut core = make_core(1);
-        let view: View = 1;
+        let view: View = View(1);
         let block_hash: BlockHash = [0xAB; 32];
 
         // Simulate the post-rotation wire pubkey: distinct bytes that
@@ -3523,7 +3537,7 @@ mod tests {
     #[test]
     fn vote_with_unresolved_validator_id_drops_silently() {
         let mut core = make_core(1);
-        let view: View = 1;
+        let view: View = View(1);
         let block_hash: BlockHash = [0xAB; 32];
 
         let rotated_pk = nid(0xEE);
@@ -3557,7 +3571,7 @@ mod tests {
     #[test]
     fn second_vote_at_same_view_for_different_block_emits_equivocation_evidence() {
         let mut core = make_core(1);
-        let view: View = 3;
+        let view: View = View(3);
         let block_a: BlockHash = [0xAA; 32];
         let block_b: BlockHash = [0xBB; 32];
 
@@ -3608,7 +3622,7 @@ mod tests {
     #[test]
     fn duplicate_vote_for_same_block_does_not_emit_equivocation_evidence() {
         let mut core = make_core(1);
-        let view: View = 3;
+        let view: View = View(3);
         let block_hash: BlockHash = [0xAA; 32];
 
         let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
@@ -3637,7 +3651,7 @@ mod tests {
     #[test]
     fn votes_from_distinct_signers_for_distinct_blocks_do_not_emit_evidence() {
         let mut core = make_core(1);
-        let view: View = 3;
+        let view: View = View(3);
         let block_a: BlockHash = [0xAA; 32];
         let block_b: BlockHash = [0xBB; 32];
 
@@ -3695,7 +3709,7 @@ mod tests {
     #[test]
     fn pacemaker_advance_garbage_collects_vote_dedupe() {
         let mut core = make_core(1);
-        let view: View = 3;
+        let view: View = View(3);
         let block_a: BlockHash = [0xAA; 32];
 
         let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
@@ -3724,7 +3738,7 @@ mod tests {
     #[test]
     fn equivocation_evidence_is_the_only_emitted_action_on_conflict() {
         let mut core = make_core(1);
-        let view: View = 3;
+        let view: View = View(3);
         let block_a: BlockHash = [0xAA; 32];
         let block_b: BlockHash = [0xBB; 32];
 
@@ -3760,7 +3774,7 @@ mod tests {
         let block_v1 = chain[0].clone();
         let block_v2 = chain[1].clone();
         let block_v2_hash = block_v2.hash();
-        let justify_v1 = dummy_qc(1, block_v1.hash());
+        let justify_v1 = dummy_qc(View(1), block_v1.hash());
 
         // Phase 1 — parent missing, proposal parks.
         let initial = core.step(Event::ProposalReceived(
@@ -3775,7 +3789,7 @@ mod tests {
             vec![Action::RequestBlock {
                 hash: block_v1.hash(),
                 peer: nid(2),
-                expected_height: 1,
+                expected_height: Height(1),
                 reason: BlockSyncReason::UnknownParentOnProposal,
             }],
         );
@@ -3785,7 +3799,7 @@ mod tests {
         core.state.insert_pending(block_v1.clone());
 
         // Phase 3 — advance the view; un-park fires.
-        let advance = core.step(Event::PacemakerAdvance(3));
+        let advance = core.step(Event::PacemakerAdvance(View(3)));
 
         // Re-dispatch of v2 yields the normal B2/B3 actions:
         // VotedInView + HighQc + Broadcast(Vote). B4/B5 skip
@@ -3794,10 +3808,10 @@ mod tests {
         assert_eq!(
             advance,
             vec![
-                Action::Persist(StateUpdate::VotedInView { view: 2 }),
+                Action::Persist(StateUpdate::VotedInView { view: View(2) }),
                 Action::Persist(StateUpdate::HighQc(justify_v1.clone())),
                 Action::Broadcast(ConsensusMsg::Vote(Vote {
-                    view: 2,
+                    view: View(2),
                     block_hash: block_v2_hash,
                 })),
                 Action::Broadcast(ConsensusMsg::NewView(NewView {
@@ -3806,7 +3820,7 @@ mod tests {
             ],
             "un-park re-dispatch + NewView broadcast",
         );
-        assert_eq!(core.state().current_view, 3);
+        assert_eq!(core.state().current_view, View(3));
         assert!(
             !core.parked_proposals.contains_key(&block_v2_hash),
             "parked entry removed after successful re-dispatch",
@@ -3827,7 +3841,7 @@ mod tests {
         let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
         let block_v1 = chain[0].clone();
         let block_v2 = chain[1].clone();
-        let justify_v1 = dummy_qc(1, block_v1.hash());
+        let justify_v1 = dummy_qc(View(1), block_v1.hash());
 
         // Phase 1 — parent missing, proposal parks. Initial RequestBlock fires.
         let initial = core.step(Event::ProposalReceived(
@@ -3842,7 +3856,7 @@ mod tests {
             vec![Action::RequestBlock {
                 hash: block_v1.hash(),
                 peer: nid(2),
-                expected_height: 1,
+                expected_height: Height(1),
                 reason: BlockSyncReason::UnknownParentOnProposal,
             }],
         );
@@ -3850,18 +3864,18 @@ mod tests {
         // Phase 2 — parent has NOT arrived yet. PacemakerAdvance must
         // re-emit RequestBlock so the integration layer can retry.
         // No high_qc set → no trailing Broadcast(NewView).
-        let advance = core.step(Event::PacemakerAdvance(2));
+        let advance = core.step(Event::PacemakerAdvance(View(2)));
         assert_eq!(
             advance,
             vec![Action::RequestBlock {
                 hash: block_v1.hash(),
                 peer: nid(2),
-                expected_height: 1,
+                expected_height: Height(1),
                 reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
             }],
             "still-parked proposal must re-fire RequestBlock on PacemakerAdvance",
         );
-        assert_eq!(core.state().current_view, 2);
+        assert_eq!(core.state().current_view, View(2));
         assert!(
             core.parked_proposals.contains_key(&block_v2.hash()),
             "proposal stays parked until parent arrives",
@@ -3871,7 +3885,7 @@ mod tests {
         // RequestBlock retry, parent now resolved) and the un-parked
         // proposal proceeds through the happy path.
         core.state.insert_pending(block_v1.clone());
-        let advance = core.step(Event::PacemakerAdvance(3));
+        let advance = core.step(Event::PacemakerAdvance(View(3)));
         let has_request_block = advance
             .iter()
             .any(|a| matches!(a, Action::RequestBlock { .. }));
@@ -3897,7 +3911,7 @@ mod tests {
         let mut core = make_core(1);
         let parent_a: BlockHash = [0xAA; 32];
         let parent_b: BlockHash = [0xBB; 32];
-        let justify = dummy_qc(0, core.state().genesis_hash);
+        let justify = dummy_qc(View(0), core.state().genesis_hash);
 
         let _ = core.step(Event::ProposalReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_proposal(
@@ -3915,7 +3929,7 @@ mod tests {
         ));
         assert_eq!(core.parked_proposals.len(), 2);
 
-        let advance = core.step(Event::PacemakerAdvance(3));
+        let advance = core.step(Event::PacemakerAdvance(View(3)));
         let request_blocks: Vec<_> = advance
             .iter()
             .filter(|a| matches!(a, Action::RequestBlock { .. }))
@@ -3931,13 +3945,13 @@ mod tests {
         assert!(request_blocks.contains(&Action::RequestBlock {
             hash: parent_a,
             peer: nid(3),
-            expected_height: 0,
+            expected_height: Height(0),
             reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
         }));
         assert!(request_blocks.contains(&Action::RequestBlock {
             hash: parent_b,
             peer: nid(4),
-            expected_height: 0,
+            expected_height: Height(0),
             reason: BlockSyncReason::StillParkedOnPacemakerAdvance,
         }));
     }
@@ -3999,7 +4013,7 @@ mod tests {
             let mut core = make_rotation_core(1, /* per_peer = */ 2, /* max = */ 8);
             let parent: BlockHash = [0xAA; 32];
             let child = orphan_child(parent, 1, nid(3));
-            let justify = dummy_qc(0, core.state().genesis_hash);
+            let justify = dummy_qc(View(0), core.state().genesis_hash);
             let sender = nid(2);
 
             // Initial probe: attempts = 1, peer = sender.
@@ -4013,13 +4027,13 @@ mod tests {
                 vec![Action::RequestBlock {
                     hash: parent,
                     peer: sender,
-                    expected_height: 0,
+                    expected_height: Height(0),
                     reason: BlockSyncReason::UnknownParentOnProposal,
                 }],
             );
 
             // Advance #1: attempts = 1 → 2, still round 0, peer = sender.
-            let advance_one = core.step(Event::PacemakerAdvance(1));
+            let advance_one = core.step(Event::PacemakerAdvance(View(1)));
             let req_one = advance_one
                 .iter()
                 .find_map(|a| match a {
@@ -4034,7 +4048,7 @@ mod tests {
 
             // Advance #2: attempts = 2 → 3, round transitions to 1 →
             // peer rotates to the next validator (nid(3)).
-            let advance_two = core.step(Event::PacemakerAdvance(2));
+            let advance_two = core.step(Event::PacemakerAdvance(View(2)));
             let req_two = advance_two
                 .iter()
                 .find_map(|a| match a {
@@ -4066,7 +4080,7 @@ mod tests {
             let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
             let parent_block = chain[0].clone();
             let child_block = chain[1].clone();
-            let justify_v1 = dummy_qc(1, parent_block.hash());
+            let justify_v1 = dummy_qc(View(1), parent_block.hash());
 
             let _ = core.step(Event::ProposalReceived(
                 crate::consensus::dispatch::Verified::unchecked(signed_proposal(
@@ -4102,8 +4116,8 @@ mod tests {
             let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
             let parent_block = chain[0].clone();
             let child_block = chain[1].clone();
-            let justify_v0 = dummy_qc(0, genesis.hash());
-            let justify_v1 = dummy_qc(1, parent_block.hash());
+            let justify_v0 = dummy_qc(View(0), genesis.hash());
+            let justify_v1 = dummy_qc(View(1), parent_block.hash());
 
             // Park the child; in-flight entry installed for the
             // missing parent_block hash.
@@ -4146,7 +4160,7 @@ mod tests {
             let parent: BlockHash = [0xAA; 32];
             let child = orphan_child(parent, 1, nid(3));
             let child_hash = child.hash();
-            let justify = dummy_qc(0, core.state().genesis_hash);
+            let justify = dummy_qc(View(0), core.state().genesis_hash);
             let sender = nid(2);
 
             // Initial probe (attempt 1).
@@ -4158,8 +4172,8 @@ mod tests {
             assert_eq!(core.block_sync_inflight.len(), 1);
 
             // Advances 1..=3 fire attempts 2..=4.
-            for v in 1..=3 {
-                let advance = core.step(Event::PacemakerAdvance(v));
+            for v in 1..=3u64 {
+                let advance = core.step(Event::PacemakerAdvance(View(v)));
                 let request_count = advance
                     .iter()
                     .filter(|a| matches!(a, Action::RequestBlock { .. }))
@@ -4178,7 +4192,7 @@ mod tests {
             // Advance 4: attempts has reached `max_attempts (=4)`.
             // The retry loop must drop the parked proposal and tick
             // the counter; no RequestBlock emission this round.
-            let drop_advance = core.step(Event::PacemakerAdvance(4));
+            let drop_advance = core.step(Event::PacemakerAdvance(View(4)));
             assert!(
                 !drop_advance
                     .iter()
@@ -4226,7 +4240,7 @@ mod tests {
 
             let parent: BlockHash = [0xCC; 32];
             let child = orphan_child(parent, 5, nid(3));
-            let justify = dummy_qc(0, core.state().genesis_hash);
+            let justify = dummy_qc(View(0), core.state().genesis_hash);
             let sender = nid(2);
 
             // Initial probe at view 0; last_asked_view = 0.
@@ -4238,7 +4252,7 @@ mod tests {
 
             // Advance to view 1 — only one view has elapsed; backoff
             // requires two. No RequestBlock this round.
-            let suppressed = core.step(Event::PacemakerAdvance(1));
+            let suppressed = core.step(Event::PacemakerAdvance(View(1)));
             assert!(
                 !suppressed
                     .iter()
@@ -4248,7 +4262,7 @@ mod tests {
 
             // Advance to view 2 — two views have elapsed; backoff
             // satisfied. RequestBlock fires.
-            let firing = core.step(Event::PacemakerAdvance(2));
+            let firing = core.step(Event::PacemakerAdvance(View(2)));
             assert_eq!(
                 firing
                     .iter()
@@ -4281,7 +4295,7 @@ mod tests {
 
             let parent: BlockHash = [0xDD; 32];
             let child = orphan_child(parent, 7, nid(3));
-            let justify = dummy_qc(0, core.state().genesis_hash);
+            let justify = dummy_qc(View(0), core.state().genesis_hash);
             let signed = signed_proposal(child, justify, nid(2));
 
             // First delivery: initial probe fires.
@@ -4356,7 +4370,7 @@ mod tests {
             let genesis = Block::genesis([0; 32], [0; 32]);
             let block_v3 = chain_from_genesis(&genesis, &[3], nid(2))[0].clone();
             let block_v3_hash = block_v3.hash();
-            let qc_v3 = dummy_qc(3, block_v3_hash);
+            let qc_v3 = dummy_qc(View(3), block_v3_hash);
 
             let _ = core.step(Event::NewViewReceived(
                 crate::consensus::dispatch::Verified::unchecked(signed_newview(qc_v3, nid(2))),
@@ -4386,7 +4400,7 @@ mod tests {
             // disabled so each PacemakerAdvance is eligible to fire.
             let mut core = make_rotation_core(1, /* per_peer = */ 1, /* max = */ 4);
             let unknown: BlockHash = [0xC0; 32];
-            let qc = dummy_qc(7, unknown);
+            let qc = dummy_qc(View(7), unknown);
             let sender = nid(2);
 
             // Seed via NewView: initial probe lands at the sender,
@@ -4414,7 +4428,7 @@ mod tests {
 
             // Advance #1: per_peer=1 → rotation steps off sender to
             // nid(3) (ring[0] after sender, skipping self=nid(1)).
-            let advance_one = core.step(Event::PacemakerAdvance(1));
+            let advance_one = core.step(Event::PacemakerAdvance(View(1)));
             let req_one = advance_one
                 .iter()
                 .find_map(|a| match a {
@@ -4436,7 +4450,7 @@ mod tests {
             // we are at the budget. The 4th advance must clean up.
             let mut core = make_rotation_core(1, /* per_peer = */ 4, /* max = */ 4);
             let unknown: BlockHash = [0xD0; 32];
-            let qc = dummy_qc(11, unknown);
+            let qc = dummy_qc(View(11), unknown);
             let sender = nid(2);
 
             // Seed: attempts goes 0 → 1.
@@ -4446,8 +4460,8 @@ mod tests {
             assert_eq!(core.block_sync_inflight.len(), 1);
 
             // Advances 1..=3: attempts climbs 1 → 4.
-            for v in 1..=3 {
-                let advance = core.step(Event::PacemakerAdvance(v));
+            for v in 1..=3u64 {
+                let advance = core.step(Event::PacemakerAdvance(View(v)));
                 assert_eq!(
                     advance
                         .iter()
@@ -4465,7 +4479,7 @@ mod tests {
             // (the counter does NOT tick — it counts dropped parked
             // proposals, not exhausted in-flight slots) but still
             // tears the in-flight entry down.
-            let drop_advance = core.step(Event::PacemakerAdvance(4));
+            let drop_advance = core.step(Event::PacemakerAdvance(View(4)));
             assert!(
                 !drop_advance
                     .iter()
@@ -4527,15 +4541,15 @@ mod tests {
             let block_v3_hash = chain[2].hash();
 
             vec![
-                Event::PacemakerAdvance(1),
+                Event::PacemakerAdvance(View(1)),
                 Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(
-                    signed_proposal(chain[0].clone(), dummy_qc(0, genesis.hash()), nid(2)),
+                    signed_proposal(chain[0].clone(), dummy_qc(View(0), genesis.hash()), nid(2)),
                 )),
                 Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(
-                    signed_proposal(chain[1].clone(), dummy_qc(1, block_v1_hash), nid(2)),
+                    signed_proposal(chain[1].clone(), dummy_qc(View(1), block_v1_hash), nid(2)),
                 )),
                 Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(
-                    signed_proposal(chain[2].clone(), dummy_qc(2, block_v2_hash), nid(2)),
+                    signed_proposal(chain[2].clone(), dummy_qc(View(2), block_v2_hash), nid(2)),
                 )),
                 Event::VoteReceived(VoteVariant::Ed25519(
                     crate::consensus::dispatch::Verified::unchecked(signed_vote(
@@ -4559,9 +4573,9 @@ mod tests {
                     )),
                 )),
                 Event::NewViewReceived(crate::consensus::dispatch::Verified::unchecked(
-                    signed_newview(dummy_qc(99, [0x99; 32]), nid(4)),
+                    signed_newview(dummy_qc(View(99), [0x99; 32]), nid(4)),
                 )),
-                Event::PacemakerAdvance(100),
+                Event::PacemakerAdvance(View(100)),
             ]
         }
 
@@ -4626,11 +4640,12 @@ mod tests {
         /// safety triple), so the test supplies it explicitly.
         fn restart_with_persisted_state(
             self_byte: u8,
-            last_voted_view: View,
+            last_voted_view: impl Into<View>,
             locked: Option<Locked>,
             high_qc: Option<QuorumCertificate>,
             pending: &[Block],
         ) -> HotStuffCore {
+            let last_voted_view = last_voted_view.into();
             let mut state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             state.last_voted_view = last_voted_view;
             state.locked = locked;
@@ -4668,7 +4683,7 @@ mod tests {
             // Pre-restart: vote at view 1.
             let genesis = Block::genesis([0; 32], [0; 32]);
             let block_v1 = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
-            let justify_v0 = dummy_qc(0, genesis.hash());
+            let justify_v0 = dummy_qc(View(0), genesis.hash());
             let signed = signed_proposal(block_v1.clone(), justify_v0, nid(2));
 
             let mut pre = make_core(1);
@@ -4676,12 +4691,13 @@ mod tests {
                 crate::consensus::dispatch::Verified::unchecked(signed.clone()),
             ));
             assert!(
-                pre_actions
-                    .iter()
-                    .any(|a| matches!(a, Action::Persist(StateUpdate::VotedInView { view: 1 }))),
+                pre_actions.iter().any(|a| matches!(
+                    a,
+                    Action::Persist(StateUpdate::VotedInView { view: View(1) })
+                )),
                 "pre-restart core must vote on the first view-1 proposal: {pre_actions:?}",
             );
-            assert_eq!(pre.state().last_voted_view, 1);
+            assert_eq!(pre.state().last_voted_view, View(1));
 
             // Snapshot persisted state. The integration layer flushes
             // these three fields; nothing else needs to survive the
@@ -4714,7 +4730,7 @@ mod tests {
             );
             assert_eq!(
                 post.state().last_voted_view,
-                1,
+                View(1),
                 "last_voted_view stays pinned at the persisted value",
             );
         }
@@ -4746,33 +4762,33 @@ mod tests {
             pre.step(Event::ProposalReceived(
                 crate::consensus::dispatch::Verified::unchecked(signed_proposal(
                     block_v1.clone(),
-                    dummy_qc(0, genesis.hash()),
+                    dummy_qc(View(0), genesis.hash()),
                     nid(2),
                 )),
             ));
             pre.step(Event::ProposalReceived(
                 crate::consensus::dispatch::Verified::unchecked(signed_proposal(
                     block_v2.clone(),
-                    dummy_qc(1, block_v1.hash()),
+                    dummy_qc(View(1), block_v1.hash()),
                     nid(2),
                 )),
             ));
             pre.step(Event::ProposalReceived(
                 crate::consensus::dispatch::Verified::unchecked(signed_proposal(
                     block_v3.clone(),
-                    dummy_qc(2, block_v2.hash()),
+                    dummy_qc(View(2), block_v2.hash()),
                     nid(2),
                 )),
             ));
             // Two-chain promotion fires on the third proposal:
             // grandparent of view 3 is block_v1 (view 1, height 1).
             let expected_lock = Locked {
-                view: 1,
-                height: 1,
+                view: View(1),
+                height: Height(1),
                 block_hash: block_v1.hash(),
             };
             assert_eq!(pre.state().locked, Some(expected_lock));
-            assert_eq!(pre.state().last_voted_view, 3);
+            assert_eq!(pre.state().last_voted_view, View(3));
 
             let last_voted_view = pre.state().last_voted_view;
             let locked = pre.state().locked;
@@ -4796,8 +4812,8 @@ mod tests {
             let sibling = Block {
                 header: BlockHeader {
                     parent_hash: genesis.hash(),
-                    height: 1,
-                    view: 4,
+                    height: Height(1),
+                    view: View(4),
                     proposer: nid(3),
                     state_commitment: [0xCC; 32],
                     commands_commitment: Block::commands_commitment(&[]),
@@ -4805,7 +4821,7 @@ mod tests {
                 },
                 commands: Vec::new(),
             };
-            let stale_justify = dummy_qc(0, genesis.hash());
+            let stale_justify = dummy_qc(View(0), genesis.hash());
             let signed_sibling = signed_proposal(sibling, stale_justify, nid(3));
 
             let actions = post.step(Event::ProposalReceived(
@@ -4829,7 +4845,7 @@ mod tests {
                 Some(expected_lock),
                 "lock survives the restart and the refused proposal",
             );
-            assert_eq!(post.state().last_voted_view, 3);
+            assert_eq!(post.state().last_voted_view, View(3));
         }
 
         /// Test 3 — high_qc preservation across restart.
@@ -4852,11 +4868,11 @@ mod tests {
             pre.step(Event::ProposalReceived(
                 crate::consensus::dispatch::Verified::unchecked(signed_proposal(
                     block_v1.clone(),
-                    dummy_qc(0, genesis.hash()),
+                    dummy_qc(View(0), genesis.hash()),
                     nid(2),
                 )),
             ));
-            let fresh_qc_v1 = dummy_qc(1, block_v1.hash());
+            let fresh_qc_v1 = dummy_qc(View(1), block_v1.hash());
             pre.step(Event::ProposalReceived(
                 crate::consensus::dispatch::Verified::unchecked(signed_proposal(
                     block_v2.clone(),
@@ -4864,7 +4880,10 @@ mod tests {
                     nid(2),
                 )),
             ));
-            assert_eq!(pre.state().high_qc.as_ref().map(|q| q.view()), Some(1));
+            assert_eq!(
+                pre.state().high_qc.as_ref().map(|q| q.view()),
+                Some(View(1))
+            );
 
             let last_voted_view = pre.state().last_voted_view;
             let locked = pre.state().locked;
@@ -4881,7 +4900,7 @@ mod tests {
             // A NewView carrying a stale high_qc (view 0). The
             // sender is a peer; on the wire this is the shape an
             // ill-informed validator would emit before catching up.
-            let stale_newview = signed_newview(dummy_qc(0, genesis.hash()), nid(3));
+            let stale_newview = signed_newview(dummy_qc(View(0), genesis.hash()), nid(3));
             let actions = post.step(Event::NewViewReceived(
                 crate::consensus::dispatch::Verified::unchecked(stale_newview),
             ));
@@ -4892,7 +4911,7 @@ mod tests {
             );
             assert_eq!(
                 post.state().high_qc.as_ref().map(|q| q.view()),
-                Some(1),
+                Some(View(1)),
                 "high_qc preserved at view 1 across restart and stale NewView",
             );
             assert_eq!(
@@ -4925,7 +4944,7 @@ mod tests {
         fn restart_with_persisted_vote_but_missing_high_qc_is_safe() {
             let genesis = Block::genesis([0; 32], [0; 32]);
             let block_v1 = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
-            let justify_v0 = dummy_qc(0, genesis.hash());
+            let justify_v0 = dummy_qc(View(0), genesis.hash());
             let signed_v1 = signed_proposal(block_v1.clone(), justify_v0, nid(2));
 
             // Pre-restart: capture the action sequence and pin the
@@ -4993,7 +5012,7 @@ mod tests {
             // path. The lost high_qc was a freshness optimization,
             // not a safety witness.
             let block_v2 = chain_from_genesis(&genesis, &[1, 2], nid(2))[1].clone();
-            let qc_v1 = dummy_qc(1, block_v1.hash());
+            let qc_v1 = dummy_qc(View(1), block_v1.hash());
             let signed_v2 = signed_proposal(block_v2, qc_v1.clone(), nid(2));
             let actions_v2 = post.step(Event::ProposalReceived(
                 crate::consensus::dispatch::Verified::unchecked(signed_v2),
@@ -5002,19 +5021,19 @@ mod tests {
             assert!(
                 actions_v2.iter().any(|a| matches!(
                     a,
-                    Action::Persist(StateUpdate::HighQc(qc)) if qc.view == 1
+                    Action::Persist(StateUpdate::HighQc(qc)) if qc.view == View(1)
                 )),
                 "next proposal recovers high_qc adoption via the normal path: \
                  {actions_v2:?}",
             );
             assert_eq!(
                 post.state().high_qc.as_ref().map(|q| q.view()),
-                Some(1),
+                Some(View(1)),
                 "high_qc adopted at view 1 from the recovery proposal's justify",
             );
             assert_eq!(
                 post.state().last_voted_view,
-                2,
+                View(2),
                 "the recovery proposal at view 2 is voted on normally",
             );
         }
@@ -5045,12 +5064,15 @@ mod tests {
             // `become_leader(4)` so the build path fires.
             let mut pre = make_core(1);
             let genesis = Block::genesis([0; 32], [0; 32]);
-            let qc_genesis = dummy_qc(0, genesis.hash());
+            let qc_genesis = dummy_qc(View(0), genesis.hash());
             pre.state.high_qc = Some(VerifiedQc::unchecked(qc_genesis.clone()));
 
             let pre_actions = pre.become_leader(4);
             let proposed_idx = pre_actions.iter().position(|a| {
-                matches!(a, Action::Persist(StateUpdate::ProposedInView { view: 4 }))
+                matches!(
+                    a,
+                    Action::Persist(StateUpdate::ProposedInView { view: View(4) })
+                )
             });
             let broadcast_idx = pre_actions
                 .iter()
@@ -5061,7 +5083,7 @@ mod tests {
                  dispatcher flushes the durable mirror before any bytes leave: \
                  {pre_actions:?}",
             );
-            assert_eq!(pre.proposed_in_view(), 4);
+            assert_eq!(pre.proposed_in_view(), View(4));
             // Capture the proposal envelope; a second build at view 4
             // must not produce *any* envelope, distinct or otherwise.
             let pre_proposal = pre_actions
@@ -5080,7 +5102,7 @@ mod tests {
             post_state.high_qc = Some(VerifiedQc::unchecked(qc_genesis.clone()));
             let post_builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
             let mut post =
-                HotStuffCore::new(nid(1), post_state, post_builder).with_proposed_in_view(4);
+                HotStuffCore::new(nid(1), post_state, post_builder).with_proposed_in_view(View(4));
 
             let post_actions = post.become_leader(4);
             assert!(
@@ -5109,7 +5131,7 @@ mod tests {
             assert!(
                 unguarded_actions
                     .iter()
-                    .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(p)) if p.block.header.view == 4)),
+                    .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(p)) if p.block.header.view == View(4))),
                 "without the persisted guard, restart *would* re-mint at view 4: \
                  {unguarded_actions:?}",
             );
@@ -5177,7 +5199,7 @@ mod tests {
             /// Per-honest-replica event inbox.
             pub inboxes: Vec<VecDeque<Event>>,
             /// Per-honest-replica committed-blocks ledger.
-            pub commits: Vec<BTreeMap<u64, Block>>,
+            pub commits: Vec<BTreeMap<Height, Block>>,
             pub validators: ValidatorSet,
             pub genesis: Block,
             /// How many of the trailing `validators` entries are
@@ -5527,14 +5549,14 @@ mod tests {
         /// collecting view-0 NewView messages; we bypass bootstrap
         /// by injecting it as an incoming event.
         fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
-            let genesis_qc = replicas.synth_qc(0, replicas.genesis.hash());
+            let genesis_qc = replicas.synth_qc(View(0), replicas.genesis.hash());
             let leader_idx = 1 % replicas.len();
             let leader_nid = replicas.validators.get(leader_idx).unwrap().into_node_id();
             let builder = TestBlockBuilder {
                 proposer: leader_nid,
             };
             let block_v1 = builder
-                .build(&replicas.genesis, 1, &genesis_qc, &HashMap::new())
+                .build(&replicas.genesis, View(1), &genesis_qc, &HashMap::new())
                 .expect("test builder must not fail");
             Signed {
                 payload: Proposal {
@@ -5732,7 +5754,7 @@ mod tests {
                 3 => (0..n_honest).prop_map(ByzantineVoteStep::Deliver),
                 1 => (0u64..8, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
                     |(view, block_hash, target_honest)| ByzantineVoteStep::InjectVote {
-                        view,
+                        view: View(view),
                         block_hash,
                         target_honest,
                     },
@@ -5864,8 +5886,8 @@ mod tests {
                         |(parent_hash, view, justify_view, justify_block_hash, target_honest)| {
                             ByzantineProposalStep::InjectProposal {
                                 parent_hash,
-                                view,
-                                justify_view,
+                                view: View(view),
+                                justify_view: View(justify_view),
                                 justify_block_hash,
                                 target_honest,
                             }
@@ -5891,10 +5913,10 @@ mod tests {
         ) -> Signed<Proposal> {
             let header = BlockHeader {
                 parent_hash,
-                height: view,
+                height: Height(view.0),
                 view,
                 proposer: byz_nid,
-                state_commitment: [view as u8; 32],
+                state_commitment: [view.0 as u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
             };
@@ -6037,7 +6059,7 @@ mod tests {
                 6 => (0..n_honest).prop_map(MixedStep::Deliver),
                 1 => (0u64..10, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
                     |(view, block_hash, target_honest)| MixedStep::InjectVote {
-                        view,
+                        view: View(view),
                         block_hash,
                         target_honest,
                     },
@@ -6053,8 +6075,8 @@ mod tests {
                         |(parent_hash, view, justify_view, justify_block_hash, target_honest)| {
                             MixedStep::InjectProposal {
                                 parent_hash,
-                                view,
-                                justify_view,
+                                view: View(view),
+                                justify_view: View(justify_view),
                                 justify_block_hash,
                                 target_honest,
                             }
@@ -6062,7 +6084,7 @@ mod tests {
                     ),
                 1 => (0u64..10, prop::array::uniform32(any::<u8>()), 0..n_honest).prop_map(
                     |(qc_view, qc_block_hash, target_honest)| MixedStep::InjectNewView {
-                        qc_view,
+                        qc_view: View(qc_view),
                         qc_block_hash,
                         target_honest,
                     },
@@ -6270,7 +6292,7 @@ mod tests {
             // signer) idempotency key.
             let signers = [nid(2), nid(3), nid(4)];
             for i in 0..(2 * cap) {
-                let view = i as View;
+                let view = View(i as u64);
                 let block_hash: BlockHash = [i as u8 + 1; 32];
                 let signer = signers[i % signers.len()];
                 let signed = signed_vote(view, block_hash, signer);
@@ -6291,7 +6313,7 @@ mod tests {
             // the cap most recent ones (cap..2*cap-1).
             let mut surviving_views: Vec<View> = core.vote_bucket.keys().map(|(v, _)| *v).collect();
             surviving_views.sort();
-            let expected: Vec<View> = (cap as View..(2 * cap) as View).collect();
+            let expected: Vec<View> = (cap as u64..(2 * cap) as u64).map(View).collect();
             assert_eq!(surviving_views, expected);
         }
 
@@ -6315,12 +6337,12 @@ mod tests {
 
             // Advance the pacemaker to view 7 — buckets for views
             // 0..7 must be dropped; 7..10 survive.
-            let _ = core.step(Event::PacemakerAdvance(7));
+            let _ = core.step(Event::PacemakerAdvance(View(7)));
             assert_eq!(core.vote_bucket.len(), 3);
             assert_eq!(core.eviction_counters().vote_bucket(), 7);
             let mut surviving: Vec<View> = core.vote_bucket.keys().map(|(v, _)| *v).collect();
             surviving.sort();
-            assert_eq!(surviving, vec![7, 8, 9]);
+            assert_eq!(surviving, vec![View(7), View(8), View(9)]);
         }
 
         /// Repeat votes for the same `(view, block_hash)` from
@@ -6367,7 +6389,7 @@ mod tests {
             let sender = nid(2);
             let orphan_parent: BlockHash = [0xFF; 32];
             for i in 0..(2 * cap) {
-                let view = i as View;
+                let view = View(i as u64);
                 // Distinct view per child guarantees a distinct
                 // child block hash AND lets us assert which views
                 // survive eviction.
@@ -6375,7 +6397,7 @@ mod tests {
                 // Vary state_commitment so even at the same view two
                 // children would hash differently — defensive.
                 child.header.state_commitment = [i as u8 + 1; 32];
-                let dummy = dummy_qc(0, core.state().genesis_hash);
+                let dummy = dummy_qc(View(0), core.state().genesis_hash);
                 let _ = core.step(Event::ProposalReceived(
                     crate::consensus::dispatch::Verified::unchecked(signed_proposal(
                         child, dummy, sender,
@@ -6396,7 +6418,7 @@ mod tests {
                 .map(|s| s.payload.block.header.view)
                 .collect();
             surviving_views.sort();
-            let expected: Vec<View> = (cap as View..(2 * cap) as View).collect();
+            let expected: Vec<View> = (cap as u64..(2 * cap) as u64).map(View).collect();
             assert_eq!(surviving_views, expected);
         }
 
@@ -6410,7 +6432,7 @@ mod tests {
             let sender = nid(2);
             let orphan_parent: BlockHash = [0xAA; 32];
             let child = orphan_child(orphan_parent, 1, nid(3));
-            let dummy = dummy_qc(0, core.state().genesis_hash);
+            let dummy = dummy_qc(View(0), core.state().genesis_hash);
 
             // Two identical inserts — second is a no-op overwrite.
             let _ = core.step(Event::ProposalReceived(
@@ -6445,7 +6467,7 @@ mod tests {
             // other insert is fair game for eviction.
             let chain = chain_from_genesis(
                 core.state().pending_blocks.get(&genesis_hash).unwrap(),
-                &(1..=(2 * cap as View)).collect::<Vec<_>>(),
+                &(1..=(2 * cap as u64)).collect::<Vec<_>>(),
                 nid(2),
             );
             for block in &chain {
@@ -6466,7 +6488,7 @@ mod tests {
                 .pending_blocks
                 .values()
                 .filter(|b| b.hash() != genesis_hash)
-                .map(|b| b.header.height)
+                .map(|b| b.header.height.0)
                 .collect();
             surviving_heights.sort();
             let expected_low = (2 * cap as u64) - (cap as u64 - 1) + 1;
@@ -6513,7 +6535,7 @@ mod tests {
                 core.state.insert_pending(block.clone());
             }
             let tip_hash = chain.last().unwrap().hash();
-            core.state.high_qc = Some(VerifiedQc::unchecked(dummy_qc(3, tip_hash)));
+            core.state.high_qc = Some(VerifiedQc::unchecked(dummy_qc(View(3), tip_hash)));
             assert_eq!(core.state.pending_blocks.len(), 4);
             assert_eq!(core.eviction_counters().pending_blocks(), 0);
 
@@ -6525,8 +6547,8 @@ mod tests {
             for i in 0..n_forks {
                 let header = crate::replication::block::BlockHeader {
                     parent_hash: genesis_hash,
-                    height: 1,
-                    view: 100 + i as View,
+                    height: Height(1),
+                    view: View(100) + View(i as u64),
                     proposer: nid(3),
                     state_commitment: [0xC0 + i as u8; 32],
                     commands_commitment: Block::commands_commitment(&[]),

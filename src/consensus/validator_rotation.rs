@@ -47,7 +47,7 @@ pub const ROTATION_TAG: &[u8; 6] = b"VKROT\0";
 /// reconfiguration (#140). Two views give the validator at least one full
 /// view to provision the new key on the signing path before it must
 /// produce votes/proposals under it.
-pub const V_EFF_MIN_DELAY: View = 2;
+pub const V_EFF_MIN_DELAY: View = View::new(2);
 
 /// Payload of a validator-key rotation transaction.
 ///
@@ -186,7 +186,11 @@ impl ValidatorKeyRotation {
     /// (signature validity, `new_pubkey` being a valid Ed25519 point) are
     /// out of scope for this layer — they happen in the verification
     /// step that consumes a [`DualSignedRotation`].
-    pub fn validate_structural(&self, current_view: View) -> Result<(), RotationStructuralError> {
+    pub fn validate_structural(
+        &self,
+        current_view: impl Into<View>,
+    ) -> Result<(), RotationStructuralError> {
+        let current_view = current_view.into();
         if self.v_eff < current_view.saturating_add(V_EFF_MIN_DELAY) {
             return Err(RotationStructuralError::EffectiveViewTooSoon {
                 current_view,
@@ -454,7 +458,7 @@ mod tests {
         ValidatorKeyRotation {
             validator: nid(1),
             new_pubkey: nid(2),
-            v_eff: 100,
+            v_eff: View(100),
             new_bls_pubkey: None,
             new_bls_pop: None,
         }
@@ -560,7 +564,7 @@ mod tests {
         let p = ValidatorKeyRotation {
             validator: nid(1),
             new_pubkey: nid(2),
-            v_eff: 10 + V_EFF_MIN_DELAY,
+            v_eff: View(10) + V_EFF_MIN_DELAY,
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -572,7 +576,7 @@ mod tests {
         let p = ValidatorKeyRotation {
             validator: nid(1),
             new_pubkey: nid(2),
-            v_eff: u64::MAX,
+            v_eff: View::MAX,
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -584,15 +588,15 @@ mod tests {
         let p = ValidatorKeyRotation {
             validator: nid(1),
             new_pubkey: nid(2),
-            v_eff: 11,
+            v_eff: View(11),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
         assert_eq!(
             p.validate_structural(10),
             Err(RotationStructuralError::EffectiveViewTooSoon {
-                current_view: 10,
-                v_eff: 11,
+                current_view: View(10),
+                v_eff: View(11),
             })
         );
     }
@@ -602,7 +606,7 @@ mod tests {
         let p = ValidatorKeyRotation {
             validator: nid(1),
             new_pubkey: nid(2),
-            v_eff: 10,
+            v_eff: View(10),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -617,7 +621,7 @@ mod tests {
         let p = ValidatorKeyRotation {
             validator: nid(1),
             new_pubkey: nid(2),
-            v_eff: 5,
+            v_eff: View(5),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -632,7 +636,7 @@ mod tests {
         let p = ValidatorKeyRotation {
             validator: nid(7),
             new_pubkey: nid(7),
-            v_eff: 1_000,
+            v_eff: View(1_000),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -651,7 +655,7 @@ mod tests {
         let p = ValidatorKeyRotation {
             validator: nid(1),
             new_pubkey: nid(2),
-            v_eff: u64::MAX,
+            v_eff: View::MAX,
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -684,7 +688,7 @@ mod tests {
         let payload = ValidatorKeyRotation {
             validator: current.node_id(),
             new_pubkey: new.node_id(),
-            v_eff: 100,
+            v_eff: View(100),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -762,12 +766,12 @@ mod tests {
         let payload = ValidatorKeyRotation {
             validator: current.node_id(),
             new_pubkey: new.node_id(),
-            v_eff: 100,
+            v_eff: View(100),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
         let other_payload = ValidatorKeyRotation {
-            v_eff: 999,
+            v_eff: View(999),
             ..payload.clone()
         };
         let other_bytes = preimage::<ValidatorKeyRotation>(&other_payload, &ChainId::TEST).unwrap();
@@ -815,7 +819,7 @@ mod tests {
         let payload = ValidatorKeyRotation {
             validator: current.node_id(),
             new_pubkey: new.node_id(),
-            v_eff: 100,
+            v_eff: View(100),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -842,7 +846,7 @@ mod tests {
         // which is enough to reject; we just want to confirm the bare
         // payload cannot pass through unchecked.
         let (mut env, current_pubkey, _) = valid_envelope();
-        env.payload.v_eff = env.payload.v_eff.wrapping_add(1);
+        env.payload.v_eff = View(env.payload.v_eff.0.wrapping_add(1));
         assert!(matches!(
             env.verify(&current_pubkey, &ChainId::TEST),
             Err(RotationVerifyError::InvalidOldSignature)
@@ -878,7 +882,7 @@ mod tests {
         let payload = ValidatorKeyRotation {
             validator: current.node_id(),
             new_pubkey: new.node_id(),
-            v_eff: 100,
+            v_eff: View(100),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -916,7 +920,7 @@ mod tests {
         assert_ne!(postcard::to_stdvec(&b).unwrap(), base_bytes);
 
         let mut c = base.clone();
-        c.v_eff = c.v_eff.wrapping_add(1);
+        c.v_eff = View(c.v_eff.0.wrapping_add(1));
         assert_ne!(postcard::to_stdvec(&c).unwrap(), base_bytes);
     }
 

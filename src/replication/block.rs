@@ -25,6 +25,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::consensus::{Height, View};
 use crate::p2p::NodeId;
 
 /// Content-address of a block, computed over its header.
@@ -42,11 +43,11 @@ pub struct BlockHeader {
     pub parent_hash: BlockHash,
 
     /// Strictly increasing; genesis is `0`, children add `+1`.
-    pub height: u64,
+    pub height: Height,
 
     /// HotStuff view in which this block was proposed. Must be strictly
     /// greater than the parent's view (see [`validate_structural`]).
-    pub view: u64,
+    pub view: View,
 
     /// Ed25519 public key of the proposer, as used by `src/p2p/tls.rs`.
     pub proposer: NodeId,
@@ -127,8 +128,8 @@ impl Block {
         Self {
             header: BlockHeader {
                 parent_hash: [0u8; 32],
-                height: 0,
-                view: 0,
+                height: Height::ZERO,
+                view: View::ZERO,
                 proposer: [0u8; 32],
                 state_commitment,
                 commands_commitment: Self::commands_commitment(&commands),
@@ -182,7 +183,7 @@ pub fn validate_structural(child: &Block, parent_header: &BlockHeader) -> anyhow
     }
     let expected_height = parent_header
         .height
-        .checked_add(1)
+        .checked_add(Height(1))
         .ok_or_else(|| anyhow::anyhow!("parent height {} overflows u64", parent_header.height))?;
     if child.header.height != expected_height {
         anyhow::bail!(
@@ -220,8 +221,8 @@ mod tests {
     fn sample_header() -> BlockHeader {
         BlockHeader {
             parent_hash: [0x11; 32],
-            height: 4,
-            view: 7,
+            height: Height(4),
+            view: View(7),
             proposer: [0x22; 32],
             state_commitment: [0x33; 32],
             commands_commitment: Block::commands_commitment(&cmds(&[b"a", b"b"])),
@@ -246,8 +247,8 @@ mod tests {
     fn genesis_is_stable_and_zero_parent() {
         let g = Block::genesis([0x77; 32], [0x88; 32]);
         assert_eq!(g.header.parent_hash, [0u8; 32]);
-        assert_eq!(g.header.height, 0);
-        assert_eq!(g.header.view, 0);
+        assert_eq!(g.header.height, Height(0));
+        assert_eq!(g.header.view, View(0));
         assert_eq!(g.header.state_commitment, [0x77; 32]);
         assert_eq!(g.header.validator_history_commitment, [0x88; 32]);
         assert!(g.commands.is_empty());
@@ -285,11 +286,11 @@ mod tests {
         assert_ne!(perturbed.hash(), original);
 
         let mut perturbed = h.clone();
-        perturbed.height = perturbed.height.wrapping_add(1);
+        perturbed.height = Height(perturbed.height.0.wrapping_add(1));
         assert_ne!(perturbed.hash(), original);
 
         let mut perturbed = h.clone();
-        perturbed.view = perturbed.view.wrapping_add(1);
+        perturbed.view = View(perturbed.view.0.wrapping_add(1));
         assert_ne!(perturbed.hash(), original);
 
         let mut perturbed = h.clone();
@@ -353,7 +354,7 @@ mod tests {
         assert!(err.to_string().contains("view must strictly increase"));
 
         // Also rejects a decreasing view.
-        child.header.view = parent.view.saturating_sub(1);
+        child.header.view = parent.view.saturating_sub(View(1));
         let err = validate_structural(&child, &parent).unwrap_err();
         assert!(err.to_string().contains("view must strictly increase"));
     }

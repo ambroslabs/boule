@@ -44,7 +44,6 @@ use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use crate::consensus::View;
 use crate::consensus::dispatch::ingress;
 use crate::consensus::hotstuff::qc::{
     ConsensusMsg, NewView, Proposal, QuorumCertificate, SignerBitmap, TimeoutVote, Vote,
@@ -54,6 +53,7 @@ use crate::consensus::hotstuff::step::{Action, BlockBuilder, Event, HotStuffCore
 use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
 use crate::consensus::node::WireMessage;
 use crate::consensus::validator_set::ValidatorSet;
+use crate::consensus::{Height, View};
 use crate::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
 use crate::p2p::NodeId;
 use crate::p2p::identity::NodeIdentity;
@@ -137,7 +137,7 @@ fn arb_qc() -> impl Strategy<Value = QuorumCertificate> {
     )
         .prop_map(
             |(view, block_hash, signers, signatures)| QuorumCertificate {
-                view,
+                view: View(view),
                 block_hash,
                 signers,
                 signatures: crate::consensus::hotstuff::qc::QcSignatures::Ed25519Collected(
@@ -167,8 +167,8 @@ fn arb_block(genesis_hash: BlockHash) -> impl Strategy<Value = Block> {
                 let commands: Vec<Bytes> = cmds.into_iter().map(Bytes::from).collect();
                 let header = BlockHeader {
                     parent_hash,
-                    height,
-                    view,
+                    height: Height(height),
+                    view: View(view),
                     proposer,
                     state_commitment,
                     commands_commitment: Block::commands_commitment(&commands),
@@ -184,7 +184,10 @@ fn arb_proposal(genesis_hash: BlockHash) -> impl Strategy<Value = Proposal> {
 }
 
 fn arb_vote() -> impl Strategy<Value = Vote> {
-    (0u64..MAX_VIEW, any::<[u8; 32]>()).prop_map(|(view, block_hash)| Vote { view, block_hash })
+    (0u64..MAX_VIEW, any::<[u8; 32]>()).prop_map(|(view, block_hash)| Vote {
+        view: View(view),
+        block_hash,
+    })
 }
 
 fn arb_new_view() -> impl Strategy<Value = NewView> {
@@ -192,8 +195,10 @@ fn arb_new_view() -> impl Strategy<Value = NewView> {
 }
 
 fn arb_timeout_vote() -> impl Strategy<Value = TimeoutVote> {
-    (0u64..MAX_VIEW, prop::option::of(arb_qc()))
-        .prop_map(|(view, high_qc)| TimeoutVote { view, high_qc })
+    (0u64..MAX_VIEW, prop::option::of(arb_qc())).prop_map(|(view, high_qc)| TimeoutVote {
+        view: View(view),
+        high_qc,
+    })
 }
 
 /// Index into the shared signer pool — the wire generator picks one
@@ -360,7 +365,7 @@ impl BlockBuilder for TestBlockBuilder {
 struct ReplicaSet {
     cores: Vec<HotStuffCore>,
     inboxes: Vec<VecDeque<Event>>,
-    commits: Vec<BTreeMap<u64, Block>>,
+    commits: Vec<BTreeMap<Height, Block>>,
     validators: ValidatorSet,
     genesis: Block,
 }
@@ -499,14 +504,14 @@ fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
 /// View-1 kickoff proposal: leader of view 1 (`validators[1 % n]`)
 /// builds a child of genesis under a synth genesis-QC.
 fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
-    let genesis_qc = replicas.synth_qc(0, replicas.genesis.hash());
+    let genesis_qc = replicas.synth_qc(View(0), replicas.genesis.hash());
     let leader_idx = 1 % replicas.len();
     let leader_nid = replicas.validators.get(leader_idx).unwrap().into_node_id();
     let builder = TestBlockBuilder {
         proposer: leader_nid,
     };
     let block_v1 = builder
-        .build(&replicas.genesis, 1, &genesis_qc, &HashMap::new())
+        .build(&replicas.genesis, View(1), &genesis_qc, &HashMap::new())
         .expect("test builder must not fail");
     Signed {
         payload: Proposal {
@@ -551,7 +556,7 @@ enum FuzzStep {
         sender_idx: usize,
         parent_hash_genesis: bool,
         view: View,
-        height: u64,
+        height: Height,
         justify_view: View,
         justify_block_hash: BlockHash,
     },
@@ -586,8 +591,11 @@ fn fuzz_step_strategy(n_replicas: usize) -> impl Strategy<Value = FuzzStep> {
             any::<[u8; 32]>(),
         ).prop_map(|(target, sender_idx, parent_hash_genesis, view, height, justify_view, justify_block_hash)| {
             FuzzStep::InjectBytesProposal {
-                target, sender_idx, parent_hash_genesis, view, height,
-                justify_view, justify_block_hash,
+                target, sender_idx, parent_hash_genesis,
+                view: View(view),
+                height: Height(height),
+                justify_view: View(justify_view),
+                justify_block_hash,
             }
         }),
         1 => (
@@ -596,7 +604,7 @@ fn fuzz_step_strategy(n_replicas: usize) -> impl Strategy<Value = FuzzStep> {
             0u64..MAX_VIEW,
             any::<[u8; 32]>(),
         ).prop_map(|(target, sender_idx, view, block_hash)| {
-            FuzzStep::InjectBytesVote { target, sender_idx, view, block_hash }
+            FuzzStep::InjectBytesVote { target, sender_idx, view: View(view), block_hash }
         }),
         1 => (
             0..n_replicas,
@@ -604,7 +612,7 @@ fn fuzz_step_strategy(n_replicas: usize) -> impl Strategy<Value = FuzzStep> {
             0u64..MAX_VIEW,
             any::<[u8; 32]>(),
         ).prop_map(|(target, sender_idx, qc_view, qc_block_hash)| {
-            FuzzStep::InjectBytesNewView { target, sender_idx, qc_view, qc_block_hash }
+            FuzzStep::InjectBytesNewView { target, sender_idx, qc_view: View(qc_view), qc_block_hash }
         }),
     ]
 }
@@ -617,7 +625,7 @@ struct MalformedProposalInputs {
     genesis_hash: BlockHash,
     parent_hash_genesis: bool,
     view: View,
-    height: u64,
+    height: Height,
     justify_view: View,
     justify_block_hash: BlockHash,
 }
@@ -632,8 +640,8 @@ fn malformed_signed_proposal(p: MalformedProposalInputs) -> Signed<Proposal> {
         p.genesis_hash
     } else {
         let mut h = [0u8; 32];
-        h[0] = p.view as u8;
-        h[1] = p.height as u8;
+        h[0] = p.view.0 as u8;
+        h[1] = p.height.0 as u8;
         h
     };
     let header = BlockHeader {
@@ -641,7 +649,7 @@ fn malformed_signed_proposal(p: MalformedProposalInputs) -> Signed<Proposal> {
         height: p.height,
         view: p.view,
         proposer: p.sender,
-        state_commitment: [p.view as u8; 32],
+        state_commitment: [p.view.0 as u8; 32],
         commands_commitment: Block::commands_commitment(&[]),
         validator_history_commitment: [0; 32],
     };
@@ -786,7 +794,7 @@ enum CacheStep {
     ParkedProposal {
         sender_idx: usize,
         view: View,
-        height: u64,
+        height: Height,
         parent_seed: u8,
     },
     /// Proposal whose parent is genesis — lands a real block in
@@ -797,15 +805,25 @@ enum CacheStep {
 fn cache_step_strategy(n_validators: usize) -> impl Strategy<Value = CacheStep> {
     prop_oneof![
         1 => (0..n_validators, 0u64..MAX_VIEW, any::<[u8; 32]>()).prop_map(
-            |(signer_idx, view, block_hash)| CacheStep::Vote { signer_idx, view, block_hash },
+            |(signer_idx, view, block_hash)| CacheStep::Vote {
+                signer_idx,
+                view: View(view),
+                block_hash,
+            },
         ),
         1 => (0..n_validators, 0u64..MAX_VIEW, 0u64..MAX_VIEW, any::<u8>()).prop_map(
             |(sender_idx, view, height, parent_seed)| CacheStep::ParkedProposal {
-                sender_idx, view, height, parent_seed,
+                sender_idx,
+                view: View(view),
+                height: Height(height),
+                parent_seed,
             },
         ),
         1 => (0..n_validators, 1u64..MAX_VIEW).prop_map(
-            |(sender_idx, view)| CacheStep::GenesisChildProposal { sender_idx, view },
+            |(sender_idx, view)| CacheStep::GenesisChildProposal {
+                sender_idx,
+                view: View(view),
+            },
         ),
     ]
 }
@@ -858,19 +876,19 @@ proptest! {
                     let sender = validators.get(sender_idx).unwrap().into_node_id();
                     let mut parent_hash = [0u8; 32];
                     parent_hash[0] = parent_seed;
-                    parent_hash[1] = view as u8;
-                    parent_hash[2] = height as u8;
+                    parent_hash[1] = view.0 as u8;
+                    parent_hash[2] = height.0 as u8;
                     let header = BlockHeader {
                         parent_hash,
                         height,
                         view,
                         proposer: sender,
-                        state_commitment: [view as u8; 32],
+                        state_commitment: [view.0 as u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
                         validator_history_commitment: [0; 32],
                     };
                     let block = Block { header, commands: Vec::new() };
-                    let mut justify = QuorumCertificate::new(0, [0; 32], validators.len());
+                    let mut justify = QuorumCertificate::new(View::ZERO, [0; 32], validators.len());
                     for i in 0..validators.len() {
                         justify.add_signature(i, [i as u8 + 1; 64]);
                     }
@@ -884,15 +902,15 @@ proptest! {
                     let sender = validators.get(sender_idx).unwrap().into_node_id();
                     let header = BlockHeader {
                         parent_hash: genesis.hash(),
-                        height: 1,
+                        height: Height(1),
                         view,
                         proposer: sender,
-                        state_commitment: [view as u8; 32],
+                        state_commitment: [view.0 as u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
                         validator_history_commitment: [0; 32],
                     };
                     let block = Block { header, commands: Vec::new() };
-                    let mut justify = QuorumCertificate::new(0, genesis.hash(), validators.len());
+                    let mut justify = QuorumCertificate::new(View::ZERO, genesis.hash(), validators.len());
                     for i in 0..validators.len() {
                         justify.add_signature(i, [i as u8 + 1; 64]);
                     }

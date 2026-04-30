@@ -205,8 +205,8 @@ impl Pacemaker {
     ) -> Self {
         Self {
             self_id,
-            current_view: 0,
-            high_qc_view: 0,
+            current_view: View::ZERO,
+            high_qc_view: View::ZERO,
             consecutive_failures: 0,
             selector,
             policy,

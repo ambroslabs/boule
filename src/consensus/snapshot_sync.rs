@@ -240,10 +240,11 @@ impl SnapshotSync {
     pub fn observe_proposal(
         &mut self,
         last_committed_height: u64,
-        proposal_height: u64,
+        proposal_height: impl Into<crate::consensus::Height>,
         proposer: NodeId,
         validator_set: &ValidatorSet,
     ) -> Vec<SnapshotSyncAction> {
+        let proposal_height = proposal_height.into();
         if !self.policy.is_enabled() {
             return Vec::new();
         }
@@ -260,10 +261,10 @@ impl SnapshotSync {
         match &mut self.state {
             State::Idle { observed_peers } => {
                 observed_peers.insert(proposer);
-                if proposal_height < last_committed_height {
+                if proposal_height.0 < last_committed_height {
                     return Vec::new();
                 }
-                let lag = proposal_height - last_committed_height;
+                let lag = proposal_height.0 - last_committed_height;
                 if lag < self.policy.interval_blocks {
                     return Vec::new();
                 }
@@ -290,7 +291,7 @@ impl SnapshotSync {
                     candidates.push(proposer);
                     in_flight_per_peer.entry(proposer).or_insert(0);
                 }
-                schedule(candidates, in_flight_per_peer, chunks, manifest.height)
+                schedule(candidates, in_flight_per_peer, chunks, manifest.height.0)
             }
             State::Done | State::Aborted => Vec::new(),
         }
@@ -317,7 +318,7 @@ impl SnapshotSync {
                     candidates.push(peer);
                     in_flight_per_peer.entry(peer).or_insert(0);
                 }
-                schedule(candidates, in_flight_per_peer, chunks, manifest.height)
+                schedule(candidates, in_flight_per_peer, chunks, manifest.height.0)
             }
             _ => Vec::new(),
         }
@@ -393,7 +394,7 @@ impl SnapshotSync {
         else {
             unreachable!("just transitioned to Fetching");
         };
-        schedule(candidates, in_flight_per_peer, chunks, manifest.height)
+        schedule(candidates, in_flight_per_peer, chunks, manifest.height.0)
     }
 
     /// Process a [`crate::consensus::dispatch::Dispatch::ReceiveSnapshotChunk`].
@@ -413,7 +414,7 @@ impl SnapshotSync {
         else {
             return Vec::new();
         };
-        if height != manifest.height {
+        if height != manifest.height.0 {
             return Vec::new();
         }
         let Some(slot) = chunks.get_mut(chunk_idx as usize) else {
@@ -557,7 +558,7 @@ impl SnapshotSync {
         else {
             return Vec::new();
         };
-        let height = manifest.height;
+        let height = manifest.height.0;
         let actions = schedule(candidates, in_flight_per_peer, chunks, height);
         // If no chunks are in flight AND we have pending slots
         // AND no actions were scheduled, the workpool is stuck.
@@ -737,8 +738,8 @@ mod tests {
         Block {
             header: BlockHeader {
                 parent_hash,
-                height,
-                view,
+                height: crate::consensus::Height(height),
+                view: crate::consensus::View(view),
                 proposer: [0u8; 32],
                 state_commitment: [0xCD; 32],
                 commands_commitment: Block::commands_commitment(&commands),
@@ -956,8 +957,12 @@ mod tests {
             // Wait for the matching request to have been emitted.
             let request_idx = next_idx_to_serve.remove(0);
             assert_eq!(request_idx, idx);
-            let actions =
-                s.on_chunk_response(p0, manifest.height, idx, Some(chunks[idx as usize].clone()));
+            let actions = s.on_chunk_response(
+                p0,
+                manifest.height.0,
+                idx,
+                Some(chunks[idx as usize].clone()),
+            );
             // Each completion may emit the next request, or Restore.
             for a in &actions {
                 match a {
@@ -1020,7 +1025,7 @@ mod tests {
             let (peer, idx) = pending_requests.remove(0);
             let actions = s.on_chunk_response(
                 peer,
-                manifest.height,
+                manifest.height.0,
                 idx,
                 Some(chunks[idx as usize].clone()),
             );
@@ -1123,7 +1128,7 @@ mod tests {
             let (peer, idx) = pending_requests.remove(0);
             let actions = s.on_chunk_response(
                 peer,
-                manifest.height,
+                manifest.height.0,
                 idx,
                 Some(chunks[idx as usize].clone()),
             );
@@ -1194,7 +1199,7 @@ mod tests {
         tampered[0] ^= 0xFF;
         let actions = s.on_chunk_response(
             peer_for_chunk_0,
-            manifest.height,
+            manifest.height.0,
             chunk_idx_0,
             Some(Bytes::from(tampered)),
         );
@@ -1241,7 +1246,7 @@ mod tests {
                 _ => None,
             })
             .expect("chunk 0 must be requested");
-        let actions = s.on_chunk_response(peer_for_chunk_0, manifest.height, chunk_idx_0, None);
+        let actions = s.on_chunk_response(peer_for_chunk_0, manifest.height.0, chunk_idx_0, None);
         assert!(
             !s.is_aborted(),
             "peer-has-no-chunk must not abort with another candidate available"
@@ -1289,7 +1294,7 @@ mod tests {
             let before_active = s.is_active();
             let _ = s.on_chunk_response(
                 p0,
-                manifest.height,
+                manifest.height.0,
                 *idx,
                 Some(chunks[*idx as usize].clone()),
             );
@@ -1311,7 +1316,7 @@ mod tests {
         let (manifest, chunks) = build_snapshot(&vs, 50, 5, &payload, 32);
         let _ = s.on_manifest_response(p0, Some(manifest.clone()), &vs);
         let other = proposer(&vs, 3); // not in the candidate set
-        let actions = s.on_chunk_response(other, manifest.height, 0, Some(chunks[0].clone()));
+        let actions = s.on_chunk_response(other, manifest.height.0, 0, Some(chunks[0].clone()));
         assert!(actions.is_empty());
         assert!(s.is_active());
     }
@@ -1325,7 +1330,7 @@ mod tests {
         let payload: Vec<u8> = vec![0xAA; 32];
         let (manifest, chunks) = build_snapshot(&vs, 50, 5, &payload, 32);
         let _ = s.on_manifest_response(p0, Some(manifest.clone()), &vs);
-        let _ = s.on_chunk_response(p0, manifest.height, 0, Some(chunks[0].clone()));
+        let _ = s.on_chunk_response(p0, manifest.height.0, 0, Some(chunks[0].clone()));
         assert!(s.is_done());
         let actions = s.observe_proposal(50, 200, p0, &vs);
         assert!(actions.is_empty());

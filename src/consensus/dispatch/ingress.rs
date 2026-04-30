@@ -404,7 +404,7 @@ pub fn ingress_snapshot_manifest_response(
 /// [`Dispatch::ServeSnapshotChunk`].
 pub fn ingress_snapshot_chunk_request(height: u64, chunk_idx: u32, from: NodeId) -> Vec<Dispatch> {
     vec![Dispatch::ServeSnapshotChunk {
-        height,
+        height: crate::consensus::Height(height),
         chunk_idx,
         to: from,
     }]
@@ -419,7 +419,7 @@ pub fn ingress_snapshot_chunk_response(
     from: NodeId,
 ) -> Vec<Dispatch> {
     vec![Dispatch::ReceiveSnapshotChunk {
-        height,
+        height: crate::consensus::Height(height),
         chunk_idx,
         payload,
         from,

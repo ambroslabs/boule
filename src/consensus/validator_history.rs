@@ -73,7 +73,7 @@ impl ValidatorSetHistory {
     pub fn from_genesis(genesis: ValidatorSet) -> Self {
         Self {
             boundaries: vec![Boundary {
-                v_eff: 0,
+                v_eff: View::ZERO,
                 set: Arc::new(genesis),
             }],
         }
@@ -85,7 +85,8 @@ impl ValidatorSetHistory {
     /// For any `view < boundaries[i].v_eff`, the answer is the boundary
     /// at index `i - 1`. The genesis boundary is at view 0, so this
     /// always finds a valid set.
-    pub fn set_at(&self, view: View) -> ValidatorSetAt {
+    pub fn set_at(&self, view: impl Into<View>) -> ValidatorSetAt {
+        let view = view.into();
         let idx = match self.boundaries.binary_search_by_key(&view, |b| b.v_eff) {
             Ok(i) => i,
             // `Err(i)` is the insertion index; the boundary in effect at
@@ -107,7 +108,12 @@ impl ValidatorSetHistory {
     /// (floor, overlap, current-membership rules) is the caller's
     /// responsibility — this method only enforces the per-history
     /// monotonicity invariant.
-    pub fn insert_boundary(&mut self, v_eff: View, set: ValidatorSet) -> anyhow::Result<()> {
+    pub fn insert_boundary(
+        &mut self,
+        v_eff: impl Into<View>,
+        set: ValidatorSet,
+    ) -> anyhow::Result<()> {
+        let v_eff = v_eff.into();
         let last = self
             .boundaries
             .last()
@@ -175,7 +181,7 @@ impl ValidatorSetHistory {
         let genesis = iter
             .next()
             .ok_or_else(|| anyhow::anyhow!("persisted history is empty"))?;
-        if genesis.v_eff != 0 {
+        if genesis.v_eff != View::ZERO {
             anyhow::bail!(
                 "persisted history's first boundary must be at v_eff = 0, got {}",
                 genesis.v_eff
@@ -227,7 +233,8 @@ impl ValidatorSetAt {
     /// and the use-site view disagree, so the cached set is for the
     /// wrong reconfiguration window. Release builds skip the check
     /// and return the cached set as-is.
-    pub fn for_view(&self, view: View) -> &ValidatorSet {
+    pub fn for_view(&self, view: impl Into<View>) -> &ValidatorSet {
+        let view = view.into();
         debug_assert_eq!(
             self.view, view,
             "validator-set scope mismatch: looked up at view {}, used at view {}",
@@ -369,7 +376,7 @@ mod tests {
     fn set_at_carries_lookup_view() {
         let h = ValidatorSetHistory::from_genesis(genesis());
         let at = h.set_at(42);
-        assert_eq!(at.view(), 42);
+        assert_eq!(at.view(), View(42));
         // for_view at the same view returns the set unconditionally.
         assert_eq!(*at.for_view(42), genesis());
     }
@@ -392,7 +399,10 @@ mod tests {
 
         let collected: Vec<(View, ValidatorSet)> =
             h.iter().map(|(v, s)| (v, (**s).clone())).collect();
-        assert_eq!(collected, vec![(0, genesis()), (10, five()), (20, six())]);
+        assert_eq!(
+            collected,
+            vec![(View(0), genesis()), (View(10), five()), (View(20), six()),]
+        );
     }
 
     // ── #254: persistence round-trip ────────────────────────────────────
@@ -426,7 +436,7 @@ mod tests {
     fn from_persisted_rejects_non_genesis_first_boundary() {
         let bad = PersistedValidatorHistory {
             boundaries: vec![PersistedBoundary {
-                v_eff: 5,
+                v_eff: View(5),
                 members: vec![nid(1), nid(2), nid(3), nid(4)],
             }],
         };
@@ -451,16 +461,16 @@ mod tests {
         let bad = PersistedValidatorHistory {
             boundaries: vec![
                 PersistedBoundary {
-                    v_eff: 0,
+                    v_eff: View(0),
                     members: vec![nid(1), nid(2), nid(3), nid(4)],
                 },
                 PersistedBoundary {
-                    v_eff: 10,
+                    v_eff: View(10),
                     members: vec![nid(1), nid(2), nid(3), nid(4), nid(5)],
                 },
                 // Out-of-order: v_eff 5 < previous 10.
                 PersistedBoundary {
-                    v_eff: 5,
+                    v_eff: View(5),
                     members: vec![nid(1), nid(2), nid(3), nid(4)],
                 },
             ],

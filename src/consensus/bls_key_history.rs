@@ -150,7 +150,7 @@ impl BlsKeyHistory {
             h.by_stable_id.insert(
                 stable_id,
                 vec![BlsKeyEntry {
-                    v_eff: 0,
+                    v_eff: View::ZERO,
                     bls_pubkey,
                 }],
             );
@@ -165,9 +165,10 @@ impl BlsKeyHistory {
     pub fn register(
         &mut self,
         stable_id: NodeId,
-        v_eff: View,
+        v_eff: impl Into<View>,
         bls_pubkey: BlsPublicKey,
     ) -> Result<(), BlsHistoryError> {
+        let v_eff = v_eff.into();
         if self.by_stable_id.contains_key(&stable_id) {
             return Err(BlsHistoryError::AlreadyRegistered { stable_id });
         }
@@ -182,9 +183,10 @@ impl BlsKeyHistory {
     pub fn apply_rotation(
         &mut self,
         stable_id: NodeId,
-        v_eff: View,
+        v_eff: impl Into<View>,
         new_bls_pubkey: BlsPublicKey,
     ) -> Result<(), BlsHistoryError> {
+        let v_eff = v_eff.into();
         let entries = self
             .by_stable_id
             .get_mut(&stable_id)
@@ -213,7 +215,8 @@ impl BlsKeyHistory {
 
     /// BLS pubkey active for `stable_id` at `view`. Returns `None` if
     /// the validator was not yet registered (or never was).
-    pub fn key_at(&self, stable_id: &NodeId, view: View) -> Option<BlsPublicKey> {
+    pub fn key_at(&self, stable_id: &NodeId, view: impl Into<View>) -> Option<BlsPublicKey> {
+        let view = view.into();
         let entries = self.by_stable_id.get(stable_id)?;
         // Binary-search the last entry whose v_eff <= view.
         let i = entries.partition_point(|e| e.v_eff <= view);
@@ -236,8 +239,9 @@ impl BlsKeyHistory {
     pub fn pubkeys_for_set(
         &self,
         set: &ValidatorSet,
-        view: View,
+        view: impl Into<View>,
     ) -> Result<Vec<BlsPublicKey>, MissingBlsPubkey> {
+        let view = view.into();
         let mut out = Vec::with_capacity(set.len());
         for stable_id in set.iter() {
             // BLS-side APIs key off the raw `NodeId` bytes (per #328
@@ -465,8 +469,8 @@ mod tests {
         assert!(matches!(
             err,
             BlsHistoryError::VeffNotStrictlyIncreasing {
-                last_v_eff: 100,
-                v_eff: 100
+                last_v_eff: View(100),
+                v_eff: View(100)
             }
         ));
         // Lower v_eff: rejected.
@@ -474,8 +478,8 @@ mod tests {
         assert!(matches!(
             err,
             BlsHistoryError::VeffNotStrictlyIncreasing {
-                last_v_eff: 100,
-                v_eff: 50
+                last_v_eff: View(100),
+                v_eff: View(50)
             }
         ));
         // Strictly greater: accepted.
@@ -552,7 +556,7 @@ mod tests {
             err,
             MissingBlsPubkey {
                 stable_id: nid(99),
-                view: 5
+                view: View(5)
             }
         );
     }
@@ -573,7 +577,7 @@ mod tests {
             err,
             MissingBlsPubkey {
                 stable_id: nid(5),
-                view: 50
+                view: View(50)
             }
         );
 
@@ -630,11 +634,11 @@ mod tests {
                 stable_id: nid(1),
                 entries: vec![
                     PersistedBlsKeyEntry {
-                        v_eff: 100,
+                        v_eff: View(100),
                         bls_pubkey: pk(0xA1),
                     },
                     PersistedBlsKeyEntry {
-                        v_eff: 50, // earlier than the previous entry
+                        v_eff: View(50), // earlier than the previous entry
                         bls_pubkey: pk(0xA2),
                     },
                 ],

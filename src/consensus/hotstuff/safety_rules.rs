@@ -133,6 +133,7 @@ mod tests {
     use super::super::state::Locked;
     use super::*;
     use crate::consensus::validator_set::ValidatorSet;
+    use crate::consensus::{Height, View};
     use crate::p2p::NodeId;
     use crate::replication::block::{Block, BlockHeader};
 
@@ -155,7 +156,8 @@ mod tests {
         let mut out = Vec::with_capacity(views.len());
         let mut parent_hash = genesis.hash();
         for (i, &view) in views.iter().enumerate() {
-            let height = genesis.header.height + (i as u64) + 1;
+            let height = genesis.header.height + Height((i as u64) + 1);
+            let view = View(view);
             let header = BlockHeader {
                 parent_hash,
                 height,
@@ -184,7 +186,7 @@ mod tests {
     }
 
     fn dummy_qc(view: u64, block_hash: BlockHash) -> QuorumCertificate {
-        QuorumCertificate::new(view, block_hash, validators().len())
+        QuorumCertificate::new(View(view), block_hash, validators().len())
     }
 
     // ── extends ─────────────────────────────────────────────────
@@ -221,8 +223,8 @@ mod tests {
         let sibling = Block {
             header: BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 2,
+                height: Height(1),
+                view: View(2),
                 proposer: nid(2),
                 state_commitment: [1; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -274,8 +276,8 @@ mod tests {
         let a = Block {
             header: BlockHeader {
                 parent_hash: b_hash,
-                height: 5,
-                view: 5,
+                height: Height(5),
+                view: View(5),
                 proposer: nid(1),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -286,8 +288,8 @@ mod tests {
         let b = Block {
             header: BlockHeader {
                 parent_hash: a_hash,
-                height: 4,
-                view: 4,
+                height: Height(4),
+                view: View(4),
                 proposer: nid(1),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -314,8 +316,8 @@ mod tests {
         let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[5]);
         let mut state = state_with_chain(&chain, g.clone());
-        state.last_voted_view = 5;
-        let p = proposal(chain[0].clone(), dummy_qc(0, g.hash()));
+        state.last_voted_view = View(5);
+        let p = proposal(chain[0].clone(), dummy_qc(0u64, g.hash()));
         assert!(!safe_to_vote(&p, &state));
     }
 
@@ -324,7 +326,7 @@ mod tests {
         let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1]);
         let state = state_with_chain(&chain, g.clone());
-        let p = proposal(chain[0].clone(), dummy_qc(0, g.hash()));
+        let p = proposal(chain[0].clone(), dummy_qc(0u64, g.hash()));
         assert!(safe_to_vote(&p, &state));
     }
 
@@ -338,12 +340,12 @@ mod tests {
         let new_block = &chain[1];
         let mut state = state_with_chain(&chain, g.clone());
         state.locked = Some(Locked {
-            view: 3,
+            view: View(3),
             height: locked_block.header.height,
             block_hash: locked_block.hash(),
         });
-        state.last_voted_view = 3;
-        let p = proposal(new_block.clone(), dummy_qc(3, locked_block.hash()));
+        state.last_voted_view = View(3);
+        let p = proposal(new_block.clone(), dummy_qc(3u64, locked_block.hash()));
         assert!(safe_to_vote(&p, &state));
     }
 
@@ -357,8 +359,8 @@ mod tests {
         let fork = Block {
             header: BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 6,
+                height: Height(1),
+                view: View(6),
                 proposer: nid(3),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -370,13 +372,13 @@ mod tests {
         state.insert_pending(locked_block.clone());
         state.insert_pending(fork.clone());
         state.locked = Some(Locked {
-            view: 5,
+            view: View(5),
             height: locked_block.header.height,
             block_hash: locked_block.hash(),
         });
-        state.last_voted_view = 5;
+        state.last_voted_view = View(5);
 
-        let stale_justify = dummy_qc(3, g.hash());
+        let stale_justify = dummy_qc(3u64, g.hash());
         let p = proposal(fork, stale_justify);
         assert!(!safe_to_vote(&p, &state));
     }
@@ -389,8 +391,8 @@ mod tests {
         let fork = Block {
             header: BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 10,
+                height: Height(1),
+                view: View(10),
                 proposer: nid(3),
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -402,13 +404,13 @@ mod tests {
         state.insert_pending(locked_block.clone());
         state.insert_pending(fork.clone());
         state.locked = Some(Locked {
-            view: 5,
+            view: View(5),
             height: locked_block.header.height,
             block_hash: locked_block.hash(),
         });
-        state.last_voted_view = 5;
+        state.last_voted_view = View(5);
 
-        let fresh_justify = dummy_qc(9, [0xEE; 32]);
+        let fresh_justify = dummy_qc(9u64, [0xEE; 32]);
         let p = proposal(fork, fresh_justify);
         assert!(safe_to_vote(&p, &state));
     }
@@ -418,18 +420,18 @@ mod tests {
     #[test]
     fn should_update_high_qc_when_empty() {
         let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-        assert!(should_update_high_qc(&dummy_qc(0, [0; 32]), &state));
+        assert!(should_update_high_qc(&dummy_qc(0u64, [0; 32]), &state));
     }
 
     #[test]
     fn should_update_high_qc_requires_strictly_greater_view() {
         let mut state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
         state.high_qc = Some(super::super::qc::VerifiedQc::unchecked(dummy_qc(
-            5, [1; 32],
+            5u64, [1; 32],
         )));
-        assert!(!should_update_high_qc(&dummy_qc(5, [2; 32]), &state));
-        assert!(!should_update_high_qc(&dummy_qc(4, [2; 32]), &state));
-        assert!(should_update_high_qc(&dummy_qc(6, [2; 32]), &state));
+        assert!(!should_update_high_qc(&dummy_qc(5u64, [2; 32]), &state));
+        assert!(!should_update_high_qc(&dummy_qc(4u64, [2; 32]), &state));
+        assert!(should_update_high_qc(&dummy_qc(6u64, [2; 32]), &state));
     }
 
     // ── three_chain_commit ──────────────────────────────────────
@@ -439,11 +441,11 @@ mod tests {
         let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1, 2, 3]);
         let state = state_with_chain(&chain, g);
-        let new_qc = dummy_qc(3, chain[2].hash());
+        let new_qc = dummy_qc(3u64, chain[2].hash());
 
         let committed = three_chain_commit(&new_qc, &state).expect("three-chain fires");
         assert_eq!(committed.hash(), chain[0].hash());
-        assert_eq!(committed.header.view, 1);
+        assert_eq!(committed.header.view, View(1));
     }
 
     #[test]
@@ -452,7 +454,7 @@ mod tests {
         // Views 1, 2, 5 — not strictly consecutive (gap between 2 and 5).
         let chain = chain_from_genesis(&g, &[1, 2, 5]);
         let state = state_with_chain(&chain, g);
-        let new_qc = dummy_qc(5, chain[2].hash());
+        let new_qc = dummy_qc(5u64, chain[2].hash());
         assert!(three_chain_commit(&new_qc, &state).is_none());
     }
 
@@ -466,7 +468,7 @@ mod tests {
         let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[2, 3]);
         let state = state_with_chain(&chain, g);
-        let new_qc = dummy_qc(3, chain[1].hash());
+        let new_qc = dummy_qc(3u64, chain[1].hash());
         // b3 = chain[1] (view 3), b2 = chain[0] (view 2, consecutive),
         // b1 = genesis (view 0, NOT consecutive with view 2) → None.
         assert!(three_chain_commit(&new_qc, &state).is_none());
@@ -476,7 +478,7 @@ mod tests {
     fn three_chain_commit_returns_none_on_unknown_qc_block() {
         let g = Block::genesis([0; 32], [0; 32]);
         let state = HotStuffState::new(validators(), g);
-        let new_qc = dummy_qc(7, [0xAB; 32]);
+        let new_qc = dummy_qc(7u64, [0xAB; 32]);
         assert!(three_chain_commit(&new_qc, &state).is_none());
     }
 
@@ -486,7 +488,7 @@ mod tests {
         let chain = chain_from_genesis(&g, &[1, 2, 3]);
         let state = state_with_chain(&chain, g);
         // QC claims view 9 over a block whose header view is 3 → malformed.
-        let bogus = dummy_qc(9, chain[2].hash());
+        let bogus = dummy_qc(9u64, chain[2].hash());
         assert!(three_chain_commit(&bogus, &state).is_none());
     }
 
@@ -497,8 +499,8 @@ mod tests {
         let g = Block::genesis([0; 32], [0; 32]);
         let chain = chain_from_genesis(&g, &[1, 2, 3]);
         let state = state_with_chain(&chain, g);
-        let new_qc = dummy_qc(3, chain[2].hash());
+        let new_qc = dummy_qc(3u64, chain[2].hash());
         let committed = three_chain_commit(&new_qc, &state).unwrap();
-        assert_eq!(committed.header.view, 1);
+        assert_eq!(committed.header.view, View(1));
     }
 }

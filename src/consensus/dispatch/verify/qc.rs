@@ -10,6 +10,7 @@
 //!   a Byzantine voter can't suppress an honest timeout signal by
 //!   attaching garbage.
 
+use crate::consensus::View;
 use crate::consensus::hotstuff::qc::QuorumCertificate;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
@@ -57,9 +58,9 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
     // parent walk catches this downstream too, but defense-in-depth
     // says reject the malformed envelope at the boundary rather than
     // relying on the safety core.
-    if qc.view == 0 && qc.block_hash != *genesis_hash {
+    if qc.view == View::ZERO && qc.block_hash != *genesis_hash {
         return Err(IngressError::InvalidQcAggregate {
-            view: 0,
+            view: View::ZERO,
             scheme: scheme.name(),
         });
     }
@@ -75,7 +76,7 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
     // QCs with no signers at any other view also have nothing to
     // verify cryptographically — accept them and let the safety core
     // decide whether to act on a no-quorum QC.
-    if qc.view == 0 || qc.signer_count() == 0 {
+    if qc.view == View::ZERO || qc.signer_count() == 0 {
         return Ok(());
     }
 

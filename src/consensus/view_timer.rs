@@ -112,13 +112,13 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let mut timer = ViewTimer::new(tx);
 
-        timer.reset(3, Duration::from_millis(100));
-        assert_eq!(timer.armed_for(), Some(3));
+        timer.reset(View(3), Duration::from_millis(100));
+        assert_eq!(timer.armed_for(), Some(View(3)));
 
         time::advance(Duration::from_millis(101)).await;
 
         let fired = rx.recv().await.expect("timer must fire");
-        assert_eq!(fired, 3);
+        assert_eq!(fired, View(3));
     }
 
     #[tokio::test]
@@ -128,9 +128,9 @@ mod tests {
         let mut timer = ViewTimer::new(tx);
 
         // Arm for view 1, then immediately re-arm for view 2.
-        timer.reset(1, Duration::from_millis(100));
-        timer.reset(2, Duration::from_millis(200));
-        assert_eq!(timer.armed_for(), Some(2));
+        timer.reset(View(1), Duration::from_millis(100));
+        timer.reset(View(2), Duration::from_millis(200));
+        assert_eq!(timer.armed_for(), Some(View(2)));
 
         // Advance past the original deadline for view 1.
         time::advance(Duration::from_millis(150)).await;
@@ -140,7 +140,7 @@ mod tests {
         // Advance past the view-2 deadline.
         time::advance(Duration::from_millis(60)).await;
         let fired = rx.recv().await.expect("view 2 timer must fire");
-        assert_eq!(fired, 2);
+        assert_eq!(fired, View(2));
     }
 
     #[tokio::test]
@@ -149,7 +149,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let mut timer = ViewTimer::new(tx);
 
-        timer.reset(5, Duration::from_millis(50));
+        timer.reset(View(5), Duration::from_millis(50));
         timer.cancel();
         assert!(timer.armed_for().is_none());
 
@@ -170,15 +170,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let mut timer = ViewTimer::new(tx);
 
-        for v in 0..5 {
-            timer.reset(v, Duration::from_millis(50));
+        for v in 0..5u64 {
+            timer.reset(View(v), Duration::from_millis(50));
         }
-        assert_eq!(timer.armed_for(), Some(4));
+        assert_eq!(timer.armed_for(), Some(View(4)));
 
         time::advance(Duration::from_millis(60)).await;
 
         let fired = rx.recv().await.unwrap();
-        assert_eq!(fired, 4);
+        assert_eq!(fired, View(4));
         // Channel must be empty — only the final view fires.
         assert!(rx.try_recv().is_err());
     }

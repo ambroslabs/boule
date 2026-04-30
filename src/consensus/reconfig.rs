@@ -52,7 +52,7 @@ pub const MIN_VALIDATOR_FLOOR: usize = 4;
 /// "Effective-view delay" — value is settled here as the consensus-side
 /// minimum; operators may target a larger delay via the CLI but cannot
 /// undercut this floor.
-pub const MIN_V_EFF_DELAY: u64 = 2;
+pub const MIN_V_EFF_DELAY: View = View::new(2);
 
 /// A pubkey + network address pair describing a validator to admit.
 ///
@@ -163,9 +163,9 @@ impl ReconfigCommand {
     pub fn validate_against(
         &self,
         current_set: &ValidatorSet,
-        current_view: View,
+        current_view: impl Into<View>,
     ) -> anyhow::Result<Vec<NodeId>> {
-        self.validate_against_with_delay(current_set, current_view, MIN_V_EFF_DELAY)
+        self.validate_against_with_delay(current_set, current_view.into(), MIN_V_EFF_DELAY)
     }
 
     /// Same as [`Self::validate_against`] but uses an operator-supplied
@@ -184,14 +184,14 @@ impl ReconfigCommand {
     pub fn validate_against_with_delay(
         &self,
         current_set: &ValidatorSet,
-        current_view: View,
+        current_view: impl Into<View>,
         min_v_eff_delay: View,
     ) -> anyhow::Result<Vec<NodeId>> {
         // Ed25519 chains never read the chain_id arg (PoPs are absent),
         // so the test sentinel is safe here.
         self.validate_against_with_delay_and_scheme(
             current_set,
-            current_view,
+            current_view.into(),
             min_v_eff_delay,
             SignatureSchemeChoice::Ed25519Collected,
             &ChainId::TEST,
@@ -214,11 +214,12 @@ impl ReconfigCommand {
     pub fn validate_against_with_delay_and_scheme(
         &self,
         current_set: &ValidatorSet,
-        current_view: View,
+        current_view: impl Into<View>,
         min_v_eff_delay: View,
         scheme: SignatureSchemeChoice,
         chain_id: &ChainId,
     ) -> anyhow::Result<Vec<NodeId>> {
+        let current_view = current_view.into();
         let effective_delay = std::cmp::max(min_v_eff_delay, MIN_V_EFF_DELAY);
         let min_v_eff = current_view.checked_add(effective_delay).ok_or_else(|| {
             anyhow::anyhow!("current_view {current_view} + delay {effective_delay} overflows",)
@@ -379,7 +380,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(10, 7010), entry(11, 7011)],
             removes: vec![nid(1)],
-            v_eff: 100,
+            v_eff: View(100),
         };
         let bytes = cmd.encode();
         assert!(ReconfigCommand::is_reconfig_payload(&bytes));
@@ -406,7 +407,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(10, 7010)],
             removes: vec![],
-            v_eff: 100,
+            v_eff: View(100),
         };
         let bytes = cmd.encode();
         // Lop off the body's tail. The tag remains intact.
@@ -424,7 +425,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let next = cmd.validate_against(&cur, 0).unwrap();
         assert_eq!(next, vec![nid(1), nid(2), nid(3), nid(4), nid(5)]);
@@ -436,7 +437,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(5)],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let next = cmd.validate_against(&cur, 0).unwrap();
         assert_eq!(next, vec![nid(1), nid(2), nid(3), nid(4)]);
@@ -448,7 +449,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(6, 7006)],
             removes: vec![nid(2)],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let next = cmd.validate_against(&cur, 0).unwrap();
         assert_eq!(next, vec![nid(1), nid(3), nid(4), nid(5), nid(6)]);
@@ -473,7 +474,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
-            v_eff: 5, // current_view = 4, min v_eff = 4 + 2 = 6.
+            v_eff: View(5), // current_view = 4, min v_eff = 4 + 2 = 6.
         };
         let err = cmd.validate_against(&cur, 4).unwrap_err();
         assert!(err.to_string().contains("v_eff 5"), "{err}");
@@ -485,7 +486,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005), entry(5, 7006)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
         assert!(
@@ -500,7 +501,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(5), nid(5)],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
         assert!(
@@ -515,7 +516,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![nid(5)],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
         assert!(
@@ -530,7 +531,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(1, 7001)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
         assert!(
@@ -545,7 +546,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(99)],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
         assert!(
@@ -560,7 +561,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(4)],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
         assert!(
@@ -575,7 +576,7 @@ mod tests {
     fn build_add_validator_payload_round_trips() {
         let node_id = nid(7);
         let addr: SocketAddr = "127.0.0.1:7007".parse().unwrap();
-        let v_eff = 42;
+        let v_eff = View(42);
         let bytes = ReconfigCommand::build_add_validator_payload(node_id, addr, v_eff);
         assert!(ReconfigCommand::is_reconfig_payload(&bytes));
         let decoded = ReconfigCommand::decode(&bytes).unwrap();
@@ -589,7 +590,7 @@ mod tests {
     #[test]
     fn build_remove_validator_payload_round_trips() {
         let node_id = nid(3);
-        let v_eff = 99;
+        let v_eff = View(99);
         let bytes = ReconfigCommand::build_remove_validator_payload(node_id, v_eff);
         assert!(ReconfigCommand::is_reconfig_payload(&bytes));
         let decoded = ReconfigCommand::decode(&bytes).unwrap();
@@ -604,7 +605,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
-            v_eff: u64::MAX,
+            v_eff: View::MAX,
         };
         let err = cmd.validate_against(&cur, u64::MAX).unwrap_err();
         assert!(err.to_string().contains("overflow"), "{err}");
@@ -634,7 +635,7 @@ mod tests {
     fn validate_bls(cmd: &ReconfigCommand, cur: &ValidatorSet) -> anyhow::Result<Vec<NodeId>> {
         cmd.validate_against_with_delay_and_scheme(
             cur,
-            0,
+            View::ZERO,
             MIN_V_EFF_DELAY,
             SignatureSchemeChoice::BlsAggregated,
             &ChainId::TEST,
@@ -647,7 +648,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let next = validate_bls(&cmd, &cur).unwrap();
         assert!(next.contains(&nid(5)));
@@ -663,7 +664,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = validate_bls(&cmd, &floor_set()).unwrap_err();
         assert!(err.to_string().contains("PoP"), "{err}");
@@ -682,7 +683,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![a],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = validate_bls(&cmd, &floor_set()).unwrap_err();
         assert!(err.to_string().contains("PoP"), "{err}");
@@ -699,7 +700,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry_with_valid_pop(5, 7005, &chain_a)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         // Sanity: under the originating chain, the add is accepted.
         cmd.validate_against_with_delay_and_scheme(
@@ -731,7 +732,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         cmd.validate_against(&cur, 0)
             .expect("entries without PoP must validate on Ed25519 chains");
@@ -745,7 +746,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = cmd
             .validate_against_with_delay_and_scheme(
@@ -768,7 +769,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let next = cmd
             .validate_against_with_delay_and_scheme(
@@ -788,7 +789,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
-            v_eff: 10,
+            v_eff: View(10),
         };
         let err = cmd
             .validate_against_with_delay_and_scheme(

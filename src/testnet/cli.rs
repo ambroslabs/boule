@@ -550,8 +550,8 @@ async fn cmd_snap(args: &[String]) -> anyhow::Result<()> {
         };
         if let (Some(_pid), Some(api)) = (pid, n.api_addr) {
             if let Some(s) = admin::maybe_consensus_status(api).await? {
-                row.current_view = Some(s.current_view);
-                row.last_committed_height = Some(s.last_committed_height);
+                row.current_view = Some(s.current_view.0);
+                row.last_committed_height = Some(s.last_committed_height.0);
                 row.peers_connected = Some(s.peers_connected.len());
                 row.self_role = Some(s.self_role);
             }

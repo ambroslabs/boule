@@ -68,15 +68,24 @@ impl RoundRobinSelector {
         let history = Arc::new(ValidatorSetHistory::from_genesis((*set).clone()));
         Self::new(history)
     }
+
+    /// Inherent shadow of [`LeaderSelector::leader_for_view`] that
+    /// accepts any `Into<View>`. Test code commonly passes a `u64`
+    /// literal; this avoids wrapping every call site in `View(..)`.
+    /// Inherent impls take precedence over trait impls, so callers
+    /// holding a concrete `RoundRobinSelector` get this overload.
+    pub fn leader_for_view(&self, view: impl Into<View>) -> NodeId {
+        <Self as LeaderSelector>::leader_for_view(self, view.into())
+    }
 }
 
 impl LeaderSelector for RoundRobinSelector {
     fn leader_for_view(&self, view: View) -> NodeId {
         let vs_at = self.history.set_at(view);
         let vs = vs_at.for_view(view);
-        // `view % len as u64` before narrowing to usize so the rotation
-        // is identical on 32- and 64-bit platforms.
-        let idx = (view % vs.len() as u64) as usize;
+        // `view.0 % len as u64` before narrowing to usize so the
+        // rotation is identical on 32- and 64-bit platforms.
+        let idx = (view.0 % vs.len() as u64) as usize;
         // Round-robin returns the wire-form `NodeId` for the leader;
         // the bytes are the validator's stable id (#328 keeps the
         // bytes reusable across the typestate boundary).
@@ -154,7 +163,7 @@ mod tests {
     fn rotation_picks_pre_boundary_set_before_v_eff_and_post_at_or_after() {
         let old_set = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4)]);
         let new_set = ValidatorSet::new(vec![vid(10), vid(20), vid(30)]);
-        let v_eff: View = 7;
+        let v_eff: View = View(7);
 
         let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
         history.insert_boundary(v_eff, new_set.clone()).unwrap();

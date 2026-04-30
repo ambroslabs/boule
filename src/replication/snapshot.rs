@@ -44,9 +44,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::consensus::View;
 use crate::consensus::hotstuff::QuorumCertificate;
 use crate::consensus::validator_set::ValidatorSet;
+use crate::consensus::{Height, View};
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 use crate::storage::{Storage, StorageExt};
@@ -90,7 +90,7 @@ pub struct SnapshotManifest {
     pub version: u8,
     /// Block height the snapshot was taken at. Equal to
     /// `block.header.height` for a well-formed manifest.
-    pub height: u64,
+    pub height: Height,
     /// View of the snapshot block. Equal to `block.header.view`.
     pub view: View,
     /// Content-hash of the snapshot block. Equal to `block.hash()`.
@@ -711,14 +711,17 @@ impl SnapshotStore {
         }
         let manifest_bytes = postcard::to_stdvec(manifest)?;
         self.storage.batch(|b| {
-            b.put(&manifest_storage_key(manifest.height), &manifest_bytes);
+            b.put(&manifest_storage_key(manifest.height.0), &manifest_bytes);
             for (idx, chunk) in chunks.iter().enumerate() {
                 b.put(
-                    &chunk_storage_key(manifest.height, idx as u32),
+                    &chunk_storage_key(manifest.height.0, idx as u32),
                     chunk.as_ref(),
                 );
             }
-            b.put(STORAGE_KEY_SNAPSHOT_LATEST, &manifest.height.to_be_bytes());
+            b.put(
+                STORAGE_KEY_SNAPSHOT_LATEST,
+                &manifest.height.0.to_be_bytes(),
+            );
             Ok(())
         })?;
         Ok(())
@@ -949,8 +952,10 @@ impl SnapshotPolicy {
     /// True iff a block at `committed_height` should trigger a
     /// snapshot under this policy. False on a disabled policy and on
     /// the genesis block (height 0).
-    pub fn should_snapshot_at(&self, committed_height: u64) -> bool {
-        self.is_enabled() && committed_height > 0 && committed_height % self.interval_blocks == 0
+    pub fn should_snapshot_at(&self, committed_height: Height) -> bool {
+        self.is_enabled()
+            && committed_height > Height::ZERO
+            && committed_height.0 % self.interval_blocks == 0
     }
 }
 
@@ -979,8 +984,8 @@ mod tests {
         Block {
             header: BlockHeader {
                 parent_hash,
-                height,
-                view,
+                height: Height(height),
+                view: View(view),
                 proposer: [0u8; 32],
                 state_commitment,
                 commands_commitment: Block::commands_commitment(&commands),
@@ -993,7 +998,7 @@ mod tests {
     /// Build a quorum-bearing QC over `block_hash` for the given
     /// validator-set length.
     fn quorum_qc_over(vs_len: usize, block_hash: BlockHash) -> QuorumCertificate {
-        let mut qc = QuorumCertificate::new(0, block_hash, vs_len);
+        let mut qc = QuorumCertificate::new(View::ZERO, block_hash, vs_len);
         for i in 0..quorum_size(vs_len) {
             qc.add_signature(i, [0u8; 64]);
         }
@@ -1059,17 +1064,17 @@ mod tests {
         let store = SnapshotStore::new(storage);
         let (manifest, chunks) = sample_manifest();
         store.save(&manifest, &chunks).unwrap();
-        let loaded = store.load_manifest(manifest.height).unwrap().unwrap();
+        let loaded = store.load_manifest(manifest.height.0).unwrap().unwrap();
         assert_eq!(loaded, manifest);
         for (idx, expected) in chunks.iter().enumerate() {
             let got = store
-                .load_chunk(manifest.height, idx as u32)
+                .load_chunk(manifest.height.0, idx as u32)
                 .unwrap()
                 .unwrap();
             assert_eq!(&got, expected);
         }
-        assert_eq!(store.latest_height().unwrap(), Some(manifest.height));
-        assert_eq!(store.list_heights().unwrap(), vec![manifest.height]);
+        assert_eq!(store.latest_height().unwrap(), Some(manifest.height.0));
+        assert_eq!(store.list_heights().unwrap(), vec![manifest.height.0]);
     }
 
     #[test]
@@ -1102,7 +1107,7 @@ mod tests {
         // Save 5 snapshots at heights 100, 200, ... 500.
         for height in [100, 200, 300, 400, 500] {
             let (mut m, chunks) = sample_manifest();
-            m.height = height;
+            m.height = Height(height);
             store.save(&m, &chunks).unwrap();
         }
         let deleted = store.prune_older_than(3).unwrap();
@@ -1118,7 +1123,7 @@ mod tests {
         let store = SnapshotStore::new(storage);
         for height in [100, 200, 300] {
             let (mut m, chunks) = sample_manifest();
-            m.height = height;
+            m.height = Height(height);
             store.save(&m, &chunks).unwrap();
         }
         store.delete(300).unwrap();
@@ -1136,7 +1141,7 @@ mod tests {
         let store = SnapshotStore::new(storage);
         for height in [100, 200] {
             let (mut m, chunks) = sample_manifest();
-            m.height = height;
+            m.height = Height(height);
             store.save(&m, &chunks).unwrap();
         }
         let deleted = store.prune_older_than(0).unwrap();
@@ -1213,16 +1218,16 @@ mod tests {
         let storage2: Arc<dyn Storage> =
             Arc::new(DiskStorage::open(tmp.path().join("kv.redb")).unwrap());
         let store2 = SnapshotStore::new(storage2);
-        let loaded = store2.load_manifest(manifest.height).unwrap().unwrap();
+        let loaded = store2.load_manifest(manifest.height.0).unwrap().unwrap();
         assert_eq!(loaded, manifest);
         for (idx, expected) in chunks.iter().enumerate() {
             let got = store2
-                .load_chunk(manifest.height, idx as u32)
+                .load_chunk(manifest.height.0, idx as u32)
                 .unwrap()
                 .unwrap();
             assert_eq!(&got, expected);
         }
-        assert_eq!(store2.latest_height().unwrap(), Some(manifest.height));
+        assert_eq!(store2.latest_height().unwrap(), Some(manifest.height.0));
     }
 
     #[test]
@@ -1245,9 +1250,9 @@ mod tests {
         let store_b = SnapshotStore::new(storage_b);
         let (m, c) = import_from_directory(tmp.path()).unwrap();
         store_b.save(&m, &c).unwrap();
-        assert_eq!(store_b.list_heights().unwrap(), vec![manifest.height]);
+        assert_eq!(store_b.list_heights().unwrap(), vec![manifest.height.0]);
         assert_eq!(
-            store_b.load_manifest(manifest.height).unwrap().unwrap(),
+            store_b.load_manifest(manifest.height.0).unwrap().unwrap(),
             manifest,
         );
     }
@@ -1326,7 +1331,7 @@ mod tests {
             .expect("len-4 set has a first element")
             .into_node_id();
         let new_pubkey: NodeId = [0xAB; 32];
-        let v_eff: View = 100;
+        let v_eff: View = View(100);
         key_hist
             .apply_rotation(
                 &ValidatorKeyRotation {
@@ -1419,7 +1424,7 @@ mod tests {
         // diverges the rebuild's hash from the block's claim.
         m.validator_history.boundaries.push(
             crate::consensus::validator_history::PersistedBoundary {
-                v_eff: 999,
+                v_eff: View(999),
                 members: vec![[0xFFu8; 32]; 4],
             },
         );
@@ -1573,13 +1578,13 @@ mod tests {
             retention_count: 3,
             chunk_size_bytes: 1024,
         };
-        assert!(!p.should_snapshot_at(0)); // genesis never triggers
-        assert!(p.should_snapshot_at(100));
-        assert!(!p.should_snapshot_at(150));
-        assert!(p.should_snapshot_at(200));
+        assert!(!p.should_snapshot_at(Height(0))); // genesis never triggers
+        assert!(p.should_snapshot_at(Height(100)));
+        assert!(!p.should_snapshot_at(Height(150)));
+        assert!(p.should_snapshot_at(Height(200)));
 
         let off = SnapshotPolicy::disabled();
-        assert!(!off.should_snapshot_at(100));
-        assert!(!off.should_snapshot_at(0));
+        assert!(!off.should_snapshot_at(Height(100)));
+        assert!(!off.should_snapshot_at(Height(0)));
     }
 }

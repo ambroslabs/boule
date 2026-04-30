@@ -29,6 +29,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::watch;
 
+#[cfg(test)]
+use super::Height;
 use super::View;
 use super::status::ConsensusStatus;
 use crate::replication::block::Block;
@@ -159,10 +161,10 @@ mod tests {
         ConsensusStatus {
             node_id: "node".to_string(),
             self_role: "replica".to_string(),
-            current_view: 0,
-            last_voted_view: 0,
-            last_committed_height: 0,
-            last_committed_view: 0,
+            current_view: View(0),
+            last_voted_view: View(0),
+            last_committed_height: Height(0),
+            last_committed_view: View(0),
             locked: None,
             high_qc: None,
             vote_buckets: Vec::new(),
@@ -183,12 +185,12 @@ mod tests {
         let (tx, rx) = watch::channel(Arc::new(empty_status()));
 
         let mut updated = empty_status();
-        updated.current_view = 42;
+        updated.current_view = View(42);
         updated.node_id = "updated-node".to_string();
         tx.send(Arc::new(updated)).unwrap();
 
         let Json(status) = get_status(State(rx)).await;
-        assert_eq!(status.current_view, 42);
+        assert_eq!(status.current_view, View(42));
         assert_eq!(status.node_id, "updated-node");
     }
 
@@ -199,8 +201,8 @@ mod tests {
         // state (all-zeros), never a 500.
         let (_tx, rx) = watch::channel(Arc::new(empty_status()));
         let Json(status) = get_status(State(rx)).await;
-        assert_eq!(status.current_view, 0);
-        assert_eq!(status.last_committed_height, 0);
+        assert_eq!(status.current_view, View(0));
+        assert_eq!(status.last_committed_height, Height(0));
         assert!(status.locked.is_none());
     }
 }
