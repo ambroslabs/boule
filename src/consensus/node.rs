@@ -2346,17 +2346,30 @@ impl ConsensusNode {
                     .await;
             }
 
-            // Joiner-side consumers land in #229. For now, log and drop
-            // so the wire protocol can be exercised end-to-end (peer A
-            // serves, peer B drops with a debug log).
             Dispatch::ReceiveSnapshotManifest { manifest, from } => {
-                tracing::debug!(
-                    target: TRACE_TARGET,
-                    from = %node_id_to_base58(&from),
-                    has_manifest = manifest.is_some(),
-                    height = manifest.as_ref().map(|m| m.height.0),
-                    "snapshot_manifest_response_received",
-                );
+                if self.snapshot_sync.is_manifest_pending_from(&from) {
+                    tracing::debug!(
+                        target: TRACE_TARGET,
+                        from = %node_id_to_base58(&from),
+                        has_manifest = manifest.is_some(),
+                        height = manifest.as_ref().map(|m| m.height.0),
+                        "snapshot_manifest_response_received",
+                    );
+                } else {
+                    // Manifest arrived without an outstanding request to
+                    // this peer (no active joiner-mode session, response
+                    // landed after we already aborted, or peer wasn't the
+                    // one we asked). The state machine drops it, but
+                    // surfacing it at warn level keeps it from being a
+                    // silent footgun in production.
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        from = %node_id_to_base58(&from),
+                        has_manifest = manifest.is_some(),
+                        height = manifest.as_ref().map(|m| m.height.0),
+                        "snapshot_manifest_response_unexpected",
+                    );
+                }
                 let actions =
                     self.snapshot_sync
                         .on_manifest_response(from, manifest, &self.validator_set);

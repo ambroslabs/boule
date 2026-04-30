@@ -226,6 +226,17 @@ impl SnapshotSync {
         matches!(self.state, State::Aborted)
     }
 
+    /// True when the state machine is awaiting a manifest from
+    /// `peer`. Lets the integration layer distinguish an expected
+    /// manifest delivery from an unsolicited or stale one (which the
+    /// state machine itself just drops, returning no actions).
+    pub fn is_manifest_pending_from(&self, peer: &NodeId) -> bool {
+        matches!(
+            &self.state,
+            State::ManifestPending { primary_peer, .. } if primary_peer == peer,
+        )
+    }
+
     /// Observe an inbound proposal at `proposal_height` proposed by
     /// `proposer`. The proposer is added to the running set of
     /// observed peers; if the joiner is `Idle` and the height
@@ -882,6 +893,25 @@ mod tests {
         let actions = s.on_manifest_response(p1, Some(manifest), &vs);
         assert!(actions.is_empty());
         assert!(s.is_active());
+    }
+
+    #[test]
+    fn is_manifest_pending_from_tracks_primary_peer_only() {
+        let mut s = SnapshotSync::new(enabled_policy(50));
+        let vs = validator_set_4();
+        let p0 = proposer(&vs, 0);
+        let p1 = proposer(&vs, 1);
+        // Idle: no peer is awaited.
+        assert!(!s.is_manifest_pending_from(&p0));
+        // After a request is sent to p0, only p0's reply is pending.
+        let _ = s.observe_proposal(0, 100, p0, &vs);
+        assert!(s.is_manifest_pending_from(&p0));
+        assert!(!s.is_manifest_pending_from(&p1));
+        // Once we transition into Fetching, we no longer await a manifest.
+        let payload: Vec<u8> = vec![0x11; 32];
+        let (manifest, _chunks) = build_snapshot(&vs, 50, 5, &payload, 32);
+        let _ = s.on_manifest_response(p0, Some(manifest), &vs);
+        assert!(!s.is_manifest_pending_from(&p0));
     }
 
     #[test]
