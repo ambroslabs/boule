@@ -34,9 +34,6 @@
 //! compiler now enforces that. `serde(transparent)` keeps the wire
 //! format byte-identical to a bare `u64`.
 
-// Some items in sub-modules are consumed across PRs; allow until wired up.
-#![allow(dead_code)]
-
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 
 use serde::{Deserialize, Serialize};

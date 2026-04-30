@@ -1,3 +1,9 @@
+// Sim is `#[cfg(test)]` and accumulates a few held-but-not-read fields
+// (channel guards, scaffolding for unimplemented features). The
+// alternative — sprinkling per-item `#[allow(dead_code)]` everywhere —
+// is noisier than scoping the lint here in a single test-only module.
+#![allow(dead_code)]
+
 //! In-memory simulation cluster for consensus integration testing.
 //!
 //! [`SimCluster::spawn`] wires `n` [`ConsensusNode`] instances together
