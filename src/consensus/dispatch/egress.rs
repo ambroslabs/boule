@@ -81,13 +81,32 @@ pub fn egress_block_request(hash: BlockHash, to: NodeId) -> Outbound {
     Outbound::SendTo { to, payload }
 }
 
-/// Encode a [`BlockResponse`] as a `SendTo` outbound frame.
+/// Encode a [`BlockResponse`] as a `SendTo` outbound frame, signing
+/// the payload so a wrong-hash response is non-repudiable evidence
+/// (#434).
+///
+/// `requested_hash` is the hash the requester named in the matching
+/// `BlockRequest`. `block` is what we found (or `None` if we didn't
+/// find it). The signed envelope binds both together: a Byzantine
+/// responder who returns a different block under a wrong-hash claim
+/// can be later slashed once that machinery lands.
 ///
 /// [`BlockResponse`]: WireMessage::BlockResponse
-pub fn egress_block_response(block: Option<Block>, to: NodeId) -> Outbound {
-    let wire = WireMessage::BlockResponse(block);
-    let payload = codec::encode(&wire).expect("BlockResponse encoding must not fail");
-    Outbound::SendTo { to, payload }
+pub fn egress_block_response(
+    requested_hash: BlockHash,
+    block: Option<Block>,
+    to: NodeId,
+    signer: &dyn Signer,
+    chain_id: &ChainId,
+) -> anyhow::Result<Outbound> {
+    let payload = crate::consensus::node::BlockResponsePayload {
+        requested_hash,
+        block,
+    };
+    let signed = Signed::sign(payload, signer, chain_id)?;
+    let wire = WireMessage::BlockResponse(signed);
+    let payload = codec::encode(&wire).map_err(anyhow::Error::from)?;
+    Ok(Outbound::SendTo { to, payload })
 }
 
 /// Encode a [`SnapshotManifestRequest`] as a `SendTo` outbound frame.

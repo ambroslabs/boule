@@ -115,7 +115,19 @@ pub enum Dispatch {
     /// Peer requested the block with this hash; serve it if held.
     ServeBlock { hash: BlockHash, to: NodeId },
     /// Peer replied to our [`WireMessage::BlockRequest`].
-    ReceiveBlock { block: Option<Block>, from: NodeId },
+    ///
+    /// `requested_hash` is the hash the responder claims to be
+    /// answering, copied from the matching
+    /// [`WireMessage::BlockRequest`]. It is signed alongside `block`
+    /// so a wrong-hash answer is non-repudiable. The integration
+    /// layer must drop responses where `block`'s actual hash differs
+    /// from `requested_hash`, or where `requested_hash` does not
+    /// match an outstanding `block_sync_inflight` entry.
+    ReceiveBlock {
+        requested_hash: BlockHash,
+        block: Option<Block>,
+        from: NodeId,
+    },
     /// A signed [`TimeoutVote`] arrived. The integration layer feeds
     /// it into its timeout-certificate bucket; on reaching quorum the
     /// bucket emits [`pacemaker::Event::OnTimeoutCert`](crate::consensus::pacemaker::Event::OnTimeoutCert) directly.
