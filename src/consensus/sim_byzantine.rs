@@ -50,7 +50,7 @@ use parking_lot::Mutex;
 use proptest::prelude::*;
 
 use super::sim::{Adversary, AdversaryCtx, SimCluster, assert_no_conflicts};
-use crate::consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote};
+use crate::consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote, Vote};
 use crate::consensus::hotstuff::{NewView, Proposal};
 use crate::consensus::node::WireMessage;
 use crate::crypto::signed::{ChainId, Signed};
@@ -466,6 +466,169 @@ impl Adversary for ForgedHistoryCommitmentAdversary {
     }
 }
 
+// ── Twin-mode adversary (issue #421) ─────────────────────────────────────────
+
+/// Which honest emission [`TwinValidatorAdversary`] should equivocate
+/// under the shared validator key. One variant per signed-envelope kind
+/// HotStuff puts on the wire whose detection / safety / liveness story
+/// differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwinKind {
+    /// Twin Vote envelopes: pass the original through and additionally
+    /// broadcast a forged Vote at the same view with a mutated
+    /// `block_hash`, re-signed under the byzantine's own key. Honest
+    /// recipients hit the `(view, voter_id)` dedupe map landed in
+    /// #409 and emit `Action::EquivocationEvidence` on the second
+    /// arrival; the integration layer increments
+    /// [`crate::consensus::status::ConsensusStatus::equivocations_detected`]
+    /// — which the proptest property reads via
+    /// [`SimCluster::peek_equivocations_detected`] to confirm the
+    /// evidence-emission path is exercised end-to-end.
+    Vote,
+    /// Twin Proposal envelopes: pass the original through and
+    /// additionally broadcast a forged Proposal at the same view whose
+    /// `block.header.state_commitment` is mutated and the resulting
+    /// block is re-signed. Both proposals reach every honest replica
+    /// (unlike [`EquivocatorAdversary`], which splits a 1+2 subset).
+    /// Safety holds via the safety core's `last_voted_view` monotonic
+    /// — each replica votes for at most one of the two proposals; the
+    /// other is dropped on the floor at the receive-side safety check.
+    /// No equivocation evidence is produced today (Proposal-equivocation
+    /// detection is future work; the dedupe map in #409 covers Vote
+    /// only).
+    Proposal,
+    /// Twin TimeoutVote envelopes: pass the original through and
+    /// additionally broadcast a forged TimeoutVote at the same view
+    /// with a mutated `high_qc` piggyback (clears the field to `None`
+    /// — distinct from any honest emission, which carries the
+    /// genuine `high_qc`). The timeout-bucket folds at most one
+    /// signature per `(view, signer)` so the byzantine's two
+    /// envelopes contribute one vote, not two; safety + liveness hold
+    /// the same way `TimeoutSpammerAdversary` does. No equivocation
+    /// evidence is produced today (the dedupe map in #409 covers
+    /// Vote only).
+    TimeoutVote,
+}
+
+/// Adversary 8 (issue #421 / audit finding 14-2): twin-mode adversary
+/// that simulates a single validator slot driving two independent
+/// inputs to the network under one shared validator key.
+///
+/// The issue's `TwinValidator` proposal carved this as two real
+/// safety-core instances behind a network router. We get the same
+/// wire-level shape — and crucially the same recipient-side reactions
+/// — by intercepting the honest core's outbound emission, decoding it,
+/// and additionally broadcasting a forged twin envelope that conflicts
+/// with the original under the same key. From the cluster's vantage
+/// every byte that hits the wire is identical to what two cores
+/// sharing a key would have emitted; the recipient-side dedupe in #409
+/// fires on the Vote variant exactly as it would in the two-core
+/// design, and safety + liveness assertions hold for the same reasons
+/// (`last_voted_view` monotonic, single-signer-per-bucket folding).
+///
+/// Restricting to one of [`TwinKind::Vote`] / [`TwinKind::Proposal`] /
+/// [`TwinKind::TimeoutVote`] per proptest property satisfies the
+/// issue's "at least three property tests" acceptance criterion and
+/// keeps the failure mode of any one assertion attributable to a
+/// single twin direction.
+pub struct TwinValidatorAdversary {
+    kind: TwinKind,
+}
+
+impl TwinValidatorAdversary {
+    pub fn new(kind: TwinKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl Adversary for TwinValidatorAdversary {
+    fn intercept(&self, ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound> {
+        let payload = outbound_payload(&outbound);
+        let Some(decoded) = decode(&payload) else {
+            return vec![outbound];
+        };
+        match (self.kind, decoded) {
+            (TwinKind::Vote, WireMessage::Vote(signed_a, bls_partial)) => {
+                // Forge a twin Vote at the same view with a mutated
+                // block_hash. The mutated hash points to no real block,
+                // but the recipient-side equivocation detector in
+                // [`crate::consensus::hotstuff::step::HotStuffCore::on_vote_received`]
+                // keys on `(view, voter_id)` and only inspects the
+                // stored vs. arriving `block_hash` — it does not
+                // require either hash to resolve to a known block.
+                //
+                // Sign under `ctx.chain_id` (not `ChainId::TEST`) so the
+                // honest receivers' `verify_sig` accepts the forgery —
+                // the cluster's chain id is derived from the genesis
+                // block hash (#324). A forgery under any other tag is
+                // rejected at ingress before it can reach the dedupe.
+                let mut block_hash_b = signed_a.payload.block_hash;
+                block_hash_b[0] ^= 0x01;
+                let vote_b = Vote {
+                    view: signed_a.payload.view,
+                    block_hash: block_hash_b,
+                };
+                let signed_b = Signed::sign(vote_b, ctx.signer.as_ref(), &ctx.chain_id)
+                    .expect("twin vote re-signing must not fail (own signer is healthy)");
+                // Carry the original Vote's BLS partial slot through —
+                // on Ed25519 chains it is `None`; on BLS chains the
+                // dispatch-layer ingress check rejects the forged twin
+                // because the partial does not sign over the mutated
+                // block_hash. The Ed25519 envelope still verifies, the
+                // dedupe map still fires, so the test invariant holds
+                // on either chain scheme.
+                let payload_b = encode(&WireMessage::Vote(signed_b, bls_partial));
+                vec![outbound, ProtocolOutbound::Broadcast(payload_b)]
+            }
+            (TwinKind::Proposal, WireMessage::Proposal(signed_a)) => {
+                // Forge a twin Proposal at the same view whose
+                // `state_commitment` is mutated so the block hash
+                // diverges from the original. Both proposals are
+                // broadcast to every peer (unlike the
+                // [`EquivocatorAdversary`] split of 1+2): every honest
+                // replica observes both forks at the same view, but
+                // each only votes for one (the safety core's
+                // `last_voted_view` monotonic check rejects the second
+                // by view-equality).
+                let block_a = signed_a.payload.block.clone();
+                let mut header_b = block_a.header.clone();
+                header_b.state_commitment[0] ^= 0x01;
+                let block_b = Block {
+                    header: header_b,
+                    commands: block_a.commands.clone(),
+                };
+                let proposal_b = Proposal {
+                    block: block_b,
+                    justify: signed_a.payload.justify.clone(),
+                };
+                let signed_b = Signed::sign(proposal_b, ctx.signer.as_ref(), &ctx.chain_id)
+                    .expect("twin proposal re-signing must not fail");
+                let payload_b = encode(&WireMessage::Proposal(signed_b));
+                vec![outbound, ProtocolOutbound::Broadcast(payload_b)]
+            }
+            (TwinKind::TimeoutVote, WireMessage::TimeoutVote(signed_a)) => {
+                // Forge a twin TimeoutVote at the same view whose
+                // `high_qc` piggyback is cleared (distinct from the
+                // honest emission, which carries the genuine
+                // `Some(high_qc)`). The timeout-bucket folds at most
+                // one signature per `(view, signer)` pair so the
+                // twin's envelope adds zero quorum weight; the bucket
+                // ignores it the same way it would absorb a stale
+                // [`TimeoutSpammerAdversary`] frame.
+                let tv_b = TimeoutVote {
+                    view: signed_a.payload.view,
+                    high_qc: None,
+                };
+                let signed_b = Signed::sign(tv_b, ctx.signer.as_ref(), &ctx.chain_id)
+                    .expect("twin timeout-vote re-signing must not fail");
+                let payload_b = encode(&WireMessage::TimeoutVote(signed_b));
+                vec![outbound, ProtocolOutbound::Broadcast(payload_b)]
+            }
+            _ => vec![outbound],
+        }
+    }
+}
+
 // ── Tests / proptest properties ──────────────────────────────────────────────
 
 #[cfg(test)]
@@ -497,6 +660,9 @@ mod tests {
         TimeoutSpammer,
         ForgedPiggyback,
         ForgedHistoryCommitment,
+        TwinVote,
+        TwinProposal,
+        TwinTimeoutVote,
     }
 
     fn build_adversary(kind: AdvKind) -> Arc<dyn Adversary> {
@@ -512,6 +678,11 @@ mod tests {
             AdvKind::TimeoutSpammer => Arc::new(TimeoutSpammerAdversary::new(2)),
             AdvKind::ForgedPiggyback => Arc::new(ForgedPiggybackAdversary::new(2)),
             AdvKind::ForgedHistoryCommitment => Arc::new(ForgedHistoryCommitmentAdversary),
+            AdvKind::TwinVote => Arc::new(TwinValidatorAdversary::new(TwinKind::Vote)),
+            AdvKind::TwinProposal => Arc::new(TwinValidatorAdversary::new(TwinKind::Proposal)),
+            AdvKind::TwinTimeoutVote => {
+                Arc::new(TwinValidatorAdversary::new(TwinKind::TimeoutVote))
+            }
         }
     }
 
@@ -524,6 +695,9 @@ mod tests {
             AdvKind::TimeoutSpammer => "timeout-spammer",
             AdvKind::ForgedPiggyback => "forged-piggyback",
             AdvKind::ForgedHistoryCommitment => "forged-history-commitment",
+            AdvKind::TwinVote => "twin-vote",
+            AdvKind::TwinProposal => "twin-proposal",
+            AdvKind::TwinTimeoutVote => "twin-timeout-vote",
         }
     }
 
@@ -750,15 +924,116 @@ mod tests {
             })?;
         }
 
-        /// **Mixed adversary** — randomly pick one of the seven
+        /// **Twin-mode vote** (issue #421 / audit finding 14-2) —
+        /// byzantine emits an honest Vote and additionally broadcasts
+        /// a forged twin Vote at the same view with a mutated
+        /// `block_hash`, both signed under the shared validator key.
+        /// Honest replicas hit the `(view, voter_id)` dedupe map
+        /// landed in #409 on the second arrival and emit
+        /// `Action::EquivocationEvidence`; the integration layer
+        /// increments
+        /// [`crate::consensus::status::ConsensusStatus::equivocations_detected`].
+        /// Safety: the dedupe drops the second partial on the floor,
+        /// so neither bucket inflates with conflicting signatures.
+        /// Liveness: the byzantine's *first* Vote still folds into
+        /// the bucket the proposed block hashes to, leaving honest
+        /// quorum formation unaffected.
+        ///
+        /// In addition to the safety + liveness floors enforced by
+        /// `run_one_property`, this property asserts the
+        /// evidence-emission path is exercised end-to-end:
+        /// `equivocations_detected` is `> 0` on at least
+        /// `f + 1 = 2` honest replicas. Per-replica detection runs
+        /// independently on each receiver, and the byzantine emits
+        /// twin votes on every view it participates in, so a
+        /// HONEST_FLOOR-of-3 commit run reliably accumulates
+        /// detections everywhere.
+        #[test]
+        fn proptest_twin_vote_preserves_safety_and_emits_evidence(
+            victim in 0usize..4,
+        ) {
+            run_paused(|| async move {
+                let (mut cluster, honest) =
+                    spawn_with_one_adversary(victim, build_adversary(AdvKind::TwinVote)).await;
+                let baseline = cluster.peek_commit_heights();
+                let (satisfied, final_heights) =
+                    run_until_honest_floor_or_cap(&mut cluster, &honest, &baseline).await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                prop_assert!(
+                    satisfied,
+                    "twin-vote adversary at index {victim}: honest nodes did not all gain \
+                     ≥ {HONEST_FLOOR} commits within {SIM_CAP:?} simulated; \
+                     baseline = {baseline:?}, final = {final_heights:?}",
+                );
+
+                let evidence_counts: Vec<u64> = honest
+                    .iter()
+                    .map(|&i| cluster.peek_equivocations_detected(i))
+                    .collect();
+                let detectors = evidence_counts.iter().filter(|&&c| c > 0).count();
+                prop_assert!(
+                    detectors >= 2,
+                    "twin-vote adversary at index {victim}: expected the equivocation \
+                     evidence path to fire on ≥ f+1 = 2 honest replicas, got {detectors} \
+                     (per-honest counts = {evidence_counts:?})",
+                );
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
+
+        /// **Twin-mode proposal** (issue #421) — byzantine leader
+        /// broadcasts an honest Proposal and additionally a forged
+        /// twin Proposal at the same view whose `state_commitment` is
+        /// mutated, both signed under the shared validator key. Both
+        /// proposals reach every honest replica (unlike the existing
+        /// [`EquivocatorAdversary`], which carves a 1+2 split).
+        /// Safety: each honest replica's `last_voted_view` monotonic
+        /// check ensures it votes for at most one of the two
+        /// proposals at view V; the other is dropped. Liveness: when
+        /// honest replicas converge on the same fork the QC forms
+        /// normally; when they vote on different forks neither side
+        /// reaches quorum, the pacemaker times out, and the next-view
+        /// honest leader recovers — the same wedge the equivocator
+        /// property already exercises.
+        #[test]
+        fn proptest_twin_proposal_preserves_safety_and_liveness(
+            victim in 0usize..4,
+        ) {
+            run_paused(|| async move {
+                run_one_property(victim, AdvKind::TwinProposal).await
+            })?;
+        }
+
+        /// **Twin-mode timeout-vote** (issue #421) — byzantine emits
+        /// an honest TimeoutVote and additionally broadcasts a forged
+        /// twin TimeoutVote at the same view with the `high_qc`
+        /// piggyback cleared, both signed under the shared validator
+        /// key. The timeout-bucket folds at most one signature per
+        /// `(view, signer)`, so the twin envelope adds zero quorum
+        /// weight; the bucket absorbs it the same way it would
+        /// absorb a stale [`TimeoutSpammerAdversary`] frame. Safety
+        /// + liveness invariants hold under the standard harness.
+        #[test]
+        fn proptest_twin_timeout_vote_preserves_safety_and_liveness(
+            victim in 0usize..4,
+        ) {
+            run_paused(|| async move {
+                run_one_property(victim, AdvKind::TwinTimeoutVote).await
+            })?;
+        }
+
+        /// **Mixed adversary** — randomly pick one of the ten
         /// adversary kinds for the single Byzantine slot. Verifies
-        /// that property-1..7's invariants hold across the union of
+        /// that property-1..10's invariants hold across the union of
         /// adversaries (no implicit interaction breaks safety or
         /// liveness when the adversary is selected uniformly).
         #[test]
         fn proptest_mixed_adversary_preserves_safety_and_liveness(
             victim in 0usize..4,
-            kind_selector in 0usize..7,
+            kind_selector in 0usize..10,
         ) {
             run_paused(|| async move {
                 let kind = match kind_selector {
@@ -768,7 +1043,10 @@ mod tests {
                     3 => AdvKind::ForgedQc,
                     4 => AdvKind::TimeoutSpammer,
                     5 => AdvKind::ForgedPiggyback,
-                    _ => AdvKind::ForgedHistoryCommitment,
+                    6 => AdvKind::ForgedHistoryCommitment,
+                    7 => AdvKind::TwinVote,
+                    8 => AdvKind::TwinProposal,
+                    _ => AdvKind::TwinTimeoutVote,
                 };
                 run_one_property(victim, kind).await
             })?;
