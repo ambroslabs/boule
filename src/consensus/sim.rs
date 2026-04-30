@@ -5056,6 +5056,266 @@ mod tests {
         );
     }
 
+    // ── audit finding 3-3: spanning-vote correctness across rotation ─────
+    //
+    // The unit tests in `validator_key_history.rs` exhaustively cover the
+    // `partition_point(|e| e.v_eff <= view)` boundary at the data-structure
+    // level. This sim test (#423) closes the loop by running a
+    // `DualSignedRotation` end-to-end through a 4-node cluster and then,
+    // against the live post-rotation `validator_key_history` snapshotted
+    // from each replica's storage, exercising the four spanning-vote
+    // ingress cases that audit finding 3-3 names. A regression in the
+    // partition predicate — silently accepting post-rotation keys for
+    // pre-rotation views, the spanning-equivocation hazard the audit
+    // calls out — would surface here as case 4 (pre-`v_eff` vote signed
+    // under the new key) being accepted instead of `UnknownSigner`.
+
+    /// Exercise validator-key rotation under live consensus traffic and
+    /// verify the four spanning-vote correctness cases against the
+    /// post-rotation history every replica converged on.
+    ///
+    /// Walks through:
+    /// 1. Spawn a 4-node cluster, warm up with a few committed blocks.
+    /// 2. Validator at sorted-index 1 emits a `DualSignedRotation` with
+    ///    `v_eff = 30`. The envelope is signed under the cluster's real
+    ///    `chain_id` (derived from `Block::genesis([0; 32], [0; 32])`,
+    ///    the same construction `spawn_inner` uses), so
+    ///    `apply_committed_rotations` accepts it on every replica and
+    ///    persists the updated `validator_key_history` to storage.
+    /// 3. Cluster runs through view ≥ `v_eff + 20` so the post-boundary
+    ///    regime is durably reached and committed under timeouts that
+    ///    the rotated validator's stale-keyed proposals/votes induce.
+    /// 4. For every replica: read the persisted `validator_key_history`
+    ///    back, then run the four spanning-vote ingress cases through
+    ///    `dispatch::ingress_wire`:
+    ///      a. Vote(view ≥ v_eff) signed under NEW key  → accepted.
+    ///      b. Vote(view ≥ v_eff) signed under OLD key  → `UnknownSigner`.
+    ///      c. Vote(view <  v_eff) signed under OLD key  → accepted (spanning).
+    ///      d. Vote(view <  v_eff) signed under NEW key  → `UnknownSigner`.
+    #[tokio::test(start_paused = true)]
+    async fn validator_key_rotation_spanning_votes_correctness() {
+        use crate::consensus::View;
+        use crate::consensus::dispatch::{IngressError, ingress_wire};
+        use crate::consensus::hotstuff::qc::Vote;
+        use crate::consensus::node::{STORAGE_KEY_VALIDATOR_KEY_HISTORY, WireMessage};
+        use crate::consensus::validator_history::ValidatorSetHistory;
+        use crate::consensus::validator_key_history::{
+            PersistedValidatorKeyHistory, ValidatorKeyHistory,
+        };
+        use crate::consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+        use crate::consensus::validator_set::{Pubkey, ValidatorId, ValidatorSet};
+        use crate::crypto::signed::Signed;
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // The cluster's per-replica `chain_id` is derived from the
+        // genesis block hash — `spawn_inner` constructs
+        // `Block::genesis([0u8; 32], [0; 32])` for every cluster, so
+        // re-deriving it here yields the exact `ChainId` every replica
+        // is verifying signatures against. Signing the rotation
+        // envelope under this `ChainId` is what makes
+        // `apply_committed_rotations` actually mutate
+        // `validator_key_history` — the existence test
+        // (`cluster_commits_validator_key_rotation_and_makes_progress`)
+        // signs under `ChainId::TEST` because it only asserts liveness;
+        // here we depend on the rotation taking effect across replicas.
+        let genesis = Block::genesis([0u8; 32], [0; 32]);
+        let chain_id = ChainId::from_genesis_hash(genesis.hash());
+
+        // Warm-up: commit a few blocks under the genesis identity so the
+        // rotation tx propagates into a real-traffic chain.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 2
+            })
+            .await;
+        assert!(warmed, "cluster failed to commit warm-up blocks");
+
+        // Pick the validator at sorted-index 1 (non-leader of view 0)
+        // to rotate, matching the existing rotation tests so the
+        // boundary behavior is comparable.
+        let rotated_idx = 1;
+        let rotated_validator = cluster.node_ids[rotated_idx];
+        let old_signer = cluster
+            .signer(rotated_idx)
+            .expect("regular SimCluster captures signers");
+
+        // Mint a real Ed25519 keypair for the rotation target so
+        // `sig_new` verifies under `payload.new_pubkey`.
+        let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
+        let new_pubkey = new_signer.node_id();
+
+        // `v_eff = 30` keeps the test budget tight: after the rotation
+        // takes effect the rotated validator's signer is not swapped,
+        // so 1-of-4 round-robin views (the rotated validator's leader
+        // turns) time out. Reaching view ≥ 50 with that drag still
+        // fits well inside a 15s wall-clock budget under
+        // `start_paused = true`.
+        let v_eff: View = 30;
+        let pre_view: View = 10;
+        let post_view: View = 50;
+
+        let payload = ValidatorKeyRotation {
+            validator: rotated_validator,
+            new_pubkey,
+            v_eff,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        };
+        let envelope = DualSignedRotation::sign(payload, &*old_signer, &*new_signer, &chain_id)
+            .expect("constructing rotation envelope must succeed");
+        let cmd_bytes = envelope.encode_command();
+        for mp in &cluster.mempools {
+            let _ = mp.insert(cmd_bytes.clone());
+        }
+
+        // Drive the cluster well past `v_eff` so every replica has
+        // committed a block at view > v_eff and persisted the updated
+        // key history. With ~25% of views timing out post-boundary,
+        // height grows ~3/4 as fast as view; height ≥ 40 implies
+        // view ≥ ~50, which is comfortably past `v_eff = 30`.
+        let crossed = cluster
+            .advance_and_yield_until(Duration::from_secs(15), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 40
+            })
+            .await;
+        assert!(
+            crossed,
+            "cluster failed to commit deeply enough past v_eff = {v_eff}",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+        let any_post_boundary = committed
+            .iter()
+            .any(|node_blocks| node_blocks.iter().any(|b| b.header.view >= v_eff));
+        assert!(
+            any_post_boundary,
+            "cluster never committed a block at view ≥ v_eff = {v_eff} — \
+             rotation correctness assertions below would be vacuous",
+        );
+
+        // Genesis-only ValidatorSetHistory: this test does not commit
+        // any reconfig, so every replica's set history is just the
+        // genesis boundary. Reconstruct it locally to feed `ingress_wire`.
+        let validators: Vec<ValidatorId> = cluster
+            .node_ids
+            .iter()
+            .copied()
+            .map(ValidatorId::from_genesis_pubkey)
+            .collect();
+        let validator_history = ValidatorSetHistory::from_genesis(ValidatorSet::new(validators));
+
+        // Build a synthetic Vote bytes-bag for the four cases. The
+        // `block_hash` is opaque to verification (signature bytes only,
+        // no view-time block lookup at ingress), so any constant works.
+        let make_vote_msg = |view: View, signer: &dyn Signer| -> WireMessage {
+            let vote = Vote {
+                view,
+                block_hash: [0xAB; 32],
+            };
+            let signed = Signed::sign(vote, signer, &chain_id).expect("sign vote");
+            WireMessage::Vote(signed, None)
+        };
+
+        let rotated_validator_id = ValidatorId::from_genesis_pubkey(rotated_validator);
+        let mut replicas_with_applied_rotation = 0usize;
+        for idx in 0..cluster.node_ids.len() {
+            let storage = cluster
+                .node_storage(idx)
+                .expect("regular SimCluster captures storages");
+            let raw = storage
+                .get(STORAGE_KEY_VALIDATOR_KEY_HISTORY)
+                .expect("storage get on validator_key_history must not error")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "node {idx}: validator_key_history must be persisted after a \
+                         committed rotation crosses v_eff",
+                    )
+                });
+            let persisted: PersistedValidatorKeyHistory =
+                postcard::from_bytes(&raw).expect("decode persisted validator_key_history");
+            let key_history = ValidatorKeyHistory::from_persisted(persisted)
+                .expect("rebuild ValidatorKeyHistory from persisted form");
+
+            // Sanity: the rotation actually took effect on this
+            // replica's history. Without this, the cases below would
+            // pass for the wrong reason (the old key still being the
+            // active key at every view).
+            assert_eq!(
+                key_history.key_at(&rotated_validator_id, pre_view),
+                Some(Pubkey::from_node_id(rotated_validator)),
+                "node {idx}: pre-v_eff lookup must resolve to old key",
+            );
+            assert_eq!(
+                key_history.key_at(&rotated_validator_id, post_view),
+                Some(Pubkey::from_node_id(new_pubkey)),
+                "node {idx}: post-v_eff lookup must resolve to new key — \
+                 the rotation did not take effect on this replica",
+            );
+            replicas_with_applied_rotation += 1;
+
+            // Case 1 (post-v_eff, NEW key) — accepted.
+            let m = make_vote_msg(post_view, new_signer.as_ref());
+            ingress_wire(new_pubkey, m, &validator_history, &key_history, &chain_id)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "node {idx}: post-v_eff vote signed under the new key must be \
+                     accepted, got {e:?}",
+                    )
+                });
+
+            // Case 2 (post-v_eff, OLD key) — rejected as `UnknownSigner`.
+            let m = make_vote_msg(post_view, old_signer.as_ref());
+            let err = ingress_wire(
+                old_signer.node_id(),
+                m,
+                &validator_history,
+                &key_history,
+                &chain_id,
+            )
+            .expect_err("post-v_eff vote signed under the old key must be rejected");
+            assert!(
+                matches!(err, IngressError::UnknownSigner(_)),
+                "node {idx}: post-v_eff old-key vote: expected UnknownSigner, got {err:?}",
+            );
+
+            // Case 3 (pre-v_eff, OLD key, spanning vote) — accepted.
+            let m = make_vote_msg(pre_view, old_signer.as_ref());
+            ingress_wire(
+                old_signer.node_id(),
+                m,
+                &validator_history,
+                &key_history,
+                &chain_id,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "node {idx}: pre-v_eff spanning vote signed under the old key \
+                     must be accepted, got {e:?}",
+                )
+            });
+
+            // Case 4 (pre-v_eff, NEW key) — rejected as `UnknownSigner`.
+            // This is the spanning-equivocation hazard the audit names:
+            // accepting a post-rotation key for a pre-rotation view
+            // would let a rotated validator double-sign across the
+            // boundary using its new identity.
+            let m = make_vote_msg(pre_view, new_signer.as_ref());
+            let err = ingress_wire(new_pubkey, m, &validator_history, &key_history, &chain_id)
+                .expect_err("pre-v_eff vote signed under the new key must be rejected");
+            assert!(
+                matches!(err, IngressError::UnknownSigner(_)),
+                "node {idx}: pre-v_eff new-key vote: expected UnknownSigner, got {err:?}",
+            );
+        }
+        assert_eq!(
+            replicas_with_applied_rotation,
+            cluster.node_ids.len(),
+            "every replica must have observed the rotation",
+        );
+    }
+
     // ── #261: rotation rejection sim tests ────────────────────────────────
     //
     // The dispatch-level signer check (PR #286) and the post-commit
