@@ -920,6 +920,18 @@ move off uniform weight = 1:
    The reconfig validator does NOT enforce this constraint; it's
    operator-policy. Verify before submitting.
 
+3. **Weight controls leader frequency too** (#145). Production builds
+   pick proposers via the stake-weighted accumulator. Long-run leader
+   frequency is *exactly* `weight[i] / total_weight`. Practical impact
+   on a `[5, 1, 1, 1]` cluster: the heavy validator proposes 5/8 =
+   62.5% of views and shoulders proportionally more leader-side work
+   (block building, outbound proposal bandwidth). Operationally
+   relevant if you're spec'ing hardware per validator.
+
+   See [`docs/operations.md` § Leader selection](operations.md#leader-selection-issue-145)
+   for the algorithm sketch and the trade-off against VRF-based
+   selection (deferred until DoS resistance becomes a concern).
+
 For a `remove`, the address and weight are irrelevant (the validator's
 already in the active set):
 
