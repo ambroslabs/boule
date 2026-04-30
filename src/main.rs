@@ -1104,56 +1104,83 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("--addr {addr_str:?} is not a valid socket address: {e}"))?;
 
+    // BLS PoPs are now bound to the chain_id (#410). To produce or
+    // verify one, the CLI needs the chain_id, which means an operator
+    // who wants to attach a PoP must point at the chain's config.
+    if (a.bls_pop_file.is_some() || a.bls_key_file.is_some()) && a.config_path.is_none() {
+        anyhow::bail!(
+            "--bls-pop-file / --bls-key-file requires --config so the chain_id can be derived \
+             from the genesis. BLS proof-of-possession pre-images bind to chain_id (#410); \
+             without --config the CLI cannot mint or verify the PoP.",
+        );
+    }
+
+    // Resolve the chain_id (when --config is supplied) once, up front
+    // — used by the CLI's local PoP verify and threaded into
+    // `derive_bls_pop_from_key_file` for fresh-mint workflows.
+    let cfg_chain_id: Option<ambros_p2p::crypto::signed::ChainId> =
+        if let Some(cfg_path) = &a.config_path {
+            let cfg = config::load(cfg_path)?;
+            let cons = cfg.consensus.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--config {} has no [consensus] section — cannot infer scheme or chain_id",
+                    cfg_path.display(),
+                )
+            })?;
+            // Scheme cross-check (predates #410): refuse to build a
+            // payload that would be rejected at commit time by #334's
+            // scheme-driven enforcement.
+            match (cons.signature_scheme, &a.bls_pop_file, &a.bls_key_file) {
+                (SignatureSchemeChoice::BlsAggregated, None, None) => {
+                    anyhow::bail!(
+                        "--config declares signature_scheme = \"bls_aggregated\" but no \
+                     --bls-pop-file or --bls-key-file was supplied. Every BLS-chain `adds` \
+                     entry must carry a proof-of-possession.",
+                    );
+                }
+                (SignatureSchemeChoice::Ed25519Collected, Some(_), _)
+                | (SignatureSchemeChoice::Ed25519Collected, _, Some(_)) => {
+                    anyhow::bail!(
+                        "--config declares signature_scheme = \"ed25519_collected\" but a \
+                     --bls-pop-file or --bls-key-file was supplied. Ed25519 chains have no \
+                     use for BLS keys; remove the BLS flag.",
+                    );
+                }
+                _ => {}
+            }
+            Some(ambros_p2p::node::derive_chain_id(cons)?)
+        } else {
+            None
+        };
+
     // Resolve the BLS proof-of-possession from whichever flag the
     // operator passed (or none, for an Ed25519 chain).
     let bls_pop = if let Some(path) = &a.bls_pop_file {
         Some(read_bls_pop_file(path)?)
     } else if let Some(path) = &a.bls_key_file {
-        Some(derive_bls_pop_from_key_file(path)?)
+        let chain_id = cfg_chain_id
+            .as_ref()
+            .expect("--config presence enforced above when --bls-key-file is set");
+        Some(derive_bls_pop_from_key_file(path, chain_id)?)
     } else {
         None
     };
 
     // Local cryptographic check: a malformed PoP would be rejected at
     // commit time anyway, but operators want a fast-fail before they
-    // distribute the payload bytes to other operators.
+    // distribute the payload bytes to other operators. Now scoped to
+    // the deployment's chain_id (#410).
     if let Some(pop) = &bls_pop {
-        BlsAggregated::verify_pop(pop, &pop.pubkey).map_err(|e| {
+        let chain_id = cfg_chain_id
+            .as_ref()
+            .expect("--config presence enforced above when bls_pop is built");
+        BlsAggregated::verify_pop(pop, &pop.pubkey, chain_id).map_err(|e| {
             anyhow::anyhow!(
-                "BLS PoP failed verification under its embedded pubkey: {e:?}. \
-                 Re-derive with --bls-key-file pointing at the validator's BLS key.",
+                "BLS PoP failed verification under its embedded pubkey + the chain's chain_id: \
+                 {e:?}. Re-mint the PoP for this deployment via --bls-key-file (PoP pre-images \
+                 are now chain-bound, #410).",
             )
         })?;
-    }
-
-    // Optional scheme cross-check: when --config is supplied, refuse
-    // to build a payload that would be rejected at commit time by
-    // #334's scheme-driven enforcement.
-    if let Some(cfg_path) = &a.config_path {
-        let cfg = config::load(cfg_path)?;
-        let cons = cfg.consensus.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--config {} has no [consensus] section — cannot infer scheme",
-                cfg_path.display(),
-            )
-        })?;
-        match (cons.signature_scheme, &bls_pop) {
-            (SignatureSchemeChoice::BlsAggregated, None) => {
-                anyhow::bail!(
-                    "--config declares signature_scheme = \"bls_aggregated\" but no \
-                     --bls-pop-file or --bls-key-file was supplied. Every BLS-chain `adds` \
-                     entry must carry a proof-of-possession.",
-                );
-            }
-            (SignatureSchemeChoice::Ed25519Collected, Some(_)) => {
-                anyhow::bail!(
-                    "--config declares signature_scheme = \"ed25519_collected\" but a \
-                     --bls-pop-file or --bls-key-file was supplied. Ed25519 chains have no \
-                     use for BLS keys; remove the BLS flag.",
-                );
-            }
-            _ => {}
-        }
     }
 
     let cmd = ReconfigCommand {
@@ -1206,18 +1233,24 @@ fn read_bls_pop_file(path: &Path) -> anyhow::Result<ambros_p2p::crypto::sig_sche
     Ok(BlsPop { pubkey, sig })
 }
 
-/// Load a [`BlsKeyFile`] from disk and derive (pubkey, PoP) on the
-/// fly. The CLI uses this to let an operator generate an add-validator
-/// payload from a freshly-provisioned BLS key file in one step.
+/// Load a [`BlsKeyFile`] from disk and derive a chain-id-bound PoP
+/// (#410) on the fly. The CLI uses this to let an operator generate
+/// an add-validator payload from a freshly-provisioned BLS key file
+/// in one step. The PoP pre-image binds to `chain_id` so the same key
+/// produces a different PoP per deployment, blocking cross-chain
+/// replay.
 fn derive_bls_pop_from_key_file(
     path: &Path,
+    chain_id: &ambros_p2p::crypto::signed::ChainId,
 ) -> anyhow::Result<ambros_p2p::crypto::sig_scheme::BlsPop> {
     use ambros_p2p::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use ambros_p2p::crypto::sig_scheme::BlsAggregated;
     let provider = BlsKeyFile::new(path.to_path_buf());
     let id = provider
         .load_or_init()
         .map_err(|e| anyhow::anyhow!("loading BLS key from {}: {e}", path.display()))?;
-    Ok(id.pop)
+    BlsAggregated::sign_pop(&id.secret, chain_id)
+        .map_err(|e| anyhow::anyhow!("signing BLS PoP for {}: {e:?}", path.display()))
 }
 
 fn handle_reconfig_remove(args: &[String]) -> anyhow::Result<()> {
@@ -1275,6 +1308,7 @@ mod tests {
     use super::*;
     use ambros_p2p::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
     use ambros_p2p::crypto::sig_scheme::BlsAggregated;
+    use ambros_p2p::crypto::signed::ChainId;
     use tempfile::TempDir;
 
     #[test]
@@ -1284,7 +1318,7 @@ mod tests {
         let mut ikm = [0u8; 32];
         ikm[0] = 0x42;
         let (sk, pk) = BlsAggregated::keygen(&ikm).unwrap();
-        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pop.txt");
@@ -1297,7 +1331,8 @@ mod tests {
         let parsed = read_bls_pop_file(&path).expect("must parse");
         assert_eq!(parsed.pubkey, pop.pubkey);
         assert_eq!(parsed.sig, pop.sig);
-        BlsAggregated::verify_pop(&parsed, &pk).expect("must still verify after round-trip");
+        BlsAggregated::verify_pop(&parsed, &pk, &ChainId::TEST)
+            .expect("must still verify after round-trip");
     }
 
     #[test]
@@ -1340,8 +1375,14 @@ mod tests {
         let provider = BlsKeyFile::new(path.clone());
         let id = provider.load_or_init().unwrap();
 
-        let derived = derive_bls_pop_from_key_file(&path).expect("must succeed");
+        let chain_id = ChainId([0x55; 32]);
+        let derived = derive_bls_pop_from_key_file(&path, &chain_id).expect("must succeed");
         assert_eq!(derived.pubkey, id.public);
-        BlsAggregated::verify_pop(&derived, &id.public).expect("derived PoP must verify");
+        BlsAggregated::verify_pop(&derived, &id.public, &chain_id)
+            .expect("derived PoP must verify under the same chain_id");
+        // #410: the same key derives a different (and incompatible)
+        // PoP under a different chain_id.
+        let other = ChainId([0xCC; 32]);
+        assert!(BlsAggregated::verify_pop(&derived, &id.public, &other).is_err());
     }
 }

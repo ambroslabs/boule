@@ -1624,6 +1624,7 @@ impl ConsensusNode {
                 &mut rebuilt_key,
                 self.signature_scheme,
                 self.min_v_eff_delay,
+                &self.chain_id,
             );
             apply_rotation_commands_to_histories(
                 block,
@@ -3664,6 +3665,7 @@ impl ConsensusNode {
                 block_view,
                 self.min_v_eff_delay,
                 self.signature_scheme,
+                &self.chain_id,
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -3803,6 +3805,7 @@ impl ConsensusNode {
                 &mut throwaway_key,
                 self.signature_scheme,
                 self.min_v_eff_delay,
+                &self.chain_id,
             );
             debug_assert_eq!(
                 rebuilt.to_persisted(),
@@ -3903,7 +3906,7 @@ impl ConsensusNode {
             // would leave the histories transiently disagreeing.
             if let Err(e) = envelope
                 .payload
-                .validate_scheme_consistency(self.signature_scheme)
+                .validate_scheme_consistency(self.signature_scheme, &self.chain_id)
             {
                 tracing::warn!(
                     target: TRACE_TARGET,

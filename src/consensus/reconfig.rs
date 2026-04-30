@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::consensus::View;
 use crate::consensus::validator_set::{ValidatorId, ValidatorSet};
 use crate::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop, SignatureSchemeChoice};
+use crate::crypto::signed::ChainId;
 use crate::p2p::NodeId;
 
 /// Magic prefix that tags a `Block.commands` entry as a reconfig payload.
@@ -167,31 +168,37 @@ impl ReconfigCommand {
     /// (#272) so deployments can require a longer "give the new
     /// validator time to state-sync" window than the consensus floor.
     ///
-    /// This shim assumes [`SignatureSchemeChoice::Ed25519Collected`].
-    /// Use [`Self::validate_against_with_delay_and_scheme`] from any
-    /// call site that has the chain's scheme in hand to enforce the
-    /// "BLS chain → every `adds` entry needs a PoP" rule.
+    /// This shim assumes [`SignatureSchemeChoice::Ed25519Collected`]
+    /// (so chain-id-bound PoP verification is irrelevant — Ed25519
+    /// chains carry no PoPs). Use [`Self::validate_against_with_delay_and_scheme`]
+    /// from any call site that has the chain's scheme in hand to
+    /// enforce the "BLS chain → every `adds` entry needs a PoP" rule.
     pub fn validate_against_with_delay(
         &self,
         current_set: &ValidatorSet,
         current_view: View,
         min_v_eff_delay: View,
     ) -> anyhow::Result<Vec<NodeId>> {
+        // Ed25519 chains never read the chain_id arg (PoPs are absent),
+        // so the test sentinel is safe here.
         self.validate_against_with_delay_and_scheme(
             current_set,
             current_view,
             min_v_eff_delay,
             SignatureSchemeChoice::Ed25519Collected,
+            &ChainId::TEST,
         )
     }
 
     /// Scheme-aware variant of [`Self::validate_against_with_delay`].
     /// Adds two checks driven by the chain's signature scheme (#334):
     ///
-    /// - BLS chain: every `adds` entry must carry a `bls_pop`. Without
-    ///   one, a Byzantine proposer could seat a validator with no
-    ///   verifiable BLS pubkey and stall every QC the new committee
-    ///   tries to form.
+    /// - BLS chain: every `adds` entry must carry a `bls_pop` whose
+    ///   pre-image binds to `chain_id` (#410). Without the PoP, a
+    ///   Byzantine proposer could seat a validator with no verifiable
+    ///   BLS pubkey and stall every QC the new committee tries to
+    ///   form; without the chain_id binding, an attacker could
+    ///   cross-replay a PoP minted on another deployment.
     /// - Ed25519 chain: no `adds` entry may carry a `bls_pop`. A BLS
     ///   PoP on an Ed25519 chain has no semantic meaning; accepting it
     ///   would mask a misconfigured operator who copied a BLS-chain
@@ -202,6 +209,7 @@ impl ReconfigCommand {
         current_view: View,
         min_v_eff_delay: View,
         scheme: SignatureSchemeChoice,
+        chain_id: &ChainId,
     ) -> anyhow::Result<Vec<NodeId>> {
         let effective_delay = std::cmp::max(min_v_eff_delay, MIN_V_EFF_DELAY);
         let min_v_eff = current_view.checked_add(effective_delay).ok_or_else(|| {
@@ -275,7 +283,7 @@ impl ReconfigCommand {
         for entry in &self.adds {
             match (&entry.bls_pop, scheme) {
                 (Some(pop), _) => {
-                    BlsAggregated::verify_pop(pop, &pop.pubkey).map_err(|e| match e {
+                    BlsAggregated::verify_pop(pop, &pop.pubkey, chain_id).map_err(|e| match e {
                         BlsKeyError::PopPubkeyMismatch => anyhow::anyhow!(
                             "BLS PoP for validator {} has mismatched embedded pubkey",
                             hex::encode(entry.node_id),
@@ -596,14 +604,15 @@ mod tests {
 
     // ---------- BLS proof-of-possession on adds (#291) ----------
 
-    /// Generate a BLS keypair and a valid PoP for embedding in a
-    /// `ValidatorEntry`. Seed the keygen with the bottom byte of the
-    /// validator's NodeId so different fixtures get different keys.
-    fn entry_with_valid_pop(b: u8, port: u16) -> ValidatorEntry {
+    /// Generate a BLS keypair and a valid PoP (bound to `chain_id`) for
+    /// embedding in a `ValidatorEntry`. Seed the keygen with the
+    /// bottom byte of the validator's NodeId so different fixtures get
+    /// different keys.
+    fn entry_with_valid_pop(b: u8, port: u16, chain_id: &ChainId) -> ValidatorEntry {
         let mut ikm = [0u8; 32];
         ikm.fill(b);
         let (sk, _pk) = BlsAggregated::keygen(&ikm).unwrap();
-        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, chain_id).unwrap();
         ValidatorEntry {
             node_id: nid(b),
             addr: addr(port),
@@ -620,6 +629,7 @@ mod tests {
             0,
             MIN_V_EFF_DELAY,
             SignatureSchemeChoice::BlsAggregated,
+            &ChainId::TEST,
         )
     }
 
@@ -627,7 +637,7 @@ mod tests {
     fn add_with_valid_bls_pop_passes_validation() {
         let cur = floor_set();
         let cmd = ReconfigCommand {
-            adds: vec![entry_with_valid_pop(5, 7005)],
+            adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
             v_eff: 10,
         };
@@ -637,7 +647,7 @@ mod tests {
 
     #[test]
     fn add_with_invalid_bls_pop_signature_is_rejected() {
-        let mut entry = entry_with_valid_pop(5, 7005);
+        let mut entry = entry_with_valid_pop(5, 7005, &ChainId::TEST);
         // Tamper the signature byte 0.
         if let Some(p) = entry.bls_pop.as_mut() {
             p.sig[0] ^= 0xFF;
@@ -656,8 +666,8 @@ mod tests {
         // Forge: take sk_a's PoP but rewrite the embedded pubkey to
         // someone else's. The signature is over pk_a's bytes but the
         // payload now claims pk_b — verification fails at the BLS step.
-        let mut a = entry_with_valid_pop(5, 7005);
-        let b = entry_with_valid_pop(6, 7006);
+        let mut a = entry_with_valid_pop(5, 7005, &ChainId::TEST);
+        let b = entry_with_valid_pop(6, 7006, &ChainId::TEST);
         if let (Some(pop_a), Some(pop_b)) = (a.bls_pop.as_mut(), b.bls_pop.as_ref()) {
             pop_a.pubkey = pop_b.pubkey;
         }
@@ -667,6 +677,41 @@ mod tests {
             v_eff: 10,
         };
         let err = validate_bls(&cmd, &floor_set()).unwrap_err();
+        assert!(err.to_string().contains("PoP"), "{err}");
+    }
+
+    /// #410: a PoP minted on chain A must not be accepted as an add
+    /// entry on chain B. Cross-chain PoP replay is the dual of the
+    /// envelope-level cross-chain replay defense (#324).
+    #[test]
+    fn add_with_pop_minted_under_different_chain_id_is_rejected() {
+        let chain_a = ChainId([0xAA; 32]);
+        let chain_b = ChainId([0xBB; 32]);
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry_with_valid_pop(5, 7005, &chain_a)],
+            removes: vec![],
+            v_eff: 10,
+        };
+        // Sanity: under the originating chain, the add is accepted.
+        cmd.validate_against_with_delay_and_scheme(
+            &cur,
+            0,
+            MIN_V_EFF_DELAY,
+            SignatureSchemeChoice::BlsAggregated,
+            &chain_a,
+        )
+        .expect("PoP minted on chain A must validate on chain A");
+        // Cross-chain replay: rejected.
+        let err = cmd
+            .validate_against_with_delay_and_scheme(
+                &cur,
+                0,
+                MIN_V_EFF_DELAY,
+                SignatureSchemeChoice::BlsAggregated,
+                &chain_b,
+            )
+            .unwrap_err();
         assert!(err.to_string().contains("PoP"), "{err}");
     }
 
@@ -700,6 +745,7 @@ mod tests {
                 0,
                 MIN_V_EFF_DELAY,
                 SignatureSchemeChoice::BlsAggregated,
+                &ChainId::TEST,
             )
             .unwrap_err();
         assert!(
@@ -712,7 +758,7 @@ mod tests {
     fn bls_chain_accepts_add_with_pop() {
         let cur = floor_set();
         let cmd = ReconfigCommand {
-            adds: vec![entry_with_valid_pop(5, 7005)],
+            adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
             v_eff: 10,
         };
@@ -722,6 +768,7 @@ mod tests {
                 0,
                 MIN_V_EFF_DELAY,
                 SignatureSchemeChoice::BlsAggregated,
+                &ChainId::TEST,
             )
             .unwrap();
         assert!(next.contains(&nid(5)));
@@ -731,7 +778,7 @@ mod tests {
     fn ed25519_chain_rejects_add_with_pop() {
         let cur = floor_set();
         let cmd = ReconfigCommand {
-            adds: vec![entry_with_valid_pop(5, 7005)],
+            adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
             v_eff: 10,
         };
@@ -741,6 +788,7 @@ mod tests {
                 0,
                 MIN_V_EFF_DELAY,
                 SignatureSchemeChoice::Ed25519Collected,
+                &ChainId::TEST,
             )
             .unwrap_err();
         assert!(err.to_string().contains("ed25519_collected"), "{err}",);
