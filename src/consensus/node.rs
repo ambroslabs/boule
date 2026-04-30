@@ -63,6 +63,7 @@ use crate::consensus::hotstuff::{HotStuffState, NewView, QuorumCertificate, gene
 use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
 use crate::consensus::pacemaker::Action as PacemakerAction;
 use crate::consensus::pacemaker::Event as PacemakerEvent;
+use crate::consensus::pacemaker::HonestyThresholdEvidence as PacemakerHonestyThresholdEvidence;
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::pacemaker::leader::RoundRobinSelector;
 use crate::consensus::pacemaker::timeout::ExponentialBackoff;
@@ -122,7 +123,7 @@ fn pacemaker_event_kind(ev: &PacemakerEvent) -> &'static str {
         PacemakerEvent::OnTimeoutCert(_) => "OnTimeoutCert",
         PacemakerEvent::OnTimeout(_) => "OnTimeout",
         PacemakerEvent::OnProposalReceived(_) => "OnProposalReceived",
-        PacemakerEvent::OnRoundSync(_) => "OnRoundSync",
+        PacemakerEvent::OnRoundSync { .. } => "OnRoundSync",
     }
 }
 
@@ -175,6 +176,24 @@ pub const STORAGE_KEY_HIGH_QC: &[u8] = b"consensus/high_qc";
 /// core via [`HotStuffCore::with_proposed_in_view`]. Audit finding
 /// 4-6, issue #407.
 pub const STORAGE_KEY_PROPOSED_IN_VIEW: &[u8] = b"consensus/proposed_in_view";
+
+/// Storage key for the most recently broadcast [`TimeoutVote`] envelope.
+/// Persisted by [`ConsensusNode::send_timeout`] *before* any byte hits
+/// the wire, then replayed bit-identically on every subsequent attempt
+/// to time out at the same `view` — whether the next attempt is a timer
+/// re-fire in the same process or the first send after a restart. The
+/// encoded value is the full [`TimeoutVote`] (`view` + the
+/// `Option<QuorumCertificate>` piggyback) so the resigned envelope
+/// matches the original byte-for-byte.
+///
+/// Without this, `send_timeout` would re-read `state.high_qc` on each
+/// attempt; that value can advance between attempts (a fresher QC
+/// arrived via a NewView, a piggybacked justify from a partial
+/// proposal, etc.), producing a *second* signed `TimeoutVote(v)` whose
+/// `high_qc` differs from the first. Both envelopes are slashable
+/// equivocation evidence even when the replica was honest. Audit
+/// finding 14-1, issue #415.
+pub const STORAGE_KEY_LAST_TIMEOUT_VOTE: &[u8] = b"consensus/last_timeout_vote";
 
 /// Storage-key prefix under which committed blocks are persisted by
 /// content-hash. Each block is written on commit so a peer can fetch
@@ -799,6 +818,14 @@ pub struct ConsensusNode {
     /// Shared with the builder's own `Arc<AtomicU64>` so the two
     /// always agree without locking.
     dropped_commands: Arc<AtomicU64>,
+    /// Cumulative count of vote-equivocation incidents the safety core
+    /// has surfaced via
+    /// [`crate::consensus::hotstuff::step::Action::EquivocationEvidence`]
+    /// (audit finding 3-1, issue #409). Incremented at the
+    /// [`apply_safety_actions`] dispatch site, so the counter and the
+    /// matching WARN log advance in lockstep. Surfaced under
+    /// [`ConsensusStatus::equivocations_detected`].
+    equivocations_detected: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -1015,6 +1042,7 @@ impl ConsensusNode {
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
+            equivocations_detected: Arc::new(AtomicU64::new(0)),
             last_committed_view: 0,
             status_tx: None,
             rate_limiter: None,
@@ -1238,6 +1266,7 @@ impl ConsensusNode {
                 timeout_buckets: self.eviction_counters.timeout_buckets(),
             },
             dropped_commands: self.dropped_commands.load(Ordering::Relaxed),
+            equivocations_detected: self.equivocations_detected.load(Ordering::Relaxed),
         }
     }
 
@@ -1418,6 +1447,7 @@ impl ConsensusNode {
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
+            equivocations_detected: Arc::new(AtomicU64::new(0)),
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
@@ -2954,6 +2984,30 @@ impl ConsensusNode {
                 SafetyAction::Commit(block) => {
                     self.apply_commit(block);
                 }
+
+                SafetyAction::EquivocationEvidence {
+                    voter,
+                    view,
+                    block_a,
+                    block_b,
+                } => {
+                    // Audit finding 3-1 (#409): the safety core just
+                    // observed a stable validator voting for two
+                    // distinct block_hash values at the same view.
+                    // Surface as a WARN with structured fields so
+                    // operators can grep for evidence and a future
+                    // slashing pipeline can attach without further
+                    // safety-core changes.
+                    self.equivocations_detected.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        voter = %node_id_to_base58(voter.as_node_id()),
+                        view,
+                        block_a = ?block_a,
+                        block_b = ?block_b,
+                        "consensus_equivocation_detected",
+                    );
+                }
             }
         }
 
@@ -3159,19 +3213,15 @@ impl ConsensusNode {
         actions
     }
 
-    /// Build, broadcast, and self-deliver a [`TimeoutVote`] for `view`.
-    ///
-    /// Self-delivery matters because production p2p broadcasts do not
-    /// loop back to the sender — without an explicit self-feed the
-    /// local bucket would be one short of quorum, and a leader-crash
-    /// scenario with exactly `quorum_size` live replicas would stall.
-    async fn send_timeout(
-        &mut self,
-        view: View,
-        broadcaster: &dyn Broadcaster,
-        view_timer: &mut ViewTimer,
-        signer: &Arc<dyn Signer>,
-    ) -> anyhow::Result<()> {
+    /// Build a fresh [`TimeoutVote`] payload for `view` from the
+    /// current `state.high_qc` and durably stamp it under
+    /// [`STORAGE_KEY_LAST_TIMEOUT_VOTE`] before returning. The
+    /// `crashpoint!("after_persist_timeout_vote")` between the put and
+    /// the return lets a regression test pin the gap between
+    /// "envelope is on disk" and "envelope is on the wire" — a crash
+    /// in this gap leaves the durable record that [`send_timeout`]
+    /// replays after restart (audit finding 14-1, issue #415).
+    fn persist_fresh_timeout_vote(&self, view: View) -> anyhow::Result<TimeoutVote> {
         let high_qc = self
             .core
             .state()
@@ -3179,6 +3229,62 @@ impl ConsensusNode {
             .as_ref()
             .map(|qc| qc.inner().clone());
         let payload = TimeoutVote { view, high_qc };
+        let bytes = encode_last_timeout_vote(&payload)?;
+        self.storage
+            .put(STORAGE_KEY_LAST_TIMEOUT_VOTE, &bytes)
+            .context("persist last_timeout_vote")?;
+        crashpoint!("after_persist_timeout_vote");
+        Ok(payload)
+    }
+
+    /// Build, broadcast, and self-deliver a [`TimeoutVote`] for `view`.
+    ///
+    /// Self-delivery matters because production p2p broadcasts do not
+    /// loop back to the sender — without an explicit self-feed the
+    /// local bucket would be one short of quorum, and a leader-crash
+    /// scenario with exactly `quorum_size` live replicas would stall.
+    ///
+    /// # Persistence (audit finding 14-1, issue #415)
+    ///
+    /// The TimeoutVote envelope this replica commits to for `view` is
+    /// persisted under [`STORAGE_KEY_LAST_TIMEOUT_VOTE`] *before* any
+    /// byte hits the wire. On any subsequent attempt to time out at
+    /// the same `view` — whether a timer re-fire in the same process
+    /// (the policy's exponential backoff fires `OnTimeout(view)` again
+    /// when the cluster has not yet formed a TC) or a `send_timeout`
+    /// after a crash-and-restart — the persisted payload is replayed
+    /// bit-identically. Without this, the second attempt would build
+    /// from `state.high_qc`, which may have advanced between the
+    /// original send and this attempt; a peer holding both signed
+    /// envelopes could then present a contradiction (two distinct
+    /// `high_qc` snapshots endorsed by the same signer at the same
+    /// view).
+    async fn send_timeout(
+        &mut self,
+        view: View,
+        broadcaster: &dyn Broadcaster,
+        view_timer: &mut ViewTimer,
+        signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        // Reuse a previously persisted envelope for this view if one
+        // exists — that is the canonical payload this replica has
+        // already committed to. Fresh views fall through to the build
+        // path below and persist their envelope before broadcast.
+        let payload = match self
+            .storage
+            .get(STORAGE_KEY_LAST_TIMEOUT_VOTE)
+            .context("read last_timeout_vote from storage")?
+        {
+            Some(raw) => {
+                let prev = decode_last_timeout_vote(&raw)?;
+                if prev.view == view {
+                    prev
+                } else {
+                    self.persist_fresh_timeout_vote(view)?
+                }
+            }
+            None => self.persist_fresh_timeout_vote(view)?,
+        };
         let signed = Signed::sign(payload, signer.as_ref(), &self.chain_id)
             .context("signing TimeoutVote")?;
 
@@ -3188,14 +3294,11 @@ impl ConsensusNode {
             .map(Bytes::from)
             .context("encoding TimeoutVote")?;
         send_outbound(broadcaster, Outbound::Broadcast(bytes)).await;
-        // Audit finding 14-1 / issue #415: TimeoutVote is sent without
-        // a preceding persist, so a crash here lets the replica
-        // restart, observe a different `high_qc`, and broadcast a
-        // *fresh* TimeoutVote for the same view with a different
-        // piggyback — equivocation. The fix is to persist the
-        // outbound TimeoutVote before this `send_outbound` returns;
-        // this crashpoint exists so the regression test for that fix
-        // can pin the gap.
+        // The envelope under STORAGE_KEY_LAST_TIMEOUT_VOTE is durable
+        // before this send returns (see persist_fresh_timeout_vote);
+        // a crash here therefore replays the same payload on restart
+        // rather than minting a fresh one with a possibly-different
+        // `high_qc` snapshot — closing audit finding 14-1 (#415).
         crashpoint!("after_broadcast_timeout_vote");
 
         // Count our own timeout locally so we don't depend on
@@ -3352,26 +3455,33 @@ impl ConsensusNode {
             // honest views to `u64::MAX`.
             //
             // Fire on the exact crossing so we don't re-emit on every
-            // subsequent vote into the same bucket.
-            let fire_round_sync = bucket_size == honesty_threshold;
+            // subsequent vote into the same bucket. The evidence token
+            // is minted inline with the threshold check; constructing
+            // `OnRoundSync` outside this gate is a compile error
+            // (audit finding 2-3 / issue #419).
+            let round_sync_evidence = (bucket_size == honesty_threshold)
+                .then(|| {
+                    PacemakerHonestyThresholdEvidence::from_bucket(bucket_size, honesty_threshold)
+                })
+                .flatten();
 
             if bucket_size < quorum {
-                return if fire_round_sync {
-                    self.fire_round_sync(view, broadcaster, view_timer, signer)
+                return if let Some(evidence) = round_sync_evidence {
+                    self.fire_round_sync(view, evidence, broadcaster, view_timer, signer)
                         .await
                 } else {
                     Ok(())
                 };
             }
-            (bucket.best_high_qc.clone(), fire_round_sync)
+            (bucket.best_high_qc.clone(), round_sync_evidence)
         };
 
         // We've also crossed full quorum — but if we passed the
         // honesty threshold on this same vote, surface the round-sync
         // hint first so the pacemaker has the latest view recorded
         // before the OnTimeoutCert flow runs.
-        if fired_round_sync {
-            self.fire_round_sync(view, broadcaster, view_timer, signer)
+        if let Some(evidence) = fired_round_sync {
+            self.fire_round_sync(view, evidence, broadcaster, view_timer, signer)
                 .await?;
         }
 
@@ -3439,15 +3549,18 @@ impl ConsensusNode {
         Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
     }
 
-    /// Surface a [`PacemakerEvent::OnRoundSync(view)`] hint to the
-    /// pacemaker, then apply the resulting actions. Called from
+    /// Surface a [`PacemakerEvent::OnRoundSync`] hint to the pacemaker,
+    /// then apply the resulting actions. Called from
     /// [`Self::on_timeout_vote`] when a per-view bucket reaches the
     /// honesty threshold (`f + 1` distinct signers — see issue #218
     /// for the wedge this prevents and the Byzantine-bound rationale
-    /// for the threshold choice).
+    /// for the threshold choice). The `evidence` parameter is the
+    /// sealed token minted at the threshold check (audit finding 2-3 /
+    /// issue #419), forwarded into the typed `OnRoundSync` payload.
     async fn fire_round_sync(
         &mut self,
         view: View,
+        evidence: PacemakerHonestyThresholdEvidence,
         broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
@@ -3458,7 +3571,7 @@ impl ConsensusNode {
             current = self.pacemaker.current_view(),
             "round_sync_fired",
         );
-        let pm_actions = self.step_pacemaker(PacemakerEvent::OnRoundSync(view));
+        let pm_actions = self.step_pacemaker(PacemakerEvent::OnRoundSync { view, evidence });
         Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
     }
 
@@ -3577,14 +3690,30 @@ impl ConsensusNode {
                 error = %e,
                 "block_persist_failed",
             );
+            // Audit finding 4-2 / issue #411: the SM has already
+            // applied above and the safety core has already retired
+            // `pending_blocks` for this commit, but the durable
+            // (block, last_committed) batch did not land. Returning
+            // here would let the snapshot creation hook, reconfig /
+            // rotation appliers, and the CommitNotifier fan-out fire
+            // against a non-durable commit — on restart the durable
+            // checkpoint would not reflect the commit, leaving SM
+            // state and `last_committed` divergent. Halt the node so
+            // an operator sees the failure and recovery starts from
+            // the durable checkpoint as the single source of truth.
+            panic!(
+                "consensus: durable persist of committed block failed (height={}, view={}, hash={:?}): {e}; halting to prevent SM/last_committed divergence",
+                block.header.height, block.header.view, block_hash,
+            );
         }
         // After the committed block + last_committed batch is durable
         // but BEFORE any downstream side effect (snapshot creation,
         // reconfig/rotation application, commit-notifier fan-out)
-        // runs. Audit finding 4-6 / issue #411 is about gating those
-        // downstream actions on the durable block write — a regression
-        // would let the snapshot creation hook fire against a block
-        // that did not in fact reach disk.
+        // runs. Audit finding 4-2 / issue #411 gates those downstream
+        // actions on the durable block write — the panic above is
+        // what enforces the gate; a regression that turned it back
+        // into a logged-and-continue would let the snapshot creation
+        // hook fire against a block that did not in fact reach disk.
         crashpoint!("after_apply_commit_block_persist");
         tracing::info!(
             "consensus: committed block height={} view={}",
@@ -4246,6 +4375,18 @@ pub fn decode_proposed_in_view(bytes: &[u8]) -> anyhow::Result<View> {
     postcard::from_bytes(bytes).context("decode proposed_in_view")
 }
 
+/// Serialize a [`TimeoutVote`] envelope for the durable
+/// [`STORAGE_KEY_LAST_TIMEOUT_VOTE`] slot. See that key's docs for the
+/// equivocation-prevention contract (audit finding 14-1, issue #415).
+pub fn encode_last_timeout_vote(payload: &TimeoutVote) -> anyhow::Result<Vec<u8>> {
+    postcard::to_stdvec(payload).context("encode last_timeout_vote")
+}
+
+/// Inverse of [`encode_last_timeout_vote`].
+pub fn decode_last_timeout_vote(bytes: &[u8]) -> anyhow::Result<TimeoutVote> {
+    postcard::from_bytes(bytes).context("decode last_timeout_vote")
+}
+
 /// Compose the storage key for a committed block keyed by its
 /// content-hash: `STORAGE_KEY_BLOCK_PREFIX || hash`.
 pub fn block_storage_key(hash: &BlockHash) -> Vec<u8> {
@@ -4369,25 +4510,68 @@ pub fn recover_state(
         state.high_qc = Some(VerifiedQc::unchecked(decode_high_qc(&raw)?));
     }
 
-    // Re-seed `pending_blocks` with the locked / high_qc blocks so the
-    // safety-rule walks (extension via locked, become_leader's parent
-    // lookup) terminate without first having to round-trip through
-    // block-sync. Genesis is already in `pending_blocks`. Any block
-    // missing from storage (e.g. an older snapshot adopted via NewView
-    // before the persist-with-block pairing landed) is silently
-    // skipped — the existing block-sync paths still cover that case.
-    if let Some(qc) = state.high_qc.as_ref().cloned()
-        && let Some(block) = load_block_from_storage(storage, &qc.block_hash())?
-    {
-        state.insert_pending(block);
+    // Re-seed `pending_blocks` with the locked / high_qc blocks plus a
+    // bounded fringe of their ancestors so the safety-rule walks
+    // (extension via locked, become_leader's parent lookup, the 2-chain
+    // promotion walk, and the 3-chain commit walk) terminate without
+    // first having to round-trip through block-sync. Genesis is already
+    // in `pending_blocks`. Any block missing from storage (e.g. an older
+    // snapshot adopted via NewView before the persist-with-block pairing
+    // landed) is silently skipped — the existing block-sync paths still
+    // cover that case.
+    //
+    // Walking `RECOVER_PARENT_HOPS` parents from each anchor closes
+    // audit finding 4-5: the 2-chain promotion walk needs the locked
+    // block's grandparent and the 3-chain commit walk needs high_qc's
+    // great-grandparent, so without this the first proposal received
+    // post-restart can silently fail to promote the lock for one or
+    // two views before the chain refills.
+    if let Some(qc) = state.high_qc.as_ref().cloned() {
+        rehydrate_ancestors(storage, &mut state, qc.block_hash())?;
     }
-    if let Some(locked) = state.locked
-        && let Some(block) = load_block_from_storage(storage, &locked.block_hash)?
-    {
-        state.insert_pending(block);
+    if let Some(locked) = state.locked {
+        rehydrate_ancestors(storage, &mut state, locked.block_hash)?;
     }
 
     Ok(state)
+}
+
+/// Number of parent hops [`recover_state`] walks back from each of
+/// `high_qc.block_hash` and `locked.block_hash` when re-seeding
+/// `pending_blocks`. Set to two so the loaded fringe covers both the
+/// 2-chain promotion walk (locked + grandparent) and the 3-chain
+/// commit walk (high_qc + great-grandparent) on the first proposal
+/// received after restart. See audit finding 4-5 / issue #412.
+const RECOVER_PARENT_HOPS: usize = 2;
+
+/// Walk up to [`RECOVER_PARENT_HOPS`] parents back from `start`,
+/// loading each block from durable storage into `state.pending_blocks`.
+/// Stops at genesis (`parent_hash == [0; 32]`), at a block already in
+/// `pending_blocks` (its parents will be reached via that block's own
+/// `header.parent_hash`), or when a block is absent from storage —
+/// whichever comes first.
+fn rehydrate_ancestors(
+    storage: &dyn Storage,
+    state: &mut HotStuffState,
+    start: BlockHash,
+) -> anyhow::Result<()> {
+    let mut cursor = start;
+    for _ in 0..=RECOVER_PARENT_HOPS {
+        let parent = if let Some(b) = state.pending_blocks.get(&cursor) {
+            b.header.parent_hash
+        } else if let Some(block) = load_block_from_storage(storage, &cursor)? {
+            let parent = block.header.parent_hash;
+            state.insert_pending(block);
+            parent
+        } else {
+            break;
+        };
+        if parent == [0u8; 32] {
+            break;
+        }
+        cursor = parent;
+    }
+    Ok(())
 }
 
 // ── Status-snapshot helper ───────────────────────────────────────────────────
@@ -5306,6 +5490,26 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_last_timeout_vote_roundtrips_with_high_qc() {
+        let payload = TimeoutVote {
+            view: 17,
+            high_qc: Some(sample_full_qc()),
+        };
+        let bytes = encode_last_timeout_vote(&payload).unwrap();
+        assert_eq!(decode_last_timeout_vote(&bytes).unwrap(), payload);
+    }
+
+    #[test]
+    fn encode_decode_last_timeout_vote_roundtrips_without_high_qc() {
+        let payload = TimeoutVote {
+            view: 0,
+            high_qc: None,
+        };
+        let bytes = encode_last_timeout_vote(&payload).unwrap();
+        assert_eq!(decode_last_timeout_vote(&bytes).unwrap(), payload);
+    }
+
+    #[test]
     fn decode_voted_view_surfaces_error_on_garbage() {
         assert!(decode_voted_view(&[0xFFu8; 64]).is_err());
     }
@@ -5657,6 +5861,174 @@ mod tests {
                 .pending_blocks
                 .contains_key(&qc.block_hash),
         );
+    }
+
+    /// Issue #412 / audit finding 4-5: `recover_state` rehydrates not
+    /// only the locked / high_qc blocks but a bounded fringe of their
+    /// ancestors so the 2-chain promotion walk and 3-chain commit walk
+    /// terminate locally on the very first proposal received after a
+    /// restart. Without this, the lock can fail to advance for one or
+    /// two views while the chain refills from fresh proposals.
+    #[test]
+    fn recover_rehydrates_locked_and_high_qc_ancestors() {
+        use crate::replication::block::BlockHeader;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let g = genesis();
+
+        // Build a five-block chain rooted at genesis: g <- b1 <- b2 <-
+        // b3 <- b4. b3 is the locked block; b4 is the high_qc block.
+        // The 3-chain commit walk from b4 needs b2 (great-grandparent);
+        // the 2-chain promotion walk from b3 needs b1 (grandparent).
+        let mut blocks = vec![g.clone()];
+        for i in 1..=4u64 {
+            let parent = blocks.last().unwrap();
+            blocks.push(Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    height: i,
+                    view: i + 10,
+                    proposer: nid(((i % 4) + 1) as u8),
+                    state_commitment: [0u8; 32],
+                    commands_commitment: Block::commands_commitment(&[]),
+                    validator_history_commitment: [0; 32],
+                },
+                commands: vec![],
+            });
+        }
+        let b1 = &blocks[1];
+        let b2 = &blocks[2];
+        let b3 = &blocks[3];
+        let b4 = &blocks[4];
+
+        // Persist every non-genesis block under the block-storage prefix
+        // (mirrors what `persist_updates` would have written across
+        // earlier sessions where each block was at the high_qc tip).
+        for b in &blocks[1..] {
+            storage
+                .put(&block_storage_key(&b.hash()), &encode_block(b).unwrap())
+                .unwrap();
+        }
+
+        // Persist locked = b3 and high_qc over b4 so `recover_state`
+        // anchors the walk on the right pair.
+        let locked = Locked {
+            view: b3.header.view,
+            height: b3.header.height,
+            block_hash: b3.hash(),
+        };
+        let mut qc = QuorumCertificate::new(b4.header.view, b4.hash(), 4);
+        qc.add_signature(0, [0x11u8; 64]);
+        qc.add_signature(1, [0x22u8; 64]);
+        qc.add_signature(2, [0x33u8; 64]);
+        storage
+            .put(STORAGE_KEY_LOCKED, &encode_locked(&locked).unwrap())
+            .unwrap();
+        storage
+            .put(STORAGE_KEY_HIGH_QC, &encode_high_qc(&qc).unwrap())
+            .unwrap();
+
+        let state = recover_state(storage.as_ref(), four_validators(), g.clone()).unwrap();
+
+        // Genesis is always seeded; every block on the locked / high_qc
+        // ancestry up to two hops from each anchor is rehydrated. The
+        // union covers b1..b4 — exactly the blocks the safety walks
+        // need on the first post-restart proposal.
+        assert!(state.pending_blocks.contains_key(&g.hash()));
+        for (label, hash) in [
+            ("b1", b1.hash()),
+            ("b2", b2.hash()),
+            ("b3", b3.hash()),
+            ("b4", b4.hash()),
+        ] {
+            assert!(
+                state.pending_blocks.contains_key(&hash),
+                "recover must rehydrate {label} so the 2-chain / 3-chain walks \
+                 terminate locally on the first proposal after restart",
+            );
+        }
+    }
+
+    /// Companion to [`recover_rehydrates_locked_and_high_qc_ancestors`]:
+    /// when an ancestor is missing from durable storage (e.g. an older
+    /// snapshot adopted via NewView before the persist-with-block
+    /// pairing landed), the walk stops at the gap and recovery does
+    /// not error — block-sync still covers the rest of the chain.
+    #[test]
+    fn recover_stops_at_first_missing_ancestor() {
+        use crate::replication::block::BlockHeader;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let g = genesis();
+
+        // g <- b1 <- b2 <- b3. Persist b2 and b3 only — b1 is missing,
+        // simulating a gap in the durable block store.
+        let b1 = Block {
+            header: BlockHeader {
+                parent_hash: g.hash(),
+                height: 1,
+                view: 11,
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let b2 = Block {
+            header: BlockHeader {
+                parent_hash: b1.hash(),
+                height: 2,
+                view: 12,
+                proposer: nid(2),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let b3 = Block {
+            header: BlockHeader {
+                parent_hash: b2.hash(),
+                height: 3,
+                view: 13,
+                proposer: nid(3),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        storage
+            .put(&block_storage_key(&b2.hash()), &encode_block(&b2).unwrap())
+            .unwrap();
+        storage
+            .put(&block_storage_key(&b3.hash()), &encode_block(&b3).unwrap())
+            .unwrap();
+
+        let locked = Locked {
+            view: b2.header.view,
+            height: b2.header.height,
+            block_hash: b2.hash(),
+        };
+        let mut qc = QuorumCertificate::new(b3.header.view, b3.hash(), 4);
+        qc.add_signature(0, [0x11u8; 64]);
+        qc.add_signature(1, [0x22u8; 64]);
+        qc.add_signature(2, [0x33u8; 64]);
+        storage
+            .put(STORAGE_KEY_LOCKED, &encode_locked(&locked).unwrap())
+            .unwrap();
+        storage
+            .put(STORAGE_KEY_HIGH_QC, &encode_high_qc(&qc).unwrap())
+            .unwrap();
+
+        let state = recover_state(storage.as_ref(), four_validators(), g.clone()).unwrap();
+
+        // The available ancestors load; the missing one stops the walk
+        // without erroring.
+        assert!(state.pending_blocks.contains_key(&b3.hash()));
+        assert!(state.pending_blocks.contains_key(&b2.hash()));
+        assert!(!state.pending_blocks.contains_key(&b1.hash()));
     }
 
     /// Persisting `HighQc` whose block is *not* in `pending_blocks` —
@@ -6259,6 +6631,125 @@ mod tests {
         let lc = decode_last_committed(&raw).expect("decode");
         assert_eq!(lc.height, block.header.height);
         assert_eq!(lc.view, block.header.view);
+    }
+
+    /// Audit finding 4-2 / issue #411: when the durable batch write
+    /// for a committed block fails, `apply_commit` must halt before
+    /// any downstream observer fires. Otherwise a non-durable commit
+    /// would propagate through the snapshot creation hook, the
+    /// reconfig/rotation appliers, and the [`CommitNotifier`]
+    /// fan-out — and on restart `last_committed_height` would
+    /// disagree with the SM-applied state, since the block + checkpoint
+    /// batch never landed.
+    #[test]
+    fn apply_commit_halts_when_storage_batch_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        use bytes::Bytes;
+
+        use crate::consensus::api::CommitNotifier;
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+        use crate::storage::WriteBatch;
+
+        // Storage wrapper: reads/single-key writes pass through to an
+        // inner `MemoryStorage`, but every `apply_batch` returns an
+        // error. Models a backend that fails the atomic
+        // `(block, last_committed)` write — the exact gap the audit
+        // finding describes.
+        struct FailingBatchStorage {
+            inner: MemoryStorage,
+        }
+        impl Storage for FailingBatchStorage {
+            fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+                self.inner.put(key, value)
+            }
+            fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+                self.inner.delete(key)
+            }
+            fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+                self.inner.scan_prefix(prefix)
+            }
+            fn apply_batch(&self, _batch: WriteBatch) -> anyhow::Result<()> {
+                anyhow::bail!("simulated storage batch failure")
+            }
+            fn compare_and_swap(
+                &self,
+                key: &[u8],
+                expected: Option<&[u8]>,
+                new: Option<&[u8]>,
+            ) -> anyhow::Result<bool> {
+                self.inner.compare_and_swap(key, expected, new)
+            }
+        }
+
+        // Counting `CommitNotifier` to detect any post-failure fan-out.
+        struct CountingNotifier {
+            count: Arc<AtomicUsize>,
+        }
+        impl CommitNotifier for CountingNotifier {
+            fn on_commit(&self, _block: &Block, _state_commitment: &[u8; 32], _view: View) {
+                self.count.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let storage: Arc<dyn Storage> = Arc::new(FailingBatchStorage {
+            inner: MemoryStorage::new(),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let notifier: Arc<dyn CommitNotifier> = Arc::new(CountingNotifier {
+            count: Arc::clone(&count),
+        });
+        let mut node = ConsensusNode::new(
+            nid(1),
+            test_config(four_validators()),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            storage,
+            Arc::new(MemoryWal::new()),
+        )
+        .with_commit_notifier(notifier);
+
+        // Block carries a valid reconfig: a regression that let the
+        // appliers run despite a non-durable persist would tick the
+        // boundary count from 1 to 2.
+        let v_eff = MIN_V_EFF_DELAY + 5;
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
+            }],
+            removes: vec![],
+            v_eff,
+        };
+        let block = block_with_reconfig(1, 0, nid(1), cmd);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            node.apply_commit(block);
+        }));
+        assert!(
+            result.is_err(),
+            "apply_commit must panic when the durable persist batch fails",
+        );
+
+        assert_eq!(
+            count.load(AtomicOrdering::Relaxed),
+            0,
+            "CommitNotifier::on_commit must not fire on a non-durable commit",
+        );
+        assert_eq!(
+            node.validator_history.boundary_count(),
+            1,
+            "reconfig appliers must not run on a non-durable commit",
+        );
+        assert_eq!(
+            node.core.state().validator_history.boundary_count(),
+            1,
+            "safety-core mirror of validator_history must also remain at the genesis-only boundary",
+        );
     }
 
     /// `recover` rebuilds `last_committed_height`/`last_committed_view`

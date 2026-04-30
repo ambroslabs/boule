@@ -68,7 +68,9 @@ pub fn egress_safety(
         }
 
         // Non-wire actions: handled by the event loop directly.
-        SafetyAction::Persist(_) | SafetyAction::Commit(_) => Ok(None),
+        SafetyAction::Persist(_)
+        | SafetyAction::Commit(_)
+        | SafetyAction::EquivocationEvidence { .. } => Ok(None),
     }
 }
 

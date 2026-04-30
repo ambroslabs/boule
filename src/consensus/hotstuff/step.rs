@@ -37,7 +37,7 @@ use crate::replication::block::{Block, BlockHash};
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, VerifiedQc, Vote};
 use super::safety_rules::{safe_to_vote, should_update_high_qc, three_chain_commit};
 use super::state::{HotStuffState, Locked};
-use crate::consensus::validator_set::ValidatorSet;
+use crate::consensus::validator_set::{ValidatorId, ValidatorSet};
 use crate::crypto::sig_scheme::{BlsPartialSig, SignatureSchemeChoice};
 
 /// Tracing target shared with the integration layer; lifted here so
@@ -225,6 +225,30 @@ pub enum Action {
         expected_height: u64,
         reason: BlockSyncReason,
     },
+    /// A validator just signed a vote at `view` for `block_b` after
+    /// previously signing a vote at the same `view` for a *different*
+    /// `block_a`. This is a slashable equivocation: an honest replica
+    /// signs at most one vote per view (per the HotStuff safety rules
+    /// and our `safe_to_vote` predicate), so two distinct
+    /// `(view, block_hash)` votes from the same stable id are
+    /// non-repudiable evidence of a Byzantine signer.
+    ///
+    /// The safety core emits this *before* the conflicting partial is
+    /// folded into the second bucket — the second vote is dropped on
+    /// the floor, so a Byzantine voter contributing partials to two
+    /// buckets at the same view sees only the first land. Audit
+    /// finding 3-1 (#409): without this hook there is nowhere for a
+    /// future slashing pipeline to attach. The integration layer
+    /// today logs at WARN, ticks a counter exposed via
+    /// [`crate::consensus::status::ConsensusStatus::equivocations_detected`],
+    /// and otherwise treats the action as informational; a full
+    /// slashing pipeline is future work.
+    EquivocationEvidence {
+        voter: ValidatorId,
+        view: View,
+        block_a: BlockHash,
+        block_b: BlockHash,
+    },
 }
 
 /// Why the safety core emitted [`Action::RequestBlock`]. Surfaced via
@@ -343,6 +367,19 @@ pub struct HotStuffCore {
     /// `(vote.view, vote.block_hash)`. A bucket becomes a full QC once
     /// `signer_count >= quorum_size(validator_set.len())`.
     vote_bucket: HashMap<(View, BlockHash), QuorumCertificate>,
+    /// Per-`(view, validator)` block-hash dedup. The first vote a stable
+    /// signer contributes at a given view records its `block_hash` here;
+    /// any subsequent vote at the same view from the same signer for a
+    /// *different* `block_hash` is equivocation evidence (audit finding
+    /// 3-1, #409). The conflicting vote is dropped on the floor — the
+    /// Byzantine voter contributes to at most one bucket per view from
+    /// our local perspective — and an [`Action::EquivocationEvidence`]
+    /// is emitted so the integration layer can log/count the event and
+    /// (eventually) feed it to a slashing pipeline. Garbage-collected
+    /// alongside [`Self::vote_bucket`] in
+    /// [`Self::evict_vote_buckets_below`] so a Byzantine flood of
+    /// low-view distinct-hash votes can't pin memory.
+    vote_dedupe: HashMap<(View, ValidatorId), BlockHash>,
     /// Proposals we received before their parent landed. Keyed by the
     /// proposal's own block hash so a later `PacemakerAdvance` can
     /// re-evaluate every parked child whose parent has since arrived.
@@ -463,6 +500,7 @@ impl HotStuffCore {
             self_id,
             state,
             vote_bucket: HashMap::new(),
+            vote_dedupe: HashMap::new(),
             parked_proposals: HashMap::new(),
             block_sync_inflight: HashMap::new(),
             proposed_in_view: 0,
@@ -1103,6 +1141,34 @@ impl HotStuffCore {
             return Vec::new();
         };
 
+        // Equivocation detection (audit finding 3-1, #409): a stable
+        // voter signs at most one vote per view. If we have already
+        // seen `voter_id` vote at `vote.view` for a *different*
+        // `block_hash`, emit `Action::EquivocationEvidence` and drop
+        // the conflicting partial on the floor — folding it into a
+        // second bucket would help a Byzantine voter form QCs on
+        // conflicting blocks. A duplicate (same `block_hash`) is
+        // idempotent: it falls through to `add_signature` /
+        // `add_bls_partial`, both no-ops on a set bit.
+        match self.vote_dedupe.entry((vote.view, voter_id)) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(vote.block_hash);
+            }
+            std::collections::hash_map::Entry::Occupied(e) if *e.get() == vote.block_hash => {
+                // Duplicate — same signer, same view, same block.
+                // Idempotent re-fold below is fine.
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let block_a = *e.get();
+                return vec![Action::EquivocationEvidence {
+                    voter: voter_id,
+                    view: vote.view,
+                    block_a,
+                    block_b: vote.block_hash,
+                }];
+            }
+        }
+
         // Accumulate into the bucket for this `(view, block_hash)`
         // pair. `QuorumCertificate::add_signature` and
         // `QuorumCertificate::add_bls_partial` are both idempotent on
@@ -1549,6 +1615,16 @@ impl HotStuffCore {
     /// Drop every `vote_bucket` entry whose `view < gc_below`.
     /// Invoked on `PacemakerAdvance` so a stale-vote flood on long-past
     /// views cannot accumulate indefinitely.
+    ///
+    /// Also sweeps [`Self::vote_dedupe`] under the same `gc_below` cutoff
+    /// (audit finding 3-1, #409): the dedup map exists only to detect
+    /// equivocation against still-actionable votes. A signer's record
+    /// at a long-past view is no longer evidence we can do anything
+    /// with — pre-existing buckets at that view have been dropped, no
+    /// new bucket can form past `gc_below` (we'd refuse to fold). Both
+    /// maps share the same view-keyed life cycle so the dedup map
+    /// can't pin memory under a Byzantine flood of low-view distinct-
+    /// hash votes.
     fn evict_vote_buckets_below(&mut self, gc_below: View) {
         let before = self.vote_bucket.len();
         self.vote_bucket.retain(|(view, _), _| *view >= gc_below);
@@ -1565,6 +1641,7 @@ impl HotStuffCore {
                 "consensus_cache_evicted",
             );
         }
+        self.vote_dedupe.retain(|(view, _), _| *view >= gc_below);
     }
 
     /// Drop the lowest-`view` `vote_bucket` entry if the map is at cap.
@@ -3466,6 +3543,199 @@ mod tests {
         assert!(actions.is_empty());
     }
 
+    // ── #409: vote-equivocation detection (audit finding 3-1) ──────────
+
+    /// Two votes from the same stable signer at the same view for two
+    /// distinct `block_hash` values must produce
+    /// [`Action::EquivocationEvidence`] on the second arrival; the
+    /// second partial must NOT be folded into the second bucket
+    /// (otherwise a Byzantine voter contributing to two buckets at the
+    /// same view could help form QCs on conflicting blocks). The first
+    /// vote lands normally.
+    #[test]
+    fn second_vote_at_same_view_for_different_block_emits_equivocation_evidence() {
+        let mut core = make_core(1);
+        let view: View = 3;
+        let block_a: BlockHash = [0xAA; 32];
+        let block_b: BlockHash = [0xBB; 32];
+
+        let first = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_a, nid(2))),
+        )));
+        assert!(
+            first.is_empty(),
+            "first vote sub-quorum: no actions expected, got {first:?}",
+        );
+        let bucket_a = core
+            .vote_bucket
+            .get(&(view, block_a))
+            .expect("first vote lands in its bucket");
+        assert_eq!(bucket_a.signer_count(), 1);
+
+        let second = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_b, nid(2))),
+        )));
+        assert_eq!(
+            second,
+            vec![Action::EquivocationEvidence {
+                voter: vid(2),
+                view,
+                block_a,
+                block_b,
+            }],
+            "conflicting vote at same view must emit EquivocationEvidence",
+        );
+
+        // The second bucket must not exist — the conflicting partial is
+        // dropped before fold.
+        assert!(
+            !core.vote_bucket.contains_key(&(view, block_b)),
+            "conflicting vote must not seed a second bucket",
+        );
+        // The original bucket is unchanged.
+        let bucket_a_after = core
+            .vote_bucket
+            .get(&(view, block_a))
+            .expect("original bucket survives");
+        assert_eq!(bucket_a_after.signer_count(), 1);
+    }
+
+    /// A duplicate of the same `(signer, view, block_hash)` is
+    /// idempotent: no equivocation emitted, the bucket's signer-count
+    /// is unchanged (the underlying `add_signature` ignores set bits).
+    #[test]
+    fn duplicate_vote_for_same_block_does_not_emit_equivocation_evidence() {
+        let mut core = make_core(1);
+        let view: View = 3;
+        let block_hash: BlockHash = [0xAA; 32];
+
+        let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_hash, nid(2))),
+        )));
+        let again = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_hash, nid(2))),
+        )));
+        assert!(again.is_empty(), "duplicate vote is a no-op, got {again:?}",);
+        let bucket = core
+            .vote_bucket
+            .get(&(view, block_hash))
+            .expect("bucket exists");
+        assert_eq!(
+            bucket.signer_count(),
+            1,
+            "duplicate must not double-count signer",
+        );
+    }
+
+    /// Distinct signers voting for distinct blocks at the same view do
+    /// not trigger equivocation — the dedup key includes the signer.
+    /// A four-validator network where two validators each vote for a
+    /// different fork must produce two buckets, not equivocation
+    /// evidence.
+    #[test]
+    fn votes_from_distinct_signers_for_distinct_blocks_do_not_emit_evidence() {
+        let mut core = make_core(1);
+        let view: View = 3;
+        let block_a: BlockHash = [0xAA; 32];
+        let block_b: BlockHash = [0xBB; 32];
+
+        let one = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_a, nid(2))),
+        )));
+        let two = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_b, nid(3))),
+        )));
+        assert!(one.is_empty() && two.is_empty(), "sub-quorum, no actions");
+
+        // Two distinct buckets, each with one signer.
+        assert_eq!(
+            core.vote_bucket
+                .get(&(view, block_a))
+                .map(|q| q.signer_count()),
+            Some(1),
+        );
+        assert_eq!(
+            core.vote_bucket
+                .get(&(view, block_b))
+                .map(|q| q.signer_count()),
+            Some(1),
+        );
+    }
+
+    /// The same signer voting at *different* views for different
+    /// blocks is normal HotStuff progress, not equivocation: the
+    /// per-view dedup key separates them.
+    #[test]
+    fn same_signer_at_different_views_does_not_emit_evidence() {
+        let mut core = make_core(1);
+        let block_a: BlockHash = [0xAA; 32];
+        let block_b: BlockHash = [0xBB; 32];
+
+        let v3 = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_a, nid(2))),
+        )));
+        let v4 = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(4, block_b, nid(2))),
+        )));
+        assert!(v3.is_empty() && v4.is_empty(), "sub-quorum, no actions");
+    }
+
+    /// Memory bound (acceptance criterion): the dedup map is GC'd in
+    /// `evict_vote_buckets_below`, which fires on `PacemakerAdvance`.
+    /// After advancing past the recorded view, a previously-seen
+    /// `(signer, view)` pair no longer detects equivocation — the
+    /// entry has been swept out alongside the matching `vote_bucket`
+    /// entry. (The trade-off is fine: a vote_bucket entry below
+    /// `gc_below` cannot feed a fresher high_qc anyway, so retaining
+    /// dedup state for it is not load-bearing — and a future vote at
+    /// the same long-past view would also be dropped on the
+    /// `view < gc_below` cleanup that follows.)
+    #[test]
+    fn pacemaker_advance_garbage_collects_vote_dedupe() {
+        let mut core = make_core(1);
+        let view: View = 3;
+        let block_a: BlockHash = [0xAA; 32];
+
+        let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_a, nid(2))),
+        )));
+        assert!(core.vote_dedupe.contains_key(&(view, vid(2))));
+
+        // Advance past `view` — this should sweep both the bucket and
+        // the dedup entry.
+        let _ = core.step(Event::PacemakerAdvance(view + 1));
+        assert!(
+            !core.vote_dedupe.contains_key(&(view, vid(2))),
+            "vote_dedupe entry must be GC'd alongside its vote_bucket",
+        );
+        assert!(
+            !core.vote_bucket.contains_key(&(view, block_a)),
+            "matching vote_bucket entry must be GC'd",
+        );
+    }
+
+    /// Deterministic emission order: `EquivocationEvidence` is the
+    /// only action emitted for the conflicting vote (no `Persist`,
+    /// `Broadcast`, or other side effect). Pins the contract that the
+    /// integration layer's match arm sees a one-element vec for each
+    /// detection.
+    #[test]
+    fn equivocation_evidence_is_the_only_emitted_action_on_conflict() {
+        let mut core = make_core(1);
+        let view: View = 3;
+        let block_a: BlockHash = [0xAA; 32];
+        let block_b: BlockHash = [0xBB; 32];
+
+        let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_a, nid(2))),
+        )));
+        let actions = core.step(Event::VoteReceived(VoteVariant::Ed25519(
+            crate::consensus::dispatch::Verified::unchecked(signed_vote(view, block_b, nid(2))),
+        )));
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], Action::EquivocationEvidence { .. }));
+    }
+
     // ── D7: parked proposal re-dispatch after parent arrives ────────
 
     #[test]
@@ -5121,7 +5391,13 @@ mod tests {
                         // Safety-core effects the harness doesn't
                         // model. `Persist` is durability, `RequestBlock`
                         // is sync; both are integration-layer jobs.
-                        Action::Persist(_) | Action::RequestBlock { .. } => {}
+                        // `EquivocationEvidence` is informational
+                        // (logged + counter-incremented) — the harness
+                        // counts the action presence rather than acting
+                        // on it.
+                        Action::Persist(_)
+                        | Action::RequestBlock { .. }
+                        | Action::EquivocationEvidence { .. } => {}
                     }
                 }
             }
