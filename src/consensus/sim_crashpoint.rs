@@ -78,43 +78,90 @@ async fn yield_until_crashpoint_fires(cluster: &mut SimCluster, idx: usize, budg
 
 // ── Issue #405 / audit finding 4-1: lock not persisted before vote send ───
 
-/// Regression harness for issue #405 (lock not persisted before vote
-/// send, Tendermint amnesia class).
+/// Regression for issue #405 (lock not persisted before vote send,
+/// Tendermint amnesia class).
 ///
-/// Scenario: arm `after_broadcast_vote` on node 0. The view-1 leader
-/// (sorted index 1 in a 4-node round-robin cluster) proposes; node 0
-/// votes; the crashpoint fires the moment node 0's vote frame is on
-/// the wire. We then restart node 0 against its captured `(signer,
-/// storage, wal)` and verify that
+/// The audit finding: pre-fix, `HotStuffCore::on_proposal_received`
+/// emitted `Action::Broadcast(Vote)` *before* `Action::Persist(Locked)`
+/// for the same proposal. Because `apply_safety_actions` flushes the
+/// persist buffer before each non-`Persist` action, the lock landed on
+/// disk only after the vote left the wire. A crash in that window
+/// (this crashpoint, `after_broadcast_vote`) left disk with
+/// `last_voted_view` advanced past the in-memory promotion: on restart,
+/// `state.locked` reverted to whatever was on disk at the moment of the
+/// crash, *one promotion stale*.
 ///
-/// 1. the crashpoint actually fired (slot drained to `None`),
-/// 2. `restart_node_with_recover` succeeds against the post-crash
-///    storage, and
-/// 3. the surviving cluster commits at least one block consistent
-///    with the post-restart state — no conflicting commits across
-///    the kill/restart boundary.
+/// Bug-shape, in terms of the durable safety triple at any vote
+/// view `N` where the 2-chain rule fired (`N ≥ 3` in our chain):
+/// pre-fix, durable `last_voted_view = N` but durable `locked.view`
+/// reflects the promotion from view `N-1` (or `None` if `N == 3` was
+/// the first promotion the node ever saw); post-fix, durable
+/// `locked.view = N - 2` because the just-cast vote's grandparent IS
+/// the freshly-promoted lock.
 ///
-/// Once #405 lands, the test will also peek the recovered node's
-/// durable `Locked` to confirm `locked.view ≥ last_voted_view`,
-/// pinning the bug shape directly.
+/// This test therefore:
+///
+/// 1. Lets the cluster warm up until node 0's durable
+///    `last_voted_view ≥ 3` — guaranteeing at least one B4 promotion
+///    has fired locally on node 0.
+/// 2. Arms `after_broadcast_vote` on node 0 (an idempotent re-arm of
+///    its task-local slot — the harness re-arms after every fire).
+/// 3. Drives until the crashpoint fires the moment node 0's next
+///    vote frame is on the wire.
+/// 4. Restarts node 0 against its captured `(signer, storage, wal)`.
+/// 5. Reads the post-restart durable safety triple directly from
+///    storage and asserts `lock.view + 2 ≥ last_voted_view` — the
+///    invariant pre-fix violated at every vote view `N ≥ 4`.
+/// 6. Asserts the cluster keeps making progress with no conflicting
+///    commits.
 #[tokio::test]
 async fn after_broadcast_vote_crashpoint_fires_and_node_restarts() {
+    use crate::consensus::node::{
+        STORAGE_KEY_LAST_VOTED_VIEW, STORAGE_KEY_LOCKED, decode_locked, decode_voted_view,
+    };
+
     tokio::time::pause();
 
     let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
-    // Pick node 0 as the crash victim. In a 4-node round-robin
-    // cluster the view-1 leader is sorted index 1, so node 0 votes
-    // on view 1's proposal almost immediately after boot.
     let victim = 0;
+    let storage = cluster
+        .node_storage(victim)
+        .expect("mesh-mode cluster must expose per-node storage");
+
+    // Phase 1: warm up. We need durable `last_voted_view ≥ 3` on
+    // node 0 so the crash later lands at a vote whose action vector
+    // also includes a B4 promotion — which is exactly the gap audit
+    // finding 4-1 names. View 1's vote has no promotion (genesis
+    // grandparent), view 2's likewise; view 3 is the first promotion
+    // every honest replica observes.
+    let warmed = yield_until(&mut cluster, 2000, |_| {
+        storage
+            .get(STORAGE_KEY_LAST_VOTED_VIEW)
+            .ok()
+            .flatten()
+            .and_then(|raw| decode_voted_view(&raw).ok())
+            .is_some_and(|v| v >= 3)
+    })
+    .await;
+    assert!(
+        warmed,
+        "warmup did not see durable last_voted_view ≥ 3 on node 0 within 2000 yields",
+    );
+
+    // Phase 2: arm after at least one B4 promotion has fired. The
+    // slot was empty pre-arm — peek to confirm — and after arm the
+    // very next `after_broadcast_vote` crossing fires the panic.
+    assert_eq!(
+        cluster.peek_crashpoint(victim),
+        None,
+        "slot must be empty before we arm — no other crashpoint should be in flight",
+    );
     assert_eq!(
         cluster.arm_crashpoint(victim, "after_broadcast_vote"),
         None,
-        "fresh cluster slot must start empty",
+        "arm must replace nothing",
     );
 
-    // Drive until the crashpoint fires. The boot path executes
-    // `OnQc(0)` → AdvanceToView(1) → leader broadcasts proposal →
-    // node 0 verifies + votes → crashpoint fires on the SendTo path.
     let fired = yield_until_crashpoint_fires(&mut cluster, victim, 1000).await;
     assert!(
         fired,
@@ -123,17 +170,60 @@ async fn after_broadcast_vote_crashpoint_fires_and_node_restarts() {
          or the macro wiring regressed",
     );
 
-    // Restart the panicked node. Recovery hits the same
-    // `(signer, storage, wal)` it had before, so any state it
-    // managed to flush before the crash (`last_voted_view`, in this
-    // scenario) is read back by `recover()`.
+    // Phase 3: restart. Recovery reopens the captured storage, so
+    // anything node 0 flushed pre-crash is what `recover()` reads
+    // back; anything that didn't flush before the crashpoint is
+    // gone.
     cluster
         .restart_node_with_recover(victim)
         .await
         .expect("recover must succeed against post-crash storage");
 
-    // Drive forward; the cluster must keep making progress and
-    // every commit must be conflict-free across nodes.
+    // Phase 4: pin the bug shape directly. Read the durable
+    // `(last_voted_view, locked)` pair the recovered node booted
+    // against; assert the post-fix invariant
+    // `lock.view + 2 ≥ last_voted_view`.
+    //
+    // Pre-fix this assertion fails at any `N ≥ 4`: durable
+    // `last_voted_view = N` (the just-cast vote flushed before the
+    // broadcast crashpoint), but durable `locked.view` still
+    // reflects the promotion from view `N - 1` (because view `N`'s
+    // promotion was queued after the broadcast and never flushed).
+    // Post-fix the just-cast vote's `Persist(Locked)` lands first,
+    // so `locked.view + 2 = last_voted_view` exactly.
+    let durable_voted = decode_voted_view(
+        &storage
+            .get(STORAGE_KEY_LAST_VOTED_VIEW)
+            .unwrap()
+            .expect("durable last_voted_view must exist after a vote-side crash"),
+    )
+    .unwrap();
+    assert!(
+        durable_voted >= 3,
+        "durable last_voted_view regressed below the warmup floor: got {durable_voted}",
+    );
+    let durable_locked = storage
+        .get(STORAGE_KEY_LOCKED)
+        .unwrap()
+        .map(|raw| decode_locked(&raw).unwrap());
+    let lock = durable_locked.expect(
+        "audit finding 4-1 (#405): durable Locked is None after crashing on a vote-broadcast \
+         past the first 2-chain promotion. Pre-fix, the lock persist was queued behind the \
+         vote broadcast and never flushed; post-fix, Persist(Locked) precedes Broadcast(Vote) \
+         and the lock is durable",
+    );
+    assert!(
+        lock.view + 2 >= durable_voted,
+        "audit finding 4-1 (#405): durable lock.view {} stale w.r.t. vote view {} \
+         (expected lock.view + 2 ≥ last_voted_view, since the just-cast vote's grandparent \
+         IS the freshly-promoted lock). The lock landed on disk one promotion behind, which \
+         is the on-disk shape that lets a restarted replica vote on a conflicting branch \
+         that satisfies the stale lock's extension rule",
+        lock.view,
+        durable_voted,
+    );
+
+    // Phase 5: cluster keeps making progress, no conflicting commits.
     let _ = yield_until(&mut cluster, 1500, |c| {
         c.peek_commit_heights().iter().filter(|&&h| h > 0).count() >= 3
     })
