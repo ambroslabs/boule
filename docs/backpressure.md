@@ -104,7 +104,7 @@ extra latency) or it would be unsafe.
 |------|-----------|------|----------|-------------------|--------|-----------|
 | Per-node event mailbox (data plane) | `consensus/sim.rs:713,1328` | `mpsc<ProtocolEvent>` | 1024 | `send().await` (`consensus/sim.rs:1817,1843`) | **Block** | Mirrors the production `event_rx` policy: a slow consumer back-pressures the route task. Capacity is sized far above any realistic per-tick burst. |
 | Per-node mailbox (PeerConnected / PeerDisconnected) | `consensus/sim.rs:1013,2177,2449` | shares the data-plane mailbox | 1024 | `try_send` → drop silently | **Drop (intentional)** | Control-plane events on the kill / wire-up path. Fire-and-forget by design — we don't want a wedged survivor's mailbox to gate the death of another node. |
-| Commit notifier | `consensus/sim.rs:777,1373` | `mpsc::unbounded_channel<Block>` | **∞ (unbounded)** | n/a (never full) | **Unbounded** *(see #485)* | Tests that don't drain `commit_rxs` accumulate committed blocks indefinitely in RAM. The only true unbound in the consensus + p2p path. #485 replaces this with a bounded channel + an overflow counter so test misuse becomes loud. |
+| Commit notifier | `consensus/api.rs::MpscCommitNotifier`, allocated in `consensus/sim.rs` | `mpsc::Sender<Block>` | `SIM_COMMIT_CHANNEL_CAP` (4096) | `try_send` → drop + counter increment + warn | **Drop + counter** | Pre-#485 was unbounded — tests that didn't drain `commit_rxs` accumulated committed blocks indefinitely in RAM. Now the cap is large enough that any healthy test stays at zero overflows; if a test wedges its receiver the harness can poll `SimCluster::total_commit_overflows()` to surface the cause instead of OOMing. |
 
 ### Rate-limiter / connection-limiter state
 
@@ -121,9 +121,10 @@ state, so they're worth recording.
 
 The audit identified three gaps that are tracked as sub-issues of #163:
 
-- **#485** — Sim commit channel is unbounded. The only unbound on the
-  consensus/p2p path; replace with a bounded channel + overflow
-  counter.
+- ~~**#485** — Sim commit channel is unbounded.~~ Landed: bounded
+  at [`SIM_COMMIT_CHANNEL_CAP`](../src/consensus/sim.rs); the
+  notifier increments a per-node overflow counter on drop, surfaced
+  in `SimCluster::total_commit_overflows()`.
 - **#486** — No overflow counters on the drop-on-full paths
   (per-peer outbound `write_tx`, gossip sink, sim mailbox). Wire
   `AtomicU64` counters and surface them in `ConsensusStatus` so the

@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::State;
 use axum::routing::get;
@@ -63,7 +64,7 @@ use crate::replication::block::Block;
 /// use ambros_p2p::consensus::node::ConsensusNode;
 ///
 /// # fn build(node: ConsensusNode) -> ConsensusNode {
-/// let (tx, mut rx) = mpsc::unbounded_channel();
+/// let (tx, mut rx) = mpsc::channel(4096);
 /// let notifier: Arc<dyn CommitNotifier> =
 ///     Arc::new(MpscCommitNotifier::new(tx));
 /// let node = node.with_commit_notifier(notifier);
@@ -91,28 +92,69 @@ pub trait CommitNotifier: Send + Sync {
 }
 
 /// [`CommitNotifier`] adapter that forwards each committed block to a
-/// [`tokio::sync::mpsc::UnboundedSender`].
+/// [`tokio::sync::mpsc::Sender`].
 ///
-/// This is the impl used by the in-process simulator (and any other
-/// single-consumer subscriber): each node owns its own unbounded
-/// channel, the harness drains the receiver, and a closed channel is
-/// treated as a shutdown signal — `send` errors are swallowed because
-/// the consensus loop must not stall on a downstream observer
-/// disappearing.
+/// Used by the in-process simulator and any other single-consumer
+/// subscriber. Each node owns its own bounded channel; the harness
+/// drains the receiver. `on_commit` calls `try_send` because it must
+/// not stall the consensus event loop — if the receiver has fallen
+/// behind capacity, the block is dropped and an internal counter is
+/// bumped so a test can assert no drops occurred. A closed channel is
+/// treated as a shutdown signal; the error is swallowed.
+///
+/// Capacity should be picked so that bursts between drains fit
+/// comfortably; for the sim, [`crate::consensus::sim::SIM_COMMIT_CHANNEL_CAP`]
+/// is a generous default. Drops are a sim bug — the harness either
+/// drains slowly enough that the cap is too low, or it forgot to drain
+/// at all.
 pub struct MpscCommitNotifier {
-    tx: tokio::sync::mpsc::UnboundedSender<Block>,
+    tx: tokio::sync::mpsc::Sender<Block>,
+    overflows: Arc<AtomicU64>,
 }
 
 impl MpscCommitNotifier {
-    /// Wrap an unbounded channel sender as a [`CommitNotifier`].
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<Block>) -> Self {
-        Self { tx }
+    /// Wrap a bounded channel sender as a [`CommitNotifier`].
+    pub fn new(tx: tokio::sync::mpsc::Sender<Block>) -> Self {
+        Self {
+            tx,
+            overflows: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Shared handle to the overflow counter. Increments every time
+    /// `on_commit` calls `try_send` and gets `Full` back. The harness
+    /// can poll this to assert no drops happened in a deterministic
+    /// test, or sum across nodes to surface back-pressure on the
+    /// commit fan-out as a whole.
+    pub fn overflow_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.overflows)
+    }
+
+    /// Read the current overflow count.
+    pub fn overflow_count(&self) -> u64 {
+        self.overflows.load(Ordering::Relaxed)
     }
 }
 
 impl CommitNotifier for MpscCommitNotifier {
     fn on_commit(&self, block: &Block, _state_commitment: &[u8; 32], _view: View) {
-        let _ = self.tx.send(block.clone());
+        match self.tx.try_send(block.clone()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Receiver fell behind. See struct doc — this is a sim
+                // bug class (cap too low, or harness forgot to drain).
+                // Drop the block, bump the counter, and warn so a wedged
+                // test surfaces the cause instead of OOMing.
+                self.overflows.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "ambros_p2p::consensus::api",
+                    "MpscCommitNotifier dropped commit on full channel"
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Receiver gone — typical at shutdown. Stay quiet.
+            }
+        }
     }
 }
 
@@ -204,5 +246,39 @@ mod tests {
         assert_eq!(status.current_view, View(0));
         assert_eq!(status.last_committed_height, Height(0));
         assert!(status.locked.is_none());
+    }
+
+    #[tokio::test]
+    async fn mpsc_commit_notifier_drops_and_counts_when_channel_full() {
+        // Capacity 1 channel, never drained. First commit fits, the
+        // next two must drop and bump the overflow counter so a
+        // wedged-receiver test surfaces the cause.
+        let (tx, _rx_held_open) = tokio::sync::mpsc::channel::<Block>(1);
+        let notifier = MpscCommitNotifier::new(tx);
+        let block = Block::genesis([0; 32], [0; 32]);
+
+        notifier.on_commit(&block, &[0; 32], View(1));
+        assert_eq!(notifier.overflow_count(), 0);
+
+        notifier.on_commit(&block, &[0; 32], View(2));
+        notifier.on_commit(&block, &[0; 32], View(3));
+        assert_eq!(notifier.overflow_count(), 2);
+
+        // The shared counter handle observes the same value.
+        let shared = notifier.overflow_counter();
+        assert_eq!(shared.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn mpsc_commit_notifier_swallows_closed_channel_silently() {
+        // Receiver dropped first ⇒ Closed. The notifier must not panic
+        // and must not bump the overflow counter (Closed ≠ Full).
+        let (tx, rx) = tokio::sync::mpsc::channel::<Block>(8);
+        drop(rx);
+        let notifier = MpscCommitNotifier::new(tx);
+        let block = Block::genesis([0; 32], [0; 32]);
+
+        notifier.on_commit(&block, &[0; 32], View(1));
+        assert_eq!(notifier.overflow_count(), 0);
     }
 }
