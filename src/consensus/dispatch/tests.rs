@@ -86,7 +86,7 @@ fn ingress_proposal_happy_path() {
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap();
-    assert_eq!(dispatches.len(), 2);
+    assert_eq!(dispatches.len(), 3);
     assert!(matches!(
         dispatches[0],
         Dispatch::Safety(SafetyEvent::ProposalReceived(_))
@@ -95,6 +95,60 @@ fn ingress_proposal_happy_path() {
         dispatches[1],
         Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(0))
     ));
+    assert!(matches!(
+        dispatches[2],
+        Dispatch::Pacemaker(pacemaker::Event::OnQc(0))
+    ));
+}
+
+/// #436: a Proposal whose `justify.view` is fresher than the proposal
+/// view shape used in the happy-path test must surface the justify
+/// view as a pacemaker `OnQc` event. Without this, a replica still at
+/// view V whose `OnQc(V)` got lost would drop a follow-up proposal at
+/// V+1 (the future-view rule on `OnProposalReceived`) and wedge until
+/// its timer fires — even though the proposal carries proof of a QC at
+/// V that should advance it immediately.
+#[test]
+fn ingress_proposal_emits_on_qc_at_justify_view() {
+    let signer = fresh_signer();
+    let vs = make_vs_with_signers(&[&signer]);
+
+    // Proposal at view 6 with a justify QC at view 5.
+    let mut justify = QuorumCertificate::new(5, [0xAB; 32], 1);
+    justify.add_signature(0, [0x11; 64]);
+    let parent = genesis();
+    let header = crate::replication::block::BlockHeader {
+        parent_hash: parent.hash(),
+        height: 1,
+        view: 6,
+        proposer: signer.node_id(),
+        state_commitment: [0; 32],
+        commands_commitment: Block::commands_commitment(&[]),
+        validator_history_commitment: [0; 32],
+    };
+    let block = Block {
+        header,
+        commands: vec![],
+    };
+    let proposal = Proposal { block, justify };
+    let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
+    let wire = WireMessage::Proposal(signed);
+    let bytes = postcard::to_stdvec(&wire).unwrap();
+
+    let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap();
+    assert_eq!(dispatches.len(), 3);
+    assert!(matches!(
+        dispatches[1],
+        Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(6))
+    ));
+    assert!(
+        matches!(
+            dispatches[2],
+            Dispatch::Pacemaker(pacemaker::Event::OnQc(5))
+        ),
+        "expected OnQc(justify.view = 5), got {:?}",
+        dispatches[2]
+    );
 }
 
 #[test]
@@ -445,7 +499,7 @@ fn egress_broadcast_proposal_is_verifiable() {
 
     // Run through ingress — should succeed.
     let dispatches = ingress_with_genesis_set(signer.node_id(), &payload, &vs).unwrap();
-    assert_eq!(dispatches.len(), 2);
+    assert_eq!(dispatches.len(), 3);
     match &dispatches[0] {
         Dispatch::Safety(SafetyEvent::ProposalReceived(s)) => {
             assert_eq!(s.inner().payload.block, proposal.block);
@@ -1510,7 +1564,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
         &ChainId::TEST,
     )
     .expect("real Ed25519 QC must verify under the genesis pubkeys");
-    assert_eq!(dispatches.len(), 2);
+    assert_eq!(dispatches.len(), 3);
 }
 
 /// PR C of #325: a Byzantine leader stamps a `Proposal` with a
@@ -1948,7 +2002,7 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
         &ChainId::TEST,
     )
     .expect("genesis QC (no signers) must pass aggregate verification");
-    assert_eq!(dispatches.len(), 2);
+    assert_eq!(dispatches.len(), 3);
 }
 
 #[test]
@@ -2338,5 +2392,5 @@ fn ingress_with_skip_lets_invalid_aggregate_through() {
         &ChainId::TEST,
     )
     .expect("Skip policy must not exercise aggregate verification");
-    assert_eq!(dispatches.len(), 2);
+    assert_eq!(dispatches.len(), 3);
 }

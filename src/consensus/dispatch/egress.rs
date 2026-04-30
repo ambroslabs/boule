@@ -255,6 +255,7 @@ pub fn egress_consensus_msg_with_loopback(
     let dispatches = match wire {
         WireMessage::Proposal(signed) => {
             let view = signed.payload.block.header.view;
+            let justify_view = signed.payload.justify.view;
             vec![
                 Dispatch::Safety(crate::consensus::hotstuff::step::Event::ProposalReceived(
                     // Loopback: we just signed `signed` ourselves via
@@ -267,6 +268,12 @@ pub fn egress_consensus_msg_with_loopback(
                     Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
                 )),
                 Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(view)),
+                // Mirror the wire ingress path: emit OnQc(justify.view)
+                // so a future-view proposal whose QC we never saw
+                // directly still advances the pacemaker (#436). On the
+                // leader's own loopback `justify.view == current_view -
+                // 1`, which the pacemaker treats as stale and ignores.
+                Dispatch::Pacemaker(pacemaker::Event::OnQc(justify_view)),
             ]
         }
         WireMessage::Vote(signed, bls_partial) => {

@@ -9075,6 +9075,21 @@ mod tests {
             matches!(second, ProtocolOutbound::Broadcast(_)),
             "second outbound must be the vote broadcast, got {second:?}",
         );
+        // #436: the proposal loopback now emits `OnQc(justify.view = 0)`,
+        // which advances this node's pacemaker from view 0 → 1 and fires
+        // `on_pacemaker_advance(1)`. That handler unconditionally emits
+        // a `Broadcast(NewView)` advertising the seeded genesis high_qc
+        // — the same NewView a real boot would send when the pacemaker
+        // advances from 0 to 1 via the boot-time `OnQc(boot_view)`.
+        // The double-propose guard on `proposed_in_view` keeps this from
+        // re-emitting a Proposal at view 1.
+        let third = send_rx
+            .try_recv()
+            .expect("Broadcast(NewView) must follow as the pacemaker advances to view 1");
+        assert!(
+            matches!(third, ProtocolOutbound::Broadcast(_)),
+            "third outbound must be the NewView broadcast, got {third:?}",
+        );
         // No further traffic.
         assert!(send_rx.try_recv().is_err());
     }
