@@ -557,6 +557,135 @@ A validator added via reconfig at view `R` starts with its initial
 pubkey as both stable id and signing key. It can later rotate via
 the same flow described here.
 
+## Weighted voting power (issue #144)
+
+The HotStuff quorum predicate is **weight-based**:
+`3 * signer_weight > 2 * total_weight`. Each validator carries a
+`u64` voting weight (#460) registered at genesis or set via a
+`change-weight` reconfig (#462). Existing flat committees (every
+validator at weight = 1) keep the same liveness profile because the
+weighted predicate collapses exactly to the count-based `2n/3 + 1`
+BFT quorum at uniform weight = 1.
+
+[The reconfig runbook in testnet-local.md](testnet-local.md#9c-validator-set-reconfiguration)
+covers the mechanics — `add-validator --weight`,
+`change-weight`, the `weight = 0` rejection rule, the
+single-validator stall constraint. This section covers what
+operators need to do *between* reconfigs on a live cluster.
+
+### When to bother with non-uniform weights
+
+For permissioned testnets, internal staging, and most small-`n`
+deployments: **don't**. Uniform weight = 1 is simpler to reason
+about, easier to monitor, and indistinguishable from the pre-#144
+behavior in every respect. The weighted-predicate machinery is
+load-bearing only when you actually want validators to have
+different voting power.
+
+Reach for non-uniform weights when:
+
+- The cluster represents a real stake distribution and equal-weight
+  voting would mis-represent it (proof-of-stake networks).
+- Operationally heterogeneous validators — e.g. a high-trust
+  founding set plus a community tier — need a weighted committee
+  rather than two separate committees with cross-attestation.
+- Specific validators have different reliability profiles and you
+  want quorum to lean on the more reliable ones.
+
+A future stake-weighted leader-selection follow-up (issue #145)
+will pair leader rotation with the same weight distribution. Until
+that lands, leader rotation stays round-robin: a weight-1 and a
+weight-1000 validator lead equally often.
+
+### Single-validator stall constraint
+
+Every validator's weight `w_i` must satisfy `3 * w_i < total_weight`.
+A validator at or above that threshold can stall the cluster
+single-handedly by going silent — no malicious behavior required,
+a single crash or network drop is enough. The weighted-Byzantine
+assumption is `Byzantine weight ≤ floor(total / 3)`; a validator
+above that bound IS the Byzantine cap and cannot be tolerated.
+
+The reconfig validator does NOT enforce this — it's operator
+policy. Verify before submitting an `add-validator` or
+`change-weight`. The check is one line:
+
+```python
+# Pseudocode; do this in whatever you wire up.
+total = sum(weights)
+assert all(3 * w < total for w in weights), \
+    "no single validator may sit at or above floor(total/3)"
+```
+
+### Monitoring a weighted cluster
+
+`/consensus/status` exposes vote and timeout buckets. **Today the
+JSON `signers` and `quorum` fields are count-based (#473
+follow-up will add `signer_weight` and `quorum_weight` u128
+fields).** On a weighted cluster the count fields are still useful
+for "who has voted at all" but don't tell you whether the
+weight-quorum threshold is in reach. Until #473 lands the
+authoritative weighted view is in the trace logs:
+
+```
+DEBUG ambros_p2p::consensus: timeout_vote view=42 signer=… \
+  bucket_signers=2 bucket_weight=8 quorum_weight=11
+```
+
+(`bucket_weight` and `quorum_weight` are emitted in `u64` form for
+tracing's sake; values up to `u64::MAX` are fine, larger totals
+truncate — a non-issue at any realistic stake distribution.)
+
+### Common stall patterns and recovery
+
+**Stall pattern A — single heavy validator down.** If
+`3 * weights[i] ≥ total_weight` (the negation of the
+single-validator-stall constraint above) and validator `i` goes
+silent (crash, network partition, mis-rotation), the honest
+remainder cannot reach quorum. The cluster will produce timeout
+certificates indefinitely without committing.
+
+*Recovery:* either bring validator `i` back online, OR submit a
+`change-weight` reconfig that drops `weights[i]` below the
+single-validator threshold. The new boundary needs `>= 2/3` of
+*current* weight to commit, so the silent validator's outage must
+not also be ≥ 1/3 of total — if it is, you're already stuck and
+the only path out is restoring the validator. Build the cluster
+so this never happens (the constraint above).
+
+**Stall pattern B — combined silent weight reaches the BFT
+bound.** If the silent or misbehaving subset's summed weight `s`
+satisfies `3 * s ≥ total_weight`, the honest remainder cannot
+reach quorum (`3 * (total - s) ≤ 2 * total`). Safety still holds
+as long as `s ≤ floor(total / 3)`, but liveness is gone. Same
+recovery: get enough silent-weight validators back online to drop
+the silent set below the bound, OR remove the silent validators
+via reconfig (which itself needs the remaining set to be able to
+commit — if it can't, only validator-recovery breaks the stall).
+
+**Stall pattern C — pending reconfig waiting for state-sync.** A
+new validator added via reconfig must finish state-sync before
+`v_eff`, otherwise it cannot vote and the post-boundary committee
+runs short. Same recovery as the existing reconfig runbook —
+submit a counter-reconfig.
+
+### Watching the weight distribution evolve
+
+Every committed reconfig writes a structured log line:
+
+```
+INFO ambros_p2p::consensus: reconfig_applied height=… view=… v_eff=… next_size=…
+```
+
+The actual weights at each boundary live in
+`STORAGE_KEY_VALIDATOR_HISTORY` (per-validator, persisted via
+`PersistedValidatorHistory`). To dump the current weight
+distribution after a reconfig, restart any validator: the boot log
+prints the recovered set and the persisted weights are visible in
+the DB blob. A future operator-introspection endpoint that surfaces
+this without restart is filed (no specific issue yet — file one if
+this becomes recurring friction).
+
 ## Consensus signature scheme (issues #143, #287–#296)
 
 A chain commits to one signature scheme at genesis and uses it for
