@@ -32,6 +32,7 @@
 
 pub mod api;
 pub mod bls_key_history;
+pub(crate) mod crashpoint;
 pub mod dispatch;
 pub mod history_commitment;
 pub mod hotstuff;
@@ -52,6 +53,9 @@ pub mod sim;
 
 #[cfg(test)]
 mod sim_byzantine;
+
+#[cfg(test)]
+mod sim_crashpoint;
 
 #[cfg(test)]
 mod wire_fuzz;
