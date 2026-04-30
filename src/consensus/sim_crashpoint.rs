@@ -379,26 +379,30 @@ async fn after_send_outbound_for_proposal_crashpoint_fires_on_view_1_leader() {
 
 // ── Issue #415 / audit finding 14-1: TimeoutVote persistence ──────────────
 
-/// Regression harness for issue #415 (`TimeoutVote` is broadcast
-/// without a preceding persist).
+/// Regression for issue #415 (`TimeoutVote` is broadcast without a
+/// preceding persist; a crash between the sign and the wire send lets
+/// a restarted replica mint a *second* signed `TimeoutVote(v)` whose
+/// `high_qc` snapshot differs from the first — slashable equivocation
+/// evidence under any future TimeoutVote-collection mechanism).
 ///
-/// Scenario: kill the view-1 leader (sorted index 1) so the
-/// surviving three nodes can only escape view 1 via the
-/// timeout-certificate path. Arm
-/// `after_broadcast_timeout_vote` on a survivor. Advance virtual
-/// time so the survivor's view timer fires. The survivor's
-/// `send_timeout` path puts a TimeoutVote frame on the wire; the
-/// crashpoint fires immediately after. We then restart the
-/// survivor and verify the cluster eventually advances past view 1
-/// without committing conflicting blocks.
-///
-/// Once #415 lands, the test will additionally assert that the
-/// recovered survivor's persisted "highest TimeoutVote view" matches
-/// the view it broadcast for, so that on restart it cannot broadcast
-/// a *second* TimeoutVote for the same view with a different
-/// piggybacked `high_qc`.
+/// Scenario: kill the view-1 leader (sorted index 1) so the surviving
+/// three nodes can only escape view 1 via the timeout-certificate
+/// path. Arm `after_broadcast_timeout_vote` on a survivor. Advance
+/// virtual time so the survivor's view-1 timer fires, dropping it
+/// through `send_timeout`. The crashpoint fires immediately after the
+/// frame leaves; the on-disk `STORAGE_KEY_LAST_TIMEOUT_VOTE` slot must
+/// already carry the just-broadcast envelope (the fix persists
+/// *before* the wire send returns). We then restart the survivor and
+/// verify (a) the persisted envelope survived, (b) the cluster
+/// eventually advances past view 1 without committing conflicting
+/// blocks, and (c) the persisted envelope was not mutated during the
+/// post-restart timer re-fires — i.e. the reborn replica replayed the
+/// same payload byte-for-byte rather than minting a fresh one with
+/// `state.high_qc` it had since advanced past.
 #[tokio::test]
 async fn after_broadcast_timeout_vote_crashpoint_fires_when_leader_is_dead() {
+    use crate::consensus::node::{STORAGE_KEY_LAST_TIMEOUT_VOTE, decode_last_timeout_vote};
+
     tokio::time::pause();
 
     let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
@@ -440,6 +444,28 @@ async fn after_broadcast_timeout_vote_crashpoint_fires_when_leader_is_dead() {
          a survivor through send_timeout",
     );
 
+    // The crashpoint fires *after* `send_outbound` returns for the
+    // TimeoutVote broadcast. The fix persists the envelope before
+    // that call, so the on-disk slot must already carry a
+    // TimeoutVote — pinning the audit-14-1 / #415 invariant: the
+    // canonical envelope this replica committed to for the timed-out
+    // view is durable before the bytes leave the host.
+    //
+    // Pre-fix: this slot did not exist at all (`send_timeout` had no
+    // persistence step), so the lookup below returned `None` and the
+    // `.expect()` tripped — the regression assertion that tightens
+    // when #415 lands.
+    let storage = cluster.peek_storage(timeout_victim);
+    let pre_restart_raw = storage
+        .get(STORAGE_KEY_LAST_TIMEOUT_VOTE)
+        .expect("storage.get must not error")
+        .expect(
+            "STORAGE_KEY_LAST_TIMEOUT_VOTE must be persisted before the TimeoutVote \
+             broadcast leaves: the audit-14-1 / #415 equivocation guard relies on \
+             this envelope surviving the crash",
+        );
+    let pre_restart = decode_last_timeout_vote(&pre_restart_raw).expect("decode timeout vote");
+
     cluster
         .restart_node_with_recover(timeout_victim)
         .await
@@ -453,6 +479,119 @@ async fn after_broadcast_timeout_vote_crashpoint_fires_when_leader_is_dead() {
         for _ in 0..100 {
             yield_now().await;
         }
+    }
+
+    // Equivocation invariant (#415): if the reborn replica ever
+    // re-broadcasts a TimeoutVote at the *same* view it was timing
+    // out on pre-crash, the persisted envelope must replay
+    // byte-for-byte rather than mint a fresh one with `state.high_qc`
+    // it has since advanced past. Pre-fix, `send_timeout` would
+    // happily sign a second envelope with a different `high_qc.view`.
+    // A bump to a strictly later view is fine — that is a new
+    // persisted entry for a view the replica never previously
+    // committed to.
+    let post_restart_raw = storage
+        .get(STORAGE_KEY_LAST_TIMEOUT_VOTE)
+        .expect("storage.get must not error")
+        .expect("post-restart storage must still carry a persisted TimeoutVote");
+    let post_restart = decode_last_timeout_vote(&post_restart_raw).expect("decode timeout vote");
+    if post_restart.view == pre_restart.view {
+        assert_eq!(
+            post_restart_raw,
+            pre_restart_raw,
+            "audit finding 14-1 (#415): persisted TimeoutVote at view {} mutated across \
+             restart (high_qc.view {:?} → {:?}) — the reborn replica minted a *second* \
+             signed envelope at the same view, which is the equivocation gap the fix \
+             exists to close",
+            pre_restart.view,
+            pre_restart.high_qc.as_ref().map(|q| q.view),
+            post_restart.high_qc.as_ref().map(|q| q.view),
+        );
+    }
+
+    let committed = cluster.drain_commits();
+    assert_no_conflicts(&committed);
+}
+
+/// Tighter bug-shape regression for issue #415: arm
+/// `after_persist_timeout_vote` so the crashpoint fires *between* the
+/// persist and the wire broadcast. Pre-fix that crashpoint did not
+/// exist — the persist was missing entirely — so this test would have
+/// hung waiting for it to fire. Post-fix the persist is the very next
+/// step before broadcast, so the slot fires once the survivor's
+/// view-1 timer drops it through `send_timeout` for the first time.
+///
+/// The post-crash assertion is identical to the broader test above:
+/// the persisted envelope must already exist, must pin the timed-out
+/// view, and must remain byte-identical after the restart-driven
+/// replay.
+#[tokio::test]
+async fn after_persist_timeout_vote_crashpoint_fires_before_broadcast() {
+    use crate::consensus::node::{STORAGE_KEY_LAST_TIMEOUT_VOTE, decode_last_timeout_vote};
+
+    tokio::time::pause();
+
+    let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+    for _ in 0..20 {
+        yield_now().await;
+    }
+
+    let timeout_victim = 0;
+    cluster.arm_crashpoint(timeout_victim, "after_persist_timeout_vote");
+    cluster.kill_node(1);
+
+    for _ in 0..12 {
+        tokio::time::advance(Duration::from_millis(500)).await;
+        for _ in 0..100 {
+            yield_now().await;
+            if cluster.peek_crashpoint(timeout_victim).is_none() {
+                break;
+            }
+        }
+        if cluster.peek_crashpoint(timeout_victim).is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        cluster.peek_crashpoint(timeout_victim),
+        None,
+        "after_persist_timeout_vote must fire once the view timer drives a \
+         survivor through send_timeout — pre-fix the persist did not exist \
+         and this slot would never have fired",
+    );
+
+    let storage = cluster.peek_storage(timeout_victim);
+    let pre_restart_raw = storage
+        .get(STORAGE_KEY_LAST_TIMEOUT_VOTE)
+        .expect("storage.get must not error")
+        .expect("the persist must precede the broadcast — the slot's purpose");
+    let pre_restart = decode_last_timeout_vote(&pre_restart_raw).expect("decode timeout vote");
+
+    cluster
+        .restart_node_with_recover(timeout_victim)
+        .await
+        .expect("recover must succeed against post-crash storage");
+
+    for _ in 0..12 {
+        tokio::time::advance(Duration::from_millis(500)).await;
+        for _ in 0..100 {
+            yield_now().await;
+        }
+    }
+
+    let post_restart_raw = storage
+        .get(STORAGE_KEY_LAST_TIMEOUT_VOTE)
+        .expect("storage.get must not error")
+        .expect("post-restart storage must still carry the persisted TimeoutVote");
+    let post_restart = decode_last_timeout_vote(&post_restart_raw).expect("decode timeout vote");
+    if post_restart.view == pre_restart.view {
+        assert_eq!(
+            post_restart_raw, pre_restart_raw,
+            "audit finding 14-1 (#415): persisted TimeoutVote bytes must be identical \
+             across the restart replay — the reborn replica must re-broadcast the same \
+             envelope rather than mint a second one with `high_qc` it has since advanced",
+        );
     }
 
     let committed = cluster.drain_commits();
@@ -487,6 +626,7 @@ async fn every_named_crashpoint_is_armable() {
         "after_send_outbound_for_proposal",
         "after_apply_commit_block_persist",
         "after_adopt_snapshot_persist",
+        "after_persist_timeout_vote",
         "after_broadcast_timeout_vote",
     ];
 

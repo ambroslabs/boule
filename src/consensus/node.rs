@@ -176,6 +176,24 @@ pub const STORAGE_KEY_HIGH_QC: &[u8] = b"consensus/high_qc";
 /// 4-6, issue #407.
 pub const STORAGE_KEY_PROPOSED_IN_VIEW: &[u8] = b"consensus/proposed_in_view";
 
+/// Storage key for the most recently broadcast [`TimeoutVote`] envelope.
+/// Persisted by [`ConsensusNode::send_timeout`] *before* any byte hits
+/// the wire, then replayed bit-identically on every subsequent attempt
+/// to time out at the same `view` — whether the next attempt is a timer
+/// re-fire in the same process or the first send after a restart. The
+/// encoded value is the full [`TimeoutVote`] (`view` + the
+/// `Option<QuorumCertificate>` piggyback) so the resigned envelope
+/// matches the original byte-for-byte.
+///
+/// Without this, `send_timeout` would re-read `state.high_qc` on each
+/// attempt; that value can advance between attempts (a fresher QC
+/// arrived via a NewView, a piggybacked justify from a partial
+/// proposal, etc.), producing a *second* signed `TimeoutVote(v)` whose
+/// `high_qc` differs from the first. Both envelopes are slashable
+/// equivocation evidence even when the replica was honest. Audit
+/// finding 14-1, issue #415.
+pub const STORAGE_KEY_LAST_TIMEOUT_VOTE: &[u8] = b"consensus/last_timeout_vote";
+
 /// Storage-key prefix under which committed blocks are persisted by
 /// content-hash. Each block is written on commit so a peer can fetch
 /// it via the block-sync sub-protocol even after we have evicted it
@@ -3179,12 +3197,47 @@ impl ConsensusNode {
         actions
     }
 
+    /// Build a fresh [`TimeoutVote`] payload for `view` from the
+    /// current `state.high_qc` and durably stamp it under
+    /// [`STORAGE_KEY_LAST_TIMEOUT_VOTE`] before returning. The
+    /// `crashpoint!("after_persist_timeout_vote")` between the put and
+    /// the return lets a regression test pin the gap between
+    /// "envelope is on disk" and "envelope is on the wire" — a crash
+    /// in this gap leaves the durable record that [`send_timeout`]
+    /// replays after restart (audit finding 14-1, issue #415).
+    fn persist_fresh_timeout_vote(&self, view: View) -> anyhow::Result<TimeoutVote> {
+        let high_qc = self.core.state().high_qc.clone();
+        let payload = TimeoutVote { view, high_qc };
+        let bytes = encode_last_timeout_vote(&payload)?;
+        self.storage
+            .put(STORAGE_KEY_LAST_TIMEOUT_VOTE, &bytes)
+            .context("persist last_timeout_vote")?;
+        crashpoint!("after_persist_timeout_vote");
+        Ok(payload)
+    }
+
     /// Build, broadcast, and self-deliver a [`TimeoutVote`] for `view`.
     ///
     /// Self-delivery matters because production p2p broadcasts do not
     /// loop back to the sender — without an explicit self-feed the
     /// local bucket would be one short of quorum, and a leader-crash
     /// scenario with exactly `quorum_size` live replicas would stall.
+    ///
+    /// # Persistence (audit finding 14-1, issue #415)
+    ///
+    /// The TimeoutVote envelope this replica commits to for `view` is
+    /// persisted under [`STORAGE_KEY_LAST_TIMEOUT_VOTE`] *before* any
+    /// byte hits the wire. On any subsequent attempt to time out at
+    /// the same `view` — whether a timer re-fire in the same process
+    /// (the policy's exponential backoff fires `OnTimeout(view)` again
+    /// when the cluster has not yet formed a TC) or a `send_timeout`
+    /// after a crash-and-restart — the persisted payload is replayed
+    /// bit-identically. Without this, the second attempt would build
+    /// from `state.high_qc`, which may have advanced between the
+    /// original send and this attempt; a peer holding both signed
+    /// envelopes could then present a contradiction (two distinct
+    /// `high_qc` snapshots endorsed by the same signer at the same
+    /// view).
     async fn send_timeout(
         &mut self,
         view: View,
@@ -3192,8 +3245,25 @@ impl ConsensusNode {
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
-        let high_qc = self.core.state().high_qc.clone();
-        let payload = TimeoutVote { view, high_qc };
+        // Reuse a previously persisted envelope for this view if one
+        // exists — that is the canonical payload this replica has
+        // already committed to. Fresh views fall through to the build
+        // path below and persist their envelope before broadcast.
+        let payload = match self
+            .storage
+            .get(STORAGE_KEY_LAST_TIMEOUT_VOTE)
+            .context("read last_timeout_vote from storage")?
+        {
+            Some(raw) => {
+                let prev = decode_last_timeout_vote(&raw)?;
+                if prev.view == view {
+                    prev
+                } else {
+                    self.persist_fresh_timeout_vote(view)?
+                }
+            }
+            None => self.persist_fresh_timeout_vote(view)?,
+        };
         let signed = Signed::sign(payload, signer.as_ref(), &self.chain_id)
             .context("signing TimeoutVote")?;
 
@@ -3203,14 +3273,11 @@ impl ConsensusNode {
             .map(Bytes::from)
             .context("encoding TimeoutVote")?;
         send_outbound(broadcaster, Outbound::Broadcast(bytes)).await;
-        // Audit finding 14-1 / issue #415: TimeoutVote is sent without
-        // a preceding persist, so a crash here lets the replica
-        // restart, observe a different `high_qc`, and broadcast a
-        // *fresh* TimeoutVote for the same view with a different
-        // piggyback — equivocation. The fix is to persist the
-        // outbound TimeoutVote before this `send_outbound` returns;
-        // this crashpoint exists so the regression test for that fix
-        // can pin the gap.
+        // The envelope under STORAGE_KEY_LAST_TIMEOUT_VOTE is durable
+        // before this send returns (see persist_fresh_timeout_vote);
+        // a crash here therefore replays the same payload on restart
+        // rather than minting a fresh one with a possibly-different
+        // `high_qc` snapshot — closing audit finding 14-1 (#415).
         crashpoint!("after_broadcast_timeout_vote");
 
         // Count our own timeout locally so we don't depend on
@@ -4283,6 +4350,18 @@ pub fn encode_proposed_in_view(view: View) -> anyhow::Result<Vec<u8>> {
 /// Inverse of [`encode_proposed_in_view`].
 pub fn decode_proposed_in_view(bytes: &[u8]) -> anyhow::Result<View> {
     postcard::from_bytes(bytes).context("decode proposed_in_view")
+}
+
+/// Serialize a [`TimeoutVote`] envelope for the durable
+/// [`STORAGE_KEY_LAST_TIMEOUT_VOTE`] slot. See that key's docs for the
+/// equivocation-prevention contract (audit finding 14-1, issue #415).
+pub fn encode_last_timeout_vote(payload: &TimeoutVote) -> anyhow::Result<Vec<u8>> {
+    postcard::to_stdvec(payload).context("encode last_timeout_vote")
+}
+
+/// Inverse of [`encode_last_timeout_vote`].
+pub fn decode_last_timeout_vote(bytes: &[u8]) -> anyhow::Result<TimeoutVote> {
+    postcard::from_bytes(bytes).context("decode last_timeout_vote")
 }
 
 /// Compose the storage key for a committed block keyed by its
@@ -5373,6 +5452,26 @@ mod tests {
             let bytes = encode_proposed_in_view(v).unwrap();
             assert_eq!(decode_proposed_in_view(&bytes).unwrap(), v);
         }
+    }
+
+    #[test]
+    fn encode_decode_last_timeout_vote_roundtrips_with_high_qc() {
+        let payload = TimeoutVote {
+            view: 17,
+            high_qc: Some(sample_full_qc()),
+        };
+        let bytes = encode_last_timeout_vote(&payload).unwrap();
+        assert_eq!(decode_last_timeout_vote(&bytes).unwrap(), payload);
+    }
+
+    #[test]
+    fn encode_decode_last_timeout_vote_roundtrips_without_high_qc() {
+        let payload = TimeoutVote {
+            view: 0,
+            high_qc: None,
+        };
+        let bytes = encode_last_timeout_vote(&payload).unwrap();
+        assert_eq!(decode_last_timeout_vote(&bytes).unwrap(), payload);
     }
 
     #[test]
