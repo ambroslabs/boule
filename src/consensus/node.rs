@@ -62,6 +62,7 @@ use crate::consensus::hotstuff::{HotStuffState, NewView, QuorumCertificate, gene
 use crate::consensus::limits::{CacheEvictionCounters, CacheLimits};
 use crate::consensus::pacemaker::Action as PacemakerAction;
 use crate::consensus::pacemaker::Event as PacemakerEvent;
+use crate::consensus::pacemaker::HonestyThresholdEvidence as PacemakerHonestyThresholdEvidence;
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::pacemaker::leader::RoundRobinSelector;
 use crate::consensus::pacemaker::timeout::ExponentialBackoff;
@@ -121,7 +122,7 @@ fn pacemaker_event_kind(ev: &PacemakerEvent) -> &'static str {
         PacemakerEvent::OnTimeoutCert(_) => "OnTimeoutCert",
         PacemakerEvent::OnTimeout(_) => "OnTimeout",
         PacemakerEvent::OnProposalReceived(_) => "OnProposalReceived",
-        PacemakerEvent::OnRoundSync(_) => "OnRoundSync",
+        PacemakerEvent::OnRoundSync { .. } => "OnRoundSync",
     }
 }
 
@@ -3364,26 +3365,33 @@ impl ConsensusNode {
             // honest views to `u64::MAX`.
             //
             // Fire on the exact crossing so we don't re-emit on every
-            // subsequent vote into the same bucket.
-            let fire_round_sync = bucket_size == honesty_threshold;
+            // subsequent vote into the same bucket. The evidence token
+            // is minted inline with the threshold check; constructing
+            // `OnRoundSync` outside this gate is a compile error
+            // (audit finding 2-3 / issue #419).
+            let round_sync_evidence = (bucket_size == honesty_threshold)
+                .then(|| {
+                    PacemakerHonestyThresholdEvidence::from_bucket(bucket_size, honesty_threshold)
+                })
+                .flatten();
 
             if bucket_size < quorum {
-                return if fire_round_sync {
-                    self.fire_round_sync(view, broadcaster, view_timer, signer)
+                return if let Some(evidence) = round_sync_evidence {
+                    self.fire_round_sync(view, evidence, broadcaster, view_timer, signer)
                         .await
                 } else {
                     Ok(())
                 };
             }
-            (bucket.best_high_qc.clone(), fire_round_sync)
+            (bucket.best_high_qc.clone(), round_sync_evidence)
         };
 
         // We've also crossed full quorum — but if we passed the
         // honesty threshold on this same vote, surface the round-sync
         // hint first so the pacemaker has the latest view recorded
         // before the OnTimeoutCert flow runs.
-        if fired_round_sync {
-            self.fire_round_sync(view, broadcaster, view_timer, signer)
+        if let Some(evidence) = fired_round_sync {
+            self.fire_round_sync(view, evidence, broadcaster, view_timer, signer)
                 .await?;
         }
 
@@ -3451,15 +3459,18 @@ impl ConsensusNode {
         Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
     }
 
-    /// Surface a [`PacemakerEvent::OnRoundSync(view)`] hint to the
-    /// pacemaker, then apply the resulting actions. Called from
+    /// Surface a [`PacemakerEvent::OnRoundSync`] hint to the pacemaker,
+    /// then apply the resulting actions. Called from
     /// [`Self::on_timeout_vote`] when a per-view bucket reaches the
     /// honesty threshold (`f + 1` distinct signers — see issue #218
     /// for the wedge this prevents and the Byzantine-bound rationale
-    /// for the threshold choice).
+    /// for the threshold choice). The `evidence` parameter is the
+    /// sealed token minted at the threshold check (audit finding 2-3 /
+    /// issue #419), forwarded into the typed `OnRoundSync` payload.
     async fn fire_round_sync(
         &mut self,
         view: View,
+        evidence: PacemakerHonestyThresholdEvidence,
         broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
@@ -3470,7 +3481,7 @@ impl ConsensusNode {
             current = self.pacemaker.current_view(),
             "round_sync_fired",
         );
-        let pm_actions = self.step_pacemaker(PacemakerEvent::OnRoundSync(view));
+        let pm_actions = self.step_pacemaker(PacemakerEvent::OnRoundSync { view, evidence });
         Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
     }
 
