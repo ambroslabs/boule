@@ -64,7 +64,12 @@ pub(in crate::consensus::dispatch) fn verify_signer_at(
         .validator_for(&signer_pk)
         .ok_or(IngressError::UnknownSigner(signer))?;
 
-    if history.set_at(view).index_of(&stable_id).is_none() {
+    if history
+        .set_at(view)
+        .for_view(view)
+        .index_of(&stable_id)
+        .is_none()
+    {
         return Err(IngressError::UnknownSigner(signer));
     }
 

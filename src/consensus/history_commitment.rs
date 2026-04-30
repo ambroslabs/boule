@@ -162,9 +162,9 @@ pub fn apply_reconfig_commands_to_set_history(
         };
 
         // Validate against the set authoritative at the block's view.
-        let current_set = set_history.set_at(block_view);
+        let current_set_at = set_history.set_at(block_view);
         let next_members = match cmd.validate_against_with_delay_and_scheme(
-            &current_set,
+            current_set_at.for_view(block_view),
             block_view,
             min_v_eff_delay,
             scheme,

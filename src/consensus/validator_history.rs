@@ -19,6 +19,17 @@
 //! - [`Self::set_at`] returns the rightmost boundary whose `v_eff <=
 //!   view` — the set authoritative at that view.
 //!
+//! # View tagging at the API boundary
+//!
+//! [`Self::set_at`] returns a [`ValidatorSetAt`], not a bare
+//! `Arc<ValidatorSet>` — the wrapper carries the [`View`] the lookup
+//! was scoped to and only releases the underlying set through
+//! [`ValidatorSetAt::for_view`], which debug-asserts the consumer
+//! passes the same view. A refactor that caches the result and reuses
+//! it past a reconfiguration boundary in the same handler trips the
+//! assertion in tests instead of silently using the wrong set
+//! (audit finding 5-2, #414).
+//!
 //! # Memory
 //!
 //! Each boundary holds an `Arc<ValidatorSet>`, so a `set_at` lookup is a
@@ -68,12 +79,13 @@ impl ValidatorSetHistory {
         }
     }
 
-    /// Return the validator set authoritative at `view`.
+    /// Return the validator set authoritative at `view`, view-tagged
+    /// so consumers re-assert scope at use site (#414).
     ///
     /// For any `view < boundaries[i].v_eff`, the answer is the boundary
     /// at index `i - 1`. The genesis boundary is at view 0, so this
     /// always finds a valid set.
-    pub fn set_at(&self, view: View) -> Arc<ValidatorSet> {
+    pub fn set_at(&self, view: View) -> ValidatorSetAt {
         let idx = match self.boundaries.binary_search_by_key(&view, |b| b.v_eff) {
             Ok(i) => i,
             // `Err(i)` is the insertion index; the boundary in effect at
@@ -82,7 +94,10 @@ impl ValidatorSetHistory {
             // matched any view-0 lookup as Ok(0).
             Err(i) => i.saturating_sub(1),
         };
-        self.boundaries[idx].set.clone()
+        ValidatorSetAt {
+            view,
+            set: self.boundaries[idx].set.clone(),
+        }
     }
 
     /// Append a new boundary at `v_eff`. Returns an error if `v_eff` is
@@ -184,6 +199,49 @@ impl ValidatorSetHistory {
     }
 }
 
+/// View-tagged result of [`ValidatorSetHistory::set_at`].
+///
+/// The wrapper carries the [`View`] the lookup was scoped to and only
+/// releases the underlying [`ValidatorSet`] through
+/// [`Self::for_view`], which debug-asserts the caller passes the same
+/// view. This makes a refactor that caches the result and reuses it
+/// past a reconfiguration boundary in the same handler — say, a fast
+/// path that reads `set_at(view)` once and uses it for subsequent
+/// operations on a higher view — trip an assertion in tests instead
+/// of silently using the wrong set (audit finding 5-2, #414).
+///
+/// Release builds drop the assertion and use the cached set, which
+/// preserves current behavior under the (correct-today) assumption
+/// that no caller misuses it.
+#[derive(Debug, Clone)]
+pub struct ValidatorSetAt {
+    view: View,
+    set: Arc<ValidatorSet>,
+}
+
+impl ValidatorSetAt {
+    /// Borrow the validator set, asserting the consumer's `view`
+    /// matches the view the wrapper was looked up for.
+    ///
+    /// In debug builds, a mismatch is a hard panic — the lookup view
+    /// and the use-site view disagree, so the cached set is for the
+    /// wrong reconfiguration window. Release builds skip the check
+    /// and return the cached set as-is.
+    pub fn for_view(&self, view: View) -> &ValidatorSet {
+        debug_assert_eq!(
+            self.view, view,
+            "validator-set scope mismatch: looked up at view {}, used at view {}",
+            self.view, view,
+        );
+        &self.set
+    }
+
+    /// The view the wrapper was looked up for.
+    pub fn view(&self) -> View {
+        self.view
+    }
+}
+
 /// One boundary in the persisted (wire) form of a [`ValidatorSetHistory`].
 ///
 /// `members` is the *full* member list at and after `v_eff`; the diff
@@ -231,10 +289,10 @@ mod tests {
     #[test]
     fn genesis_only_returns_genesis_for_any_view() {
         let h = ValidatorSetHistory::from_genesis(genesis());
-        assert_eq!(*h.set_at(0), genesis());
-        assert_eq!(*h.set_at(1), genesis());
-        assert_eq!(*h.set_at(1_000_000), genesis());
-        assert_eq!(*h.set_at(View::MAX), genesis());
+        assert_eq!(*h.set_at(0).for_view(0), genesis());
+        assert_eq!(*h.set_at(1).for_view(1), genesis());
+        assert_eq!(*h.set_at(1_000_000).for_view(1_000_000), genesis());
+        assert_eq!(*h.set_at(View::MAX).for_view(View::MAX), genesis());
         assert_eq!(h.boundary_count(), 1);
     }
 
@@ -244,13 +302,13 @@ mod tests {
         h.insert_boundary(10, five()).unwrap();
 
         // Genesis governs `view < 10`.
-        assert_eq!(*h.set_at(0), genesis());
-        assert_eq!(*h.set_at(9), genesis());
+        assert_eq!(*h.set_at(0).for_view(0), genesis());
+        assert_eq!(*h.set_at(9).for_view(9), genesis());
         // The new boundary takes effect at exactly `v_eff`.
-        assert_eq!(*h.set_at(10), five());
+        assert_eq!(*h.set_at(10).for_view(10), five());
         // ...and persists for all later views until another boundary.
-        assert_eq!(*h.set_at(11), five());
-        assert_eq!(*h.set_at(View::MAX), five());
+        assert_eq!(*h.set_at(11).for_view(11), five());
+        assert_eq!(*h.set_at(View::MAX).for_view(View::MAX), five());
 
         assert_eq!(*h.current_set(), five());
         assert_eq!(h.boundary_count(), 2);
@@ -263,12 +321,12 @@ mod tests {
         h.insert_boundary(20, six()).unwrap();
 
         // Each window picks the right set.
-        assert_eq!(*h.set_at(0), genesis());
-        assert_eq!(*h.set_at(9), genesis());
-        assert_eq!(*h.set_at(10), five());
-        assert_eq!(*h.set_at(19), five());
-        assert_eq!(*h.set_at(20), six());
-        assert_eq!(*h.set_at(99), six());
+        assert_eq!(*h.set_at(0).for_view(0), genesis());
+        assert_eq!(*h.set_at(9).for_view(9), genesis());
+        assert_eq!(*h.set_at(10).for_view(10), five());
+        assert_eq!(*h.set_at(19).for_view(19), five());
+        assert_eq!(*h.set_at(20).for_view(20), six());
+        assert_eq!(*h.set_at(99).for_view(99), six());
 
         assert_eq!(h.boundary_count(), 3);
         assert_eq!(*h.current_set(), six());
@@ -297,14 +355,33 @@ mod tests {
 
     #[test]
     fn set_at_returns_arc_to_internal_storage() {
-        // The Arc returned by set_at and the Arc held in the history
-        // should reference the same allocation, so callers don't pay a
-        // deep copy on hot paths.
+        // The Arc held inside the wrapper and the Arc held in the
+        // history should reference the same allocation, so callers
+        // don't pay a deep copy on hot paths.
         let mut h = ValidatorSetHistory::from_genesis(genesis());
         h.insert_boundary(10, five()).unwrap();
         let a = h.set_at(15);
         let b = h.set_at(15);
-        assert!(Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&a.set, &b.set));
+    }
+
+    #[test]
+    fn set_at_carries_lookup_view() {
+        let h = ValidatorSetHistory::from_genesis(genesis());
+        let at = h.set_at(42);
+        assert_eq!(at.view(), 42);
+        // for_view at the same view returns the set unconditionally.
+        assert_eq!(*at.for_view(42), genesis());
+    }
+
+    #[test]
+    #[should_panic(expected = "validator-set scope mismatch")]
+    fn for_view_panics_in_debug_when_consumer_view_differs() {
+        let h = ValidatorSetHistory::from_genesis(genesis());
+        let at = h.set_at(42);
+        // Reusing a view-42 lookup at view 43 is the exact bug shape
+        // #414 catches: a cached set used past a reconfig boundary.
+        let _ = at.for_view(43);
     }
 
     #[test]
@@ -332,9 +409,9 @@ mod tests {
         let restored = ValidatorSetHistory::from_persisted(decoded).unwrap();
 
         assert_eq!(restored.boundary_count(), 3);
-        assert_eq!(*restored.set_at(0), genesis());
-        assert_eq!(*restored.set_at(7), five());
-        assert_eq!(*restored.set_at(15), six());
+        assert_eq!(*restored.set_at(0).for_view(0), genesis());
+        assert_eq!(*restored.set_at(7).for_view(7), five());
+        assert_eq!(*restored.set_at(15).for_view(15), six());
         assert_eq!(*restored.current_set(), six());
     }
 

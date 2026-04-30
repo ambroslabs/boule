@@ -1155,7 +1155,11 @@ fn vote_after_rotation_signed_with_new_key_accepted() {
         "stamped id must NOT be the rotated wire pubkey — pre-#394 derivation",
     );
     assert!(
-        history.set_at(100).index_of(&stamped).is_some(),
+        history
+            .set_at(100)
+            .for_view(100)
+            .index_of(&stamped)
+            .is_some(),
         "stamped id must index into the validator set so the safety core's \
          bitmap lookup succeeds",
     );

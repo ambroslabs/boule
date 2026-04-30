@@ -62,7 +62,8 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
         return Ok(());
     }
 
-    let vs = history.set_at(qc.view);
+    let vs_at = history.set_at(qc.view);
+    let vs = vs_at.for_view(qc.view);
     // Each partial in the QC is the Ed25519 / BLS signature on the
     // domain-separated Signed<Vote> envelope preimage — the same bytes
     // the voter signed in `Signed::sign(vote, signer)`. Reconstruct
@@ -120,7 +121,7 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
                 view: qc.view,
                 scheme: scheme.name(),
             })?;
-            let pubkeys = bls_history.pubkeys_for_set(&vs, qc.view).map_err(|_| {
+            let pubkeys = bls_history.pubkeys_for_set(vs, qc.view).map_err(|_| {
                 IngressError::InvalidQcAggregate {
                     view: qc.view,
                     scheme: scheme.name(),
@@ -173,8 +174,8 @@ pub(in crate::consensus::dispatch) fn verify_high_qc_piggyback(
     // The piggyback's bitmap is sized for the validator set authoritative
     // at `qc.view` (the same set that voted to mint the QC). Reject
     // bitmap-shape divergence before paying for an aggregate verify.
-    let vs = history.set_at(qc.view);
-    if !qc.is_well_formed(&vs) {
+    let vs_at = history.set_at(qc.view);
+    if !qc.is_well_formed(vs_at.for_view(qc.view)) {
         return false;
     }
     verify_qc_if_requested(qc, history, key_history, qc_verification, chain_id).is_ok()
