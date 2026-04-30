@@ -1156,6 +1156,17 @@ impl ConsensusNode {
         self
     }
 
+    /// Clone the shared equivocation counter (audit finding 3-1, issue
+    /// #409). The same `Arc` the integration layer increments on every
+    /// `Action::EquivocationEvidence` it observes — capturing it before
+    /// the node is moved into [`ConsensusNode::run`] lets a test harness
+    /// (`SimCluster::peek_equivocations_detected`, issue #421's twin-mode
+    /// adversary) verify the evidence-emission path end-to-end without
+    /// having to subscribe to a status publisher.
+    pub fn equivocations_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.equivocations_detected)
+    }
+
     /// Build a fresh [`ConsensusStatus`] snapshot from the current
     /// safety-core, pacemaker, mempool, and peer-tracking state.
     ///

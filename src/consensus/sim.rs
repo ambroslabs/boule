@@ -51,6 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -268,6 +269,15 @@ pub struct AdversaryCtx {
     /// (e.g. the equivocator's fork blocks share the genesis hash
     /// as their initial parent).
     pub genesis: Block,
+    /// The cluster's deployment-scoped chain id, derived as
+    /// [`ChainId::from_genesis_hash`]`(genesis.hash())` (#324). Use
+    /// this — not [`ChainId::TEST`] — when re-signing forged envelopes
+    /// the adversary expects honest receivers to *accept* the
+    /// signature on. The dispatch layer's `verify_sig` reads the same
+    /// chain_id off the local `ConsensusNode`, so a forgery signed
+    /// under any other tag fails envelope verification at ingress and
+    /// never reaches the safety core.
+    pub chain_id: crate::crypto::signed::ChainId,
 }
 
 /// Hook installed on a single node's routing task that lets a Byzantine
@@ -405,6 +415,18 @@ pub struct SimCluster {
     /// [`Self::assert_no_replica_double_voted`] runs from `Drop` so
     /// every existing sim test picks up the assertion automatically.
     pub vote_observer: Arc<VoteObserver>,
+    /// Per-node clones of [`ConsensusNode::equivocations_counter`]. The
+    /// same `Arc<AtomicU64>` the integration layer increments on every
+    /// `Action::EquivocationEvidence` it observes (audit finding 3-1,
+    /// issue #409). Captured at spawn time so a test can read each
+    /// honest replica's running equivocation count via
+    /// [`SimCluster::peek_equivocations_detected`] — used by the
+    /// twin-mode adversary suite (#421) to assert the evidence path is
+    /// exercised end-to-end. Restart paths today don't refresh this
+    /// vector, so post-restart the captured `Arc` points at the
+    /// pre-restart counter (irrelevant for the suite at the time of
+    /// writing — none of it restarts).
+    equivocations_counters: Vec<Arc<AtomicU64>>,
 }
 
 impl SimCluster {
@@ -651,6 +673,11 @@ impl SimCluster {
         let mut storages_for_restart: Vec<Arc<dyn Storage>> = Vec::new();
         let mut wals_for_restart: Vec<Arc<dyn Wal>> = Vec::new();
         let mut mempools_captured: Vec<Arc<dyn Mempool>> = Vec::new();
+        // Per-node equivocation counter Arcs (audit finding 3-1, #409),
+        // captured before the node moves into its run-loop task so a
+        // test can read the running count via
+        // `SimCluster::peek_equivocations_detected`.
+        let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
 
         for (idx, (nid, event_rx)) in event_rxs.into_iter().enumerate() {
             let signer = signer_map[&nid].clone();
@@ -754,6 +781,7 @@ impl SimCluster {
                     validators: Arc::clone(&node_ids_arc),
                     signer: Arc::clone(&signer),
                     genesis: genesis.clone(),
+                    chain_id: crate::crypto::signed::ChainId::from_genesis_hash(genesis.hash()),
                 };
                 (adv, ctx)
             });
@@ -779,6 +807,14 @@ impl SimCluster {
             // it. Cloning is cheap (Arc bump) and the slots share state.
             let crash_slot = crate::consensus::crashpoint::CrashSlot::empty();
             crash_slots.push(crash_slot.clone());
+
+            // Capture the equivocation-counter Arc before the node moves
+            // into the spawned task. The `Arc<AtomicU64>` is shared with
+            // the integration layer's `Action::EquivocationEvidence`
+            // dispatch site, so reads via
+            // `SimCluster::peek_equivocations_detected` see updates the
+            // run loop applies after each ingress tick.
+            equivocations_counters.push(node.equivocations_counter());
 
             tokio::spawn(async move {
                 let _ = crate::consensus::crashpoint::CRASH_SLOT
@@ -812,6 +848,7 @@ impl SimCluster {
             genesis,
             timeout_base,
             vote_observer,
+            equivocations_counters,
         };
         (cluster, limiters)
     }
@@ -1042,6 +1079,18 @@ impl SimCluster {
         self.flush_into_cache();
         let n = self.node_ids.len();
         std::mem::replace(&mut self.commit_cache, (0..n).map(|_| Vec::new()).collect())
+    }
+
+    /// Cumulative count of vote-equivocation incidents node `idx`'s
+    /// integration layer has surfaced via
+    /// [`crate::consensus::hotstuff::step::Action::EquivocationEvidence`]
+    /// (audit finding 3-1, issue #409). Reads the same `Arc<AtomicU64>`
+    /// the run loop increments on every emit, so callers see updates
+    /// after each ingress tick without subscribing to a status
+    /// publisher. Used by the twin-mode adversary suite (issue #421) to
+    /// assert the evidence-emission path is exercised end-to-end.
+    pub fn peek_equivocations_detected(&self, idx: usize) -> u64 {
+        self.equivocations_counters[idx].load(Ordering::Relaxed)
     }
 
     /// Non-destructively report the highest committed [`Block`] height
@@ -1908,6 +1957,7 @@ impl SimCluster {
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut mempools_captured_gossip: Vec<Arc<dyn Mempool>> = Vec::new();
+        let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
         // Hold the overlay shutdown senders for the lifetime of the
         // SimCluster — dropping them eagerly wakes the orchestrator's
         // `_ = &mut self.shutdown` select arm and tears the run loop
@@ -1959,6 +2009,7 @@ impl SimCluster {
 
             let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
                 .with_commit_notifier(commit_notifier);
+            equivocations_counters.push(node.equivocations_counter());
 
             // Per-node outbound channel: orchestrator's OverlaySink writes
             // here; the route task reads on the other side.
@@ -2129,6 +2180,7 @@ impl SimCluster {
             genesis,
             timeout_base,
             vote_observer,
+            equivocations_counters,
         }
     }
 }
