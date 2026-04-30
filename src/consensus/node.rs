@@ -3554,14 +3554,30 @@ impl ConsensusNode {
                 error = %e,
                 "block_persist_failed",
             );
+            // Audit finding 4-2 / issue #411: the SM has already
+            // applied above and the safety core has already retired
+            // `pending_blocks` for this commit, but the durable
+            // (block, last_committed) batch did not land. Returning
+            // here would let the snapshot creation hook, reconfig /
+            // rotation appliers, and the CommitNotifier fan-out fire
+            // against a non-durable commit — on restart the durable
+            // checkpoint would not reflect the commit, leaving SM
+            // state and `last_committed` divergent. Halt the node so
+            // an operator sees the failure and recovery starts from
+            // the durable checkpoint as the single source of truth.
+            panic!(
+                "consensus: durable persist of committed block failed (height={}, view={}, hash={:?}): {e}; halting to prevent SM/last_committed divergence",
+                block.header.height, block.header.view, block_hash,
+            );
         }
         // After the committed block + last_committed batch is durable
         // but BEFORE any downstream side effect (snapshot creation,
         // reconfig/rotation application, commit-notifier fan-out)
-        // runs. Audit finding 4-6 / issue #411 is about gating those
-        // downstream actions on the durable block write — a regression
-        // would let the snapshot creation hook fire against a block
-        // that did not in fact reach disk.
+        // runs. Audit finding 4-2 / issue #411 gates those downstream
+        // actions on the durable block write — the panic above is
+        // what enforces the gate; a regression that turned it back
+        // into a logged-and-continue would let the snapshot creation
+        // hook fire against a block that did not in fact reach disk.
         crashpoint!("after_apply_commit_block_persist");
         tracing::info!(
             "consensus: committed block height={} view={}",
@@ -6212,6 +6228,125 @@ mod tests {
         let lc = decode_last_committed(&raw).expect("decode");
         assert_eq!(lc.height, block.header.height);
         assert_eq!(lc.view, block.header.view);
+    }
+
+    /// Audit finding 4-2 / issue #411: when the durable batch write
+    /// for a committed block fails, `apply_commit` must halt before
+    /// any downstream observer fires. Otherwise a non-durable commit
+    /// would propagate through the snapshot creation hook, the
+    /// reconfig/rotation appliers, and the [`CommitNotifier`]
+    /// fan-out — and on restart `last_committed_height` would
+    /// disagree with the SM-applied state, since the block + checkpoint
+    /// batch never landed.
+    #[test]
+    fn apply_commit_halts_when_storage_batch_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        use bytes::Bytes;
+
+        use crate::consensus::api::CommitNotifier;
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+        use crate::storage::WriteBatch;
+
+        // Storage wrapper: reads/single-key writes pass through to an
+        // inner `MemoryStorage`, but every `apply_batch` returns an
+        // error. Models a backend that fails the atomic
+        // `(block, last_committed)` write — the exact gap the audit
+        // finding describes.
+        struct FailingBatchStorage {
+            inner: MemoryStorage,
+        }
+        impl Storage for FailingBatchStorage {
+            fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+                self.inner.put(key, value)
+            }
+            fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+                self.inner.delete(key)
+            }
+            fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+                self.inner.scan_prefix(prefix)
+            }
+            fn apply_batch(&self, _batch: WriteBatch) -> anyhow::Result<()> {
+                anyhow::bail!("simulated storage batch failure")
+            }
+            fn compare_and_swap(
+                &self,
+                key: &[u8],
+                expected: Option<&[u8]>,
+                new: Option<&[u8]>,
+            ) -> anyhow::Result<bool> {
+                self.inner.compare_and_swap(key, expected, new)
+            }
+        }
+
+        // Counting `CommitNotifier` to detect any post-failure fan-out.
+        struct CountingNotifier {
+            count: Arc<AtomicUsize>,
+        }
+        impl CommitNotifier for CountingNotifier {
+            fn on_commit(&self, _block: &Block, _state_commitment: &[u8; 32], _view: View) {
+                self.count.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let storage: Arc<dyn Storage> = Arc::new(FailingBatchStorage {
+            inner: MemoryStorage::new(),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let notifier: Arc<dyn CommitNotifier> = Arc::new(CountingNotifier {
+            count: Arc::clone(&count),
+        });
+        let mut node = ConsensusNode::new(
+            nid(1),
+            test_config(four_validators()),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            storage,
+            Arc::new(MemoryWal::new()),
+        )
+        .with_commit_notifier(notifier);
+
+        // Block carries a valid reconfig: a regression that let the
+        // appliers run despite a non-durable persist would tick the
+        // boundary count from 1 to 2.
+        let v_eff = MIN_V_EFF_DELAY + 5;
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
+            }],
+            removes: vec![],
+            v_eff,
+        };
+        let block = block_with_reconfig(1, 0, nid(1), cmd);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            node.apply_commit(block);
+        }));
+        assert!(
+            result.is_err(),
+            "apply_commit must panic when the durable persist batch fails",
+        );
+
+        assert_eq!(
+            count.load(AtomicOrdering::Relaxed),
+            0,
+            "CommitNotifier::on_commit must not fire on a non-durable commit",
+        );
+        assert_eq!(
+            node.validator_history.boundary_count(),
+            1,
+            "reconfig appliers must not run on a non-durable commit",
+        );
+        assert_eq!(
+            node.core.state().validator_history.boundary_count(),
+            1,
+            "safety-core mirror of validator_history must also remain at the genesis-only boundary",
+        );
     }
 
     /// `recover` rebuilds `last_committed_height`/`last_committed_view`
