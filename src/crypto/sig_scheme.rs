@@ -44,6 +44,7 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::consensus::hotstuff::qc::SignerBitmap;
+use crate::crypto::signed::ChainId;
 use crate::p2p::NodeId;
 
 /// A pluggable signature scheme for HotStuff QC aggregation.
@@ -360,40 +361,65 @@ impl BlsAggregated {
     }
 
     /// Produce a proof-of-possession (PoP) over `pubkey` using
-    /// `secret`. The PoP is a BLS signature whose message is the
-    /// validator's own compressed pubkey bytes — it proves the signer
-    /// actually holds the secret half of the registered pubkey.
+    /// `secret`, scoped to `chain_id`. The PoP is a BLS signature
+    /// whose message is `chain_id || pubkey` — it proves the signer
+    /// holds the secret half of the registered pubkey *on this
+    /// specific deployment*.
     ///
     /// PoPs defend against rogue-key attacks: an attacker who picks a
     /// pubkey `K' = K_target − K_self` cannot produce a valid PoP for
     /// `K'` without holding its secret half, so the registration tx
-    /// can reject the malicious key. Required at validator
-    /// registration time on BLS chains; the reconfig path enforces
-    /// presence in #293, when the rest of the BLS integration also
-    /// lands.
-    pub fn sign_pop(secret: &BlsSecretKey) -> Result<BlsPop, BlsKeyError> {
+    /// can reject the malicious key.
+    ///
+    /// The 32-byte `chain_id` is mixed into the pre-image (#410, audit
+    /// finding 7-2) so a PoP minted for one deployment cannot be
+    /// replayed on another deployment that happens to share the same
+    /// validator BLS key. Both halves are fixed-size, so no
+    /// length-prefix is needed at the boundary.
+    pub fn sign_pop(secret: &BlsSecretKey, chain_id: &ChainId) -> Result<BlsPop, BlsKeyError> {
         let sk = blst::min_pk::SecretKey::from_bytes(secret).map_err(BlsKeyError::Blst)?;
         let pubkey = sk.sk_to_pk().to_bytes();
-        let sig = sk.sign(&pubkey, Self::DST, &[]).to_bytes();
+        let preimage = pop_preimage(chain_id, &pubkey);
+        let sig = sk.sign(&preimage, Self::DST, &[]).to_bytes();
         Ok(BlsPop { pubkey, sig })
     }
 
-    /// Verify a [`BlsPop`]. Returns `Ok(())` iff:
+    /// Verify a [`BlsPop`] under `chain_id`. Returns `Ok(())` iff:
     /// 1. `pop.pubkey` equals `expected_pubkey` — an attacker cannot
     ///    submit a PoP for someone else's key as their own.
-    /// 2. `pop.sig` is a valid BLS signature over `pop.pubkey` under
-    ///    `pop.pubkey` — proving possession of the secret half.
-    pub fn verify_pop(pop: &BlsPop, expected_pubkey: &BlsPublicKey) -> Result<(), BlsKeyError> {
+    /// 2. `pop.sig` is a valid BLS signature over
+    ///    `chain_id || pop.pubkey` under `pop.pubkey` — proving
+    ///    possession of the secret half *on this deployment*.
+    ///
+    /// A PoP minted under `chain_id=A` fails verification under
+    /// `chain_id=B`, blocking cross-deployment PoP replay (#410).
+    pub fn verify_pop(
+        pop: &BlsPop,
+        expected_pubkey: &BlsPublicKey,
+        chain_id: &ChainId,
+    ) -> Result<(), BlsKeyError> {
         if pop.pubkey != *expected_pubkey {
             return Err(BlsKeyError::PopPubkeyMismatch);
         }
         let pk = blst::min_pk::PublicKey::from_bytes(&pop.pubkey).map_err(BlsKeyError::Blst)?;
         let sig = blst::min_pk::Signature::from_bytes(&pop.sig).map_err(BlsKeyError::Blst)?;
-        match sig.verify(true, &pop.pubkey, Self::DST, &[], &pk, true) {
+        let preimage = pop_preimage(chain_id, &pop.pubkey);
+        match sig.verify(true, &preimage, Self::DST, &[], &pk, true) {
             blst::BLST_ERROR::BLST_SUCCESS => Ok(()),
             err => Err(BlsKeyError::Blst(err)),
         }
     }
+}
+
+/// Build the BLS proof-of-possession pre-image: `chain_id || pubkey`.
+/// Both halves are fixed-size (32 + 48 bytes) so the concatenation is
+/// unambiguous without a length prefix — same shape argument as the
+/// envelope pre-image in [`crate::crypto::signed`].
+fn pop_preimage(chain_id: &ChainId, pubkey: &BlsPublicKey) -> [u8; 32 + 48] {
+    let mut out = [0u8; 32 + 48];
+    out[..32].copy_from_slice(chain_id.as_bytes());
+    out[32..].copy_from_slice(pubkey);
+    out
 }
 
 /// Proof-of-possession (PoP) bundle for a BLS validator pubkey.
@@ -1014,14 +1040,14 @@ mod tests {
             .expect("idempotent add must keep aggregate valid");
     }
 
-    // ── BLS proof-of-possession (#291) ────────────────────────────────
+    // ── BLS proof-of-possession (#291, #410) ──────────────────────────
 
     #[test]
     fn bls_pop_round_trips_under_correct_pubkey() {
         let (sk, pk) = bls_signer(0xF0);
-        let pop = BlsAggregated::sign_pop(&sk).expect("PoP signing must succeed");
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).expect("PoP signing must succeed");
         assert_eq!(pop.pubkey, pk);
-        BlsAggregated::verify_pop(&pop, &pk).expect("real PoP must verify");
+        BlsAggregated::verify_pop(&pop, &pk, &ChainId::TEST).expect("real PoP must verify");
     }
 
     #[test]
@@ -1031,10 +1057,10 @@ mod tests {
         // embedded pubkey first.
         let (sk_a, _pk_a) = bls_signer(0xF1);
         let (_sk_b, pk_b) = bls_signer(0xF2);
-        let pop = BlsAggregated::sign_pop(&sk_a).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk_a, &ChainId::TEST).unwrap();
         // pop.pubkey is pk_a; checking against pk_b must fail.
         assert_eq!(
-            BlsAggregated::verify_pop(&pop, &pk_b),
+            BlsAggregated::verify_pop(&pop, &pk_b, &ChainId::TEST),
             Err(BlsKeyError::PopPubkeyMismatch),
         );
     }
@@ -1042,9 +1068,9 @@ mod tests {
     #[test]
     fn bls_pop_rejects_tampered_signature() {
         let (sk, pk) = bls_signer(0xF3);
-        let mut pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let mut pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
         pop.sig[0] ^= 0xFF;
-        assert!(BlsAggregated::verify_pop(&pop, &pk).is_err());
+        assert!(BlsAggregated::verify_pop(&pop, &pk, &ChainId::TEST).is_err());
     }
 
     #[test]
@@ -1053,7 +1079,7 @@ mod tests {
         // postcard. `[u8; 48]` and `[u8; 96]` go through the
         // dedicated serde modules above.
         let (sk, _pk) = bls_signer(0xF4);
-        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
         let bytes = postcard::to_stdvec(&pop).unwrap();
         let back: BlsPop = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, pop);
@@ -1067,21 +1093,47 @@ mod tests {
         // pubkey, so swapping invalidates the signature.
         let (sk_a, pk_a) = bls_signer(0xF5);
         let (_sk_b, pk_b) = bls_signer(0xF6);
-        let mut pop = BlsAggregated::sign_pop(&sk_a).unwrap();
+        let mut pop = BlsAggregated::sign_pop(&sk_a, &ChainId::TEST).unwrap();
         // Forge: replace embedded pubkey with pk_b but keep sig from sk_a.
         pop.pubkey = pk_b;
         // Now caller passes pk_b as expected, so the mismatch check
         // passes, but the signature verifies over pk_b's bytes under
         // pk_a's signature — must fail at the BLS verify step.
         assert!(matches!(
-            BlsAggregated::verify_pop(&pop, &pk_b),
+            BlsAggregated::verify_pop(&pop, &pk_b, &ChainId::TEST),
             Err(BlsKeyError::Blst(_)),
         ));
         // For completeness: with the correct expected pubkey (pk_a), the
         // mismatch check fires first.
         assert_eq!(
-            BlsAggregated::verify_pop(&pop, &pk_a),
+            BlsAggregated::verify_pop(&pop, &pk_a, &ChainId::TEST),
             Err(BlsKeyError::PopPubkeyMismatch),
         );
+    }
+
+    /// Audit finding 7-2 (#410): a PoP minted under `chain_id=A` does
+    /// not verify under `chain_id=B`, even with the same validator
+    /// BLS key. Without the chain_id binding, an attacker who runs the
+    /// same BLS key on two deployments could replay the genesis-time
+    /// PoP across them.
+    #[test]
+    fn bls_pop_chain_id_separation_prevents_cross_deployment_replay() {
+        let (sk, pk) = bls_signer(0x10);
+        let chain_a = ChainId([0xAA; 32]);
+        let chain_b = ChainId([0xBB; 32]);
+
+        let pop_a = BlsAggregated::sign_pop(&sk, &chain_a).unwrap();
+
+        // Sanity: same chain still verifies.
+        BlsAggregated::verify_pop(&pop_a, &pk, &chain_a)
+            .expect("PoP must verify under its own chain_id");
+
+        // The cross-chain replay attempt fails at the BLS verify step
+        // (the embedded pubkey is the same as `expected_pubkey`, so the
+        // mismatch check passes — only the signature math catches it).
+        assert!(matches!(
+            BlsAggregated::verify_pop(&pop_a, &pk, &chain_b),
+            Err(BlsKeyError::Blst(_)),
+        ));
     }
 }

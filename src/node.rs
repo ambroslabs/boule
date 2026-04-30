@@ -395,12 +395,30 @@ async fn start_consensus(
     // a real `validator_history_commitment` (#325 PR B), computed over
     // the genesis-time `(set_history, key_history, bls_key_history?)`
     // triple.
-    let genesis_bls = cons_cfg
+    let genesis_bls_full = cons_cfg
         .resolve_genesis_bls_keys()
         .context("validating genesis BLS validator table")?;
+    // Pubkey-only projection used by genesis-block construction and by
+    // `reconcile_bls_identity`. PoPs are split off and verified
+    // *after* the chain_id is known (#410), since the PoP pre-image
+    // binds to chain_id.
+    let genesis_bls: Vec<(NodeId, crate::crypto::sig_scheme::BlsPublicKey)> = genesis_bls_full
+        .iter()
+        .map(|(nid, pk, _pop)| (*nid, *pk))
+        .collect();
 
     let genesis = build_genesis(cons_cfg, &validator_set, &genesis_bls)?;
     info!("consensus: genesis hash = {:?}", genesis.hash());
+
+    // Now the chain_id is known: verify the operator-supplied
+    // proof-of-possession bytes bind to *this* deployment's chain_id
+    // (#410, audit finding 7-2). Without this check, an attacker who
+    // operates the same validator BLS key on two deployments could
+    // cross-replay a genesis-time PoP across them.
+    let chain_id = crate::crypto::signed::ChainId::from_genesis_hash(genesis.hash());
+    cons_cfg
+        .verify_genesis_bls_pops(&genesis_bls_full, &chain_id)
+        .context("verifying genesis BLS proof-of-possession against chain_id")?;
 
     let (storage, wal): (Arc<dyn Storage>, Arc<dyn Wal>) = match &cons_cfg.storage_dir {
         Some(dir) => {
@@ -789,6 +807,78 @@ fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Resul
         .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
         .collect();
     Ok(ValidatorSet::new(validator_ids))
+}
+
+/// Derive the deployment's [`ChainId`] from a [`ConsensusConfig`]
+/// without booting a full consensus node. Used by CLI tooling
+/// (`reconfig add-validator` etc.) that needs to mint or verify
+/// chain-bound BLS proofs-of-possession (#410) before the node is
+/// actually running.
+///
+/// Performs only the structural validation of `validators_bls`
+/// (decoding hex, length match, no duplicates) — the cryptographic
+/// PoP check is exactly what the caller is preparing to perform, so
+/// it would be redundant here.
+///
+/// [`ChainId`]: crate::crypto::signed::ChainId
+pub fn derive_chain_id(cfg: &ConsensusConfig) -> anyhow::Result<crate::crypto::signed::ChainId> {
+    if cfg.validators.is_empty() {
+        anyhow::bail!("[consensus.validators] must list at least one node");
+    }
+    let mut ids: Vec<NodeId> = Vec::with_capacity(cfg.validators.len());
+    for raw in &cfg.validators {
+        let id = base58_to_node_id(raw)
+            .map_err(|e| anyhow::anyhow!("decoding validator NodeId {raw:?}: {e}"))?;
+        ids.push(id);
+    }
+    let bls_full = cfg
+        .resolve_genesis_bls_keys()
+        .context("decoding genesis BLS validator table")?;
+    let bls_pubkeys: Vec<(NodeId, crate::crypto::sig_scheme::BlsPublicKey)> = bls_full
+        .into_iter()
+        .map(|(nid, pk, _pop)| (nid, pk))
+        .collect();
+    let mut seed = [0u8; 32];
+    if let Some(hex) = &cfg.genesis_seed_hex {
+        seed = decode_hex32(hex)
+            .ok_or_else(|| anyhow::anyhow!("genesis_seed_hex must be 64 hex chars (32 bytes)"))?;
+    }
+    Ok(derive_chain_id_from_parts(
+        &ids,
+        cfg.signature_scheme,
+        &bls_pubkeys,
+        seed,
+    ))
+}
+
+/// Lower-level [`ChainId`] derivation that takes only the inputs the
+/// genesis-block construction needs, without going through a fully-
+/// populated [`ConsensusConfig`]. Used by the `testnet` driver
+/// (which mints validator BLS keys before any config has been written
+/// and needs the chain_id to mint chain-bound PoPs, #410).
+///
+/// `validator_node_ids` is the cluster's validator pubkeys in their
+/// genesis order — the function sorts them through [`ValidatorSet`]
+/// the same way `[consensus.validators]` parsing does, so the input
+/// order doesn't matter as long as it's the same set on every node.
+///
+/// [`ChainId`]: crate::crypto::signed::ChainId
+pub fn derive_chain_id_from_parts(
+    validator_node_ids: &[NodeId],
+    signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice,
+    genesis_bls: &[(NodeId, crate::crypto::sig_scheme::BlsPublicKey)],
+    genesis_seed: [u8; 32],
+) -> crate::crypto::signed::ChainId {
+    let validator_ids: Vec<crate::consensus::validator_set::ValidatorId> = validator_node_ids
+        .iter()
+        .copied()
+        .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+        .collect();
+    let validator_set = ValidatorSet::new(validator_ids);
+    let commitment =
+        compute_genesis_validator_history_commitment(&validator_set, signature_scheme, genesis_bls);
+    let genesis = Block::genesis(genesis_seed, commitment);
+    crate::crypto::signed::ChainId::from_genesis_hash(genesis.hash())
 }
 
 /// Build the genesis block from the optional `genesis_seed_hex` config
