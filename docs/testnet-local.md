@@ -860,6 +860,13 @@ already got running.
 - Only one reconfig may be pending at a time. While a previously
   committed reconfig's `v_eff` is still in the future, any second
   reconfig is dropped silently.
+- Every per-validator weight in `adds` or `changes` must be `>= 1`
+  (#462). Weight 0 is rejected at validation time — the canonical way
+  to spell removal is `remove-validator`. Quorum is computed in
+  weight units: `3 * signer_weight > 2 * total_weight` (#461). At
+  uniform weight = 1 across the committee this collapses to the
+  count-based `(2n)/3 + 1` BFT quorum, so an existing flat-committee
+  testnet keeps the same liveness profile.
 
 **Step 1: build the payload.** Use the CLI on any host (it doesn't
 talk to the cluster — just encodes the tagged bytes). For an `add`,
@@ -875,18 +882,42 @@ curl -s http://127.0.0.1:8000/consensus/status | jq .current_view
 ./target/release/ambros-p2p reconfig add-validator \
     --pubkey <new-node-NodeId-base58> \
     --addr   127.0.0.1:7004 \
+    --weight 1 \
     --v-eff  150
 # Output: a single hex line — the encoded ReconfigCommand bytes.
 ```
 
-For a `remove`, the address is irrelevant (the validator's already in
-the active set):
+`--weight` is required (#462). Pass `1` for a flat (unweighted)
+committee — that's the pre-#144 default and what every existing
+testnet should use until you actually want stake-weighted voting.
+Pass any other `u64 >= 1` to seat the validator at that voting weight.
+
+For a `remove`, the address and weight are irrelevant (the validator's
+already in the active set):
 
 ```sh
 ./target/release/ambros-p2p reconfig remove-validator \
     --pubkey <removed-node-NodeId-base58> \
     --v-eff  150
 ```
+
+To **change a currently-seated validator's voting weight** without
+adding or removing them — e.g. halve a validator's influence on
+quorum without touching membership — use `change-weight`:
+
+```sh
+# Halve validator X's voting weight at v_eff = current_view + 100.
+./target/release/ambros-p2p reconfig change-weight \
+    --pubkey <existing-node-NodeId-base58> \
+    --weight 1 \
+    --v-eff  150
+```
+
+The committee membership is unchanged at `v_eff`; only that
+validator's weight in `has_quorum`'s `3*signer_weight > 2*total_weight`
+predicate moves. Any QCs formed before `v_eff` continue to verify
+under the pre-boundary weights (the historical-validator-set lookup
+keys QC verification by `qc.view`).
 
 **Step 2: inject the payload into a mempool.** There is no
 transaction-submission API yet (#251 follow-up). Today the operator

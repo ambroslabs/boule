@@ -324,6 +324,13 @@ struct SpawnExtras {
     /// node so leaders can produce real BLS partials on Vote frames.
     /// `None` keeps the default Ed25519 cluster shape.
     signature_scheme: Option<crate::crypto::sig_scheme::SignatureSchemeChoice>,
+    /// Per-validator voting weights, indexed in *sorted* validator
+    /// order (`spawn_inner` sorts the freshly-generated `NodeSigner`s
+    /// by `NodeId` before assigning weights — the slot at index `i`
+    /// in `weights` ends up paired with the validator that sorts to
+    /// index `i`). `None` falls back to uniform weight = 1, the
+    /// pre-#463 cluster shape. Length must equal `n` if supplied.
+    weights: Option<Vec<u64>>,
 }
 
 /// An in-memory cluster of N consensus nodes connected by channel-backed
@@ -457,6 +464,39 @@ impl SimCluster {
             .0
     }
 
+    /// Spawn `n` honest nodes with explicit per-validator voting
+    /// weights (#463). `weights` is indexed in sorted [`NodeId`]
+    /// order — slot `i` is paired with the validator that sorts to
+    /// index `i` after [`crate::consensus::validator_set::ValidatorSet::new`]
+    /// orders the freshly-generated signers.
+    ///
+    /// Each entry must be `>= 1`; the proptest harness over weighted
+    /// quorums uses this to drive a non-uniform-weight committee.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n < 4`, `weights.len() != n`, or any weight is 0.
+    pub async fn spawn_with_weights(n: usize, timeout_base: Duration, weights: Vec<u64>) -> Self {
+        assert_eq!(
+            weights.len(),
+            n,
+            "spawn_with_weights: weights.len() must equal n",
+        );
+        for (i, w) in weights.iter().enumerate() {
+            assert!(*w >= 1, "spawn_with_weights: weight at index {i} is 0");
+        }
+        Self::spawn_inner(
+            n,
+            timeout_base,
+            SpawnExtras {
+                weights: Some(weights),
+                ..SpawnExtras::default()
+            },
+        )
+        .await
+        .0
+    }
+
     /// Spawn `n` honest nodes configured for the BLS-aggregated chain
     /// scheme (#354 step 2).
     ///
@@ -491,6 +531,7 @@ impl SimCluster {
                 signature_scheme: Some(
                     crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
                 ),
+                weights: None,
             },
         )
         .await
@@ -526,6 +567,7 @@ impl SimCluster {
                 rate_limits: None,
                 adversaries: Some(adversaries),
                 signature_scheme: None,
+                weights: None,
             },
         )
         .await
@@ -553,6 +595,7 @@ impl SimCluster {
                 rate_limits: Some(rate_limits),
                 adversaries: None,
                 signature_scheme: None,
+                weights: None,
             },
         )
         .await
@@ -567,10 +610,14 @@ impl SimCluster {
             rate_limits,
             adversaries,
             signature_scheme,
+            weights,
         } = extras;
         let scheme = signature_scheme.unwrap_or_default();
         if let Some(adv) = adversaries.as_ref() {
             assert_eq!(adv.len(), n, "adversary slots must equal n");
+        }
+        if let Some(ws) = weights.as_ref() {
+            assert_eq!(ws.len(), n, "weights slots must equal n");
         }
         assert!(n >= 4, "BFT requires at least 4 nodes (3f+1 with f=1)");
 
@@ -582,7 +629,19 @@ impl SimCluster {
             .collect();
 
         // ValidatorSet sorts IDs ascending, establishing leader-rotation order.
-        let vs = ValidatorSet::new(validator_ids_unsorted);
+        let vs = if let Some(weights) = weights {
+            // The caller promises `weights[i]` is the weight for the
+            // validator at sorted index `i`. Sort the freshly-
+            // generated ValidatorIds first, *then* zip with the
+            // already-sorted-index-aligned weights.
+            let mut sorted_ids = validator_ids_unsorted;
+            sorted_ids.sort();
+            let paired: Vec<_> = sorted_ids.into_iter().zip(weights).collect();
+            ValidatorSet::with_weights(paired)
+                .expect("spawn_with_weights validated weight >= 1 above")
+        } else {
+            ValidatorSet::new(validator_ids_unsorted)
+        };
         let genesis = Block::genesis([0u8; 32], [0; 32]);
 
         // Build a signer lookup by NodeId.
@@ -4147,6 +4206,158 @@ mod tests {
                 prop_assert!(
                     any_post,
                     "L4: no committed block at view >= v_eff={v_eff} for target={target}",
+                );
+
+                Ok(())
+            })?;
+        }
+
+        /// **L5 — non-uniform weights preserve safety and liveness.**
+        /// `n` honest replicas with random per-validator voting weights
+        /// in `[1, 100]` must:
+        ///   1. commit at least one block under the weighted-quorum
+        ///      predicate (`3*signer_weight > 2*total_weight`),
+        ///   2. never have committed conflicting blocks at any point
+        ///      across replicas (safety).
+        ///
+        /// The committee runs honest — no adversary is injected. The
+        /// property holds because the weighted Byzantine assumption
+        /// (`Byzantine weight ≤ floor(total/3)`) is trivially
+        /// satisfied at zero Byzantine weight. The test exists to
+        /// catch arithmetic bugs in the weight-quorum predicate, the
+        /// genesis-QC fill, and the round-sync hint at non-uniform
+        /// weights — code paths that pre-#144 trivially behaved
+        /// because every weight collapsed to 1 (#463 acceptance).
+        ///
+        /// Weight range capped at `[1, 100]` rather than the issue's
+        /// `[1, 1000]` to keep the case budget under the 15-s
+        /// per-test wall-clock floor (CLAUDE.md). The arithmetic
+        /// cared about by the predicate is the same; smaller numbers
+        /// still exercise non-uniform-weight quorum subsets.
+        #[test]
+        fn proptest_weighted_committee_preserves_safety_and_liveness(
+            // 4-validator cluster: the smallest BFT committee.
+            // Wider clusters (n=5..7) work but blow the per-case
+            // simulator-setup time budget; the property exercised here
+            // is arithmetic, and 4 validators with non-uniform weights
+            // already covers the predicate's degenerate and non-
+            // degenerate cases.
+            w0 in 1u64..=100,
+            w1 in 1u64..=100,
+            w2 in 1u64..=100,
+            w3 in 1u64..=100,
+        ) {
+            run_paused(|| async move {
+                let weights = vec![w0, w1, w2, w3];
+                let mut cluster =
+                    SimCluster::spawn_with_weights(4, Duration::from_millis(50), weights.clone())
+                        .await;
+
+                // Warm-up: drive simulated time until at least one
+                // node has committed a block.
+                let warmed = cluster
+                    .advance_and_yield_until(PHASE_CAP, |c| {
+                        c.peek_commit_heights().iter().any(|&h| h > 0)
+                    })
+                    .await;
+                prop_assert!(
+                    warmed,
+                    "L5: weighted cluster failed to commit any block (weights={weights:?})",
+                );
+
+                // Run a bit longer so the chain advances past the
+                // genesis QC and exercises QC formation under the
+                // weighted predicate at multiple views.
+                let _ = cluster
+                    .advance_and_yield_until(PHASE_CAP, |c| {
+                        c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 3
+                    })
+                    .await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                Ok(())
+            })?;
+        }
+
+        /// **L6 — change-weight reconfig preserves safety and
+        /// liveness across the boundary.** Bump one validator's
+        /// voting weight via a `change-weight` reconfig and verify:
+        ///   1. the cluster commits past `v_eff`,
+        ///   2. no conflicting commits across the boundary
+        ///      (the historical-validator-set lookup at `qc.view`
+        ///      keeps pre-boundary QCs verifiable),
+        ///   3. at least one block lands at view ≥ `v_eff` (the
+        ///      post-boundary regime is genuinely active).
+        ///
+        /// Floor consideration: the cluster has 4 validators, all
+        /// at weight 1 at genesis. Bumping one to `new_weight ∈
+        /// [2, 5]` makes that validator stake-heavy enough that
+        /// quorum subsets rebalance, but the cluster remains
+        /// connected (no Byzantine assumption violation: 0 Byzantine
+        /// weight is trivially ≤ floor(total/3) = 1 at genesis and
+        /// ≤ floor((3 + new_weight)/3) post-boundary).
+        #[test]
+        fn proptest_change_weight_reconfig_preserves_safety_and_liveness(
+            target in 0usize..4,
+            new_weight in 2u64..=5,
+            v_eff_offset in 8u64..20,
+        ) {
+            use crate::consensus::View;
+            use crate::consensus::reconfig::{ReconfigCommand, WeightChange};
+
+            run_paused(|| async move {
+                let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+                let warmed = cluster
+                    .advance_and_yield_until(PHASE_CAP, |c| {
+                        c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 1
+                    })
+                    .await;
+                prop_assert!(
+                    warmed,
+                    "L6: warm-up did not produce a commit on every node",
+                );
+
+                let target_id = cluster.node_ids[target];
+                let v_eff: View = View(v_eff_offset + 5);
+                let cmd = ReconfigCommand {
+                    adds: vec![],
+                    removes: vec![],
+                    changes: vec![WeightChange {
+                        node_id: target_id,
+                        weight: new_weight,
+                    }],
+                    v_eff,
+                };
+                let payload = cmd.encode();
+                for mp in &cluster.mempools {
+                    let _ = mp.insert(payload.clone());
+                }
+
+                let crossed = cluster
+                    .advance_and_yield_until(Duration::from_secs(8), |c| {
+                        c.peek_commit_heights().iter().min().copied().unwrap_or(0)
+                            >= v_eff.0 + 5
+                    })
+                    .await;
+                prop_assert!(
+                    crossed,
+                    "L6: cluster failed to commit past v_eff={v_eff} \
+                     for target={target} new_weight={new_weight}",
+                );
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                let any_post = committed
+                    .iter()
+                    .any(|node_blocks| node_blocks.iter().any(|b| b.header.view >= v_eff));
+                prop_assert!(
+                    any_post,
+                    "L6: no committed block at view >= v_eff={v_eff} \
+                     (target={target} new_weight={new_weight})",
                 );
 
                 Ok(())
