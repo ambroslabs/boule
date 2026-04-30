@@ -72,7 +72,8 @@ impl RoundRobinSelector {
 
 impl LeaderSelector for RoundRobinSelector {
     fn leader_for_view(&self, view: View) -> NodeId {
-        let vs = self.history.set_at(view);
+        let vs_at = self.history.set_at(view);
+        let vs = vs_at.for_view(view);
         // `view % len as u64` before narrowing to usize so the rotation
         // is identical on 32- and 64-bit platforms.
         let idx = (view % vs.len() as u64) as usize;

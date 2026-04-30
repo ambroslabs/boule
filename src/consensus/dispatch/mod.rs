@@ -65,11 +65,13 @@ pub use egress::{
     egress_snapshot_chunk_request, egress_snapshot_chunk_response,
     egress_snapshot_manifest_request, egress_snapshot_manifest_response,
 };
+#[cfg(test)]
+pub use ingress::{ingress, ingress_wire};
 pub use ingress::{
-    ingress, ingress_block_request, ingress_block_response, ingress_new_view, ingress_proposal,
+    ingress_block_request, ingress_block_response, ingress_new_view, ingress_proposal,
     ingress_snapshot_chunk_request, ingress_snapshot_chunk_response,
     ingress_snapshot_manifest_request, ingress_snapshot_manifest_response, ingress_timeout_vote,
-    ingress_vote, ingress_wire, ingress_wire_with_qc_verification, ingress_with_qc_verification,
+    ingress_vote, ingress_wire_with_qc_verification, ingress_with_qc_verification,
 };
 
 // Re-imports referenced from doc-comments above.
@@ -140,10 +142,10 @@ pub enum Dispatch {
     /// flag is cleared but the envelope is still emitted, because the
     /// timeout-vote *signal* itself is signed by a known validator and
     /// must not be suppressible by attaching a forged piggyback (audit
-    /// finding 10-F3, issue #321). On
-    /// [`QcVerification::Skip`] the flag is always `true`, preserving
-    /// the historical contract for test fixtures that build QCs with
-    /// placeholder signatures.
+    /// finding 10-F3, issue #321). Under the `cfg(test)`-only
+    /// `QcVerification::Skip` policy the flag is always `true`,
+    /// preserving the historical contract for test fixtures that
+    /// build QCs with placeholder signatures.
     TimeoutVote {
         signed: Signed<TimeoutVote>,
         high_qc_trusted: bool,
@@ -446,24 +448,30 @@ impl<T> Verified<Signed<T>> {
 
 /// Chain-level verification context for [`ingress_with_qc_verification`].
 ///
-/// `Skip` is the default for tests that construct QCs with placeholder
-/// signatures (no actual cryptographic content) and for the legacy
-/// [`ingress`] entry point.
-///
-/// `Verify` is what production wires: every QC's aggregate is checked
-/// against the per-historical-view validator pubkeys before any
-/// `Dispatch` is emitted (closes the Byzantine-leader-ships-a-bogus-QC
+/// `Verify` is the only variant production wires: every QC's aggregate
+/// is checked against the per-historical-view validator pubkeys before
+/// any `Dispatch` is emitted (closes the Byzantine-leader-ships-a-bogus-QC
 /// vector regardless of scheme), and every `Proposal`'s
 /// `validator_history_commitment` is checked against what the follower
 /// would compute over the block's reconfig/rotation commands (#325 PR
 /// C; closes the Byzantine-leader-ships-a-bogus-history-commitment
 /// vector before any vote is cast).
 ///
+/// `Skip` is gated to `cfg(test)` (audit finding 10-4, issue #413) so
+/// no production code path can silently disable embedded-QC aggregate
+/// verification by selecting it. Test fixtures that construct QCs with
+/// placeholder signatures (no actual cryptographic content) — and the
+/// legacy [`ingress`] / [`ingress_wire`] convenience wrappers, which
+/// are themselves `cfg(test)` — are the only callers that ever
+/// observe it.
+///
 /// The historical name reflects QC verification, but the variant
 /// carries every chain-level parameter needed for both checks:
-/// `scheme`, `bls_key_history`, and `min_v_eff_delay` are all read by
-/// the proposal-receive validator alongside the QC verifier.
+/// `scheme`, `bls_key_history`, `min_v_eff_delay`, and `genesis_hash`
+/// are all read by the proposal-receive validator alongside the QC
+/// verifier.
 pub enum QcVerification<'a> {
+    #[cfg(test)]
     Skip,
     Verify {
         scheme: SignatureSchemeChoice,
@@ -479,6 +487,17 @@ pub enum QcVerification<'a> {
         /// is `crate::consensus::reconfig::MIN_V_EFF_DELAY`; tests
         /// may pass a different value to exercise edge cases.
         min_v_eff_delay: View,
+        /// The chain's genesis block hash. Used by the QC aggregate
+        /// verifier (audit finding 7-4, issue #418) to reject view-0
+        /// QCs whose `block_hash` is anything other than `genesis_hash`.
+        /// The genesis-QC convention skips aggregate verification at
+        /// `view == 0` (placeholder Ed25519 sigs / empty BLS aggregate
+        /// sentinel), but that skip would otherwise also accept a
+        /// forged QC at view 0 over an attacker-chosen block hash.
+        /// The safety core's parent walk would catch this downstream,
+        /// but defense-in-depth says reject the malformed envelope at
+        /// the boundary.
+        genesis_hash: BlockHash,
     },
 }
 
