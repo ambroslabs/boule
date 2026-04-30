@@ -707,7 +707,6 @@ impl SimCluster {
                 let identity = crate::crypto::bls_key::BlsValidatorIdentity {
                     secret: zeroize::Zeroizing::new(sk),
                     public: pk,
-                    pop: crate::crypto::sig_scheme::BlsAggregated::sign_pop(&sk).unwrap(),
                 };
                 let bls_signer: Arc<
                     dyn crate::crypto::signed::PartialSigner<
@@ -4987,7 +4986,7 @@ mod tests {
         bls_ikm[0] = 0x42; // deterministic across re-runs of this test
         bls_ikm[1] = rotated_idx as u8;
         let (new_bls_sk, new_bls_pk) = BlsAggregated::keygen(&bls_ikm).unwrap();
-        let new_bls_pop = BlsAggregated::sign_pop(&new_bls_sk).unwrap();
+        let new_bls_pop = BlsAggregated::sign_pop(&new_bls_sk, &ChainId::TEST).unwrap();
 
         let v_eff: View = 60;
         let payload = ValidatorKeyRotation {
