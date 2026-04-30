@@ -108,6 +108,7 @@ fn update_kind(u: &StateUpdate) -> &'static str {
         StateUpdate::VotedInView { .. } => "VotedInView",
         StateUpdate::Locked(_) => "Locked",
         StateUpdate::HighQc(_) => "HighQc",
+        StateUpdate::ProposedInView { .. } => "ProposedInView",
     }
 }
 
@@ -158,6 +159,19 @@ pub const STORAGE_KEY_LOCKED: &[u8] = b"consensus/locked";
 /// Storage key for the replica's highest-known QC, used as the
 /// justify on proposals and piggybacked on `NewView`.
 pub const STORAGE_KEY_HIGH_QC: &[u8] = b"consensus/high_qc";
+
+/// Storage key for the highest view at which this replica has minted
+/// a `Proposal` as leader. Persisted before any `Broadcast(Proposal)`
+/// leaves so a crash between `Signed::sign` and the network bytes
+/// reaching peers cannot let a restarted leader re-mint a *different*
+/// proposal at the same view (different parent walk, different
+/// `high_qc` snapshot, different mempool ordering) — two distinct
+/// signed `Proposal(v)` envelopes from the same leader are slashable
+/// equivocation evidence even when the leader was honest. Read at
+/// boot by [`ConsensusNode::recover`] and threaded into the safety
+/// core via [`HotStuffCore::with_proposed_in_view`]. Audit finding
+/// 4-6, issue #407.
+pub const STORAGE_KEY_PROPOSED_IN_VIEW: &[u8] = b"consensus/proposed_in_view";
 
 /// Storage-key prefix under which committed blocks are persisted by
 /// content-hash. Each block is written on commit so a peer can fetch
@@ -1264,6 +1278,19 @@ impl ConsensusNode {
             Arc::clone(&dropped_commands),
             config.propose_limit,
         ));
+        // #407: restore the leader-side `proposed_in_view` guard so a
+        // crash between `Signed::sign` and the `Broadcast(Proposal)`
+        // bytes leaving the host does not let this replica re-mint a
+        // *different* signed proposal at the same view on restart.
+        // Missing key = fresh storage; a value of `0` is the safe
+        // default the in-memory field already starts at.
+        let proposed_in_view = match storage
+            .get(STORAGE_KEY_PROPOSED_IN_VIEW)
+            .context("read proposed_in_view from storage")?
+        {
+            Some(raw) => decode_proposed_in_view(&raw)?,
+            None => 0,
+        };
         let eviction_counters = CacheEvictionCounters::default();
         let mut core = HotStuffCore::with_limits(
             self_id,
@@ -1272,7 +1299,8 @@ impl ConsensusNode {
             config.limits,
             eviction_counters.clone(),
         )
-        .with_signature_scheme(config.signature_scheme);
+        .with_signature_scheme(config.signature_scheme)
+        .with_proposed_in_view(proposed_in_view);
 
         // #254: replay each post-genesis boundary into the safety
         // core's history so vote tally / QC sizing / proposal-time
@@ -1668,7 +1696,7 @@ impl ConsensusNode {
             let hash = match u {
                 StateUpdate::HighQc(qc) => qc.block_hash,
                 StateUpdate::Locked(locked) => locked.block_hash,
-                StateUpdate::VotedInView { .. } => continue,
+                StateUpdate::VotedInView { .. } | StateUpdate::ProposedInView { .. } => continue,
             };
             if let Some(block) = self.core.state().pending_blocks.get(&hash) {
                 let bytes = encode_block(block)?;
@@ -1689,6 +1717,10 @@ impl ConsensusNode {
                     StateUpdate::HighQc(qc) => {
                         let bytes = encode_high_qc(qc)?;
                         b.put(STORAGE_KEY_HIGH_QC, &bytes);
+                    }
+                    StateUpdate::ProposedInView { view } => {
+                        let bytes = encode_proposed_in_view(*view)?;
+                        b.put(STORAGE_KEY_PROPOSED_IN_VIEW, &bytes);
                     }
                 }
             }
@@ -3968,6 +4000,18 @@ pub fn decode_high_qc(bytes: &[u8]) -> anyhow::Result<QuorumCertificate> {
     postcard::from_bytes(bytes).context("decode high_qc")
 }
 
+/// Serialize a `proposed_in_view` value to its on-storage encoding.
+/// See [`STORAGE_KEY_PROPOSED_IN_VIEW`] for the durability contract
+/// (audit finding 4-6, issue #407).
+pub fn encode_proposed_in_view(view: View) -> anyhow::Result<Vec<u8>> {
+    postcard::to_stdvec(&view).context("encode proposed_in_view")
+}
+
+/// Inverse of [`encode_proposed_in_view`].
+pub fn decode_proposed_in_view(bytes: &[u8]) -> anyhow::Result<View> {
+    postcard::from_bytes(bytes).context("decode proposed_in_view")
+}
+
 /// Compose the storage key for a committed block keyed by its
 /// content-hash: `STORAGE_KEY_BLOCK_PREFIX || hash`.
 pub fn block_storage_key(hash: &BlockHash) -> Vec<u8> {
@@ -4992,8 +5036,22 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_proposed_in_view_roundtrips() {
+        let cases = [0u64, 1, 42, u64::MAX];
+        for v in cases {
+            let bytes = encode_proposed_in_view(v).unwrap();
+            assert_eq!(decode_proposed_in_view(&bytes).unwrap(), v);
+        }
+    }
+
+    #[test]
     fn decode_voted_view_surfaces_error_on_garbage() {
         assert!(decode_voted_view(&[0xFFu8; 64]).is_err());
+    }
+
+    #[test]
+    fn decode_proposed_in_view_surfaces_error_on_garbage() {
+        assert!(decode_proposed_in_view(&[0xFFu8; 64]).is_err());
     }
 
     #[test]
@@ -5127,6 +5185,83 @@ mod tests {
         );
         // `recover` does not reset the pacemaker — it always starts at 0.
         assert_eq!(recovered.current_view(), 0);
+    }
+
+    /// Issue #407 / audit finding 4-6: persisting `ProposedInView`
+    /// before `Broadcast(Proposal)` and restoring it on
+    /// [`ConsensusNode::recover`] keeps a leader from re-minting a
+    /// *different* signed proposal at the same view if it crashes
+    /// between `Signed::sign` and the network bytes leaving the
+    /// host. Without the durable mirror the in-memory guard would
+    /// reset to `0` on restart and the next call into
+    /// `try_propose_as_leader(view)` would re-enter the build path
+    /// for the same view — handing a Byzantine-detector a
+    /// slashable equivocation envelope, even though the leader was
+    /// honest.
+    #[test]
+    fn persist_then_recover_preserves_proposed_in_view() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        let node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        );
+        node.persist_updates(&[StateUpdate::ProposedInView { view: 12 }])
+            .unwrap();
+
+        // The durable write is immediately readable under the
+        // documented storage key — defense-in-depth so a future refactor
+        // that drops the call to `b.put(STORAGE_KEY_PROPOSED_IN_VIEW, _)`
+        // surfaces here rather than only in the recovery test below.
+        let raw = storage
+            .get(STORAGE_KEY_PROPOSED_IN_VIEW)
+            .unwrap()
+            .expect("ProposedInView must be persisted under STORAGE_KEY_PROPOSED_IN_VIEW");
+        assert_eq!(decode_proposed_in_view(&raw).unwrap(), 12);
+        drop(node);
+
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.core.proposed_in_view(),
+            12,
+            "recover() must restore proposed_in_view from durable storage so a \
+             leader that crashed mid-broadcast cannot re-mint at the same view",
+        );
+    }
+
+    /// Companion to [`persist_then_recover_preserves_proposed_in_view`]:
+    /// fresh storage with no `ProposedInView` ever written must recover
+    /// to `0`, matching the in-memory default for an unstarted leader.
+    #[test]
+    fn recover_with_no_persisted_proposed_in_view_defaults_to_zero() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(recovered.core.proposed_in_view(), 0);
     }
 
     /// Issue #206 regression: persisting a `Locked` / `HighQc` whose
@@ -5428,13 +5563,22 @@ mod tests {
         let expected = genesis_qc(&genesis(), four_validators().len());
         assert_eq!(node.core.state().high_qc.as_ref(), Some(&expected));
 
-        // And `become_leader(1)` must now yield an Action::Broadcast(Proposal)
-        // rather than the empty Vec the pre-fix code returned.
+        // And `become_leader(1)` must now yield an
+        // Action::Broadcast(Proposal) (preceded by the
+        // ProposedInView persist that closes the audit-4-6 / #407
+        // self-equivocation hazard) rather than the empty Vec the
+        // pre-fix code returned.
         let mut node = node;
         let actions = node.core.become_leader(1);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
         assert!(matches!(
             &actions[0],
+            SafetyAction::Persist(crate::consensus::hotstuff::StateUpdate::ProposedInView {
+                view: 1
+            }),
+        ));
+        assert!(matches!(
+            &actions[1],
             SafetyAction::Broadcast(crate::consensus::hotstuff::ConsensusMsg::Proposal(_)),
         ));
     }
@@ -8351,11 +8495,14 @@ mod tests {
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
-        // Safety core emits exactly `[Broadcast(Proposal)]` for a freshly
-        // booted leader seeded with the genesis QC (regression-tested by
-        // `new_seeds_genesis_qc_so_view_one_leader_can_propose`).
+        // Safety core emits `[Persist(ProposedInView), Broadcast(Proposal)]`
+        // for a freshly booted leader seeded with the genesis QC
+        // (regression-tested by
+        // `new_seeds_genesis_qc_so_view_one_leader_can_propose`). The
+        // ProposedInView persist is the audit-4-6 / #407 self-equivocation
+        // guard the dispatcher flushes before the broadcast.
         let actions = node.core.become_leader(1);
-        assert_eq!(actions.len(), 1);
+        assert_eq!(actions.len(), 2);
 
         node.apply_safety_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer)
             .await
