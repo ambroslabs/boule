@@ -301,8 +301,7 @@ pub fn recover_state(
     validator_set: ValidatorSet,
     genesis: Block,
 ) -> anyhow::Result<HotStuffState> {
-    let vs_len = validator_set.len();
-    let boot_qc = genesis_qc(&genesis, vs_len);
+    let boot_qc = genesis_qc(&genesis, &validator_set);
     let mut state = HotStuffState::new(validator_set, genesis);
     // Default every fresh replica to the cluster-agreed genesis QC so
     // view-1 can proceed without waiting for a cross-cluster NewView

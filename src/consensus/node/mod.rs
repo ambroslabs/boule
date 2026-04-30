@@ -387,7 +387,7 @@ impl ConsensusNode {
         // accepts via its `signer_count == 0` genesis-skip path.
         let boot_qc = match config.signature_scheme {
             crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => {
-                genesis_qc(&config.genesis, validator_set_len)
+                genesis_qc(&config.genesis, &config.validator_set)
             }
             crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => {
                 genesis_qc_bls(&config.genesis, validator_set_len)
@@ -1878,7 +1878,7 @@ mod tests {
         // Empty storage means no persisted high_qc, so the recovery path
         // seeds the cluster-agreed genesis QC so the view-1 leader can
         // propose on first boot.
-        let expected = genesis_qc(&genesis(), four_validators().len());
+        let expected = genesis_qc(&genesis(), &four_validators());
         assert_eq!(state.high_qc.as_ref().map(|q| q.inner()), Some(&expected));
         assert!(state.pending_blocks.contains_key(&genesis().hash()));
     }
@@ -2492,7 +2492,7 @@ mod tests {
         .unwrap();
         assert_eq!(recovered.core.state().last_voted_view, View(0));
         assert_eq!(recovered.core.state().locked, Some(sample_locked()));
-        let expected = genesis_qc(&genesis(), four_validators().len());
+        let expected = genesis_qc(&genesis(), &four_validators());
         assert_eq!(
             recovered.core.state().high_qc.as_ref().map(|q| q.inner()),
             Some(&expected)
@@ -2551,7 +2551,7 @@ mod tests {
         // without waiting for a NewView round that only ever lands after
         // somebody has already proposed.
         let node = make_node(nid(1));
-        let expected = genesis_qc(&genesis(), four_validators().len());
+        let expected = genesis_qc(&genesis(), &four_validators());
         assert_eq!(
             node.core.state().high_qc.as_ref().map(|q| q.inner()),
             Some(&expected)
@@ -3904,7 +3904,7 @@ mod tests {
         // for the lag-detection observation. The integration layer
         // peeks at `signed.payload.block.header.height` and
         // `signed.signer`, both of which we control.
-        let justify = genesis_qc(&genesis(), 4);
+        let justify = genesis_qc(&genesis(), &four_validators());
         let proposal = Proposal { block, justify };
         let signed = Signed::sign(proposal, signer, &ChainId::TEST).expect("sign proposal");
         Dispatch::Safety(SafetyEvent::ProposalReceived(
@@ -6449,7 +6449,7 @@ mod tests {
                 node.signature_scheme,
                 node.min_v_eff_delay,
             );
-        let justify = crate::consensus::hotstuff::qc::genesis_qc(&parent, vs.len());
+        let justify = crate::consensus::hotstuff::qc::genesis_qc(&parent, &vs);
         let proposal = Proposal { block, justify };
         let signed_proposal =
             Signed::sign(proposal, &leader_signer, &node.chain_id).expect("sign proposal");

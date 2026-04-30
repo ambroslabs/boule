@@ -59,28 +59,84 @@ use crate::crypto::signed::SignedMessage;
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 
-/// HotStuff quorum threshold: `2n/3 + 1`.
+/// HotStuff quorum threshold over a flat (count-based) committee:
+/// `2n/3 + 1`.
 ///
 /// For `n = 3f + 1` this equals `2f + 1`, the usual BFT quorum.
 /// `quorum_size(0)` returns `1` (a harmless default — an empty
 /// validator set has no quorum).
+///
+/// **Note (#461):** The protocol's quorum predicate
+/// ([`QuorumCertificate::has_quorum`]) is **weight-based**, not
+/// count-based. This helper survives because test fixtures and
+/// simulation adversaries that operate at uniform weight = 1 still
+/// reason about "the count threshold" in the degenerate case;
+/// production paths in `step.rs`, `node/`, and `dispatch/` go through
+/// the weighted predicate. Equivalent at weight = 1: `quorum_size(n) =
+/// quorum_weight_threshold(uniform-1 set of size n)`.
 pub const fn quorum_size(n: usize) -> usize {
     (2 * n) / 3 + 1
 }
 
-/// Honesty threshold: any set of `n/3 + 1` distinct signers
-/// includes at least one honest signer (under the standard `n = 3f + 1`
-/// BFT assumption: at most `f = n/3` faulty replicas, so `f + 1` is the
-/// smallest set guaranteed to contain an honest member).
+/// Honesty threshold over a flat (count-based) committee: `n/3 + 1`.
 ///
-/// Used by the round-sync hint (`OnRoundSync`) so a single Byzantine
-/// `TimeoutVote` cannot drag honest replicas' `current_view` forward —
-/// see issue #218.
+/// Any set of `n/3 + 1` distinct signers includes at least one honest
+/// signer under the standard `n = 3f + 1` BFT assumption (at most `f =
+/// n/3` faulty replicas, so `f + 1` is the smallest set guaranteed to
+/// contain an honest member).
+///
+/// Used historically by the round-sync hint (`OnRoundSync`) so a
+/// single Byzantine `TimeoutVote` cannot drag honest replicas'
+/// `current_view` forward (issue #218).
+///
+/// **Note (#461):** The integration layer's round-sync gate is
+/// weight-based via [`honesty_weight_threshold`]; this helper survives
+/// at the count-based weight = 1 degenerate case for tests.
 ///
 /// `honesty_threshold(0)` returns `1` (mirrors [`quorum_size`]'s
 /// degenerate-default behaviour).
 pub const fn honesty_threshold(n: usize) -> usize {
     n / 3 + 1
+}
+
+/// HotStuff weighted quorum threshold: the smallest signer-weight `w`
+/// satisfying `3*w > 2*total_weight`. Equivalently
+/// `floor(2*total_weight/3) + 1`.
+///
+/// At uniform weight = 1 this collapses to [`quorum_size`]`(vs.len())`.
+/// Returns `1` for an empty validator set (mirrors the `quorum_size(0)
+/// = 1` degenerate default).
+///
+/// Use this only for diagnostics / human-readable surfaces — the
+/// predicate ([`QuorumCertificate::has_quorum`]) uses the
+/// multiply-not-divide form `3*signer_weight > 2*total_weight`
+/// directly to avoid rounding bugs at the boundary.
+pub fn quorum_weight_threshold(vs: &ValidatorSet) -> u128 {
+    let total = vs.total_weight();
+    if total == 0 {
+        1
+    } else {
+        // 2*total fits in u128 because total ≤ n * u64::MAX ≪ u128::MAX
+        // for any realistic n. Saturating is defensive against future
+        // changes that lift the per-weight upper bound.
+        2u128.saturating_mul(total) / 3 + 1
+    }
+}
+
+/// Honesty threshold over a weighted committee: the smallest signer-
+/// weight whose tally is guaranteed to contain at least one honest
+/// signer under the chain's BFT assumption (Byzantine weight ≤
+/// `floor(total_weight / 3)`).
+///
+/// `floor(total_weight / 3) + 1` — strictly greater than the largest
+/// possible Byzantine weight. At uniform weight = 1 this collapses to
+/// [`honesty_threshold`]`(vs.len())`.
+///
+/// Used by the round-sync hint at the integration layer
+/// (`timeout_bucket.rs`).
+pub fn honesty_weight_threshold(vs: &ValidatorSet) -> u128 {
+    let total = vs.total_weight();
+    if total == 0 { 1 } else { total / 3 + 1 }
 }
 
 /// Compact signer set, indexed over a [`ValidatorSet`]'s sorted order.
@@ -421,10 +477,48 @@ impl QuorumCertificate {
         self.signers.count()
     }
 
-    /// True iff at least `quorum_size(vs.len())` validators from `vs`
-    /// have a signature recorded here.
+    /// Sum of the voting weights of validators whose bit is set in
+    /// this QC's [`SignerBitmap`], evaluated against `vs`. `vs` must
+    /// be the validator set authoritative at `qc.view` (#460/#461).
+    ///
+    /// Returns `u128` so weights summing near `u64::MAX` don't wrap.
+    pub fn signer_weight(&self, vs: &ValidatorSet) -> u128 {
+        debug_assert_eq!(
+            self.signers.len(),
+            vs.len(),
+            "signer_weight: bitmap length and validator-set length must match",
+        );
+        let mut acc: u128 = 0;
+        for idx in self.signers.iter_set() {
+            // Defensive bound: a malformed bitmap can have set bits
+            // past `vs.len()` if the caller skipped `is_well_formed`.
+            // Iterating `iter_set` past the validator set's range
+            // would panic on `weight_at`; skip instead so the predicate
+            // returns false on bogus QCs rather than panicking.
+            if idx >= vs.len() {
+                continue;
+            }
+            acc = acc.saturating_add(u128::from(vs.weight_at(idx)));
+        }
+        acc
+    }
+
+    /// True iff the validators whose bits are set in this QC's bitmap
+    /// account for **strictly more than** two-thirds of `vs`'s total
+    /// voting weight. The integer-math form `3*signer_weight >
+    /// 2*total_weight` avoids division and rounding bugs at the
+    /// boundary.
+    ///
+    /// At uniform weight = 1 this is exactly `signer_count >=
+    /// quorum_size(vs.len())`, so existing weight = 1 fixtures behave
+    /// byte-identically.
     pub fn has_quorum(&self, vs: &ValidatorSet) -> bool {
-        self.signer_count() >= quorum_size(vs.len())
+        let signer = self.signer_weight(vs);
+        let total = vs.total_weight();
+        // saturating_mul: a pathological u128-overflow input saturates
+        // both sides to u128::MAX, the strict-`>` returns false — i.e.
+        // the safe direction is "no quorum."
+        3u128.saturating_mul(signer) > 2u128.saturating_mul(total)
     }
 
     /// Well-formedness check used when accepting a QC from the wire:
@@ -645,23 +739,35 @@ pub enum ConsensusMsg {
 /// seeds into its `high_qc` at boot.
 ///
 /// By convention a genesis QC has `view = 0`, `block_hash =
-/// genesis.hash()`, and the first `quorum_size(vs_len)` validator slots
-/// signed with all-zero placeholders. The safety core never re-verifies
-/// embedded QC signatures (that is the ingress layer's job at the
-/// envelope level), so the placeholder signatures never reach a
+/// genesis.hash()`, and the lowest-indexed validator slots signed with
+/// all-zero placeholders, filled until the running weight sum crosses
+/// the weighted-quorum threshold (#461). The safety core never re-
+/// verifies embedded QC signatures (that is the ingress layer's job at
+/// the envelope level), so the placeholder signatures never reach a
 /// verifier; they exist only to make the QC's
 /// [`QuorumCertificate::has_quorum`] / [`QuorumCertificate::is_well_formed`]
 /// predicates tell the truth about "a quorum signed off on the chain
 /// root."
 ///
+/// At uniform weight = 1 (the case for every chain that has not yet
+/// committed a non-uniform reconfig) the fill is byte-identical to the
+/// pre-#461 `0..quorum_size(n)` loop — both stop after exactly
+/// `quorum_size(n)` iterations.
+///
 /// Every honest replica constructs an identical genesis QC from the
-/// same `(genesis, validator_set_len)` pair, so the view-1 leader's
-/// proposal — justified by this QC — is indistinguishable across
-/// replicas.
-pub fn genesis_qc(genesis: &Block, validator_set_len: usize) -> QuorumCertificate {
-    let mut qc = QuorumCertificate::new(View::ZERO, genesis.hash(), validator_set_len);
-    for i in 0..quorum_size(validator_set_len) {
+/// same `(genesis, vs)` pair, so the view-1 leader's proposal —
+/// justified by this QC — is indistinguishable across replicas.
+pub fn genesis_qc(genesis: &Block, vs: &ValidatorSet) -> QuorumCertificate {
+    let mut qc = QuorumCertificate::new(View::ZERO, genesis.hash(), vs.len());
+    let mut accum: u128 = 0;
+    let total = vs.total_weight();
+    for i in 0..vs.len() {
         qc.add_signature(i, [0u8; 64]);
+        accum = accum.saturating_add(u128::from(vs.weight_at(i)));
+        // Stop as soon as the running weight strictly crosses 2/3.
+        if 3u128.saturating_mul(accum) > 2u128.saturating_mul(total) {
+            break;
+        }
     }
     qc
 }
@@ -1158,6 +1264,181 @@ mod tests {
         assert!(qc.is_bls());
         assert_eq!(qc.view, View::ZERO);
         assert_eq!(qc.block_hash, genesis.hash());
+    }
+
+    // ── #461: weighted quorum predicate ─────────────────────────────────
+
+    fn vid_for(b: u8) -> crate::consensus::validator_set::ValidatorId {
+        crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(nid(b))
+    }
+
+    /// Sanity: the weighted threshold collapses to the count-based one
+    /// when every weight is 1. This is the byte-identity test that
+    /// existing weight-1 fixtures rely on.
+    #[test]
+    fn weighted_quorum_collapses_to_count_at_weight_one() {
+        for n in [1usize, 2, 3, 4, 7, 10] {
+            let vs = ValidatorSet::new((0..n as u8).map(|i| vid_for(i + 1)).collect::<Vec<_>>());
+            assert_eq!(
+                quorum_weight_threshold(&vs) as usize,
+                quorum_size(n),
+                "n = {n}"
+            );
+            assert_eq!(
+                honesty_weight_threshold(&vs) as usize,
+                honesty_threshold(n),
+                "n = {n}"
+            );
+        }
+    }
+
+    /// Non-uniform weights: a stake-heavy validator can swing quorum.
+    /// Weights `[5, 1, 1, 1]` total 8; quorum threshold = `2*8/3 + 1 =
+    /// 6`. Two-validator subsets meeting the threshold are the
+    /// stake-heavy validator (5) plus *any* other (5+1=6 ≥ 6 ✓).
+    /// Without the heavy validator, three small ones (3) do *not*
+    /// meet quorum.
+    #[test]
+    fn nondegenerate_weights_change_quorum_subsets() {
+        let vs = ValidatorSet::with_weights(vec![
+            (vid_for(1), 5),
+            (vid_for(2), 1),
+            (vid_for(3), 1),
+            (vid_for(4), 1),
+        ])
+        .unwrap();
+        // ValidatorSet sorts by id ascending; with byte-identical
+        // genesis pubkeys vid_for(1) sorts first. Confirm before
+        // building bitmaps that depend on that ordering.
+        assert_eq!(vs.weight_at(0), 5);
+
+        let threshold = quorum_weight_threshold(&vs);
+        assert_eq!(threshold, 6);
+
+        // Heavy + one small: signer weight = 6 ≥ 6 ⇒ quorum.
+        let mut qc_heavy_plus_small =
+            QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
+        qc_heavy_plus_small.add_signature(0, [0; 64]); // weight 5
+        qc_heavy_plus_small.add_signature(1, [0; 64]); // weight 1
+        assert_eq!(qc_heavy_plus_small.signer_weight(&vs), 6);
+        assert!(qc_heavy_plus_small.has_quorum(&vs));
+
+        // Three small validators: weight = 3 < 6 ⇒ no quorum.
+        let mut qc_three_small = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
+        qc_three_small.add_signature(1, [0; 64]);
+        qc_three_small.add_signature(2, [0; 64]);
+        qc_three_small.add_signature(3, [0; 64]);
+        assert_eq!(qc_three_small.signer_weight(&vs), 3);
+        assert!(!qc_three_small.has_quorum(&vs));
+    }
+
+    /// The `>` (strict) comparison must reject signer weight that
+    /// hits exactly `2/3` of the total. Boundary sample: total = 9,
+    /// signer_weight = 6 → `3*6 = 18`, `2*9 = 18`, NOT quorum. Same
+    /// total, signer_weight = 7 → `21 > 18`, quorum.
+    #[test]
+    fn quorum_predicate_strictly_above_two_thirds() {
+        let vs =
+            ValidatorSet::with_weights(vec![(vid_for(1), 3), (vid_for(2), 3), (vid_for(3), 3)])
+                .unwrap();
+        assert_eq!(vs.total_weight(), 9);
+
+        let mut qc_at = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
+        qc_at.add_signature(0, [0; 64]); // weight 3
+        qc_at.add_signature(1, [0; 64]); // weight 3 → 6 total
+        assert_eq!(qc_at.signer_weight(&vs), 6);
+        assert!(
+            !qc_at.has_quorum(&vs),
+            "signer weight equal to 2/3 of total must NOT be quorum"
+        );
+
+        let mut qc_above = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
+        qc_above.add_signature(0, [0; 64]);
+        qc_above.add_signature(1, [0; 64]);
+        qc_above.add_signature(2, [0; 64]);
+        assert_eq!(qc_above.signer_weight(&vs), 9);
+        assert!(qc_above.has_quorum(&vs));
+    }
+
+    /// Weights summing near `u64::MAX` must not wrap. The QC's
+    /// `signer_weight` method aggregates into `u128`; the predicate
+    /// uses saturating multiplication so a pathological u128-overflow
+    /// input fails closed (returns false), never falsely declares
+    /// quorum.
+    #[test]
+    fn has_quorum_handles_weights_near_u64_max_without_wrapping() {
+        let vs = ValidatorSet::with_weights(vec![
+            (vid_for(1), u64::MAX),
+            (vid_for(2), u64::MAX),
+            (vid_for(3), u64::MAX),
+            (vid_for(4), 1),
+        ])
+        .unwrap();
+        // total = 3 * u64::MAX + 1
+        let expected_total = (u64::MAX as u128) * 3 + 1;
+        assert_eq!(vs.total_weight(), expected_total);
+
+        // Two of the three heavy validators: signer_weight = 2 *
+        // u64::MAX. Threshold (in math): 3 * 2 * u64::MAX > 2 * (3 *
+        // u64::MAX + 1) ⇔ 6 * u64::MAX > 6 * u64::MAX + 2 ⇔ false.
+        let mut qc_two_heavy = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
+        qc_two_heavy.add_signature(0, [0; 64]);
+        qc_two_heavy.add_signature(1, [0; 64]);
+        assert_eq!(qc_two_heavy.signer_weight(&vs), (u64::MAX as u128) * 2);
+        assert!(
+            !qc_two_heavy.has_quorum(&vs),
+            "two-of-three heavy validators do not strictly exceed 2/3 of total"
+        );
+
+        // Add the light validator → signer_weight = 2*u64::MAX + 1.
+        // 3 * (2*u64::MAX + 1) = 6*u64::MAX + 3, vs 2*total =
+        // 6*u64::MAX + 2. 6*u64::MAX + 3 > 6*u64::MAX + 2 ⇒ quorum.
+        let mut qc_two_heavy_plus_one =
+            QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
+        qc_two_heavy_plus_one.add_signature(0, [0; 64]);
+        qc_two_heavy_plus_one.add_signature(1, [0; 64]);
+        qc_two_heavy_plus_one.add_signature(3, [0; 64]); // weight 1
+        assert_eq!(
+            qc_two_heavy_plus_one.signer_weight(&vs),
+            (u64::MAX as u128) * 2 + 1
+        );
+        assert!(qc_two_heavy_plus_one.has_quorum(&vs));
+    }
+
+    /// `genesis_qc`'s fill loop is byte-identical to the pre-#461
+    /// `0..quorum_size(n)` loop when every weight is 1. Spot-check for
+    /// n in {4, 7, 10}.
+    #[test]
+    fn genesis_qc_fill_collapses_to_quorum_size_at_weight_one() {
+        for n in [4usize, 7, 10] {
+            let vs = ValidatorSet::new((0..n as u8).map(|i| vid_for(i + 1)).collect::<Vec<_>>());
+            let g = Block::genesis([0; 32], [0; 32]);
+            let qc = genesis_qc(&g, &vs);
+            assert_eq!(qc.signer_count(), quorum_size(n));
+            assert!(qc.has_quorum(&vs), "n = {n}");
+            assert!(qc.is_well_formed(&vs));
+        }
+    }
+
+    /// `genesis_qc` correctly fills enough bits even when a single
+    /// stake-heavy validator dominates. Weights `[5, 1, 1, 1]` →
+    /// quorum threshold = 6; the loop must add the heavy validator
+    /// (sorted index 0; weight 5) PLUS at least one small to cross.
+    #[test]
+    fn genesis_qc_fill_handles_nonuniform_weights() {
+        let vs = ValidatorSet::with_weights(vec![
+            (vid_for(1), 5),
+            (vid_for(2), 1),
+            (vid_for(3), 1),
+            (vid_for(4), 1),
+        ])
+        .unwrap();
+        let g = Block::genesis([0; 32], [0; 32]);
+        let qc = genesis_qc(&g, &vs);
+        assert!(qc.has_quorum(&vs));
+        // Heavy validator (5) plus one small (1) = 6 = threshold.
+        assert_eq!(qc.signer_weight(&vs), 6);
+        assert_eq!(qc.signer_count(), 2);
     }
 
     #[test]
