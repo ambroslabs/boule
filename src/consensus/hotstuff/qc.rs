@@ -1470,6 +1470,146 @@ mod tests {
         assert_eq!(qc.signer_count(), 2);
     }
 
+    /// #469 gap 1 — pin the issue body's "weight change requires a
+    /// larger signer subset" claim.
+    ///
+    /// Two `ValidatorSet`s differ only in one validator's weight:
+    /// pre-boundary `[2, 2, 2, 2]` (total 8, threshold weight 6),
+    /// post-boundary `[4, 2, 2, 2]` (total 10, threshold weight 7).
+    /// The same QC bitmap covering the three light validators
+    /// (sorted indices 1, 2, 3 — total signer weight 6 in both sets)
+    /// is quorum pre-boundary and NOT quorum post-boundary. Crossing
+    /// the boundary therefore forces either the heavy validator
+    /// (weight 4) or a fourth signer to participate. Audit-by-name
+    /// for the #144 acceptance criterion that the parent issue's
+    /// proptest only covered indirectly.
+    #[test]
+    fn weight_change_recomputes_quorum_subsets() {
+        let pre = ValidatorSet::with_weights(vec![
+            (vid_for(1), 2),
+            (vid_for(2), 2),
+            (vid_for(3), 2),
+            (vid_for(4), 2),
+        ])
+        .unwrap();
+        let post = ValidatorSet::with_weights(vec![
+            (vid_for(1), 4),
+            (vid_for(2), 2),
+            (vid_for(3), 2),
+            (vid_for(4), 2),
+        ])
+        .unwrap();
+        // ValidatorSet sorts by id ascending. vid_for(1) sorts to
+        // index 0; the heavy validator post-boundary is at sorted
+        // index 0. The QC's bitmap covers indices 1, 2, 3 — the
+        // three light validators — in BOTH sets.
+        let mut qc = QuorumCertificate::new(View(7), sample_block_hash(), pre.len());
+        qc.add_signature(1, [0; 64]);
+        qc.add_signature(2, [0; 64]);
+        qc.add_signature(3, [0; 64]);
+
+        // Pre-boundary: signer weight 2+2+2 = 6 > 2/3 of 8 (= 5.33)
+        // ⇒ quorum.
+        assert_eq!(qc.signer_weight(&pre), 6);
+        assert_eq!(quorum_weight_threshold(&pre), 6);
+        assert!(
+            qc.has_quorum(&pre),
+            "3-of-4 light validators must reach quorum at uniform weight 2",
+        );
+
+        // Post-boundary: same bitmap, same signer weight 6, but
+        // total is now 10 and threshold is 7. 3*6 = 18, 2*10 = 20,
+        // 18 > 20 is false ⇒ NOT quorum.
+        assert_eq!(qc.signer_weight(&post), 6);
+        assert_eq!(quorum_weight_threshold(&post), 7);
+        assert!(
+            !qc.has_quorum(&post),
+            "the 3-light subset that was quorum pre-boundary must NOT \
+             be quorum post-boundary — heavy validator or a 4th signer required",
+        );
+
+        // Confirm the post-boundary "larger signer set" — adding the
+        // heavy validator (sorted index 0; weight 4) lifts signer
+        // weight to 10 ⇒ quorum.
+        let mut qc_with_heavy = QuorumCertificate::new(View(7), sample_block_hash(), post.len());
+        qc_with_heavy.add_signature(0, [0; 64]);
+        qc_with_heavy.add_signature(1, [0; 64]);
+        qc_with_heavy.add_signature(2, [0; 64]);
+        qc_with_heavy.add_signature(3, [0; 64]);
+        assert_eq!(qc_with_heavy.signer_weight(&post), 10);
+        assert!(qc_with_heavy.has_quorum(&post));
+    }
+
+    /// #469 gap 2 — pin "historical QCs from before a weight change
+    /// still verify correctly."
+    ///
+    /// A QC formed at view 5 under uniform weights `[1, 1, 1, 1]`
+    /// covers 3-of-4 signers (quorum: `signer_count = 3 = quorum_size(4)`).
+    /// At view 10 the cluster commits a reconfig that bumps the
+    /// first validator's weight to 5. The exact same bitmap, looked
+    /// up against the pre-boundary set via
+    /// `ValidatorSetHistory::set_at(qc.view)`, must still be quorum.
+    /// The same bitmap looked up against the post-boundary set must
+    /// NOT be quorum — without the historical lookup, an honest
+    /// replica would mis-verify a perfectly-good archived QC.
+    #[test]
+    fn historical_qc_verifies_under_pre_boundary_weights_after_weight_change() {
+        use crate::consensus::validator_history::ValidatorSetHistory;
+
+        let pre = ValidatorSet::new(vec![vid_for(1), vid_for(2), vid_for(3), vid_for(4)]);
+        let post = ValidatorSet::with_weights(vec![
+            (vid_for(1), 5),
+            (vid_for(2), 1),
+            (vid_for(3), 1),
+            (vid_for(4), 1),
+        ])
+        .unwrap();
+        let mut history = ValidatorSetHistory::from_genesis(pre.clone());
+        history.insert_boundary(10u64, post.clone()).unwrap();
+
+        // Build a pre-boundary QC at view 5: 3-of-4 light signers,
+        // covering sorted indices 1, 2, 3.
+        let mut qc = QuorumCertificate::new(View(5), sample_block_hash(), pre.len());
+        qc.add_signature(1, [0; 64]);
+        qc.add_signature(2, [0; 64]);
+        qc.add_signature(3, [0; 64]);
+
+        // Historical verification: the historical-set lookup at
+        // qc.view returns the pre-boundary set, and the QC is quorum
+        // there.
+        let pre_set_at_qc = history.set_at(View(5));
+        assert!(
+            qc.has_quorum(pre_set_at_qc.for_view(View(5))),
+            "pre-boundary QC must remain quorum under the validator \
+             set authoritative at qc.view",
+        );
+
+        // Conversely, looking up the post-boundary set at view 11
+        // and applying the SAME bitmap is NOT quorum: 3 light
+        // signers = weight 3, threshold = floor(2*8/3)+1 = 6. The
+        // distinction proves the historical lookup is load-bearing
+        // — without it, an honest replica would (incorrectly) reject
+        // the archived QC.
+        let post_set_at_v11 = history.set_at(View(11));
+        let mut qc_against_post = QuorumCertificate::new(
+            View(11), // synthetic view at which the post-boundary set is authoritative
+            sample_block_hash(),
+            post.len(),
+        );
+        qc_against_post.add_signature(1, [0; 64]);
+        qc_against_post.add_signature(2, [0; 64]);
+        qc_against_post.add_signature(3, [0; 64]);
+        assert_eq!(
+            qc_against_post.signer_weight(post_set_at_v11.for_view(View(11))),
+            3
+        );
+        assert!(
+            !qc_against_post.has_quorum(post_set_at_v11.for_view(View(11))),
+            "the post-boundary 3-light subset must NOT be quorum — \
+             confirms the historical lookup at qc.view is load-bearing",
+        );
+    }
+
     #[test]
     fn genesis_qc_bls_aggregate_is_empty_sentinel() {
         let vs = four_validators();
