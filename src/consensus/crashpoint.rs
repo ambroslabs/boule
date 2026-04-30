@@ -37,6 +37,12 @@
 //! future macro change that would smuggle a runtime branch into
 //! release builds breaks compilation of that anchor).
 
+// CrashSlot's helpers (`empty`, `arm`, `peek`) are only consumed by
+// the `#[cfg(test)] sim` module; in lib builds the dead-code lint
+// flags every method, so scope the allow here rather than ripping
+// the `pub` API away from the test-only consumers.
+#![allow(dead_code)]
+
 use std::sync::{Arc, Mutex};
 
 tokio::task_local! {
