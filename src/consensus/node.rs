@@ -2310,17 +2310,25 @@ impl ConsensusNode {
     ///    manifest's claimed `state_commitment`. A mismatch means
     ///    the producer published a snapshot that doesn't agree with
     ///    its own block header — defensively reject.
-    /// 3. Persist the snapshot block under
+    /// 3. Adopt the snapshot in the safety core: insert the block
+    ///    into `pending_blocks`, set `locked`, `high_qc`, and
+    ///    `last_voted_view` to the snapshot's values. Lock and
+    ///    high-QC views are monotonically forward (joiner's prior
+    ///    values are at most genesis), so safety invariants are
+    ///    preserved. The safety core returns the [`StateUpdate`]s
+    ///    its in-memory mutations must be paired with on disk.
+    /// 4. Persist the snapshot block under
     ///    [`STORAGE_KEY_BLOCK_PREFIX`], the new `last_committed`,
-    ///    and the manifest's `commit_qc` under
-    ///    [`STORAGE_KEY_HIGH_QC`] in one atomic batch. Survives
-    ///    crash recovery: a subsequent boot's [`recover_state`]
-    ///    rebuilds the safety state from these keys.
-    /// 4. Adopt the snapshot in the safety core: insert the block
-    ///    into `pending_blocks`, set `locked` and `high_qc` to the
-    ///    snapshot's values. Lock and high-QC views are
-    ///    monotonically forward (joiner's prior values are at most
-    ///    genesis), so safety invariants are preserved.
+    ///    and every safety-core [`StateUpdate`] from step 3
+    ///    (`VotedInView`, `Locked`, `HighQc`) in one atomic batch.
+    ///    Folding the safety-core writes into the same batch is the
+    ///    audit-finding-4-3 (#406) requirement: a crash between an
+    ///    in-memory adoption and a follow-up persist would let
+    ///    [`recover_state`] rehydrate stale `locked` / `last_voted_view`
+    ///    and the joiner could vote on a fork below the snapshot
+    ///    height. Survives crash recovery: a subsequent boot's
+    ///    [`recover_state`] rebuilds the safety state from these
+    ///    keys.
     /// 5. Update the in-memory `last_committed_*` so subsequent
     ///    `apply_commit`s don't regress.
     fn restore_from_snapshot(
@@ -2344,7 +2352,18 @@ impl ConsensusNode {
                 hex::encode(manifest.state_commitment),
             );
         }
-        // Step 3: persist (block, last_committed, high_qc) atomically.
+        // Step 3: adopt in the safety core (in-memory) and capture
+        // the safety-state Persist actions the core requires us to
+        // flush. Doing the in-memory mutation first lets us pre-encode
+        // every key the snapshot must persist before opening the
+        // batch, so a single atomic write covers both the
+        // integration-layer keys (block, last_committed) and the
+        // safety-core keys (voted_in_view, locked, high_qc). Audit
+        // finding 4-3 (#406): without folding the safety-core writes
+        // into the same batch, a crash between an in-memory adoption
+        // and a follow-up persist would let `recover_state` rehydrate
+        // a stale `locked` / `last_voted_view` and the joiner could
+        // vote on a fork below the snapshot height.
         let block = manifest.block.clone();
         let block_hash = manifest.block_hash;
         let last_committed = LastCommitted {
@@ -2352,19 +2371,39 @@ impl ConsensusNode {
             view: manifest.view,
             last_committed_hash: block_hash,
         };
+        let safety_persist_actions =
+            self.core
+                .adopt_snapshot(block.clone(), manifest.commit_qc.clone(), manifest.view);
+        let mut safety_persist_writes: Vec<(&'static [u8], Vec<u8>)> = Vec::new();
+        for action in &safety_persist_actions {
+            match action {
+                SafetyAction::Persist(StateUpdate::VotedInView { view }) => {
+                    safety_persist_writes
+                        .push((STORAGE_KEY_LAST_VOTED_VIEW, encode_voted_view(*view)?));
+                }
+                SafetyAction::Persist(StateUpdate::Locked(locked)) => {
+                    safety_persist_writes.push((STORAGE_KEY_LOCKED, encode_locked(locked)?));
+                }
+                SafetyAction::Persist(StateUpdate::HighQc(qc)) => {
+                    safety_persist_writes.push((STORAGE_KEY_HIGH_QC, encode_high_qc(qc)?));
+                }
+                other => anyhow::bail!(
+                    "adopt_snapshot must only emit Persist actions, got {:?}",
+                    other,
+                ),
+            }
+        }
         let block_bytes = encode_block(&block)?;
         let last_committed_bytes = encode_last_committed(&last_committed)?;
-        let high_qc_bytes = encode_high_qc(&manifest.commit_qc)?;
         let block_key = block_storage_key(&block_hash);
         self.storage.batch(|b| {
             b.put(&block_key, &block_bytes);
             b.put(STORAGE_KEY_LAST_COMMITTED, &last_committed_bytes);
-            b.put(STORAGE_KEY_HIGH_QC, &high_qc_bytes);
+            for (key, bytes) in &safety_persist_writes {
+                b.put(key, bytes);
+            }
             Ok(())
         })?;
-        // Step 4: adopt in the safety core.
-        self.core
-            .adopt_snapshot(block, manifest.commit_qc.clone(), manifest.view);
         // Step 5: update in-memory last-committed counters. The
         // safety core emits `Action::Commit` in height order, so
         // future commits will increment from this baseline.
@@ -7195,6 +7234,173 @@ mod tests {
             )),
             "on-disk persisted history must carry the rotation",
         );
+    }
+
+    /// Audit finding 4-3 (#406): a joiner that adopts a snapshot,
+    /// crashes before the next consensus event, and restarts must
+    /// rehydrate `locked`, `high_qc`, and `last_voted_view` from
+    /// storage at the snapshot's `(view, height)`. Without persisting
+    /// the safety state alongside the snapshot block + last_committed
+    /// in one atomic batch, `recover_state` would re-seed the joiner
+    /// with `locked = None` and `last_voted_view = 0` — letting it
+    /// vote on a fork below the snapshot height (`safe_to_vote`'s
+    /// `view > last_voted_view` check is trivially satisfied).
+    #[tokio::test]
+    async fn restore_then_restart_preserves_locked_high_qc_and_last_voted_view() {
+        use crate::replication::impls::counter_sm::{CounterCommand, CounterStateMachine};
+
+        let server_signer = fresh_signer();
+        let server_node_id = server_signer.node_id();
+        let joiner_signer = fresh_signer();
+        let other1 = fresh_signer().node_id();
+        let other2 = fresh_signer().node_id();
+        let vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(server_node_id),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                joiner_signer.node_id(),
+            ),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(other1),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(other2),
+        ]);
+
+        // Build a snapshot at height 50 / view 50. The exact values
+        // don't matter — what we're testing is that they survive a
+        // restart, so they need to be distinguishable from "fresh
+        // joiner" defaults (view 0, no lock).
+        let snapshot_height: u64 = 50;
+        let snapshot_view: View = 50;
+        let server_sm: Arc<Mutex<Box<dyn StateMachine>>> =
+            Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+        for _ in 0..5 {
+            server_sm
+                .lock()
+                .apply(&CounterCommand::Increment.encode())
+                .unwrap();
+        }
+        let snapshot_payload = server_sm.lock().snapshot();
+        let expected_commitment = server_sm.lock().state_commitment();
+        let chunks_with_hashes =
+            crate::replication::snapshot::chunk_snapshot(&snapshot_payload, 1024);
+        let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
+        let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
+        let snapshot_block = {
+            let parent_hash = genesis().hash();
+            let commands: Vec<bytes::Bytes> = Vec::new();
+            crate::replication::block::Block {
+                header: crate::replication::block::BlockHeader {
+                    parent_hash,
+                    height: snapshot_height,
+                    view: snapshot_view,
+                    proposer: server_node_id,
+                    state_commitment: expected_commitment,
+                    commands_commitment: crate::replication::block::Block::commands_commitment(
+                        &commands,
+                    ),
+                    validator_history_commitment: [0; 32],
+                },
+                commands,
+            }
+        };
+        let mut commit_qc = QuorumCertificate::new(snapshot_view, snapshot_block.hash(), vs.len());
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
+            commit_qc.add_signature(i, [0u8; 64]);
+        }
+        // `build_for_test_genesis_histories` rewrites
+        // `block.header.validator_history_commitment` (and re-targets
+        // `commit_qc.block_hash` to match), so capture the canonical
+        // post-build hash and QC for downstream assertions.
+        let manifest =
+            crate::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
+                snapshot_block,
+                &vs,
+                1024,
+                chunk_hashes,
+                commit_qc,
+                1_700_000_000,
+            );
+        manifest.verify(&vs).expect("manifest verifies");
+        let snapshot_block_hash = manifest.block_hash;
+        let expected_commit_qc = manifest.commit_qc.clone();
+
+        // ── Pre-crash session: build the joiner, restore the snapshot,
+        //   then drop the node (simulating a crash before any further
+        //   consensus event lands the safety state via `persist_updates`).
+        let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let joiner_wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = snapshot_test_config_enabled(vs.clone(), snapshot_height);
+        let joiner_sm: Arc<Mutex<Box<dyn StateMachine>>> =
+            Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+        let mut joiner_node = ConsensusNode::new(
+            joiner_signer.node_id(),
+            cfg.clone(),
+            Arc::clone(&joiner_sm),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&joiner_storage),
+            Arc::clone(&joiner_wal),
+        );
+        let payload = bytes::Bytes::from(
+            chunks
+                .iter()
+                .flat_map(|c| c.iter().copied())
+                .collect::<Vec<u8>>(),
+        );
+        joiner_node
+            .restore_from_snapshot(manifest, payload)
+            .expect("restore_from_snapshot succeeds");
+
+        // Sanity-check the in-memory state right after restore.
+        assert_eq!(
+            joiner_node.core.state().last_voted_view,
+            snapshot_view,
+            "in-memory last_voted_view must be bumped to snapshot view",
+        );
+        assert_eq!(
+            joiner_node.core.state().locked.map(|l| l.view),
+            Some(snapshot_view),
+            "in-memory locked must reference the snapshot view",
+        );
+        assert_eq!(
+            joiner_node.core.state().high_qc.as_ref().map(|qc| qc.view),
+            Some(snapshot_view),
+            "in-memory high_qc must reference the snapshot view",
+        );
+
+        drop(joiner_node);
+        drop(joiner_sm);
+
+        // ── Post-crash session: recover from the same storage. The
+        //   recovered safety state must reflect the snapshot — no
+        //   silent regression to genesis defaults.
+        let recovered_sm: Arc<Mutex<Box<dyn StateMachine>>> =
+            Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+        let recovered = ConsensusNode::recover(
+            joiner_signer.node_id(),
+            cfg,
+            Arc::clone(&recovered_sm),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&joiner_storage),
+            Arc::clone(&joiner_wal),
+        )
+        .expect("recover from snapshot-restored storage succeeds");
+
+        let state = recovered.core.state();
+        assert_eq!(
+            state.last_voted_view, snapshot_view,
+            "recovered last_voted_view must match snapshot view; \
+             without it, safe_to_vote's view > last_voted_view check \
+             is trivially satisfied on a conflicting fork",
+        );
+        let recovered_locked = state
+            .locked
+            .expect("recovered locked must be present (snapshot's lock survived)");
+        assert_eq!(recovered_locked.view, snapshot_view);
+        assert_eq!(recovered_locked.height, snapshot_height);
+        assert_eq!(recovered_locked.block_hash, snapshot_block_hash);
+        let recovered_high_qc = state
+            .high_qc
+            .as_ref()
+            .expect("recovered high_qc must be present");
+        assert_eq!(recovered_high_qc, &expected_commit_qc);
     }
 
     /// Joiner multi-source happy path (#230 acceptance criterion 1):
