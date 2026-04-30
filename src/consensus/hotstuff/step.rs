@@ -34,7 +34,7 @@ use crate::crypto::signed::Signed;
 use crate::p2p::NodeId;
 use crate::replication::block::{Block, BlockHash};
 
-use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, Vote};
+use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, VerifiedQc, Vote};
 use super::safety_rules::{safe_to_vote, should_update_high_qc, three_chain_commit};
 use super::state::{HotStuffState, Locked};
 use crate::consensus::validator_set::{ValidatorId, ValidatorSet};
@@ -665,10 +665,15 @@ impl HotStuffCore {
     /// message's envelope — so a conventional genesis QC with
     /// placeholder signatures is safe here.
     ///
+    /// Takes a [`VerifiedQc`] (audit finding 5-1 / issue #408) so the
+    /// caller cannot accidentally land an unverified QC into the
+    /// safety core; the wrap site is grep-able as
+    /// `VerifiedQc::unchecked` and documents its trust model inline.
+    ///
     /// After bootstrap, `high_qc` is adopted through ordinary proposal
     /// / vote / NewView / TimeoutVote paths; callers should prefer
     /// those over calling this directly.
-    pub fn set_high_qc(&mut self, qc: QuorumCertificate) {
+    pub fn set_high_qc(&mut self, qc: VerifiedQc) {
         self.state.high_qc = Some(qc);
     }
 
@@ -712,12 +717,16 @@ impl HotStuffCore {
     /// validator set and has quorum
     /// ([`crate::replication::snapshot::SnapshotManifest::verify`])
     /// before calling. The integration layer's `restore_from_snapshot`
-    /// already enforces this.
+    /// already enforces this; the [`VerifiedQc`] parameter type
+    /// pushes that obligation to the type level (audit finding 5-1 /
+    /// issue #408) so a future refactor cannot land a snapshot's
+    /// `commit_qc` into `state.high_qc` without first wrapping it
+    /// through `VerifiedQc::unchecked` at a named audit site.
     #[must_use = "callers must flush the returned Persist actions atomically; see audit finding 4-3"]
     pub fn adopt_snapshot(
         &mut self,
         snapshot_block: Block,
-        commit_qc: QuorumCertificate,
+        commit_qc: VerifiedQc,
         snapshot_view: View,
     ) -> Vec<Action> {
         let block_hash = snapshot_block.hash();
@@ -738,7 +747,7 @@ impl HotStuffCore {
                 view: snapshot_view,
             }),
             Action::Persist(StateUpdate::Locked(locked)),
-            Action::Persist(StateUpdate::HighQc(commit_qc)),
+            Action::Persist(StateUpdate::HighQc(commit_qc.into_inner())),
         ]
     }
 
@@ -788,6 +797,7 @@ impl HotStuffCore {
         let Some(high_qc) = self.state.high_qc.clone() else {
             return Vec::new();
         };
+        let high_qc = high_qc.into_inner();
         let Some(parent) = self.state.pending_blocks.get(&high_qc.block_hash).cloned() else {
             return Vec::new();
         };
@@ -956,7 +966,13 @@ impl HotStuffCore {
             // sender but haven't seen a proposal.
             if should_update_high_qc(&signed.payload.justify, &self.state) {
                 let qc = signed.payload.justify.clone();
-                self.state.high_qc = Some(qc.clone());
+                // `signed` arrived inside a `Verified<Signed<Proposal>>`
+                // envelope; the dispatch verifier ran
+                // `verify_qc_if_requested` on `qc` against the
+                // historical validator set at `qc.view` before
+                // constructing the envelope. Wrap unchecked here is
+                // equivalent. Audit finding 5-1 / issue #408.
+                self.state.high_qc = Some(VerifiedQc::unchecked(qc.clone()));
                 actions.push(Action::Persist(StateUpdate::HighQc(qc)));
             }
 
@@ -1201,7 +1217,14 @@ impl HotStuffCore {
         // `updateQCHigh(qc)` call at the end of `onReceiveVote`
         // in the paper's Algorithm 4.
         if should_update_high_qc(&formed, &self.state) {
-            self.state.high_qc = Some(formed.clone());
+            // Locally assembled from ingress-verified vote envelopes:
+            // each Ed25519 partial / BLS partial was verified at
+            // ingress against the signer's per-historical-view pubkey
+            // before reaching the safety core, so the aggregate is
+            // valid by construction. Wrap unchecked here is the
+            // intended audited-by-name trust path. Audit finding 5-1
+            // / issue #408.
+            self.state.high_qc = Some(VerifiedQc::unchecked(formed.clone()));
             actions.push(Action::Persist(StateUpdate::HighQc(formed.clone())));
         }
 
@@ -1250,7 +1273,12 @@ impl HotStuffCore {
         }
         let block_hash = qc.block_hash;
         let sender = signed.signer;
-        self.state.high_qc = Some(qc.clone());
+        // `signed` arrived inside a `Verified<Signed<NewView>>`
+        // envelope; the dispatch verifier ran `verify_qc_if_requested`
+        // on `qc` against the historical validator set at `qc.view`
+        // before constructing the envelope. Wrap unchecked here is
+        // equivalent. Audit finding 5-1 / issue #408.
+        self.state.high_qc = Some(VerifiedQc::unchecked(qc.clone()));
         let mut actions = vec![Action::Persist(StateUpdate::HighQc(qc))];
         if !self.state.pending_blocks.contains_key(&block_hash) {
             // `expected_height` is informational (the integration
@@ -1384,7 +1412,7 @@ impl HotStuffCore {
             .state
             .high_qc
             .as_ref()
-            .map(|qc| qc.block_hash)
+            .map(|qc| qc.block_hash())
             .filter(|h| !self.state.pending_blocks.contains_key(h))
         {
             parent_hashes_to_retry.insert(high_qc_hash);
@@ -1395,7 +1423,7 @@ impl HotStuffCore {
 
         if let Some(high_qc) = self.state.high_qc.clone() {
             actions.push(Action::Broadcast(ConsensusMsg::NewView(NewView {
-                high_qc,
+                high_qc: high_qc.into_inner(),
             })));
         }
 
@@ -2103,7 +2131,7 @@ mod tests {
         );
         assert_eq!(core.state().last_voted_view, 1);
         assert_eq!(
-            core.state().high_qc.as_ref().map(|q| q.view),
+            core.state().high_qc.as_ref().map(|q| q.view()),
             Some(0),
             "high_qc adopted from the proposal's justify",
         );
@@ -2279,7 +2307,7 @@ mod tests {
             ],
         );
         assert_eq!(core.state().last_voted_view, 10);
-        assert_eq!(core.state().high_qc.as_ref().map(|q| q.view), Some(9));
+        assert_eq!(core.state().high_qc.as_ref().map(|q| q.view()), Some(9));
     }
 
     // ── D5: Byzantine fork at same view from different proposers ─────
@@ -2857,7 +2885,10 @@ mod tests {
             ],
             "quorum transition emits HighQc + ProposedInView persists then Broadcast(Proposal)",
         );
-        assert_eq!(core.state().high_qc.as_ref(), Some(&expected_qc));
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&expected_qc)
+        );
         assert_eq!(core.proposed_in_view(), 4);
     }
 
@@ -2966,7 +2997,7 @@ mod tests {
 
         // Seed a high_qc as if a proposal had adopted one.
         let qc = dummy_qc(5, [0xAA; 32]);
-        core.state.high_qc = Some(qc.clone());
+        core.state.high_qc = Some(VerifiedQc::unchecked(qc.clone()));
 
         // Later PacemakerAdvance → view updates AND the broadcast
         // carries the current high_qc.
@@ -3014,7 +3045,7 @@ mod tests {
         // yet. We seed the inflight tracker the way the NewView path
         // would (via #240), so PacemakerAdvance below isn't a no-op
         // on the retry side.
-        core.state.high_qc = Some(high_qc.clone());
+        core.state.high_qc = Some(VerifiedQc::unchecked(high_qc.clone()));
         core.block_sync_inflight.insert(
             high_qc_hash,
             BlockSyncInflight {
@@ -3131,7 +3162,10 @@ mod tests {
             fresh,
             vec![Action::Persist(StateUpdate::HighQc(qc_v5.clone()))],
         );
-        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&qc_v5)
+        );
 
         // Same view — `should_update_high_qc` requires strictly
         // greater, so no action, no state change.
@@ -3140,7 +3174,10 @@ mod tests {
             crate::consensus::dispatch::Verified::unchecked(signed_newview(qc_v5_alt, nid(3))),
         ));
         assert!(same.is_empty(), "same-view NewView is a no-op: {same:?}");
-        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&qc_v5)
+        );
 
         // Strictly older — dropped.
         let qc_v3 = dummy_qc(3, [0x33; 32]);
@@ -3148,7 +3185,10 @@ mod tests {
             crate::consensus::dispatch::Verified::unchecked(signed_newview(qc_v3, nid(4))),
         ));
         assert!(stale.is_empty(), "stale NewView is a no-op: {stale:?}");
-        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v5));
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&qc_v5)
+        );
 
         // Strictly newer over the genesis hash again — adopted,
         // overwriting the previous, still no block-sync (block known).
@@ -3160,7 +3200,10 @@ mod tests {
             newer,
             vec![Action::Persist(StateUpdate::HighQc(qc_v9.clone()))],
         );
-        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v9));
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&qc_v9)
+        );
     }
 
     /// Issue #240: a `NewView` whose adopted `high_qc` references a
@@ -3194,7 +3237,10 @@ mod tests {
             ],
             "NewView adopting a fresh high_qc over an unknown block must persist + request the block",
         );
-        assert_eq!(core.state().high_qc.as_ref(), Some(&qc_v7));
+        assert_eq!(
+            core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&qc_v7)
+        );
         assert!(
             core.block_sync_inflight.contains_key(&unknown_hash),
             "in-flight retry tracker must be installed so PacemakerAdvance can drive retries",
@@ -4586,7 +4632,10 @@ mod tests {
             let mut state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             state.last_voted_view = last_voted_view;
             state.locked = locked;
-            state.high_qc = high_qc;
+            // Mirrors `recover_state`: the persisted bytes decode to
+            // `QuorumCertificate`, then wrap as `VerifiedQc` at the
+            // audited recovery site.
+            state.high_qc = high_qc.map(VerifiedQc::unchecked);
             for block in pending {
                 state.insert_pending(block.clone());
             }
@@ -4637,7 +4686,7 @@ mod tests {
             // crash for the safety invariant to hold.
             let last_voted_view = pre.state().last_voted_view;
             let locked = pre.state().locked;
-            let high_qc = pre.state().high_qc.clone();
+            let high_qc = pre.state().high_qc.as_ref().map(|q| q.inner().clone());
 
             // Restart: fresh core, same persisted triple.
             let mut post = restart_with_persisted_state(
@@ -4725,7 +4774,7 @@ mod tests {
 
             let last_voted_view = pre.state().last_voted_view;
             let locked = pre.state().locked;
-            let high_qc = pre.state().high_qc.clone();
+            let high_qc = pre.state().high_qc.as_ref().map(|q| q.inner().clone());
 
             // Restart with the persisted snapshot. block_v1 is the
             // locked block — it MUST be in `pending_blocks` for the
@@ -4813,11 +4862,11 @@ mod tests {
                     nid(2),
                 )),
             ));
-            assert_eq!(pre.state().high_qc.as_ref().map(|q| q.view), Some(1));
+            assert_eq!(pre.state().high_qc.as_ref().map(|q| q.view()), Some(1));
 
             let last_voted_view = pre.state().last_voted_view;
             let locked = pre.state().locked;
-            let high_qc = pre.state().high_qc.clone();
+            let high_qc = pre.state().high_qc.as_ref().map(|q| q.inner().clone());
 
             let mut post = restart_with_persisted_state(
                 1,
@@ -4840,11 +4889,14 @@ mod tests {
                 "stale NewView must produce no actions: {actions:?}",
             );
             assert_eq!(
-                post.state().high_qc.as_ref().map(|q| q.view),
+                post.state().high_qc.as_ref().map(|q| q.view()),
                 Some(1),
                 "high_qc preserved at view 1 across restart and stale NewView",
             );
-            assert_eq!(post.state().high_qc, Some(fresh_qc_v1));
+            assert_eq!(
+                post.state().high_qc.as_ref().map(|q| q.inner().clone()),
+                Some(fresh_qc_v1)
+            );
         }
 
         /// Test 4 — partial persistence.
@@ -4954,7 +5006,7 @@ mod tests {
                  {actions_v2:?}",
             );
             assert_eq!(
-                post.state().high_qc.as_ref().map(|q| q.view),
+                post.state().high_qc.as_ref().map(|q| q.view()),
                 Some(1),
                 "high_qc adopted at view 1 from the recovery proposal's justify",
             );
@@ -4992,7 +5044,7 @@ mod tests {
             let mut pre = make_core(1);
             let genesis = Block::genesis([0; 32], [0; 32]);
             let qc_genesis = dummy_qc(0, genesis.hash());
-            pre.state.high_qc = Some(qc_genesis.clone());
+            pre.state.high_qc = Some(VerifiedQc::unchecked(qc_genesis.clone()));
 
             let pre_actions = pre.become_leader(4);
             let proposed_idx = pre_actions.iter().position(|a| {
@@ -5023,7 +5075,7 @@ mod tests {
             // `with_proposed_in_view`, mirroring what the integration
             // layer's `recover()` does.
             let mut post_state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-            post_state.high_qc = Some(qc_genesis.clone());
+            post_state.high_qc = Some(VerifiedQc::unchecked(qc_genesis.clone()));
             let post_builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
             let mut post =
                 HotStuffCore::new(nid(1), post_state, post_builder).with_proposed_in_view(4);
@@ -5047,7 +5099,7 @@ mod tests {
             // other branch of `build_proposal_at_view`.
             let mut post_unguarded_state =
                 HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-            post_unguarded_state.high_qc = Some(qc_genesis);
+            post_unguarded_state.high_qc = Some(VerifiedQc::unchecked(qc_genesis));
             let unguarded_builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
             let mut post_unguarded =
                 HotStuffCore::new(nid(1), post_unguarded_state, unguarded_builder);
@@ -6459,7 +6511,7 @@ mod tests {
                 core.state.insert_pending(block.clone());
             }
             let tip_hash = chain.last().unwrap().hash();
-            core.state.high_qc = Some(dummy_qc(3, tip_hash));
+            core.state.high_qc = Some(VerifiedQc::unchecked(dummy_qc(3, tip_hash)));
             assert_eq!(core.state.pending_blocks.len(), 4);
             assert_eq!(core.eviction_counters().pending_blocks(), 0);
 

@@ -38,14 +38,15 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
-    let QcVerification::Verify {
-        scheme,
-        bls_key_history,
-        min_v_eff_delay: _,
-        genesis_hash,
-    } = qc_verification
-    else {
-        return Ok(());
+    let (scheme, bls_key_history, genesis_hash) = match qc_verification {
+        #[cfg(test)]
+        QcVerification::Skip => return Ok(()),
+        QcVerification::Verify {
+            scheme,
+            bls_key_history,
+            min_v_eff_delay: _,
+            genesis_hash,
+        } => (scheme, bls_key_history, genesis_hash),
     };
 
     // Audit finding 7-4 (issue #418): a view-0 QC is the genesis
@@ -155,8 +156,8 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
 /// Soft-verify the `high_qc` piggyback on a [`TimeoutVote`](crate::consensus::hotstuff::qc::TimeoutVote).
 ///
 /// Returns `true` if the piggyback is either absent, accompanied by a
-/// [`QcVerification::Skip`] policy (legacy / test fixture path), or
-/// passes both well-formedness and aggregate-signature verification
+/// `QcVerification::Skip` policy (legacy / test fixture path —
+/// `cfg(test)`-only), or passes both well-formedness and aggregate-signature verification
 /// against the validator set authoritative at `qc.view`. Returns
 /// `false` if the piggyback is structurally malformed or fails
 /// aggregate verification — the caller must then drop the piggyback
@@ -183,6 +184,7 @@ pub(in crate::consensus::dispatch) fn verify_high_qc_piggyback(
     let Some(qc) = high_qc else {
         return true;
     };
+    #[cfg(test)]
     if matches!(qc_verification, QcVerification::Skip) {
         return true;
     }

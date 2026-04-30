@@ -201,16 +201,18 @@ impl ValidatorKeyRotation {
 
     /// Check that the BLS half of this rotation matches the chain's
     /// signature scheme, and (on BLS chains) that `new_bls_pop`
-    /// verifies under `new_bls_pubkey` (#358).
+    /// verifies under `new_bls_pubkey` and `chain_id` (#358, #410).
     ///
     /// Separate from [`Self::validate_structural`] because the chain
     /// scheme isn't part of the rotation payload — it's a property of
     /// the chain the rotation is being applied to. Callers thread the
     /// scheme in from `NodeConfigForConsensus.signature_scheme` (or
-    /// `ConsensusNode.signature_scheme` post-construction).
+    /// `ConsensusNode.signature_scheme` post-construction) and the
+    /// chain_id from `ConsensusNode.chain_id`.
     pub fn validate_scheme_consistency(
         &self,
         scheme: SignatureSchemeChoice,
+        chain_id: &ChainId,
     ) -> Result<(), RotationStructuralError> {
         match scheme {
             SignatureSchemeChoice::Ed25519Collected => {
@@ -231,7 +233,7 @@ impl ValidatorKeyRotation {
                         bls_pop_present: self.new_bls_pop.is_some(),
                     });
                 };
-                BlsAggregated::verify_pop(pop, pk)
+                BlsAggregated::verify_pop(pop, pk, chain_id)
                     .map_err(|_| RotationStructuralError::BlsPopVerificationFailed)
             }
         }
@@ -935,7 +937,7 @@ mod tests {
     fn validate_scheme_consistency_ed25519_chain_accepts_no_bls_fields() {
         let p = sample_payload();
         assert_eq!(
-            p.validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected),
+            p.validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected, &ChainId::TEST),
             Ok(())
         );
     }
@@ -946,7 +948,7 @@ mod tests {
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk);
         let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected)
+            .validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected, &ChainId::TEST)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -961,11 +963,11 @@ mod tests {
     #[test]
     fn validate_scheme_consistency_ed25519_chain_rejects_bls_pop_present() {
         let (sk, _pk) = bls_keypair(0xA1);
-        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
         let mut p = sample_payload();
         p.new_bls_pop = Some(pop);
         let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected)
+            .validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected, &ChainId::TEST)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -980,12 +982,12 @@ mod tests {
     #[test]
     fn validate_scheme_consistency_bls_chain_accepts_valid_pop() {
         let (sk, pk) = bls_keypair(0xB0);
-        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk);
         p.new_bls_pop = Some(pop);
         assert_eq!(
-            p.validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated),
+            p.validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST),
             Ok(())
         );
     }
@@ -994,7 +996,7 @@ mod tests {
     fn validate_scheme_consistency_bls_chain_rejects_missing_bls_pubkey() {
         let p = sample_payload();
         let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated)
+            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1012,7 +1014,7 @@ mod tests {
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk);
         let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated)
+            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1033,12 +1035,12 @@ mod tests {
         // the registration path runs (#291).
         let (sk_a, _pk_a) = bls_keypair(0xC0);
         let (_sk_b, pk_b) = bls_keypair(0xC1);
-        let pop_under_a = BlsAggregated::sign_pop(&sk_a).unwrap();
+        let pop_under_a = BlsAggregated::sign_pop(&sk_a, &ChainId::TEST).unwrap();
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk_b);
         p.new_bls_pop = Some(pop_under_a);
         let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated)
+            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1049,17 +1051,43 @@ mod tests {
     #[test]
     fn validate_scheme_consistency_bls_chain_rejects_tampered_pop_signature() {
         let (sk, pk) = bls_keypair(0xD0);
-        let mut pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let mut pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
         pop.sig[0] ^= 0xFF;
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk);
         p.new_bls_pop = Some(pop);
         let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated)
+            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST)
             .unwrap_err();
         assert!(matches!(
             err,
             RotationStructuralError::BlsPopVerificationFailed
+        ));
+    }
+
+    /// #410: a rotation whose `new_bls_pop` was minted under chain A
+    /// must be rejected when the rotation is applied on chain B,
+    /// blocking cross-deployment PoP replay even when the rest of the
+    /// rotation is well-formed.
+    #[test]
+    fn validate_scheme_consistency_rejects_cross_chain_bls_pop_replay() {
+        let chain_a = ChainId([0xAA; 32]);
+        let chain_b = ChainId([0xBB; 32]);
+        let (sk, pk) = bls_keypair(0xD1);
+        let pop_on_a = BlsAggregated::sign_pop(&sk, &chain_a).unwrap();
+        let mut p = sample_payload();
+        p.new_bls_pubkey = Some(pk);
+        p.new_bls_pop = Some(pop_on_a);
+
+        // Sanity: under the originating chain, the PoP verifies.
+        assert_eq!(
+            p.validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &chain_a),
+            Ok(())
+        );
+        // Cross-chain replay is rejected.
+        assert!(matches!(
+            p.validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &chain_b),
+            Err(RotationStructuralError::BlsPopVerificationFailed)
         ));
     }
 
@@ -1070,7 +1098,7 @@ mod tests {
         // existing `BlsPop` serde modules. Catches a layout regression
         // in either path before the payload ever reaches a chain.
         let (sk, pk) = bls_keypair(0xE0);
-        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk);
         p.new_bls_pop = Some(pop);

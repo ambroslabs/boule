@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 use zeroize::Zeroizing;
 
-use crate::crypto::sig_scheme::{BlsAggregated, BlsPartialSig, BlsPop, BlsPublicKey, BlsSecretKey};
+use crate::crypto::sig_scheme::{BlsAggregated, BlsPartialSig, BlsPublicKey, BlsSecretKey};
 use crate::crypto::signed::PartialSigner;
 
 /// Format version stamped at the head of the on-disk key file.
@@ -61,9 +61,15 @@ pub struct BlsKeyFile {
 /// issue non-goal).
 pub trait BlsKeyProvider: Send + Sync {
     /// Load an existing BLS validator key, or provision a fresh one if
-    /// the backing store is empty. Returns the (secret, public,
-    /// proof-of-possession) triple. The PoP is freshly computed from
-    /// the secret on every load — no need to persist it separately.
+    /// the backing store is empty. Returns the (secret, public) pair.
+    ///
+    /// Proof-of-possession is *not* materialized here because the PoP
+    /// pre-image binds to the chain's [`ChainId`] (#410, audit
+    /// finding 7-2) and the key file is chain-agnostic. Callers that
+    /// need a PoP derive one on demand via
+    /// [`BlsAggregated::sign_pop`] using the chain's `ChainId`.
+    ///
+    /// [`ChainId`]: crate::crypto::signed::ChainId
     fn load_or_init(&self) -> anyhow::Result<BlsValidatorIdentity>;
 
     /// Try to load without creating. `None` if the backing store has no
@@ -76,16 +82,20 @@ pub trait BlsKeyProvider: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// A loaded BLS validator identity: secret + public + a freshly-derived
-/// proof-of-possession.
+/// A loaded BLS validator identity: secret + public.
 ///
 /// `secret` is wrapped in [`Zeroizing`] so the buffer is wiped on
 /// drop. Callers should keep this struct alive only long enough to
 /// build the in-memory signer.
+///
+/// Proof-of-possession is not stored here because the PoP pre-image
+/// binds to the chain's `ChainId` (#410); a single key file may be
+/// used across genesis-time configuration and future rotations on the
+/// same chain, but the PoP is derived per-use via
+/// [`BlsAggregated::sign_pop`].
 pub struct BlsValidatorIdentity {
     pub secret: Zeroizing<BlsSecretKey>,
     pub public: BlsPublicKey,
-    pub pop: BlsPop,
 }
 
 impl std::fmt::Debug for BlsValidatorIdentity {
@@ -93,7 +103,6 @@ impl std::fmt::Debug for BlsValidatorIdentity {
         f.debug_struct("BlsValidatorIdentity")
             .field("secret", &"<redacted>")
             .field("public", &hex::encode(self.public))
-            .field("pop", &"<computed>")
             .finish()
     }
 }
@@ -184,13 +193,7 @@ impl BlsKeyProvider for BlsKeyFile {
             let secret = Zeroizing::new(secret);
             atomic_write(&self.path, &secret).context("writing BLS validator key")?;
             tracing::info!("generated new BLS validator key at {}", self.path.display(),);
-            let pop = BlsAggregated::sign_pop(&secret)
-                .map_err(|e| anyhow::anyhow!("PoP signing failed: {e}"))?;
-            Ok(BlsValidatorIdentity {
-                secret,
-                public,
-                pop,
-            })
+            Ok(BlsValidatorIdentity { secret, public })
         }
     }
 
@@ -222,17 +225,12 @@ fn decode_and_derive(raw: &[u8]) -> anyhow::Result<BlsValidatorIdentity> {
     let mut secret = Zeroizing::new([0u8; 32]);
     secret[..].copy_from_slice(&raw[1..FILE_LEN]);
 
-    // Derive pubkey + PoP from the secret. Both are quick.
+    // Derive the pubkey from the secret. PoP is deferred until a chain
+    // context is in scope (#410).
     let sk = blst::min_pk::SecretKey::from_bytes(&secret[..])
         .map_err(|e| anyhow::anyhow!("malformed BLS secret key on disk: {e:?}"))?;
     let public: BlsPublicKey = sk.sk_to_pk().to_bytes();
-    let pop = BlsAggregated::sign_pop(&secret)
-        .map_err(|e| anyhow::anyhow!("PoP signing failed for loaded key: {e}"))?;
-    Ok(BlsValidatorIdentity {
-        secret,
-        public,
-        pop,
-    })
+    Ok(BlsValidatorIdentity { secret, public })
 }
 
 fn atomic_write(path: &Path, secret: &BlsSecretKey) -> anyhow::Result<()> {
@@ -305,6 +303,7 @@ fn getrandom_or_panic(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::signed::ChainId;
     use tempfile::TempDir;
 
     #[test]
@@ -321,7 +320,6 @@ mod tests {
         let id2 = provider.load_or_init().unwrap();
         assert_eq!(id1.secret[..], id2.secret[..], "reload yields same secret");
         assert_eq!(id1.public, id2.public);
-        assert_eq!(id1.pop, id2.pop, "PoP is deterministic in the secret");
     }
 
     #[test]
@@ -342,13 +340,16 @@ mod tests {
     }
 
     #[test]
-    fn pop_verifies_under_loaded_pubkey() {
-        // End-to-end check: the PoP we hand back is a valid PoP for the
-        // pubkey we hand back.
+    fn pop_derived_from_loaded_key_verifies_under_loaded_pubkey() {
+        // End-to-end check: a PoP derived from the loaded secret under
+        // an arbitrary chain_id verifies under the loaded pubkey and
+        // that same chain_id (#410).
         let dir = TempDir::new().unwrap();
         let provider = BlsKeyFile::new(dir.path().join("bls.key"));
         let id = provider.load_or_init().unwrap();
-        BlsAggregated::verify_pop(&id.pop, &id.public).expect("self-PoP must verify");
+        let chain_id = ChainId([0x77; 32]);
+        let pop = BlsAggregated::sign_pop(&id.secret, &chain_id).unwrap();
+        BlsAggregated::verify_pop(&pop, &id.public, &chain_id).expect("self-PoP must verify");
     }
 
     #[test]
