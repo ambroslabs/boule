@@ -50,6 +50,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::consensus::View;
 use crate::consensus::api::CommitNotifier;
+use crate::consensus::crashpoint::crashpoint;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
 use crate::consensus::hotstuff::Locked;
 use crate::consensus::hotstuff::qc::genesis_qc_bls;
@@ -2362,6 +2363,15 @@ impl ConsensusNode {
             b.put(STORAGE_KEY_HIGH_QC, &high_qc_bytes);
             Ok(())
         })?;
+        // Audit finding 4-2 / issue #406: the storage batch above
+        // landed (block, last_committed, high_qc) atomically, but the
+        // safety core's `Locked` is updated only by the `adopt_snapshot`
+        // call below — and the `Locked` write is not yet durable. A
+        // crash between this point and the next post-snapshot persist
+        // would resume with `high_qc` ahead of `locked`, violating the
+        // HotStuff invariant `locked.view ≤ high_qc.view` that
+        // `recover_state` and the safety walks rely on.
+        crashpoint!("after_adopt_snapshot_persist");
         // Step 4: adopt in the safety core.
         self.core
             .adopt_snapshot(block, manifest.commit_qc.clone(), manifest.view);
@@ -2594,8 +2604,22 @@ impl ConsensusNode {
             }
             // Non-persist action: flush persists first.
             if !persist_buf.is_empty() {
+                let kinds: Vec<_> = persist_buf.iter().map(update_kind).collect();
                 self.persist_updates(&persist_buf)?;
                 persist_buf.clear();
+                // Crashpoints fire AFTER the persist batch durably
+                // landed but BEFORE the dependent send leaves. Audit
+                // findings #1 / #11 / #406 hinge on this exact gap:
+                // the buffer kinds tell the harness which durability
+                // boundary the integration layer just crossed.
+                for kind in kinds {
+                    match kind {
+                        "VotedInView" => crashpoint!("after_persist_voted_view"),
+                        "Locked" => crashpoint!("after_persist_locked"),
+                        "HighQc" => crashpoint!("after_persist_high_qc"),
+                        _ => {}
+                    }
+                }
             }
 
             match action {
@@ -2644,7 +2668,25 @@ impl ConsensusNode {
                         &self.validator_key_history,
                         &self.chain_id,
                     )?;
+                    let msg_is_proposal =
+                        matches!(msg, crate::consensus::hotstuff::ConsensusMsg::Proposal(_));
+                    let msg_is_vote =
+                        matches!(msg, crate::consensus::hotstuff::ConsensusMsg::Vote(_));
                     send_outbound(broadcaster, Outbound::Broadcast(payload)).await;
+                    // After a Proposal hits the wire the leader has a
+                    // de-facto commitment to view N — but
+                    // `proposed_in_view` is in-memory only (audit
+                    // finding 4-3 / issue #407). After a Vote hits the
+                    // wire the replica has a de-facto commitment to
+                    // last_voted_view = view, which `persist_voted_view`
+                    // either has or has not flushed depending on
+                    // discipline (audit finding 4-1 / issue #405).
+                    if msg_is_proposal {
+                        crashpoint!("after_send_outbound_for_proposal");
+                    }
+                    if msg_is_vote {
+                        crashpoint!("after_broadcast_vote");
+                    }
                     self.deliver_loopback(loopback, broadcaster, view_timer, signer)
                         .await?;
                 }
@@ -2658,6 +2700,8 @@ impl ConsensusNode {
                         &self.validator_key_history,
                         &self.chain_id,
                     )?;
+                    let msg_is_vote =
+                        matches!(msg, crate::consensus::hotstuff::ConsensusMsg::Vote(_));
                     if target == self.self_id {
                         tracing::debug!(
                             target: TRACE_TARGET,
@@ -2683,6 +2727,16 @@ impl ConsensusNode {
                             },
                         )
                         .await;
+                        // Vote frames are unicast `SendTo(next_leader)`
+                        // by default. After the bytes are on the wire
+                        // the replica has committed to that vote — so a
+                        // crash here exercises audit finding #1 (the
+                        // peer accepts the vote, the local replica
+                        // restarts, and if `last_voted_view` was not
+                        // already durable the restart equivocates).
+                        if msg_is_vote {
+                            crashpoint!("after_broadcast_vote");
+                        }
                     }
                 }
 
@@ -2729,7 +2783,16 @@ impl ConsensusNode {
         // emits Persist + SendTo; the SendTo flushes, but a final-only
         // Persist batch needs explicit flush here).
         if !persist_buf.is_empty() {
+            let kinds: Vec<_> = persist_buf.iter().map(update_kind).collect();
             self.persist_updates(&persist_buf)?;
+            for kind in kinds {
+                match kind {
+                    "VotedInView" => crashpoint!("after_persist_voted_view"),
+                    "Locked" => crashpoint!("after_persist_locked"),
+                    "HighQc" => crashpoint!("after_persist_high_qc"),
+                    _ => {}
+                }
+            }
         }
 
         Ok(())
@@ -2941,6 +3004,15 @@ impl ConsensusNode {
             .map(Bytes::from)
             .context("encoding TimeoutVote")?;
         send_outbound(broadcaster, Outbound::Broadcast(bytes)).await;
+        // Audit finding 14-1 / issue #415: TimeoutVote is sent without
+        // a preceding persist, so a crash here lets the replica
+        // restart, observe a different `high_qc`, and broadcast a
+        // *fresh* TimeoutVote for the same view with a different
+        // piggyback — equivocation. The fix is to persist the
+        // outbound TimeoutVote before this `send_outbound` returns;
+        // this crashpoint exists so the regression test for that fix
+        // can pin the gap.
+        crashpoint!("after_broadcast_timeout_vote");
 
         // Count our own timeout locally so we don't depend on
         // broadcast-to-self semantics from the p2p layer. The
@@ -3320,6 +3392,14 @@ impl ConsensusNode {
                 "block_persist_failed",
             );
         }
+        // After the committed block + last_committed batch is durable
+        // but BEFORE any downstream side effect (snapshot creation,
+        // reconfig/rotation application, commit-notifier fan-out)
+        // runs. Audit finding 4-6 / issue #411 is about gating those
+        // downstream actions on the durable block write — a regression
+        // would let the snapshot creation hook fire against a block
+        // that did not in fact reach disk.
+        crashpoint!("after_apply_commit_block_persist");
         tracing::info!(
             "consensus: committed block height={} view={}",
             block.header.height,

@@ -188,7 +188,21 @@ pub struct SimCluster {
     /// Inbound event senders, one per node, shared with the routing
     /// tasks. `kill_node` uses this map to dispatch `PeerDisconnected`
     /// to every survivor at kill time.
-    event_txs: Arc<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>,
+    ///
+    /// The outer `Arc<HashMap<…>>` is read-only — keys never change
+    /// once the cluster is built — but each value is wrapped in a
+    /// [`parking_lot::Mutex`] so [`SimCluster::restart_node_with_recover`]
+    /// can hot-swap a single node's `Sender` while the surviving
+    /// route tasks (which captured the same outer Arc at spawn time)
+    /// pick the new sender up on their next frame. Lock contention is
+    /// trivial under the sim's `current_thread + start_paused` model.
+    event_txs: Arc<HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>>>,
+    /// Per-node fire-once crashpoint slots, in `node_ids` order. The
+    /// sim hands a clone of each slot into the consensus task's
+    /// `CRASH_SLOT.scope(...)`; `arm_crashpoint(idx, name)` arms the
+    /// outer-handle clone, which the in-task `crashpoint!()` macro
+    /// observes via the shared `Arc<Mutex<…>>` inside the slot.
+    crash_slots: Vec<crate::consensus::crashpoint::CrashSlot>,
     /// Commits buffered by [`SimCluster::peek_commit_heights`] so that
     /// non-destructive height snapshots do not steal blocks from the
     /// next [`SimCluster::drain_commits`] call. `drain_commits` takes
@@ -432,12 +446,19 @@ impl SimCluster {
 
         // Per-node event channel: routing tasks write here; each node's
         // run() loop reads from its receiver.
-        let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
+        //
+        // The map is wrapped in `Arc<HashMap<…, Mutex<Sender>>>` (rather
+        // than `Arc<HashMap<…, Sender>>`) so that
+        // [`SimCluster::restart_node_with_recover`] can hot-swap a
+        // single node's `Sender` while the surviving route tasks (which
+        // captured the same outer Arc at spawn time) pick the new
+        // sender up on their next frame.
+        let mut event_txs: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> = HashMap::new();
         let mut event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
         for v in vs.iter() {
             let nid = v.into_node_id();
             let (tx, rx) = mpsc::channel(1024);
-            event_txs.insert(nid, tx);
+            event_txs.insert(nid, Mutex::new(tx));
             event_rxs.push((nid, rx));
         }
         let event_txs = Arc::new(event_txs);
@@ -447,6 +468,12 @@ impl SimCluster {
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut limiters: Vec<Arc<crate::p2p::limits::RateLimiter>> = Vec::new();
+        // Per-node fire-once crashpoint slots. One per node, in
+        // `node_ids` order. The sim hands a clone of each into the
+        // consensus task's `CRASH_SLOT.scope(...)`; the test's
+        // `arm_crashpoint(idx, name)` writes through the outer-handle
+        // clone retained here.
+        let mut crash_slots: Vec<crate::consensus::crashpoint::CrashSlot> = Vec::with_capacity(n);
         // Captured for [`SimCluster::restart_all_with_recover`] (#206).
         // Each Vec is in the same `node_ids` (sorted ascending) order
         // as `commit_rxs` / `shutdown_txs`, so a `take`/`recover`
@@ -576,9 +603,19 @@ impl SimCluster {
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             shutdown_txs.push(Some(shutdown_tx));
 
+            // Per-node crashpoint slot. The sim retains one clone in
+            // `crash_slots[idx]`; another goes into the task's
+            // `CRASH_SLOT.scope(...)` so the macro's `try_with` finds
+            // it. Cloning is cheap (Arc bump) and the slots share state.
+            let crash_slot = crate::consensus::crashpoint::CrashSlot::empty();
+            crash_slots.push(crash_slot.clone());
+
             tokio::spawn(async move {
-                let _ = node
-                    .run(broadcaster, discovery, event_rx, signer, shutdown_rx)
+                let _ = crate::consensus::crashpoint::CRASH_SLOT
+                    .scope(crash_slot, async move {
+                        node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
+                            .await
+                    })
                     .await;
             });
         }
@@ -593,6 +630,7 @@ impl SimCluster {
             partition_blocks,
             dead_nodes,
             event_txs,
+            crash_slots,
             commit_cache,
             shutdown_txs,
             overlay_shutdowns: Vec::new(),
@@ -678,9 +716,10 @@ impl SimCluster {
             if nid == killed {
                 continue;
             }
-            let Some(event_tx) = self.event_txs.get(&nid) else {
+            let Some(event_tx_slot) = self.event_txs.get(&nid) else {
                 continue;
             };
+            let event_tx = event_tx_slot.lock().clone();
             if event_tx
                 .try_send(ProtocolEvent::PeerDisconnected { node_id: killed })
                 .is_err()
@@ -982,11 +1021,11 @@ impl SimCluster {
         self.link_cuts.lock().clear();
         self.partition_blocks.lock().clear();
 
-        let mut new_event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
+        let mut new_event_txs: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> = HashMap::new();
         let mut new_event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
         for &nid in &self.node_ids {
             let (tx, rx) = mpsc::channel::<ProtocolEvent>(1024);
-            new_event_txs.insert(nid, tx);
+            new_event_txs.insert(nid, Mutex::new(tx));
             new_event_rxs.push((nid, rx));
         }
         let new_event_txs = Arc::new(new_event_txs);
@@ -1001,6 +1040,8 @@ impl SimCluster {
         let mut new_commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
         let mut new_shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut new_mempools: Vec<Arc<dyn Mempool>> = Vec::new();
+        let mut new_crash_slots: Vec<crate::consensus::crashpoint::CrashSlot> =
+            Vec::with_capacity(n);
 
         for ((nid, event_rx), idx) in new_event_rxs.into_iter().zip(0..n) {
             let signer = Arc::clone(&signers[idx]);
@@ -1061,9 +1102,19 @@ impl SimCluster {
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             new_shutdown_txs.push(Some(shutdown_tx));
 
+            // Fresh per-node crashpoint slot for the post-restart
+            // run. The previous session's slot dies with its task; a
+            // restart-equivalent test that wants to also crash the
+            // recovered node must arm against this fresh slot.
+            let crash_slot = crate::consensus::crashpoint::CrashSlot::empty();
+            new_crash_slots.push(crash_slot.clone());
+
             tokio::spawn(async move {
-                let _ = node
-                    .run(broadcaster, discovery, event_rx, signer, shutdown_rx)
+                let _ = crate::consensus::crashpoint::CRASH_SLOT
+                    .scope(crash_slot, async move {
+                        node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
+                            .await
+                    })
                     .await;
             });
         }
@@ -1071,12 +1122,205 @@ impl SimCluster {
         self.commit_rxs = new_commit_rxs;
         self.shutdown_txs = new_shutdown_txs;
         self.mempools = new_mempools;
+        self.crash_slots = new_crash_slots;
         // Reset the per-node commit cache since the new commit_rxs
         // replace the old ones; any blocks not yet drained from the
         // pre-restart receivers are intentionally lost — this matches
         // the production semantics where in-flight commit observers
         // also disappear on restart.
         self.commit_cache = (0..n).map(|_| Vec::new()).collect();
+    }
+
+    // ── Crashpoint harness (issue #420) ───────────────────────────────────────
+
+    /// Arm the fire-once crashpoint slot for node `idx` with `name`.
+    /// The next `crashpoint!("name")` the consensus task crosses
+    /// panics with a `CrashPoint(name)` payload, modelling a process
+    /// kill at the named durability boundary.
+    ///
+    /// The slot is fire-once: a single matching crashpoint clears the
+    /// arm. Subsequent `crashpoint!()` calls in the same task with the
+    /// same name are silent. Re-arming after the task is restarted
+    /// (via [`SimCluster::restart_node_with_recover`]) works against
+    /// the fresh slot the restart helper installs.
+    ///
+    /// Replaces any previously-armed but not-yet-fired entry; returns
+    /// the previous arm so callers can defensively assert nothing was
+    /// lost.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is out of range or if the cluster was spawned
+    /// without per-node crash slots (gossip-mode clusters).
+    pub fn arm_crashpoint(&self, idx: usize, name: &'static str) -> Option<&'static str> {
+        assert!(
+            idx < self.crash_slots.len(),
+            "arm_crashpoint: idx {idx} out of range (n={})",
+            self.crash_slots.len(),
+        );
+        self.crash_slots[idx].arm(name)
+    }
+
+    /// Inspect the currently-armed crashpoint name for node `idx`,
+    /// without consuming it. Returns `None` if no crashpoint is armed
+    /// or if the previously-armed crashpoint already fired (the slot
+    /// is fire-once). Use as a post-condition assertion to confirm
+    /// the expected crashpoint actually fired during a test run.
+    pub fn peek_crashpoint(&self, idx: usize) -> Option<&'static str> {
+        self.crash_slots[idx].peek()
+    }
+
+    /// Crash one specific node and bring it back via
+    /// [`ConsensusNode::recover`] against the same on-disk state.
+    ///
+    /// Surgical analog of [`SimCluster::restart_all_with_recover`]:
+    /// only node `idx` is torn down and respawned. The other replicas
+    /// keep running. Use after a [`crashpoint!`] has fired (the
+    /// node's tokio task has already panicked) or after a deliberate
+    /// [`SimCluster::kill_node`] when the test wants the node back.
+    ///
+    /// Mechanics:
+    ///
+    /// 1. Mark `idx` as dead so peers' route tasks drop any in-flight
+    ///    frames addressed to the panicked event_rx.
+    /// 2. Yield several rounds so any sends already at
+    ///    `event_tx.send(...).await` hit the closed receiver and
+    ///    return.
+    /// 3. Hot-swap a fresh `Sender` into the per-node slot in
+    ///    `event_txs`. Surviving route tasks see the new sender on
+    ///    their next frame because each entry is a `Mutex<Sender>`.
+    /// 4. Spawn a new route task for the reborn node's outbound
+    ///    channel.
+    /// 5. Build a new `ConsensusNode` via `recover()` against the
+    ///    captured `(signer, storage, wal)` triple. Wrap the run loop
+    ///    in a fresh `CRASH_SLOT.scope` so the test can re-arm.
+    /// 6. Clear `idx` from the dead-nodes set so subsequent traffic
+    ///    flows again.
+    ///
+    /// Mempool, state machine, and pacemaker are *not* preserved —
+    /// the same as `restart_all_with_recover`. What survives is the
+    /// durable `(last_voted_view, locked, high_qc, committed-blocks)`
+    /// tuple in storage, which `recover` consumes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cluster was not spawned via a mesh-mode
+    /// constructor (gossip-mode clusters don't capture per-node
+    /// `(signer, storage, wal)` triples).
+    pub async fn restart_node_with_recover(&mut self, idx: usize) -> anyhow::Result<()> {
+        let signers = self
+            .signers
+            .as_ref()
+            .expect("restart_node_with_recover requires a mesh-mode SimCluster");
+        let storages = self
+            .storages
+            .as_ref()
+            .expect("restart_node_with_recover requires captured storages");
+        let wals = self
+            .wals
+            .as_ref()
+            .expect("restart_node_with_recover requires captured WALs");
+        let signer = Arc::clone(&signers[idx]);
+        let storage = Arc::clone(&storages[idx]);
+        let wal = Arc::clone(&wals[idx]);
+        let nid = self.node_ids[idx];
+
+        // Step 1: mark dead and tear down the existing shutdown sender.
+        // The panicked task already exited, but we drop our shutdown
+        // sender so a stray drop doesn't try to signal a nonexistent
+        // run loop. If `restart_node_with_recover` is called against
+        // a still-live node, this also signals it down.
+        if let Some(tx) = self.shutdown_txs[idx].take() {
+            let _ = tx.send(());
+        }
+        self.dead_nodes.lock().insert(nid);
+
+        // Step 2: drain any in-flight sends to the dead receiver. With
+        // tokio paused, yields are virtually free; 32 is well above
+        // the longest send-then-resolve chain in the route loop.
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        // Step 3: hot-swap the per-node `event_tx` so peers' route
+        // tasks (which captured the same outer Arc) deliver into the
+        // reborn node's mailbox on their next frame.
+        let (new_event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(1024);
+        if let Some(slot) = self.event_txs.get(&nid) {
+            *slot.lock() = new_event_tx;
+        }
+
+        // Step 4: build the reborn node and wire its outbound channel
+        // through a fresh route task.
+        let config = NodeConfigForConsensus {
+            validator_set: self.validator_set.clone(),
+            genesis: self.genesis.clone(),
+            propose_limit: 16,
+            timeout_base: self.timeout_base,
+            timeout_max: Duration::from_secs(30),
+            limits: CacheLimits::unbounded_for_tests(),
+            snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
+            min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+            signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
+        };
+        let sm: Arc<Mutex<Box<dyn StateMachine>>> =
+            Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(256));
+        self.mempools[idx] = Arc::clone(&mempool);
+
+        let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
+        self.commit_rxs[idx] = commit_rx;
+        // Reset the per-node commit cache for the reborn slot — old
+        // pre-crash commits already returned via earlier
+        // `drain_commits` calls; the `recover` path replays from
+        // durable state and starts a new in-memory log.
+        self.commit_cache[idx].clear();
+        let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(MpscCommitNotifier::new(commit_tx));
+
+        let node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)?
+            .with_commit_notifier(commit_notifier);
+
+        let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
+        let broadcaster: Arc<dyn Broadcaster> = Arc::new(MeshBroadcaster::new(send_tx));
+        let (_disco_src_tx, disco_src_rx) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
+        let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(disco_src_rx);
+
+        spawn_route_task(
+            nid,
+            send_rx,
+            Arc::clone(&self.event_txs),
+            Arc::clone(&self.partitioned),
+            Arc::clone(&self.link_cuts),
+            Arc::clone(&self.partition_blocks),
+            Arc::clone(&self.dead_nodes),
+            None,
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        self.shutdown_txs[idx] = Some(shutdown_tx);
+
+        // Fresh per-node crashpoint slot for the reborn task. The
+        // pre-crash slot fired its single arm and was discarded with
+        // the dead task; tests that want to crash the recovered node
+        // again call `arm_crashpoint(idx, …)` against this fresh slot.
+        let crash_slot = crate::consensus::crashpoint::CrashSlot::empty();
+        self.crash_slots[idx] = crash_slot.clone();
+
+        tokio::spawn(async move {
+            let _ = crate::consensus::crashpoint::CRASH_SLOT
+                .scope(crash_slot, async move {
+                    node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
+                        .await
+                })
+                .await;
+        });
+
+        // Step 5: clear the dead-nodes mark so peers can talk to the
+        // reborn node again. Done after the new run loop is spawned
+        // so an inbound frame that arrives between revival and run
+        // has somewhere to go.
+        self.dead_nodes.lock().remove(&nid);
+        Ok(())
     }
 
     /// Drain both receivers into the per-node cache. Shared by
@@ -1115,7 +1359,7 @@ impl Drop for SimCluster {
 fn spawn_route_task(
     my_id: NodeId,
     mut send_rx: mpsc::Receiver<ProtocolOutbound>,
-    route_txs: Arc<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>,
+    route_txs: Arc<HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>>>,
     partitioned: Arc<Mutex<HashSet<NodeId>>>,
     link_cuts: Arc<Mutex<HashSet<LinkCut>>>,
     partition_blocks: Arc<Mutex<HashSet<LinkCut>>>,
@@ -1168,7 +1412,7 @@ fn spawn_route_task(
 async fn route_one_frame(
     my_id: NodeId,
     outbound: ProtocolOutbound,
-    route_txs: &HashMap<NodeId, mpsc::Sender<ProtocolEvent>>,
+    route_txs: &HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>>,
     partitioned: &Mutex<HashSet<NodeId>>,
     link_cuts: &Mutex<HashSet<LinkCut>>,
     partition_blocks: &Mutex<HashSet<LinkCut>>,
@@ -1176,7 +1420,7 @@ async fn route_one_frame(
 ) {
     match outbound {
         ProtocolOutbound::Broadcast(payload) => {
-            for (target, tx) in route_txs.iter() {
+            for (target, tx_slot) in route_txs.iter() {
                 if *target == my_id {
                     continue;
                 }
@@ -1192,6 +1436,11 @@ async fn route_one_frame(
                 if partition_blocks.lock().contains(&(my_id, *target)) {
                     continue;
                 }
+                // Clone the sender out of the per-entry mutex so we
+                // never hold the lock across the async send. The
+                // `restart_node_with_recover` path swaps the inner
+                // sender; subsequent frames re-clone the new one.
+                let tx = tx_slot.lock().clone();
                 let _ = tx
                     .send(ProtocolEvent::Message {
                         from: my_id,
@@ -1216,7 +1465,8 @@ async fn route_one_frame(
             if partition_blocks.lock().contains(&(my_id, node_id)) {
                 return;
             }
-            if let Some(tx) = route_txs.get(&node_id) {
+            if let Some(tx_slot) = route_txs.get(&node_id) {
+                let tx = tx_slot.lock().clone();
                 let _ = tx
                     .send(ProtocolEvent::Message {
                         from: my_id,
@@ -1377,12 +1627,12 @@ impl SimCluster {
 
         // Per-node raw event channels — sim's route tasks deliver
         // `ProtocolEvent`s to the orchestrator's input here.
-        let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
+        let mut event_txs: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> = HashMap::new();
         let mut event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
         for v in vs.iter() {
             let nid = v.into_node_id();
             let (tx, rx) = mpsc::channel(1024);
-            event_txs.insert(nid, tx);
+            event_txs.insert(nid, Mutex::new(tx));
             event_rxs.push((nid, rx));
         }
         let event_txs = Arc::new(event_txs);
@@ -1537,7 +1787,7 @@ impl SimCluster {
         // edges.
         for (i, neighbours) in topology.iter().enumerate() {
             let nid_i = node_ids[i];
-            let event_tx_i = &event_txs[&nid_i];
+            let event_tx_i = event_txs[&nid_i].lock().clone();
             for &j in neighbours {
                 let nid_j = node_ids[j];
                 if event_tx_i
@@ -1597,6 +1847,9 @@ impl SimCluster {
             partition_blocks,
             dead_nodes,
             event_txs,
+            // Crashpoint injection is mesh-cluster only — the gossip
+            // overlay clusters don't run inside `CRASH_SLOT.scope(...)`.
+            crash_slots: Vec::new(),
             commit_cache,
             shutdown_txs,
             overlay_shutdowns,
@@ -1667,7 +1920,7 @@ mod tests {
         node_ids: Vec<NodeId>,
         send_txs: Vec<mpsc::Sender<ProtocolOutbound>>,
         event_rxs: Vec<mpsc::Receiver<ProtocolEvent>>,
-        event_txs: Arc<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>,
+        event_txs: Arc<HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>>>,
         dead_nodes: Arc<Mutex<HashSet<NodeId>>>,
         #[allow(dead_code)]
         partitioned: Arc<Mutex<HashSet<NodeId>>>,
@@ -1694,11 +1947,12 @@ mod tests {
             let partition_blocks = Arc::new(Mutex::new(HashSet::new()));
             let dead_nodes = Arc::new(Mutex::new(HashSet::new()));
 
-            let mut event_tx_map: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
+            let mut event_tx_map: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> =
+                HashMap::new();
             let mut event_rxs: Vec<mpsc::Receiver<ProtocolEvent>> = Vec::new();
             for &nid in &node_ids {
                 let (tx, rx) = mpsc::channel(1024);
-                event_tx_map.insert(nid, tx);
+                event_tx_map.insert(nid, Mutex::new(tx));
                 event_rxs.push(rx);
             }
             let event_txs = Arc::new(event_tx_map);
@@ -1744,7 +1998,8 @@ mod tests {
                 if nid == killed {
                     continue;
                 }
-                if let Some(event_tx) = self.event_txs.get(&nid) {
+                if let Some(event_tx_slot) = self.event_txs.get(&nid) {
+                    let event_tx = event_tx_slot.lock().clone();
                     let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id: killed });
                 }
             }
