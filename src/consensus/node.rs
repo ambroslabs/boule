@@ -2834,10 +2834,13 @@ impl ConsensusNode {
                 view: signed.inner().payload.block.header.view,
                 height: signed.inner().payload.block.header.height,
             }),
-            SafetyEvent::VoteReceived(signed, _bls_partial) => Some(SafetyLogCtx::Vote {
-                voter: signed.inner().signer,
-                view: signed.inner().payload.view,
-            }),
+            SafetyEvent::VoteReceived(variant) => {
+                let signed = variant.verified().inner();
+                Some(SafetyLogCtx::Vote {
+                    voter: signed.signer,
+                    view: signed.payload.view,
+                })
+            }
             SafetyEvent::NewViewReceived(signed) => Some(SafetyLogCtx::NewView {
                 sender: signed.inner().signer,
                 high_qc_view: signed.inner().payload.high_qc.view,
