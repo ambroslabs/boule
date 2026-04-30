@@ -984,11 +984,14 @@ fn handle_snapshot_import(args: &[String]) -> anyhow::Result<()> {
 
 fn handle_reconfig_subcommand(args: &[String]) -> anyhow::Result<()> {
     let sub = args.first().ok_or_else(|| {
-        anyhow::anyhow!("missing reconfig subcommand (try: add-validator, remove-validator)")
+        anyhow::anyhow!(
+            "missing reconfig subcommand (try: add-validator, remove-validator, change-weight)"
+        )
     })?;
     match sub.as_str() {
         "add-validator" => handle_reconfig_add(&args[1..]),
         "remove-validator" => handle_reconfig_remove(&args[1..]),
+        "change-weight" => handle_reconfig_change_weight(&args[1..]),
         other => anyhow::bail!("unknown `reconfig` subcommand: {other}"),
     }
 }
@@ -998,6 +1001,10 @@ struct ReconfigArgs {
     pubkey: Option<String>,
     addr: Option<String>,
     v_eff: Option<u64>,
+    /// Voting weight for the validator at and after `v_eff` (#462).
+    /// Required for `add-validator`; optional and ignored for
+    /// `remove-validator`. Required for `change-weight`. Must be `>= 1`.
+    weight: Option<u64>,
     /// Path to a hex-encoded `<pubkey_hex>:<pop_hex>` file (48-byte
     /// BLS pubkey + 96-byte PoP signature) for the new validator.
     /// Mutually exclusive with `--bls-key-file`.
@@ -1042,6 +1049,21 @@ fn parse_reconfig_args(args: &[String]) -> anyhow::Result<ReconfigArgs> {
                     raw.parse::<u64>()
                         .map_err(|e| anyhow::anyhow!("invalid --v-eff {raw:?}: {e}"))?,
                 );
+            }
+            "--weight" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--weight requires a u64 weight"))?;
+                let w = raw
+                    .parse::<u64>()
+                    .map_err(|e| anyhow::anyhow!("invalid --weight {raw:?}: {e}"))?;
+                if w == 0 {
+                    anyhow::bail!(
+                        "--weight 0 is reserved; use `remove-validator` to drop a validator."
+                    );
+                }
+                out.weight = Some(w);
             }
             "--bls-pop-file" => {
                 i += 1;
@@ -1184,13 +1206,20 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
         })?;
     }
 
+    let weight = a.weight.ok_or_else(|| {
+        anyhow::anyhow!(
+            "reconfig add-validator requires --weight <u64>; use 1 for an unweighted committee."
+        )
+    })?;
     let cmd = ReconfigCommand {
         adds: vec![ValidatorEntry {
             node_id,
             addr,
             bls_pop,
+            weight,
         }],
         removes: vec![],
+        changes: vec![],
         v_eff,
     };
     let payload = cmd.encode();
@@ -1275,6 +1304,37 @@ fn handle_reconfig_remove(args: &[String]) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("--pubkey {pubkey_b58:?} is not a valid NodeId: {e}"))?;
 
     let payload = ReconfigCommand::build_remove_validator_payload(node_id, v_eff);
+    println!("{}", hex::encode(&payload));
+    Ok(())
+}
+
+/// `reconfig change-weight` (#462): change a currently-seated
+/// validator's voting weight at and after `v_eff`. Membership is
+/// unchanged.
+fn handle_reconfig_change_weight(args: &[String]) -> anyhow::Result<()> {
+    use ambros_p2p::consensus::reconfig::ReconfigCommand;
+    use ambros_p2p::p2p::tls::base58_to_node_id;
+
+    let a = parse_reconfig_args(args)?;
+    let pubkey_b58 = a
+        .pubkey
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("reconfig change-weight requires --pubkey <base58>"))?;
+    let v_eff = ambros_p2p::consensus::View(
+        a.v_eff
+            .ok_or_else(|| anyhow::anyhow!("reconfig change-weight requires --v-eff <view>"))?,
+    );
+    let weight = a
+        .weight
+        .ok_or_else(|| anyhow::anyhow!("reconfig change-weight requires --weight <u64>"))?;
+    if a.addr.is_some() {
+        anyhow::bail!("reconfig change-weight does not take --addr");
+    }
+
+    let node_id = base58_to_node_id(pubkey_b58)
+        .map_err(|e| anyhow::anyhow!("--pubkey {pubkey_b58:?} is not a valid NodeId: {e}"))?;
+
+    let payload = ReconfigCommand::build_change_weight_payload(node_id, weight, v_eff);
     println!("{}", hex::encode(&payload));
     Ok(())
 }

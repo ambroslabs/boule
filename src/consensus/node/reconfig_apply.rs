@@ -109,11 +109,33 @@ impl ConsensusNode {
                 continue;
             }
 
-            let next_members_vid: Vec<crate::consensus::validator_set::ValidatorId> = next_members
-                .into_iter()
-                .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
-                .collect();
-            let new_set = ValidatorSet::new(next_members_vid);
+            let next_entries: Vec<(crate::consensus::validator_set::ValidatorId, u64)> =
+                next_members
+                    .into_iter()
+                    .map(|(n, w)| {
+                        (
+                            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(n),
+                            w,
+                        )
+                    })
+                    .collect();
+            let new_set = match ValidatorSet::with_weights(next_entries) {
+                Ok(s) => s,
+                Err(e) => {
+                    // validate_against_with_delay_and_scheme already
+                    // rejects weight 0; this path is unreachable in
+                    // practice. If it fires, drop the reconfig — the
+                    // post-#460 ValidatorSet invariant is load-bearing
+                    // for has_quorum, so a malformed boundary must
+                    // never land in the history.
+                    tracing::error!(
+                        target: TRACE_TARGET,
+                        error = %e,
+                        "reconfig_with_weights_construct_failed",
+                    );
+                    continue;
+                }
+            };
 
             // Insert the boundary into the integration-layer history
             // (used by `dispatch::ingress`).

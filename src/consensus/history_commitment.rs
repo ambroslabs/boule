@@ -188,11 +188,19 @@ pub fn apply_reconfig_commands_to_set_history(
             continue;
         }
 
-        let next_members_vid: Vec<crate::consensus::validator_set::ValidatorId> = next_members
+        let next_entries: Vec<(crate::consensus::validator_set::ValidatorId, u64)> = next_members
             .into_iter()
-            .map(crate::consensus::validator_set::ValidatorId::from_genesis_pubkey)
+            .map(|(n, w)| {
+                (
+                    crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(n),
+                    w,
+                )
+            })
             .collect();
-        let new_set = ValidatorSet::new(next_members_vid);
+        let new_set = match ValidatorSet::with_weights(next_entries) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         // Snapshot the post-reconfig members for the key_history
         // mirror so we don't double-borrow `set_history` after the
         // boundary is inserted.

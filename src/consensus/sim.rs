@@ -4110,6 +4110,7 @@ mod tests {
                 let cmd = ReconfigCommand {
                     adds: vec![],
                     removes: vec![removed],
+                    changes: vec![],
                     v_eff,
                 };
                 let payload = cmd.encode();
@@ -4817,6 +4818,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![removed],
+            changes: vec![],
             v_eff,
         };
         let payload = cmd.encode();
