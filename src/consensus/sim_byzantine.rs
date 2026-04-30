@@ -50,6 +50,7 @@ use parking_lot::Mutex;
 use proptest::prelude::*;
 
 use super::sim::{Adversary, AdversaryCtx, SimCluster, assert_no_conflicts};
+use crate::consensus::View;
 use crate::consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote, Vote};
 use crate::consensus::hotstuff::{NewView, Proposal};
 use crate::consensus::node::WireMessage;
@@ -322,7 +323,7 @@ impl Adversary for TimeoutSpammerAdversary {
             return vec![outbound];
         }
         let tv = TimeoutVote {
-            view: u64::from(*counter),
+            view: View(u64::from(*counter)),
             high_qc: None,
         };
         let signed = Signed::sign(tv, ctx.signer.as_ref(), &ChainId::TEST)
@@ -404,7 +405,7 @@ impl Adversary for ForgedPiggybackAdversary {
             return vec![outbound];
         }
         let tv = TimeoutVote {
-            view: u64::from(*counter),
+            view: View(u64::from(*counter)),
             high_qc: Some(Self::forged_piggyback_qc(ctx.validators.len())),
         };
         let signed = Signed::sign(tv, ctx.signer.as_ref(), &ChainId::TEST)

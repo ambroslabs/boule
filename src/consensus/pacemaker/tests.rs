@@ -83,18 +83,18 @@ fn round_sync_evidence() -> HonestyThresholdEvidence {
 #[test]
 fn two_timeouts_then_tc_advances_to_view_1() {
     let mut pm = make_pm(1);
-    let _ = pm.step(Event::OnTimeout(0));
-    let _ = pm.step(Event::OnTimeout(0));
-    assert_eq!(pm.current_view(), 0);
+    let _ = pm.step(Event::OnTimeout(View(0)));
+    let _ = pm.step(Event::OnTimeout(View(0)));
+    assert_eq!(pm.current_view(), View(0));
     assert_eq!(pm.consecutive_failures(), 2);
 
-    let actions = pm.step(Event::OnTimeoutCert(0));
-    assert_eq!(pm.current_view(), 1);
+    let actions = pm.step(Event::OnTimeoutCert(View(0)));
+    assert_eq!(pm.current_view(), View(1));
     assert_eq!(pm.consecutive_failures(), 0);
     assert_eq!(
         actions[0],
         Action::AdvanceToView {
-            view: 1,
+            view: View(1),
             cause: AdvanceCause::Tc,
         }
     );
@@ -104,18 +104,18 @@ fn two_timeouts_then_tc_advances_to_view_1() {
 #[test]
 fn qc_for_future_view_jumps_and_resets_failures() {
     let mut pm = make_pm(1);
-    let _ = pm.step(Event::OnTimeout(0));
-    let _ = pm.step(Event::OnTimeout(0));
+    let _ = pm.step(Event::OnTimeout(View(0)));
+    let _ = pm.step(Event::OnTimeout(View(0)));
     assert_eq!(pm.consecutive_failures(), 2);
 
-    let actions = pm.step(Event::OnQc(5));
-    assert_eq!(pm.current_view(), 6);
-    assert_eq!(pm.high_qc_view(), 5);
+    let actions = pm.step(Event::OnQc(View(5)));
+    assert_eq!(pm.current_view(), View(6));
+    assert_eq!(pm.high_qc_view(), View(5));
     assert_eq!(pm.consecutive_failures(), 0);
     assert_eq!(
         actions[0],
         Action::AdvanceToView {
-            view: 6,
+            view: View(6),
             cause: AdvanceCause::Qc,
         }
     );
@@ -126,35 +126,35 @@ fn qc_for_future_view_jumps_and_resets_failures() {
 fn stale_qc_is_noop() {
     let mut pm = make_pm(1);
     // Jump forward so 0 is stale.
-    let _ = pm.step(Event::OnQc(5));
-    assert_eq!(pm.current_view(), 6);
+    let _ = pm.step(Event::OnQc(View(5)));
+    assert_eq!(pm.current_view(), View(6));
 
-    let actions = pm.step(Event::OnQc(0));
+    let actions = pm.step(Event::OnQc(View(0)));
     assert!(actions.is_empty());
-    assert_eq!(pm.current_view(), 6);
-    assert_eq!(pm.high_qc_view(), 5);
+    assert_eq!(pm.current_view(), View(6));
+    assert_eq!(pm.high_qc_view(), View(5));
 }
 
 #[test]
 fn timeout_for_non_current_view_is_ignored() {
     let mut pm = make_pm(1);
     // Advance to view 4 via TC.
-    let _ = pm.step(Event::OnTimeoutCert(3));
-    assert_eq!(pm.current_view(), 4);
+    let _ = pm.step(Event::OnTimeoutCert(View(3)));
+    assert_eq!(pm.current_view(), View(4));
 
     // Stale view.
-    assert!(pm.step(Event::OnTimeout(2)).is_empty());
+    assert!(pm.step(Event::OnTimeout(View(2))).is_empty());
     // Future view.
-    assert!(pm.step(Event::OnTimeout(7)).is_empty());
+    assert!(pm.step(Event::OnTimeout(View(7))).is_empty());
     assert_eq!(pm.consecutive_failures(), 0);
 }
 
 #[test]
 fn backoff_grows_with_successive_timeouts() {
     let mut pm = make_pm(1);
-    let a1 = pm.step(Event::OnTimeout(0));
-    let a2 = pm.step(Event::OnTimeout(0));
-    let a3 = pm.step(Event::OnTimeout(0));
+    let a1 = pm.step(Event::OnTimeout(View(0)));
+    let a2 = pm.step(Event::OnTimeout(View(0)));
+    let a3 = pm.step(Event::OnTimeout(View(0)));
 
     assert_eq!(
         find_reset_timer(&a1),
@@ -169,7 +169,11 @@ fn backoff_grows_with_successive_timeouts() {
         Some(Duration::from_millis(BASE_MS * 8))
     );
     assert_eq!(pm.consecutive_failures(), 3);
-    assert_eq!(pm.current_view(), 0, "OnTimeout must not advance the view");
+    assert_eq!(
+        pm.current_view(),
+        View(0),
+        "OnTimeout must not advance the view"
+    );
 }
 
 #[test]
@@ -178,24 +182,24 @@ fn become_leader_fires_iff_self_is_leader_of_new_view() {
     // RoundRobin for view 1 -> validators[1] = nid(2).
     // So self = nid(2) should see BecomeLeader(1); self = nid(1) should not.
     let mut as_leader = make_pm(2);
-    let actions = as_leader.step(Event::OnQc(0));
+    let actions = as_leader.step(Event::OnQc(View(0)));
     assert!(
-        actions.contains(&Action::BecomeLeader(1)),
+        actions.contains(&Action::BecomeLeader(View(1))),
         "self is leader of view 1: {actions:?}"
     );
     // Emission order: AdvanceToView, BecomeLeader, ResetTimer.
     assert_eq!(
         actions[0],
         Action::AdvanceToView {
-            view: 1,
+            view: View(1),
             cause: AdvanceCause::Qc,
         }
     );
-    assert_eq!(actions[1], Action::BecomeLeader(1));
+    assert_eq!(actions[1], Action::BecomeLeader(View(1)));
     assert!(matches!(actions[2], Action::ResetTimer(_)));
 
     let mut as_follower = make_pm(1);
-    let actions = as_follower.step(Event::OnQc(0));
+    let actions = as_follower.step(Event::OnQc(View(0)));
     assert!(
         !actions.iter().any(|a| matches!(a, Action::BecomeLeader(_))),
         "self is not leader of view 1: {actions:?}"
@@ -206,10 +210,10 @@ fn become_leader_fires_iff_self_is_leader_of_new_view() {
 fn proposal_received_resets_timer_at_current_backoff() {
     let mut pm = make_pm(1);
     // One prior timeout -> failures = 1.
-    let _ = pm.step(Event::OnTimeout(0));
+    let _ = pm.step(Event::OnTimeout(View(0)));
     assert_eq!(pm.consecutive_failures(), 1);
 
-    let actions = pm.step(Event::OnProposalReceived(0));
+    let actions = pm.step(Event::OnProposalReceived(View(0)));
     // Should ResetTimer at policy.timeout(1) = 2 * base; failures must
     // NOT drop to 0 just because a proposal arrived.
     assert_eq!(actions.len(), 1);
@@ -231,15 +235,19 @@ fn proposal_received_resets_timer_at_current_backoff() {
 fn round_sync_jumps_to_v_not_v_plus_one_for_future_view() {
     let mut pm = make_pm(1);
     let actions = pm.step(Event::OnRoundSync {
-        view: 7,
+        view: View(7),
         evidence: round_sync_evidence(),
     });
-    assert_eq!(pm.current_view(), 7, "advance is *to* v, not to v + 1");
+    assert_eq!(
+        pm.current_view(),
+        View(7),
+        "advance is *to* v, not to v + 1"
+    );
     assert!(
         actions.iter().any(|a| matches!(
             a,
             Action::AdvanceToView {
-                view: 7,
+                view: View(7),
                 cause: AdvanceCause::RoundSync
             }
         )),
@@ -254,30 +262,30 @@ fn round_sync_jumps_to_v_not_v_plus_one_for_future_view() {
 #[test]
 fn round_sync_for_current_or_stale_view_is_noop() {
     let mut pm = make_pm(1);
-    let _ = pm.step(Event::OnQc(4));
-    assert_eq!(pm.current_view(), 5);
+    let _ = pm.step(Event::OnQc(View(4)));
+    assert_eq!(pm.current_view(), View(5));
 
     // Stale.
     let actions = pm.step(Event::OnRoundSync {
-        view: 3,
+        view: View(3),
         evidence: round_sync_evidence(),
     });
     assert!(
         actions.is_empty(),
         "stale round-sync is a no-op: {actions:?}"
     );
-    assert_eq!(pm.current_view(), 5);
+    assert_eq!(pm.current_view(), View(5));
 
     // Current.
     let actions = pm.step(Event::OnRoundSync {
-        view: 5,
+        view: View(5),
         evidence: round_sync_evidence(),
     });
     assert!(
         actions.is_empty(),
         "current-view round-sync is a no-op: {actions:?}"
     );
-    assert_eq!(pm.current_view(), 5);
+    assert_eq!(pm.current_view(), View(5));
 }
 
 /// Round sync must not promote `high_qc_view` — the whole point of
@@ -287,17 +295,17 @@ fn round_sync_for_current_or_stale_view_is_noop() {
 #[test]
 fn round_sync_does_not_advance_high_qc_view() {
     let mut pm = make_pm(1);
-    let _ = pm.step(Event::OnQc(2));
-    assert_eq!(pm.high_qc_view(), 2);
+    let _ = pm.step(Event::OnQc(View(2)));
+    assert_eq!(pm.high_qc_view(), View(2));
 
     let _ = pm.step(Event::OnRoundSync {
-        view: 7,
+        view: View(7),
         evidence: round_sync_evidence(),
     });
-    assert_eq!(pm.current_view(), 7);
+    assert_eq!(pm.current_view(), View(7));
     assert_eq!(
         pm.high_qc_view(),
-        2,
+        View(2),
         "round-sync must leave high_qc_view untouched — only OnQc moves it",
     );
 }
@@ -331,17 +339,17 @@ fn honesty_threshold_evidence_below_bucket_is_none() {
 fn tc_resets_failures_so_next_timeout_uses_base() {
     let mut pm = make_pm(1);
     // Two timeouts at view 0.
-    let _ = pm.step(Event::OnTimeout(0));
-    let _ = pm.step(Event::OnTimeout(0));
+    let _ = pm.step(Event::OnTimeout(View(0)));
+    let _ = pm.step(Event::OnTimeout(View(0)));
     assert_eq!(pm.consecutive_failures(), 2);
 
     // TC advances to view 1 and resets.
-    let _ = pm.step(Event::OnTimeoutCert(0));
-    assert_eq!(pm.current_view(), 1);
+    let _ = pm.step(Event::OnTimeoutCert(View(0)));
+    assert_eq!(pm.current_view(), View(1));
     assert_eq!(pm.consecutive_failures(), 0);
 
     // Next timeout at view 1 arms ResetTimer at 2 * base, not 16 * base.
-    let actions = pm.step(Event::OnTimeout(1));
+    let actions = pm.step(Event::OnTimeout(View(1)));
     assert_eq!(
         find_reset_timer(&actions),
         Some(Duration::from_millis(BASE_MS * 2))
@@ -510,16 +518,20 @@ fn liveness_via_qc_when_leader_is_live() {
     // Each node's delivery of OnProposalReceived(0) triggers a vote in
     // the mock safety core; after quorum (3), the bus broadcasts
     // OnQc(0) and every live pacemaker advances to view 1.
-    bus.broadcast_to_live(Event::OnProposalReceived(0));
+    bus.broadcast_to_live(Event::OnProposalReceived(View(0)));
     bus.run_until_quiescent();
 
     for pm in live_pms(&bus) {
         assert_eq!(
             pm.current_view(),
-            1,
+            View(1),
             "live node did not advance past view 0"
         );
-        assert_eq!(pm.high_qc_view(), 0, "QC for view 0 should be recorded");
+        assert_eq!(
+            pm.high_qc_view(),
+            View(0),
+            "QC for view 0 should be recorded"
+        );
     }
 }
 
@@ -531,7 +543,7 @@ fn liveness_via_tc_when_leader_is_offline() {
 
     // No proposal arrives — each live node's local timer fires for view 0.
     for i in bus.live_indices() {
-        bus.pending[i].push(Event::OnTimeout(0));
+        bus.pending[i].push(Event::OnTimeout(View(0)));
     }
     bus.run_until_quiescent();
 
@@ -540,7 +552,7 @@ fn liveness_via_tc_when_leader_is_offline() {
     for pm in live_pms(&bus) {
         assert_eq!(
             pm.current_view(),
-            1,
+            View(1),
             "live node did not advance past view 0"
         );
         assert_eq!(pm.consecutive_failures(), 0, "TC must reset backoff");
@@ -550,5 +562,5 @@ fn liveness_via_tc_when_leader_is_offline() {
     // Sanity-check that at least one live node saw BecomeLeader(1) over
     // the course of the sim by re-querying the selector directly.
     let sel = selector(validators());
-    assert_eq!(sel.leader_for_view(1), nid(2));
+    assert_eq!(sel.leader_for_view(View(1)), nid(2));
 }

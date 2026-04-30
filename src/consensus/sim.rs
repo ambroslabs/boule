@@ -64,6 +64,7 @@ use crate::consensus::api::{CommitNotifier, MpscCommitNotifier};
 use crate::consensus::limits::CacheLimits;
 use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::validator_set::ValidatorSet;
+use crate::consensus::{Height, View};
 use crate::crypto::signed::{NodeSigner, Signer};
 use crate::p2p::identity::NodeIdentity;
 use crate::p2p::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
@@ -126,7 +127,7 @@ pub struct VoteViolation {
     /// payload).
     pub replica: NodeId,
     /// View at which the conflict was observed.
-    pub view: u64,
+    pub view: View,
     /// First block hash this replica voted for at `view`. Recorded in
     /// arrival order; `conflicting_hash` is whichever later vote
     /// disagreed.
@@ -160,7 +161,7 @@ pub struct VoteObserver {
     /// field); the inner map is keyed by `Vote::view`. The first hash
     /// observed at each view is sticky so subsequent observations are
     /// diffed against it for double-vote detection.
-    inner: Mutex<HashMap<NodeId, HashMap<u64, BlockHash>>>,
+    inner: Mutex<HashMap<NodeId, HashMap<View, BlockHash>>>,
     /// Append-only list of conflicts surfaced during the run.
     /// [`SimCluster::assert_no_replica_double_voted`] panics on a
     /// non-empty list at teardown.
@@ -172,7 +173,8 @@ impl VoteObserver {
     /// first time we see this view, or if a prior recording at the
     /// same view had the identical `block_hash`. Conflicting hashes
     /// are appended to the violations list.
-    pub fn record(&self, replica: NodeId, view: u64, block_hash: BlockHash) {
+    pub fn record(&self, replica: NodeId, view: impl Into<View>, block_hash: BlockHash) {
+        let view = view.into();
         let mut votes = self.inner.lock();
         let by_view = votes.entry(replica).or_default();
         match by_view.get(&view) {
@@ -1107,7 +1109,7 @@ impl SimCluster {
         self.flush_into_cache();
         self.commit_cache
             .iter()
-            .map(|blocks| blocks.iter().map(|b| b.header.height).max().unwrap_or(0))
+            .map(|blocks| blocks.iter().map(|b| b.header.height.0).max().unwrap_or(0))
             .collect()
     }
 
@@ -2197,7 +2199,7 @@ fn fresh_signer() -> NodeSigner {
 /// Check that all blocks committed across all nodes are consistent:
 /// every height must map to exactly one block hash. Panics on violation.
 pub fn assert_no_conflicts(all_committed: &[Vec<Block>]) {
-    let mut canonical: HashMap<u64, BlockHash> = HashMap::new();
+    let mut canonical: HashMap<Height, BlockHash> = HashMap::new();
     for node_commits in all_committed {
         for block in node_commits {
             let h = block.header.height;
@@ -2227,6 +2229,7 @@ mod tests {
     use super::{
         LinkCut, SimCluster, VoteObserver, assert_no_conflicts, fresh_signer, spawn_route_task,
     };
+    use crate::consensus::View;
     use crate::consensus::validator_set::ValidatorSet;
     use crate::crypto::signed::{ChainId, Signer};
     use crate::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
@@ -2261,7 +2264,7 @@ mod tests {
         let v = obs.violations();
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].replica, replica);
-        assert_eq!(v[0].view, 5);
+        assert_eq!(v[0].view, View(5));
         assert_eq!(v[0].first_hash, h_a);
         assert_eq!(v[0].conflicting_hash, h_b);
     }
@@ -2903,7 +2906,7 @@ mod tests {
     /// messages. The surviving three replicas cannot form a normal QC
     /// (nobody proposed view-1), so the only way out is a timeout
     /// certificate: each replica's view timer fires, they all broadcast
-    /// `TimeoutVote { view: 1 }`, and on quorum every replica advances
+    /// `TimeoutVote { view: View(1) }`, and on quorum every replica advances
     /// to view 2 where a new leader proposes. The cluster must commit
     /// at least one block without ever receiving a view-1 proposal.
     ///
@@ -4011,7 +4014,7 @@ mod tests {
                     .await;
                 prop_assert!(warmed, "L5: warm-up did not produce any commit");
 
-                let v_eff: View = v_eff_offset + 5; // floor + small margin
+                let v_eff: View = View(v_eff_offset + 5); // floor + small margin
                 let current = cluster
                     .signer(target)
                     .expect("regular SimCluster captures signers");
@@ -4037,7 +4040,7 @@ mod tests {
                 let crossed = cluster
                     .advance_and_yield_until(Duration::from_secs(12), |c| {
                         c.peek_commit_heights().iter().min().copied().unwrap_or(0)
-                            >= v_eff + 5
+                            >= v_eff.0 + 5
                     })
                     .await;
                 prop_assert!(
@@ -4097,7 +4100,7 @@ mod tests {
                 prop_assert!(warmed, "L4: warm-up did not produce any commit");
 
                 let removed = cluster.node_ids[target];
-                let v_eff: View = v_eff_offset + 5; // floor + a small margin
+                let v_eff: View = View(v_eff_offset + 5); // floor + a small margin
                 let cmd = ReconfigCommand {
                     adds: vec![],
                     removes: vec![removed],
@@ -4120,7 +4123,7 @@ mod tests {
                 let crossed = cluster
                     .advance_and_yield_until(Duration::from_secs(8), |c| {
                         c.peek_commit_heights().iter().min().copied().unwrap_or(0)
-                            >= v_eff + 5
+                            >= v_eff.0 + 5
                     })
                     .await;
                 prop_assert!(
@@ -4804,7 +4807,7 @@ mod tests {
         // that whichever leader picks up the payload satisfies
         // `block_view + MIN_V_EFF_DELAY <= v_eff`.
         let removed = cluster.node_ids[4];
-        let v_eff: View = 60;
+        let v_eff: View = View(60);
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![removed],
@@ -4834,7 +4837,7 @@ mod tests {
                 // with each commit, and views advance ≥ heights, so
                 // a height of `v_eff + 5` guarantees at least one
                 // commit happened at view >= v_eff (with margin).
-                committed.iter().min().copied().unwrap_or(0) >= v_eff + 5
+                committed.iter().min().copied().unwrap_or(0) >= v_eff.0 + 5
             })
             .await;
         assert!(
@@ -4915,7 +4918,7 @@ mod tests {
         // ahead of any leader-of-view turn the rotated validator might
         // serve right after commit, so the cross-boundary window is
         // unambiguous.
-        let v_eff: View = 60;
+        let v_eff: View = View(60);
         let payload = ValidatorKeyRotation {
             validator: rotated_validator,
             new_pubkey,
@@ -4942,7 +4945,7 @@ mod tests {
         // absorbs the wasted views.
         let crossed = cluster
             .advance_and_yield_until(Duration::from_secs(12), |c| {
-                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff + 5
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff.0 + 5
             })
             .await;
         assert!(
@@ -5040,7 +5043,7 @@ mod tests {
         let (new_bls_sk, new_bls_pk) = BlsAggregated::keygen(&bls_ikm).unwrap();
         let new_bls_pop = BlsAggregated::sign_pop(&new_bls_sk, &ChainId::TEST).unwrap();
 
-        let v_eff: View = 60;
+        let v_eff: View = View(60);
         let payload = ValidatorKeyRotation {
             validator: rotated_validator,
             new_pubkey,
@@ -5065,7 +5068,7 @@ mod tests {
         // overhead is dominated by the inter-view round trips.
         let crossed = cluster
             .advance_and_yield_until(Duration::from_secs(12), |c| {
-                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff + 5
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff.0 + 5
             })
             .await;
         assert!(
@@ -5202,9 +5205,9 @@ mod tests {
         // turns) time out. Reaching view ≥ 50 with that drag still
         // fits well inside a 15s wall-clock budget under
         // `start_paused = true`.
-        let v_eff: View = 30;
-        let pre_view: View = 10;
-        let post_view: View = 50;
+        let v_eff: View = View(30);
+        let pre_view: View = View(10);
+        let post_view: View = View(50);
 
         let payload = ValidatorKeyRotation {
             validator: rotated_validator,
@@ -5428,7 +5431,7 @@ mod tests {
             .await;
         assert!(warmed, "warm-up did not commit");
 
-        let v_eff: View = 60;
+        let v_eff: View = View(60);
         let (mut env, _) = rotation_envelope_for_idx(&cluster, 1, v_eff).await;
         // Zero out sig_old. sig_new still verifies under
         // payload.new_pubkey, but the dual-signature property requires
@@ -5446,7 +5449,7 @@ mod tests {
         // at full speed (no wasted views from a rejected leader).
         let crossed = cluster
             .advance_and_yield_until(Duration::from_secs(8), |c| {
-                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff + 5
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff.0 + 5
             })
             .await;
         assert!(crossed, "cluster failed to commit past v_eff = {v_eff}");
@@ -5486,7 +5489,7 @@ mod tests {
             .await;
         assert!(warmed, "warm-up did not commit");
 
-        let v_eff: View = 60;
+        let v_eff: View = View(60);
         let (mut env, _) = rotation_envelope_for_idx(&cluster, 1, v_eff).await;
         env.sig_new = [0u8; 64];
         let bad_bytes = env.encode_command();
@@ -5496,7 +5499,7 @@ mod tests {
 
         let crossed = cluster
             .advance_and_yield_until(Duration::from_secs(8), |c| {
-                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff + 5
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff.0 + 5
             })
             .await;
         assert!(crossed, "cluster failed to commit past v_eff = {v_eff}");
@@ -5545,7 +5548,7 @@ mod tests {
             crate::consensus::validator_rotation::ValidatorKeyRotation {
                 validator: cluster.node_ids[1],
                 new_pubkey: new_signer.node_id(),
-                v_eff: 0,
+                v_eff: View(0),
                 new_bls_pubkey: None,
                 new_bls_pop: None,
             },
@@ -5645,12 +5648,12 @@ mod tests {
             // Index each replica's commits by height, then compare
             // every height that all four replicas reached for full
             // `Block` equality (not just hash).
-            let by_height: Vec<HashMap<u64, &Block>> = committed
+            let by_height: Vec<HashMap<crate::consensus::Height, &Block>> = committed
                 .iter()
                 .map(|node_blocks| node_blocks.iter().map(|b| (b.header.height, b)).collect())
                 .collect();
 
-            let mut common: Vec<u64> = by_height[0]
+            let mut common: Vec<crate::consensus::Height> = by_height[0]
                 .keys()
                 .copied()
                 .filter(|h| by_height.iter().skip(1).all(|m| m.contains_key(h)))

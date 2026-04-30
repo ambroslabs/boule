@@ -35,13 +35,15 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::{Height, View};
+
 /// The `locked` block (HotStuff two-chain lock) as of the snapshot
 /// instant. See [`crate::consensus::hotstuff::state::Locked`] for the
 /// safety-core representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockedStatus {
-    pub view: u64,
-    pub height: u64,
+    pub view: View,
+    pub height: Height,
     /// 32-byte block hash, hex-encoded.
     pub block_hash: String,
 }
@@ -52,8 +54,8 @@ pub struct LockedStatus {
 /// enhancement).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QcStatus {
-    pub view: u64,
-    pub height: Option<u64>,
+    pub view: View,
+    pub height: Option<Height>,
     /// 32-byte block hash, hex-encoded.
     pub block_hash: String,
 }
@@ -63,7 +65,7 @@ pub struct QcStatus {
 /// QC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoteBucketStatus {
-    pub view: u64,
+    pub view: View,
     /// 32-byte block hash the votes in this bucket are for, hex-encoded.
     pub block_hash: String,
     pub signers: usize,
@@ -75,7 +77,7 @@ pub struct VoteBucketStatus {
 /// tied to a specific block).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeoutBucketStatus {
-    pub view: u64,
+    pub view: View,
     pub signers: usize,
     pub quorum: usize,
 }
@@ -88,7 +90,7 @@ pub struct ParkedProposalStatus {
     pub block_hash: String,
     /// 32-byte hash of the missing parent, hex-encoded.
     pub parent_hash: String,
-    pub view: u64,
+    pub view: View,
 }
 
 /// Cumulative count of cap- or `gc_below`-driven evictions across the
@@ -133,10 +135,10 @@ pub struct ConsensusStatus {
     /// `"leader(view=N)"` when this node is the round-robin leader for
     /// the current view; otherwise `"replica"`.
     pub self_role: String,
-    pub current_view: u64,
-    pub last_voted_view: u64,
-    pub last_committed_height: u64,
-    pub last_committed_view: u64,
+    pub current_view: View,
+    pub last_voted_view: View,
+    pub last_committed_height: Height,
+    pub last_committed_view: View,
     pub locked: Option<LockedStatus>,
     pub high_qc: Option<QcStatus>,
     /// Vote buckets whose view falls within `current_view ± 4`. The
@@ -198,35 +200,35 @@ mod tests {
         ConsensusStatus {
             node_id: "DmX44PdK8JNVZUkbLTpD3W5ngmVnWBGyYrmFhh2Mkdb4".to_string(),
             self_role: "leader(view=157)".to_string(),
-            current_view: 157,
-            last_voted_view: 156,
-            last_committed_height: 156,
-            last_committed_view: 157,
+            current_view: View(157),
+            last_voted_view: View(156),
+            last_committed_height: Height(156),
+            last_committed_view: View(157),
             locked: Some(LockedStatus {
-                view: 155,
-                height: 154,
+                view: View(155),
+                height: Height(154),
                 block_hash: "aa".repeat(32),
             }),
             high_qc: Some(QcStatus {
-                view: 156,
-                height: Some(155),
+                view: View(156),
+                height: Some(Height(155)),
                 block_hash: "bb".repeat(32),
             }),
             vote_buckets: vec![VoteBucketStatus {
-                view: 158,
+                view: View(158),
                 block_hash: "cc".repeat(32),
                 signers: 2,
                 quorum: 3,
             }],
             timeout_buckets: vec![TimeoutBucketStatus {
-                view: 159,
+                view: View(159),
                 signers: 1,
                 quorum: 3,
             }],
             parked_proposals: vec![ParkedProposalStatus {
                 block_hash: "dd".repeat(32),
                 parent_hash: "ee".repeat(32),
-                view: 158,
+                view: View(158),
             }],
             pending_blocks_count: 3,
             peers_connected: vec![
@@ -345,10 +347,10 @@ mod tests {
         let s = ConsensusStatus {
             node_id: String::new(),
             self_role: "replica".to_string(),
-            current_view: 0,
-            last_voted_view: 0,
-            last_committed_height: 0,
-            last_committed_view: 0,
+            current_view: View::ZERO,
+            last_voted_view: View::ZERO,
+            last_committed_height: Height::ZERO,
+            last_committed_view: View::ZERO,
             locked: None,
             high_qc: None,
             vote_buckets: Vec::new(),

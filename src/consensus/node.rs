@@ -48,7 +48,6 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use crate::consensus::View;
 use crate::consensus::api::CommitNotifier;
 use crate::consensus::crashpoint::crashpoint;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
@@ -75,6 +74,7 @@ use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::view_timer::ViewTimer;
+use crate::consensus::{Height, View};
 use crate::crypto::signed::ChainId;
 use crate::crypto::signed::Signed;
 use crate::crypto::signed::SignedMessage;
@@ -134,7 +134,7 @@ enum SafetyLogCtx {
     Proposal {
         proposer: NodeId,
         view: View,
-        height: u64,
+        height: Height,
     },
     Vote {
         voter: NodeId,
@@ -563,7 +563,7 @@ impl BlockBuilder for MempoolBlockBuilder {
 
         // Walk parent's uncommitted ancestor chain. The result is
         // newest-first; reversing gives the apply order.
-        let committed_height = self.last_committed_height.load(Ordering::Relaxed);
+        let committed_height = Height(self.last_committed_height.load(Ordering::Relaxed));
         let ancestor_chain = uncommitted_ancestor_chain(parent, pending_blocks, committed_height);
 
         // Fork the committed SM state: snapshot, apply ancestor commands
@@ -596,8 +596,8 @@ impl BlockBuilder for MempoolBlockBuilder {
                             self.dropped_commands.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(
                                 target: TRACE_TARGET,
-                                view,
-                                ancestor_height = ancestor.header.height,
+                                view = view.0,
+                                ancestor_height = ancestor.header.height.0,
                                 cmd_idx,
                                 error = %e,
                                 "block_builder_ancestor_command_apply_failed",
@@ -615,7 +615,7 @@ impl BlockBuilder for MempoolBlockBuilder {
                         self.dropped_commands.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
                             target: TRACE_TARGET,
-                            view,
+                            view = view.0,
                             cmd_idx,
                             error = %e,
                             "block_builder_command_apply_failed",
@@ -637,8 +637,8 @@ impl BlockBuilder for MempoolBlockBuilder {
             if let Err(e) = sm.restore(&snap) {
                 tracing::error!(
                     target: TRACE_TARGET,
-                    view,
-                    parent_height = parent.header.height,
+                    view = view.0,
+                    parent_height = parent.header.height.0,
                     ancestor_chain_len = ancestor_chain.len(),
                     snap_bytes = snap_len,
                     error = %e,
@@ -691,7 +691,7 @@ impl BlockBuilder for MempoolBlockBuilder {
 fn uncommitted_ancestor_chain(
     parent: &Block,
     pending_blocks: &HashMap<BlockHash, Block>,
-    committed_height: u64,
+    committed_height: Height,
 ) -> Vec<Block> {
     let mut chain = Vec::new();
     let mut cursor = parent.clone();
@@ -1043,7 +1043,7 @@ impl ConsensusNode {
             last_committed_height,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
-            last_committed_view: 0,
+            last_committed_view: View::ZERO,
             status_tx: None,
             rate_limiter: None,
             peer_cmd_tx: None,
@@ -1200,8 +1200,8 @@ impl ConsensusNode {
             }
         });
 
-        let min_view = current_view.saturating_sub(BUCKET_VIEW_WINDOW);
-        let max_view = current_view.saturating_add(BUCKET_VIEW_WINDOW);
+        let min_view = current_view.saturating_sub(View(BUCKET_VIEW_WINDOW));
+        let max_view = current_view.saturating_add(View(BUCKET_VIEW_WINDOW));
 
         let mut vote_buckets: Vec<VoteBucketStatus> = self
             .core
@@ -1259,7 +1259,7 @@ impl ConsensusNode {
             self_role,
             current_view,
             last_voted_view: state.last_voted_view,
-            last_committed_height: self.last_committed_height.load(Ordering::Relaxed),
+            last_committed_height: Height(self.last_committed_height.load(Ordering::Relaxed)),
             last_committed_view: self.last_committed_view,
             locked,
             high_qc,
@@ -1328,8 +1328,8 @@ impl ConsensusNode {
         {
             Some(raw) => decode_last_committed(&raw)?,
             None => LastCommitted {
-                height: 0,
-                view: 0,
+                height: Height::ZERO,
+                view: View::ZERO,
                 last_committed_hash: [0u8; 32],
             },
         };
@@ -1365,7 +1365,7 @@ impl ConsensusNode {
             Arc::clone(&timeout_policy) as _,
         );
 
-        let last_committed_height = Arc::new(AtomicU64::new(last_committed.height));
+        let last_committed_height = Arc::new(AtomicU64::new(last_committed.height.0));
         let dropped_commands = Arc::new(AtomicU64::new(0));
         let builder = Arc::new(MempoolBlockBuilder::new(
             self_id,
@@ -1386,7 +1386,7 @@ impl ConsensusNode {
             .context("read proposed_in_view from storage")?
         {
             Some(raw) => decode_proposed_in_view(&raw)?,
-            None => 0,
+            None => View::ZERO,
         };
         let eviction_counters = CacheEvictionCounters::default();
         let mut core = HotStuffCore::with_limits(
@@ -1406,7 +1406,7 @@ impl ConsensusNode {
         // surfaces as a recovery error — we'd rather fail closed than
         // run with a stale set.
         for (v_eff, set) in validator_history.iter() {
-            if v_eff == 0 {
+            if v_eff == View::ZERO {
                 continue;
             }
             core.insert_validator_boundary(v_eff, (**set).clone())
@@ -1533,7 +1533,7 @@ impl ConsensusNode {
             Some(raw) => decode_last_committed(&raw)?,
             None => return Ok(()),
         };
-        if last_committed.height == 0 {
+        if last_committed.height == Height::ZERO {
             // No committed blocks past genesis; nothing to walk.
             return Ok(());
         }
@@ -1584,7 +1584,7 @@ impl ConsensusNode {
                     )
                 })?
             };
-            let is_genesis = block.header.height == 0;
+            let is_genesis = block.header.height == Height::ZERO;
             let parent = block.header.parent_hash;
             chain.push(block);
             if is_genesis {
@@ -1911,10 +1911,10 @@ impl ConsensusNode {
             target: TRACE_TARGET,
             self_id = %node_id_to_base58(&self.self_id),
             last_committed_height = self.last_committed_height.load(Ordering::Relaxed),
-            last_committed_view = self.last_committed_view,
-            high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view()),
-            last_voted_view = self.core.state().last_voted_view,
-            locked_view = ?self.core.state().locked.as_ref().map(|l| l.view),
+            last_committed_view = self.last_committed_view.0,
+            high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view().0),
+            last_voted_view = self.core.state().last_voted_view.0,
+            locked_view = ?self.core.state().locked.as_ref().map(|l| l.view.0),
             validator_set_size = self.validator_set.len(),
             "consensus_resumed",
         );
@@ -1949,7 +1949,7 @@ impl ConsensusNode {
             .high_qc
             .as_ref()
             .map(|qc| qc.view())
-            .unwrap_or(0)
+            .unwrap_or(View::ZERO)
             .max(self.core.state().last_voted_view);
         let boot_actions = self.step_pacemaker(PacemakerEvent::OnQc(boot_view));
         self.apply_pacemaker_actions(boot_actions, broadcaster.as_ref(), &mut view_timer, &signer)
@@ -2280,8 +2280,8 @@ impl ConsensusNode {
                         from = %node_id_to_base58(&from),
                         requested_hash = ?requested_hash,
                         received_hash = ?block_hash,
-                        view = block_view,
-                        height = block_height,
+                        view = block_view.0,
+                        height = block_height.0,
                         "block_sync_response_hash_mismatch",
                     );
                     return Ok(());
@@ -2291,8 +2291,8 @@ impl ConsensusNode {
                         target: TRACE_TARGET,
                         from = %node_id_to_base58(&from),
                         requested_hash = ?requested_hash,
-                        view = block_view,
-                        height = block_height,
+                        view = block_view.0,
+                        height = block_height.0,
                         "block_sync_response_unrequested",
                     );
                     return Ok(());
@@ -2301,8 +2301,8 @@ impl ConsensusNode {
                     target: TRACE_TARGET,
                     from = %node_id_to_base58(&from),
                     hash = ?block_hash,
-                    view = block_view,
-                    height = block_height,
+                    view = block_view.0,
+                    height = block_height.0,
                     "block_sync_response_received",
                 );
                 self.core.insert_pending_block(block);
@@ -2354,7 +2354,7 @@ impl ConsensusNode {
                     target: TRACE_TARGET,
                     from = %node_id_to_base58(&from),
                     has_manifest = manifest.is_some(),
-                    height = manifest.as_ref().map(|m| m.height),
+                    height = manifest.as_ref().map(|m| m.height.0),
                     "snapshot_manifest_response_received",
                 );
                 let actions =
@@ -2373,7 +2373,7 @@ impl ConsensusNode {
                 tracing::debug!(
                     target: TRACE_TARGET,
                     from = %node_id_to_base58(&from),
-                    height,
+                    height = height.0,
                     chunk_idx,
                     has_payload = payload.is_some(),
                     payload_len = payload.as_ref().map(|p| p.len()),
@@ -2381,7 +2381,7 @@ impl ConsensusNode {
                 );
                 let actions = self
                     .snapshot_sync
-                    .on_chunk_response(from, height, chunk_idx, payload);
+                    .on_chunk_response(from, height.0, chunk_idx, payload);
                 self.apply_snapshot_sync_actions(actions, broadcaster, view_timer, signer)
                     .await?;
             }
@@ -2437,16 +2437,16 @@ impl ConsensusNode {
                     if let Err(e) = self.restore_from_snapshot(*manifest, payload) {
                         tracing::error!(
                             target: TRACE_TARGET,
-                            height,
-                            view,
+                            height = height.0,
+                            view = view.0,
                             error = %e,
                             "snapshot_restore_failed",
                         );
                     } else {
                         tracing::info!(
                             target: TRACE_TARGET,
-                            height,
-                            view,
+                            height = height.0,
+                            view = view.0,
                             "snapshot_restored",
                         );
                         // Re-drive any parked proposals through the
@@ -2599,9 +2599,9 @@ impl ConsensusNode {
         // Step 5: update in-memory last-committed counters. The
         // safety core emits `Action::Commit` in height order, so
         // future commits will increment from this baseline.
-        if manifest.height > self.last_committed_height.load(Ordering::Relaxed) {
+        if manifest.height.0 > self.last_committed_height.load(Ordering::Relaxed) {
             self.last_committed_height
-                .store(manifest.height, Ordering::Relaxed);
+                .store(manifest.height.0, Ordering::Relaxed);
             self.last_committed_view = manifest.view;
         }
         // Step 5b (#325 PR D): install the producer's validator
@@ -2639,7 +2639,7 @@ impl ConsensusNode {
         // pick all see the snapshot-time committee. Genesis is
         // already seeded; only later boundaries need replay.
         for (v_eff, set) in installed_set.iter() {
-            if v_eff == 0 {
+            if v_eff == View::ZERO {
                 continue;
             }
             self.core
@@ -2744,7 +2744,7 @@ impl ConsensusNode {
             target: TRACE_TARGET,
             from = %node_id_to_base58(&to),
             requested_height = ?height,
-            served_height = manifest.as_ref().map(|m| m.height),
+            served_height = manifest.as_ref().map(|m| m.height.0),
             "snapshot_manifest_request_received",
         );
         let out = dispatch::egress_snapshot_manifest_response(manifest, to);
@@ -2756,18 +2756,18 @@ impl ConsensusNode {
     /// `payload = None`.
     async fn serve_snapshot_chunk(
         &self,
-        height: u64,
+        height: Height,
         chunk_idx: u32,
         to: NodeId,
         broadcaster: &dyn Broadcaster,
     ) {
         let store = crate::replication::snapshot::SnapshotStore::new(Arc::clone(&self.storage));
-        let payload = match store.load_chunk(height, chunk_idx) {
+        let payload = match store.load_chunk(height.0, chunk_idx) {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(
                     target: TRACE_TARGET,
-                    height,
+                    height = height.0,
                     chunk_idx,
                     error = %e,
                     "snapshot_chunk_lookup_failed",
@@ -2778,12 +2778,12 @@ impl ConsensusNode {
         tracing::info!(
             target: TRACE_TARGET,
             from = %node_id_to_base58(&to),
-            height,
+            height = height.0,
             chunk_idx,
             served = payload.is_some(),
             "snapshot_chunk_request_received",
         );
-        let out = dispatch::egress_snapshot_chunk_response(height, chunk_idx, payload, to);
+        let out = dispatch::egress_snapshot_chunk_response(height.0, chunk_idx, payload, to);
         send_outbound(broadcaster, out).await;
     }
 
@@ -2977,7 +2977,7 @@ impl ConsensusNode {
                         tracing::debug!(
                             target: TRACE_TARGET,
                             hash = ?hash,
-                            requesting_height = expected_height,
+                            requesting_height = expected_height.0,
                             triggered_by = reason.as_str(),
                             "block_sync_request_self_dropped",
                         );
@@ -2986,10 +2986,10 @@ impl ConsensusNode {
                             target: TRACE_TARGET,
                             dest = %node_id_to_base58(&peer),
                             hash = ?hash,
-                            requesting_height = expected_height,
+                            requesting_height = expected_height.0,
                             triggered_by = reason.as_str(),
-                            our_view = self.pacemaker.current_view(),
-                            our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view()),
+                            our_view = self.pacemaker.current_view().0,
+                            our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view().0),
                             "block_sync_request_emitted",
                         );
                         let out = dispatch::egress_block_request(hash, peer);
@@ -3018,7 +3018,7 @@ impl ConsensusNode {
                     tracing::warn!(
                         target: TRACE_TARGET,
                         voter = %node_id_to_base58(voter.as_node_id()),
-                        view,
+                        view = view.0,
                         block_a = ?block_a,
                         block_b = ?block_b,
                         "consensus_equivocation_detected",
@@ -3077,7 +3077,7 @@ impl ConsensusNode {
         for action in actions {
             tracing::debug!(
                 target: TRACE_TARGET,
-                view = self.pacemaker.current_view(),
+                view = self.pacemaker.current_view().0,
                 self_id = %node_id_to_base58(&self.self_id),
                 action = ?action,
                 "pacemaker_action",
@@ -3086,7 +3086,7 @@ impl ConsensusNode {
                 PacemakerAction::AdvanceToView { view: v, cause } => {
                     tracing::debug!(
                         target: TRACE_TARGET,
-                        new_view = v,
+                        new_view = v.0,
                         cause = cause.as_str(),
                         "view_advanced",
                     );
@@ -3123,7 +3123,7 @@ impl ConsensusNode {
     fn step_pacemaker(&mut self, ev: PacemakerEvent) -> Vec<PacemakerAction> {
         tracing::debug!(
             target: TRACE_TARGET,
-            view = self.pacemaker.current_view(),
+            view = self.pacemaker.current_view().0,
             self_id = %node_id_to_base58(&self.self_id),
             event = pacemaker_event_kind(&ev),
             "pacemaker_event",
@@ -3177,8 +3177,8 @@ impl ConsensusNode {
                 tracing::debug!(
                     target: TRACE_TARGET,
                     proposer = %node_id_to_base58(&proposer),
-                    view,
-                    height,
+                    view = view.0,
+                    height = height.0,
                     voted,
                     parked,
                     "proposal_received",
@@ -3193,8 +3193,8 @@ impl ConsensusNode {
                     tracing::warn!(
                         target: TRACE_TARGET,
                         proposer = %node_id_to_base58(&proposer),
-                        view,
-                        height,
+                        view = view.0,
+                        height = height.0,
                         request_block_emitted = true,
                         "proposal_rejected_unknown_parent",
                     );
@@ -3207,7 +3207,7 @@ impl ConsensusNode {
                 tracing::debug!(
                     target: TRACE_TARGET,
                     voter = %node_id_to_base58(&voter),
-                    view,
+                    view = view.0,
                     formed_qc,
                     "vote_received",
                 );
@@ -3219,7 +3219,7 @@ impl ConsensusNode {
                 tracing::debug!(
                     target: TRACE_TARGET,
                     sender = %node_id_to_base58(&sender),
-                    high_qc_view,
+                    high_qc_view = high_qc_view.0,
                     "new_view_received",
                 );
             }
@@ -3389,9 +3389,9 @@ impl ConsensusNode {
                 tracing::debug!(
                     target: TRACE_TARGET,
                     wedged_peer = %node_id_to_base58(&signed.signer),
-                    wedged_view = view,
-                    our_view = self.pacemaker.current_view(),
-                    our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view()),
+                    wedged_view = view.0,
+                    our_view = self.pacemaker.current_view().0,
+                    our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view().0),
                     "catch_up_new_view_sent",
                 );
                 send_outbound(
@@ -3453,7 +3453,7 @@ impl ConsensusNode {
             let bucket_size = bucket.signers.len();
             tracing::debug!(
                 target: TRACE_TARGET,
-                view,
+                view = view.0,
                 signer = %node_id_to_base58(&signer_id),
                 bucket_size,
                 quorum,
@@ -3503,7 +3503,7 @@ impl ConsensusNode {
 
         tracing::debug!(
             target: TRACE_TARGET,
-            view,
+            view = view.0,
             adopt_qc_view = ?adopt_qc.as_ref().map(|q| q.view),
             "tc_formed",
         );
@@ -3583,8 +3583,8 @@ impl ConsensusNode {
     ) -> anyhow::Result<()> {
         tracing::debug!(
             target: TRACE_TARGET,
-            view,
-            current = self.pacemaker.current_view(),
+            view = view.0,
+            current = self.pacemaker.current_view().0,
             "round_sync_fired",
         );
         let pm_actions = self.step_pacemaker(PacemakerEvent::OnRoundSync { view, evidence });
@@ -3618,7 +3618,7 @@ impl ConsensusNode {
                 target: TRACE_TARGET,
                 cache = "timeout_buckets",
                 policy = "cap",
-                evicted_view = victim_view,
+                evicted_view = victim_view.0,
                 cap = self.timeout_buckets_capacity,
                 size_after = self.timeout_buckets.len(),
                 "consensus_cache_evicted",
@@ -3673,9 +3673,9 @@ impl ConsensusNode {
         // safety core emits `Action::Commit` in height order, so a
         // plain max-by-value assignment keeps this monotonic without
         // any extra bookkeeping.
-        if block.header.height > self.last_committed_height.load(Ordering::Relaxed) {
+        if block.header.height.0 > self.last_committed_height.load(Ordering::Relaxed) {
             self.last_committed_height
-                .store(block.header.height, Ordering::Relaxed);
+                .store(block.header.height.0, Ordering::Relaxed);
             self.last_committed_view = block.header.view;
         }
         // Persist (block, last_committed) atomically so the responder
@@ -3684,7 +3684,7 @@ impl ConsensusNode {
         let block_hash = block.hash();
         let key = block_storage_key(&block_hash);
         let last_committed = LastCommitted {
-            height: self.last_committed_height.load(Ordering::Relaxed),
+            height: Height(self.last_committed_height.load(Ordering::Relaxed)),
             view: self.last_committed_view,
             last_committed_hash: block_hash,
         };
@@ -3700,8 +3700,8 @@ impl ConsensusNode {
         if let Err(e) = put_result {
             tracing::error!(
                 target: TRACE_TARGET,
-                height = block.header.height,
-                view = block.header.view,
+                height = block.header.height.0,
+                view = block.header.view.0,
                 hash = ?block_hash,
                 error = %e,
                 "block_persist_failed",
@@ -3746,8 +3746,8 @@ impl ConsensusNode {
             if let Err(e) = self.try_take_snapshot(&block) {
                 tracing::error!(
                     target: TRACE_TARGET,
-                    height = block.header.height,
-                    view = block.header.view,
+                    height = block.header.height.0,
+                    view = block.header.view.0,
                     error = %e,
                     "snapshot_create_failed",
                 );
@@ -3811,8 +3811,8 @@ impl ConsensusNode {
                 Err(e) => {
                     tracing::warn!(
                         target: TRACE_TARGET,
-                        height = block.header.height,
-                        view = block.header.view,
+                        height = block.header.height.0,
+                        view = block.header.view.0,
                         error = %e,
                         "reconfig_payload_malformed",
                     );
@@ -3838,9 +3838,9 @@ impl ConsensusNode {
                 Err(e) => {
                     tracing::warn!(
                         target: TRACE_TARGET,
-                        height = block.header.height,
-                        view = block_view,
-                        v_eff = cmd.v_eff,
+                        height = block.header.height.0,
+                        view = block_view.0,
+                        v_eff = cmd.v_eff.0,
                         error = %e,
                         "reconfig_validation_failed",
                     );
@@ -3860,13 +3860,13 @@ impl ConsensusNode {
             let conflict = self
                 .validator_history
                 .iter()
-                .any(|(v_eff, _)| v_eff != 0 && v_eff > block_view);
+                .any(|(v_eff, _)| v_eff != View::ZERO && v_eff > block_view);
             if conflict {
                 tracing::warn!(
                     target: TRACE_TARGET,
-                    height = block.header.height,
-                    view = block_view,
-                    v_eff = cmd.v_eff,
+                    height = block.header.height.0,
+                    view = block_view.0,
+                    v_eff = cmd.v_eff.0,
                     "reconfig_conflicts_with_pending_or_committed_boundary",
                 );
                 continue;
@@ -3914,9 +3914,9 @@ impl ConsensusNode {
 
             tracing::info!(
                 target: TRACE_TARGET,
-                height = block.header.height,
-                view = block_view,
-                v_eff = cmd.v_eff,
+                height = block.header.height.0,
+                view = block_view.0,
+                v_eff = cmd.v_eff.0,
                 next_size = new_set.len(),
                 "reconfig_applied",
             );
@@ -4018,8 +4018,8 @@ impl ConsensusNode {
                 Err(e) => {
                     tracing::warn!(
                         target: TRACE_TARGET,
-                        height = block.header.height,
-                        view = block_view,
+                        height = block.header.height.0,
+                        view = block_view.0,
                         error = %e,
                         "rotation_payload_malformed",
                     );
@@ -4040,8 +4040,8 @@ impl ConsensusNode {
                 None => {
                     tracing::warn!(
                         target: TRACE_TARGET,
-                        height = block.header.height,
-                        view = block_view,
+                        height = block.header.height.0,
+                        view = block_view.0,
                         validator = ?envelope.payload.validator,
                         "rotation_validator_not_in_key_history",
                     );
@@ -4057,8 +4057,8 @@ impl ConsensusNode {
             if let Err(e) = envelope.verify(current_key.as_node_id(), &self.chain_id) {
                 tracing::warn!(
                     target: TRACE_TARGET,
-                    height = block.header.height,
-                    view = block_view,
+                    height = block.header.height.0,
+                    view = block_view.0,
                     validator = ?envelope.payload.validator,
                     error = %e,
                     "rotation_signature_verification_failed",
@@ -4077,8 +4077,8 @@ impl ConsensusNode {
             {
                 tracing::warn!(
                     target: TRACE_TARGET,
-                    height = block.header.height,
-                    view = block_view,
+                    height = block.header.height.0,
+                    view = block_view.0,
                     validator = ?envelope.payload.validator,
                     error = %e,
                     "rotation_scheme_consistency_failed",
@@ -4103,11 +4103,11 @@ impl ConsensusNode {
             {
                 tracing::warn!(
                     target: TRACE_TARGET,
-                    height = block.header.height,
-                    view = block_view,
+                    height = block.header.height.0,
+                    view = block_view.0,
                     validator = ?envelope.payload.validator,
                     new_pubkey = ?envelope.payload.new_pubkey,
-                    v_eff = envelope.payload.v_eff,
+                    v_eff = envelope.payload.v_eff.0,
                     error = %e,
                     "rotation_history_apply_failed",
                 );
@@ -4149,12 +4149,12 @@ impl ConsensusNode {
                     // notices.
                     tracing::error!(
                         target: TRACE_TARGET,
-                        height = block.header.height,
-                        view = block_view,
+                        height = block.header.height.0,
+                        view = block_view.0,
                         validator = ?envelope.payload.validator,
                         stable_id = ?stable_id,
                         new_bls_pubkey = ?new_bls_pk,
-                        v_eff = envelope.payload.v_eff,
+                        v_eff = envelope.payload.v_eff.0,
                         error = %e,
                         "bls_rotation_history_apply_failed_after_ed25519_apply_succeeded",
                     );
@@ -4165,11 +4165,11 @@ impl ConsensusNode {
 
             tracing::info!(
                 target: TRACE_TARGET,
-                height = block.header.height,
-                view = block_view,
+                height = block.header.height.0,
+                view = block_view.0,
                 validator = ?envelope.payload.validator,
                 new_pubkey = ?envelope.payload.new_pubkey,
-                v_eff = envelope.payload.v_eff,
+                v_eff = envelope.payload.v_eff.0,
                 "rotation_applied",
             );
             applied_any = true;
@@ -4280,8 +4280,8 @@ impl ConsensusNode {
             None => {
                 tracing::warn!(
                     target: TRACE_TARGET,
-                    height = block.header.height,
-                    view = block.header.view,
+                    height = block.header.height.0,
+                    view = block.header.view.0,
                     "snapshot_skipped_no_qc_cached",
                 );
                 return Ok(());
@@ -4338,8 +4338,8 @@ impl ConsensusNode {
         let pruned = store.prune_older_than(self.snapshot_policy.retention_count)?;
         tracing::info!(
             target: TRACE_TARGET,
-            height = manifest.height,
-            view = manifest.view,
+            height = manifest.height.0,
+            view = manifest.view.0,
             chunk_count = manifest.chunk_count,
             chunk_size = manifest.chunk_size,
             pruned = ?pruned,
@@ -4443,7 +4443,7 @@ pub fn decode_block(bytes: &[u8]) -> anyhow::Result<Block> {
 /// "no chain to walk").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastCommitted {
-    pub height: u64,
+    pub height: Height,
     pub view: View,
     pub last_committed_hash: BlockHash,
 }
@@ -4611,7 +4611,7 @@ fn self_role_string(validator_set: &ValidatorSet, self_id: &NodeId, view: View) 
     if validator_set.is_empty() {
         return "replica".to_string();
     }
-    let idx = (view % validator_set.len() as u64) as usize;
+    let idx = (view.0 % validator_set.len() as u64) as usize;
     match validator_set.get(idx) {
         Some(leader) if leader.as_node_id() == self_id => format!("leader(view={view})"),
         _ => "replica".to_string(),
@@ -4652,8 +4652,11 @@ fn genesis_only_bls_seed(
             .validators
             .into_iter()
             .filter_map(|v| {
-                let mut v0_entries: Vec<PersistedBlsKeyEntry> =
-                    v.entries.into_iter().filter(|e| e.v_eff == 0).collect();
+                let mut v0_entries: Vec<PersistedBlsKeyEntry> = v
+                    .entries
+                    .into_iter()
+                    .filter(|e| e.v_eff == View::ZERO)
+                    .collect();
                 if v0_entries.is_empty() {
                     // Reconfig-added validator (no genesis entry).
                     // Don't seed it — the rebuild will add it back via
@@ -4751,9 +4754,9 @@ mod tests {
     #[test]
     fn new_initializes_at_view_zero() {
         let node = make_node(nid(1));
-        assert_eq!(node.current_view(), 0);
-        assert_eq!(node.core.state().current_view, 0);
-        assert_eq!(node.pacemaker.current_view(), 0);
+        assert_eq!(node.current_view(), View(0));
+        assert_eq!(node.core.state().current_view, View(0));
+        assert_eq!(node.pacemaker.current_view(), View(0));
     }
 
     #[test]
@@ -4782,8 +4785,8 @@ mod tests {
         Block {
             header: BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 1,
+                height: Height(1),
+                view: View(1),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -4794,7 +4797,7 @@ mod tests {
     }
 
     fn sample_qc() -> crate::consensus::hotstuff::QuorumCertificate {
-        crate::consensus::hotstuff::QuorumCertificate::new(0, genesis().hash(), 4)
+        crate::consensus::hotstuff::QuorumCertificate::new(View::ZERO, genesis().hash(), 4)
     }
 
     fn dummy_sig() -> [u8; 64] {
@@ -4823,7 +4826,7 @@ mod tests {
         let msg = WireMessage::Vote(
             Signed {
                 payload: Vote {
-                    view: 7,
+                    view: View(7),
                     block_hash: [0xAB; 32],
                 },
                 signer: nid(2),
@@ -4842,7 +4845,7 @@ mod tests {
         let msg = WireMessage::Vote(
             Signed {
                 payload: Vote {
-                    view: 7,
+                    view: View(7),
                     block_hash: [0xAB; 32],
                 },
                 signer: nid(2),
@@ -4874,7 +4877,7 @@ mod tests {
     fn wire_message_timeout_vote_roundtrip() {
         use crate::consensus::hotstuff::qc::TimeoutVote;
         let tv = TimeoutVote {
-            view: 9,
+            view: View(9),
             high_qc: Some(sample_qc()),
         };
         let msg = WireMessage::TimeoutVote(Signed {
@@ -4889,7 +4892,7 @@ mod tests {
         // The `high_qc: None` variant must also roundtrip — it's the
         // very-early-bootstrap encoding where no QC has been observed.
         let tv_none = TimeoutVote {
-            view: 1,
+            view: View(1),
             high_qc: None,
         };
         let msg_none = WireMessage::TimeoutVote(Signed {
@@ -5008,12 +5011,12 @@ mod tests {
         let qc = sample_qc();
 
         let block = builder
-            .build(&parent, 3, &qc, &HashMap::new())
+            .build(&parent, View(3), &qc, &HashMap::new())
             .expect("test builder must not fail");
 
         assert_eq!(block.header.parent_hash, parent.hash());
-        assert_eq!(block.header.height, 1);
-        assert_eq!(block.header.view, 3);
+        assert_eq!(block.header.height, Height(1));
+        assert_eq!(block.header.view, View(3));
         assert_eq!(block.header.proposer, nid(1));
     }
 
@@ -5028,7 +5031,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
             .expect("test builder must not fail");
 
         assert_eq!(block.commands.len(), 2);
@@ -5047,10 +5050,10 @@ mod tests {
         let qc = sample_qc();
 
         let b1 = builder
-            .build(&parent, 1, &qc, &HashMap::new())
+            .build(&parent, View(1), &qc, &HashMap::new())
             .expect("test builder must not fail");
         let b2 = builder
-            .build(&parent, 1, &qc, &HashMap::new())
+            .build(&parent, View(1), &qc, &HashMap::new())
             .expect("test builder must not fail");
 
         assert_eq!(b1.hash(), b2.hash(), "build must be deterministic");
@@ -5070,7 +5073,7 @@ mod tests {
 
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         builder
-            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
             .expect("test builder must not fail");
 
         let after = sm.lock().state_commitment();
@@ -5091,7 +5094,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
             .expect("test builder must not fail");
 
         // Manually apply the same command and check commitment matches.
@@ -5114,7 +5117,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
             .expect("test builder must not fail");
 
         let recomputed = Block::commands_commitment(&block.commands);
@@ -5171,7 +5174,7 @@ mod tests {
         // The fork-and-restore round trip inside `build` triggers our
         // simulated failure. The builder must surface this as `Err`,
         // not panic.
-        let result = builder.build(&genesis(), 1, &sample_qc(), &HashMap::new());
+        let result = builder.build(&genesis(), View(1), &sample_qc(), &HashMap::new());
         let err = result.expect_err("builder must propagate restore failure as Err");
         let msg = format!("{err:#}");
         assert!(
@@ -5225,13 +5228,13 @@ mod tests {
         // pending_blocks parent links + commands), so any value
         // works here.
         let g = genesis();
-        let make_inflight = |parent_hash: BlockHash, height: u64, view: View| -> Block {
+        let make_inflight = |parent_hash: BlockHash, height: u64, view: u64| -> Block {
             let commands = vec![CounterCommand::Increment.encode()];
             Block {
                 header: BlockHeader {
                     parent_hash,
-                    height,
-                    view,
+                    height: Height(height),
+                    view: View(view),
                     proposer: nid(1),
                     state_commitment: [0u8; 32],
                     commands_commitment: Block::commands_commitment(&commands),
@@ -5251,7 +5254,7 @@ mod tests {
         pending_blocks.insert(b3.hash(), b3.clone());
 
         let proposal = builder
-            .build(&b3, 4, &sample_qc(), &pending_blocks)
+            .build(&b3, View(4), &sample_qc(), &pending_blocks)
             .expect("test builder must not fail");
 
         // The builder must not have left the SM mutated — the apply
@@ -5317,13 +5320,13 @@ mod tests {
         // until the prune fires the safety core can hold it; the
         // builder must not re-apply b1's commands either way).
         let g = genesis();
-        let make_inflight = |parent_hash: BlockHash, height: u64, view: View| -> Block {
+        let make_inflight = |parent_hash: BlockHash, height: u64, view: u64| -> Block {
             let commands = vec![CounterCommand::Increment.encode()];
             Block {
                 header: BlockHeader {
                     parent_hash,
-                    height,
-                    view,
+                    height: Height(height),
+                    view: View(view),
                     proposer: nid(1),
                     state_commitment: [0u8; 32],
                     commands_commitment: Block::commands_commitment(&commands),
@@ -5341,7 +5344,7 @@ mod tests {
         pending_blocks.insert(b2.hash(), b2.clone());
 
         let proposal = builder
-            .build(&b2, 3, &sample_qc(), &pending_blocks)
+            .build(&b2, View(3), &sample_qc(), &pending_blocks)
             .expect("test builder must not fail");
 
         // SM unmutated.
@@ -5410,7 +5413,7 @@ mod tests {
             Arc::clone(&dropped_commands),
         );
         let block = builder
-            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
             .expect("builder must skip-and-warn rather than fail the proposal");
 
         // All three commands ride the block — replicas hit the same
@@ -5449,7 +5452,7 @@ mod tests {
         // monotonic for the lifetime of the node, like
         // `cache_evictions`.
         builder
-            .build(&genesis(), 2, &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(2), &sample_qc(), &HashMap::new())
             .expect("second build must also succeed");
         assert_eq!(
             dropped_commands.load(Ordering::Relaxed),
@@ -5462,14 +5465,14 @@ mod tests {
 
     fn sample_locked() -> Locked {
         Locked {
-            view: 40,
-            height: 5,
+            view: View(40),
+            height: Height(5),
             block_hash: [0xABu8; 32],
         }
     }
 
     fn sample_full_qc() -> QuorumCertificate {
-        let mut qc = QuorumCertificate::new(41, [0xCDu8; 32], 4);
+        let mut qc = QuorumCertificate::new(View(41), [0xCDu8; 32], 4);
         qc.add_signature(0, [0x11u8; 64]);
         qc.add_signature(2, [0x22u8; 64]);
         qc.add_signature(3, [0x33u8; 64]);
@@ -5478,7 +5481,7 @@ mod tests {
 
     #[test]
     fn encode_decode_voted_view_roundtrips() {
-        let cases = [0u64, 1, 42, u64::MAX];
+        let cases = [View(0), View(1), View(42), View::MAX];
         for v in cases {
             let bytes = encode_voted_view(v).unwrap();
             assert_eq!(decode_voted_view(&bytes).unwrap(), v);
@@ -5501,7 +5504,7 @@ mod tests {
 
     #[test]
     fn encode_decode_proposed_in_view_roundtrips() {
-        let cases = [0u64, 1, 42, u64::MAX];
+        let cases = [View(0), View(1), View(42), View::MAX];
         for v in cases {
             let bytes = encode_proposed_in_view(v).unwrap();
             assert_eq!(decode_proposed_in_view(&bytes).unwrap(), v);
@@ -5511,7 +5514,7 @@ mod tests {
     #[test]
     fn encode_decode_last_timeout_vote_roundtrips_with_high_qc() {
         let payload = TimeoutVote {
-            view: 17,
+            view: View(17),
             high_qc: Some(sample_full_qc()),
         };
         let bytes = encode_last_timeout_vote(&payload).unwrap();
@@ -5521,7 +5524,7 @@ mod tests {
     #[test]
     fn encode_decode_last_timeout_vote_roundtrips_without_high_qc() {
         let payload = TimeoutVote {
-            view: 0,
+            view: View(0),
             high_qc: None,
         };
         let bytes = encode_last_timeout_vote(&payload).unwrap();
@@ -5542,8 +5545,8 @@ mod tests {
     fn recover_state_from_empty_storage_seeds_genesis_qc() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let state = recover_state(storage.as_ref(), four_validators(), genesis()).unwrap();
-        assert_eq!(state.current_view, 0);
-        assert_eq!(state.last_voted_view, 0);
+        assert_eq!(state.current_view, View(0));
+        assert_eq!(state.last_voted_view, View(0));
         assert!(state.locked.is_none());
         // Empty storage means no persisted high_qc, so the recovery path
         // seeds the cluster-agreed genesis QC so the view-1 leader can
@@ -5580,7 +5583,7 @@ mod tests {
             Arc::clone(&storage),
             Arc::clone(&wal),
         );
-        node.persist_updates(&[StateUpdate::VotedInView { view: 99 }])
+        node.persist_updates(&[StateUpdate::VotedInView { view: View(99) }])
             .unwrap();
         drop(node);
 
@@ -5594,7 +5597,7 @@ mod tests {
             Arc::clone(&wal),
         )
         .unwrap();
-        assert_eq!(recovered.core.state().last_voted_view, 99);
+        assert_eq!(recovered.core.state().last_voted_view, View(99));
     }
 
     #[test]
@@ -5648,7 +5651,7 @@ mod tests {
             Arc::clone(&wal),
         );
         let updates = vec![
-            StateUpdate::VotedInView { view: 7 },
+            StateUpdate::VotedInView { view: View(7) },
             StateUpdate::Locked(sample_locked()),
             StateUpdate::HighQc(sample_full_qc()),
         ];
@@ -5664,14 +5667,14 @@ mod tests {
             Arc::clone(&wal),
         )
         .unwrap();
-        assert_eq!(recovered.core.state().last_voted_view, 7);
+        assert_eq!(recovered.core.state().last_voted_view, View(7));
         assert_eq!(recovered.core.state().locked, Some(sample_locked()));
         assert_eq!(
             recovered.core.state().high_qc.as_ref().map(|q| q.inner()),
             Some(&sample_full_qc()),
         );
         // `recover` does not reset the pacemaker — it always starts at 0.
-        assert_eq!(recovered.current_view(), 0);
+        assert_eq!(recovered.current_view(), View(0));
     }
 
     /// Issue #407 / audit finding 4-6: persisting `ProposedInView`
@@ -5699,7 +5702,7 @@ mod tests {
             Arc::clone(&storage),
             Arc::clone(&wal),
         );
-        node.persist_updates(&[StateUpdate::ProposedInView { view: 12 }])
+        node.persist_updates(&[StateUpdate::ProposedInView { view: View(12) }])
             .unwrap();
 
         // The durable write is immediately readable under the
@@ -5710,7 +5713,7 @@ mod tests {
             .get(STORAGE_KEY_PROPOSED_IN_VIEW)
             .unwrap()
             .expect("ProposedInView must be persisted under STORAGE_KEY_PROPOSED_IN_VIEW");
-        assert_eq!(decode_proposed_in_view(&raw).unwrap(), 12);
+        assert_eq!(decode_proposed_in_view(&raw).unwrap(), View(12));
         drop(node);
 
         let recovered = ConsensusNode::recover(
@@ -5724,7 +5727,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             recovered.core.proposed_in_view(),
-            12,
+            View(12),
             "recover() must restore proposed_in_view from durable storage so a \
              leader that crashed mid-broadcast cannot re-mint at the same view",
         );
@@ -5748,7 +5751,7 @@ mod tests {
             Arc::clone(&wal),
         )
         .unwrap();
-        assert_eq!(recovered.core.proposed_in_view(), 0);
+        assert_eq!(recovered.core.proposed_in_view(), View(0));
     }
 
     /// Issue #206 regression: persisting a `Locked` / `HighQc` whose
@@ -5774,8 +5777,8 @@ mod tests {
         let b_locked = Block {
             header: BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 18,
+                height: Height(1),
+                view: View(18),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -5786,8 +5789,8 @@ mod tests {
         let b_high_qc = Block {
             header: BlockHeader {
                 parent_hash: b_locked.hash(),
-                height: 2,
-                view: 19,
+                height: Height(2),
+                view: View(19),
                 proposer: nid(2),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -5797,8 +5800,8 @@ mod tests {
         };
 
         let locked = Locked {
-            view: 18,
-            height: 1,
+            view: View(18),
+            height: Height(1),
             block_hash: b_locked.hash(),
         };
         let mut qc = QuorumCertificate::new(19, b_high_qc.hash(), 4);
@@ -5905,8 +5908,8 @@ mod tests {
             blocks.push(Block {
                 header: BlockHeader {
                     parent_hash: parent.hash(),
-                    height: i,
-                    view: i + 10,
+                    height: Height(i),
+                    view: View(i + 10),
                     proposer: nid(((i % 4) + 1) as u8),
                     state_commitment: [0u8; 32],
                     commands_commitment: Block::commands_commitment(&[]),
@@ -5985,8 +5988,8 @@ mod tests {
         let b1 = Block {
             header: BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 11,
+                height: Height(1),
+                view: View(11),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -5997,8 +6000,8 @@ mod tests {
         let b2 = Block {
             header: BlockHeader {
                 parent_hash: b1.hash(),
-                height: 2,
-                view: 12,
+                height: Height(2),
+                view: View(12),
                 proposer: nid(2),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -6009,8 +6012,8 @@ mod tests {
         let b3 = Block {
             header: BlockHeader {
                 parent_hash: b2.hash(),
-                height: 3,
-                view: 13,
+                height: Height(3),
+                view: View(13),
                 proposer: nid(3),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -6088,9 +6091,9 @@ mod tests {
     fn persist_is_last_write_wins_within_batch() {
         let node = make_node(nid(1));
         node.persist_updates(&[
-            StateUpdate::VotedInView { view: 3 },
-            StateUpdate::VotedInView { view: 5 },
-            StateUpdate::VotedInView { view: 4 },
+            StateUpdate::VotedInView { view: View(3) },
+            StateUpdate::VotedInView { view: View(5) },
+            StateUpdate::VotedInView { view: View(4) },
         ])
         .unwrap();
         let raw = node
@@ -6098,7 +6101,7 @@ mod tests {
             .get(STORAGE_KEY_LAST_VOTED_VIEW)
             .unwrap()
             .unwrap();
-        assert_eq!(decode_voted_view(&raw).unwrap(), 4);
+        assert_eq!(decode_voted_view(&raw).unwrap(), View(4));
     }
 
     #[test]
@@ -6106,16 +6109,16 @@ mod tests {
         // Subsequent persist calls overwrite the previous value: there's
         // no accumulation, each key is a single cell in storage.
         let node = make_node(nid(1));
-        node.persist_updates(&[StateUpdate::VotedInView { view: 1 }])
+        node.persist_updates(&[StateUpdate::VotedInView { view: View(1) }])
             .unwrap();
-        node.persist_updates(&[StateUpdate::VotedInView { view: 2 }])
+        node.persist_updates(&[StateUpdate::VotedInView { view: View(2) }])
             .unwrap();
         let raw = node
             .storage
             .get(STORAGE_KEY_LAST_VOTED_VIEW)
             .unwrap()
             .unwrap();
-        assert_eq!(decode_voted_view(&raw).unwrap(), 2);
+        assert_eq!(decode_voted_view(&raw).unwrap(), View(2));
     }
 
     #[test]
@@ -6160,7 +6163,7 @@ mod tests {
             Arc::clone(&wal),
         )
         .unwrap();
-        assert_eq!(recovered.core.state().last_voted_view, 0);
+        assert_eq!(recovered.core.state().last_voted_view, View(0));
         assert_eq!(recovered.core.state().locked, Some(sample_locked()));
         let expected = genesis_qc(&genesis(), four_validators().len());
         assert_eq!(
@@ -6238,7 +6241,7 @@ mod tests {
         assert!(matches!(
             &actions[0],
             SafetyAction::Persist(crate::consensus::hotstuff::StateUpdate::ProposedInView {
-                view: 1
+                view: View(1)
             }),
         ));
         assert!(matches!(
@@ -6280,8 +6283,8 @@ mod tests {
         let block = crate::replication::block::Block {
             header: crate::replication::block::BlockHeader {
                 parent_hash: genesis().hash(),
-                height: 1,
-                view: 1,
+                height: Height(1),
+                view: View(1),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: crate::replication::block::Block::commands_commitment(
@@ -6318,7 +6321,7 @@ mod tests {
     /// `ReconfigCommand` payload built by `make_cmd`.
     fn block_with_reconfig(
         height: u64,
-        view: View,
+        view: u64,
         proposer: NodeId,
         cmd: crate::consensus::reconfig::ReconfigCommand,
     ) -> crate::replication::block::Block {
@@ -6326,8 +6329,8 @@ mod tests {
         let commands = vec![payload];
         let header = crate::replication::block::BlockHeader {
             parent_hash: genesis().hash(),
-            height,
-            view,
+            height: Height(height),
+            view: View(view),
             proposer,
             state_commitment: [0u8; 32],
             commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
@@ -6432,7 +6435,7 @@ mod tests {
                 bls_pop: None,
             }],
             removes: vec![],
-            v_eff: 5,
+            v_eff: View(5),
         };
         let block = block_with_reconfig(1, 5, nid(1), cmd);
         node.apply_commit(block);
@@ -6471,8 +6474,8 @@ mod tests {
         let commands = vec![payload_a, payload_b];
         let header = crate::replication::block::BlockHeader {
             parent_hash: genesis().hash(),
-            height: 1,
-            view: 0,
+            height: Height(1),
+            view: View(0),
             proposer: nid(1),
             state_commitment: [0u8; 32],
             commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
@@ -6619,8 +6622,8 @@ mod tests {
         let commands = vec![bad_payload];
         let header = crate::replication::block::BlockHeader {
             parent_hash: genesis().hash(),
-            height: 1,
-            view: 0,
+            height: Height(1),
+            view: View(0),
             proposer: nid(1),
             state_commitment: [0u8; 32],
             commands_commitment: crate::replication::block::Block::commands_commitment(&commands),
@@ -6822,8 +6825,8 @@ mod tests {
                 let block = Block {
                     header: BlockHeader {
                         parent_hash,
-                        height: h,
-                        view: if h == 42 { 57 } else { h },
+                        height: Height(h),
+                        view: View(if h == 42 { 57 } else { h }),
                         proposer: nid(1),
                         state_commitment: [0u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
@@ -6834,7 +6837,7 @@ mod tests {
                 node.apply_commit(block);
             }
             assert_eq!(node.last_committed_height.load(Ordering::Relaxed), 42);
-            assert_eq!(node.last_committed_view, 57);
+            assert_eq!(node.last_committed_view, View(57));
         }
 
         // New session: recover from the same storage and confirm the
@@ -6849,7 +6852,7 @@ mod tests {
         )
         .expect("recover");
         assert_eq!(recovered.last_committed_height.load(Ordering::Relaxed), 42);
-        assert_eq!(recovered.last_committed_view, 57);
+        assert_eq!(recovered.last_committed_view, View(57));
     }
 
     /// `Dispatch::ServeBlock` must serve a block that lives only in
@@ -7033,7 +7036,7 @@ mod tests {
         // about to receive).
         let requested_hash: BlockHash = [0xAA; 32];
         node.core
-            .install_block_sync_inflight_for_test(requested_hash, nid(2), 1);
+            .install_block_sync_inflight_for_test(requested_hash, nid(2), Height(1));
 
         let block = sample_block();
         let block_hash = block.hash();
@@ -7084,7 +7087,7 @@ mod tests {
         let block = sample_block();
         let block_hash = block.hash();
         node.core
-            .install_block_sync_inflight_for_test(block_hash, nid(2), 1);
+            .install_block_sync_inflight_for_test(block_hash, nid(2), Height(1));
 
         node.apply_dispatch(
             Dispatch::ReceiveBlock {
@@ -7140,8 +7143,8 @@ mod tests {
             crate::replication::block::Block {
                 header: crate::replication::block::BlockHeader {
                     parent_hash,
-                    height,
-                    view: 7,
+                    height: Height(height),
+                    view: View(7),
                     proposer: [0u8; 32],
                     state_commitment: [0xCD; 32],
                     commands_commitment: crate::replication::block::Block::commands_commitment(
@@ -7152,7 +7155,7 @@ mod tests {
                 commands,
             }
         };
-        let mut qc = QuorumCertificate::new(0, block.hash(), vs.len());
+        let mut qc = QuorumCertificate::new(View::ZERO, block.hash(), vs.len());
         for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
             qc.add_signature(i, [0u8; 64]);
         }
@@ -7260,7 +7263,7 @@ mod tests {
         match wire {
             WireMessage::SnapshotManifestResponse(Some(got)) => {
                 assert_eq!(got, m_low);
-                assert_eq!(got.height, 100);
+                assert_eq!(got.height, Height(100));
             }
             other => panic!("expected SnapshotManifestResponse, got {other:?}"),
         }
@@ -7323,7 +7326,7 @@ mod tests {
         for idx in 0..manifest.chunk_count {
             node.apply_dispatch(
                 Dispatch::ServeSnapshotChunk {
-                    height: 100,
+                    height: Height(100),
                     chunk_idx: idx,
                     to: nid(2),
                 },
@@ -7370,7 +7373,7 @@ mod tests {
 
         node.apply_dispatch(
             Dispatch::ServeSnapshotChunk {
-                height: 999,
+                height: Height(999),
                 chunk_idx: 0,
                 to: nid(2),
             },
@@ -7448,7 +7451,7 @@ mod tests {
         // requests the chunk and we observe the outbound reply.
         for idx in 0..served.chunk_count {
             let req_bytes = postcard::to_stdvec(&WireMessage::SnapshotChunkRequest {
-                height: served.height,
+                height: served.height.0,
                 chunk_idx: idx,
             })
             .unwrap();
@@ -7472,7 +7475,7 @@ mod tests {
                     chunk_idx,
                     payload: Some(p),
                 } => {
-                    assert_eq!(height, served.height);
+                    assert_eq!(height, served.height.0);
                     assert_eq!(chunk_idx, idx);
                     crate::replication::snapshot::verify_chunk(&served, idx, &p)
                         .expect("chunk must verify");
@@ -7561,8 +7564,8 @@ mod tests {
         let block = Block {
             header: BlockHeader {
                 parent_hash,
-                height,
-                view,
+                height: Height(height),
+                view: View(view),
                 proposer: signer.node_id(),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&commands),
@@ -7651,8 +7654,8 @@ mod tests {
             crate::replication::block::Block {
                 header: crate::replication::block::BlockHeader {
                     parent_hash,
-                    height: 50,
-                    view: 50,
+                    height: Height(50),
+                    view: View(50),
                     proposer: server_node_id,
                     state_commitment: expected_commitment,
                     commands_commitment: crate::replication::block::Block::commands_commitment(
@@ -7891,10 +7894,10 @@ mod tests {
         );
         assert_eq!(
             joiner_node.last_committed_height.load(Ordering::Relaxed),
-            50,
+            50u64,
             "joiner's last_committed_height must equal the snapshot's height",
         );
-        assert_eq!(joiner_node.last_committed_view, 50);
+        assert_eq!(joiner_node.last_committed_view, View(50));
         assert_eq!(
             joiner_sm.lock().state_commitment(),
             expected_commitment,
@@ -8004,8 +8007,8 @@ mod tests {
             Block {
                 header: BlockHeader {
                     parent_hash,
-                    height: 50,
-                    view: 50,
+                    height: Height(50),
+                    view: View(50),
                     proposer: server_signer.node_id(),
                     state_commitment: [0xCD; 32],
                     commands_commitment: Block::commands_commitment(&commands),
@@ -8061,7 +8064,7 @@ mod tests {
         // No restore happened.
         assert_eq!(
             joiner_node.last_committed_height.load(Ordering::Relaxed),
-            0,
+            0u64,
             "no restore must have run; last_committed stays at 0",
         );
         // No outbound chunk requests should have been emitted; the
@@ -8125,7 +8128,7 @@ mod tests {
         //   `v_eff = 30`, well below the snapshot height of 50.
         let rotated_validator = other1_signer.node_id();
         let new_pubkey: NodeId = [0xAB; 32];
-        let v_eff: View = 30;
+        let v_eff: View = View(30);
         let mut producer_key_hist = ValidatorKeyHistory::new(vs.iter().copied());
         producer_key_hist
             .apply_rotation(
@@ -8166,8 +8169,8 @@ mod tests {
             crate::replication::block::Block {
                 header: crate::replication::block::BlockHeader {
                     parent_hash,
-                    height: 50,
-                    view: 50,
+                    height: Height(50),
+                    view: View(50),
                     proposer: server_node_id,
                     state_commitment: expected_commitment,
                     commands_commitment: crate::replication::block::Block::commands_commitment(
@@ -8321,8 +8324,8 @@ mod tests {
         // don't matter — what we're testing is that they survive a
         // restart, so they need to be distinguishable from "fresh
         // joiner" defaults (view 0, no lock).
-        let snapshot_height: u64 = 50;
-        let snapshot_view: View = 50;
+        let snapshot_height: Height = Height(50);
+        let snapshot_view: View = View(50);
         let server_sm: Arc<Mutex<Box<dyn StateMachine>>> =
             Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
         for _ in 0..5 {
@@ -8381,7 +8384,7 @@ mod tests {
         //   consensus event lands the safety state via `persist_updates`).
         let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let joiner_wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
-        let cfg = snapshot_test_config_enabled(vs.clone(), snapshot_height);
+        let cfg = snapshot_test_config_enabled(vs.clone(), snapshot_height.0);
         let joiner_sm: Arc<Mutex<Box<dyn StateMachine>>> =
             Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
         let mut joiner_node = ConsensusNode::new(
@@ -8516,8 +8519,8 @@ mod tests {
             crate::replication::block::Block {
                 header: crate::replication::block::BlockHeader {
                     parent_hash,
-                    height: 50,
-                    view: 50,
+                    height: Height(50),
+                    view: View(50),
                     proposer: server_ids[0],
                     state_commitment: expected_commitment,
                     commands_commitment: crate::replication::block::Block::commands_commitment(
@@ -8671,7 +8674,7 @@ mod tests {
         );
         assert_eq!(
             joiner_node.last_committed_height.load(Ordering::Relaxed),
-            50,
+            50u64,
             "joiner's last_committed_height must equal snapshot height",
         );
         assert_eq!(
@@ -8722,8 +8725,8 @@ mod tests {
             crate::replication::block::Block {
                 header: crate::replication::block::BlockHeader {
                     parent_hash,
-                    height: 50,
-                    view: 50,
+                    height: Height(50),
+                    view: View(50),
                     proposer: server_ids[0],
                     state_commitment: expected_commitment,
                     commands_commitment: crate::replication::block::Block::commands_commitment(
@@ -8932,7 +8935,7 @@ mod tests {
         );
         assert_eq!(
             joiner_node.last_committed_height.load(Ordering::Relaxed),
-            50
+            50u64
         );
         assert_eq!(joiner_sm.lock().state_commitment(), expected_commitment);
     }
@@ -9040,7 +9043,7 @@ mod tests {
 
         let view_before = node.pacemaker.current_view();
         let tv = crate::consensus::hotstuff::qc::TimeoutVote {
-            view: 42,
+            view: View(42),
             high_qc: None,
         };
         let signed = crate::crypto::signed::Signed::sign(
@@ -9127,7 +9130,7 @@ mod tests {
         // ingress + dispatch path the live event loop uses.
         for peer in [&peer_a, &peer_b] {
             let tv = crate::consensus::hotstuff::qc::TimeoutVote {
-                view: 42,
+                view: View(42),
                 high_qc: None,
             };
             let signed = crate::crypto::signed::Signed::sign(
@@ -9155,7 +9158,7 @@ mod tests {
 
         assert_eq!(
             node.pacemaker.current_view(),
-            42,
+            View(42),
             "OnRoundSync at f+1 honesty threshold jumps to v, not v+1",
         );
         assert_eq!(
@@ -9209,7 +9212,7 @@ mod tests {
         // Build a *well-formed* but cryptographically bogus QC at a
         // very-fresh view. Quorum-many bits set, quorum-many zero
         // signatures — passes is_well_formed, fails verify_aggregate.
-        let bogus_view: View = u64::MAX - 1;
+        let bogus_view: View = View(u64::MAX - 1);
         let bogus_block_hash = [0xDE; 32];
         let mut forged = crate::consensus::hotstuff::qc::QuorumCertificate::new(
             bogus_view,
@@ -9225,7 +9228,7 @@ mod tests {
         // and piggybacks the forged QC. The envelope itself is valid
         // (real signature over real payload bytes), so envelope
         // verification at ingress will pass.
-        let attack_view: View = 42;
+        let attack_view: View = View(42);
         let tv = crate::consensus::hotstuff::qc::TimeoutVote {
             view: attack_view,
             high_qc: Some(forged),
@@ -9360,7 +9363,7 @@ mod tests {
         let (broadcaster, mut outbound_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
-        let actions = node.step_pacemaker(PacemakerEvent::OnQc(50));
+        let actions = node.step_pacemaker(PacemakerEvent::OnQc(View(50)));
         node.apply_pacemaker_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer_arc)
             .await
             .expect("apply boot");
@@ -9370,7 +9373,7 @@ mod tests {
         while outbound_rx.try_recv().is_ok() {}
         let our_view_before = node.pacemaker.current_view();
         assert!(
-            our_view_before > 5,
+            our_view_before > View(5),
             "test setup: our pacemaker must be ahead of the wedged peer's view (5)",
         );
         let our_high_qc_view_before = node
@@ -9384,7 +9387,7 @@ mod tests {
         // Inject a stale TimeoutVote(view=5) from the wedged peer
         // through the ingress + dispatch path.
         let tv = crate::consensus::hotstuff::qc::TimeoutVote {
-            view: 5,
+            view: View(5),
             high_qc: None,
         };
         let signed = crate::crypto::signed::Signed::sign(
@@ -9471,8 +9474,8 @@ mod tests {
         let b_high = Block {
             header: BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 9,
+                height: Height(1),
+                view: View(9),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -9482,8 +9485,8 @@ mod tests {
         };
         let high_qc = QuorumCertificate::new(9, b_high.hash(), 4);
         let locked = Locked {
-            view: 8,
-            height: 1,
+            view: View(8),
+            height: Height(1),
             block_hash: b_high.hash(),
         };
 
@@ -9501,7 +9504,7 @@ mod tests {
         );
         node.core.insert_pending_block(b_high.clone());
         node.persist_updates(&[
-            StateUpdate::VotedInView { view: 10 },
+            StateUpdate::VotedInView { view: View(10) },
             StateUpdate::Locked(locked),
             StateUpdate::HighQc(high_qc.clone()),
         ])
@@ -9520,8 +9523,11 @@ mod tests {
             Arc::clone(&wal),
         )
         .unwrap();
-        assert_eq!(recovered.core.state().last_voted_view, 10);
-        assert_eq!(recovered.core.state().high_qc.as_ref().unwrap().view(), 9);
+        assert_eq!(recovered.core.state().last_voted_view, View(10));
+        assert_eq!(
+            recovered.core.state().high_qc.as_ref().unwrap().view(),
+            View(9)
+        );
 
         // Build a self-signer whose node_id matches recovered.self_id
         // (= nid(1) here is a synthetic placeholder, not derived from a
@@ -9539,7 +9545,7 @@ mod tests {
             .high_qc
             .as_ref()
             .map(|qc| qc.view())
-            .unwrap_or(0)
+            .unwrap_or(View::ZERO)
             .max(recovered.core.state().last_voted_view);
         let boot_actions = recovered.step_pacemaker(PacemakerEvent::OnQc(boot_view));
         recovered
@@ -9554,7 +9560,7 @@ mod tests {
 
         assert_eq!(
             recovered.pacemaker.current_view(),
-            11,
+            View(11),
             "pacemaker must land at max(high_qc.view, last_voted_view) + 1 = 11 after recover boot",
         );
     }
@@ -9638,8 +9644,8 @@ mod tests {
             .get(STORAGE_KEY_LAST_VOTED_VIEW)
             .unwrap()
             .expect("last_voted_view must be persisted after self-vote");
-        assert_eq!(decode_voted_view(&raw).unwrap(), 1);
-        assert_eq!(node.core.state().last_voted_view, 1);
+        assert_eq!(decode_voted_view(&raw).unwrap(), View(1));
+        assert_eq!(node.core.state().last_voted_view, View(1));
 
         // Wire traffic: the proposal broadcast must have gone out, and
         // the subsequent vote must also be broadcast (not SendTo) —
@@ -9761,7 +9767,7 @@ mod tests {
         // Hand-craft a self-addressed Vote action (as the safety core
         // would emit when this node is the next-view leader).
         let vote = crate::consensus::hotstuff::qc::Vote {
-            view: 7,
+            view: View(7),
             block_hash: [0x42; 32],
         };
         let action = SafetyAction::SendTo(
@@ -9797,7 +9803,7 @@ mod tests {
         let mut view_timer = ViewTimer::new(timer_tx);
 
         let vote = crate::consensus::hotstuff::qc::Vote {
-            view: 3,
+            view: View(3),
             block_hash: [0x7A; 32],
         };
         let action =
@@ -9891,10 +9897,10 @@ mod tests {
         // self-loopback shortcut. View 0 must be skipped — `view <
         // current_view` would short-circuit before the bucket insert.
         let voter = vs.get(1).unwrap().into_node_id();
-        let n = (2 * cap) as View;
+        let n = (2 * cap) as u64;
         for view in 1..=n {
             let payload = TimeoutVote {
-                view,
+                view: View(view),
                 high_qc: None,
             };
             let signed = Signed {
@@ -9914,14 +9920,11 @@ mod tests {
         assert_eq!(node.timeout_buckets.len(), cap);
         // n - cap inserts triggered eviction (n inserts past the
         // cap-fill point of `cap`).
-        assert_eq!(
-            node.eviction_counters().timeout_buckets(),
-            (n as u64) - (cap as u64),
-        );
+        assert_eq!(node.eviction_counters().timeout_buckets(), n - (cap as u64),);
         // Lowest-view-first: surviving views are the cap most recent.
         let mut surviving: Vec<View> = node.timeout_buckets.keys().copied().collect();
         surviving.sort();
-        let expected: Vec<View> = ((n - cap as View + 1)..=n).collect();
+        let expected: Vec<View> = ((n - cap as u64 + 1)..=n).map(View).collect();
         assert_eq!(surviving, expected);
     }
 
@@ -10097,8 +10100,8 @@ mod tests {
         let mut block = Block {
             header: BlockHeader {
                 parent_hash: parent.hash(),
-                height: 1,
-                view: 1,
+                height: Height(1),
+                view: View(1),
                 proposer: leader_id,
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -10150,14 +10153,14 @@ mod tests {
         let recorded = log.lock().clone();
         let persist_idx = recorded
             .iter()
-            .position(|e| matches!(e, OrderEvent::PersistVotedInView(1)));
+            .position(|e| matches!(e, OrderEvent::PersistVotedInView(v) if *v == View(1)));
         let broadcast_idx = recorded
             .iter()
-            .position(|e| matches!(e, OrderEvent::BroadcastVoteFor(1)));
-        let persist_idx =
-            persist_idx.expect("VotedInView{view: 1} must be persisted (storage.batch must run)");
+            .position(|e| matches!(e, OrderEvent::BroadcastVoteFor(v) if *v == View(1)));
+        let persist_idx = persist_idx
+            .expect("VotedInView{view: View(1)} must be persisted (storage.batch must run)");
         let broadcast_idx = broadcast_idx
-            .expect("Vote{view: 1} must be broadcast (Action::Broadcast(Vote) must fire)");
+            .expect("Vote{view: View(1)} must be broadcast (Action::Broadcast(Vote) must fire)");
         assert!(
             persist_idx < broadcast_idx,
             "persist must return before broadcast is called: \
@@ -10322,12 +10325,12 @@ mod tests {
         // (the grandparent walk reaches b_v1, height 1, beating the
         // None-baseline lock).
         let leader_id = leader_signer.node_id();
-        fn build_block(parent: &Block, view: View, proposer: NodeId) -> Block {
+        fn build_block(parent: &Block, view: u64, proposer: NodeId) -> Block {
             Block {
                 header: BlockHeader {
                     parent_hash: parent.hash(),
                     height: parent.header.height + 1,
-                    view,
+                    view: View(view),
                     proposer,
                     state_commitment: [0; 32],
                     commands_commitment: Block::commands_commitment(&[]),
@@ -10403,8 +10406,8 @@ mod tests {
             .expect("Persist(Locked) must reach storage.batch");
         let broadcast_idx = recorded
             .iter()
-            .position(|e| matches!(e, OrderEvent::BroadcastVoteFor(3)))
-            .expect("Vote{view: 3} must be broadcast");
+            .position(|e| matches!(e, OrderEvent::BroadcastVoteFor(v) if *v == View(3)))
+            .expect("Vote{view: View(3)} must be broadcast");
         assert!(
             persist_idx < broadcast_idx,
             "audit finding 4-1: lock persist must return before vote broadcast is called: \
@@ -10420,7 +10423,8 @@ mod tests {
             .expect("locked entry must be persisted");
         let on_disk = decode_locked(&raw).unwrap();
         assert_eq!(
-            on_disk.view, 1,
+            on_disk.view,
+            View(1),
             "on-disk lock must match the view-1 grandparent: {on_disk:?}",
         );
     }
@@ -10442,7 +10446,7 @@ mod tests {
         let action = SafetyAction::RequestBlock {
             hash: [0xCD; 32],
             peer: self_id,
-            expected_height: 7,
+            expected_height: Height(7),
             reason: crate::consensus::hotstuff::step::BlockSyncReason::UnknownParentOnProposal,
         };
         node.apply_safety_actions(vec![action], broadcaster.as_ref(), &mut view_timer, &signer)
@@ -10790,7 +10794,7 @@ mod tests {
         cfg
     }
 
-    fn make_committable_block(parent: &Block, height: u64, view: View) -> Block {
+    fn make_committable_block(parent: &Block, height: u64, view: u64) -> Block {
         // Synthesize a block whose header is well-formed enough for
         // `apply_commit` to write to storage without complaint. The
         // safety-rule walks aren't exercised here — `apply_commit`
@@ -10799,8 +10803,8 @@ mod tests {
         Block {
             header: BlockHeader {
                 parent_hash: parent.hash(),
-                height,
-                view,
+                height: Height(height),
+                view: View(view),
                 proposer: [0u8; 32],
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&commands),
@@ -10847,8 +10851,8 @@ mod tests {
             .load_manifest(5)
             .unwrap()
             .expect("snapshot must have been created at height 5");
-        assert_eq!(manifest.height, 5);
-        assert_eq!(manifest.view, 5);
+        assert_eq!(manifest.height, Height(5));
+        assert_eq!(manifest.view, View(5));
         assert_eq!(manifest.block_hash, block.hash());
         // Manifest's QC matches the one we cached.
         assert_eq!(manifest.commit_qc, qc);
@@ -10983,7 +10987,7 @@ mod tests {
                 make_committable_block(&genesis(), height - 1, height - 1)
             };
             let block = make_committable_block(&parent, height, height);
-            let mut qc = QuorumCertificate::new(height, block.hash(), 4);
+            let mut qc = QuorumCertificate::new(View(height), block.hash(), 4);
             qc.add_signature(0, [0u8; 64]);
             qc.add_signature(1, [0u8; 64]);
             qc.add_signature(2, [0u8; 64]);
@@ -11026,7 +11030,7 @@ mod tests {
                 make_committable_block(&genesis(), height - 1, height - 1)
             };
             let block = make_committable_block(&parent, height, height);
-            let mut qc = QuorumCertificate::new(height, block.hash(), 4);
+            let mut qc = QuorumCertificate::new(View(height), block.hash(), 4);
             qc.add_signature(0, [0u8; 64]);
             qc.add_signature(1, [0u8; 64]);
             qc.add_signature(2, [0u8; 64]);
@@ -11092,7 +11096,7 @@ mod tests {
     fn block_with_reconfig_extending(
         parent_hash: BlockHash,
         height: u64,
-        view: View,
+        view: u64,
         proposer: NodeId,
         cmd: crate::consensus::reconfig::ReconfigCommand,
         validator_history_commitment: [u8; 32],
@@ -11101,8 +11105,8 @@ mod tests {
         let commands = vec![payload];
         let header = crate::replication::block::BlockHeader {
             parent_hash,
-            height,
-            view,
+            height: Height(height),
+            view: View(view),
             proposer,
             state_commitment: [0u8; 32],
             commands_commitment: Block::commands_commitment(&commands),
@@ -11216,7 +11220,7 @@ mod tests {
             .expect("validator history blob must be persisted");
         let mut persisted: PersistedValidatorHistory = postcard::from_bytes(&raw).unwrap();
         assert_eq!(persisted.boundaries.len(), 2);
-        persisted.boundaries[1].v_eff = persisted.boundaries[1].v_eff.wrapping_add(1);
+        persisted.boundaries[1].v_eff = View(persisted.boundaries[1].v_eff.0.wrapping_add(1));
         let tampered = postcard::to_stdvec(&persisted).unwrap();
         storage
             .put(STORAGE_KEY_VALIDATOR_HISTORY, &tampered)
@@ -11274,8 +11278,8 @@ mod tests {
         let block1 = Block {
             header: crate::replication::block::BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 1,
+                height: Height(1),
+                view: View(1),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -11296,7 +11300,7 @@ mod tests {
             boundaries: genesis_only.boundaries,
         };
         tampered.boundaries.push(PersistedBoundary {
-            v_eff: 999, // Past anything in the committed chain.
+            v_eff: View(999), // Past anything in the committed chain.
             members: vec![nid(1), nid(2), nid(3), nid(4), nid(99)],
         });
         let bytes = postcard::to_stdvec(&tampered).unwrap();
@@ -11353,8 +11357,8 @@ mod tests {
         let block1 = Block {
             header: crate::replication::block::BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 1,
+                height: Height(1),
+                view: View(1),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
@@ -11455,8 +11459,8 @@ mod tests {
         let block1 = Block {
             header: crate::replication::block::BlockHeader {
                 parent_hash: g.hash(),
-                height: 1,
-                view: 1,
+                height: Height(1),
+                view: View(1),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),

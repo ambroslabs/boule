@@ -108,7 +108,7 @@ fn bench_ed25519(n: usize, q: usize) -> Stats {
     let signers: Vec<NodeSigner> = (0..n).map(|_| fresh_ed_signer()).collect();
     let pubkeys: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
     let block_hash = [0xAB; 32];
-    let view = 1u64;
+    let view = ambros_p2p::consensus::View(1);
     let payload = ConsensusVote { view, block_hash };
     let message = postcard::to_stdvec(&payload).expect("vote payload encoding");
 
@@ -150,7 +150,7 @@ fn bench_bls(n: usize, q: usize) -> Stats {
     let signers: Vec<(BlsSecretKey, BlsPublicKey)> = (0..n).map(bls_signer).collect();
     let pubkeys: Vec<BlsPublicKey> = signers.iter().map(|(_, pk)| *pk).collect();
     let block_hash = [0xCD; 32];
-    let view = 1u64;
+    let view = ambros_p2p::consensus::View(1);
     let payload = ConsensusVote { view, block_hash };
     let message = postcard::to_stdvec(&payload).expect("vote payload encoding");
 

@@ -46,9 +46,9 @@
 
 use bytes::Bytes;
 
-use crate::consensus::View;
 use crate::consensus::hotstuff::qc::TimeoutVote;
 use crate::consensus::validator_set::ValidatorId;
+use crate::consensus::{Height, View};
 use crate::crypto::sig_scheme::SignatureSchemeChoice;
 use crate::crypto::signed::Signed;
 use crate::p2p::NodeId;
@@ -167,14 +167,14 @@ pub enum Dispatch {
     /// The integration layer looks the chunk up and replies with
     /// [`WireMessage::SnapshotChunkResponse`].
     ServeSnapshotChunk {
-        height: u64,
+        height: Height,
         chunk_idx: u32,
         to: NodeId,
     },
     /// Peer replied to our [`WireMessage::SnapshotChunkRequest`].
     /// Same joiner-side note as for [`Dispatch::ReceiveSnapshotManifest`].
     ReceiveSnapshotChunk {
-        height: u64,
+        height: Height,
         chunk_idx: u32,
         payload: Option<bytes::Bytes>,
         from: NodeId,
@@ -242,7 +242,7 @@ pub enum IngressError {
     /// ingress closes the window between propose and restart.
     InvalidValidatorHistoryCommitment {
         view: View,
-        height: u64,
+        height: Height,
         claimed: [u8; 32],
         actual: [u8; 32],
     },

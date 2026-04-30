@@ -93,11 +93,11 @@ fn ingress_proposal_happy_path() {
     ));
     assert!(matches!(
         dispatches[1],
-        Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(0))
+        Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(View(0)))
     ));
     assert!(matches!(
         dispatches[2],
-        Dispatch::Pacemaker(pacemaker::Event::OnQc(0))
+        Dispatch::Pacemaker(pacemaker::Event::OnQc(View(0)))
     ));
 }
 
@@ -119,8 +119,8 @@ fn ingress_proposal_emits_on_qc_at_justify_view() {
     let parent = genesis();
     let header = crate::replication::block::BlockHeader {
         parent_hash: parent.hash(),
-        height: 1,
-        view: 6,
+        height: Height(1),
+        view: View(6),
         proposer: signer.node_id(),
         state_commitment: [0; 32],
         commands_commitment: Block::commands_commitment(&[]),
@@ -139,12 +139,12 @@ fn ingress_proposal_emits_on_qc_at_justify_view() {
     assert_eq!(dispatches.len(), 3);
     assert!(matches!(
         dispatches[1],
-        Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(6))
+        Dispatch::Pacemaker(pacemaker::Event::OnProposalReceived(View(6)))
     ));
     assert!(
         matches!(
             dispatches[2],
-            Dispatch::Pacemaker(pacemaker::Event::OnQc(5))
+            Dispatch::Pacemaker(pacemaker::Event::OnQc(View(5)))
         ),
         "expected OnQc(justify.view = 5), got {:?}",
         dispatches[2]
@@ -196,7 +196,7 @@ fn ingress_vote_happy_path() {
     let vs = make_vs_with_signers(&[&signer]);
 
     let vote = Vote {
-        view: 3,
+        view: View(3),
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
@@ -233,7 +233,7 @@ fn ingress_new_view_emits_pacemaker_on_qc() {
     ));
     assert!(matches!(
         dispatches[1],
-        Dispatch::Pacemaker(pacemaker::Event::OnQc(7))
+        Dispatch::Pacemaker(pacemaker::Event::OnQc(View(7)))
     ));
 }
 
@@ -245,7 +245,7 @@ fn ingress_timeout_vote_happy_path() {
     let vs = make_vs_with_signers(&[&signer]);
 
     let tv = TimeoutVote {
-        view: 7,
+        view: View(7),
         high_qc: Some(sample_qc()),
     };
     let signed = Signed::sign(tv, &signer, &ChainId::TEST).unwrap();
@@ -270,7 +270,7 @@ fn ingress_timeout_vote_unknown_signer_rejected() {
     let vs = make_vs_with_signers(&[&other]);
 
     let tv = TimeoutVote {
-        view: 3,
+        view: View(3),
         high_qc: None,
     };
     let signed = Signed::sign(tv, &signer, &ChainId::TEST).unwrap();
@@ -287,7 +287,7 @@ fn ingress_timeout_vote_bad_signature_rejected() {
     let vs = make_vs_with_signers(&[&signer]);
 
     let tv = TimeoutVote {
-        view: 1,
+        view: View(1),
         high_qc: None,
     };
     let mut signed = Signed::sign(tv, &signer, &ChainId::TEST).unwrap();
@@ -417,7 +417,7 @@ fn egress_send_to_encodes_vote() {
     let target: NodeId = [0x55u8; 32];
 
     let vote = Vote {
-        view: 5,
+        view: View(5),
         block_hash: [0x77; 32],
     };
     let action = crate::consensus::hotstuff::step::Action::SendTo(
@@ -440,8 +440,9 @@ fn egress_send_to_encodes_vote() {
 fn egress_persist_returns_none() {
     let signer = fresh_signer();
     use crate::consensus::hotstuff::step::StateUpdate;
-    let action =
-        crate::consensus::hotstuff::step::Action::Persist(StateUpdate::VotedInView { view: 1 });
+    let action = crate::consensus::hotstuff::step::Action::Persist(StateUpdate::VotedInView {
+        view: View(1),
+    });
     let out = egress_safety(&action, &signer, None, &ChainId::TEST).unwrap();
     assert!(out.is_none());
 }
@@ -462,7 +463,7 @@ fn egress_request_block_yields_send_to() {
     let action = crate::consensus::hotstuff::step::Action::RequestBlock {
         hash,
         peer,
-        expected_height: 41,
+        expected_height: Height(41),
         reason: crate::consensus::hotstuff::step::BlockSyncReason::UnknownParentOnProposal,
     };
     let out = egress_safety(&action, &signer, None, &ChainId::TEST)
@@ -531,8 +532,8 @@ fn sample_manifest_for_dispatch() -> SnapshotManifest {
     let block = Block {
         header: BlockHeader {
             parent_hash,
-            height: 42,
-            view: 7,
+            height: Height(42),
+            view: View(7),
             proposer: [0u8; 32],
             state_commitment: [0xCD; 32],
             commands_commitment: Block::commands_commitment(&commands),
@@ -614,7 +615,7 @@ fn ingress_snapshot_chunk_request_carries_height_and_index() {
     let dispatches = ingress_with_genesis_set(from, &bytes, &vs).unwrap();
     assert!(matches!(
         &dispatches[0],
-        Dispatch::ServeSnapshotChunk { height: 555, chunk_idx: 7, to } if to == &from,
+        Dispatch::ServeSnapshotChunk { height: Height(555), chunk_idx: 7, to } if to == &from,
     ));
 }
 
@@ -632,7 +633,7 @@ fn ingress_snapshot_chunk_response_carries_payload() {
     let dispatches = ingress_with_genesis_set(from, &bytes_vec, &vs).unwrap();
     match &dispatches[0] {
         Dispatch::ReceiveSnapshotChunk {
-            height: 99,
+            height: Height(99),
             chunk_idx: 3,
             payload: Some(p),
             from: f,
@@ -766,7 +767,7 @@ fn vote_at_v_eff_verifies_against_post_boundary_set() {
     let old_set = make_vs_with_signers(&[&old_signer]);
     let new_set = make_vs_with_signers(&[&old_signer, &new_signer]);
 
-    let v_eff: View = 5;
+    let v_eff: View = View(5);
     let mut history = ValidatorSetHistory::from_genesis(old_set);
     history.insert_boundary(v_eff, new_set).unwrap();
 
@@ -806,7 +807,7 @@ fn vote_at_v_eff_rejected_without_boundary() {
     let key_history = key_history_for(&history_without_boundary);
 
     let vote = Vote {
-        view: 5,
+        view: View(5),
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &new_signer, &ChainId::TEST).unwrap();
@@ -838,7 +839,7 @@ fn vote_before_boundary_verifies_against_pre_boundary_set() {
     // Critically, `new_set` does *not* contain `old_signer`.
     let new_set = make_vs_with_signers(&[&new_signer]);
 
-    let v_eff: View = 10;
+    let v_eff: View = View(10);
     let mut history = ValidatorSetHistory::from_genesis(old_set);
     history.insert_boundary(v_eff, new_set).unwrap();
     let key_history = key_history_for(&history);
@@ -874,7 +875,7 @@ fn proposal_at_v_eff_verifies_against_post_boundary_set() {
     let old_set = make_vs_with_signers(&[&old_signer]);
     let new_set = make_vs_with_signers(&[&old_signer, &new_signer]);
 
-    let v_eff: View = 7;
+    let v_eff: View = View(7);
     let mut history = ValidatorSetHistory::from_genesis(old_set);
     history.insert_boundary(v_eff, new_set).unwrap();
     let key_history = key_history_for(&history);
@@ -933,7 +934,7 @@ fn new_view_with_pre_boundary_high_qc_under_old_set_accepted() {
     let old_set = make_vs_with_signers(&[&old_a, &old_b]);
     let new_set = make_vs_with_signers(&[&old_a, &old_b, &new_only]);
 
-    let v_eff: View = 5;
+    let v_eff: View = View(5);
     let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
     history.insert_boundary(v_eff, new_set).unwrap();
     let key_history = key_history_for(&history);
@@ -982,7 +983,7 @@ fn new_view_with_high_qc_minted_against_new_set_rejected_at_pre_boundary_view() 
     let old_set = make_vs_with_signers(&[&old_a, &old_b]);
     let new_set = make_vs_with_signers(&[&old_a, &old_b, &new_only]);
 
-    let v_eff: View = 5;
+    let v_eff: View = View(5);
     let mut history = ValidatorSetHistory::from_genesis(old_set.clone());
     history.insert_boundary(v_eff, new_set.clone()).unwrap();
     let key_history = key_history_for(&history);
@@ -1051,7 +1052,7 @@ fn new_view_under_genesis_only_history_round_trips() {
     ));
     assert!(matches!(
         dispatches[1],
-        Dispatch::Pacemaker(pacemaker::Event::OnQc(7))
+        Dispatch::Pacemaker(pacemaker::Event::OnQc(View(7)))
     ));
 }
 
@@ -1073,8 +1074,9 @@ fn key_history_with_rotation(
     vs: &ValidatorSet,
     validator: NodeId,
     new_pubkey: NodeId,
-    v_eff: View,
+    v_eff: impl Into<View>,
 ) -> ValidatorKeyHistory {
+    let v_eff = v_eff.into();
     let mut kh = key_history_from_set(vs);
     // Reverse-index lookup must succeed for the test setup —
     // always rotate from a validator that's actually in `vs`.
@@ -1086,7 +1088,7 @@ fn key_history_with_rotation(
             new_bls_pubkey: None,
             new_bls_pop: None,
         },
-        v_eff - 2,
+        v_eff - View(2),
     )
     .expect("test rotation must apply cleanly");
     kh
@@ -1114,7 +1116,7 @@ fn vote_after_rotation_signed_with_new_key_accepted() {
     let key_history = key_history_with_rotation(&vs, old.node_id(), new.node_id(), 100);
 
     let vote = Vote {
-        view: 100,
+        view: View(100),
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &new, &ChainId::TEST).unwrap();
@@ -1181,7 +1183,7 @@ fn spanning_vote_pre_rotation_view_signed_with_old_key_accepted() {
     // Vote for a view *before* the rotation's v_eff, signed by the
     // pre-rotation key.
     let vote = Vote {
-        view: 50,
+        view: View(50),
         block_hash: [0xCD; 32],
     };
     let signed = Signed::sign(vote, &old, &ChainId::TEST).unwrap();
@@ -1216,7 +1218,7 @@ fn vote_after_rotation_signed_with_stale_old_key_rejected() {
 
     // View at/after v_eff, but signed under the now-stale old key.
     let vote = Vote {
-        view: 100,
+        view: View(100),
         block_hash: [0xEF; 32],
     };
     let signed = Signed::sign(vote, &old, &ChainId::TEST).unwrap();
@@ -1251,7 +1253,7 @@ fn vote_before_rotation_signed_with_future_new_key_rejected() {
 
     // View before v_eff, signed by the future key.
     let vote = Vote {
-        view: 50,
+        view: View(50),
         block_hash: [0x12; 32],
     };
     let signed = Signed::sign(vote, &new, &ChainId::TEST).unwrap();
@@ -1285,7 +1287,7 @@ fn vote_signed_by_unrelated_key_rejected() {
     let key_history = key_history_from_set(&vs);
 
     let vote = Vote {
-        view: 5,
+        view: View(5),
         block_hash: [0x77; 32],
     };
     let signed = Signed::sign(vote, &attacker, &ChainId::TEST).unwrap();
@@ -1319,7 +1321,7 @@ fn proposal_after_rotation_signed_with_new_key_accepted() {
     let header = crate::replication::block::BlockHeader {
         parent_hash: parent.hash(),
         height: parent.header.height + 1,
-        view: 100,
+        view: View(100),
         proposer: new.node_id(),
         state_commitment: [0u8; 32],
         commands_commitment: Block::commands_commitment(&[]),
@@ -1359,7 +1361,7 @@ fn timeout_vote_after_rotation_signed_with_new_key_accepted() {
     let key_history = key_history_with_rotation(&vs, old.node_id(), new.node_id(), 100);
 
     let tv = TimeoutVote {
-        view: 100,
+        view: View(100),
         high_qc: None,
     };
     let signed = Signed::sign(tv, &new, &ChainId::TEST).unwrap();
@@ -1425,7 +1427,7 @@ fn vote_from_removed_validator_after_v_eff_rejected() {
     let old_set = make_vs_with_signers(&[&kept, &removed]);
     let new_set = make_vs_with_signers(&[&kept]); // removed gone
 
-    let v_eff: View = 5;
+    let v_eff: View = View(5);
     let mut history = ValidatorSetHistory::from_genesis(old_set);
     history.insert_boundary(v_eff, new_set).unwrap();
     let key_history = key_history_for(&history);
@@ -1514,7 +1516,7 @@ fn quorum_size_for_n(n: usize) -> usize {
 
 #[test]
 fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
-    let view: View = 5;
+    let view: View = View(5);
     let block_hash = [0x55; 32];
     let (signers, vs, qc) = build_real_ed25519_qc(view, block_hash);
     let leader = &signers[0];
@@ -1530,7 +1532,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
     let mut block = Block {
         header: crate::replication::block::BlockHeader {
             parent_hash: block_hash,
-            height: 1,
+            height: Height(1),
             view: view + 1,
             proposer: leader.node_id(),
             state_commitment: [0; 32],
@@ -1583,7 +1585,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
 /// dispatched and `expect_err` panics.
 #[test]
 fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_proposal() {
-    let view: View = 5;
+    let view: View = View(5);
     let block_hash = [0x55; 32];
     let (signers, vs, qc) = build_real_ed25519_qc(view, block_hash);
     let leader = &signers[0];
@@ -1601,7 +1603,7 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
     let block = Block {
         header: crate::replication::block::BlockHeader {
             parent_hash: block_hash,
-            height: 1,
+            height: Height(1),
             view: view + 1,
             proposer: leader.node_id(),
             state_commitment: [0; 32],
@@ -1634,8 +1636,8 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
         matches!(
             err,
             IngressError::InvalidValidatorHistoryCommitment {
-                height: 1,
-                view: 6,
+                height: Height(1),
+                view: View(6),
                 claimed,
                 ..
             } if claimed == forged_commitment
@@ -1646,7 +1648,7 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
 
 #[test]
 fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
-    let view: View = 5;
+    let view: View = View(5);
     let block_hash = [0x55; 32];
     let (signers, vs, mut qc) = build_real_ed25519_qc(view, block_hash);
     let leader = &signers[0];
@@ -1660,7 +1662,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
     let block = Block {
         header: crate::replication::block::BlockHeader {
             parent_hash: block_hash,
-            height: 1,
+            height: Height(1),
             view: view + 1,
             proposer: leader.node_id(),
             state_commitment: [0; 32],
@@ -1694,7 +1696,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
     assert!(matches!(
         err,
         IngressError::InvalidQcAggregate {
-            view: 5,
+            view: View(5),
             scheme: "ed25519_collected"
         }
     ));
@@ -1702,7 +1704,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
 
 #[test]
 fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
-    let view: View = 7;
+    let view: View = View(7);
     let block_hash = [0x77; 32];
     let (signers, vs, mut high_qc) = build_real_ed25519_qc(view, block_hash);
     let messenger = &signers[1];
@@ -1738,7 +1740,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
     assert!(matches!(
         err,
         IngressError::InvalidQcAggregate {
-            view: 7,
+            view: View(7),
             scheme: "ed25519_collected"
         }
     ));
@@ -1750,7 +1752,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
 /// fold it into the bucket's `best_high_qc`.
 #[test]
 fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
-    let qc_view: View = 4;
+    let qc_view: View = View(4);
     let block_hash = [0x44; 32];
     let (signers, vs, qc) = build_real_ed25519_qc(qc_view, block_hash);
     let voter = &signers[0];
@@ -1807,7 +1809,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
 /// laundering vector.
 #[test]
 fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback() {
-    let qc_view: View = 4;
+    let qc_view: View = View(4);
     let block_hash = [0x44; 32];
     let (signers, vs, mut qc) = build_real_ed25519_qc(qc_view, block_hash);
     let voter = &signers[0];
@@ -1871,7 +1873,7 @@ fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback()
 /// number of pubkeys through).
 #[test]
 fn ingress_with_verify_drops_malformed_high_qc_in_timeout_vote_piggyback() {
-    let qc_view: View = 4;
+    let qc_view: View = View(4);
     let block_hash = [0x44; 32];
     let (signers, vs, qc) = build_real_ed25519_qc(qc_view, block_hash);
     let voter = &signers[0];
@@ -1933,7 +1935,7 @@ fn ingress_with_verify_emits_high_qc_trusted_for_timeout_vote_with_no_piggyback(
     let vs = make_vs_with_signers(&[&voter]);
 
     let tv = TimeoutVote {
-        view: 9,
+        view: View(9),
         high_qc: None,
     };
     let signed = Signed::sign(tv, &voter, &ChainId::TEST).unwrap();
@@ -2072,7 +2074,7 @@ fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
         matches!(
             err,
             IngressError::InvalidQcAggregate {
-                view: 0,
+                view: View::ZERO,
                 scheme: "ed25519_collected",
             }
         ),
@@ -2084,7 +2086,7 @@ fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
 fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
     // A QC carrying the BLS variant arriving on an Ed25519 chain is
     // a structural mismatch — reject before pairing-check.
-    let view: View = 3;
+    let view: View = View(3);
     let block_hash = [0x33; 32];
     let signer = fresh_signer();
     let vs = make_vs_with_signers(&[&signer]);
@@ -2102,7 +2104,7 @@ fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
     let block = Block {
         header: crate::replication::block::BlockHeader {
             parent_hash: block_hash,
-            height: 1,
+            height: Height(1),
             view: view + 1,
             proposer: signer.node_id(),
             state_commitment: [0; 32],
@@ -2184,7 +2186,7 @@ fn make_signed_vote_with_bls_partial(
 fn ingress_vote_on_bls_chain_accepts_valid_bls_partial() {
     let (signer, bls_sk, bls_pk) = fresh_bls_signer(0x11);
     let vs = make_vs_with_signers(&[&signer]);
-    let view: View = 5;
+    let view: View = View(5);
     let block_hash = [0xAA; 32];
 
     let (signed, partial) = make_signed_vote_with_bls_partial(&signer, &bls_sk, view, block_hash);
@@ -2221,7 +2223,7 @@ fn ingress_vote_on_bls_chain_accepts_valid_bls_partial() {
 fn ingress_vote_on_bls_chain_rejects_missing_bls_partial() {
     let (signer, _bls_sk, bls_pk) = fresh_bls_signer(0x22);
     let vs = make_vs_with_signers(&[&signer]);
-    let view: View = 4;
+    let view: View = View(4);
     let block_hash = [0xBB; 32];
 
     // Vote with no BLS partial attached (None).
@@ -2252,7 +2254,7 @@ fn ingress_vote_on_bls_chain_rejects_missing_bls_partial() {
     let expected_signer = signer.node_id();
     assert!(matches!(
         err,
-        IngressError::InvalidBlsPartial { view: 4, signer: s } if s == expected_signer,
+        IngressError::InvalidBlsPartial { view: View(4), signer: s } if s == expected_signer,
     ));
 }
 
@@ -2260,7 +2262,7 @@ fn ingress_vote_on_bls_chain_rejects_missing_bls_partial() {
 fn ingress_vote_on_bls_chain_rejects_tampered_bls_partial() {
     let (signer, bls_sk, bls_pk) = fresh_bls_signer(0x33);
     let vs = make_vs_with_signers(&[&signer]);
-    let view: View = 6;
+    let view: View = View(6);
     let block_hash = [0xCC; 32];
 
     let (signed, mut partial) =
@@ -2290,7 +2292,7 @@ fn ingress_vote_on_bls_chain_rejects_tampered_bls_partial() {
     .expect_err("tampered BLS partial must be rejected");
     assert!(matches!(
         err,
-        IngressError::InvalidBlsPartial { view: 6, .. }
+        IngressError::InvalidBlsPartial { view: View(6), .. }
     ));
 }
 
@@ -2303,7 +2305,7 @@ fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
     let (signer, _bls_sk_a, bls_pk_a) = fresh_bls_signer(0x44);
     let (_, bls_sk_b, _bls_pk_b) = fresh_bls_signer(0x45);
     let vs = make_vs_with_signers(&[&signer]);
-    let view: View = 8;
+    let view: View = View(8);
     let block_hash = [0xDD; 32];
 
     let (signed, _) = make_signed_vote_with_bls_partial(&signer, &bls_sk_b, view, block_hash);
@@ -2338,7 +2340,7 @@ fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
     .expect_err("partial signed under the wrong BLS key must be rejected");
     assert!(matches!(
         err,
-        IngressError::InvalidBlsPartial { view: 8, .. }
+        IngressError::InvalidBlsPartial { view: View(8), .. }
     ));
 }
 
@@ -2349,7 +2351,7 @@ fn ingress_vote_on_ed25519_chain_ignores_bls_partial_field() {
     // (The QC verifier only consults the inner Ed25519 sig.)
     let signer = fresh_signer();
     let vs = make_vs_with_signers(&[&signer]);
-    let view: View = 9;
+    let view: View = View(9);
     let block_hash = [0xEE; 32];
 
     // Ship a junk BLS partial alongside the vote — it must be ignored.
@@ -2391,7 +2393,7 @@ fn ingress_vote_on_bls_chain_rejects_when_bls_history_absent() {
     // can't resolve the signer's historical BLS pubkey.
     let (signer, bls_sk, _bls_pk) = fresh_bls_signer(0x55);
     let vs = make_vs_with_signers(&[&signer]);
-    let view: View = 11;
+    let view: View = View(11);
     let block_hash = [0x11; 32];
 
     let (signed, partial) = make_signed_vote_with_bls_partial(&signer, &bls_sk, view, block_hash);
@@ -2418,7 +2420,7 @@ fn ingress_vote_on_bls_chain_rejects_when_bls_history_absent() {
     .expect_err("BLS chain without bls_key_history must reject");
     assert!(matches!(
         err,
-        IngressError::InvalidBlsPartial { view: 11, .. }
+        IngressError::InvalidBlsPartial { view: View(11), .. }
     ));
 }
 
@@ -2432,7 +2434,7 @@ fn ingress_vote_with_skip_does_not_validate_bls_partial() {
     let vs = make_vs_with_signers(&[&signer]);
 
     let vote = Vote {
-        view: 2,
+        view: View(2),
         block_hash: [0x77; 32],
     };
     let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();

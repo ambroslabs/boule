@@ -116,6 +116,7 @@ async fn yield_until_crashpoint_fires(cluster: &mut SimCluster, idx: usize, budg
 ///    commits.
 #[tokio::test]
 async fn after_broadcast_vote_crashpoint_fires_and_node_restarts() {
+    use crate::consensus::View;
     use crate::consensus::node::{
         STORAGE_KEY_LAST_VOTED_VIEW, STORAGE_KEY_LOCKED, decode_locked, decode_voted_view,
     };
@@ -140,7 +141,7 @@ async fn after_broadcast_vote_crashpoint_fires_and_node_restarts() {
             .ok()
             .flatten()
             .and_then(|raw| decode_voted_view(&raw).ok())
-            .is_some_and(|v| v >= 3)
+            .is_some_and(|v| v >= View(3))
     })
     .await;
     assert!(
@@ -199,7 +200,7 @@ async fn after_broadcast_vote_crashpoint_fires_and_node_restarts() {
     )
     .unwrap();
     assert!(
-        durable_voted >= 3,
+        durable_voted >= View(3),
         "durable last_voted_view regressed below the warmup floor: got {durable_voted}",
     );
     let durable_locked = storage
@@ -353,7 +354,7 @@ async fn after_send_outbound_for_proposal_crashpoint_fires_on_view_1_leader() {
         );
     assert_eq!(
         decode_proposed_in_view(&raw).expect("decode proposed_in_view"),
-        1,
+        crate::consensus::View(1),
         "the leader minted at view 1, so the persisted guard must equal 1",
     );
 

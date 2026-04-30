@@ -1089,9 +1089,10 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
         .addr
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --addr <socketaddr>"))?;
-    let v_eff = a
-        .v_eff
-        .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --v-eff <view>"))?;
+    let v_eff = ambros_p2p::consensus::View(
+        a.v_eff
+            .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --v-eff <view>"))?,
+    );
     if a.bls_pop_file.is_some() && a.bls_key_file.is_some() {
         anyhow::bail!(
             "--bls-pop-file and --bls-key-file are mutually exclusive — pass one or the other.",
@@ -1262,9 +1263,10 @@ fn handle_reconfig_remove(args: &[String]) -> anyhow::Result<()> {
         .pubkey
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --pubkey <base58>"))?;
-    let v_eff = a
-        .v_eff
-        .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --v-eff <view>"))?;
+    let v_eff = ambros_p2p::consensus::View(
+        a.v_eff
+            .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --v-eff <view>"))?,
+    );
     if a.addr.is_some() {
         anyhow::bail!("reconfig remove-validator does not take --addr");
     }

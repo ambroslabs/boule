@@ -139,7 +139,7 @@ impl ValidatorKeyHistory {
             // re-registered at genesis with a different history.
             h.by_stable_id.entry(bytes).or_insert_with(|| {
                 vec![KeyEntry {
-                    v_eff: 0,
+                    v_eff: View::ZERO,
                     pubkey: bytes,
                 }]
             });
@@ -195,7 +195,12 @@ impl ValidatorKeyHistory {
     /// make [`Self::validator_for`] ambiguous). Use
     /// [`Self::apply_rotation`] for the case where a known validator
     /// is changing keys.
-    pub fn add_validator(&mut self, pubkey: Pubkey, v_eff: View) -> Result<(), HistoryError> {
+    pub fn add_validator(
+        &mut self,
+        pubkey: Pubkey,
+        v_eff: impl Into<View>,
+    ) -> Result<(), HistoryError> {
+        let v_eff = v_eff.into();
         let bytes: NodeId = pubkey.into_node_id();
         if let Some(owner) = self.pubkey_to_stable_id.get(&bytes) {
             return Err(HistoryError::NewKeyCollidesWithOtherValidator {
@@ -242,7 +247,8 @@ impl ValidatorKeyHistory {
     /// or (defensively) if no entry covers `view`. Spanning votes (a
     /// late vote at an older view) verify against whichever pubkey was
     /// active at that older view, which is what this method returns.
-    pub fn key_at(&self, validator: &ValidatorId, view: View) -> Option<Pubkey> {
+    pub fn key_at(&self, validator: &ValidatorId, view: impl Into<View>) -> Option<Pubkey> {
+        let view = view.into();
         let entries = self.by_stable_id.get(validator.as_node_id())?;
         // Entries are sorted by v_eff ascending; the active key at
         // `view` is the one from the entry with the largest v_eff that
@@ -261,7 +267,12 @@ impl ValidatorKeyHistory {
     /// pubkey it has ever used. Convenience for call sites that only
     /// have a wire pubkey — equivalent to
     /// `validator_for(p).and_then(|v| key_at(&v, view))`.
-    pub fn key_at_for_pubkey(&self, pubkey_anywhere: &Pubkey, view: View) -> Option<Pubkey> {
+    pub fn key_at_for_pubkey(
+        &self,
+        pubkey_anywhere: &Pubkey,
+        view: impl Into<View>,
+    ) -> Option<Pubkey> {
+        let view = view.into();
         let validator = self.validator_for(pubkey_anywhere)?;
         self.key_at(&validator, view)
     }
@@ -311,8 +322,9 @@ impl ValidatorKeyHistory {
     pub fn apply_rotation(
         &mut self,
         rotation: &ValidatorKeyRotation,
-        commit_view: View,
+        commit_view: impl Into<View>,
     ) -> Result<(), HistoryError> {
+        let commit_view = commit_view.into();
         rotation.validate_structural(commit_view)?;
 
         let stable_id = *self.pubkey_to_stable_id.get(&rotation.validator).ok_or(
@@ -475,7 +487,8 @@ mod tests {
         Pubkey::from_node_id(nid(b))
     }
 
-    fn rot(validator: NodeId, new_pubkey: NodeId, v_eff: View) -> ValidatorKeyRotation {
+    fn rot(validator: NodeId, new_pubkey: NodeId, v_eff: impl Into<View>) -> ValidatorKeyRotation {
+        let v_eff = v_eff.into();
         ValidatorKeyRotation {
             validator,
             new_pubkey,
@@ -585,8 +598,8 @@ mod tests {
         assert_eq!(
             h.apply_rotation(&rot(nid(10), nid(20), 100), 50),
             Err(HistoryError::VeffNotStrictlyIncreasing {
-                last_v_eff: 100,
-                v_eff: 100,
+                last_v_eff: View(100),
+                v_eff: View(100),
             })
         );
     }
@@ -598,8 +611,8 @@ mod tests {
         assert_eq!(
             h.apply_rotation(&rot(nid(10), nid(20), 150), 50),
             Err(HistoryError::VeffNotStrictlyIncreasing {
-                last_v_eff: 200,
-                v_eff: 150,
+                last_v_eff: View(200),
+                v_eff: View(150),
             })
         );
     }
@@ -711,7 +724,7 @@ mod tests {
     #[test]
     fn apply_rotation_at_minimum_legal_v_eff_succeeds() {
         let mut h = ValidatorKeyHistory::new([vid(1)]);
-        let commit_view = 50;
+        let commit_view = View(50);
         let r = rot(nid(1), nid(10), commit_view + V_EFF_MIN_DELAY);
         h.apply_rotation(&r, commit_view).unwrap();
         assert_eq!(
@@ -932,7 +945,7 @@ mod tests {
             validators: vec![PersistedValidator {
                 stable_id: nid(1),
                 entries: vec![PersistedKeyEntry {
-                    v_eff: 0,
+                    v_eff: View(0),
                     pubkey: nid(99),
                 }],
             }],
@@ -948,15 +961,15 @@ mod tests {
                 stable_id: nid(1),
                 entries: vec![
                     PersistedKeyEntry {
-                        v_eff: 0,
+                        v_eff: View(0),
                         pubkey: nid(1),
                     },
                     PersistedKeyEntry {
-                        v_eff: 100,
+                        v_eff: View(100),
                         pubkey: nid(10),
                     },
                     PersistedKeyEntry {
-                        v_eff: 50,
+                        v_eff: View(50),
                         pubkey: nid(20),
                     },
                 ],
@@ -977,11 +990,11 @@ mod tests {
                     stable_id: nid(1),
                     entries: vec![
                         PersistedKeyEntry {
-                            v_eff: 0,
+                            v_eff: View(0),
                             pubkey: nid(1),
                         },
                         PersistedKeyEntry {
-                            v_eff: 100,
+                            v_eff: View(100),
                             pubkey: nid(50),
                         },
                     ],
@@ -990,11 +1003,11 @@ mod tests {
                     stable_id: nid(2),
                     entries: vec![
                         PersistedKeyEntry {
-                            v_eff: 0,
+                            v_eff: View(0),
                             pubkey: nid(2),
                         },
                         PersistedKeyEntry {
-                            v_eff: 200,
+                            v_eff: View(200),
                             pubkey: nid(50),
                         },
                     ],

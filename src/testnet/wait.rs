@@ -35,6 +35,7 @@ where
 /// `--all-reach-height N`: every live node has `last_committed_height >= height`.
 /// Dead nodes (no pid file) are skipped — semantics match `testnet ls`.
 pub async fn all_reach_height(state: &State, height: u64, timeout: Duration) -> anyhow::Result<()> {
+    let height = crate::consensus::Height(height);
     poll_until(timeout, || async {
         let live = live_nodes(state);
         if live.is_empty() {
@@ -98,7 +99,7 @@ pub async fn all_advance_by(state: &State, delta: u64, timeout: Duration) -> any
                 };
                 match admin::maybe_consensus_status(api).await? {
                     Some(s) => {
-                        snap.insert(n.index, s.last_committed_height.saturating_add(delta));
+                        snap.insert(n.index, s.last_committed_height.0.saturating_add(delta));
                     }
                     None => {
                         all_reachable = false;
@@ -128,7 +129,7 @@ pub async fn all_advance_by(state: &State, delta: u64, timeout: Duration) -> any
                 }
             };
             match admin::maybe_consensus_status(api).await? {
-                Some(s) if s.last_committed_height >= target => continue,
+                Some(s) if s.last_committed_height.0 >= target => continue,
                 _ => {
                     all_advanced = false;
                     break;
@@ -166,14 +167,14 @@ async fn all_healthy_check(state: &State, within: u64) -> anyhow::Result<bool> {
             Some(s) => s,
             None => return Ok(false),
         };
-        if s.last_committed_height < 1 {
+        if s.last_committed_height < crate::consensus::Height(1) {
             return Ok(false);
         }
         if s.peers_connected.len() < expected_peers {
             return Ok(false);
         }
-        views.push(s.current_view);
-        min_height = min_height.min(s.last_committed_height);
+        views.push(s.current_view.0);
+        min_height = min_height.min(s.last_committed_height.0);
     }
     let max_view = views.iter().max().copied().unwrap_or(0);
     let min_view = views.iter().min().copied().unwrap_or(0);
@@ -205,7 +206,7 @@ pub async fn node_caught_up(
             None => return Ok(false),
         };
         let mine = match admin::maybe_consensus_status(api).await? {
-            Some(s) => s.last_committed_height,
+            Some(s) => s.last_committed_height.0,
             None => return Ok(false),
         };
         let mut others_heights: Vec<u64> = Vec::new();
@@ -218,7 +219,7 @@ pub async fn node_caught_up(
                 None => return Ok(false),
             };
             if let Some(s) = admin::maybe_consensus_status(api).await? {
-                others_heights.push(s.last_committed_height);
+                others_heights.push(s.last_committed_height.0);
             } else {
                 return Ok(false);
             }
@@ -270,7 +271,7 @@ pub async fn quiescent(state: &State, hold: Duration, timeout: Duration) -> anyh
                 }
             };
             match admin::maybe_consensus_status(api).await? {
-                Some(s) => snap.push((s.current_view, s.last_committed_height)),
+                Some(s) => snap.push((s.current_view.0, s.last_committed_height.0)),
                 None => {
                     all_reachable = false;
                     break;

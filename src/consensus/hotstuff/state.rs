@@ -10,10 +10,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::consensus::View;
 use crate::consensus::limits::CacheEvictionCounters;
 use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_set::ValidatorSet;
+use crate::consensus::{Height, View};
 use crate::replication::block::{Block, BlockHash};
 
 use super::qc::VerifiedQc;
@@ -55,7 +55,7 @@ const PROTECTED_HIGH_QC_DEPTH: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Locked {
     pub view: View,
-    pub height: u64,
+    pub height: Height,
     pub block_hash: BlockHash,
 }
 
@@ -145,10 +145,10 @@ impl HotStuffState {
         pending.insert(genesis_hash, genesis);
         let validator_history = ValidatorSetHistory::from_genesis(validator_set.clone());
         Self {
-            current_view: 0,
+            current_view: View::ZERO,
             locked: None,
             high_qc: None,
-            last_voted_view: 0,
+            last_voted_view: View::ZERO,
             validator_set,
             validator_history,
             pending_blocks: pending,
@@ -240,7 +240,7 @@ impl HotStuffState {
                 target: TRACE_TARGET,
                 cache = "pending_blocks",
                 policy = "cap",
-                evicted_height = victim_height,
+                evicted_height = %victim_height,
                 cap = self.pending_blocks_capacity,
                 size_after = self.pending_blocks.len(),
                 "consensus_cache_evicted",
@@ -289,8 +289,8 @@ mod tests {
         let genesis = Block::genesis([0x77; 32], [0; 32]);
         let g_hash = genesis.hash();
         let state = HotStuffState::new(vs.clone(), genesis.clone());
-        assert_eq!(state.current_view, 0);
-        assert_eq!(state.last_voted_view, 0);
+        assert_eq!(state.current_view, View::ZERO);
+        assert_eq!(state.last_voted_view, View::ZERO);
         assert!(state.locked.is_none());
         assert!(state.high_qc.is_none());
         assert_eq!(state.genesis_hash, g_hash);
