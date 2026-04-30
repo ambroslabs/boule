@@ -656,6 +656,20 @@ impl SimCluster {
         self.signers.as_ref().map(|s| Arc::clone(&s[idx]))
     }
 
+    /// Per-node durable storage handle, in the same `node_ids` order as
+    /// [`Self::signer`]. Returns `None` for clusters that don't capture
+    /// per-node storages (the gossip-mode harness). The same `Arc` is
+    /// handed to `ConsensusNode::recover` across
+    /// [`SimCluster::restart_node_with_recover`], so reading the bytes
+    /// returned here corresponds to the on-disk shape a process restart
+    /// would observe — used by crash-recovery regression tests
+    /// (e.g. the audit-finding-4-1 / issue #405 lock-durability check)
+    /// to peek at the post-restart safety triple without reaching into
+    /// the reborn node's in-memory state.
+    pub fn node_storage(&self, idx: usize) -> Option<Arc<dyn Storage>> {
+        self.storages.as_ref().map(|s| Arc::clone(&s[idx]))
+    }
+
     /// Add node `idx` to the partition set. The routing tasks will drop all
     /// messages to and from this node until [`heal_node`] is called.
     ///
