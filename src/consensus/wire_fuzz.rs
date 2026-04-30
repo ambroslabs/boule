@@ -35,7 +35,7 @@
 //! and still scales to nightly's `PROPTEST_CASES=4096` without
 //! tripping CI's wall-clock limit.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
@@ -327,6 +327,7 @@ impl BlockBuilder for TestBlockBuilder {
         parent: &Block,
         view: View,
         _high_qc: &QuorumCertificate,
+        _pending_blocks: &HashMap<BlockHash, Block>,
     ) -> anyhow::Result<Block> {
         let header = BlockHeader {
             parent_hash: parent.hash(),
@@ -490,7 +491,7 @@ fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
         proposer: leader_nid,
     };
     let block_v1 = builder
-        .build(&replicas.genesis, 1, &genesis_qc)
+        .build(&replicas.genesis, 1, &genesis_qc, &HashMap::new())
         .expect("test builder must not fail");
     Signed {
         payload: Proposal {

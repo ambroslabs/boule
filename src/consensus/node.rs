@@ -22,17 +22,24 @@
 //! outbound message is sent. This module sets up the components;
 //! the ordering discipline is enforced when actions are applied.
 //!
-//! # `state_commitment` simplification
+//! # `state_commitment` over the uncommitted ancestor chain
 //!
 //! [`MempoolBlockBuilder`] computes the child block's `state_commitment`
-//! by forking the current committed SM state (snapshot → restore →
-//! apply → read commitment → restore back). This is exact when the
-//! proposed parent is the last-committed block, which is the common
-//! case in a healthy network. A future PR will walk the not-yet-
-//! committed ancestor chain for the rare multi-block-in-flight case.
+//! by forking the current committed SM state (snapshot → apply → read
+//! commitment → restore back). When the proposed parent is the
+//! last-committed block, this is a single-step apply. When the leader
+//! is pipelining proposals ahead of commits — the normal path under
+//! sustained load — the parent has uncommitted ancestors above the
+//! last-committed boundary; the builder walks those ancestors via the
+//! safety core's `pending_blocks` map and applies their commands in
+//! order before applying the candidate commands. This keeps the
+//! leader's stamped `state_commitment` byte-identical to what every
+//! replica computes from its own SM-after-uncommitted-ancestors
+//! (issue #375).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -399,16 +406,28 @@ impl NodeConfigForConsensus {
 /// and the current committed state machine.
 ///
 /// `state_commitment` is computed by forking the committed SM state:
-/// snapshot → apply new commands → read commitment → restore.  This is
-/// exact when the proposed parent equals the last-committed block
-/// (the common case). A future enhancement will walk the uncommitted
-/// ancestor chain for the multi-block-in-flight scenario.
+/// snapshot → walk uncommitted ancestors of `parent` and apply their
+/// commands → apply candidate commands → read commitment → restore.
+/// In the steady-state pipelined path (leader at view `v` proposes
+/// while views `v − 1`, `v − 2` are still uncommitted), the
+/// uncommitted-ancestor walk is what makes the leader's stamped
+/// commitment match what every replica computes from its own
+/// SM-after-uncommitted-ancestors. See [`MempoolBlockBuilder::build`]
+/// for the walk algorithm.
 pub struct MempoolBlockBuilder {
     self_id: NodeId,
     mempool: Arc<dyn Mempool>,
     /// Shared with the event loop's `Commit` handler, which advances
     /// this SM forward when blocks commit.
     state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
+    /// Shared height of the most-recently-committed block. The
+    /// integration layer ([`ConsensusNode::apply_commit`] and
+    /// [`ConsensusNode::restore_from_snapshot`]) writes; the builder
+    /// reads to bound the uncommitted-ancestor walk so genesis
+    /// (height 0, pre-seeded into `pending_blocks`) and any
+    /// recovery-seeded block at-or-below the committed boundary
+    /// are not re-applied to the SM.
+    last_committed_height: Arc<AtomicU64>,
     propose_limit: usize,
 }
 
@@ -417,36 +436,74 @@ impl MempoolBlockBuilder {
         self_id: NodeId,
         mempool: Arc<dyn Mempool>,
         state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
+        last_committed_height: Arc<AtomicU64>,
         propose_limit: usize,
     ) -> Self {
         Self {
             self_id,
             mempool,
             state_machine,
+            last_committed_height,
             propose_limit,
         }
     }
 }
 
 impl BlockBuilder for MempoolBlockBuilder {
+    /// Compute `state_commitment` for the new block over the chain
+    /// `last_committed → … → parent → candidate`:
+    ///
+    /// 1. Walk `parent`'s ancestors backwards via `pending_blocks`,
+    ///    keeping every block whose `header.height` is strictly
+    ///    above the integration layer's `last_committed_height`. The
+    ///    walk terminates either when the next `parent_hash` is
+    ///    absent from `pending_blocks` (the boundary is the
+    ///    last-committed block, pruned by `step::on_proposal_received`
+    ///    after each three-chain commit) or when the walk reaches a
+    ///    block at or below the committed boundary (genesis pre-seed
+    ///    or a recovery-seeded block).
+    /// 2. Snapshot the SM, apply the collected ancestors' commands
+    ///    in oldest-first order, then apply the mempool-pulled
+    ///    candidate commands. Read `state_commitment` after each
+    ///    successful `apply` per the [`StateMachine`] contract that a
+    ///    failed command is a no-op.
+    /// 3. Restore the SM to the snapshot.
     fn build(
         &self,
         parent: &Block,
         view: View,
         _high_qc: &QuorumCertificate,
+        pending_blocks: &HashMap<BlockHash, Block>,
     ) -> anyhow::Result<Block> {
         let commands = self.mempool.propose(self.propose_limit);
 
-        // Fork the committed SM state: snapshot, apply candidate commands,
-        // read commitment, then restore so the SM is left unchanged.
+        // Walk parent's uncommitted ancestor chain. The result is
+        // newest-first; reversing gives the apply order.
+        let committed_height = self.last_committed_height.load(Ordering::Relaxed);
+        let ancestor_chain = uncommitted_ancestor_chain(parent, pending_blocks, committed_height);
+
+        // Fork the committed SM state: snapshot, apply ancestor commands
+        // and candidate commands, read commitment, then restore so the
+        // SM is left unchanged.
         let state_commitment = {
             let mut sm = self.state_machine.lock();
             let snap = sm.snapshot();
 
             let mut commitment = sm.state_commitment();
-            // Apply each command on the fork; ignore individual errors
-            // (a command that fails changes nothing per the StateMachine
-            // contract, so commitment is consistent with "skip bad cmds").
+            // Apply each in-flight ancestor's commands in chain order,
+            // oldest first. Same `apply` discipline as below: a
+            // command that errors is a no-op per the StateMachine
+            // contract, so the commitment is consistent with "skip
+            // bad cmds" — which is exactly what every replica's own
+            // apply will produce on the same input.
+            for ancestor in ancestor_chain.iter().rev() {
+                for cmd in &ancestor.commands {
+                    if sm.apply(cmd).is_ok() {
+                        commitment = sm.state_commitment();
+                    }
+                }
+            }
+            // Now apply the candidate commands on top.
             for cmd in &commands {
                 if sm.apply(cmd).is_ok() {
                     commitment = sm.state_commitment();
@@ -468,6 +525,7 @@ impl BlockBuilder for MempoolBlockBuilder {
                     target: TRACE_TARGET,
                     view,
                     parent_height = parent.header.height,
+                    ancestor_chain_len = ancestor_chain.len(),
                     snap_bytes = snap_len,
                     error = %e,
                     "block_builder_restore_failed",
@@ -493,6 +551,44 @@ impl BlockBuilder for MempoolBlockBuilder {
             commands,
         })
     }
+}
+
+/// Walk `parent`'s ancestors backwards through `pending_blocks`,
+/// returning every block whose height is strictly above
+/// `committed_height` — i.e. the uncommitted-ancestor chain that the
+/// builder must fold into its `state_commitment`.
+///
+/// The result is newest-first (`parent` is element 0 if it is
+/// uncommitted); callers iterating in apply order should reverse it.
+///
+/// The walk stops when:
+/// - the cursor's height drops to or below `committed_height` (the
+///   committed boundary; genesis pre-seed or recovery-seeded blocks
+///   live below this line), or
+/// - the cursor's `parent_hash` is missing from `pending_blocks`
+///   (post-commit prune has removed the last-committed block).
+fn uncommitted_ancestor_chain(
+    parent: &Block,
+    pending_blocks: &HashMap<BlockHash, Block>,
+    committed_height: u64,
+) -> Vec<Block> {
+    let mut chain = Vec::new();
+    let mut cursor = parent.clone();
+    loop {
+        if cursor.header.height <= committed_height {
+            // cursor is committed (genesis pre-seed or a
+            // recovery-seeded committed block); not part of the
+            // uncommitted chain.
+            break;
+        }
+        let parent_hash = cursor.header.parent_hash;
+        chain.push(cursor);
+        match pending_blocks.get(&parent_hash) {
+            Some(next) => cursor = next.clone(),
+            None => break,
+        }
+    }
+    chain
 }
 
 // ── ConsensusNode ────────────────────────────────────────────────────────────
@@ -588,7 +684,11 @@ pub struct ConsensusNode {
     peers_connected: HashSet<NodeId>,
     /// Height of the most recently committed block, updated in
     /// [`ConsensusNode::apply_commit`]. Zero before the first commit.
-    last_committed_height: u64,
+    /// Wrapped in `Arc<AtomicU64>` so the [`MempoolBlockBuilder`] can
+    /// read it from inside the safety core's `build_proposal_at_view`
+    /// path to bound the uncommitted-ancestor walk (issue #375)
+    /// without having to thread a borrow through the trait object.
+    last_committed_height: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -727,10 +827,12 @@ impl ConsensusNode {
             Arc::clone(&timeout_policy) as _,
         );
 
+        let last_committed_height = Arc::new(AtomicU64::new(0));
         let builder = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
             Arc::clone(&state_machine),
+            Arc::clone(&last_committed_height),
             config.propose_limit,
         ));
 
@@ -794,7 +896,7 @@ impl ConsensusNode {
             eviction_counters,
             commit_tx: None,
             peers_connected: HashSet::new(),
-            last_committed_height: 0,
+            last_committed_height,
             last_committed_view: 0,
             status_tx: None,
             rate_limiter: None,
@@ -989,7 +1091,7 @@ impl ConsensusNode {
             self_role,
             current_view,
             last_voted_view: state.last_voted_view,
-            last_committed_height: self.last_committed_height,
+            last_committed_height: self.last_committed_height.load(Ordering::Relaxed),
             last_committed_view: self.last_committed_view,
             locked,
             high_qc,
@@ -1093,10 +1195,12 @@ impl ConsensusNode {
             Arc::clone(&timeout_policy) as _,
         );
 
+        let last_committed_height = Arc::new(AtomicU64::new(last_committed.height));
         let builder = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
             Arc::clone(&state_machine),
+            Arc::clone(&last_committed_height),
             config.propose_limit,
         ));
         let eviction_counters = CacheEvictionCounters::default();
@@ -1166,7 +1270,7 @@ impl ConsensusNode {
             eviction_counters,
             commit_tx: None,
             peers_connected: HashSet::new(),
-            last_committed_height: last_committed.height,
+            last_committed_height,
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
@@ -1613,7 +1717,7 @@ impl ConsensusNode {
         tracing::info!(
             target: TRACE_TARGET,
             self_id = %node_id_to_base58(&self.self_id),
-            last_committed_height = self.last_committed_height,
+            last_committed_height = self.last_committed_height.load(Ordering::Relaxed),
             last_committed_view = self.last_committed_view,
             high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view),
             last_voted_view = self.core.state().last_voted_view,
@@ -1876,7 +1980,7 @@ impl ConsensusNode {
                     let proposer = signed.signer;
                     let proposal_height = signed.payload.block.header.height;
                     let actions = self.snapshot_sync.observe_proposal(
-                        self.last_committed_height,
+                        self.last_committed_height.load(Ordering::Relaxed),
                         proposal_height,
                         proposer,
                         &self.validator_set,
@@ -2202,8 +2306,9 @@ impl ConsensusNode {
         // Step 5: update in-memory last-committed counters. The
         // safety core emits `Action::Commit` in height order, so
         // future commits will increment from this baseline.
-        if manifest.height > self.last_committed_height {
-            self.last_committed_height = manifest.height;
+        if manifest.height > self.last_committed_height.load(Ordering::Relaxed) {
+            self.last_committed_height
+                .store(manifest.height, Ordering::Relaxed);
             self.last_committed_view = manifest.view;
         }
         // Step 5b (#325 PR D): install the producer's validator
@@ -3116,8 +3221,9 @@ impl ConsensusNode {
         // safety core emits `Action::Commit` in height order, so a
         // plain max-by-value assignment keeps this monotonic without
         // any extra bookkeeping.
-        if block.header.height > self.last_committed_height {
-            self.last_committed_height = block.header.height;
+        if block.header.height > self.last_committed_height.load(Ordering::Relaxed) {
+            self.last_committed_height
+                .store(block.header.height, Ordering::Relaxed);
             self.last_committed_view = block.header.view;
         }
         // Persist (block, last_committed) atomically so the responder
@@ -3126,7 +3232,7 @@ impl ConsensusNode {
         let block_hash = block.hash();
         let key = block_storage_key(&block_hash);
         let last_committed = LastCommitted {
-            height: self.last_committed_height,
+            height: self.last_committed_height.load(Ordering::Relaxed),
             view: self.last_committed_view,
             last_committed_hash: block_hash,
         };
@@ -4270,7 +4376,21 @@ mod tests {
         mempool: Arc<dyn Mempool>,
         sm: Arc<Mutex<Box<dyn StateMachine>>>,
     ) -> MempoolBlockBuilder {
-        MempoolBlockBuilder::new(self_id, mempool, sm, 10)
+        MempoolBlockBuilder::new(self_id, mempool, sm, Arc::new(AtomicU64::new(0)), 10)
+    }
+
+    /// Variant of [`make_builder`] that lets the caller seed
+    /// `last_committed_height`. Used by the multi-block-in-flight
+    /// test (#375) where the SM has been advanced past the
+    /// pre-seeded genesis but pending_blocks still contains it.
+    #[allow(dead_code)]
+    fn make_builder_with_committed(
+        self_id: NodeId,
+        mempool: Arc<dyn Mempool>,
+        sm: Arc<Mutex<Box<dyn StateMachine>>>,
+        last_committed_height: Arc<AtomicU64>,
+    ) -> MempoolBlockBuilder {
+        MempoolBlockBuilder::new(self_id, mempool, sm, last_committed_height, 10)
     }
 
     #[test]
@@ -4282,7 +4402,7 @@ mod tests {
         let qc = sample_qc();
 
         let block = builder
-            .build(&parent, 3, &qc)
+            .build(&parent, 3, &qc, &HashMap::new())
             .expect("test builder must not fail");
 
         assert_eq!(block.header.parent_hash, parent.hash());
@@ -4302,7 +4422,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), 1, &sample_qc())
+            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
             .expect("test builder must not fail");
 
         assert_eq!(block.commands.len(), 2);
@@ -4321,10 +4441,10 @@ mod tests {
         let qc = sample_qc();
 
         let b1 = builder
-            .build(&parent, 1, &qc)
+            .build(&parent, 1, &qc, &HashMap::new())
             .expect("test builder must not fail");
         let b2 = builder
-            .build(&parent, 1, &qc)
+            .build(&parent, 1, &qc, &HashMap::new())
             .expect("test builder must not fail");
 
         assert_eq!(b1.hash(), b2.hash(), "build must be deterministic");
@@ -4344,7 +4464,7 @@ mod tests {
 
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         builder
-            .build(&genesis(), 1, &sample_qc())
+            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
             .expect("test builder must not fail");
 
         let after = sm.lock().state_commitment();
@@ -4365,7 +4485,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), 1, &sample_qc())
+            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
             .expect("test builder must not fail");
 
         // Manually apply the same command and check commitment matches.
@@ -4388,7 +4508,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), 1, &sample_qc())
+            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
             .expect("test builder must not fail");
 
         let recomputed = Block::commands_commitment(&block.commands);
@@ -4445,13 +4565,200 @@ mod tests {
         // The fork-and-restore round trip inside `build` triggers our
         // simulated failure. The builder must surface this as `Err`,
         // not panic.
-        let result = builder.build(&genesis(), 1, &sample_qc());
+        let result = builder.build(&genesis(), 1, &sample_qc(), &HashMap::new());
         let err = result.expect_err("builder must propagate restore failure as Err");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("simulated restore failure"),
             "error must surface the underlying state-machine failure, got {msg}",
         );
+    }
+
+    /// Issue #375: multi-block-in-flight — when the leader builds a
+    /// child while previous blocks are uncommitted, the stamped
+    /// `state_commitment` must reflect *all* the in-flight ancestors'
+    /// commands, not just the candidate commands applied to the
+    /// committed SM. Pre-fix, the commitment was computed against the
+    /// committed SM directly; replicas applying the chain in order
+    /// would compute a different value and reject the proposal.
+    ///
+    /// The test builds a chain `genesis → b1 → b2 → b3` of
+    /// uncommitted ancestors (each carrying one `Increment`), then
+    /// asks the builder to extend `b3` with another `Increment` from
+    /// the mempool. The stamped `state_commitment` must equal what a
+    /// replica computes when applying every block's commands in
+    /// order (`b1.cmds → b2.cmds → b3.cmds → candidate.cmds`).
+    ///
+    /// **Bisect-confirmed**: reverting [`MempoolBlockBuilder::build`]
+    /// to the pre-fix single-step apply makes the assertion fail with
+    /// a commitment mismatch — the leader's stamp would be the
+    /// commitment for "apply 1 increment to genesis state" instead
+    /// of "apply 4 increments".
+    #[test]
+    fn builder_state_commitment_walks_uncommitted_ancestor_chain() {
+        use crate::replication::impls::counter_sm::CounterCommand;
+
+        // The candidate (the new block being built) pulls one
+        // Increment from the mempool.
+        let mp: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(16));
+        mp.insert(CounterCommand::Increment.encode()).unwrap();
+
+        let sm = make_sm();
+        let before = sm.lock().state_commitment();
+        let last_committed_height = Arc::new(AtomicU64::new(0));
+        let builder = make_builder_with_committed(
+            nid(1),
+            Arc::clone(&mp),
+            Arc::clone(&sm),
+            Arc::clone(&last_committed_height),
+        );
+
+        // Build the in-flight ancestor chain: genesis → b1 → b2 → b3,
+        // each carrying one Increment. State_commitment fields are
+        // not load-bearing for the builder's walk (the walk uses
+        // pending_blocks parent links + commands), so any value
+        // works here.
+        let g = genesis();
+        let make_inflight = |parent_hash: BlockHash, height: u64, view: View| -> Block {
+            let commands = vec![CounterCommand::Increment.encode()];
+            Block {
+                header: BlockHeader {
+                    parent_hash,
+                    height,
+                    view,
+                    proposer: nid(1),
+                    state_commitment: [0u8; 32],
+                    commands_commitment: Block::commands_commitment(&commands),
+                    validator_history_commitment: [0; 32],
+                },
+                commands,
+            }
+        };
+        let b1 = make_inflight(g.hash(), 1, 1);
+        let b2 = make_inflight(b1.hash(), 2, 2);
+        let b3 = make_inflight(b2.hash(), 3, 3);
+
+        let mut pending_blocks: HashMap<BlockHash, Block> = HashMap::new();
+        pending_blocks.insert(g.hash(), g.clone());
+        pending_blocks.insert(b1.hash(), b1.clone());
+        pending_blocks.insert(b2.hash(), b2.clone());
+        pending_blocks.insert(b3.hash(), b3.clone());
+
+        let proposal = builder
+            .build(&b3, 4, &sample_qc(), &pending_blocks)
+            .expect("test builder must not fail");
+
+        // The builder must not have left the SM mutated — the apply
+        // discipline still requires snapshot/restore round-tripping.
+        assert_eq!(
+            sm.lock().state_commitment(),
+            before,
+            "build must not leave the state machine mutated",
+        );
+
+        // Compute the reference commitment by applying every block's
+        // commands to a fresh SM in order, then the candidate
+        // command. This is what every honest replica computes in its
+        // own pending_blocks walk.
+        let mut reference = CounterStateMachine::new();
+        for ancestor in [&b1, &b2, &b3] {
+            for cmd in &ancestor.commands {
+                reference.apply(cmd).unwrap();
+            }
+        }
+        for cmd in &proposal.commands {
+            reference.apply(cmd).unwrap();
+        }
+        assert_eq!(
+            proposal.header.state_commitment,
+            reference.state_commitment(),
+            "state_commitment must reflect b1+b2+b3+candidate, not just candidate",
+        );
+        assert_eq!(reference.value(), 4, "1 + 1 + 1 + 1 = 4 increments applied");
+    }
+
+    /// Issue #375 corollary: after the last-committed boundary
+    /// advances (e.g. the SM is updated and `last_committed_height`
+    /// bumped), the builder must stop walking *at* the new boundary
+    /// — not the old one or genesis. This pins the contract that the
+    /// integration layer's `apply_commit` updates the shared atomic
+    /// in lockstep with the SM.
+    #[test]
+    fn builder_state_commitment_stops_at_last_committed_boundary() {
+        use crate::replication::impls::counter_sm::CounterCommand;
+
+        let mp: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(16));
+        mp.insert(CounterCommand::Increment.encode()).unwrap();
+
+        // Simulate "b1 has been committed": the SM has applied b1's
+        // commands and `last_committed_height = 1`.
+        let sm = make_sm();
+        sm.lock()
+            .apply(&CounterCommand::Increment.encode())
+            .unwrap();
+        let post_b1_commitment = sm.lock().state_commitment();
+
+        let last_committed_height = Arc::new(AtomicU64::new(1));
+        let builder = make_builder_with_committed(
+            nid(1),
+            Arc::clone(&mp),
+            Arc::clone(&sm),
+            Arc::clone(&last_committed_height),
+        );
+
+        // pending_blocks still contains b1, b2 (the typical
+        // post-three-chain-commit shape would have pruned b1, but
+        // until the prune fires the safety core can hold it; the
+        // builder must not re-apply b1's commands either way).
+        let g = genesis();
+        let make_inflight = |parent_hash: BlockHash, height: u64, view: View| -> Block {
+            let commands = vec![CounterCommand::Increment.encode()];
+            Block {
+                header: BlockHeader {
+                    parent_hash,
+                    height,
+                    view,
+                    proposer: nid(1),
+                    state_commitment: [0u8; 32],
+                    commands_commitment: Block::commands_commitment(&commands),
+                    validator_history_commitment: [0; 32],
+                },
+                commands,
+            }
+        };
+        let b1 = make_inflight(g.hash(), 1, 1);
+        let b2 = make_inflight(b1.hash(), 2, 2);
+
+        let mut pending_blocks: HashMap<BlockHash, Block> = HashMap::new();
+        pending_blocks.insert(g.hash(), g.clone());
+        pending_blocks.insert(b1.hash(), b1.clone());
+        pending_blocks.insert(b2.hash(), b2.clone());
+
+        let proposal = builder
+            .build(&b2, 3, &sample_qc(), &pending_blocks)
+            .expect("test builder must not fail");
+
+        // SM unmutated.
+        assert_eq!(sm.lock().state_commitment(), post_b1_commitment);
+
+        // Reference: b2.commands + candidate.commands applied on top
+        // of post-b1 state.
+        let mut reference = CounterStateMachine::new();
+        reference
+            .apply(&CounterCommand::Increment.encode())
+            .unwrap();
+        for cmd in &b2.commands {
+            reference.apply(cmd).unwrap();
+        }
+        for cmd in &proposal.commands {
+            reference.apply(cmd).unwrap();
+        }
+        assert_eq!(
+            proposal.header.state_commitment,
+            reference.state_commitment(),
+            "commitment must reflect b2 + candidate on top of committed b1",
+        );
+        assert_eq!(reference.value(), 3);
     }
 
     // ── C-series: durability bridge ──────────────────────────────────────────
@@ -5388,7 +5695,7 @@ mod tests {
                 };
                 node.apply_commit(block);
             }
-            assert_eq!(node.last_committed_height, 42);
+            assert_eq!(node.last_committed_height.load(Ordering::Relaxed), 42);
             assert_eq!(node.last_committed_view, 57);
         }
 
@@ -5403,7 +5710,7 @@ mod tests {
             Arc::new(MemoryWal::new()),
         )
         .expect("recover");
-        assert_eq!(recovered.last_committed_height, 42);
+        assert_eq!(recovered.last_committed_height.load(Ordering::Relaxed), 42);
         assert_eq!(recovered.last_committed_view, 57);
     }
 
@@ -6301,7 +6608,8 @@ mod tests {
             "joiner's snapshot_sync must reach Done after a successful fetch",
         );
         assert_eq!(
-            joiner_node.last_committed_height, 50,
+            joiner_node.last_committed_height.load(Ordering::Relaxed),
+            50,
             "joiner's last_committed_height must equal the snapshot's height",
         );
         assert_eq!(joiner_node.last_committed_view, 50);
@@ -6470,7 +6778,8 @@ mod tests {
         );
         // No restore happened.
         assert_eq!(
-            joiner_node.last_committed_height, 0,
+            joiner_node.last_committed_height.load(Ordering::Relaxed),
+            0,
             "no restore must have run; last_committed stays at 0",
         );
         // No outbound chunk requests should have been emitted; the
@@ -6696,7 +7005,8 @@ mod tests {
             "joiner must complete the multi-source fetch",
         );
         assert_eq!(
-            joiner_node.last_committed_height, 50,
+            joiner_node.last_committed_height.load(Ordering::Relaxed),
+            50,
             "joiner's last_committed_height must equal snapshot height",
         );
         assert_eq!(
@@ -6955,7 +7265,10 @@ mod tests {
             joiner_node.snapshot_sync.is_done(),
             "joiner must complete fetch after a single peer drop",
         );
-        assert_eq!(joiner_node.last_committed_height, 50);
+        assert_eq!(
+            joiner_node.last_committed_height.load(Ordering::Relaxed),
+            50
+        );
         assert_eq!(joiner_sm.lock().state_commitment(), expected_commitment);
     }
 
