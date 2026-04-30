@@ -236,6 +236,16 @@ pub trait BlockBuilder: Send + Sync {
     /// `header.proposer` from context known to the integration layer;
     /// the safety core does not thread its own `NodeId` in here.
     ///
+    /// `pending_blocks` is the safety core's
+    /// [`HotStuffState::pending_blocks`] map at the moment of build,
+    /// passed by reference so the production
+    /// [`MempoolBlockBuilder`] can walk the *uncommitted ancestor
+    /// chain* from `parent` back to the last committed boundary and
+    /// fold those ancestors' commands into its `state_commitment`
+    /// computation (issue #375). Implementations that don't compute a
+    /// state commitment (e.g. `TestBlockBuilder`) ignore this
+    /// argument.
+    ///
     /// Returns `Err` when the builder cannot construct a block — for
     /// example, the production [`MempoolBlockBuilder`] returns `Err`
     /// when the state-machine fork-and-restore round trip fails
@@ -245,12 +255,14 @@ pub trait BlockBuilder: Send + Sync {
     /// affected view, letting the next-view leader take over rather
     /// than crashing the node.
     ///
+    /// [`HotStuffState::pending_blocks`]: super::state::HotStuffState::pending_blocks
     /// [`MempoolBlockBuilder`]: crate::consensus::node::MempoolBlockBuilder
     fn build(
         &self,
         parent: &Block,
         view: View,
         high_qc: &QuorumCertificate,
+        pending_blocks: &HashMap<BlockHash, Block>,
     ) -> anyhow::Result<Block>;
 }
 
@@ -605,19 +617,23 @@ impl HotStuffCore {
         // `state_commitment` it can't trust. Log the cause so an
         // operator can correlate the skip with whatever local issue
         // produced it.
-        let new_block = match self.builder.build(&parent, view, &high_qc) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    view,
-                    parent_height = parent.header.height,
-                    error = %e,
-                    "block_builder_build_failed",
-                );
-                return Vec::new();
-            }
-        };
+        let new_block =
+            match self
+                .builder
+                .build(&parent, view, &high_qc, &self.state.pending_blocks)
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        view,
+                        parent_height = parent.header.height,
+                        error = %e,
+                        "block_builder_build_failed",
+                    );
+                    return Vec::new();
+                }
+            };
         self.proposed_in_view = view;
         vec![Action::Broadcast(ConsensusMsg::Proposal(Proposal {
             block: new_block,
@@ -1646,6 +1662,7 @@ mod tests {
             parent: &Block,
             view: View,
             _high_qc: &QuorumCertificate,
+            _pending_blocks: &HashMap<BlockHash, Block>,
         ) -> anyhow::Result<Block> {
             let header = BlockHeader {
                 parent_hash: parent.hash(),
@@ -4853,7 +4870,7 @@ mod tests {
                 proposer: leader_nid,
             };
             let block_v1 = builder
-                .build(&replicas.genesis, 1, &genesis_qc)
+                .build(&replicas.genesis, 1, &genesis_qc, &HashMap::new())
                 .expect("test builder must not fail");
             Signed {
                 payload: Proposal {
