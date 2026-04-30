@@ -592,10 +592,10 @@ Reach for non-uniform weights when:
 - Specific validators have different reliability profiles and you
   want quorum to lean on the more reliable ones.
 
-A future stake-weighted leader-selection follow-up (issue #145)
-will pair leader rotation with the same weight distribution. Until
-that lands, leader rotation stays round-robin: a weight-1 and a
-weight-1000 validator lead equally often.
+Stake-weighted leader rotation pairs with the weighted-quorum
+predicate: see [Leader selection](#leader-selection-issue-145)
+below for how leadership frequency tracks `weight[i] / total_weight`
+under the production default.
 
 ### Single-validator stall constraint
 
@@ -685,6 +685,57 @@ prints the recovered set and the persisted weights are visible in
 the DB blob. A future operator-introspection endpoint that surfaces
 this without restart is filed (no specific issue yet — file one if
 this becomes recurring friction).
+
+### Leader selection (issue #145)
+
+Production builds use **`WeightedAccumulatorSelector`**, a
+deterministic stake-weighted accumulator (Tendermint-style):
+each validator carries a priority that grows by its weight every
+view, the leader is whoever has the highest priority (ties: lowest
+`NodeId`), and the chosen validator's priority drops by
+`total_weight`. Long-run leader frequency is **exactly**
+`weight[i] / total_weight` with no statistical drift.
+
+Practical consequences for operators:
+
+- **No DoS resistance over plain round-robin.** The accumulator is
+  fully deterministic — every replica computes the same leader for
+  every view from the same public inputs. An adversary running a
+  blockchain explorer can predict the next 1000 leaders and time a
+  DoS at each one. This matches the threat model of a permissioned
+  / consortium deployment, where leadership is just "do more work
+  this view." Open multi-operator networks where targeted DoS is a
+  real threat want VRF-based unpredictable selection (Option 3 of
+  #145, deferred until going public).
+- **Heavier validators are leaders more often, *exactly* in
+  proportion to their weight.** With weights `[10, 1, 1, 1]` over a
+  13-view period: the heavy validator leads 10 views, each light
+  validator leads 1 view. Per-period the distribution is exact;
+  shorter windows can be off by ±1 view per validator.
+- **Reconfiguration boundaries reset the accumulator.** The
+  post-boundary regime starts with priorities = `[0; n]`. A
+  validator who was about to lead in the next view of the
+  pre-boundary regime is *not* prioritized in the post-boundary
+  regime — they re-enter the rotation alongside everyone else.
+- **`self_role` in `/consensus/status`** is computed by querying the
+  installed selector for the current view, so it correctly reports
+  `leader(view=N)` whenever the local node *would* propose. Under
+  uniform weights this still reduces to the previous
+  `validators[view % len]` behavior.
+
+Operationally, weighted leadership is mostly invisible — the only
+practical effect is that a heavy validator's hardware will see more
+proposal-build work and more outbound bandwidth than a light one.
+If you set up a `[10, 1, 1, 1]` cluster the heavy validator will do
+roughly 10× the per-view leader work of any light validator.
+
+When to opt out: tests that assert exact rotation expectations
+(e.g. \"node X must propose at view Y\") still construct
+`RoundRobinSelector` directly. There's no production path to swap
+selectors at runtime today — that knob ships when the second
+production-grade selector (VRF) lands. Keep round-robin unit-test
+fixtures in mind if you find a property that depends on uniform
+leadership frequency in the short run.
 
 ## Consensus signature scheme (issues #143, #287–#296)
 
