@@ -16,7 +16,7 @@ use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::replication::block::{Block, BlockHash};
 
-use super::qc::QuorumCertificate;
+use super::qc::VerifiedQc;
 
 /// Tracing target for eviction logs. Same string as
 /// [`crate::consensus::node::TRACE_TARGET`] so a single
@@ -79,7 +79,16 @@ pub struct HotStuffState {
     /// NewView, freshly assembled). Used to piggyback our most recent
     /// proof of progress when we send a NewView, and as the justify
     /// for proposals we build.
-    pub high_qc: Option<QuorumCertificate>,
+    ///
+    /// Typed as `Option<VerifiedQc>` (not `Option<QuorumCertificate>`)
+    /// so every code path that lands a QC here must construct a
+    /// [`VerifiedQc`] — the dispatch verifier (wire path) does so
+    /// implicitly via `Verified<Signed<…>>` envelopes; the small set
+    /// of trusted-by-construction sites (genesis seed, locally-formed
+    /// QC, recovery from durable storage, snapshot adoption) wrap via
+    /// `VerifiedQc::unchecked` with an inline audit comment. Audit
+    /// finding 5-1 / issue #408.
+    pub high_qc: Option<VerifiedQc>,
 
     /// View of the most recent block this replica has voted on.
     /// Prevents double-voting within a view.
@@ -246,7 +255,7 @@ impl HotStuffState {
         let mut out = std::collections::HashSet::new();
         out.insert(self.genesis_hash);
         if let Some(qc) = &self.high_qc {
-            let mut cursor = qc.block_hash;
+            let mut cursor = qc.block_hash();
             for _ in 0..PROTECTED_HIGH_QC_DEPTH {
                 if !out.insert(cursor) {
                     break;

@@ -148,6 +148,7 @@ pub fn apply_reconfig_commands_to_set_history(
     key_history: &mut ValidatorKeyHistory,
     scheme: SignatureSchemeChoice,
     min_v_eff_delay: View,
+    chain_id: &ChainId,
 ) {
     use crate::consensus::reconfig::ReconfigCommand;
 
@@ -168,6 +169,7 @@ pub fn apply_reconfig_commands_to_set_history(
             block_view,
             min_v_eff_delay,
             scheme,
+            chain_id,
         ) {
             Ok(m) => m,
             Err(_) => continue,
@@ -258,7 +260,7 @@ pub fn apply_rotation_commands_to_histories(
 
         if envelope
             .payload
-            .validate_scheme_consistency(scheme)
+            .validate_scheme_consistency(scheme, chain_id)
             .is_err()
         {
             continue;
@@ -360,7 +362,14 @@ pub fn compute_post_block_commitment(
     let mut set = set_history.clone();
     let mut key = key_history.clone();
     let mut bls = bls_key_history.cloned();
-    apply_reconfig_commands_to_set_history(block, &mut set, &mut key, scheme, min_v_eff_delay);
+    apply_reconfig_commands_to_set_history(
+        block,
+        &mut set,
+        &mut key,
+        scheme,
+        min_v_eff_delay,
+        chain_id,
+    );
     apply_rotation_commands_to_histories(block, &set, &mut key, bls.as_mut(), chain_id, scheme);
     validator_history_commitment_v1(&set, &key, bls.as_ref())
 }
