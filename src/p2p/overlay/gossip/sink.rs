@@ -31,6 +31,9 @@
 //! callers and both run on the tokio runtime; `try_send` is the right
 //! call.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -45,16 +48,41 @@ use super::peer_list_task::OverlayUnicast;
 /// [`OverlayUnicast`] sink.
 ///
 /// Cheap to clone (the underlying `Sender` is `Clone`).
+///
+/// Carries an `Arc<AtomicU64>` overflow counter that increments every
+/// time `send_to` returns `Full` from `try_send`. Cloned sinks share the
+/// same counter so the rolled-up total reflects every drop on every
+/// caller. Operators surface this through `ConsensusStatus` to spot
+/// repeated drops without having to grep tracing logs (#163 / #486).
 #[derive(Clone)]
 pub struct OverlaySink {
     send_tx: mpsc::Sender<ProtocolOutbound>,
+    overflows: Arc<AtomicU64>,
 }
 
 impl OverlaySink {
     /// Wrap a clone of the per-protocol outbound sender returned by
     /// [`crate::p2p::PeerCommand::RegisterProtocol`].
     pub fn new(send_tx: mpsc::Sender<ProtocolOutbound>) -> Self {
-        Self { send_tx }
+        Self {
+            send_tx,
+            overflows: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Shared handle to the overflow counter. Increments every time
+    /// [`OverlayUnicast::send_to`] hits `try_send` `Full`. The closed
+    /// case is intentionally not counted: those drops are a normal
+    /// consequence of a manager shutting down and would mask real
+    /// back-pressure events.
+    pub fn overflow_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.overflows)
+    }
+
+    /// Read the current overflow count. Monotonic for the lifetime of
+    /// the sink (and any clones); never decrements.
+    pub fn overflow_count(&self) -> u64 {
+        self.overflows.load(Ordering::Relaxed)
     }
 }
 
@@ -81,6 +109,7 @@ impl OverlayUnicast for OverlaySink {
                 // channel capacity is too small for the consensus
                 // emit rate (#163 back-pressure) or one specific
                 // peer's connection task has stalled.
+                self.overflows.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     target: "ambros_p2p::p2p::overlay::gossip",
                     target_peer = %node_id_to_base58(&target),
@@ -133,12 +162,14 @@ mod tests {
     async fn send_to_drops_silently_when_channel_full() {
         // Capacity 1; fill it, then assert the next send_to is a no-op
         // (doesn't panic, doesn't block, doesn't enqueue a second
-        // entry).
+        // entry) and the overflow counter increments.
         let (tx, mut rx) = mpsc::channel::<ProtocolOutbound>(1);
         let sink = OverlaySink::new(tx);
 
         sink.send_to(nid(1), Bytes::from_static(b"first"));
+        assert_eq!(sink.overflow_count(), 0);
         sink.send_to(nid(2), Bytes::from_static(b"dropped"));
+        assert_eq!(sink.overflow_count(), 1);
 
         // First message survives; second was dropped on Full.
         match rx.recv().await.expect("channel closed") {
@@ -147,6 +178,35 @@ mod tests {
         }
         // Channel must now be empty (no buffered second entry).
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn overflow_counter_does_not_increment_on_closed() {
+        // Closed receivers fire when the manager is shutting down;
+        // counting those would mask real back-pressure events.
+        let (tx, rx) = mpsc::channel::<ProtocolOutbound>(8);
+        let sink = OverlaySink::new(tx);
+        drop(rx);
+
+        sink.send_to(nid(3), Bytes::from_static(b"into the void"));
+        assert_eq!(sink.overflow_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cloned_sinks_share_the_overflow_counter() {
+        // Capacity 1; fill from sink_a, drop from sink_b — the
+        // counter on either handle reflects the shared total.
+        let (tx, _rx) = mpsc::channel::<ProtocolOutbound>(1);
+        let sink_a = OverlaySink::new(tx);
+        let sink_b = sink_a.clone();
+
+        sink_a.send_to(nid(1), Bytes::from_static(b"first"));
+        sink_b.send_to(nid(2), Bytes::from_static(b"dropped"));
+        assert_eq!(sink_a.overflow_count(), 1);
+        assert_eq!(sink_b.overflow_count(), 1);
+
+        let counter = sink_a.overflow_counter();
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

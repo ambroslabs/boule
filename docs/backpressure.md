@@ -68,7 +68,7 @@ test fixtures with smaller channels do not appear here.
 
 | Path | File:line | Type | Capacity | Send-side on full | Policy | Rationale |
 |------|-----------|------|----------|-------------------|--------|-----------|
-| Overlay sink to peer | `p2p/overlay/gossip/sink.rs:64` | wraps `ProtocolHandle::send_tx` | 256 | `try_send` → drop + warn | **Drop + counter** *(counter pending)* | Used by the peer-list maintenance loop and gossip forwards. Multiple delivery paths exist (peer-list pushes repeat at the next interval; mesh forwards have N>1 hops), so one drop is recoverable. The drop site already has a comment pointing at this issue; #486 wires the counter. |
+| Overlay sink to peer | `p2p/overlay/gossip/sink.rs:64` | wraps `ProtocolHandle::send_tx` | 256 | `try_send` → drop + counter + warn | **Drop + counter** | Used by the peer-list maintenance loop and gossip forwards. Multiple delivery paths exist (peer-list pushes repeat at the next interval; mesh forwards have N>1 hops), so one drop is recoverable. Counter (#486) is wired through `node.rs` into `ConsensusStatus.backpressure.gossip_sink_overflow_total`; the closed-channel path is intentionally not counted (manager-shutdown noise would mask real back-pressure). |
 | Gossip dedup ring | `p2p/overlay/gossip/dedup.rs` | `IndexMap` (FIFO) | configurable | FIFO eviction at capacity, lazy TTL purge | **Bounded with eviction** | Content store rather than flow-control queue; cap is sized for expected gossip diameter × fan-out. |
 | Discovery events | `p2p/overlay/gossip/discovery.rs:94` | `broadcast<DiscoveryEvent>` | configurable | broadcast::send | **Drop on lag** | Subscribers re-poll on `Lagged`. |
 | Overlay command queue | `p2p/overlay/gossip/overlay.rs:288` | `mpsc<OverlayCmd>` | configurable | `send().await` | **Block** | Internal coordination; not data-plane. |
@@ -125,11 +125,13 @@ The audit identified three gaps that are tracked as sub-issues of #163:
   at [`SIM_COMMIT_CHANNEL_CAP`](../src/consensus/sim.rs); the
   notifier increments a per-node overflow counter on drop, surfaced
   in `SimCluster::total_commit_overflows()`.
-- **#486** — No overflow counters on the drop-on-full paths
-  (per-peer outbound `write_tx`, gossip sink, sim mailbox). Wire
-  `AtomicU64` counters and surface them in `ConsensusStatus` so the
-  back-pressure events the policy *intends* to surface actually
-  become operationally visible.
+- **#486** — Partially landed: the gossip sink now tracks an
+  `AtomicU64` overflow counter and surfaces through
+  `ConsensusStatus.backpressure.gossip_sink_overflow_total`. The
+  per-peer outbound `write_tx` drop site (`p2p/manager.rs:198`) and
+  the production consensus event channel are still uncounted; threading
+  a counter through `ProtocolHandle` is the natural next step (#486
+  follow-up).
 - **#163-PR4 (not yet filed)** — Slow-peer disconnect heuristic for
   per-peer outbound. The drop is wired (`p2p/manager.rs:198`) but
   there's no "after K consecutive overflows in window W, disconnect"
