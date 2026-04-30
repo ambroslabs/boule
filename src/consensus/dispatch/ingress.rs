@@ -274,7 +274,11 @@ pub fn ingress_new_view(
     // claimed at a pre-boundary view) is rejected here before
     // it can pollute the safety core's `state.high_qc`.
     let vs = history.set_at(high_qc_view);
-    if !signed.payload.high_qc.is_well_formed(&vs) {
+    if !signed
+        .payload
+        .high_qc
+        .is_well_formed(vs.for_view(high_qc_view))
+    {
         return Err(IngressError::MalformedHighQc { view: high_qc_view });
     }
     verify_qc_if_requested(

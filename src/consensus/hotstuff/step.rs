@@ -856,8 +856,8 @@ impl HotStuffCore {
         // so this matches the previous `state.validator_set` lookup;
         // after #272 it correctly picks the post-boundary set for any
         // proposal at or after `v_eff`.
-        let vs = self.state.validator_history.set_at(view);
-        if round_robin_leader(&vs, view) != self.self_id {
+        let vs_at = self.state.validator_history.set_at(view);
+        if round_robin_leader(vs_at.for_view(view), view) != self.self_id {
             return Vec::new();
         }
         self.build_proposal_at_view(view)
@@ -1137,7 +1137,7 @@ impl HotStuffCore {
         // instead of re-tagging `signed.signer` keeps the bitmap-index
         // lookup correct after a key rotation, where the wire pubkey's
         // bytes no longer coincide with the validator's stable id.
-        let Some(voter_idx) = vs_at_vote.index_of(&voter_id) else {
+        let Some(voter_idx) = vs_at_vote.for_view(vote.view).index_of(&voter_id) else {
             return Vec::new();
         };
 
@@ -1177,7 +1177,8 @@ impl HotStuffCore {
         // `vote.view` so the bitmap and quorum threshold match what
         // the QC will be checked against later.
         let key = (vote.view, vote.block_hash);
-        let validator_set_len = vs_at_vote.len();
+        let vs_at_vote_set = vs_at_vote.for_view(vote.view);
+        let validator_set_len = vs_at_vote_set.len();
         // Make room before insert. Updating an existing bucket
         // doesn't grow the map, so the cap check only fires on
         // genuinely new (view, block_hash) tuples — exactly the
@@ -1195,12 +1196,12 @@ impl HotStuffCore {
                     QuorumCertificate::new_bls(vote.view, vote.block_hash, validator_set_len)
                 }
             });
-        let had_quorum = qc.has_quorum(&vs_at_vote);
+        let had_quorum = qc.has_quorum(vs_at_vote_set);
         match bls_partial {
             None => qc.add_signature(voter_idx, signed.sig),
             Some(partial) => qc.add_bls_partial(voter_idx, partial),
         }
-        let has_quorum_now = qc.has_quorum(&vs_at_vote);
+        let has_quorum_now = qc.has_quorum(vs_at_vote_set);
 
         // Only fire on the transition from sub-quorum to quorum.
         // Late votes arriving after the QC formed are absorbed
@@ -1340,9 +1341,10 @@ impl HotStuffCore {
         // afterwards crossing `v_eff` swaps in the post-boundary set
         // for downstream readers (e.g. `pick_block_sync_peer`) that
         // don't carry a view context.
-        let active = self.state.validator_history.set_at(v);
+        let active_at = self.state.validator_history.set_at(v);
+        let active = active_at.for_view(v);
         if *active != self.state.validator_set {
-            self.state.validator_set = (*active).clone();
+            self.state.validator_set = active.clone();
         }
 
         // gc_below sweep: a vote bucket whose `view < current_view`

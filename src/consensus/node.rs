@@ -3815,9 +3815,9 @@ impl ConsensusNode {
             // commit drains, but the rule must use the block's view
             // so all replicas accept or reject identically.
             let block_view = block.header.view;
-            let current_set = self.validator_history.set_at(block_view);
+            let current_set_at = self.validator_history.set_at(block_view);
             let next_members = match cmd.validate_against_with_delay_and_scheme(
-                &current_set,
+                current_set_at.for_view(block_view),
                 block_view,
                 self.min_v_eff_delay,
                 self.signature_scheme,
@@ -4295,7 +4295,8 @@ impl ConsensusNode {
         // the boot-time genesis set). After a reconfig, the snapshot
         // must embed the post-boundary committee so a fresh joiner's
         // QC verification picks the right set.
-        let active_set = self.validator_history.set_at(block.header.view);
+        let active_set_at = self.validator_history.set_at(block.header.view);
+        let active_set = active_set_at.for_view(block.header.view);
         // #325 PR D: embed the producer's full `(validator_history,
         // validator_key_history, bls_key_history?)` triple in the
         // manifest's persisted forms. The joiner installs these
@@ -4309,7 +4310,7 @@ impl ConsensusNode {
         let bls_key_history_persisted = self.bls_key_history.as_ref().map(|h| h.to_persisted());
         let manifest = SnapshotManifest::build(
             block.clone(), // `block` is `&Block` here; clone for the manifest's owned field.
-            &active_set,
+            active_set,
             self.snapshot_policy.chunk_size_bytes,
             chunk_hashes,
             commit_qc,
@@ -6353,9 +6354,17 @@ mod tests {
         // Both histories carry the new boundary.
         assert_eq!(node.validator_history.boundary_count(), 2);
         assert_eq!(node.core.state().validator_history.boundary_count(), 2);
-        assert_eq!(*node.validator_history.set_at(v_eff), five_validators());
         assert_eq!(
-            *node.core.state().validator_history.set_at(v_eff),
+            *node.validator_history.set_at(v_eff).for_view(v_eff),
+            five_validators()
+        );
+        assert_eq!(
+            *node
+                .core
+                .state()
+                .validator_history
+                .set_at(v_eff)
+                .for_view(v_eff),
             five_validators()
         );
 
@@ -6465,12 +6474,21 @@ mod tests {
         // history's now-non-genesis boundary at v_eff_a conflicts with
         // any `v_eff >= v_eff_a`.
         assert_eq!(node.validator_history.boundary_count(), 2);
-        assert_eq!(*node.validator_history.set_at(v_eff_a), five_validators());
+        assert_eq!(
+            *node.validator_history.set_at(v_eff_a).for_view(v_eff_a),
+            five_validators()
+        );
         // v_eff_b is past the only non-genesis boundary, so the same
         // post-boundary set applies — confirming cmd_b did NOT land
         // (otherwise the set would be six_validators).
-        assert_eq!(*node.validator_history.set_at(v_eff_b), five_validators());
-        assert_ne!(*node.validator_history.set_at(v_eff_b), six_validators());
+        assert_eq!(
+            *node.validator_history.set_at(v_eff_b).for_view(v_eff_b),
+            five_validators()
+        );
+        assert_ne!(
+            *node.validator_history.set_at(v_eff_b).for_view(v_eff_b),
+            six_validators()
+        );
     }
 
     /// #254: a reconfig committed by one ConsensusNode must be visible
@@ -6532,11 +6550,16 @@ mod tests {
             "safety-core history must mirror the boundary after replay",
         );
         assert_eq!(
-            *recovered.validator_history.set_at(v_eff),
+            *recovered.validator_history.set_at(v_eff).for_view(v_eff),
             five_validators()
         );
         assert_eq!(
-            *recovered.core.state().validator_history.set_at(v_eff),
+            *recovered
+                .core
+                .state()
+                .validator_history
+                .set_at(v_eff)
+                .for_view(v_eff),
             five_validators()
         );
 
