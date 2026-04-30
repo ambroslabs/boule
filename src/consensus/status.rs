@@ -170,6 +170,19 @@ pub struct ConsensusStatus {
     /// counts), but sustained growth is a signal worth surfacing.
     #[serde(default)]
     pub dropped_commands: u64,
+    /// Cumulative count of vote-equivocation incidents detected by the
+    /// safety core (audit finding 3-1, issue #409): a single stable
+    /// validator id contributing votes for two distinct `block_hash`
+    /// values at the same view. Each incident corresponds to one
+    /// [`crate::consensus::hotstuff::step::Action::EquivocationEvidence`]
+    /// emitted by the safety core; the integration layer increments
+    /// this counter and logs the event at WARN. Monotonic for the
+    /// lifetime of the node — resets on restart but never decrements
+    /// during a run. A non-zero value indicates a Byzantine voter is
+    /// detectable on the wire; future slashing pipelines will consume
+    /// the same evidence.
+    #[serde(default)]
+    pub equivocations_detected: u64,
 }
 
 /// How far on either side of `current_view` to include in the bucket
@@ -233,6 +246,7 @@ mod tests {
                 timeout_buckets: 0,
             },
             dropped_commands: 11,
+            equivocations_detected: 2,
         }
     }
 
@@ -287,6 +301,9 @@ mod tests {
 
         // Block-builder dropped-command counter (#376).
         assert_eq!(json["dropped_commands"], 11);
+
+        // Vote-equivocation counter (audit 3-1, #409).
+        assert_eq!(json["equivocations_detected"], 2);
     }
 
     #[test]
@@ -343,6 +360,7 @@ mod tests {
             mempool_size: 0,
             cache_evictions: CacheEvictionStatus::default(),
             dropped_commands: 0,
+            equivocations_detected: 0,
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["current_view"], 0);
@@ -354,5 +372,6 @@ mod tests {
         assert_eq!(json["cache_evictions"]["pending_blocks"], 0);
         assert_eq!(json["cache_evictions"]["timeout_buckets"], 0);
         assert_eq!(json["dropped_commands"], 0);
+        assert_eq!(json["equivocations_detected"], 0);
     }
 }

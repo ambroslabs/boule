@@ -90,6 +90,162 @@ use zeroize::Zeroizing;
 /// (outbound links from a Byzantine replica cut, inbound intact).
 type LinkCut = (NodeId, NodeId);
 
+// ── Per-replica vote-uniqueness observer (issue #422) ────────────────────────
+
+/// How the route task should peel framing off an outbound payload before
+/// asking the [`VoteObserver`] to look for an inner `WireMessage::Vote`.
+///
+/// `Mesh` route tasks (the `spawn` / `spawn_with_*` family) write
+/// postcard-encoded [`crate::consensus::node::WireMessage`] bytes
+/// straight onto the per-node send channel. `GossipOverlay` route tasks
+/// (the `spawn_gossip` family) instead write postcard-encoded
+/// [`crate::p2p::overlay::gossip::wire::OverlayFrame`] bytes whose
+/// `Forward.payload` carries the inner `WireMessage` — the observer
+/// unwraps that one extra layer before decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadFraming {
+    Mesh,
+    GossipOverlay,
+}
+
+/// A safety-core vote-uniqueness violation observed by [`VoteObserver`].
+///
+/// The same replica emitted two distinct votes for the same view —
+/// either via `Action::Broadcast(ConsensusMsg::Vote)` or
+/// `Action::SendTo(_, ConsensusMsg::Vote)`. This is a direct breach of
+/// the HotStuff `vote_once` invariant and would silently bypass the
+/// existing global oracle [`assert_no_conflicts`] until it propagated
+/// to a conflicting commit (audit finding 14-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoteViolation {
+    /// Stable identity of the replica whose safety core emitted both
+    /// votes. Resolved from the [`crate::crypto::signed::Signed::signer`]
+    /// field on the observed vote envelope, so the attribution survives
+    /// gossip-mode forwarding (the originator's signer travels with the
+    /// payload).
+    pub replica: NodeId,
+    /// View at which the conflict was observed.
+    pub view: u64,
+    /// First block hash this replica voted for at `view`. Recorded in
+    /// arrival order; `conflicting_hash` is whichever later vote
+    /// disagreed.
+    pub first_hash: BlockHash,
+    /// A later, distinct block hash this replica voted for at the same
+    /// view. The pair `(first_hash, conflicting_hash)` is the
+    /// safety-violation evidence the assertion reports.
+    pub conflicting_hash: BlockHash,
+}
+
+/// Per-replica observer that records every vote a replica's safety core
+/// emits and flags any second emission for the same view that disagrees
+/// on `block_hash`.
+///
+/// Wired into every [`spawn_route_task`] so each per-node routing task
+/// sees the safety core's outbound `Action::Broadcast` /
+/// `Action::SendTo` frames *before* the adversary intercept hook runs —
+/// ensuring the observer attributes only what the honest safety core
+/// produced, not synthetic frames a Byzantine adversary fabricated.
+///
+/// Idempotent re-emissions for the same `(view, block_hash)` are
+/// allowed: HotStuff's safety core may legitimately re-broadcast the
+/// same vote (e.g. on a peer-reconnect resend or a duplicate proposal
+/// arrival). Only a *different* `block_hash` for the same view is a
+/// violation. See [`SimCluster::assert_no_replica_double_voted`] for
+/// the teardown assertion that surfaces violations.
+#[derive(Debug, Default)]
+pub struct VoteObserver {
+    /// Per-replica `view → block_hash` map. Outer key is the safety
+    /// core's `NodeId` (resolved from the `Signed<Vote>::signer`
+    /// field); the inner map is keyed by `Vote::view`. The first hash
+    /// observed at each view is sticky so subsequent observations are
+    /// diffed against it for double-vote detection.
+    inner: Mutex<HashMap<NodeId, HashMap<u64, BlockHash>>>,
+    /// Append-only list of conflicts surfaced during the run.
+    /// [`SimCluster::assert_no_replica_double_voted`] panics on a
+    /// non-empty list at teardown.
+    violations: Mutex<Vec<VoteViolation>>,
+}
+
+impl VoteObserver {
+    /// Record one observed vote. No-op if `(replica, view)` is the
+    /// first time we see this view, or if a prior recording at the
+    /// same view had the identical `block_hash`. Conflicting hashes
+    /// are appended to the violations list.
+    pub fn record(&self, replica: NodeId, view: u64, block_hash: BlockHash) {
+        let mut votes = self.inner.lock();
+        let by_view = votes.entry(replica).or_default();
+        match by_view.get(&view) {
+            Some(prev_hash) if *prev_hash == block_hash => {
+                // Idempotent re-emission — explicitly allowed.
+            }
+            Some(prev_hash) => {
+                self.violations.lock().push(VoteViolation {
+                    replica,
+                    view,
+                    first_hash: *prev_hash,
+                    conflicting_hash: block_hash,
+                });
+            }
+            None => {
+                by_view.insert(view, block_hash);
+            }
+        }
+    }
+
+    /// Snapshot of the recorded violations. Cloned out of the internal
+    /// lock so callers can match on the result without holding it.
+    pub fn violations(&self) -> Vec<VoteViolation> {
+        self.violations.lock().clone()
+    }
+
+    /// Decode `payload` according to `framing` and record any inner
+    /// `WireMessage::Vote` at its safety-core signer. Decode failures
+    /// are silent: payloads of other [`crate::consensus::node::WireMessage`]
+    /// variants (proposals, new-views, block requests, ...) are
+    /// expected on the same channel and intentionally ignored.
+    fn observe_outbound(&self, payload: &[u8], framing: PayloadFraming) {
+        let wire_bytes: &[u8] = match framing {
+            PayloadFraming::Mesh => payload,
+            PayloadFraming::GossipOverlay => {
+                match postcard::from_bytes::<crate::p2p::overlay::gossip::wire::OverlayFrame>(
+                    payload,
+                ) {
+                    Ok(crate::p2p::overlay::gossip::wire::OverlayFrame::Forward {
+                        payload: inner,
+                        ..
+                    }) => {
+                        // Re-decode from the unwrapped inner payload.
+                        // `Bytes` doesn't `as_ref` to `&[u8]` in a way
+                        // that survives the match, so reborrow via a
+                        // local. Avoid `into_inner` to keep zero-copy
+                        // semantics in the common case.
+                        if let Ok(crate::consensus::node::WireMessage::Vote(signed, _)) =
+                            postcard::from_bytes::<crate::consensus::node::WireMessage>(&inner)
+                        {
+                            self.record(
+                                signed.signer,
+                                signed.payload.view,
+                                signed.payload.block_hash,
+                            );
+                        }
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        };
+        if let Ok(crate::consensus::node::WireMessage::Vote(signed, _)) =
+            postcard::from_bytes::<crate::consensus::node::WireMessage>(wire_bytes)
+        {
+            self.record(
+                signed.signer,
+                signed.payload.view,
+                signed.payload.block_hash,
+            );
+        }
+    }
+}
+
 // ── Byzantine adversary hook (issue #132) ────────────────────────────────────
 
 /// Per-node context handed to an [`Adversary`] on every intercept call.
@@ -241,6 +397,14 @@ pub struct SimCluster {
     /// Captured view-timer base, re-used by restart so the post-restart
     /// behaviour matches the pre-restart cadence.
     timeout_base: Duration,
+    /// Per-replica vote-uniqueness observer (issue #422 / audit
+    /// finding 14-3). Wired into every per-node route task so each
+    /// safety core's outbound `ConsensusMsg::Vote` frames are recorded
+    /// and diffed against prior votes at the same view. Default-on
+    /// across mesh and gossip-mode clusters; teardown via
+    /// [`Self::assert_no_replica_double_voted`] runs from `Drop` so
+    /// every existing sim test picks up the assertion automatically.
+    pub vote_observer: Arc<VoteObserver>,
 }
 
 impl SimCluster {
@@ -463,6 +627,11 @@ impl SimCluster {
         }
         let event_txs = Arc::new(event_txs);
 
+        // Per-replica vote-uniqueness observer (issue #422). Default-on
+        // for every mesh-mode cluster; passed by `Arc` clone into each
+        // route task so all per-node observations land in the same map.
+        let vote_observer: Arc<VoteObserver> = Arc::new(VoteObserver::default());
+
         let node_ids: Vec<NodeId> = vs.iter().map(|v| v.into_node_id()).collect();
         let node_ids_arc: Arc<Vec<NodeId>> = Arc::new(node_ids.clone());
         let mut commit_rxs: Vec<mpsc::UnboundedReceiver<Block>> = Vec::new();
@@ -597,6 +766,8 @@ impl SimCluster {
                 Arc::clone(&partition_blocks),
                 Arc::clone(&dead_nodes),
                 route_adv,
+                Arc::clone(&vote_observer),
+                PayloadFraming::Mesh,
             );
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -640,6 +811,7 @@ impl SimCluster {
             validator_set: vs,
             genesis,
             timeout_base,
+            vote_observer,
         };
         (cluster, limiters)
     }
@@ -1110,6 +1282,8 @@ impl SimCluster {
                 Arc::clone(&self.partition_blocks),
                 Arc::clone(&self.dead_nodes),
                 None,
+                Arc::clone(&self.vote_observer),
+                PayloadFraming::Mesh,
             );
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1327,6 +1501,8 @@ impl SimCluster {
             Arc::clone(&self.partition_blocks),
             Arc::clone(&self.dead_nodes),
             None,
+            Arc::clone(&self.vote_observer),
+            PayloadFraming::Mesh,
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1365,6 +1541,30 @@ impl SimCluster {
             }
         }
     }
+
+    /// Panic if the per-replica [`VoteObserver`] recorded any vote
+    /// where one safety core emitted two distinct `block_hash`es for
+    /// the same `view`.
+    ///
+    /// Audit finding 14-3 (issue #422): a HotStuff `vote_once`
+    /// violation that produces two votes on different blocks for the
+    /// same view is a direct safety breach. The global oracle
+    /// [`assert_no_conflicts`] only catches it once it propagates to
+    /// conflicting commits; this assertion catches it at the safety
+    /// core's outbound boundary.
+    ///
+    /// Called automatically from [`SimCluster::drop`] (skipped when
+    /// the test is already panicking, to avoid masking the original
+    /// failure with a double-panic). Tests can also invoke it
+    /// explicitly mid-run if they want to localise the failure to a
+    /// specific phase.
+    pub fn assert_no_replica_double_voted(&self) {
+        let violations = self.vote_observer.violations();
+        assert!(
+            violations.is_empty(),
+            "vote-once violation: replicas emitted conflicting votes at the same view: {violations:?}",
+        );
+    }
 }
 
 impl Drop for SimCluster {
@@ -1373,6 +1573,13 @@ impl Drop for SimCluster {
             if let Some(tx) = opt.take() {
                 let _ = tx.send(());
             }
+        }
+        // Audit finding 14-3 (issue #422): default-on safety check
+        // across every sim test. Skip when the test thread is already
+        // panicking so the original failure is not masked by a
+        // double-panic in `Drop`.
+        if !std::thread::panicking() {
+            self.assert_no_replica_double_voted();
         }
     }
 }
@@ -1398,9 +1605,26 @@ fn spawn_route_task(
     partition_blocks: Arc<Mutex<HashSet<LinkCut>>>,
     dead_nodes: Arc<Mutex<HashSet<NodeId>>>,
     adversary: Option<(Arc<dyn Adversary>, AdversaryCtx)>,
+    vote_observer: Arc<VoteObserver>,
+    framing: PayloadFraming,
 ) {
     tokio::spawn(async move {
         while let Some(outbound) = send_rx.recv().await {
+            // Vote-uniqueness observer (issue #422). Inspect the frame
+            // *before* the my_id partition / dead checks and *before*
+            // the adversary intercept — so a vote the safety core
+            // emitted is recorded even if the network would later drop
+            // it (e.g. vote-withholding partitions), and adversary
+            // forgeries that are not safety-core emissions are not
+            // attributed to the honest replica.
+            let payload_for_observer: Option<Bytes> = match &outbound {
+                ProtocolOutbound::Broadcast(p) => Some(p.clone()),
+                ProtocolOutbound::SendTo { payload, .. } => Some(payload.clone()),
+            };
+            if let Some(p) = payload_for_observer {
+                vote_observer.observe_outbound(&p, framing);
+            }
+
             if partitioned.lock().contains(&my_id) {
                 // This node is partitioned — drop all outbound frames.
                 continue;
@@ -1658,6 +1882,12 @@ impl SimCluster {
         let partition_blocks: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
         let dead_nodes: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
 
+        // Per-replica vote-uniqueness observer (issue #422). Same
+        // default-on observer the mesh constructors install; the
+        // route task unwraps the gossip-overlay framing before
+        // looking for an inner `WireMessage::Vote`.
+        let vote_observer: Arc<VoteObserver> = Arc::new(VoteObserver::default());
+
         // Per-node raw event channels — sim's route tasks deliver
         // `ProtocolEvent`s to the orchestrator's input here.
         let mut event_txs: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> = HashMap::new();
@@ -1800,6 +2030,8 @@ impl SimCluster {
                 Arc::clone(&partition_blocks),
                 Arc::clone(&dead_nodes),
                 None,
+                Arc::clone(&vote_observer),
+                PayloadFraming::GossipOverlay,
             );
 
             pending.push(PendingNode {
@@ -1896,6 +2128,7 @@ impl SimCluster {
             validator_set: vs,
             genesis,
             timeout_base,
+            vote_observer,
         }
     }
 }
@@ -1939,11 +2172,63 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::task::yield_now;
 
-    use super::{LinkCut, SimCluster, assert_no_conflicts, fresh_signer, spawn_route_task};
+    use super::{
+        LinkCut, SimCluster, VoteObserver, assert_no_conflicts, fresh_signer, spawn_route_task,
+    };
     use crate::consensus::validator_set::ValidatorSet;
     use crate::crypto::signed::{ChainId, Signer};
     use crate::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
     use crate::replication::block::Block;
+
+    // ── VoteObserver unit tests (issue #422) ──────────────────────────────────
+
+    /// Idempotent re-emissions for the same `(view, block_hash)` are
+    /// not violations — HotStuff legitimately re-broadcasts a vote on
+    /// peer reconnect / duplicate proposal arrival.
+    #[test]
+    fn vote_observer_treats_same_view_same_hash_as_idempotent() {
+        let obs = VoteObserver::default();
+        let replica: NodeId = [1; 32];
+        let hash = [7u8; 32];
+        obs.record(replica, 5, hash);
+        obs.record(replica, 5, hash);
+        obs.record(replica, 5, hash);
+        assert!(obs.violations().is_empty());
+    }
+
+    /// Distinct `block_hash`es for the same `(replica, view)` are
+    /// the canonical safety violation the assertion exists to catch.
+    #[test]
+    fn vote_observer_flags_conflicting_hashes_at_same_view() {
+        let obs = VoteObserver::default();
+        let replica: NodeId = [2; 32];
+        let h_a = [0u8; 32];
+        let h_b = [1u8; 32];
+        obs.record(replica, 5, h_a);
+        obs.record(replica, 5, h_b);
+        let v = obs.violations();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].replica, replica);
+        assert_eq!(v[0].view, 5);
+        assert_eq!(v[0].first_hash, h_a);
+        assert_eq!(v[0].conflicting_hash, h_b);
+    }
+
+    /// Different replicas voting for different blocks at the same
+    /// view is fine — that's what diverging replicas are *expected*
+    /// to do under partition. The observer keys violations
+    /// per-replica, not globally.
+    #[test]
+    fn vote_observer_does_not_cross_replicas() {
+        let obs = VoteObserver::default();
+        let r1: NodeId = [3; 32];
+        let r2: NodeId = [4; 32];
+        let h_a = [0u8; 32];
+        let h_b = [1u8; 32];
+        obs.record(r1, 5, h_a);
+        obs.record(r2, 5, h_b);
+        assert!(obs.violations().is_empty());
+    }
 
     /// Bare routing harness: spawns only the per-node routing tasks and
     /// hands the caller the outbound sender + inbound receiver for each
@@ -1991,6 +2276,12 @@ mod tests {
             let event_txs = Arc::new(event_tx_map);
 
             let mut send_txs = Vec::new();
+            // BareRouting only exercises route-task plumbing (kill,
+            // partition, link-cut). It hand-injects raw byte payloads
+            // that are not real `WireMessage`s, so the vote observer
+            // would silently no-op anyway — but plumb a fresh one
+            // through to keep the call signature uniform.
+            let vote_observer = Arc::new(super::VoteObserver::default());
             for &nid in &node_ids {
                 let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
                 send_txs.push(send_tx);
@@ -2003,6 +2294,8 @@ mod tests {
                     Arc::clone(&partition_blocks),
                     Arc::clone(&dead_nodes),
                     None,
+                    Arc::clone(&vote_observer),
+                    super::PayloadFraming::Mesh,
                 );
             }
 
@@ -3799,6 +4092,118 @@ mod tests {
         }
     }
 
+    // ── Vote-uniqueness property (issue #422 / audit finding 14-3) ────────────
+
+    /// Dedicated property test for the per-replica `vote_once`
+    /// invariant: across a long event sequence with multiple
+    /// view changes (leader crashes, mid-run restart, partition +
+    /// heal), no replica may emit two distinct votes for the same
+    /// view.
+    ///
+    /// The default-on observer wired into [`SimCluster::spawn`] (and
+    /// run from `Drop`) catches the property automatically across
+    /// every other test in the suite. This test additionally asserts
+    /// that the observer *did* record votes — a future refactor that
+    /// silently breaks the route-task hook would otherwise green-pass
+    /// every existing sim because an empty observation set has no
+    /// violations.
+    #[tokio::test(start_paused = true)]
+    async fn vote_observer_holds_through_long_view_change_sequence() {
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Phase 1: warm-up under the genesis topology so the chain
+        // starts advancing past genesis.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(2), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 2
+            })
+            .await;
+        assert!(warmed, "warm-up failed to produce 2 commits on every node");
+
+        // Phase 2: kill the view-1 leader (sorted index 0). This
+        // forces a view-change cascade — the pacemaker times out,
+        // each survivor emits NewView for view 2 and then votes on
+        // view 2's proposal under the next leader.
+        cluster.kill_node(0);
+        let post_kill = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                let h = c.peek_commit_heights();
+                (1..4).all(|i| h[i] >= 4)
+            })
+            .await;
+        assert!(
+            post_kill,
+            "majority did not advance past height 4 after leader kill"
+        );
+
+        // Phase 3: bring the killed node back via crash-recovery and
+        // let it catch up. `recover` re-loads `last_voted_view`,
+        // `locked`, and `high_qc` from durable state, so the reborn
+        // safety core continues from the same vote-once boundary it
+        // had at kill — the reborn replica must not vote again at
+        // any view it already voted at pre-kill.
+        cluster
+            .restart_node_with_recover(0)
+            .await
+            .expect("restart_node_with_recover must succeed");
+        let caught_up = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| c.peek_commit_heights()[0] >= 4)
+            .await;
+        assert!(caught_up, "reborn node 0 did not catch up to height 4");
+
+        // Phase 4: install a flip-flop one-way partition that
+        // alternately isolates the current view's leader, forcing a
+        // few additional view changes before letting the cluster
+        // converge again.
+        cluster.partition_one_way(&[1], &[2, 3]);
+        let _ = cluster
+            .advance_and_yield_until(Duration::from_millis(800), |_| false)
+            .await;
+        cluster.heal_partition();
+        cluster.partition_one_way(&[2], &[1, 3]);
+        let _ = cluster
+            .advance_and_yield_until(Duration::from_millis(800), |_| false)
+            .await;
+        cluster.heal_partition();
+
+        let progressed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 8
+            })
+            .await;
+        assert!(
+            progressed,
+            "post-flipflop convergence failed: {:?}",
+            cluster.peek_commit_heights()
+        );
+
+        // Sanity: the observer is wired, so it must have recorded
+        // votes. Without this guard, a silently-broken hook would
+        // make every sim test trivially pass at teardown. We also
+        // check the population is realistic — each surviving replica
+        // votes on every view it accepts, so the floor scales with
+        // the height we reached.
+        let vote_count: usize = cluster
+            .vote_observer
+            .inner
+            .lock()
+            .values()
+            .map(|by_view| by_view.len())
+            .sum();
+        assert!(
+            vote_count >= 8,
+            "observer recorded suspiciously few votes ({vote_count}); is the route-task hook still wired?",
+        );
+
+        // Explicit assertion in addition to the `Drop` hook so a
+        // failure surfaces a clear test name rather than as a
+        // teardown panic.
+        cluster.assert_no_replica_double_voted();
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
     // ── L-fixed: deterministic regression sentinels for the L-series ─────────
     //
     // The proptest cases above randomise inputs but the property
@@ -4647,6 +5052,266 @@ mod tests {
         assert!(
             rotation_committed,
             "expected at least one committed block to carry the BLS rotation tx",
+        );
+    }
+
+    // ── audit finding 3-3: spanning-vote correctness across rotation ─────
+    //
+    // The unit tests in `validator_key_history.rs` exhaustively cover the
+    // `partition_point(|e| e.v_eff <= view)` boundary at the data-structure
+    // level. This sim test (#423) closes the loop by running a
+    // `DualSignedRotation` end-to-end through a 4-node cluster and then,
+    // against the live post-rotation `validator_key_history` snapshotted
+    // from each replica's storage, exercising the four spanning-vote
+    // ingress cases that audit finding 3-3 names. A regression in the
+    // partition predicate — silently accepting post-rotation keys for
+    // pre-rotation views, the spanning-equivocation hazard the audit
+    // calls out — would surface here as case 4 (pre-`v_eff` vote signed
+    // under the new key) being accepted instead of `UnknownSigner`.
+
+    /// Exercise validator-key rotation under live consensus traffic and
+    /// verify the four spanning-vote correctness cases against the
+    /// post-rotation history every replica converged on.
+    ///
+    /// Walks through:
+    /// 1. Spawn a 4-node cluster, warm up with a few committed blocks.
+    /// 2. Validator at sorted-index 1 emits a `DualSignedRotation` with
+    ///    `v_eff = 30`. The envelope is signed under the cluster's real
+    ///    `chain_id` (derived from `Block::genesis([0; 32], [0; 32])`,
+    ///    the same construction `spawn_inner` uses), so
+    ///    `apply_committed_rotations` accepts it on every replica and
+    ///    persists the updated `validator_key_history` to storage.
+    /// 3. Cluster runs through view ≥ `v_eff + 20` so the post-boundary
+    ///    regime is durably reached and committed under timeouts that
+    ///    the rotated validator's stale-keyed proposals/votes induce.
+    /// 4. For every replica: read the persisted `validator_key_history`
+    ///    back, then run the four spanning-vote ingress cases through
+    ///    `dispatch::ingress_wire`:
+    ///      a. Vote(view ≥ v_eff) signed under NEW key  → accepted.
+    ///      b. Vote(view ≥ v_eff) signed under OLD key  → `UnknownSigner`.
+    ///      c. Vote(view <  v_eff) signed under OLD key  → accepted (spanning).
+    ///      d. Vote(view <  v_eff) signed under NEW key  → `UnknownSigner`.
+    #[tokio::test(start_paused = true)]
+    async fn validator_key_rotation_spanning_votes_correctness() {
+        use crate::consensus::View;
+        use crate::consensus::dispatch::{IngressError, ingress_wire};
+        use crate::consensus::hotstuff::qc::Vote;
+        use crate::consensus::node::{STORAGE_KEY_VALIDATOR_KEY_HISTORY, WireMessage};
+        use crate::consensus::validator_history::ValidatorSetHistory;
+        use crate::consensus::validator_key_history::{
+            PersistedValidatorKeyHistory, ValidatorKeyHistory,
+        };
+        use crate::consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+        use crate::consensus::validator_set::{Pubkey, ValidatorId, ValidatorSet};
+        use crate::crypto::signed::Signed;
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // The cluster's per-replica `chain_id` is derived from the
+        // genesis block hash — `spawn_inner` constructs
+        // `Block::genesis([0u8; 32], [0; 32])` for every cluster, so
+        // re-deriving it here yields the exact `ChainId` every replica
+        // is verifying signatures against. Signing the rotation
+        // envelope under this `ChainId` is what makes
+        // `apply_committed_rotations` actually mutate
+        // `validator_key_history` — the existence test
+        // (`cluster_commits_validator_key_rotation_and_makes_progress`)
+        // signs under `ChainId::TEST` because it only asserts liveness;
+        // here we depend on the rotation taking effect across replicas.
+        let genesis = Block::genesis([0u8; 32], [0; 32]);
+        let chain_id = ChainId::from_genesis_hash(genesis.hash());
+
+        // Warm-up: commit a few blocks under the genesis identity so the
+        // rotation tx propagates into a real-traffic chain.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 2
+            })
+            .await;
+        assert!(warmed, "cluster failed to commit warm-up blocks");
+
+        // Pick the validator at sorted-index 1 (non-leader of view 0)
+        // to rotate, matching the existing rotation tests so the
+        // boundary behavior is comparable.
+        let rotated_idx = 1;
+        let rotated_validator = cluster.node_ids[rotated_idx];
+        let old_signer = cluster
+            .signer(rotated_idx)
+            .expect("regular SimCluster captures signers");
+
+        // Mint a real Ed25519 keypair for the rotation target so
+        // `sig_new` verifies under `payload.new_pubkey`.
+        let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
+        let new_pubkey = new_signer.node_id();
+
+        // `v_eff = 30` keeps the test budget tight: after the rotation
+        // takes effect the rotated validator's signer is not swapped,
+        // so 1-of-4 round-robin views (the rotated validator's leader
+        // turns) time out. Reaching view ≥ 50 with that drag still
+        // fits well inside a 15s wall-clock budget under
+        // `start_paused = true`.
+        let v_eff: View = 30;
+        let pre_view: View = 10;
+        let post_view: View = 50;
+
+        let payload = ValidatorKeyRotation {
+            validator: rotated_validator,
+            new_pubkey,
+            v_eff,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        };
+        let envelope = DualSignedRotation::sign(payload, &*old_signer, &*new_signer, &chain_id)
+            .expect("constructing rotation envelope must succeed");
+        let cmd_bytes = envelope.encode_command();
+        for mp in &cluster.mempools {
+            let _ = mp.insert(cmd_bytes.clone());
+        }
+
+        // Drive the cluster well past `v_eff` so every replica has
+        // committed a block at view > v_eff and persisted the updated
+        // key history. With ~25% of views timing out post-boundary,
+        // height grows ~3/4 as fast as view; height ≥ 40 implies
+        // view ≥ ~50, which is comfortably past `v_eff = 30`.
+        let crossed = cluster
+            .advance_and_yield_until(Duration::from_secs(15), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 40
+            })
+            .await;
+        assert!(
+            crossed,
+            "cluster failed to commit deeply enough past v_eff = {v_eff}",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+        let any_post_boundary = committed
+            .iter()
+            .any(|node_blocks| node_blocks.iter().any(|b| b.header.view >= v_eff));
+        assert!(
+            any_post_boundary,
+            "cluster never committed a block at view ≥ v_eff = {v_eff} — \
+             rotation correctness assertions below would be vacuous",
+        );
+
+        // Genesis-only ValidatorSetHistory: this test does not commit
+        // any reconfig, so every replica's set history is just the
+        // genesis boundary. Reconstruct it locally to feed `ingress_wire`.
+        let validators: Vec<ValidatorId> = cluster
+            .node_ids
+            .iter()
+            .copied()
+            .map(ValidatorId::from_genesis_pubkey)
+            .collect();
+        let validator_history = ValidatorSetHistory::from_genesis(ValidatorSet::new(validators));
+
+        // Build a synthetic Vote bytes-bag for the four cases. The
+        // `block_hash` is opaque to verification (signature bytes only,
+        // no view-time block lookup at ingress), so any constant works.
+        let make_vote_msg = |view: View, signer: &dyn Signer| -> WireMessage {
+            let vote = Vote {
+                view,
+                block_hash: [0xAB; 32],
+            };
+            let signed = Signed::sign(vote, signer, &chain_id).expect("sign vote");
+            WireMessage::Vote(signed, None)
+        };
+
+        let rotated_validator_id = ValidatorId::from_genesis_pubkey(rotated_validator);
+        let mut replicas_with_applied_rotation = 0usize;
+        for idx in 0..cluster.node_ids.len() {
+            let storage = cluster
+                .node_storage(idx)
+                .expect("regular SimCluster captures storages");
+            let raw = storage
+                .get(STORAGE_KEY_VALIDATOR_KEY_HISTORY)
+                .expect("storage get on validator_key_history must not error")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "node {idx}: validator_key_history must be persisted after a \
+                         committed rotation crosses v_eff",
+                    )
+                });
+            let persisted: PersistedValidatorKeyHistory =
+                postcard::from_bytes(&raw).expect("decode persisted validator_key_history");
+            let key_history = ValidatorKeyHistory::from_persisted(persisted)
+                .expect("rebuild ValidatorKeyHistory from persisted form");
+
+            // Sanity: the rotation actually took effect on this
+            // replica's history. Without this, the cases below would
+            // pass for the wrong reason (the old key still being the
+            // active key at every view).
+            assert_eq!(
+                key_history.key_at(&rotated_validator_id, pre_view),
+                Some(Pubkey::from_node_id(rotated_validator)),
+                "node {idx}: pre-v_eff lookup must resolve to old key",
+            );
+            assert_eq!(
+                key_history.key_at(&rotated_validator_id, post_view),
+                Some(Pubkey::from_node_id(new_pubkey)),
+                "node {idx}: post-v_eff lookup must resolve to new key — \
+                 the rotation did not take effect on this replica",
+            );
+            replicas_with_applied_rotation += 1;
+
+            // Case 1 (post-v_eff, NEW key) — accepted.
+            let m = make_vote_msg(post_view, new_signer.as_ref());
+            ingress_wire(new_pubkey, m, &validator_history, &key_history, &chain_id)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "node {idx}: post-v_eff vote signed under the new key must be \
+                     accepted, got {e:?}",
+                    )
+                });
+
+            // Case 2 (post-v_eff, OLD key) — rejected as `UnknownSigner`.
+            let m = make_vote_msg(post_view, old_signer.as_ref());
+            let err = ingress_wire(
+                old_signer.node_id(),
+                m,
+                &validator_history,
+                &key_history,
+                &chain_id,
+            )
+            .expect_err("post-v_eff vote signed under the old key must be rejected");
+            assert!(
+                matches!(err, IngressError::UnknownSigner(_)),
+                "node {idx}: post-v_eff old-key vote: expected UnknownSigner, got {err:?}",
+            );
+
+            // Case 3 (pre-v_eff, OLD key, spanning vote) — accepted.
+            let m = make_vote_msg(pre_view, old_signer.as_ref());
+            ingress_wire(
+                old_signer.node_id(),
+                m,
+                &validator_history,
+                &key_history,
+                &chain_id,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "node {idx}: pre-v_eff spanning vote signed under the old key \
+                     must be accepted, got {e:?}",
+                )
+            });
+
+            // Case 4 (pre-v_eff, NEW key) — rejected as `UnknownSigner`.
+            // This is the spanning-equivocation hazard the audit names:
+            // accepting a post-rotation key for a pre-rotation view
+            // would let a rotated validator double-sign across the
+            // boundary using its new identity.
+            let m = make_vote_msg(pre_view, new_signer.as_ref());
+            let err = ingress_wire(new_pubkey, m, &validator_history, &key_history, &chain_id)
+                .expect_err("pre-v_eff vote signed under the new key must be rejected");
+            assert!(
+                matches!(err, IngressError::UnknownSigner(_)),
+                "node {idx}: pre-v_eff new-key vote: expected UnknownSigner, got {err:?}",
+            );
+        }
+        assert_eq!(
+            replicas_with_applied_rotation,
+            cluster.node_ids.len(),
+            "every replica must have observed the rotation",
         );
     }
 
