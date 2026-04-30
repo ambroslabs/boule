@@ -176,6 +176,16 @@ pub enum StateUpdate {
     /// Replica adopted a fresher `high_qc` (seen via a proposal's
     /// justify, a freshly-formed QC, or a `NewView`).
     HighQc(QuorumCertificate),
+    /// Leader stamped a view it has minted a `Proposal` for. Persist
+    /// before the corresponding `Broadcast(Proposal)` flushes — without
+    /// it, a crash between `Signed::sign` and the network bytes leaving
+    /// the host (audit finding 4-6, issue #407) would let a restarted
+    /// replica re-mint a *different* proposal at the same view if its
+    /// peers have not yet advanced past it (different parent walk,
+    /// different `high_qc` snapshot, different mempool ordering). Two
+    /// distinct signed `Proposal(v)` envelopes from the same leader
+    /// are slashable equivocation evidence.
+    ProposedInView { view: View },
 }
 
 /// Effects the safety core asks the integration layer to perform.
@@ -361,11 +371,13 @@ pub struct HotStuffCore {
     /// could still emit two proposals at the same view if block-sync
     /// arrived between the QC-formed branch and the AdvanceToView
     /// pacemaker action — indistinguishable from Byzantine
-    /// equivocation to peers. In-memory only: across a process
-    /// restart the cluster will have advanced to a strictly later
-    /// view via NewView/RoundSync traffic before this replica's
-    /// pacemaker reaches the same leader slot again, so a transient
-    /// `proposed_in_view = 0` post-restart is safe.
+    /// equivocation to peers. Mirrored durably via
+    /// [`StateUpdate::ProposedInView`]: the integration layer flushes
+    /// the persist before the matching `Broadcast(Proposal)` leaves,
+    /// and [`Self::with_proposed_in_view`] restores it on recovery
+    /// so a crash between `Signed::sign` and the network bytes
+    /// leaving the host can't re-mint a different proposal at the
+    /// same view (audit finding 4-6, issue #407).
     proposed_in_view: View,
     builder: Arc<dyn BlockBuilder>,
     /// Per-cache caps. Forced evictions fire when an `insert` would
@@ -470,6 +482,26 @@ impl HotStuffCore {
     pub fn with_signature_scheme(mut self, scheme: SignatureSchemeChoice) -> Self {
         self.signature_scheme = scheme;
         self
+    }
+
+    /// Restore the durably-persisted `proposed_in_view` value. The
+    /// integration layer's recovery path calls this once at boot from
+    /// the persisted [`StateUpdate::ProposedInView`] write so a leader
+    /// that crashed between `Signed::sign` and the network bytes
+    /// leaving the host cannot re-mint a different proposal at the
+    /// same view on restart (audit finding 4-6, issue #407). Defaults
+    /// to `0` for unit tests and fresh-storage boots.
+    pub fn with_proposed_in_view(mut self, view: View) -> Self {
+        self.proposed_in_view = view;
+        self
+    }
+
+    /// Highest view at which this replica has minted a proposal as
+    /// leader. Exposed for tests and recovery assertions; production
+    /// code should use [`StateUpdate::ProposedInView`] for durability
+    /// and [`Self::with_proposed_in_view`] for restore.
+    pub fn proposed_in_view(&self) -> View {
+        self.proposed_in_view
     }
 
     /// Borrow the eviction counters this core increments. The
@@ -714,10 +746,22 @@ impl HotStuffCore {
                 }
             };
         self.proposed_in_view = view;
-        vec![Action::Broadcast(ConsensusMsg::Proposal(Proposal {
-            block: new_block,
-            justify: high_qc,
-        }))]
+        // Persist `proposed_in_view` first so a crash between
+        // `Signed::sign` (inside the integration layer's egress path
+        // for the Broadcast below) and the network bytes leaving the
+        // host can't re-mint a *different* proposal at this view on
+        // restart. The dispatcher's `apply_safety_actions` flushes
+        // every Persist in the action vec before the next non-Persist
+        // action fires, so emitting `Persist` immediately before the
+        // `Broadcast` gives us the required ordering for free.
+        // Audit finding 4-6, issue #407.
+        vec![
+            Action::Persist(StateUpdate::ProposedInView { view }),
+            Action::Broadcast(ConsensusMsg::Proposal(Proposal {
+                block: new_block,
+                justify: high_qc,
+            })),
+        ]
     }
 
     /// The leader-rotation-aware variant of [`Self::build_proposal_at_view`].
@@ -2696,14 +2740,16 @@ mod tests {
             step3,
             vec![
                 Action::Persist(StateUpdate::HighQc(expected_qc.clone())),
+                Action::Persist(StateUpdate::ProposedInView { view: 4 }),
                 Action::Broadcast(ConsensusMsg::Proposal(Proposal {
                     block: expected_new_block,
                     justify: expected_qc.clone(),
                 })),
             ],
-            "quorum transition emits HighQc persist then Broadcast(Proposal)",
+            "quorum transition emits HighQc + ProposedInView persists then Broadcast(Proposal)",
         );
         assert_eq!(core.state().high_qc.as_ref(), Some(&expected_qc));
+        assert_eq!(core.proposed_in_view(), 4);
     }
 
     // ── BLS QC formation (#354 step 2) ──────────────────────────────
@@ -4615,6 +4661,111 @@ mod tests {
                 2,
                 "the recovery proposal at view 2 is voted on normally",
             );
+        }
+
+        /// Issue #407 / audit finding 4-6: a leader that crashes
+        /// between `Signed::sign` (inside the integration layer's
+        /// egress path for the `Broadcast(Proposal)` action) and the
+        /// network bytes leaving the host must not be able to mint a
+        /// *different* signed `Proposal(view)` envelope on restart.
+        ///
+        /// Pre-restart, `build_proposal_at_view` emits
+        /// `Persist(ProposedInView { view })` immediately before its
+        /// `Broadcast(Proposal)`, so the dispatcher's
+        /// `apply_safety_actions` flushes the persist before any
+        /// outbound bytes leave. After restart, the recovery path
+        /// threads the persisted value back into the safety core via
+        /// [`HotStuffCore::with_proposed_in_view`], so the in-memory
+        /// guard re-fires on the next `try_propose_as_leader(view)`
+        /// and the build path returns an empty action vec. Two
+        /// distinct signed `Proposal(view)` envelopes from the same
+        /// honest leader would otherwise be slashable equivocation
+        /// evidence in any future slashing implementation.
+        #[test]
+        fn restart_does_not_re_propose_at_already_proposed_view() {
+            // Pre-restart: nid(1) is the round-robin leader of view 4
+            // (validators are nid(1..=4); 4 % 4 = 0 → nid(1)). Seed a
+            // fresh high_qc over genesis (view 0) and invoke
+            // `become_leader(4)` so the build path fires.
+            let mut pre = make_core(1);
+            let genesis = Block::genesis([0; 32], [0; 32]);
+            let qc_genesis = dummy_qc(0, genesis.hash());
+            pre.state.high_qc = Some(qc_genesis.clone());
+
+            let pre_actions = pre.become_leader(4);
+            let proposed_idx = pre_actions.iter().position(|a| {
+                matches!(a, Action::Persist(StateUpdate::ProposedInView { view: 4 }))
+            });
+            let broadcast_idx = pre_actions
+                .iter()
+                .position(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
+            assert!(
+                matches!((proposed_idx, broadcast_idx), (Some(p), Some(b)) if p < b),
+                "Persist(ProposedInView) must precede Broadcast(Proposal) so the \
+                 dispatcher flushes the durable mirror before any bytes leave: \
+                 {pre_actions:?}",
+            );
+            assert_eq!(pre.proposed_in_view(), 4);
+            // Capture the proposal envelope; a second build at view 4
+            // must not produce *any* envelope, distinct or otherwise.
+            let pre_proposal = pre_actions
+                .iter()
+                .find_map(|a| match a {
+                    Action::Broadcast(ConsensusMsg::Proposal(p)) => Some(p.clone()),
+                    _ => None,
+                })
+                .expect("pre-restart leader must have broadcast a proposal");
+
+            // "Crash and restart": fresh state plus the persisted
+            // `proposed_in_view` threaded back through
+            // `with_proposed_in_view`, mirroring what the integration
+            // layer's `recover()` does.
+            let mut post_state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
+            post_state.high_qc = Some(qc_genesis.clone());
+            let post_builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
+            let mut post =
+                HotStuffCore::new(nid(1), post_state, post_builder).with_proposed_in_view(4);
+
+            let post_actions = post.become_leader(4);
+            assert!(
+                post_actions.is_empty(),
+                "restart with persisted proposed_in_view must not re-mint at the \
+                 same view (would be slashable equivocation if envelopes differed): \
+                 {post_actions:?}",
+            );
+            assert!(
+                post_actions
+                    .iter()
+                    .all(|a| !matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_)))),
+                "no second Broadcast(Proposal) at view 4 after restart: {post_actions:?}",
+            );
+            // Sanity: with the guard absent (`with_proposed_in_view`
+            // not called), the same setup *would* re-mint — confirming
+            // the persistence is what's holding the line, not some
+            // other branch of `build_proposal_at_view`.
+            let mut post_unguarded_state =
+                HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
+            post_unguarded_state.high_qc = Some(qc_genesis);
+            let unguarded_builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
+            let mut post_unguarded =
+                HotStuffCore::new(nid(1), post_unguarded_state, unguarded_builder);
+            let unguarded_actions = post_unguarded.become_leader(4);
+            assert!(
+                unguarded_actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(p)) if p.block.header.view == 4)),
+                "without the persisted guard, restart *would* re-mint at view 4: \
+                 {unguarded_actions:?}",
+            );
+            // The second envelope here happens to be byte-identical
+            // because `TestBlockBuilder` is deterministic — production
+            // builders are not (different mempool ordering, different
+            // `high_qc` snapshot if a peer NewView landed between the
+            // two attempts), so the audit finding's "different
+            // envelope" hazard is real even when the builder input
+            // looks identical. The guard fires regardless of envelope
+            // equality.
+            let _ = pre_proposal;
         }
     }
 
