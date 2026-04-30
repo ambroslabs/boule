@@ -574,11 +574,18 @@ pub fn ingress_wire_with_qc_verification(
                 qc_verification,
                 chain_id,
             )?;
+            // After `verify_bls_partial_if_required` succeeds, BLS
+            // chains have a `Some` partial and Ed25519 chains have a
+            // `None`. Encode that invariant in the `VoteVariant` enum
+            // (#372) so the safety core can dispatch on the type
+            // instead of a defensive runtime check.
+            let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
+            let variant = crate::consensus::hotstuff::step::VoteVariant::from_optional_partial(
+                verified,
+                bls_partial,
+            );
             Ok(vec![Dispatch::Safety(
-                crate::consensus::hotstuff::step::Event::VoteReceived(
-                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
-                    bls_partial,
-                ),
+                crate::consensus::hotstuff::step::Event::VoteReceived(variant),
             )])
         }
 
@@ -1292,12 +1299,16 @@ pub fn egress_consensus_msg_with_loopback(
             // self-vote on a BLS chain folds the partial into the
             // leader's QC bucket — the next-view leader voting on
             // its own proposal must contribute its BLS partial just
-            // like any peer's vote (#118 + #354 step 2).
+            // like any peer's vote (#118 + #354 step 2). The variant
+            // mirrors the wire path: presence of a partial means BLS;
+            // absence means Ed25519 (#372).
+            let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
+            let variant = crate::consensus::hotstuff::step::VoteVariant::from_optional_partial(
+                verified,
+                bls_partial,
+            );
             vec![Dispatch::Safety(
-                crate::consensus::hotstuff::step::Event::VoteReceived(
-                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
-                    bls_partial,
-                ),
+                crate::consensus::hotstuff::step::Event::VoteReceived(variant),
             )]
         }
         WireMessage::NewView(signed) => {
@@ -1478,7 +1489,7 @@ mod tests {
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
         ));
     }
 
@@ -2007,7 +2018,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
         ));
     }
 
@@ -2078,7 +2089,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
         ));
     }
 
@@ -2346,7 +2357,7 @@ mod tests {
             &ChainId::TEST,
         )
         .unwrap();
-        let SafetyEvent::VoteReceived(verified, _bls_partial) = (match &dispatches[0] {
+        let SafetyEvent::VoteReceived(variant) = (match &dispatches[0] {
             Dispatch::Safety(ev) => ev.clone(),
             other => panic!("expected Dispatch::Safety(VoteReceived), got {other:?}"),
         }) else {
@@ -2360,7 +2371,7 @@ mod tests {
         // stamped bytes are NOT the wire bytes is the load-bearing
         // assertion this test contributes over the existing
         // accept-or-reject coverage.
-        let stamped = verified.signer_validator_id();
+        let stamped = variant.verified().signer_validator_id();
         let expected =
             crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(old.node_id());
         assert_eq!(
@@ -2412,7 +2423,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
         ));
     }
 
@@ -2683,7 +2694,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
         ));
     }
 
@@ -3360,7 +3371,7 @@ mod tests {
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
         ));
     }
 
@@ -3521,7 +3532,7 @@ mod tests {
         assert_eq!(dispatches.len(), 1);
         assert!(matches!(
             dispatches[0],
-            Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+            Dispatch::Safety(SafetyEvent::VoteReceived(_))
         ));
     }
 
