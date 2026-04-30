@@ -892,6 +892,34 @@ committee — that's the pre-#144 default and what every existing
 testnet should use until you actually want stake-weighted voting.
 Pass any other `u64 >= 1` to seat the validator at that voting weight.
 
+**Choosing a weight value.** Two practical rules of thumb when you
+move off uniform weight = 1:
+
+1. **Relative ratios are what matter, not absolute values.** Weights
+   are `u64`, so headroom is enormous and there's no reason to start
+   small. Pick numbers in a range that makes the relationships
+   readable in logs (e.g. `[1, 100]` for human-readable testnets;
+   raw stake-token amounts for production-faithful staging).
+2. **Every single validator's weight `w_i` must satisfy `3 * w_i <
+   total_weight`** (equivalently, `w_i < total_weight / 3`). A
+   validator at or above that threshold can stall the cluster
+   single-handedly by going silent: its absence drops the honest
+   remainder below the `3 * signer_weight > 2 * total_weight`
+   quorum predicate. No malicious behavior required — a single
+   crash is enough.
+
+   Worked examples (n = 4):
+
+   | Weights | Total | Per-validator check | OK? |
+   | --- | --- | --- | --- |
+   | `[1, 1, 1, 1]` | 4 | 3·1 = 3 < 4 | ✓ |
+   | `[5, 5, 5, 1]` | 16 | max 3·5 = 15 < 16 | ✓ |
+   | `[6, 5, 4, 1]` | 16 | 3·6 = 18 > 16 | ✗ — validator 0 silent stalls |
+   | `[10, 1, 1, 1]` | 13 | 3·10 = 30 > 13 | ✗ — heavy validator silent stalls |
+
+   The reconfig validator does NOT enforce this constraint; it's
+   operator-policy. Verify before submitting.
+
 For a `remove`, the address and weight are irrelevant (the validator's
 already in the active set):
 
