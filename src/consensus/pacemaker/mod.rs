@@ -78,6 +78,16 @@ impl HonestyThresholdEvidence {
     pub fn from_bucket(bucket_size: usize, honesty_threshold: usize) -> Option<Self> {
         (bucket_size >= honesty_threshold).then_some(Self(()))
     }
+
+    /// Weight-based variant of [`Self::from_bucket`] (#461). Mints
+    /// evidence iff the running signer-weight in the bucket has
+    /// crossed [`crate::consensus::hotstuff::qc::honesty_weight_threshold`].
+    ///
+    /// Same audit invariant: both arguments are computed at the call
+    /// site, so the threshold rule remains visible.
+    pub fn from_bucket_weight(bucket_weight: u128, honesty_threshold: u128) -> Option<Self> {
+        (bucket_weight >= honesty_threshold).then_some(Self(()))
+    }
 }
 
 /// Inputs the pacemaker reacts to.
