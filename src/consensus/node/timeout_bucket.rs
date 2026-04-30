@@ -21,7 +21,9 @@ use crate::consensus::crashpoint::crashpoint;
 use crate::consensus::dispatch::{self, Outbound};
 use crate::consensus::hotstuff::NewView;
 use crate::consensus::hotstuff::QuorumCertificate;
-use crate::consensus::hotstuff::qc::{TimeoutVote, quorum_size};
+use crate::consensus::hotstuff::qc::{
+    TimeoutVote, honesty_weight_threshold, quorum_weight_threshold,
+};
 use crate::consensus::hotstuff::step::Event as SafetyEvent;
 use crate::consensus::pacemaker::Event as PacemakerEvent;
 use crate::consensus::pacemaker::HonestyThresholdEvidence as PacemakerHonestyThresholdEvidence;
@@ -40,14 +42,20 @@ use super::{
 /// Accumulator for one view's timeout votes.
 ///
 /// Tracks the set of distinct signers that have timed out at a view,
-/// and the freshest `high_qc` any of them reported. When `signers.len()`
-/// reaches `quorum_size(validator_set.len())` we fire
+/// the running sum of those signers' voting weights (#461), and the
+/// freshest `high_qc` any of them reported. When `signer_weight`
+/// crosses the weighted-quorum threshold we fire
 /// [`pacemaker::Event::OnTimeoutCert`] — and we drop the bucket so
 /// further duplicate timeout votes for the same view don't re-enter
 /// the pacemaker.
 #[derive(Default)]
 pub(super) struct TimeoutBucket {
     pub(super) signers: HashSet<NodeId>,
+    /// Sum of voting weights for the signers in [`Self::signers`],
+    /// looked up against the validator set authoritative at this
+    /// bucket's view (#461). Tracked alongside `signers` so the
+    /// quorum check is O(1) per insert rather than O(|signers|).
+    pub(super) signer_weight: u128,
     pub(super) best_high_qc: Option<QuorumCertificate>,
 }
 
@@ -229,9 +237,17 @@ impl ConsensusNode {
             return Ok(());
         }
 
-        let quorum = quorum_size(self.validator_set.len());
+        let quorum_weight = quorum_weight_threshold(&self.validator_set);
         let signer_id = signed.signer;
         let is_local = signer_id == self.self_id;
+        // Look up the signer's voting weight against the *current* set
+        // (membership was already confirmed above). The weight is the
+        // signer's contribution to this bucket's running tally; with
+        // every weight defaulted to 1 (#460) the running tally and the
+        // distinct-signer count are numerically identical, and the
+        // weight-based quorum reduces exactly to the count-based
+        // pre-#461 form.
+        let signer_weight = u128::from(self.validator_set.weight_for(&stable_id).unwrap_or(0));
         // Cap-based eviction. A genuinely new view triggers the
         // check; an entry update (same view, different signer) does
         // not grow the map, so we skip the check on the existing-key
@@ -241,14 +257,19 @@ impl ConsensusNode {
         if !self.timeout_buckets.contains_key(&view) {
             self.evict_timeout_buckets_to_fit_one();
         }
-        let honesty_threshold =
-            crate::consensus::hotstuff::qc::honesty_threshold(self.validator_set.len());
+        let honesty_threshold = honesty_weight_threshold(&self.validator_set);
         let (adopt_qc, fired_round_sync) = {
             let bucket = self.timeout_buckets.entry(view).or_default();
             let is_new = bucket.signers.insert(signed.signer);
             if !is_new {
                 return Ok(());
             }
+            // Maintain the running weight sum in lockstep with the
+            // signer set; `is_new` above guarantees we don't double-
+            // count.
+            let prev_weight = bucket.signer_weight;
+            bucket.signer_weight = bucket.signer_weight.saturating_add(signer_weight);
+
             // Remember the freshest high_qc reported so far. `None`
             // here means the sender had never seen a QC (rare after
             // genesis-QC seeding); we just leave `best_high_qc` as-is.
@@ -273,38 +294,46 @@ impl ConsensusNode {
                 }
             }
 
-            let bucket_size = bucket.signers.len();
+            let bucket_signers = bucket.signers.len();
+            let bucket_weight = bucket.signer_weight;
             tracing::debug!(
                 target: TRACE_TARGET,
                 view = view.0,
                 signer = %node_id_to_base58(&signer_id),
-                bucket_size,
-                quorum,
+                bucket_signers,
+                bucket_weight = bucket_weight as u64, // tracing prefers u64
+                quorum_weight = quorum_weight as u64,
                 is_local,
                 "timeout_vote",
             );
 
-            // Round-sync hint (issue #218): the bucket has reached
-            // `f + 1` distinct signers, so at least one honest peer
-            // reports being at view `view`. We can advance our
+            // Round-sync hint (issue #218): the bucket has accumulated
+            // enough signer-weight to guarantee at least one honest
+            // peer reports being at view `view`. We can advance our
             // pacemaker to `view` even before quorum gives us a TC.
-            // Crucially, a single Byzantine signer can't fire this —
-            // it needs at least one honest co-signer — which is what
-            // keeps the `TimeoutSpammer` adversary from dragging
-            // honest views to `u64::MAX`.
+            // Crucially, a Byzantine subset whose total weight is at
+            // most `floor(total_weight/3)` can't fire this — it needs
+            // strictly more — which is what keeps the
+            // `TimeoutSpammer` adversary from dragging honest views to
+            // `u64::MAX`.
             //
             // Fire on the exact crossing so we don't re-emit on every
             // subsequent vote into the same bucket. The evidence token
             // is minted inline with the threshold check; constructing
             // `OnRoundSync` outside this gate is a compile error
             // (audit finding 2-3 / issue #419).
-            let round_sync_evidence = (bucket_size == honesty_threshold)
-                .then(|| {
-                    PacemakerHonestyThresholdEvidence::from_bucket(bucket_size, honesty_threshold)
-                })
-                .flatten();
+            let crossed_honesty =
+                prev_weight < honesty_threshold && bucket_weight >= honesty_threshold;
+            let round_sync_evidence = if crossed_honesty {
+                PacemakerHonestyThresholdEvidence::from_bucket_weight(
+                    bucket_weight,
+                    honesty_threshold,
+                )
+            } else {
+                None
+            };
 
-            if bucket_size < quorum {
+            if bucket_weight < quorum_weight {
                 return if let Some(evidence) = round_sync_evidence {
                     self.fire_round_sync(view, evidence, broadcaster, view_timer, signer)
                         .await
