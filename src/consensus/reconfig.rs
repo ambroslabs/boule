@@ -64,6 +64,10 @@ pub const MIN_V_EFF_DELAY: View = View::new(2);
 /// module) verifies the PoP whenever it is present, regardless of the
 /// chain's scheme — scheme-driven enforcement (PoP *required* on BLS
 /// chains) lands together with the rest of the BLS integration in #293.
+///
+/// `weight` is the validator's voting weight when seated (#462). Must
+/// be `>= 1`; weight 0 is rejected at validation time, mirroring the
+/// `ValidatorSet::with_weights` invariant from #460.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorEntry {
     pub node_id: NodeId,
@@ -77,17 +81,47 @@ pub struct ValidatorEntry {
     /// tolerate `skip_serializing_if`) — `None` adds a single Option
     /// discriminant byte to the wire payload.
     pub bls_pop: Option<BlsPop>,
+    /// Voting weight to assign this validator at and after `v_eff`
+    /// (#462). The weighted-quorum predicate
+    /// ([`crate::consensus::hotstuff::qc::QuorumCertificate::has_quorum`])
+    /// reads this via the boundary's [`crate::consensus::validator_set::ValidatorSet`].
+    /// Validation rejects `weight == 0` — the reconfig "remove" path
+    /// is the canonical way to spell removal.
+    pub weight: u64,
+}
+
+/// A weight-only adjustment for a currently-seated validator. Equivalent
+/// to "the existing member's voting weight changes from its current
+/// value to `weight` at and after `v_eff`" without altering membership
+/// (#462). Composes with `adds` / `removes` in the same
+/// [`ReconfigCommand`] under the disjointness rules in
+/// [`ReconfigCommand::validate_against_with_delay_and_scheme`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightChange {
+    pub node_id: NodeId,
+    pub weight: u64,
 }
 
 /// A typed reconfiguration payload.
 ///
-/// `adds` and `removes` describe the diff against the active set. `v_eff`
-/// is the view at which the resulting set becomes authoritative. See
-/// [`Self::validate_against`] for the exact pre-commit checks.
+/// `adds`, `removes`, and `changes` describe the diff against the
+/// active set. `v_eff` is the view at which the resulting set becomes
+/// authoritative. See [`Self::validate_against`] for the exact
+/// pre-commit checks.
+///
+/// **Wire-format note (#462):** `ValidatorEntry` gains a `weight`
+/// field and `ReconfigCommand` gains a `changes` field — both bump the
+/// postcard layout. Pre-#462 reconfig payloads in mempools or on disk
+/// will not decode under the new layout and are silently ignored
+/// (see `is_reconfig_payload` + `decode`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconfigCommand {
     pub adds: Vec<ValidatorEntry>,
     pub removes: Vec<NodeId>,
+    /// Weight-only adjustments for currently-seated validators (#462).
+    /// Each entry must reference a current member and carry a non-
+    /// zero weight; conflicts with `adds`/`removes` are rejected.
+    pub changes: Vec<WeightChange>,
     pub v_eff: View,
 }
 
@@ -116,17 +150,24 @@ impl ReconfigCommand {
         postcard::from_bytes(body).map_err(|e| anyhow::anyhow!("malformed ReconfigCommand: {e}"))
     }
 
-    /// Construct a tagged "add a single validator" payload, suitable
-    /// for injection into a mempool. Convenience wrapper used by the
-    /// CLI (#251).
-    pub fn build_add_validator_payload(node_id: NodeId, addr: SocketAddr, v_eff: View) -> Bytes {
+    /// Construct a tagged "add a single validator" payload at the
+    /// supplied voting weight. Convenience wrapper used by the CLI
+    /// (#251 / #462).
+    pub fn build_add_validator_payload(
+        node_id: NodeId,
+        addr: SocketAddr,
+        weight: u64,
+        v_eff: View,
+    ) -> Bytes {
         Self {
             adds: vec![ValidatorEntry {
                 node_id,
                 addr,
                 bls_pop: None,
+                weight,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff,
         }
         .encode()
@@ -138,21 +179,37 @@ impl ReconfigCommand {
         Self {
             adds: vec![],
             removes: vec![node_id],
+            changes: vec![],
+            v_eff,
+        }
+        .encode()
+    }
+
+    /// Construct a tagged "change a validator's weight" payload (#462).
+    /// The validator must be a current member at `v_eff`; the weight
+    /// must be non-zero. Validation rules apply at commit time.
+    pub fn build_change_weight_payload(node_id: NodeId, weight: u64, v_eff: View) -> Bytes {
+        Self {
+            adds: vec![],
+            removes: vec![],
+            changes: vec![WeightChange { node_id, weight }],
             v_eff,
         }
         .encode()
     }
 
     /// Validate this command against the active state at validation time.
-    /// Returns the resulting member list (sorted, deduplicated) on
-    /// success.
+    /// Returns the resulting weighted member list (sorted by `NodeId`,
+    /// deduplicated) on success.
     ///
     /// Checks:
     /// - `v_eff >= current_view + MIN_V_EFF_DELAY`.
-    /// - No duplicates within `adds` or within `removes`, and no
-    ///   `NodeId` appearing in both.
+    /// - No duplicates within `adds` / `removes` / `changes`, and no
+    ///   `NodeId` appearing in more than one of those lists.
     /// - Each `removes` entry is currently a member.
+    /// - Each `changes` entry is currently a member.
     /// - No `adds` entry is currently a member.
+    /// - Every weight (in `adds` and `changes`) is `>= 1`.
     /// - Resulting set size `>= MIN_VALIDATOR_FLOOR`.
     ///
     /// Test-only shim around [`Self::validate_against_with_delay_and_scheme`]
@@ -164,7 +221,7 @@ impl ReconfigCommand {
         &self,
         current_set: &ValidatorSet,
         current_view: impl Into<View>,
-    ) -> anyhow::Result<Vec<NodeId>> {
+    ) -> anyhow::Result<Vec<(NodeId, u64)>> {
         self.validate_against_with_delay(current_set, current_view.into(), MIN_V_EFF_DELAY)
     }
 
@@ -186,7 +243,7 @@ impl ReconfigCommand {
         current_set: &ValidatorSet,
         current_view: impl Into<View>,
         min_v_eff_delay: View,
-    ) -> anyhow::Result<Vec<NodeId>> {
+    ) -> anyhow::Result<Vec<(NodeId, u64)>> {
         // Ed25519 chains never read the chain_id arg (PoPs are absent),
         // so the test sentinel is safe here.
         self.validate_against_with_delay_and_scheme(
@@ -218,7 +275,7 @@ impl ReconfigCommand {
         min_v_eff_delay: View,
         scheme: SignatureSchemeChoice,
         chain_id: &ChainId,
-    ) -> anyhow::Result<Vec<NodeId>> {
+    ) -> anyhow::Result<Vec<(NodeId, u64)>> {
         let current_view = current_view.into();
         let effective_delay = std::cmp::max(min_v_eff_delay, MIN_V_EFF_DELAY);
         let min_v_eff = current_view.checked_add(effective_delay).ok_or_else(|| {
@@ -231,6 +288,29 @@ impl ReconfigCommand {
                 current_view,
                 effective_delay
             );
+        }
+
+        // Weight gating: weight 0 is reserved (matches
+        // ValidatorSet::with_weights's #460 invariant). Reject in
+        // adds and changes alike, before any membership lookups —
+        // catches the misuse with a clear error.
+        for entry in &self.adds {
+            if entry.weight == 0 {
+                anyhow::bail!(
+                    "validator {} has weight 0; weight 0 is reserved — \
+                     remove the validator via `removes` instead.",
+                    hex::encode(entry.node_id),
+                );
+            }
+        }
+        for change in &self.changes {
+            if change.weight == 0 {
+                anyhow::bail!(
+                    "weight change for {} carries weight 0; weight 0 is reserved — \
+                     remove the validator via `removes` instead.",
+                    hex::encode(change.node_id),
+                );
+            }
         }
 
         let mut adds_seen: BTreeSet<NodeId> = BTreeSet::new();
@@ -247,9 +327,31 @@ impl ReconfigCommand {
             }
         }
 
+        let mut changes_seen: BTreeSet<NodeId> = BTreeSet::new();
+        for change in &self.changes {
+            if !changes_seen.insert(change.node_id) {
+                anyhow::bail!(
+                    "duplicate node_id in changes: {}",
+                    hex::encode(change.node_id)
+                );
+            }
+        }
+
         if let Some(n) = adds_seen.intersection(&removes_seen).next() {
             anyhow::bail!(
                 "node_id appears in both adds and removes: {}",
+                hex::encode(n)
+            );
+        }
+        if let Some(n) = adds_seen.intersection(&changes_seen).next() {
+            anyhow::bail!(
+                "node_id appears in both adds and changes: {}",
+                hex::encode(n)
+            );
+        }
+        if let Some(n) = removes_seen.intersection(&changes_seen).next() {
+            anyhow::bail!(
+                "node_id appears in both removes and changes: {}",
                 hex::encode(n)
             );
         }
@@ -273,6 +375,13 @@ impl ReconfigCommand {
             let vid = ValidatorId::from_genesis_pubkey(*n);
             if current_set.contains(&vid) {
                 anyhow::bail!("add targets existing member: {}", hex::encode(n));
+            }
+        }
+
+        for n in &changes_seen {
+            let vid = ValidatorId::from_genesis_pubkey(*n);
+            if !current_set.contains(&vid) {
+                anyhow::bail!("change targets non-member: {}", hex::encode(n));
             }
         }
 
@@ -322,11 +431,30 @@ impl ReconfigCommand {
             }
         }
 
-        let mut next: Vec<NodeId> = current_set.iter().map(|v| v.into_node_id()).collect();
-        next.retain(|n| !removes_seen.contains(n));
-        next.extend(adds_seen.iter().copied());
-        next.sort_unstable();
-        next.dedup();
+        // Build the (NodeId, weight) map. Start from the current set's
+        // weights, drop removes, apply changes, append adds; sort by
+        // NodeId for deterministic output.
+        let mut next: Vec<(NodeId, u64)> = current_set
+            .iter_weighted()
+            .map(|(v, w)| (v.into_node_id(), w))
+            .filter(|(n, _)| !removes_seen.contains(n))
+            .collect();
+        // Apply weight changes in-place.
+        for change in &self.changes {
+            if let Some((_, w)) = next.iter_mut().find(|(n, _)| *n == change.node_id) {
+                *w = change.weight;
+            }
+            // Membership for changes was confirmed above; the lookup
+            // here can fail only if a `removes` already filtered the
+            // entry, which the disjointness check above also rules
+            // out. Skip silently — defensive idempotency.
+        }
+        // Append adds with their declared weights.
+        for entry in &self.adds {
+            next.push((entry.node_id, entry.weight));
+        }
+        next.sort_by_key(|(n, _)| *n);
+        next.dedup_by_key(|(n, _)| *n);
 
         if next.len() < MIN_VALIDATOR_FLOOR {
             anyhow::bail!(
@@ -357,10 +485,15 @@ mod tests {
     }
 
     fn entry(b: u8, port: u16) -> ValidatorEntry {
+        entry_with_weight(b, port, 1)
+    }
+
+    fn entry_with_weight(b: u8, port: u16, weight: u64) -> ValidatorEntry {
         ValidatorEntry {
             node_id: nid(b),
             addr: addr(port),
             bls_pop: None,
+            weight,
         }
     }
 
@@ -380,6 +513,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(10, 7010), entry(11, 7011)],
             removes: vec![nid(1)],
+            changes: vec![],
             v_eff: View(100),
         };
         let bytes = cmd.encode();
@@ -407,6 +541,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(10, 7010)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(100),
         };
         let bytes = cmd.encode();
@@ -425,10 +560,20 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let next = cmd.validate_against(&cur, 0).unwrap();
-        assert_eq!(next, vec![nid(1), nid(2), nid(3), nid(4), nid(5)]);
+        assert_eq!(
+            next,
+            vec![
+                (nid(1), 1),
+                (nid(2), 1),
+                (nid(3), 1),
+                (nid(4), 1),
+                (nid(5), 1),
+            ]
+        );
     }
 
     #[test]
@@ -437,10 +582,14 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(5)],
+            changes: vec![],
             v_eff: View(10),
         };
         let next = cmd.validate_against(&cur, 0).unwrap();
-        assert_eq!(next, vec![nid(1), nid(2), nid(3), nid(4)]);
+        assert_eq!(
+            next,
+            vec![(nid(1), 1), (nid(2), 1), (nid(3), 1), (nid(4), 1)]
+        );
     }
 
     #[test]
@@ -449,10 +598,20 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(6, 7006)],
             removes: vec![nid(2)],
+            changes: vec![],
             v_eff: View(10),
         };
         let next = cmd.validate_against(&cur, 0).unwrap();
-        assert_eq!(next, vec![nid(1), nid(3), nid(4), nid(5), nid(6)]);
+        assert_eq!(
+            next,
+            vec![
+                (nid(1), 1),
+                (nid(3), 1),
+                (nid(4), 1),
+                (nid(5), 1),
+                (nid(6), 1),
+            ]
+        );
     }
 
     #[test]
@@ -461,6 +620,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
+            changes: vec![],
             v_eff: MIN_V_EFF_DELAY, // current_view = 0, min = 0 + 2.
         };
         cmd.validate_against(&cur, 0).unwrap();
@@ -474,6 +634,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(5), // current_view = 4, min v_eff = 4 + 2 = 6.
         };
         let err = cmd.validate_against(&cur, 4).unwrap_err();
@@ -486,6 +647,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005), entry(5, 7006)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
@@ -501,6 +663,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(5), nid(5)],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
@@ -516,6 +679,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![nid(5)],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
@@ -531,6 +695,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(1, 7001)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
@@ -546,6 +711,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(99)],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
@@ -561,6 +727,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(4)],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = cmd.validate_against(&cur, 0).unwrap_err();
@@ -577,13 +744,15 @@ mod tests {
         let node_id = nid(7);
         let addr: SocketAddr = "127.0.0.1:7007".parse().unwrap();
         let v_eff = View(42);
-        let bytes = ReconfigCommand::build_add_validator_payload(node_id, addr, v_eff);
+        let bytes = ReconfigCommand::build_add_validator_payload(node_id, addr, 1, v_eff);
         assert!(ReconfigCommand::is_reconfig_payload(&bytes));
         let decoded = ReconfigCommand::decode(&bytes).unwrap();
         assert_eq!(decoded.adds.len(), 1);
         assert_eq!(decoded.adds[0].node_id, node_id);
         assert_eq!(decoded.adds[0].addr, addr);
+        assert_eq!(decoded.adds[0].weight, 1);
         assert!(decoded.removes.is_empty());
+        assert!(decoded.changes.is_empty());
         assert_eq!(decoded.v_eff, v_eff);
     }
 
@@ -596,6 +765,22 @@ mod tests {
         let decoded = ReconfigCommand::decode(&bytes).unwrap();
         assert!(decoded.adds.is_empty());
         assert_eq!(decoded.removes, vec![node_id]);
+        assert!(decoded.changes.is_empty());
+        assert_eq!(decoded.v_eff, v_eff);
+    }
+
+    #[test]
+    fn build_change_weight_payload_round_trips() {
+        let node_id = nid(2);
+        let v_eff = View(100);
+        let bytes = ReconfigCommand::build_change_weight_payload(node_id, 7, v_eff);
+        assert!(ReconfigCommand::is_reconfig_payload(&bytes));
+        let decoded = ReconfigCommand::decode(&bytes).unwrap();
+        assert!(decoded.adds.is_empty());
+        assert!(decoded.removes.is_empty());
+        assert_eq!(decoded.changes.len(), 1);
+        assert_eq!(decoded.changes[0].node_id, node_id);
+        assert_eq!(decoded.changes[0].weight, 7);
         assert_eq!(decoded.v_eff, v_eff);
     }
 
@@ -605,6 +790,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
+            changes: vec![],
             v_eff: View::MAX,
         };
         let err = cmd.validate_against(&cur, u64::MAX).unwrap_err();
@@ -626,13 +812,17 @@ mod tests {
             node_id: nid(b),
             addr: addr(port),
             bls_pop: Some(pop),
+            weight: 1,
         }
     }
 
     /// Validate `cmd` on a BLS chain. Helper for the PoP-cryptography
     /// tests below — they all assume the BLS scheme (PoP-on-Ed25519 is
     /// rejected by #334's presence check before the crypto runs).
-    fn validate_bls(cmd: &ReconfigCommand, cur: &ValidatorSet) -> anyhow::Result<Vec<NodeId>> {
+    fn validate_bls(
+        cmd: &ReconfigCommand,
+        cur: &ValidatorSet,
+    ) -> anyhow::Result<Vec<(NodeId, u64)>> {
         cmd.validate_against_with_delay_and_scheme(
             cur,
             View::ZERO,
@@ -648,10 +838,11 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let next = validate_bls(&cmd, &cur).unwrap();
-        assert!(next.contains(&nid(5)));
+        assert!(next.iter().any(|(n, _)| *n == nid(5)));
     }
 
     #[test]
@@ -664,6 +855,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = validate_bls(&cmd, &floor_set()).unwrap_err();
@@ -683,6 +875,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![a],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = validate_bls(&cmd, &floor_set()).unwrap_err();
@@ -700,6 +893,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry_with_valid_pop(5, 7005, &chain_a)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         // Sanity: under the originating chain, the add is accepted.
@@ -732,6 +926,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         cmd.validate_against(&cur, 0)
@@ -746,6 +941,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry(5, 7005)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = cmd
@@ -769,6 +965,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let next = cmd
@@ -780,7 +977,7 @@ mod tests {
                 &ChainId::TEST,
             )
             .unwrap();
-        assert!(next.contains(&nid(5)));
+        assert!(next.iter().any(|(n, _)| *n == nid(5)));
     }
 
     #[test]
@@ -789,6 +986,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
             removes: vec![],
+            changes: vec![],
             v_eff: View(10),
         };
         let err = cmd
@@ -801,5 +999,189 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("ed25519_collected"), "{err}",);
+    }
+
+    // ── #462: weighted reconfig payload ─────────────────────────────────
+
+    #[test]
+    fn add_with_explicit_weight_validates_and_returns_weighted_entries() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry_with_weight(5, 7005, 7)],
+            removes: vec![],
+            changes: vec![],
+            v_eff: View(10),
+        };
+        let next = cmd.validate_against(&cur, 0).unwrap();
+        // Existing 1..=4 keep weight 1, new validator 5 gets weight 7.
+        assert_eq!(
+            next,
+            vec![
+                (nid(1), 1),
+                (nid(2), 1),
+                (nid(3), 1),
+                (nid(4), 1),
+                (nid(5), 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn change_weight_returns_updated_weight() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![],
+            removes: vec![],
+            changes: vec![WeightChange {
+                node_id: nid(2),
+                weight: 5,
+            }],
+            v_eff: View(10),
+        };
+        let next = cmd.validate_against(&cur, 0).unwrap();
+        assert_eq!(
+            next,
+            vec![(nid(1), 1), (nid(2), 5), (nid(3), 1), (nid(4), 1)]
+        );
+    }
+
+    #[test]
+    fn add_with_zero_weight_rejected() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry_with_weight(5, 7005, 0)],
+            removes: vec![],
+            changes: vec![],
+            v_eff: View(10),
+        };
+        let err = cmd.validate_against(&cur, 0).unwrap_err();
+        assert!(err.to_string().contains("weight 0"), "{err}");
+    }
+
+    #[test]
+    fn change_with_zero_weight_rejected() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![],
+            removes: vec![],
+            changes: vec![WeightChange {
+                node_id: nid(1),
+                weight: 0,
+            }],
+            v_eff: View(10),
+        };
+        let err = cmd.validate_against(&cur, 0).unwrap_err();
+        assert!(err.to_string().contains("weight 0"), "{err}");
+    }
+
+    #[test]
+    fn change_targeting_non_member_rejected() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![],
+            removes: vec![],
+            changes: vec![WeightChange {
+                node_id: nid(99),
+                weight: 3,
+            }],
+            v_eff: View(10),
+        };
+        let err = cmd.validate_against(&cur, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("change targets non-member"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_in_changes_rejected() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![],
+            removes: vec![],
+            changes: vec![
+                WeightChange {
+                    node_id: nid(1),
+                    weight: 2,
+                },
+                WeightChange {
+                    node_id: nid(1),
+                    weight: 3,
+                },
+            ],
+            v_eff: View(10),
+        };
+        let err = cmd.validate_against(&cur, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate node_id in changes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn change_overlapping_with_removes_rejected() {
+        let cur = five_set();
+        let cmd = ReconfigCommand {
+            adds: vec![],
+            removes: vec![nid(5)],
+            changes: vec![WeightChange {
+                node_id: nid(5),
+                weight: 3,
+            }],
+            v_eff: View(10),
+        };
+        let err = cmd.validate_against(&cur, 0).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("appears in both removes and changes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn change_overlapping_with_adds_rejected() {
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry_with_weight(5, 7005, 2)],
+            removes: vec![],
+            changes: vec![WeightChange {
+                node_id: nid(5),
+                weight: 7,
+            }],
+            v_eff: View(10),
+        };
+        let err = cmd.validate_against(&cur, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("appears in both adds and changes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mixed_add_remove_change_composes_correctly() {
+        // Exercise the disjointness rules with one of each operation
+        // in a single command: add nid(6) at weight 3, remove nid(2),
+        // bump nid(1)'s weight from 1 to 5.
+        let cur = five_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry_with_weight(6, 7006, 3)],
+            removes: vec![nid(2)],
+            changes: vec![WeightChange {
+                node_id: nid(1),
+                weight: 5,
+            }],
+            v_eff: View(10),
+        };
+        let next = cmd.validate_against(&cur, 0).unwrap();
+        assert_eq!(
+            next,
+            vec![
+                (nid(1), 5), // weight bumped via change
+                (nid(3), 1),
+                (nid(4), 1),
+                (nid(5), 1),
+                (nid(6), 3), // added at weight 3
+            ]
+        );
     }
 }

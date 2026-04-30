@@ -2685,8 +2685,10 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                weight: 1,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff,
         };
         let block = block_with_reconfig(1, 0, nid(1), cmd);
@@ -2732,6 +2734,7 @@ mod tests {
         let cmd = ReconfigCommand {
             adds: vec![],
             removes: vec![nid(3), nid(4)],
+            changes: vec![],
             v_eff,
         };
         // Empty `adds` so nothing's needed; this is purely a removal.
@@ -2739,6 +2742,7 @@ mod tests {
             node_id: nid(0),
             addr: "127.0.0.1:0".parse().unwrap(),
             bls_pop: None,
+            weight: 1,
         };
         let block = block_with_reconfig(1, 0, nid(1), cmd);
         node.apply_commit(block);
@@ -2760,8 +2764,10 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                weight: 1,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff: View(5),
         };
         let block = block_with_reconfig(1, 5, nid(1), cmd);
@@ -2782,8 +2788,10 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                weight: 1,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff: v_eff_a,
         };
         let cmd_b = ReconfigCommand {
@@ -2791,8 +2799,10 @@ mod tests {
                 node_id: nid(6),
                 addr: "127.0.0.1:9006".parse().unwrap(),
                 bls_pop: None,
+                weight: 1,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff: v_eff_b,
         };
 
@@ -2858,8 +2868,10 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                weight: 1,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff,
         };
         let block = block_with_reconfig(1, 0, nid(1), cmd);
@@ -3092,8 +3104,10 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                weight: 1,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff,
         };
         let block = block_with_reconfig(1, 0, nid(1), cmd);
@@ -7488,8 +7502,10 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                weight: 1,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff,
         };
         let mut block1 = block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, [0u8; 32]);
@@ -7544,8 +7560,10 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                weight: 1,
             }],
             removes: vec![],
+            changes: vec![],
             v_eff,
         };
         let mut block1 = block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, [0u8; 32]);
