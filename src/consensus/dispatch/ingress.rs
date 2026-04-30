@@ -214,10 +214,15 @@ pub fn ingress_vote(
         verify_signer_at(signed.signer, signed.payload.view, history, key_history)?;
     verify_sig(&signed, chain_id)?;
     verify_bls_partial_if_required(&signed, bls_partial.as_ref(), qc_verification, chain_id)?;
-    Ok(vec![Dispatch::Safety(SafetyEvent::VoteReceived(
-        Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
-        bls_partial,
-    ))])
+    // After `verify_bls_partial_if_required` succeeds, BLS chains
+    // have a `Some` partial and Ed25519 chains have a `None`. Encode
+    // that invariant in the `VoteVariant` enum (#372) so the safety
+    // core can dispatch on the type instead of a defensive runtime
+    // check.
+    let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
+    let variant =
+        crate::consensus::hotstuff::step::VoteVariant::from_optional_partial(verified, bls_partial);
+    Ok(vec![Dispatch::Safety(SafetyEvent::VoteReceived(variant))])
 }
 
 /// Verify a `Signed<NewView>` envelope and emit the safety-core

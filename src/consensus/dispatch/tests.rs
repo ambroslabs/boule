@@ -153,7 +153,7 @@ fn ingress_vote_happy_path() {
     assert_eq!(dispatches.len(), 1);
     assert!(matches!(
         dispatches[0],
-        Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+        Dispatch::Safety(SafetyEvent::VoteReceived(_))
     ));
 }
 
@@ -690,7 +690,7 @@ fn vote_at_v_eff_verifies_against_post_boundary_set() {
     .unwrap();
     assert!(matches!(
         dispatches[0],
-        Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+        Dispatch::Safety(SafetyEvent::VoteReceived(_))
     ));
 }
 
@@ -761,7 +761,7 @@ fn vote_before_boundary_verifies_against_pre_boundary_set() {
     .unwrap();
     assert!(matches!(
         dispatches[0],
-        Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+        Dispatch::Safety(SafetyEvent::VoteReceived(_))
     ));
 }
 
@@ -1029,7 +1029,7 @@ fn vote_after_rotation_signed_with_new_key_accepted() {
         &ChainId::TEST,
     )
     .unwrap();
-    let SafetyEvent::VoteReceived(verified, _bls_partial) = (match &dispatches[0] {
+    let SafetyEvent::VoteReceived(variant) = (match &dispatches[0] {
         Dispatch::Safety(ev) => ev.clone(),
         other => panic!("expected Dispatch::Safety(VoteReceived), got {other:?}"),
     }) else {
@@ -1043,7 +1043,7 @@ fn vote_after_rotation_signed_with_new_key_accepted() {
     // stamped bytes are NOT the wire bytes is the load-bearing
     // assertion this test contributes over the existing
     // accept-or-reject coverage.
-    let stamped = verified.signer_validator_id();
+    let stamped = variant.verified().signer_validator_id();
     let expected = crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(old.node_id());
     assert_eq!(
         stamped, expected,
@@ -1094,7 +1094,7 @@ fn spanning_vote_pre_rotation_view_signed_with_old_key_accepted() {
     .unwrap();
     assert!(matches!(
         dispatches[0],
-        Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+        Dispatch::Safety(SafetyEvent::VoteReceived(_))
     ));
 }
 
@@ -1365,7 +1365,7 @@ fn vote_from_removed_validator_after_v_eff_rejected() {
     .unwrap();
     assert!(matches!(
         dispatches[0],
-        Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+        Dispatch::Safety(SafetyEvent::VoteReceived(_))
     ));
 }
 
@@ -2036,7 +2036,7 @@ fn ingress_vote_on_bls_chain_accepts_valid_bls_partial() {
     assert_eq!(dispatches.len(), 1);
     assert!(matches!(
         dispatches[0],
-        Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+        Dispatch::Safety(SafetyEvent::VoteReceived(_))
     ));
 }
 
@@ -2198,7 +2198,7 @@ fn ingress_vote_on_ed25519_chain_ignores_bls_partial_field() {
     assert_eq!(dispatches.len(), 1);
     assert!(matches!(
         dispatches[0],
-        Dispatch::Safety(SafetyEvent::VoteReceived(_, _))
+        Dispatch::Safety(SafetyEvent::VoteReceived(_))
     ));
 }
 

@@ -255,12 +255,16 @@ pub fn egress_consensus_msg_with_loopback(
             // self-vote on a BLS chain folds the partial into the
             // leader's QC bucket — the next-view leader voting on
             // its own proposal must contribute its BLS partial just
-            // like any peer's vote (#118 + #354 step 2).
+            // like any peer's vote (#118 + #354 step 2). The variant
+            // mirrors the wire path: presence of a partial means BLS;
+            // absence means Ed25519 (#372).
+            let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
+            let variant = crate::consensus::hotstuff::step::VoteVariant::from_optional_partial(
+                verified,
+                bls_partial,
+            );
             vec![Dispatch::Safety(
-                crate::consensus::hotstuff::step::Event::VoteReceived(
-                    Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
-                    bls_partial,
-                ),
+                crate::consensus::hotstuff::step::Event::VoteReceived(variant),
             )]
         }
         WireMessage::NewView(signed) => {

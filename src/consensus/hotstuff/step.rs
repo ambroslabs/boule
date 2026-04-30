@@ -89,25 +89,68 @@ pub enum Event {
     /// A signed vote arrived on the wire. Only meaningful to the leader
     /// of `vote.view + 1`; other replicas drop it in [`HotStuffCore::step`].
     ///
-    /// The optional second field is the BLS partial signature carried
-    /// alongside the Ed25519 envelope on `bls_aggregated` chains
-    /// (#354 step 1). On Ed25519 chains it is always `None` and ignored.
-    /// On BLS chains it is `Some(_)` and folded into the QC bucket via
-    /// [`QuorumCertificate::add_bls_partial`]; the ingress layer
+    /// The payload is wrapped in [`VoteVariant`] so the dispatch layer
+    /// commits at the type level to whether this is an Ed25519 vote
+    /// (no partial, ever) or a BLS-aggregated vote (partial always
+    /// present). The ingress layer
     /// (`crate::consensus::dispatch::verify_bls_partial_if_required`)
     /// has already verified the partial against the signer's
     /// per-historical-view BLS pubkey, so the safety core treats it as
     /// trusted bytes ready to fold.
-    VoteReceived(
-        crate::consensus::dispatch::Verified<Signed<Vote>>,
-        Option<BlsPartialSig>,
-    ),
+    VoteReceived(VoteVariant),
     /// A signed `NewView` arrived on the wire.
     NewViewReceived(crate::consensus::dispatch::Verified<Signed<NewView>>),
     /// The pacemaker has advanced the local view. Never emitted by the
     /// safety core itself — always injected from the integration layer
     /// after a pacemaker `AdvanceToView` fires.
     PacemakerAdvance(View),
+}
+
+/// Verified vote payload, tagged at the type level with the chain's
+/// signature scheme. The dispatch layer commits to a variant per chain
+/// scheme (#372): on Ed25519 chains the wire envelope carries no BLS
+/// partial; on `bls_aggregated` chains it carries a partial that the
+/// ingress verifier
+/// (`crate::consensus::dispatch::verify_bls_partial_if_required`) has
+/// already validated against the signer's per-historical-view BLS
+/// pubkey. The safety core matches on the variant and folds the bytes
+/// without re-checking — the "BLS chain + missing partial" combination
+/// the previous tuple shape made expressible no longer compiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoteVariant {
+    /// Ed25519 chain vote: only the signed envelope, no BLS partial.
+    Ed25519(crate::consensus::dispatch::Verified<Signed<Vote>>),
+    /// BLS-aggregated chain vote: the signed envelope plus the BLS
+    /// partial that will be folded into the QC bucket via
+    /// [`QuorumCertificate::add_bls_partial`].
+    Bls {
+        signed: crate::consensus::dispatch::Verified<Signed<Vote>>,
+        partial: BlsPartialSig,
+    },
+}
+
+impl VoteVariant {
+    /// Borrow the inner [`Verified`] envelope shared by both variants.
+    pub fn verified(&self) -> &crate::consensus::dispatch::Verified<Signed<Vote>> {
+        match self {
+            VoteVariant::Ed25519(verified) => verified,
+            VoteVariant::Bls { signed, .. } => signed,
+        }
+    }
+
+    /// Convenience constructor for callers (the dispatch layer, test
+    /// fixtures) that have already computed whether a BLS partial is
+    /// present: `Some` → [`VoteVariant::Bls`], `None` →
+    /// [`VoteVariant::Ed25519`].
+    pub fn from_optional_partial(
+        signed: crate::consensus::dispatch::Verified<Signed<Vote>>,
+        bls_partial: Option<BlsPartialSig>,
+    ) -> Self {
+        match bls_partial {
+            Some(partial) => VoteVariant::Bls { signed, partial },
+            None => VoteVariant::Ed25519(signed),
+        }
+    }
 }
 
 /// A durable state change the integration layer must persist (WAL /
@@ -334,9 +377,15 @@ pub struct HotStuffCore {
     /// snapshot. Cloned into the integration layer so the
     /// timeout-bucket handler can share a single counter handle.
     eviction_counters: CacheEvictionCounters,
-    /// Chain-level signature scheme. Drives `on_vote_received`'s choice
-    /// between Ed25519 envelope-sig folding and BLS partial folding.
-    /// Set at boot via [`Self::with_signature_scheme`]; defaults to
+    /// Chain-level signature scheme. Pre-#372 this drove
+    /// `on_vote_received`'s choice between Ed25519 envelope-sig folding
+    /// and BLS partial folding via a runtime branch on
+    /// `self.signature_scheme`. After #372 the dispatch layer commits
+    /// to a [`VoteVariant`] per chain scheme, and the safety core
+    /// reads the variant directly. The field is retained so the
+    /// integration-layer setter [`Self::with_signature_scheme`] still
+    /// type-checks and so future read sites (e.g. proposer-side
+    /// scheme-aware logic) have a place to land. Defaults to
     /// `Ed25519Collected` so direct-construction unit tests behave as
     /// they always have.
     signature_scheme: SignatureSchemeChoice,
@@ -669,16 +718,7 @@ impl HotStuffCore {
     pub fn step(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::ProposalReceived(verified) => self.on_proposal_received(verified.into_inner()),
-            Event::VoteReceived(verified, bls_partial) => {
-                // The stable `ValidatorId` was resolved at ingress
-                // (`verify_signer_at` → `ValidatorKeyHistory::validator_for`)
-                // and stamped on the `Verified` envelope. Reading it
-                // here — instead of re-deriving from `signed.signer`
-                // bytes — keeps the bitmap-index lookup correct after
-                // a key rotation (#394).
-                let (signed, signer_validator_id) = verified.into_parts();
-                self.on_vote_received(signed, signer_validator_id, bls_partial)
-            }
+            Event::VoteReceived(variant) => self.on_vote_received(variant),
             Event::NewViewReceived(verified) => self.on_new_view_received(verified.into_inner()),
             Event::PacemakerAdvance(v) => self.on_pacemaker_advance(v),
         }
@@ -870,12 +910,25 @@ impl HotStuffCore {
     /// round-robin still commits when one validator is permanently
     /// down (otherwise every fourth view's QC would never form and
     /// the 3-chain commit rule would never fire).
-    fn on_vote_received(
-        &mut self,
-        signed: Signed<Vote>,
-        voter_id: crate::consensus::validator_set::ValidatorId,
-        bls_partial: Option<BlsPartialSig>,
-    ) -> Vec<Action> {
+    fn on_vote_received(&mut self, variant: VoteVariant) -> Vec<Action> {
+        // Decompose the typed variant once. `signed` is the verified
+        // envelope; `voter_id` is the stable `ValidatorId` ingress
+        // resolved via `ValidatorKeyHistory::validator_for` and stamped
+        // on the envelope (#394). `bls_partial` is `Some` iff the
+        // variant is `Bls` — the type prevents the "BLS chain + missing
+        // partial" combination the previous tuple shape needed a
+        // runtime check to defend against (#372).
+        let (signed, voter_id, bls_partial): (Signed<Vote>, _, Option<BlsPartialSig>) =
+            match variant {
+                VoteVariant::Ed25519(verified) => {
+                    let (signed, voter_id) = verified.into_parts();
+                    (signed, voter_id, None)
+                }
+                VoteVariant::Bls { signed, partial } => {
+                    let (signed, voter_id) = signed.into_parts();
+                    (signed, voter_id, Some(partial))
+                }
+            };
         let vote = &signed.payload;
         let next_view = vote.view + 1;
 
@@ -898,16 +951,6 @@ impl HotStuffCore {
             return Vec::new();
         };
 
-        // BLS chains require an attached partial; the ingress layer
-        // already enforces this at the wire boundary (#354 step 1), but
-        // a self-loopback that forgot to plumb the partial through is
-        // the failure mode this defends against. Drop silently rather
-        // than fold an Ed25519 sig into a BLS aggregate — that would
-        // panic in `add_bls_partial` and crash the safety core.
-        if self.signature_scheme == SignatureSchemeChoice::BlsAggregated && bls_partial.is_none() {
-            return Vec::new();
-        }
-
         // Accumulate into the bucket for this `(view, block_hash)`
         // pair. `QuorumCertificate::add_signature` and
         // `QuorumCertificate::add_bls_partial` are both idempotent on
@@ -925,27 +968,19 @@ impl HotStuffCore {
         if !self.vote_bucket.contains_key(&key) {
             self.evict_vote_buckets_to_fit_one();
         }
-        let scheme = self.signature_scheme;
-        let qc = self.vote_bucket.entry(key).or_insert_with(|| match scheme {
-            SignatureSchemeChoice::Ed25519Collected => {
-                QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len)
-            }
-            SignatureSchemeChoice::BlsAggregated => {
-                QuorumCertificate::new_bls(vote.view, vote.block_hash, validator_set_len)
-            }
-        });
+        let qc = self
+            .vote_bucket
+            .entry(key)
+            .or_insert_with(|| match bls_partial {
+                None => QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len),
+                Some(_) => {
+                    QuorumCertificate::new_bls(vote.view, vote.block_hash, validator_set_len)
+                }
+            });
         let had_quorum = qc.has_quorum(&vs_at_vote);
-        match scheme {
-            SignatureSchemeChoice::Ed25519Collected => {
-                qc.add_signature(voter_idx, signed.sig);
-            }
-            SignatureSchemeChoice::BlsAggregated => {
-                // Unwrap is safe: the early-return above rejects BLS
-                // votes without a partial. The ingress layer has
-                // already verified the partial against the voter's
-                // per-historical-view BLS pubkey.
-                qc.add_bls_partial(voter_idx, bls_partial.expect("BLS chain require partial"));
-            }
+        match bls_partial {
+            None => qc.add_signature(voter_idx, signed.sig),
+            Some(partial) => qc.add_bls_partial(voter_idx, partial),
         }
         let has_quorum_now = qc.has_quorum(&vs_at_vote);
 
@@ -2403,10 +2438,9 @@ mod tests {
         let block_hash: BlockHash = [0xAA; 32];
         let vote = signed_vote(2, block_hash, nid(2));
 
-        let actions = core.step(Event::VoteReceived(
+        let actions = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(vote),
-            None,
-        ));
+        )));
 
         assert!(actions.is_empty(), "sub-quorum vote is silent: {actions:?}");
         let bucket = core
@@ -2430,16 +2464,14 @@ mod tests {
         let mut core = make_core(1);
         let block_hash: BlockHash = [0xAA; 32];
 
-        let step1 = core.step(Event::VoteReceived(
+        let step1 = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_hash, nid(2))),
-            None,
-        ));
+        )));
         assert!(step1.is_empty(), "first sub-quorum vote is silent");
 
-        let step2 = core.step(Event::VoteReceived(
+        let step2 = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_hash, nid(3))),
-            None,
-        ));
+        )));
         assert!(step2.is_empty(), "second sub-quorum vote is silent");
 
         let bucket = core
@@ -2470,14 +2502,12 @@ mod tests {
         core.state.insert_pending(block_v3.clone());
 
         // First two votes accumulate silently.
-        let step1 = core.step(Event::VoteReceived(
+        let step1 = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(2))),
-            None,
-        ));
-        let step2 = core.step(Event::VoteReceived(
+        )));
+        let step2 = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(3))),
-            None,
-        ));
+        )));
         assert!(step1.is_empty(), "first sub-quorum vote silent: {step1:?}");
         assert!(step2.is_empty(), "second sub-quorum vote silent: {step2:?}");
 
@@ -2504,10 +2534,9 @@ mod tests {
             commands: Vec::new(),
         };
 
-        let step3 = core.step(Event::VoteReceived(
+        let step3 = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(4))),
-            None,
-        ));
+        )));
 
         assert_eq!(
             step3,
@@ -2576,10 +2605,10 @@ mod tests {
                 signer: *signer_id,
                 sig: [signer_id[0]; 64],
             };
-            step_actions = core.step(Event::VoteReceived(
-                crate::consensus::dispatch::Verified::unchecked(signed),
-                Some(partial),
-            ));
+            step_actions = core.step(Event::VoteReceived(VoteVariant::Bls {
+                signed: crate::consensus::dispatch::Verified::unchecked(signed),
+                partial,
+            }));
         }
 
         // Quorum-emit branch: Persist(HighQc(_)) + Broadcast(Proposal(_))
@@ -2601,31 +2630,13 @@ mod tests {
             .expect("real BLS aggregate must verify under genesis pubkeys");
     }
 
-    #[test]
-    fn bls_vote_without_partial_is_dropped_silently() {
-        // Defense-in-depth: on a BLS chain a Vote that arrives at the
-        // safety core without a partial (a loopback that forgot to
-        // plumb it, or a corner-case test wiring) must be dropped
-        // rather than panic in `add_bls_partial` or fold an Ed25519
-        // sig into the BLS aggregate.
-        let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-        let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
-        let mut core = HotStuffCore::new(nid(1), state, builder)
-            .with_signature_scheme(SignatureSchemeChoice::BlsAggregated);
-
-        let actions = core.step(Event::VoteReceived(
-            crate::consensus::dispatch::Verified::unchecked(signed_vote(3, [0xAA; 32], nid(2))),
-            None,
-        ));
-        assert!(
-            actions.is_empty(),
-            "BLS vote without partial silently dropped"
-        );
-        assert!(
-            core.vote_bucket.is_empty(),
-            "no QC bucket created for an unusable vote",
-        );
-    }
+    // The pre-#372 defense-in-depth check ("BLS chain + missing
+    // partial → drop the vote") and its test
+    // (`bls_vote_without_partial_is_dropped_silently`) were removed
+    // when the tuple `Event::VoteReceived(_, Option<BlsPartialSig>)`
+    // was replaced by [`VoteVariant`]: a BLS-flavored vote that lacks
+    // its partial is no longer constructible, so there is nothing for
+    // the safety core to defend against at runtime.
 
     // ── D8: PacemakerAdvance base contract ──────────────────────────
 
@@ -2928,25 +2939,21 @@ mod tests {
         core.state.insert_pending(block_v3.clone());
 
         // Drive to quorum: first three votes.
-        let _ = core.step(Event::VoteReceived(
+        let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(2))),
-            None,
-        ));
-        let _ = core.step(Event::VoteReceived(
+        )));
+        let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(3))),
-            None,
-        ));
-        let _ = core.step(Event::VoteReceived(
+        )));
+        let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(4))),
-            None,
-        ));
+        )));
 
         // Late vote from a new signer — still a no-op at the dispatch
         // surface even though the bucket grows to 4 sigs.
-        let step_late_new = core.step(Event::VoteReceived(
+        let step_late_new = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(1))),
-            None,
-        ));
+        )));
         assert!(
             step_late_new.is_empty(),
             "late vote from new signer must not re-broadcast: {step_late_new:?}",
@@ -2954,10 +2961,9 @@ mod tests {
 
         // Duplicate vote from an existing signer — `add_signature` is
         // a no-op on the set-bit; dispatch also early-returns.
-        let step_dup = core.step(Event::VoteReceived(
+        let step_dup = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(2))),
-            None,
-        ));
+        )));
         assert!(
             step_dup.is_empty(),
             "duplicate vote must not re-broadcast: {step_dup:?}",
@@ -2985,10 +2991,9 @@ mod tests {
         let mut core = make_core(1);
         let vote = signed_vote(3, [0xAA; 32], nid(99));
 
-        let actions = core.step(Event::VoteReceived(
+        let actions = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(vote),
-            None,
-        ));
+        )));
 
         assert!(
             actions.is_empty(),
@@ -3021,10 +3026,9 @@ mod tests {
 
         // Vote at view = v_eff signed by the old-only member.
         let vote = signed_vote(v_eff, [0xAA; 32], nid(4));
-        let actions = core.step(Event::VoteReceived(
+        let actions = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(vote),
-            None,
-        ));
+        )));
 
         assert!(
             actions.is_empty(),
@@ -3053,10 +3057,9 @@ mod tests {
 
         // Vote at view = v_eff - 1 signed by the new-only member.
         let vote = signed_vote(v_eff - 1, [0xBB; 32], nid(5));
-        let actions = core.step(Event::VoteReceived(
+        let actions = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(vote),
-            None,
-        ));
+        )));
 
         assert!(
             actions.is_empty(),
@@ -3084,10 +3087,9 @@ mod tests {
 
         let block_hash: BlockHash = [0xCC; 32];
         let vote = signed_vote(v_eff, block_hash, nid(7));
-        let _ = core.step(Event::VoteReceived(
+        let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked(vote),
-            None,
-        ));
+        )));
 
         let bucket = core
             .vote_bucket
@@ -3136,10 +3138,9 @@ mod tests {
         // `ValidatorKeyHistory::validator_for` and stamp it on the
         // envelope. Simulate that stamping directly here.
         let stable_id = vid(2);
-        let actions = core.step(Event::VoteReceived(
+        let actions = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked_with_signer(signed, stable_id),
-            None,
-        ));
+        )));
 
         let bucket = core.vote_bucket.get(&(view, block_hash)).expect(
             "post-rotation vote must contribute to the bitmap when the \
@@ -3175,10 +3176,9 @@ mod tests {
         let pre_fix_id =
             crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(rotated_pk);
 
-        let actions = core.step(Event::VoteReceived(
+        let actions = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::consensus::dispatch::Verified::unchecked_with_signer(signed, pre_fix_id),
-            None,
-        ));
+        )));
 
         assert!(
             core.vote_bucket.is_empty(),
@@ -3987,30 +3987,27 @@ mod tests {
                 Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(
                     signed_proposal(chain[2].clone(), dummy_qc(2, block_v2_hash), nid(2)),
                 )),
-                Event::VoteReceived(
+                Event::VoteReceived(VoteVariant::Ed25519(
                     crate::consensus::dispatch::Verified::unchecked(signed_vote(
                         3,
                         block_v3_hash,
                         nid(2),
                     )),
-                    None,
-                ),
-                Event::VoteReceived(
+                )),
+                Event::VoteReceived(VoteVariant::Ed25519(
                     crate::consensus::dispatch::Verified::unchecked(signed_vote(
                         3,
                         block_v3_hash,
                         nid(3),
                     )),
-                    None,
-                ),
-                Event::VoteReceived(
+                )),
+                Event::VoteReceived(VoteVariant::Ed25519(
                     crate::consensus::dispatch::Verified::unchecked(signed_vote(
                         3,
                         block_v3_hash,
                         nid(4),
                     )),
-                    None,
-                ),
+                )),
                 Event::NewViewReceived(crate::consensus::dispatch::Verified::unchecked(
                     signed_newview(dummy_qc(99, [0x99; 32]), nid(4)),
                 )),
@@ -4835,14 +4832,14 @@ mod tests {
                             .index_of(&source_vid)
                             .expect("event_from_msg called with unknown source NodeId");
                         let bls_partial = self.bls_partial_for_vote(signer_idx, &payload);
-                        Event::VoteReceived(
+                        Event::VoteReceived(VoteVariant::from_optional_partial(
                             crate::consensus::dispatch::Verified::unchecked(Signed {
                                 payload,
                                 signer: source,
                                 sig,
                             }),
                             bls_partial,
-                        )
+                        ))
                     }
                     ConsensusMsg::NewView(payload) => Event::NewViewReceived(
                         crate::consensus::dispatch::Verified::unchecked(Signed {
@@ -5118,10 +5115,10 @@ mod tests {
                         };
                         replicas.inject(
                             target_honest,
-                            Event::VoteReceived(
+                            Event::VoteReceived(VoteVariant::from_optional_partial(
                                 crate::consensus::dispatch::Verified::unchecked(vote),
                                 bls_partial,
-                            ),
+                            )),
                         );
                     }
                 }
@@ -5448,10 +5445,10 @@ mod tests {
                         };
                         replicas.inject(
                             target_honest,
-                            Event::VoteReceived(
+                            Event::VoteReceived(VoteVariant::from_optional_partial(
                                 crate::consensus::dispatch::Verified::unchecked(vote),
                                 bls_partial,
-                            ),
+                            )),
                         );
                     }
                     MixedStep::InjectProposal {
@@ -5610,10 +5607,9 @@ mod tests {
                 let block_hash: BlockHash = [i as u8 + 1; 32];
                 let signer = signers[i % signers.len()];
                 let signed = signed_vote(view, block_hash, signer);
-                core.step(Event::VoteReceived(
+                core.step(Event::VoteReceived(VoteVariant::Ed25519(
                     crate::consensus::dispatch::Verified::unchecked(signed),
-                    None,
-                ));
+                )));
                 assert!(
                     core.vote_bucket.len() <= cap,
                     "vote_bucket grew past cap after insert {i}: len={}",
@@ -5641,12 +5637,11 @@ mod tests {
             let signer = nid(2);
             for view in 0..10 {
                 let block_hash: BlockHash = [view as u8 + 1; 32];
-                core.step(Event::VoteReceived(
+                core.step(Event::VoteReceived(VoteVariant::Ed25519(
                     crate::consensus::dispatch::Verified::unchecked(signed_vote(
                         view, block_hash, signer,
                     )),
-                    None,
-                ));
+                )));
             }
             assert_eq!(core.vote_bucket.len(), 10);
             assert_eq!(core.eviction_counters().vote_bucket(), 0);
@@ -5669,31 +5664,26 @@ mod tests {
             let cap = 2usize;
             let mut core = make_core_with_limits(1, cap_only_vote_bucket(cap));
             // Fill to cap with two distinct tuples first.
-            let _ = core.step(Event::VoteReceived(
+            let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
                 crate::consensus::dispatch::Verified::unchecked(signed_vote(0, [1; 32], nid(2))),
-                None,
-            ));
-            let _ = core.step(Event::VoteReceived(
+            )));
+            let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
                 crate::consensus::dispatch::Verified::unchecked(signed_vote(1, [2; 32], nid(2))),
-                None,
-            ));
+            )));
             assert_eq!(core.vote_bucket.len(), cap);
             assert_eq!(core.eviction_counters().vote_bucket(), 0);
 
             // Three more votes on the SAME (view, block_hash) tuples
             // from different signers — bucket-update path, no growth.
-            let _ = core.step(Event::VoteReceived(
+            let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
                 crate::consensus::dispatch::Verified::unchecked(signed_vote(0, [1; 32], nid(3))),
-                None,
-            ));
-            let _ = core.step(Event::VoteReceived(
+            )));
+            let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
                 crate::consensus::dispatch::Verified::unchecked(signed_vote(0, [1; 32], nid(4))),
-                None,
-            ));
-            let _ = core.step(Event::VoteReceived(
+            )));
+            let _ = core.step(Event::VoteReceived(VoteVariant::Ed25519(
                 crate::consensus::dispatch::Verified::unchecked(signed_vote(1, [2; 32], nid(3))),
-                None,
-            ));
+            )));
             assert_eq!(core.vote_bucket.len(), cap);
             assert_eq!(core.eviction_counters().vote_bucket(), 0);
         }

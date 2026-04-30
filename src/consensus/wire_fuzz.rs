@@ -463,14 +463,15 @@ fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
                 sig,
             }))
         }
-        ConsensusMsg::Vote(payload) => Event::VoteReceived(
-            crate::consensus::dispatch::Verified::unchecked(Signed {
-                payload,
-                signer: source,
-                sig,
-            }),
-            None,
-        ),
+        ConsensusMsg::Vote(payload) => {
+            Event::VoteReceived(crate::consensus::hotstuff::step::VoteVariant::Ed25519(
+                crate::consensus::dispatch::Verified::unchecked(Signed {
+                    payload,
+                    signer: source,
+                    sig,
+                }),
+            ))
+        }
         ConsensusMsg::NewView(payload) => {
             Event::NewViewReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
                 payload,
@@ -703,7 +704,7 @@ proptest! {
                         signer: sender,
                         sig: [0u8; 64],
                     };
-                    replicas.inject(target, Event::VoteReceived(crate::consensus::dispatch::Verified::unchecked(signed), None));
+                    replicas.inject(target, Event::VoteReceived(crate::consensus::hotstuff::step::VoteVariant::Ed25519(crate::consensus::dispatch::Verified::unchecked(signed))));
                 }
                 FuzzStep::InjectBytesNewView { target, sender_idx, qc_view, qc_block_hash } => {
                     let sender = replicas.validators.get(sender_idx).unwrap().into_node_id();
@@ -830,12 +831,13 @@ proptest! {
                 CacheStep::Vote { signer_idx, view, block_hash } => {
                     let signer = validators.get(signer_idx).unwrap().into_node_id();
                     Event::VoteReceived(
-                        crate::consensus::dispatch::Verified::unchecked(Signed {
-                            payload: Vote { view, block_hash },
-                            signer,
-                            sig: [0u8; 64],
-                        }),
-                        None,
+                        crate::consensus::hotstuff::step::VoteVariant::Ed25519(
+                            crate::consensus::dispatch::Verified::unchecked(Signed {
+                                payload: Vote { view, block_hash },
+                                signer,
+                                sig: [0u8; 64],
+                            }),
+                        ),
                     )
                 }
                 CacheStep::ParkedProposal { sender_idx, view, height, parent_seed } => {

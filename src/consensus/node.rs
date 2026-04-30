@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::consensus::View;
+use crate::consensus::api::CommitNotifier;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
 use crate::consensus::hotstuff::Locked;
 use crate::consensus::hotstuff::qc::genesis_qc_bls;
@@ -428,6 +429,12 @@ pub struct MempoolBlockBuilder {
     /// recovery-seeded block at-or-below the committed boundary
     /// are not re-applied to the SM.
     last_committed_height: Arc<AtomicU64>,
+    /// Cumulative count of commands the builder dropped because
+    /// `StateMachine::apply` returned `Err` (issue #376). Read by
+    /// [`ConsensusNode::build_status`] and surfaced under
+    /// `ConsensusStatus::dropped_commands` so an operator can spot
+    /// a flood of rejected commands without grepping logs.
+    dropped_commands: Arc<AtomicU64>,
     propose_limit: usize,
 }
 
@@ -437,6 +444,7 @@ impl MempoolBlockBuilder {
         mempool: Arc<dyn Mempool>,
         state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
         last_committed_height: Arc<AtomicU64>,
+        dropped_commands: Arc<AtomicU64>,
         propose_limit: usize,
     ) -> Self {
         Self {
@@ -444,6 +452,7 @@ impl MempoolBlockBuilder {
             mempool,
             state_machine,
             last_committed_height,
+            dropped_commands,
             propose_limit,
         }
     }
@@ -491,22 +500,52 @@ impl BlockBuilder for MempoolBlockBuilder {
 
             let mut commitment = sm.state_commitment();
             // Apply each in-flight ancestor's commands in chain order,
-            // oldest first. Same `apply` discipline as below: a
-            // command that errors is a no-op per the StateMachine
-            // contract, so the commitment is consistent with "skip
-            // bad cmds" — which is exactly what every replica's own
-            // apply will produce on the same input.
+            // oldest first, then the candidate commands on top. A
+            // failed `apply` leaves state unchanged per the
+            // [`StateMachine`] contract, so the commitment is
+            // consistent with "skip bad cmds" — which is exactly what
+            // every replica's own apply will produce on the same
+            // input. The silent drop hid bugs from operators
+            // (issue #376), so emit a warn-level event per failure
+            // so a flood of rejected commands shows up in the logs.
+            // Ancestor `cmd_idx` is reported as `(height, idx)` so
+            // operators can disambiguate from candidate-command
+            // failures (which carry only `cmd_idx`).
             for ancestor in ancestor_chain.iter().rev() {
-                for cmd in &ancestor.commands {
-                    if sm.apply(cmd).is_ok() {
-                        commitment = sm.state_commitment();
+                for (cmd_idx, cmd) in ancestor.commands.iter().enumerate() {
+                    match sm.apply(cmd) {
+                        Ok(_) => {
+                            commitment = sm.state_commitment();
+                        }
+                        Err(e) => {
+                            self.dropped_commands.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                view,
+                                ancestor_height = ancestor.header.height,
+                                cmd_idx,
+                                error = %e,
+                                "block_builder_ancestor_command_apply_failed",
+                            );
+                        }
                     }
                 }
             }
-            // Now apply the candidate commands on top.
-            for cmd in &commands {
-                if sm.apply(cmd).is_ok() {
-                    commitment = sm.state_commitment();
+            for (cmd_idx, cmd) in commands.iter().enumerate() {
+                match sm.apply(cmd) {
+                    Ok(_) => {
+                        commitment = sm.state_commitment();
+                    }
+                    Err(e) => {
+                        self.dropped_commands.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            view,
+                            cmd_idx,
+                            error = %e,
+                            "block_builder_command_apply_failed",
+                        );
+                    }
                 }
             }
 
@@ -674,9 +713,11 @@ pub struct ConsensusNode {
     /// the [`HotStuffCore`] at construction so all four caches feed
     /// into one consistent set of cumulative counts.
     eviction_counters: CacheEvictionCounters,
-    /// Optional channel to notify an observer (e.g. a test harness) of
-    /// each committed block. `None` in production builds.
-    commit_tx: Option<tokio::sync::mpsc::UnboundedSender<Block>>,
+    /// Optional [`CommitNotifier`] fired after each block is committed
+    /// and applied. `None` in production builds today; consumed by the
+    /// simulator for liveness assertions and by future observer-mode
+    /// (#308) / out-of-process Application (#225) wiring.
+    commit_notifier: Option<Arc<dyn CommitNotifier>>,
     /// Peer-membership snapshot used by [`ConsensusNode::build_status`].
     /// Populated from [`Discovery`] events inside [`ConsensusNode::run`];
     /// before `run` starts (or in tests that bypass it) the set is empty
@@ -689,6 +730,12 @@ pub struct ConsensusNode {
     /// path to bound the uncommitted-ancestor walk (issue #375)
     /// without having to thread a borrow through the trait object.
     last_committed_height: Arc<AtomicU64>,
+    /// Cumulative count of commands the local [`MempoolBlockBuilder`]
+    /// dropped because `StateMachine::apply` returned `Err` (issue
+    /// #376). Surfaced under [`ConsensusStatus::dropped_commands`].
+    /// Shared with the builder's own `Arc<AtomicU64>` so the two
+    /// always agree without locking.
+    dropped_commands: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -828,11 +875,13 @@ impl ConsensusNode {
         );
 
         let last_committed_height = Arc::new(AtomicU64::new(0));
+        let dropped_commands = Arc::new(AtomicU64::new(0));
         let builder = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
             Arc::clone(&state_machine),
             Arc::clone(&last_committed_height),
+            Arc::clone(&dropped_commands),
             config.propose_limit,
         ));
 
@@ -894,9 +943,10 @@ impl ConsensusNode {
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
             eviction_counters,
-            commit_tx: None,
+            commit_notifier: None,
             peers_connected: HashSet::new(),
             last_committed_height,
+            dropped_commands,
             last_committed_view: 0,
             status_tx: None,
             rate_limiter: None,
@@ -944,13 +994,21 @@ impl ConsensusNode {
         self
     }
 
-    /// Attach a commit observer.
+    /// Attach a [`CommitNotifier`] (issue #373).
     ///
-    /// Every block committed by the event loop is sent on `tx`. Intended
-    /// for test harnesses (e.g. `SimCluster`); production callers leave
-    /// this unset (`None`) and observe commits via the state machine.
-    pub fn with_commit_observer(mut self, tx: tokio::sync::mpsc::UnboundedSender<Block>) -> Self {
-        self.commit_tx = Some(tx);
+    /// Every block committed by the event loop is reported via
+    /// [`CommitNotifier::on_commit`] after the block has been applied
+    /// to the state machine, persisted, and had its tagged reconfig
+    /// (#272) and rotation (#260) payloads processed. Intended for
+    /// test harnesses (e.g. `SimCluster`), observer-mode nodes (#308),
+    /// and external indexers; production callers without an observer
+    /// leave this unset (`None`).
+    ///
+    /// The callback runs on the consensus event loop — implementations
+    /// must not block (forward to a channel or atomic). See the
+    /// [`CommitNotifier`] doc-comment for the full contract.
+    pub fn with_commit_notifier(mut self, notifier: Arc<dyn CommitNotifier>) -> Self {
+        self.commit_notifier = Some(notifier);
         self
     }
 
@@ -1108,6 +1166,7 @@ impl ConsensusNode {
                 pending_blocks: self.eviction_counters.pending_blocks(),
                 timeout_buckets: self.eviction_counters.timeout_buckets(),
             },
+            dropped_commands: self.dropped_commands.load(Ordering::Relaxed),
         }
     }
 
@@ -1196,11 +1255,13 @@ impl ConsensusNode {
         );
 
         let last_committed_height = Arc::new(AtomicU64::new(last_committed.height));
+        let dropped_commands = Arc::new(AtomicU64::new(0));
         let builder = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
             Arc::clone(&state_machine),
             Arc::clone(&last_committed_height),
+            Arc::clone(&dropped_commands),
             config.propose_limit,
         ));
         let eviction_counters = CacheEvictionCounters::default();
@@ -1268,9 +1329,10 @@ impl ConsensusNode {
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
             eviction_counters,
-            commit_tx: None,
+            commit_notifier: None,
             peers_connected: HashSet::new(),
             last_committed_height,
+            dropped_commands,
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
@@ -2772,10 +2834,13 @@ impl ConsensusNode {
                 view: signed.inner().payload.block.header.view,
                 height: signed.inner().payload.block.header.height,
             }),
-            SafetyEvent::VoteReceived(signed, _bls_partial) => Some(SafetyLogCtx::Vote {
-                voter: signed.inner().signer,
-                view: signed.inner().payload.view,
-            }),
+            SafetyEvent::VoteReceived(variant) => {
+                let signed = variant.verified().inner();
+                Some(SafetyLogCtx::Vote {
+                    voter: signed.signer,
+                    view: signed.payload.view,
+                })
+            }
             SafetyEvent::NewViewReceived(signed) => Some(SafetyLogCtx::NewView {
                 sender: signed.inner().signer,
                 high_qc_view: signed.inner().payload.high_qc.view,
@@ -3294,8 +3359,8 @@ impl ConsensusNode {
         // the reconfig has applied — though in practice committing
         // both in the same block is unusual).
         self.apply_committed_rotations(&block);
-        if let Some(tx) = &self.commit_tx {
-            let _ = tx.send(block);
+        if let Some(notifier) = &self.commit_notifier {
+            notifier.on_commit(&block, &block.header.state_commitment, block.header.view);
         }
     }
 
@@ -4376,7 +4441,33 @@ mod tests {
         mempool: Arc<dyn Mempool>,
         sm: Arc<Mutex<Box<dyn StateMachine>>>,
     ) -> MempoolBlockBuilder {
-        MempoolBlockBuilder::new(self_id, mempool, sm, Arc::new(AtomicU64::new(0)), 10)
+        MempoolBlockBuilder::new(
+            self_id,
+            mempool,
+            sm,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            10,
+        )
+    }
+
+    /// Variant of [`make_builder`] that exposes the
+    /// `dropped_commands` counter so a caller can observe how many
+    /// commands the builder skipped (#376).
+    fn make_builder_with_dropped(
+        self_id: NodeId,
+        mempool: Arc<dyn Mempool>,
+        sm: Arc<Mutex<Box<dyn StateMachine>>>,
+        dropped_commands: Arc<AtomicU64>,
+    ) -> MempoolBlockBuilder {
+        MempoolBlockBuilder::new(
+            self_id,
+            mempool,
+            sm,
+            Arc::new(AtomicU64::new(0)),
+            dropped_commands,
+            10,
+        )
     }
 
     /// Variant of [`make_builder`] that lets the caller seed
@@ -4390,7 +4481,14 @@ mod tests {
         sm: Arc<Mutex<Box<dyn StateMachine>>>,
         last_committed_height: Arc<AtomicU64>,
     ) -> MempoolBlockBuilder {
-        MempoolBlockBuilder::new(self_id, mempool, sm, last_committed_height, 10)
+        MempoolBlockBuilder::new(
+            self_id,
+            mempool,
+            sm,
+            last_committed_height,
+            Arc::new(AtomicU64::new(0)),
+            10,
+        )
     }
 
     #[test]
@@ -4759,6 +4857,97 @@ mod tests {
             "commitment must reflect b2 + candidate on top of committed b1",
         );
         assert_eq!(reference.value(), 3);
+    }
+
+    /// Issue #376: a command whose `apply` returns `Err` is dropped
+    /// silently from the leader's commitment computation. The block
+    /// itself still carries the (invalid) command bytes — replicas
+    /// will fail the same `apply` deterministically and end up at
+    /// the same commitment — but operators get no signal that any
+    /// of their submitted commands were rejected. After the fix the
+    /// builder emits a `tracing::warn!` per failed apply with
+    /// `cmd_idx`, `view`, and `error` and bumps a shared cumulative
+    /// counter that surfaces under `ConsensusStatus::dropped_commands`.
+    /// The behavioural contract is that the build still succeeds, the
+    /// resulting `state_commitment` matches the partial application
+    /// of only the commands that did apply, and the counter
+    /// increments by the number of skipped commands.
+    #[test]
+    fn builder_skips_failing_commands_and_commitment_matches_partial_apply() {
+        use crate::replication::StateMachine;
+        use crate::replication::impls::counter_sm::CounterCommand;
+        use bytes::Bytes;
+
+        // Mix valid and invalid commands. `bad_underflow` is a
+        // well-formed `Decrement` against a fresh counter (`value =
+        // 0` → underflow on apply). `bad_decode` is a malformed
+        // payload that fails postcard decode. Both are exactly the
+        // silent-drop cases the issue calls out: app-level rejection
+        // and decode error.
+        let good = CounterCommand::Increment.encode();
+        let bad_underflow = CounterCommand::Decrement.encode();
+        let bad_decode: Bytes = Bytes::from_static(&[0xFFu8, 0x00, 0x00, 0x00]);
+
+        let mp: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(16));
+        mp.insert(bad_underflow.clone()).unwrap();
+        mp.insert(good.clone()).unwrap();
+        mp.insert(bad_decode.clone()).unwrap();
+
+        let sm = make_sm();
+        let dropped_commands = Arc::new(AtomicU64::new(0));
+        let builder = make_builder_with_dropped(
+            nid(1),
+            Arc::clone(&mp),
+            Arc::clone(&sm),
+            Arc::clone(&dropped_commands),
+        );
+        let block = builder
+            .build(&genesis(), 1, &sample_qc(), &HashMap::new())
+            .expect("builder must skip-and-warn rather than fail the proposal");
+
+        // All three commands ride the block — replicas hit the same
+        // `apply` errors deterministically and converge.
+        assert_eq!(block.commands.len(), 3);
+
+        // Reference: apply only the one good command to a fresh
+        // counter SM and compare commitments.
+        let mut reference = crate::replication::impls::CounterStateMachine::new();
+        reference.apply(&good).unwrap();
+        assert_eq!(
+            block.header.state_commitment,
+            reference.state_commitment(),
+            "state_commitment must reflect only the commands that applied",
+        );
+
+        // The state machine itself must be untouched after build —
+        // failing applies must not leak past the fork-and-restore.
+        assert_eq!(
+            sm.lock().state_commitment(),
+            crate::replication::impls::CounterStateMachine::new().state_commitment(),
+            "build must not mutate the SM, even when some commands fail to apply",
+        );
+
+        // The shared counter (surfaced under
+        // `ConsensusStatus::dropped_commands`) bumps by exactly the
+        // number of commands that hit `Err` on apply.
+        assert_eq!(
+            dropped_commands.load(Ordering::Relaxed),
+            2,
+            "dropped_commands must reflect both the underflow and the decode error",
+        );
+
+        // A second build with the same mempool contents must add to
+        // the cumulative count, not reset it — the counter is
+        // monotonic for the lifetime of the node, like
+        // `cache_evictions`.
+        builder
+            .build(&genesis(), 2, &sample_qc(), &HashMap::new())
+            .expect("second build must also succeed");
+        assert_eq!(
+            dropped_commands.load(Ordering::Relaxed),
+            4,
+            "dropped_commands must accumulate across builds",
+        );
     }
 
     // ── C-series: durability bridge ──────────────────────────────────────────
