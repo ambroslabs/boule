@@ -6797,6 +6797,217 @@ mod tests {
         );
     }
 
+    /// Joiner happy path with a rotation applied before the
+    /// snapshot height (#311). A fresh joiner restoring from a
+    /// post-rotation snapshot must inherit the producer's
+    /// `validator_key_history` so it can resolve the rotated
+    /// validator's pubkey at views ≥ `v_eff` to the post-rotation
+    /// key. Without this, the joiner would fall through to tail-sync
+    /// and reject every QC whose signer is the rotated validator
+    /// (`IngressError::UnknownSigner`) — exactly the failure mode
+    /// #311 calls out.
+    ///
+    /// Drives the joiner-side restore directly via
+    /// `restore_from_snapshot` rather than the full network shuttle
+    /// (the wire path is already covered by
+    /// `joiner_fetches_snapshot_from_server_and_restores_state`).
+    /// This isolates the rotation-aware install logic.
+    #[tokio::test]
+    async fn joiner_restore_installs_rotated_validator_key_history() {
+        use crate::consensus::history_commitment::validator_history_commitment_v1;
+        use crate::consensus::validator_key_history::PersistedValidatorKeyHistory;
+        use crate::consensus::validator_rotation::ValidatorKeyRotation;
+        use crate::replication::impls::counter_sm::CounterCommand;
+
+        let server_signer = fresh_signer();
+        let server_node_id = server_signer.node_id();
+        let joiner_signer = fresh_signer();
+        let other1_signer = fresh_signer();
+        let other2_signer = fresh_signer();
+        let vs = ValidatorSet::new(vec![
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(server_node_id),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                joiner_signer.node_id(),
+            ),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                other1_signer.node_id(),
+            ),
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                other2_signer.node_id(),
+            ),
+        ]);
+
+        // ── Build the producer's history triple with one rotation
+        //   applied. The rotated validator is `other1` (a non-leader
+        //   of view 0); it rotates to a synthetic `new_pubkey` at
+        //   `v_eff = 30`, well below the snapshot height of 50.
+        let rotated_validator = other1_signer.node_id();
+        let new_pubkey: NodeId = [0xAB; 32];
+        let v_eff: View = 30;
+        let mut producer_key_hist = ValidatorKeyHistory::new(vs.iter().copied());
+        producer_key_hist
+            .apply_rotation(
+                &ValidatorKeyRotation {
+                    validator: rotated_validator,
+                    new_pubkey,
+                    v_eff,
+                    new_bls_pubkey: None,
+                    new_bls_pop: None,
+                },
+                10,
+            )
+            .expect("rotation applies cleanly");
+        let producer_set_hist = ValidatorSetHistory::from_genesis(vs.clone());
+        let commitment =
+            validator_history_commitment_v1(&producer_set_hist, &producer_key_hist, None);
+
+        // ── Build the snapshot at height 50 / view 50 with the
+        //   right state-commitment and history-commitment.
+        let server_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        for _ in 0..5 {
+            server_sm
+                .lock()
+                .apply(&CounterCommand::Increment.encode())
+                .unwrap();
+        }
+        let snapshot_payload = server_sm.lock().snapshot();
+        let expected_commitment = server_sm.lock().state_commitment();
+        let chunks_with_hashes =
+            crate::replication::snapshot::chunk_snapshot(&snapshot_payload, 1024);
+        let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
+        let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
+        let snapshot_block = {
+            let parent_hash = genesis().hash();
+            let commands: Vec<bytes::Bytes> = Vec::new();
+            crate::replication::block::Block {
+                header: crate::replication::block::BlockHeader {
+                    parent_hash,
+                    height: 50,
+                    view: 50,
+                    proposer: server_node_id,
+                    state_commitment: expected_commitment,
+                    commands_commitment: crate::replication::block::Block::commands_commitment(
+                        &commands,
+                    ),
+                    validator_history_commitment: commitment,
+                },
+                commands,
+            }
+        };
+        let mut commit_qc = QuorumCertificate::new(50, snapshot_block.hash(), vs.len());
+        for i in 0..crate::consensus::hotstuff::qc::quorum_size(vs.len()) {
+            commit_qc.add_signature(i, [0u8; 64]);
+        }
+        let manifest = crate::replication::snapshot::SnapshotManifest::build(
+            snapshot_block,
+            &vs,
+            1024,
+            chunk_hashes,
+            commit_qc,
+            1_700_000_000,
+            producer_set_hist.to_persisted(),
+            producer_key_hist.to_persisted(),
+            None,
+        );
+        manifest
+            .verify(&vs)
+            .expect("producer-built manifest must verify against the local set");
+
+        // ── Build the fresh joiner and restore directly.
+        let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let joiner_sm: Arc<Mutex<Box<dyn StateMachine>>> = Arc::new(Mutex::new(Box::new(
+            crate::replication::impls::counter_sm::CounterStateMachine::new(),
+        )));
+        let mut joiner_node = ConsensusNode::new(
+            joiner_signer.node_id(),
+            snapshot_test_config_enabled(vs.clone(), 50),
+            Arc::clone(&joiner_sm),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&joiner_storage),
+            Arc::new(MemoryWal::new()),
+        );
+        // Pre-condition: joiner's key history is genesis-only and
+        // does *not* know about the rotation.
+        assert_eq!(
+            joiner_node.validator_key_history.key_at(
+                &crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                    rotated_validator,
+                ),
+                v_eff,
+            ),
+            Some(crate::consensus::validator_set::Pubkey::from_node_id(
+                rotated_validator,
+            )),
+            "test setup: joiner starts with a genesis-only key history",
+        );
+        assert!(
+            joiner_node
+                .validator_key_history
+                .validator_for(&crate::consensus::validator_set::Pubkey::from_node_id(
+                    new_pubkey,
+                ))
+                .is_none(),
+            "test setup: joiner does not yet know `new_pubkey`",
+        );
+
+        let payload = bytes::Bytes::from(
+            chunks
+                .iter()
+                .flat_map(|c| c.iter().copied())
+                .collect::<Vec<u8>>(),
+        );
+        joiner_node
+            .restore_from_snapshot(manifest, payload)
+            .expect("restore_from_snapshot must accept the rotation-aware manifest");
+
+        // ── Post-condition: joiner's in-memory key history reflects
+        //   the producer's rotation.
+        let stable =
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(rotated_validator);
+        assert_eq!(
+            joiner_node.validator_key_history.key_at(&stable, v_eff - 1),
+            Some(crate::consensus::validator_set::Pubkey::from_node_id(
+                rotated_validator,
+            )),
+            "pre-v_eff lookups must still resolve to the genesis key",
+        );
+        assert_eq!(
+            joiner_node.validator_key_history.key_at(&stable, v_eff),
+            Some(crate::consensus::validator_set::Pubkey::from_node_id(
+                new_pubkey,
+            )),
+            "at-v_eff lookups must resolve to the rotated key",
+        );
+        assert_eq!(
+            joiner_node.validator_key_history.validator_for(
+                &crate::consensus::validator_set::Pubkey::from_node_id(new_pubkey),
+            ),
+            Some(stable),
+            "the new pubkey resolves through the reverse index — \
+             dispatch::verify_signer_at would accept post-rotation votes",
+        );
+
+        // ── On-disk: the persisted blob round-trips back into a
+        //   history with the rotation entry, so a subsequent restart
+        //   recovers the same state.
+        let persisted_bytes = joiner_storage
+            .get(STORAGE_KEY_VALIDATOR_KEY_HISTORY)
+            .unwrap()
+            .expect("persisted validator_key_history must be on disk after restore");
+        let persisted: PersistedValidatorKeyHistory =
+            postcard::from_bytes(&persisted_bytes).expect("persisted blob decodes");
+        let rebuilt = ValidatorKeyHistory::from_persisted(persisted).unwrap();
+        assert_eq!(
+            rebuilt.key_at(&stable, v_eff),
+            Some(crate::consensus::validator_set::Pubkey::from_node_id(
+                new_pubkey,
+            )),
+            "on-disk persisted history must carry the rotation",
+        );
+    }
+
     /// Joiner multi-source happy path (#230 acceptance criterion 1):
     /// 3 peers serve the same snapshot in parallel. Drives the
     /// fetch end-to-end via in-memory dispatch and asserts that
