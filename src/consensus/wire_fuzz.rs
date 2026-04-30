@@ -434,7 +434,9 @@ impl ReplicaSet {
                 Action::Commit(block) => {
                     self.commits[source].insert(block.header.height, block);
                 }
-                Action::Persist(_) | Action::RequestBlock { .. } => {}
+                Action::Persist(_)
+                | Action::RequestBlock { .. }
+                | Action::EquivocationEvidence { .. } => {}
             }
         }
     }

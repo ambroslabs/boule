@@ -799,6 +799,14 @@ pub struct ConsensusNode {
     /// Shared with the builder's own `Arc<AtomicU64>` so the two
     /// always agree without locking.
     dropped_commands: Arc<AtomicU64>,
+    /// Cumulative count of vote-equivocation incidents the safety core
+    /// has surfaced via
+    /// [`crate::consensus::hotstuff::step::Action::EquivocationEvidence`]
+    /// (audit finding 3-1, issue #409). Incremented at the
+    /// [`apply_safety_actions`] dispatch site, so the counter and the
+    /// matching WARN log advance in lockstep. Surfaced under
+    /// [`ConsensusStatus::equivocations_detected`].
+    equivocations_detected: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -1010,6 +1018,7 @@ impl ConsensusNode {
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
+            equivocations_detected: Arc::new(AtomicU64::new(0)),
             last_committed_view: 0,
             status_tx: None,
             rate_limiter: None,
@@ -1230,6 +1239,7 @@ impl ConsensusNode {
                 timeout_buckets: self.eviction_counters.timeout_buckets(),
             },
             dropped_commands: self.dropped_commands.load(Ordering::Relaxed),
+            equivocations_detected: self.equivocations_detected.load(Ordering::Relaxed),
         }
     }
 
@@ -1410,6 +1420,7 @@ impl ConsensusNode {
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
+            equivocations_detected: Arc::new(AtomicU64::new(0)),
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
@@ -2939,6 +2950,30 @@ impl ConsensusNode {
                 SafetyAction::Commit(block) => {
                     self.apply_commit(block);
                 }
+
+                SafetyAction::EquivocationEvidence {
+                    voter,
+                    view,
+                    block_a,
+                    block_b,
+                } => {
+                    // Audit finding 3-1 (#409): the safety core just
+                    // observed a stable validator voting for two
+                    // distinct block_hash values at the same view.
+                    // Surface as a WARN with structured fields so
+                    // operators can grep for evidence and a future
+                    // slashing pipeline can attach without further
+                    // safety-core changes.
+                    self.equivocations_detected.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        voter = %node_id_to_base58(voter.as_node_id()),
+                        view,
+                        block_a = ?block_a,
+                        block_b = ?block_b,
+                        "consensus_equivocation_detected",
+                    );
+                }
             }
         }
 
@@ -3565,14 +3600,30 @@ impl ConsensusNode {
                 error = %e,
                 "block_persist_failed",
             );
+            // Audit finding 4-2 / issue #411: the SM has already
+            // applied above and the safety core has already retired
+            // `pending_blocks` for this commit, but the durable
+            // (block, last_committed) batch did not land. Returning
+            // here would let the snapshot creation hook, reconfig /
+            // rotation appliers, and the CommitNotifier fan-out fire
+            // against a non-durable commit — on restart the durable
+            // checkpoint would not reflect the commit, leaving SM
+            // state and `last_committed` divergent. Halt the node so
+            // an operator sees the failure and recovery starts from
+            // the durable checkpoint as the single source of truth.
+            panic!(
+                "consensus: durable persist of committed block failed (height={}, view={}, hash={:?}): {e}; halting to prevent SM/last_committed divergence",
+                block.header.height, block.header.view, block_hash,
+            );
         }
         // After the committed block + last_committed batch is durable
         // but BEFORE any downstream side effect (snapshot creation,
         // reconfig/rotation application, commit-notifier fan-out)
-        // runs. Audit finding 4-6 / issue #411 is about gating those
-        // downstream actions on the durable block write — a regression
-        // would let the snapshot creation hook fire against a block
-        // that did not in fact reach disk.
+        // runs. Audit finding 4-2 / issue #411 gates those downstream
+        // actions on the durable block write — the panic above is
+        // what enforces the gate; a regression that turned it back
+        // into a logged-and-continue would let the snapshot creation
+        // hook fire against a block that did not in fact reach disk.
         crashpoint!("after_apply_commit_block_persist");
         tracing::info!(
             "consensus: committed block height={} view={}",
@@ -4345,25 +4396,68 @@ pub fn recover_state(
         state.high_qc = Some(decode_high_qc(&raw)?);
     }
 
-    // Re-seed `pending_blocks` with the locked / high_qc blocks so the
-    // safety-rule walks (extension via locked, become_leader's parent
-    // lookup) terminate without first having to round-trip through
-    // block-sync. Genesis is already in `pending_blocks`. Any block
-    // missing from storage (e.g. an older snapshot adopted via NewView
-    // before the persist-with-block pairing landed) is silently
-    // skipped — the existing block-sync paths still cover that case.
-    if let Some(qc) = state.high_qc.as_ref().cloned()
-        && let Some(block) = load_block_from_storage(storage, &qc.block_hash)?
-    {
-        state.insert_pending(block);
+    // Re-seed `pending_blocks` with the locked / high_qc blocks plus a
+    // bounded fringe of their ancestors so the safety-rule walks
+    // (extension via locked, become_leader's parent lookup, the 2-chain
+    // promotion walk, and the 3-chain commit walk) terminate without
+    // first having to round-trip through block-sync. Genesis is already
+    // in `pending_blocks`. Any block missing from storage (e.g. an older
+    // snapshot adopted via NewView before the persist-with-block pairing
+    // landed) is silently skipped — the existing block-sync paths still
+    // cover that case.
+    //
+    // Walking `RECOVER_PARENT_HOPS` parents from each anchor closes
+    // audit finding 4-5: the 2-chain promotion walk needs the locked
+    // block's grandparent and the 3-chain commit walk needs high_qc's
+    // great-grandparent, so without this the first proposal received
+    // post-restart can silently fail to promote the lock for one or
+    // two views before the chain refills.
+    if let Some(qc) = state.high_qc.as_ref().cloned() {
+        rehydrate_ancestors(storage, &mut state, qc.block_hash)?;
     }
-    if let Some(locked) = state.locked
-        && let Some(block) = load_block_from_storage(storage, &locked.block_hash)?
-    {
-        state.insert_pending(block);
+    if let Some(locked) = state.locked {
+        rehydrate_ancestors(storage, &mut state, locked.block_hash)?;
     }
 
     Ok(state)
+}
+
+/// Number of parent hops [`recover_state`] walks back from each of
+/// `high_qc.block_hash` and `locked.block_hash` when re-seeding
+/// `pending_blocks`. Set to two so the loaded fringe covers both the
+/// 2-chain promotion walk (locked + grandparent) and the 3-chain
+/// commit walk (high_qc + great-grandparent) on the first proposal
+/// received after restart. See audit finding 4-5 / issue #412.
+const RECOVER_PARENT_HOPS: usize = 2;
+
+/// Walk up to [`RECOVER_PARENT_HOPS`] parents back from `start`,
+/// loading each block from durable storage into `state.pending_blocks`.
+/// Stops at genesis (`parent_hash == [0; 32]`), at a block already in
+/// `pending_blocks` (its parents will be reached via that block's own
+/// `header.parent_hash`), or when a block is absent from storage —
+/// whichever comes first.
+fn rehydrate_ancestors(
+    storage: &dyn Storage,
+    state: &mut HotStuffState,
+    start: BlockHash,
+) -> anyhow::Result<()> {
+    let mut cursor = start;
+    for _ in 0..=RECOVER_PARENT_HOPS {
+        let parent = if let Some(b) = state.pending_blocks.get(&cursor) {
+            b.header.parent_hash
+        } else if let Some(block) = load_block_from_storage(storage, &cursor)? {
+            let parent = block.header.parent_hash;
+            state.insert_pending(block);
+            parent
+        } else {
+            break;
+        };
+        if parent == [0u8; 32] {
+            break;
+        }
+        cursor = parent;
+    }
+    Ok(())
 }
 
 // ── Status-snapshot helper ───────────────────────────────────────────────────
@@ -5629,6 +5723,174 @@ mod tests {
         );
     }
 
+    /// Issue #412 / audit finding 4-5: `recover_state` rehydrates not
+    /// only the locked / high_qc blocks but a bounded fringe of their
+    /// ancestors so the 2-chain promotion walk and 3-chain commit walk
+    /// terminate locally on the very first proposal received after a
+    /// restart. Without this, the lock can fail to advance for one or
+    /// two views while the chain refills from fresh proposals.
+    #[test]
+    fn recover_rehydrates_locked_and_high_qc_ancestors() {
+        use crate::replication::block::BlockHeader;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let g = genesis();
+
+        // Build a five-block chain rooted at genesis: g <- b1 <- b2 <-
+        // b3 <- b4. b3 is the locked block; b4 is the high_qc block.
+        // The 3-chain commit walk from b4 needs b2 (great-grandparent);
+        // the 2-chain promotion walk from b3 needs b1 (grandparent).
+        let mut blocks = vec![g.clone()];
+        for i in 1..=4u64 {
+            let parent = blocks.last().unwrap();
+            blocks.push(Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    height: i,
+                    view: i + 10,
+                    proposer: nid(((i % 4) + 1) as u8),
+                    state_commitment: [0u8; 32],
+                    commands_commitment: Block::commands_commitment(&[]),
+                    validator_history_commitment: [0; 32],
+                },
+                commands: vec![],
+            });
+        }
+        let b1 = &blocks[1];
+        let b2 = &blocks[2];
+        let b3 = &blocks[3];
+        let b4 = &blocks[4];
+
+        // Persist every non-genesis block under the block-storage prefix
+        // (mirrors what `persist_updates` would have written across
+        // earlier sessions where each block was at the high_qc tip).
+        for b in &blocks[1..] {
+            storage
+                .put(&block_storage_key(&b.hash()), &encode_block(b).unwrap())
+                .unwrap();
+        }
+
+        // Persist locked = b3 and high_qc over b4 so `recover_state`
+        // anchors the walk on the right pair.
+        let locked = Locked {
+            view: b3.header.view,
+            height: b3.header.height,
+            block_hash: b3.hash(),
+        };
+        let mut qc = QuorumCertificate::new(b4.header.view, b4.hash(), 4);
+        qc.add_signature(0, [0x11u8; 64]);
+        qc.add_signature(1, [0x22u8; 64]);
+        qc.add_signature(2, [0x33u8; 64]);
+        storage
+            .put(STORAGE_KEY_LOCKED, &encode_locked(&locked).unwrap())
+            .unwrap();
+        storage
+            .put(STORAGE_KEY_HIGH_QC, &encode_high_qc(&qc).unwrap())
+            .unwrap();
+
+        let state = recover_state(storage.as_ref(), four_validators(), g.clone()).unwrap();
+
+        // Genesis is always seeded; every block on the locked / high_qc
+        // ancestry up to two hops from each anchor is rehydrated. The
+        // union covers b1..b4 — exactly the blocks the safety walks
+        // need on the first post-restart proposal.
+        assert!(state.pending_blocks.contains_key(&g.hash()));
+        for (label, hash) in [
+            ("b1", b1.hash()),
+            ("b2", b2.hash()),
+            ("b3", b3.hash()),
+            ("b4", b4.hash()),
+        ] {
+            assert!(
+                state.pending_blocks.contains_key(&hash),
+                "recover must rehydrate {label} so the 2-chain / 3-chain walks \
+                 terminate locally on the first proposal after restart",
+            );
+        }
+    }
+
+    /// Companion to [`recover_rehydrates_locked_and_high_qc_ancestors`]:
+    /// when an ancestor is missing from durable storage (e.g. an older
+    /// snapshot adopted via NewView before the persist-with-block
+    /// pairing landed), the walk stops at the gap and recovery does
+    /// not error — block-sync still covers the rest of the chain.
+    #[test]
+    fn recover_stops_at_first_missing_ancestor() {
+        use crate::replication::block::BlockHeader;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let g = genesis();
+
+        // g <- b1 <- b2 <- b3. Persist b2 and b3 only — b1 is missing,
+        // simulating a gap in the durable block store.
+        let b1 = Block {
+            header: BlockHeader {
+                parent_hash: g.hash(),
+                height: 1,
+                view: 11,
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let b2 = Block {
+            header: BlockHeader {
+                parent_hash: b1.hash(),
+                height: 2,
+                view: 12,
+                proposer: nid(2),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let b3 = Block {
+            header: BlockHeader {
+                parent_hash: b2.hash(),
+                height: 3,
+                view: 13,
+                proposer: nid(3),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        storage
+            .put(&block_storage_key(&b2.hash()), &encode_block(&b2).unwrap())
+            .unwrap();
+        storage
+            .put(&block_storage_key(&b3.hash()), &encode_block(&b3).unwrap())
+            .unwrap();
+
+        let locked = Locked {
+            view: b2.header.view,
+            height: b2.header.height,
+            block_hash: b2.hash(),
+        };
+        let mut qc = QuorumCertificate::new(b3.header.view, b3.hash(), 4);
+        qc.add_signature(0, [0x11u8; 64]);
+        qc.add_signature(1, [0x22u8; 64]);
+        qc.add_signature(2, [0x33u8; 64]);
+        storage
+            .put(STORAGE_KEY_LOCKED, &encode_locked(&locked).unwrap())
+            .unwrap();
+        storage
+            .put(STORAGE_KEY_HIGH_QC, &encode_high_qc(&qc).unwrap())
+            .unwrap();
+
+        let state = recover_state(storage.as_ref(), four_validators(), g.clone()).unwrap();
+
+        // The available ancestors load; the missing one stops the walk
+        // without erroring.
+        assert!(state.pending_blocks.contains_key(&b3.hash()));
+        assert!(state.pending_blocks.contains_key(&b2.hash()));
+        assert!(!state.pending_blocks.contains_key(&b1.hash()));
+    }
+
     /// Persisting `HighQc` whose block is *not* in `pending_blocks` —
     /// the rare NewView-only adoption path — still records the QC
     /// metadata, but no block write fires (the safety core's
@@ -6223,6 +6485,125 @@ mod tests {
         let lc = decode_last_committed(&raw).expect("decode");
         assert_eq!(lc.height, block.header.height);
         assert_eq!(lc.view, block.header.view);
+    }
+
+    /// Audit finding 4-2 / issue #411: when the durable batch write
+    /// for a committed block fails, `apply_commit` must halt before
+    /// any downstream observer fires. Otherwise a non-durable commit
+    /// would propagate through the snapshot creation hook, the
+    /// reconfig/rotation appliers, and the [`CommitNotifier`]
+    /// fan-out — and on restart `last_committed_height` would
+    /// disagree with the SM-applied state, since the block + checkpoint
+    /// batch never landed.
+    #[test]
+    fn apply_commit_halts_when_storage_batch_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        use bytes::Bytes;
+
+        use crate::consensus::api::CommitNotifier;
+        use crate::consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+        use crate::storage::WriteBatch;
+
+        // Storage wrapper: reads/single-key writes pass through to an
+        // inner `MemoryStorage`, but every `apply_batch` returns an
+        // error. Models a backend that fails the atomic
+        // `(block, last_committed)` write — the exact gap the audit
+        // finding describes.
+        struct FailingBatchStorage {
+            inner: MemoryStorage,
+        }
+        impl Storage for FailingBatchStorage {
+            fn get(&self, key: &[u8]) -> anyhow::Result<Option<Bytes>> {
+                self.inner.get(key)
+            }
+            fn put(&self, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+                self.inner.put(key, value)
+            }
+            fn delete(&self, key: &[u8]) -> anyhow::Result<()> {
+                self.inner.delete(key)
+            }
+            fn scan_prefix(&self, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+                self.inner.scan_prefix(prefix)
+            }
+            fn apply_batch(&self, _batch: WriteBatch) -> anyhow::Result<()> {
+                anyhow::bail!("simulated storage batch failure")
+            }
+            fn compare_and_swap(
+                &self,
+                key: &[u8],
+                expected: Option<&[u8]>,
+                new: Option<&[u8]>,
+            ) -> anyhow::Result<bool> {
+                self.inner.compare_and_swap(key, expected, new)
+            }
+        }
+
+        // Counting `CommitNotifier` to detect any post-failure fan-out.
+        struct CountingNotifier {
+            count: Arc<AtomicUsize>,
+        }
+        impl CommitNotifier for CountingNotifier {
+            fn on_commit(&self, _block: &Block, _state_commitment: &[u8; 32], _view: View) {
+                self.count.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let storage: Arc<dyn Storage> = Arc::new(FailingBatchStorage {
+            inner: MemoryStorage::new(),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let notifier: Arc<dyn CommitNotifier> = Arc::new(CountingNotifier {
+            count: Arc::clone(&count),
+        });
+        let mut node = ConsensusNode::new(
+            nid(1),
+            test_config(four_validators()),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            storage,
+            Arc::new(MemoryWal::new()),
+        )
+        .with_commit_notifier(notifier);
+
+        // Block carries a valid reconfig: a regression that let the
+        // appliers run despite a non-durable persist would tick the
+        // boundary count from 1 to 2.
+        let v_eff = MIN_V_EFF_DELAY + 5;
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
+            }],
+            removes: vec![],
+            v_eff,
+        };
+        let block = block_with_reconfig(1, 0, nid(1), cmd);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            node.apply_commit(block);
+        }));
+        assert!(
+            result.is_err(),
+            "apply_commit must panic when the durable persist batch fails",
+        );
+
+        assert_eq!(
+            count.load(AtomicOrdering::Relaxed),
+            0,
+            "CommitNotifier::on_commit must not fire on a non-durable commit",
+        );
+        assert_eq!(
+            node.validator_history.boundary_count(),
+            1,
+            "reconfig appliers must not run on a non-durable commit",
+        );
+        assert_eq!(
+            node.core.state().validator_history.boundary_count(),
+            1,
+            "safety-core mirror of validator_history must also remain at the genesis-only boundary",
+        );
     }
 
     /// `recover` rebuilds `last_committed_height`/`last_committed_view`
