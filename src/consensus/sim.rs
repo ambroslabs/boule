@@ -59,6 +59,7 @@ use rand_chacha::ChaCha20Rng;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::clock::{Clock, TokioClock};
+use crate::consensus::api::{CommitNotifier, MpscCommitNotifier};
 use crate::consensus::limits::CacheLimits;
 use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::validator_set::ValidatorSet;
@@ -485,11 +486,13 @@ impl SimCluster {
 
             let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
             commit_rxs.push(commit_rx);
+            let commit_notifier: Arc<dyn CommitNotifier> =
+                Arc::new(MpscCommitNotifier::new(commit_tx));
 
             // ConsensusNode::new already auto-seeds the cluster-agreed
             // genesis QC; no explicit with_genesis_qc override here.
             let mut node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
-                .with_commit_observer(commit_tx);
+                .with_commit_notifier(commit_notifier);
 
             // BLS plumbing (#354 step 2). Each node gets:
             // (1) a `BlsKeyHistory` populated from the shared genesis
@@ -1027,10 +1030,12 @@ impl SimCluster {
 
             let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
             new_commit_rxs.push(commit_rx);
+            let commit_notifier: Arc<dyn CommitNotifier> =
+                Arc::new(MpscCommitNotifier::new(commit_tx));
 
             let node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)
                 .expect("recover must succeed against the same storage that just persisted")
-                .with_commit_observer(commit_tx);
+                .with_commit_notifier(commit_notifier);
 
             let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
             let broadcaster: Arc<dyn Broadcaster> = Arc::new(MeshBroadcaster::new(send_tx));
@@ -1436,9 +1441,11 @@ impl SimCluster {
 
             let (commit_tx, commit_rx) = mpsc::unbounded_channel::<Block>();
             commit_rxs.push(commit_rx);
+            let commit_notifier: Arc<dyn CommitNotifier> =
+                Arc::new(MpscCommitNotifier::new(commit_tx));
 
             let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
-                .with_commit_observer(commit_tx);
+                .with_commit_notifier(commit_notifier);
 
             // Per-node outbound channel: orchestrator's OverlaySink writes
             // here; the route task reads on the other side.

@@ -1,14 +1,23 @@
-//! HTTP admin surface for the consensus subsystem.
+//! Public consensus API surface.
 //!
-//! Exposes read-only endpoints mounted into the node's main
-//! [`axum::Router`] when `[consensus]` is configured:
+//! Two flavors of API live here:
+//!
+//! - The read-only HTTP admin router ([`router`]), mounted into the
+//!   node's main [`axum::Router`] when `[consensus]` is configured.
+//! - The [`CommitNotifier`] trait — a stable subscription point for
+//!   "what just committed?" that consumers like observer-mode nodes
+//!   (#308), out-of-process Application integrations (#225), and
+//!   external tooling (block explorers, metrics, snap-sync) can plug
+//!   into without modifying [`crate::consensus::node`].
+//!
+//! HTTP endpoints currently exposed:
 //!
 //! - `GET /consensus/status` — latest [`ConsensusStatus`] snapshot
 //!   published by the consensus event loop. See
 //!   [`crate::consensus::status`] for the JSON shape.
 //!
-//! On a gossip-only node (no `[consensus]` section), this router is
-//! not mounted, and axum's default 404 applies — matching the
+//! On a gossip-only node (no `[consensus]` section), the HTTP router
+//! is not mounted, and axum's default 404 applies — matching the
 //! acceptance criterion from the design issue.
 
 #![warn(missing_docs)]
@@ -20,7 +29,90 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::watch;
 
+use super::View;
 use super::status::ConsensusStatus;
+use crate::replication::block::Block;
+
+/// Hook fired by the consensus pipeline after each block has been
+/// applied to the state machine, persisted, and had its reconfig and
+/// rotation payloads committed.
+///
+/// Plug-in surface for consumers that want the post-commit stream
+/// without running the safety core's egress: observer-mode nodes
+/// (#308 Tier A), out-of-process Applications (#225 M1), and external
+/// tooling such as block explorers, metrics scrapers, and snap-sync
+/// daemons.
+///
+/// # Threading
+///
+/// `on_commit` is invoked synchronously from the consensus event loop.
+/// Implementations **must not block**: forward to a channel, increment
+/// an atomic, or log. Anything heavier (HTTP fan-out, disk writes that
+/// can stall) belongs on a separate task that drains a channel this
+/// notifier feeds.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use tokio::sync::mpsc;
+///
+/// use ambros_p2p::consensus::api::{CommitNotifier, MpscCommitNotifier};
+/// use ambros_p2p::consensus::node::ConsensusNode;
+///
+/// # fn build(node: ConsensusNode) -> ConsensusNode {
+/// let (tx, mut rx) = mpsc::unbounded_channel();
+/// let notifier: Arc<dyn CommitNotifier> =
+///     Arc::new(MpscCommitNotifier::new(tx));
+/// let node = node.with_commit_notifier(notifier);
+///
+/// // Elsewhere, drain `rx` to react to commits:
+/// // tokio::spawn(async move {
+/// //     while let Some(block) = rx.recv().await { /* index, fan out, … */ }
+/// // });
+/// # node
+/// # }
+/// ```
+pub trait CommitNotifier: Send + Sync {
+    /// Notify of a newly committed block.
+    ///
+    /// `state_commitment` and `view` mirror
+    /// `block.header.state_commitment` and `block.header.view`. They
+    /// are passed alongside the block as a stable summary signature so
+    /// observers that only care about post-commit state digests do not
+    /// need to reach into block-header internals.
+    ///
+    /// `block` is borrowed; clone inside the implementation if the
+    /// observer needs to retain it past the call (e.g. forwarding on a
+    /// channel).
+    fn on_commit(&self, block: &Block, state_commitment: &[u8; 32], view: View);
+}
+
+/// [`CommitNotifier`] adapter that forwards each committed block to a
+/// [`tokio::sync::mpsc::UnboundedSender`].
+///
+/// This is the impl used by the in-process simulator (and any other
+/// single-consumer subscriber): each node owns its own unbounded
+/// channel, the harness drains the receiver, and a closed channel is
+/// treated as a shutdown signal — `send` errors are swallowed because
+/// the consensus loop must not stall on a downstream observer
+/// disappearing.
+pub struct MpscCommitNotifier {
+    tx: tokio::sync::mpsc::UnboundedSender<Block>,
+}
+
+impl MpscCommitNotifier {
+    /// Wrap an unbounded channel sender as a [`CommitNotifier`].
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<Block>) -> Self {
+        Self { tx }
+    }
+}
+
+impl CommitNotifier for MpscCommitNotifier {
+    fn on_commit(&self, block: &Block, _state_commitment: &[u8; 32], _view: View) {
+        let _ = self.tx.send(block.clone());
+    }
+}
 
 /// Build the consensus-admin router.
 ///
@@ -81,6 +173,7 @@ mod tests {
             validator_set: Vec::new(),
             mempool_size: 0,
             cache_evictions: crate::consensus::status::CacheEvictionStatus::default(),
+            dropped_commands: 0,
         }
     }
 
