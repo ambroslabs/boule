@@ -242,11 +242,23 @@ fn arb_signed_wire_bytes_and_signer() -> impl Strategy<Value = (Vec<u8>, NodeId)
                 .expect("encode WireMessage::BlockRequest");
             (bytes, [0u8; 32])
         }),
-        prop::option::of(arb_block(Block::genesis([0; 32], [0; 32]).hash())).prop_map(|maybe| {
-            let bytes = postcard::to_stdvec(&WireMessage::BlockResponse(maybe))
-                .expect("encode WireMessage::BlockResponse");
-            (bytes, [0u8; 32])
-        }),
+        (
+            arb_signer_idx(),
+            any::<[u8; 32]>(),
+            prop::option::of(arb_block(Block::genesis([0; 32], [0; 32]).hash())),
+        )
+            .prop_map(|(idx, requested_hash, block)| {
+                let signer = &signer_pool()[idx];
+                let payload = crate::consensus::node::BlockResponsePayload {
+                    requested_hash,
+                    block,
+                };
+                let signed = Signed::sign(payload, signer, &ChainId::TEST)
+                    .expect("sign BlockResponsePayload");
+                let bytes = postcard::to_stdvec(&WireMessage::BlockResponse(signed))
+                    .expect("encode WireMessage::BlockResponse");
+                (bytes, signer.node_id())
+            }),
     ]
 }
 

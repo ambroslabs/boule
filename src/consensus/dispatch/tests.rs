@@ -264,18 +264,64 @@ fn ingress_block_request_no_signature_needed() {
 }
 
 #[test]
-fn ingress_block_response_no_signature_needed() {
-    let from = [0x02u8; 32];
-    let vs = ValidatorSet::new(vec![]);
-    let wire = WireMessage::BlockResponse(Some(genesis()));
+fn ingress_block_response_happy_path() {
+    let signer = fresh_signer();
+    let vs = make_vs_with_signers(&[&signer]);
+    let from = signer.node_id();
+    let block = genesis();
+    let requested_hash = block.hash();
+    let payload = crate::consensus::node::BlockResponsePayload {
+        requested_hash,
+        block: Some(block),
+    };
+    let signed = Signed::sign(payload, &signer, &ChainId::TEST).unwrap();
+    let wire = WireMessage::BlockResponse(signed);
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress_with_genesis_set(from, &bytes, &vs).unwrap();
     assert_eq!(dispatches.len(), 1);
     assert!(matches!(
         &dispatches[0],
-        Dispatch::ReceiveBlock { block: Some(_), from: f } if f == &from,
+        Dispatch::ReceiveBlock {
+            requested_hash: rh,
+            block: Some(_),
+            from: f,
+        } if rh == &requested_hash && f == &from,
     ));
+}
+
+#[test]
+fn ingress_block_response_unknown_signer_rejected() {
+    let signer = fresh_signer();
+    let other = fresh_signer();
+    let vs = make_vs_with_signers(&[&other]); // signer not in VS
+    let payload = crate::consensus::node::BlockResponsePayload {
+        requested_hash: [0xAB; 32],
+        block: None,
+    };
+    let signed = Signed::sign(payload, &signer, &ChainId::TEST).unwrap();
+    let wire = WireMessage::BlockResponse(signed);
+    let bytes = postcard::to_stdvec(&wire).unwrap();
+
+    let err = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap_err();
+    assert!(matches!(err, IngressError::UnknownSigner(_)));
+}
+
+#[test]
+fn ingress_block_response_bad_signature_rejected() {
+    let signer = fresh_signer();
+    let vs = make_vs_with_signers(&[&signer]);
+    let payload = crate::consensus::node::BlockResponsePayload {
+        requested_hash: [0xAB; 32],
+        block: None,
+    };
+    let mut signed = Signed::sign(payload, &signer, &ChainId::TEST).unwrap();
+    signed.sig[0] ^= 0xFF;
+    let wire = WireMessage::BlockResponse(signed);
+    let bytes = postcard::to_stdvec(&wire).unwrap();
+
+    let err = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap_err();
+    assert!(matches!(err, IngressError::InvalidSignature(_)));
 }
 
 #[test]

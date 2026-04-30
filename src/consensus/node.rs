@@ -75,6 +75,7 @@ use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::view_timer::ViewTimer;
 use crate::crypto::signed::ChainId;
 use crate::crypto::signed::Signed;
+use crate::crypto::signed::SignedMessage;
 use crate::crypto::signed::Signer;
 use crate::p2p::NodeId;
 use crate::p2p::ProtocolEvent;
@@ -235,6 +236,34 @@ pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 
 // ── Wire message envelope ────────────────────────────────────────────────────
 
+/// Signed payload of a [`WireMessage::BlockResponse`].
+///
+/// `requested_hash` is the hash the requester named in the matching
+/// `BlockRequest`. Including it inside the signed envelope binds the
+/// responder's signature to a specific request: a Byzantine peer who
+/// returns a different block (or no block) under a wrong-hash claim
+/// is non-repudiable evidence — the requester can later present
+/// `(BlockResponsePayload, signature)` for slashing once that
+/// machinery lands.
+///
+/// Receivers must drop a response whose `block.hash() != requested_hash`,
+/// or whose `requested_hash` does not match an outstanding
+/// `block_sync_inflight` entry. See the
+/// [`Dispatch::ReceiveBlock`](crate::consensus::dispatch::Dispatch::ReceiveBlock)
+/// handler in [`Self::apply_dispatch`] for the gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockResponsePayload {
+    /// The hash from the matching `BlockRequest` this response answers.
+    pub requested_hash: BlockHash,
+    /// The block matching `requested_hash`, or `None` if the responder
+    /// doesn't have it.
+    pub block: Option<Block>,
+}
+
+impl SignedMessage for BlockResponsePayload {
+    const DOMAIN: &'static str = "ambros.consensus.block_response.v1";
+}
+
 /// Every message sent over the `PROTOCOL_ID` channel is one of these
 /// variants, postcard-encoded.
 ///
@@ -285,8 +314,11 @@ pub enum WireMessage {
     TimeoutVote(Signed<TimeoutVote>),
     /// Ask a peer for the block with this content-hash.
     BlockRequest(BlockHash),
-    /// Reply to a `BlockRequest`. `None` means "I don't have it".
-    BlockResponse(Option<Block>),
+    /// Reply to a `BlockRequest`. The signed payload commits to the
+    /// hash the requester originally named so a Byzantine responder
+    /// who returns the wrong block (or nothing) is non-repudiable
+    /// evidence the responder can later be slashed for (#434).
+    BlockResponse(Signed<BlockResponsePayload>),
     /// Ask a peer for a snapshot manifest. `None` means "your latest";
     /// `Some(h)` means "the snapshot at exact height `h`".
     SnapshotManifestRequest {
@@ -2147,19 +2179,54 @@ impl ConsensusNode {
                         "block_sync_request_unfindable",
                     );
                 }
-                let out = dispatch::egress_block_response(block, to);
+                let out = dispatch::egress_block_response(
+                    hash,
+                    block,
+                    to,
+                    signer.as_ref(),
+                    &self.chain_id,
+                )?;
                 send_outbound(broadcaster, out).await;
             }
 
-            // Block arrived in response to an earlier RequestBlock; insert it
-            // and re-drive parked proposals via PacemakerAdvance.
+            // Block arrived in response to an earlier RequestBlock;
+            // insert it and re-drive parked proposals via
+            // PacemakerAdvance. Drop the response if it does not match
+            // the hash we asked for (or if we never asked for that
+            // hash) — without this gate a Byzantine responder could
+            // pollute `pending_blocks` with arbitrary blocks (#434,
+            // audit finding 10-2).
             Dispatch::ReceiveBlock {
+                requested_hash,
                 block: Some(block),
                 from,
             } => {
                 let block_hash = block.hash();
                 let block_view = block.header.view;
                 let block_height = block.header.height;
+                if block_hash != requested_hash {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        from = %node_id_to_base58(&from),
+                        requested_hash = ?requested_hash,
+                        received_hash = ?block_hash,
+                        view = block_view,
+                        height = block_height,
+                        "block_sync_response_hash_mismatch",
+                    );
+                    return Ok(());
+                }
+                if !self.core.has_inflight_block_request(&requested_hash) {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        from = %node_id_to_base58(&from),
+                        requested_hash = ?requested_hash,
+                        view = block_view,
+                        height = block_height,
+                        "block_sync_response_unrequested",
+                    );
+                    return Ok(());
+                }
                 tracing::info!(
                     target: TRACE_TARGET,
                     from = %node_id_to_base58(&from),
@@ -2175,10 +2242,15 @@ impl ConsensusNode {
                     .await?;
             }
 
-            Dispatch::ReceiveBlock { block: None, from } => {
+            Dispatch::ReceiveBlock {
+                requested_hash,
+                block: None,
+                from,
+            } => {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     from = %node_id_to_base58(&from),
+                    requested_hash = ?requested_hash,
                     "block_sync_response_not_found",
                 );
             }
@@ -4588,7 +4660,15 @@ mod tests {
 
     #[test]
     fn wire_message_block_response_some_roundtrip() {
-        let msg = WireMessage::BlockResponse(Some(sample_block()));
+        let block = sample_block();
+        let msg = WireMessage::BlockResponse(Signed {
+            payload: BlockResponsePayload {
+                requested_hash: block.hash(),
+                block: Some(block),
+            },
+            signer: [0u8; 32],
+            sig: [0u8; 64],
+        });
         let encoded = postcard::to_stdvec(&msg).unwrap();
         let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, msg);
@@ -4596,7 +4676,14 @@ mod tests {
 
     #[test]
     fn wire_message_block_response_none_roundtrip() {
-        let msg = WireMessage::BlockResponse(None);
+        let msg = WireMessage::BlockResponse(Signed {
+            payload: BlockResponsePayload {
+                requested_hash: [0xAA; 32],
+                block: None,
+            },
+            signer: [0u8; 32],
+            sig: [0u8; 64],
+        });
         let encoded = postcard::to_stdvec(&msg).unwrap();
         let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded, msg);
@@ -6240,7 +6327,9 @@ mod tests {
                     postcard::from_bytes(&payload).expect("decode BlockResponse");
                 match wire {
                     WireMessage::BlockResponse(got) => {
-                        assert_eq!(got, Some(block));
+                        assert_eq!(got.payload.requested_hash, hash);
+                        assert_eq!(got.payload.block, Some(block));
+                        assert_eq!(got.signer, signer.node_id());
                     }
                     other => panic!("expected BlockResponse, got {other:?}"),
                 }
@@ -6278,10 +6367,152 @@ mod tests {
                 assert_eq!(node_id, nid(2));
                 let wire: WireMessage =
                     postcard::from_bytes(&payload).expect("decode BlockResponse");
-                assert!(matches!(wire, WireMessage::BlockResponse(None)));
+                match wire {
+                    WireMessage::BlockResponse(got) => {
+                        assert_eq!(got.payload.requested_hash, unknown_hash);
+                        assert!(got.payload.block.is_none());
+                    }
+                    other => panic!("expected BlockResponse, got {other:?}"),
+                }
             }
             other => panic!("expected SendTo, got {other:?}"),
         }
+    }
+
+    // ── BlockResponse hash-check gates (#434) ──────────────────────────
+
+    /// `Dispatch::ReceiveBlock` for an unsolicited hash (no
+    /// `block_sync_inflight` entry) must drop the block before it
+    /// lands in `pending_blocks`. Without this gate a Byzantine peer
+    /// could pollute the cache with arbitrary blocks the requester
+    /// never asked for (audit finding 10-2).
+    #[tokio::test]
+    async fn receive_block_drops_unsolicited_response() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let block = sample_block();
+        let block_hash = block.hash();
+        let pending_before = node.core.state().pending_blocks.len();
+
+        node.apply_dispatch(
+            Dispatch::ReceiveBlock {
+                requested_hash: block_hash,
+                block: Some(block),
+                from: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        assert_eq!(
+            node.core.state().pending_blocks.len(),
+            pending_before,
+            "unsolicited BlockResponse must not insert into pending_blocks",
+        );
+        assert!(
+            !node.core.state().pending_blocks.contains_key(&block_hash),
+            "the unsolicited block hash must not appear in pending_blocks",
+        );
+    }
+
+    /// `Dispatch::ReceiveBlock` for a hash we *did* request, but
+    /// where the responder ships a different block under that
+    /// `requested_hash` claim, must drop the block. Otherwise a
+    /// Byzantine responder could swap arbitrary content into the
+    /// cache under a known-good hash.
+    #[tokio::test]
+    async fn receive_block_drops_hash_mismatch() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Pretend we asked for some other hash (not the block we are
+        // about to receive).
+        let requested_hash: BlockHash = [0xAA; 32];
+        node.core
+            .install_block_sync_inflight_for_test(requested_hash, nid(2), 1);
+
+        let block = sample_block();
+        let block_hash = block.hash();
+        assert_ne!(block_hash, requested_hash);
+        let pending_before = node.core.state().pending_blocks.len();
+
+        node.apply_dispatch(
+            Dispatch::ReceiveBlock {
+                requested_hash,
+                block: Some(block),
+                from: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        assert_eq!(
+            node.core.state().pending_blocks.len(),
+            pending_before,
+            "hash-mismatched BlockResponse must not insert into pending_blocks",
+        );
+        assert!(
+            !node.core.state().pending_blocks.contains_key(&block_hash),
+            "the wrong-hash block must not appear in pending_blocks",
+        );
+        assert!(
+            node.core.has_inflight_block_request(&requested_hash),
+            "the inflight retry entry for the originally-requested hash must \
+             be preserved across a hash-mismatched response so retries continue",
+        );
+    }
+
+    /// Conversely, when a responder returns a block whose hash
+    /// matches both the `requested_hash` and an outstanding inflight
+    /// entry, the block must be inserted as before. Pins the
+    /// happy-path of the new gate.
+    #[tokio::test]
+    async fn receive_block_inserts_when_hash_matches_inflight() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let block = sample_block();
+        let block_hash = block.hash();
+        node.core
+            .install_block_sync_inflight_for_test(block_hash, nid(2), 1);
+
+        node.apply_dispatch(
+            Dispatch::ReceiveBlock {
+                requested_hash: block_hash,
+                block: Some(block),
+                from: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        assert!(
+            node.core.state().pending_blocks.contains_key(&block_hash),
+            "matching-hash BlockResponse must insert the block",
+        );
+        assert!(
+            !node.core.has_inflight_block_request(&block_hash),
+            "insert_pending_block clears the inflight entry on match",
+        );
     }
 
     // ── Snapshot wire protocol (#228) — serving handlers ────────────────

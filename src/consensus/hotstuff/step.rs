@@ -585,6 +585,38 @@ impl HotStuffCore {
         self.block_sync_inflight.remove(&hash);
     }
 
+    /// Whether there is a still-tracked `RequestBlock` retry entry for
+    /// `hash`. The integration layer's `BlockResponse` handler gates
+    /// `insert_pending_block` on this so an unsolicited (or
+    /// post-cleanup duplicate) response is dropped before it can
+    /// pollute `pending_blocks` (#434).
+    pub fn has_inflight_block_request(&self, hash: &BlockHash) -> bool {
+        self.block_sync_inflight.contains_key(hash)
+    }
+
+    /// Test-only: install a `block_sync_inflight` entry for `hash` as
+    /// if a `RequestBlock` had just been emitted to `original_sender`
+    /// for a parent at `expected_height`. Lets the integration-layer
+    /// dispatch tests (#434) exercise the `BlockResponse` hash-check
+    /// gates without standing up a full parked-proposal flow.
+    #[cfg(test)]
+    pub(crate) fn install_block_sync_inflight_for_test(
+        &mut self,
+        hash: BlockHash,
+        original_sender: NodeId,
+        expected_height: u64,
+    ) {
+        self.block_sync_inflight.insert(
+            hash,
+            BlockSyncInflight {
+                original_sender,
+                attempts: 1,
+                last_asked_view: self.state.current_view,
+                expected_height,
+            },
+        );
+    }
+
     /// Directly set `high_qc` on the safety-core state.
     ///
     /// Used at boot by the integration layer to seed a well-known
