@@ -1420,6 +1420,35 @@ mod tests {
         }
     }
 
+    /// Boundary u128 arithmetic in `quorum_weight_threshold` and
+    /// `has_quorum`: weights summing to a value that, when multiplied
+    /// by 3, would overflow u64 must be aggregated and compared in
+    /// u128 without wrap. This is the dual of
+    /// `has_quorum_handles_weights_near_u64_max_without_wrapping`
+    /// for the predicate's helper rather than the predicate itself,
+    /// and pins the `2 * total_weight` operand specifically (the
+    /// other side of the integer-math comparison).
+    #[test]
+    fn quorum_weight_threshold_u128_safe_against_3x_total_overflow() {
+        // total = 4 * u64::MAX > 2^64 — would wrap a u64 product but
+        // fits in u128 with room to triple. Threshold computed in
+        // u128 must equal floor(2*total/3) + 1.
+        let vs = ValidatorSet::with_weights(vec![
+            (vid_for(1), u64::MAX),
+            (vid_for(2), u64::MAX),
+            (vid_for(3), u64::MAX),
+            (vid_for(4), u64::MAX),
+        ])
+        .unwrap();
+        let total = vs.total_weight();
+        assert_eq!(total, (u64::MAX as u128) * 4);
+        let threshold = quorum_weight_threshold(&vs);
+        let expected = 2u128 * total / 3 + 1;
+        assert_eq!(threshold, expected);
+        // honesty threshold: total/3 + 1, also overflow-free.
+        assert_eq!(honesty_weight_threshold(&vs), total / 3 + 1);
+    }
+
     /// `genesis_qc` correctly fills enough bits even when a single
     /// stake-heavy validator dominates. Weights `[5, 1, 1, 1]` →
     /// quorum threshold = 6; the loop must add the heavy validator
