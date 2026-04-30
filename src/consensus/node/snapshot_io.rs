@@ -25,7 +25,7 @@ use crate::consensus::crashpoint::crashpoint;
 use crate::consensus::dispatch;
 use crate::consensus::hotstuff::qc::VerifiedQc;
 use crate::consensus::hotstuff::step::{Action as SafetyAction, Event as SafetyEvent, StateUpdate};
-use crate::consensus::pacemaker::leader::RoundRobinSelector;
+use crate::consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use crate::consensus::view_timer::ViewTimer;
 use crate::crypto::signed::Signer;
 use crate::p2p::NodeId;
@@ -310,7 +310,7 @@ impl ConsensusNode {
         self.validator_key_history = installed_key;
         self.bls_key_history = installed_bls;
         self.pacemaker
-            .set_selector(Arc::new(RoundRobinSelector::new(Arc::new(
+            .set_selector(Arc::new(WeightedAccumulatorSelector::new(Arc::new(
                 self.validator_history.clone(),
             ))));
         // Persist the installed histories so a subsequent restart

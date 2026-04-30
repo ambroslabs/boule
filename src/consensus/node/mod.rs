@@ -63,7 +63,7 @@ use crate::consensus::hotstuff::{HotStuffState, QuorumCertificate, genesis_qc};
 use crate::consensus::limits::CacheEvictionCounters;
 use crate::consensus::pacemaker::Event as PacemakerEvent;
 use crate::consensus::pacemaker::Pacemaker;
-use crate::consensus::pacemaker::leader::RoundRobinSelector;
+use crate::consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use crate::consensus::pacemaker::timeout::ExponentialBackoff;
 use crate::consensus::status::ConsensusStatus;
 use crate::consensus::validator_history::ValidatorSetHistory;
@@ -346,11 +346,14 @@ impl ConsensusNode {
         ));
 
         // Pacemaker leader rotation runs against the historical lookup
-        // (#271). With the genesis-only history below, behavior matches
-        // the previous single-set rotation exactly; once #272 lands the
-        // commit-time application path, leaders past `v_eff` will come
-        // from the post-boundary set.
-        let selector = Arc::new(RoundRobinSelector::from_genesis_set(Arc::clone(
+        // (#271) under the production default `WeightedAccumulatorSelector`
+        // (#476 / parent #145). At uniform genesis weights this behaves
+        // byte-for-byte like the previous round-robin selector starting
+        // from the lowest-NodeId index; with non-uniform weights the
+        // long-run leader frequency tracks `weight[i] / total_weight`
+        // exactly. Tests that need the old round-robin rotation
+        // construct `RoundRobinSelector` directly.
+        let selector = Arc::new(WeightedAccumulatorSelector::from_genesis_set(Arc::clone(
             &validator_set,
         )));
 
@@ -649,8 +652,11 @@ impl ConsensusNode {
         ));
         // Build the selector against a snapshot of the recovered
         // history so leader rotation honors any post-genesis boundaries
-        // immediately after restart.
-        let selector = Arc::new(RoundRobinSelector::new(Arc::new(validator_history.clone())));
+        // immediately after restart. Production default is
+        // `WeightedAccumulatorSelector` (#476 / parent #145).
+        let selector = Arc::new(WeightedAccumulatorSelector::new(Arc::new(
+            validator_history.clone(),
+        )));
         let pacemaker = Pacemaker::new(
             self_id,
             Arc::clone(&selector) as _,

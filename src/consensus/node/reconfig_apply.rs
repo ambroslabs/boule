@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::consensus::View;
-use crate::consensus::pacemaker::leader::RoundRobinSelector;
+use crate::consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::replication::block::Block;
 
@@ -166,10 +166,14 @@ impl ConsensusNode {
             }
             // Re-install the pacemaker selector against a fresh
             // snapshot of the now-extended history so leader rotation
-            // past `v_eff` lands on the post-boundary set.
+            // past `v_eff` lands on the post-boundary set. The
+            // post-boundary regime starts with a fresh accumulator
+            // (priorities = [0; n]) — see
+            // `WeightedAccumulatorSelector` for the per-regime
+            // independence guarantee.
             let snapshot = Arc::new(self.validator_history.clone());
             self.pacemaker
-                .set_selector(Arc::new(RoundRobinSelector::new(snapshot)));
+                .set_selector(Arc::new(WeightedAccumulatorSelector::new(snapshot)));
 
             tracing::info!(
                 target: TRACE_TARGET,
