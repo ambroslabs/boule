@@ -46,6 +46,7 @@ pub(in crate::consensus::dispatch) fn verify_proposal_history_commitment_if_requ
             scheme,
             bls_key_history,
             min_v_eff_delay,
+            genesis_hash: _,
         } => (scheme, bls_key_history, min_v_eff_delay),
     };
     let actual = crate::consensus::history_commitment::compute_post_block_commitment(

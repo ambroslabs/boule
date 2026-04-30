@@ -467,8 +467,9 @@ impl<T> Verified<Signed<T>> {
 ///
 /// The historical name reflects QC verification, but the variant
 /// carries every chain-level parameter needed for both checks:
-/// `scheme`, `bls_key_history`, and `min_v_eff_delay` are all read by
-/// the proposal-receive validator alongside the QC verifier.
+/// `scheme`, `bls_key_history`, `min_v_eff_delay`, and `genesis_hash`
+/// are all read by the proposal-receive validator alongside the QC
+/// verifier.
 pub enum QcVerification<'a> {
     #[cfg(test)]
     Skip,
@@ -486,6 +487,17 @@ pub enum QcVerification<'a> {
         /// is `crate::consensus::reconfig::MIN_V_EFF_DELAY`; tests
         /// may pass a different value to exercise edge cases.
         min_v_eff_delay: View,
+        /// The chain's genesis block hash. Used by the QC aggregate
+        /// verifier (audit finding 7-4, issue #418) to reject view-0
+        /// QCs whose `block_hash` is anything other than `genesis_hash`.
+        /// The genesis-QC convention skips aggregate verification at
+        /// `view == 0` (placeholder Ed25519 sigs / empty BLS aggregate
+        /// sentinel), but that skip would otherwise also accept a
+        /// forged QC at view 0 over an attacker-chosen block hash.
+        /// The safety core's parent walk would catch this downstream,
+        /// but defense-in-depth says reject the malformed envelope at
+        /// the boundary.
+        genesis_hash: BlockHash,
     },
 }
 
