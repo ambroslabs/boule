@@ -54,6 +54,13 @@ use super::{Dispatch, IngressError, QcVerification, Verified};
 /// Returns [`Err(IngressError)`] if the frame can't be decoded or fails
 /// signature verification. The event loop should log and drop on error;
 /// the state machines are never touched.
+///
+/// Gated to `cfg(test)` (audit finding 10-4, issue #413): defaults to
+/// [`QcVerification::Skip`], which would silently disable embedded-QC
+/// aggregate verification if a production caller ever picked it up.
+/// Production wires [`ingress_with_qc_verification`] with
+/// [`QcVerification::Verify`] directly.
+#[cfg(test)]
 pub fn ingress(
     from: NodeId,
     bytes: &[u8],
@@ -74,7 +81,8 @@ pub fn ingress(
 /// Decode + verify a wire frame, additionally checking embedded QC
 /// aggregates per `qc_verification`. Production callers pass
 /// [`QcVerification::Verify`] with the chain's scheme; tests that
-/// construct QCs with placeholder signatures pass [`QcVerification::Skip`].
+/// construct QCs with placeholder signatures pass the `cfg(test)`-only
+/// `QcVerification::Skip`.
 pub fn ingress_with_qc_verification(
     from: NodeId,
     bytes: &[u8],
@@ -89,7 +97,10 @@ pub fn ingress_with_qc_verification(
 
 /// Same as [`ingress`] but takes an already-decoded [`WireMessage`].
 ///
-/// Exposed for unit tests that construct wire messages directly.
+/// Exposed for unit tests that construct wire messages directly. Gated
+/// to `cfg(test)` for the same reason as [`ingress`] (audit finding
+/// 10-4, issue #413).
+#[cfg(test)]
 pub fn ingress_wire(
     from: NodeId,
     msg: WireMessage,

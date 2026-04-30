@@ -707,7 +707,6 @@ impl SimCluster {
                 let identity = crate::crypto::bls_key::BlsValidatorIdentity {
                     secret: zeroize::Zeroizing::new(sk),
                     public: pk,
-                    pop: crate::crypto::sig_scheme::BlsAggregated::sign_pop(&sk).unwrap(),
                 };
                 let bls_signer: Arc<
                     dyn crate::crypto::signed::PartialSigner<
@@ -4987,7 +4986,7 @@ mod tests {
         bls_ikm[0] = 0x42; // deterministic across re-runs of this test
         bls_ikm[1] = rotated_idx as u8;
         let (new_bls_sk, new_bls_pk) = BlsAggregated::keygen(&bls_ikm).unwrap();
-        let new_bls_pop = BlsAggregated::sign_pop(&new_bls_sk).unwrap();
+        let new_bls_pop = BlsAggregated::sign_pop(&new_bls_sk, &ChainId::TEST).unwrap();
 
         let v_eff: View = 60;
         let payload = ValidatorKeyRotation {
@@ -5532,5 +5531,102 @@ mod tests {
             rotation_committed,
             "the rejected rotation tx should still appear on-chain",
         );
+    }
+
+    // ── #437 / Audit Finding 5-3: cross-replica Block byte determinism ────────
+    //
+    // #426 verified that `MempoolBlockBuilder::build` reads
+    // `pending_blocks` only via `.get(&hash)` — there is no `HashMap`
+    // iteration in the build path, so `state_commitment` is
+    // determinism-safe today. This test is the regression net for
+    // *future* changes: it commits ≥ 10 blocks at every node of a
+    // 4-node cluster, then asserts byte-equal `Block` (full struct
+    // equality, not just hash) at every height that all four replicas
+    // committed. If a future change introduces an order-sensitive
+    // iteration of `pending_blocks` (or otherwise breaks block-build
+    // determinism), it surfaces here as cross-replica `Block` divergence.
+
+    /// Cross-replica byte-equal `Block` regression for Audit Finding
+    /// 5-3 (#426 / #437). Sweeps three hand-coded seeds; for each seed
+    /// every height committed by all four replicas must carry the
+    /// byte-identical `Block`.
+    #[tokio::test(start_paused = true)]
+    async fn audit_5_3_cross_replica_block_byte_determinism() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        for seed in [0x00C0_FFEEu64, 0xDEAD_BEEF, 0x4242_4242] {
+            let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+            // Feed deterministic mempool payloads into every node so
+            // the leader's `MempoolBlockBuilder::build` runs against a
+            // non-empty `pending_blocks` HashMap. Any future code path
+            // that iterates it in HashMap order would surface as
+            // cross-replica block divergence below.
+            let mut rng = ChaCha20Rng::seed_from_u64(seed);
+            for _ in 0..32 {
+                let mut buf = [0u8; 16];
+                rng.fill(&mut buf);
+                let payload = Bytes::copy_from_slice(&buf);
+                for mp in &cluster.mempools {
+                    let _ = mp.insert(payload.clone());
+                }
+            }
+
+            // Drive until every replica has committed ≥ 10 blocks.
+            // Under paused virtual time the wall-clock cost is yields,
+            // not seconds; 10 commits across 4 nodes is comfortably
+            // under the 15s per-test budget.
+            let reached = cluster
+                .advance_and_yield_until(Duration::from_secs(10), |c| {
+                    c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 10
+                })
+                .await;
+            assert!(
+                reached,
+                "seed={seed:#x}: cluster failed to commit 10 blocks per node within budget",
+            );
+
+            let committed = cluster.drain_commits();
+            assert_eq!(committed.len(), 4);
+
+            // Index each replica's commits by height, then compare
+            // every height that all four replicas reached for full
+            // `Block` equality (not just hash).
+            let by_height: Vec<HashMap<u64, &Block>> = committed
+                .iter()
+                .map(|node_blocks| node_blocks.iter().map(|b| (b.header.height, b)).collect())
+                .collect();
+
+            let mut common: Vec<u64> = by_height[0]
+                .keys()
+                .copied()
+                .filter(|h| by_height.iter().skip(1).all(|m| m.contains_key(h)))
+                .collect();
+            common.sort();
+            assert!(
+                common.len() >= 10,
+                "seed={seed:#x}: expected >= 10 heights common to all four replicas, got {} ({common:?})",
+                common.len(),
+            );
+
+            for h in &common {
+                let b0 = by_height[0][h];
+                for (i, m) in by_height.iter().enumerate().skip(1) {
+                    let bi = m[h];
+                    assert_eq!(
+                        bi, b0,
+                        "seed={seed:#x}: replica {i} committed a non-byte-equal Block at height {h} (Audit Finding 5-3 regression)",
+                    );
+                }
+            }
+
+            // Sanity: hash-level safety still holds. `assert_eq!` above
+            // already implies this, but keeping the explicit oracle
+            // makes a partial regression (hashes equal, internals not)
+            // surface with a clearer message at teardown.
+            assert_no_conflicts(&committed);
+            cluster.assert_no_replica_double_voted();
+        }
     }
 }

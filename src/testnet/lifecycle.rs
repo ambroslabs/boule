@@ -128,6 +128,13 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
     // Phase 2a: on BLS chains, mint each node's BLS validator key now
     // (so we can pre-compute the genesis BLS table and bake the path
     // into the final config). On Ed25519 chains this is a no-op.
+    //
+    // PoPs are minted in two passes (#410): first the keypairs alone,
+    // then — once we can compute the deployment's chain_id from the
+    // (validators + bls_pubkeys) tuple — chain-bound PoPs over each
+    // validator's pubkey. The single-pass version that lived here
+    // before chain_id binding produced PoPs that would replay across
+    // any deployment sharing those BLS keys.
     let bls_genesis = mint_bls_keys_if_needed(signature_scheme, &mut nodes)?;
 
     // Phase 2b: write the final per-node config with the full
@@ -206,16 +213,33 @@ struct BlsGenesisEntry {
 /// Mutates each node's `NodeLayout::bls_key_path` so the final-config
 /// writer can reference the on-disk path under
 /// `[node.bls_validator_identity]`.
+///
+/// The PoP attached to each entry is derived against the deployment's
+/// chain_id (#410), computed in-process from the genesis-block hash
+/// over (validators, BLS pubkeys, default genesis seed). Without that
+/// binding a PoP minted here would replay across any deployment that
+/// happened to reuse the same validator BLS key.
 fn mint_bls_keys_if_needed(
     scheme: crate::crypto::sig_scheme::SignatureSchemeChoice,
     nodes: &mut [NodeLayout],
 ) -> anyhow::Result<Option<Vec<BlsGenesisEntry>>> {
     use crate::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
-    use crate::crypto::sig_scheme::SignatureSchemeChoice;
+    use crate::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
+    use crate::p2p::tls::base58_to_node_id;
     if scheme == SignatureSchemeChoice::Ed25519Collected {
         return Ok(None);
     }
-    let mut genesis = Vec::with_capacity(nodes.len());
+
+    // Pass 1: provision each validator's BLS key file on disk and
+    // collect (NodeId, secret, pubkey). PoPs are deferred until the
+    // chain_id is known.
+    struct PendingEntry {
+        node_id: String,
+        node_id_bytes: crate::p2p::tls::NodeId,
+        secret: zeroize::Zeroizing<crate::crypto::sig_scheme::BlsSecretKey>,
+        public: BlsPublicKey,
+    }
+    let mut pending: Vec<PendingEntry> = Vec::with_capacity(nodes.len());
     for n in nodes.iter_mut() {
         let dir = n
             .config_path
@@ -236,12 +260,42 @@ fn mint_bls_keys_if_needed(
             .node_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("node_id missing for {}", n.display_name()))?;
-        genesis.push(BlsGenesisEntry {
+        let node_id_bytes = base58_to_node_id(&node_id).map_err(|e| {
+            anyhow::anyhow!("invalid node_id {} for {}: {e}", node_id, n.display_name(),)
+        })?;
+        pending.push(PendingEntry {
             node_id,
-            bls_pubkey_hex: hex::encode(identity.public),
-            bls_pop_hex: hex::encode(identity.pop.sig),
+            node_id_bytes,
+            secret: identity.secret,
+            public: identity.public,
         });
         n.bls_key_path = Some(bls_path);
+    }
+
+    // Pass 2: compute the deployment's chain_id from the validator
+    // pubkeys + BLS table the genesis block will commit to, and mint a
+    // chain-bound PoP per validator (#410).
+    let validator_ids: Vec<crate::p2p::tls::NodeId> =
+        pending.iter().map(|e| e.node_id_bytes).collect();
+    let bls_pubkeys: Vec<(crate::p2p::tls::NodeId, BlsPublicKey)> = pending
+        .iter()
+        .map(|e| (e.node_id_bytes, e.public))
+        .collect();
+    // `testnet new` doesn't expose `genesis_seed_hex`, so the cluster
+    // uses the default all-zeros seed — same as a config that omits
+    // the field.
+    let chain_id =
+        crate::node::derive_chain_id_from_parts(&validator_ids, scheme, &bls_pubkeys, [0u8; 32]);
+
+    let mut genesis = Vec::with_capacity(pending.len());
+    for entry in pending {
+        let pop = BlsAggregated::sign_pop(&entry.secret, &chain_id)
+            .map_err(|e| anyhow::anyhow!("signing chain-bound BLS PoP: {e:?}"))?;
+        genesis.push(BlsGenesisEntry {
+            node_id: entry.node_id,
+            bls_pubkey_hex: hex::encode(entry.public),
+            bls_pop_hex: hex::encode(pop.sig),
+        });
     }
     Ok(Some(genesis))
 }

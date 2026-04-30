@@ -39,13 +39,15 @@ pub(in crate::consensus::dispatch) fn verify_proposal_history_commitment_if_requ
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
-    let QcVerification::Verify {
-        scheme,
-        bls_key_history,
-        min_v_eff_delay,
-    } = qc_verification
-    else {
-        return Ok(());
+    let (scheme, bls_key_history, min_v_eff_delay) = match qc_verification {
+        #[cfg(test)]
+        QcVerification::Skip => return Ok(()),
+        QcVerification::Verify {
+            scheme,
+            bls_key_history,
+            min_v_eff_delay,
+            genesis_hash: _,
+        } => (scheme, bls_key_history, min_v_eff_delay),
     };
     let actual = crate::consensus::history_commitment::compute_post_block_commitment(
         block,

@@ -470,6 +470,103 @@ impl QuorumCertificate {
     }
 }
 
+/// A [`QuorumCertificate`] whose aggregate signature has been verified
+/// against the validator set authoritative at `qc.view`.
+///
+/// Mirrors the [`crate::consensus::dispatch::Verified`] envelope
+/// pattern at the QC layer: the safety core's `state.high_qc` is typed
+/// `Option<VerifiedQc>` so a future snapshot importer or persistence
+/// path that decodes a QC from bytes cannot land it in the safety
+/// core without a typed-by-construction trust justification. Audit
+/// finding 5-1 / issue #408.
+///
+/// # Constructors
+///
+/// - [`VerifiedQc::unchecked`]: production callers MUST be at named
+///   audit sites (currently enumerated in that constructor's doc);
+///   tests use freely. Every production call site is grep-able by
+///   name and explains its trust model in an inline comment.
+///
+/// The wire format is unchanged — `QuorumCertificate` is what crosses
+/// the network and what is persisted to disk; `VerifiedQc` only
+/// exists in-memory inside the safety core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedQc(QuorumCertificate);
+
+impl VerifiedQc {
+    /// Construct a `VerifiedQc` without running aggregate verification.
+    ///
+    /// **Production code MUST NOT call this except at audited-by-name
+    /// sites.** Every call site in production is grep-able as
+    /// `VerifiedQc::unchecked` and includes an inline comment
+    /// justifying its trust model. The currently-allowed production
+    /// trust paths are:
+    ///
+    /// 1. **Genesis QC seed** — `ConsensusNode::new` and
+    ///    `recover_state` mint the cluster-agreed genesis QC via
+    ///    [`genesis_qc`] / [`genesis_qc_bls`] before the safety core
+    ///    has seen any wire traffic. The dispatch verifier
+    ///    [`crate::consensus::dispatch::verify::qc::verify_qc_if_requested`]
+    ///    short-circuits at `view == 0 || signer_count == 0`, so
+    ///    wrapping unchecked is exactly equivalent.
+    /// 2. **QC adopted from a `Verified<Signed<Proposal>>` /
+    ///    `Verified<Signed<NewView>>` envelope** — the dispatch
+    ///    verifier ran `verify_qc_if_requested` against the
+    ///    historical validator set at `qc.view` before constructing
+    ///    the envelope. Extracting the QC for `state.high_qc` carries
+    ///    that same proof.
+    /// 3. **Locally-formed QC from ingress-verified vote envelopes**
+    ///    (`HotStuffCore::on_vote_received`). Ed25519 partials and
+    ///    BLS partials each get verified at ingress against the
+    ///    signer's per-historical-view pubkey before they reach the
+    ///    safety core; the locally-assembled aggregate is
+    ///    well-formed by construction.
+    /// 4. **QC piggybacked on a `TimeoutVote` that survived
+    ///    `verify_high_qc_piggyback`** (`high_qc_trusted == true`).
+    ///    The piggyback verifier runs the same aggregate-verify
+    ///    check as the hard path; on failure the piggyback is
+    ///    dropped before the bucket sees it (audit finding 10-F3 /
+    ///    issue #321).
+    /// 5. **QC decoded by `recover_state` from our own durable
+    ///    storage**. The QC was a `VerifiedQc` at the time we
+    ///    persisted it; trust on read mirrors what we extend to
+    ///    `last_voted_view` and `locked` from the same store.
+    /// 6. **QC adopted via
+    ///    [`crate::consensus::hotstuff::step::HotStuffCore::adopt_snapshot`]
+    ///    from a `SnapshotManifest`** that survived
+    ///    `SnapshotManifest::verify` upstream.
+    ///
+    /// Tests use this freely.
+    pub fn unchecked(qc: QuorumCertificate) -> Self {
+        Self(qc)
+    }
+
+    /// Borrow the inner QC. Read-only access for safety-rule
+    /// predicates and any caller that needs the raw signature payload
+    /// (e.g. wire-egress, where the typestate is stripped).
+    pub fn inner(&self) -> &QuorumCertificate {
+        &self.0
+    }
+
+    /// Consume and unwrap. Used at wire-egress to extract the raw
+    /// `QuorumCertificate` for serialization (the wire format is
+    /// `QuorumCertificate`, not `VerifiedQc`).
+    pub fn into_inner(self) -> QuorumCertificate {
+        self.0
+    }
+
+    /// Shortcut for `self.inner().view` so safety-rule readers stay
+    /// terse.
+    pub fn view(&self) -> View {
+        self.0.view
+    }
+
+    /// Shortcut for `self.inner().block_hash`.
+    pub fn block_hash(&self) -> BlockHash {
+        self.0.block_hash
+    }
+}
+
 // ───────────────────────────── wire types ─────────────────────────────
 
 /// A leader's proposal for a new block at some view, justified by a QC
