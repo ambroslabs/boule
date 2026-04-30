@@ -1318,7 +1318,7 @@ mod tests {
         let mut ikm = [0u8; 32];
         ikm[0] = 0x42;
         let (sk, pk) = BlsAggregated::keygen(&ikm).unwrap();
-        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId([0u8; 32])).unwrap();
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("pop.txt");
@@ -1331,7 +1331,7 @@ mod tests {
         let parsed = read_bls_pop_file(&path).expect("must parse");
         assert_eq!(parsed.pubkey, pop.pubkey);
         assert_eq!(parsed.sig, pop.sig);
-        BlsAggregated::verify_pop(&parsed, &pk, &ChainId::TEST)
+        BlsAggregated::verify_pop(&parsed, &pk, &ChainId([0u8; 32]))
             .expect("must still verify after round-trip");
     }
 

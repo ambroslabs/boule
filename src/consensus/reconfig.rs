@@ -154,6 +154,12 @@ impl ReconfigCommand {
     /// - Each `removes` entry is currently a member.
     /// - No `adds` entry is currently a member.
     /// - Resulting set size `>= MIN_VALIDATOR_FLOOR`.
+    ///
+    /// Test-only shim around [`Self::validate_against_with_delay_and_scheme`]
+    /// — production callers thread in the chain's real scheme and
+    /// chain_id rather than relying on the Ed25519 + [`ChainId::TEST`]
+    /// defaults this wrapper hardcodes.
+    #[cfg(test)]
     pub fn validate_against(
         &self,
         current_set: &ValidatorSet,
@@ -168,11 +174,13 @@ impl ReconfigCommand {
     /// (#272) so deployments can require a longer "give the new
     /// validator time to state-sync" window than the consensus floor.
     ///
-    /// This shim assumes [`SignatureSchemeChoice::Ed25519Collected`]
-    /// (so chain-id-bound PoP verification is irrelevant — Ed25519
-    /// chains carry no PoPs). Use [`Self::validate_against_with_delay_and_scheme`]
-    /// from any call site that has the chain's scheme in hand to
-    /// enforce the "BLS chain → every `adds` entry needs a PoP" rule.
+    /// This shim is `cfg(test)` because it assumes
+    /// [`SignatureSchemeChoice::Ed25519Collected`] and uses
+    /// [`ChainId::TEST`], both of which are inappropriate for
+    /// production. Production callers go through
+    /// [`Self::validate_against_with_delay_and_scheme`] with the
+    /// chain's real scheme + chain_id.
+    #[cfg(test)]
     pub fn validate_against_with_delay(
         &self,
         current_set: &ValidatorSet,
