@@ -4350,25 +4350,68 @@ pub fn recover_state(
         state.high_qc = Some(decode_high_qc(&raw)?);
     }
 
-    // Re-seed `pending_blocks` with the locked / high_qc blocks so the
-    // safety-rule walks (extension via locked, become_leader's parent
-    // lookup) terminate without first having to round-trip through
-    // block-sync. Genesis is already in `pending_blocks`. Any block
-    // missing from storage (e.g. an older snapshot adopted via NewView
-    // before the persist-with-block pairing landed) is silently
-    // skipped — the existing block-sync paths still cover that case.
-    if let Some(qc) = state.high_qc.as_ref().cloned()
-        && let Some(block) = load_block_from_storage(storage, &qc.block_hash)?
-    {
-        state.insert_pending(block);
+    // Re-seed `pending_blocks` with the locked / high_qc blocks plus a
+    // bounded fringe of their ancestors so the safety-rule walks
+    // (extension via locked, become_leader's parent lookup, the 2-chain
+    // promotion walk, and the 3-chain commit walk) terminate without
+    // first having to round-trip through block-sync. Genesis is already
+    // in `pending_blocks`. Any block missing from storage (e.g. an older
+    // snapshot adopted via NewView before the persist-with-block pairing
+    // landed) is silently skipped — the existing block-sync paths still
+    // cover that case.
+    //
+    // Walking `RECOVER_PARENT_HOPS` parents from each anchor closes
+    // audit finding 4-5: the 2-chain promotion walk needs the locked
+    // block's grandparent and the 3-chain commit walk needs high_qc's
+    // great-grandparent, so without this the first proposal received
+    // post-restart can silently fail to promote the lock for one or
+    // two views before the chain refills.
+    if let Some(qc) = state.high_qc.as_ref().cloned() {
+        rehydrate_ancestors(storage, &mut state, qc.block_hash)?;
     }
-    if let Some(locked) = state.locked
-        && let Some(block) = load_block_from_storage(storage, &locked.block_hash)?
-    {
-        state.insert_pending(block);
+    if let Some(locked) = state.locked {
+        rehydrate_ancestors(storage, &mut state, locked.block_hash)?;
     }
 
     Ok(state)
+}
+
+/// Number of parent hops [`recover_state`] walks back from each of
+/// `high_qc.block_hash` and `locked.block_hash` when re-seeding
+/// `pending_blocks`. Set to two so the loaded fringe covers both the
+/// 2-chain promotion walk (locked + grandparent) and the 3-chain
+/// commit walk (high_qc + great-grandparent) on the first proposal
+/// received after restart. See audit finding 4-5 / issue #412.
+const RECOVER_PARENT_HOPS: usize = 2;
+
+/// Walk up to [`RECOVER_PARENT_HOPS`] parents back from `start`,
+/// loading each block from durable storage into `state.pending_blocks`.
+/// Stops at genesis (`parent_hash == [0; 32]`), at a block already in
+/// `pending_blocks` (its parents will be reached via that block's own
+/// `header.parent_hash`), or when a block is absent from storage —
+/// whichever comes first.
+fn rehydrate_ancestors(
+    storage: &dyn Storage,
+    state: &mut HotStuffState,
+    start: BlockHash,
+) -> anyhow::Result<()> {
+    let mut cursor = start;
+    for _ in 0..=RECOVER_PARENT_HOPS {
+        let parent = if let Some(b) = state.pending_blocks.get(&cursor) {
+            b.header.parent_hash
+        } else if let Some(block) = load_block_from_storage(storage, &cursor)? {
+            let parent = block.header.parent_hash;
+            state.insert_pending(block);
+            parent
+        } else {
+            break;
+        };
+        if parent == [0u8; 32] {
+            break;
+        }
+        cursor = parent;
+    }
+    Ok(())
 }
 
 // ── Status-snapshot helper ───────────────────────────────────────────────────
@@ -5632,6 +5675,174 @@ mod tests {
                 .pending_blocks
                 .contains_key(&qc.block_hash),
         );
+    }
+
+    /// Issue #412 / audit finding 4-5: `recover_state` rehydrates not
+    /// only the locked / high_qc blocks but a bounded fringe of their
+    /// ancestors so the 2-chain promotion walk and 3-chain commit walk
+    /// terminate locally on the very first proposal received after a
+    /// restart. Without this, the lock can fail to advance for one or
+    /// two views while the chain refills from fresh proposals.
+    #[test]
+    fn recover_rehydrates_locked_and_high_qc_ancestors() {
+        use crate::replication::block::BlockHeader;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let g = genesis();
+
+        // Build a five-block chain rooted at genesis: g <- b1 <- b2 <-
+        // b3 <- b4. b3 is the locked block; b4 is the high_qc block.
+        // The 3-chain commit walk from b4 needs b2 (great-grandparent);
+        // the 2-chain promotion walk from b3 needs b1 (grandparent).
+        let mut blocks = vec![g.clone()];
+        for i in 1..=4u64 {
+            let parent = blocks.last().unwrap();
+            blocks.push(Block {
+                header: BlockHeader {
+                    parent_hash: parent.hash(),
+                    height: i,
+                    view: i + 10,
+                    proposer: nid(((i % 4) + 1) as u8),
+                    state_commitment: [0u8; 32],
+                    commands_commitment: Block::commands_commitment(&[]),
+                    validator_history_commitment: [0; 32],
+                },
+                commands: vec![],
+            });
+        }
+        let b1 = &blocks[1];
+        let b2 = &blocks[2];
+        let b3 = &blocks[3];
+        let b4 = &blocks[4];
+
+        // Persist every non-genesis block under the block-storage prefix
+        // (mirrors what `persist_updates` would have written across
+        // earlier sessions where each block was at the high_qc tip).
+        for b in &blocks[1..] {
+            storage
+                .put(&block_storage_key(&b.hash()), &encode_block(b).unwrap())
+                .unwrap();
+        }
+
+        // Persist locked = b3 and high_qc over b4 so `recover_state`
+        // anchors the walk on the right pair.
+        let locked = Locked {
+            view: b3.header.view,
+            height: b3.header.height,
+            block_hash: b3.hash(),
+        };
+        let mut qc = QuorumCertificate::new(b4.header.view, b4.hash(), 4);
+        qc.add_signature(0, [0x11u8; 64]);
+        qc.add_signature(1, [0x22u8; 64]);
+        qc.add_signature(2, [0x33u8; 64]);
+        storage
+            .put(STORAGE_KEY_LOCKED, &encode_locked(&locked).unwrap())
+            .unwrap();
+        storage
+            .put(STORAGE_KEY_HIGH_QC, &encode_high_qc(&qc).unwrap())
+            .unwrap();
+
+        let state = recover_state(storage.as_ref(), four_validators(), g.clone()).unwrap();
+
+        // Genesis is always seeded; every block on the locked / high_qc
+        // ancestry up to two hops from each anchor is rehydrated. The
+        // union covers b1..b4 — exactly the blocks the safety walks
+        // need on the first post-restart proposal.
+        assert!(state.pending_blocks.contains_key(&g.hash()));
+        for (label, hash) in [
+            ("b1", b1.hash()),
+            ("b2", b2.hash()),
+            ("b3", b3.hash()),
+            ("b4", b4.hash()),
+        ] {
+            assert!(
+                state.pending_blocks.contains_key(&hash),
+                "recover must rehydrate {label} so the 2-chain / 3-chain walks \
+                 terminate locally on the first proposal after restart",
+            );
+        }
+    }
+
+    /// Companion to [`recover_rehydrates_locked_and_high_qc_ancestors`]:
+    /// when an ancestor is missing from durable storage (e.g. an older
+    /// snapshot adopted via NewView before the persist-with-block
+    /// pairing landed), the walk stops at the gap and recovery does
+    /// not error — block-sync still covers the rest of the chain.
+    #[test]
+    fn recover_stops_at_first_missing_ancestor() {
+        use crate::replication::block::BlockHeader;
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let g = genesis();
+
+        // g <- b1 <- b2 <- b3. Persist b2 and b3 only — b1 is missing,
+        // simulating a gap in the durable block store.
+        let b1 = Block {
+            header: BlockHeader {
+                parent_hash: g.hash(),
+                height: 1,
+                view: 11,
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let b2 = Block {
+            header: BlockHeader {
+                parent_hash: b1.hash(),
+                height: 2,
+                view: 12,
+                proposer: nid(2),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        let b3 = Block {
+            header: BlockHeader {
+                parent_hash: b2.hash(),
+                height: 3,
+                view: 13,
+                proposer: nid(3),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        };
+        storage
+            .put(&block_storage_key(&b2.hash()), &encode_block(&b2).unwrap())
+            .unwrap();
+        storage
+            .put(&block_storage_key(&b3.hash()), &encode_block(&b3).unwrap())
+            .unwrap();
+
+        let locked = Locked {
+            view: b2.header.view,
+            height: b2.header.height,
+            block_hash: b2.hash(),
+        };
+        let mut qc = QuorumCertificate::new(b3.header.view, b3.hash(), 4);
+        qc.add_signature(0, [0x11u8; 64]);
+        qc.add_signature(1, [0x22u8; 64]);
+        qc.add_signature(2, [0x33u8; 64]);
+        storage
+            .put(STORAGE_KEY_LOCKED, &encode_locked(&locked).unwrap())
+            .unwrap();
+        storage
+            .put(STORAGE_KEY_HIGH_QC, &encode_high_qc(&qc).unwrap())
+            .unwrap();
+
+        let state = recover_state(storage.as_ref(), four_validators(), g.clone()).unwrap();
+
+        // The available ancestors load; the missing one stops the walk
+        // without erroring.
+        assert!(state.pending_blocks.contains_key(&b3.hash()));
+        assert!(state.pending_blocks.contains_key(&b2.hash()));
+        assert!(!state.pending_blocks.contains_key(&b1.hash()));
     }
 
     /// Persisting `HighQc` whose block is *not* in `pending_blocks` —
