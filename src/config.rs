@@ -6,6 +6,7 @@ use tracing::warn;
 
 use crate::cli::OutputFormat;
 use crate::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
+use crate::crypto::signed::ChainId;
 use crate::p2p::identity::KeyProvider;
 use crate::p2p::identity::encrypted_file::EncryptedFileKeyProvider;
 use crate::p2p::identity::env::EnvKeyProvider;
@@ -273,20 +274,31 @@ pub struct ValidatorBlsEntry {
 }
 
 impl ConsensusConfig {
-    /// Parse and validate the `validators_bls` table against
-    /// `signature_scheme` and `validators`. Returns the ordered list of
-    /// `(node_id, bls_pubkey)` pairs ready to seed a
-    /// [`crate::consensus::bls_key_history::BlsKeyHistory::with_genesis`].
+    /// Parse and structurally validate the `validators_bls` table
+    /// against `signature_scheme` and `validators`. Returns the
+    /// ordered list of `(node_id, bls_pubkey, bls_pop)` triples ready
+    /// for two consumers:
+    ///
+    /// 1. A `(NodeId, BlsPublicKey)` projection seeds the genesis
+    ///    [`crate::consensus::bls_key_history::BlsKeyHistory`] and
+    ///    feeds the genesis-block `validator_history_commitment`.
+    /// 2. The `BlsPop` is verified cryptographically by
+    ///    [`Self::verify_genesis_bls_pops`] *after* the genesis hash
+    ///    (and therefore the chain_id) is known, since the PoP
+    ///    pre-image binds to chain_id (#410).
     ///
     /// Errors:
     /// - On a BLS chain: `validators_bls` missing, mismatched length,
-    ///   duplicate or unknown `node_id`s, malformed hex, or any PoP
-    ///   that fails verification under its declared pubkey.
+    ///   duplicate or unknown `node_id`s, or malformed hex. PoP
+    ///   cryptographic verification is deferred to
+    ///   [`Self::verify_genesis_bls_pops`] because the chain_id isn't
+    ///   known until the genesis block is built from this triple.
     /// - On an Ed25519 chain: any `validators_bls` entry present at all.
     ///
     /// On a BLS chain, the returned `Vec` is the per-validator BLS
-    /// timeline at view 0. On an Ed25519 chain, returns an empty `Vec`.
-    pub fn resolve_genesis_bls_keys(&self) -> anyhow::Result<Vec<(NodeId, BlsPublicKey)>> {
+    /// timeline at view 0 plus the operator-supplied PoPs. On an
+    /// Ed25519 chain, returns an empty `Vec`.
+    pub fn resolve_genesis_bls_keys(&self) -> anyhow::Result<Vec<(NodeId, BlsPublicKey, BlsPop)>> {
         match self.signature_scheme {
             SignatureSchemeChoice::Ed25519Collected => {
                 if !self.validators_bls.is_empty() {
@@ -374,17 +386,36 @@ impl ConsensusConfig {
                         pubkey,
                         sig: sig_bytes,
                     };
-                    BlsAggregated::verify_pop(&pop, &pubkey).map_err(|e| {
-                        anyhow::anyhow!(
-                            "consensus.validators_bls[{idx}] PoP failed verification under its \
-                             declared pubkey: {e}",
-                        )
-                    })?;
-                    out.push((nid, pubkey));
+                    out.push((nid, pubkey, pop));
                 }
                 Ok(out)
             }
         }
+    }
+
+    /// Cryptographically verify the genesis `validators_bls` PoPs
+    /// against `chain_id`. Run after the genesis block is built so the
+    /// chain_id is known (#410): the PoP pre-image is
+    /// `chain_id || pubkey`, so an operator-supplied PoP that does
+    /// not bind to the deployment's chain_id is rejected here.
+    ///
+    /// On Ed25519 chains this is a no-op; the `entries` slice will be
+    /// empty.
+    pub fn verify_genesis_bls_pops(
+        &self,
+        entries: &[(NodeId, BlsPublicKey, BlsPop)],
+        chain_id: &ChainId,
+    ) -> anyhow::Result<()> {
+        for (idx, (_nid, pubkey, pop)) in entries.iter().enumerate() {
+            BlsAggregated::verify_pop(pop, pubkey, chain_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "consensus.validators_bls[{idx}] PoP failed verification under its declared \
+                     pubkey and the chain's chain_id: {e}. Re-mint the PoP against this \
+                     deployment's genesis (the PoP pre-image now binds to chain_id, #410).",
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Validate that the snapshot-policy fields are internally
@@ -2033,12 +2064,16 @@ listen_addr = "127.0.0.1:8080"
     }
 
     fn make_bls_validator(seed: u8) -> BlsTestEntry {
+        // Tests bind PoPs to the test sentinel chain_id; the
+        // corresponding `verify_genesis_bls_pops` calls below pass
+        // `&ChainId::TEST`. A real deployment would mint PoPs against
+        // the deployment's actual `ChainId::from_genesis_hash(...)`.
         let nid: NodeId = [seed; 32];
         let mut ikm = [0u8; 32];
         ikm[0] = seed;
         ikm[1] = 0xAA;
         let (sk, pk) = BlsAggregated::keygen(&ikm).unwrap();
-        let pop = BlsAggregated::sign_pop(&sk).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
         BlsTestEntry {
             nid_b58: node_id_to_base58(&nid),
             pubkey_hex: hex::encode(pk),
@@ -2087,13 +2122,53 @@ listen_addr = "127.0.0.1:8080"
             bls_table = render_bls_table(&v),
         );
         let cons = parse(&s).consensus.expect("consensus");
-        let resolved = cons.resolve_genesis_bls_keys().expect("PoPs must verify");
+        let resolved = cons
+            .resolve_genesis_bls_keys()
+            .expect("structural validation must pass");
         assert_eq!(resolved.len(), 4);
         // Each NodeId in the resolved list must appear in the validators list.
-        for (nid, _pk) in &resolved {
+        for (nid, _pk, _pop) in &resolved {
             let b58 = node_id_to_base58(nid);
             assert!(v.iter().any(|e| e.nid_b58 == b58));
         }
+        // PoPs were minted under `ChainId::TEST`; verification under
+        // the same chain_id must succeed (#410).
+        cons.verify_genesis_bls_pops(&resolved, &ChainId::TEST)
+            .expect("PoPs minted under ChainId::TEST must verify under ChainId::TEST");
+    }
+
+    /// Audit finding 7-2 (#410): a `validators_bls` table whose PoPs
+    /// were minted against chain_id A is rejected when verified
+    /// against chain_id B. This is the genesis-config dual of the
+    /// reconfig-add cross-chain replay defense.
+    #[test]
+    fn bls_chain_pop_verification_rejects_cross_chain_replay() {
+        let v = (1..=4u8).map(make_bls_validator).collect::<Vec<_>>();
+        let s = format!(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+{validators}signature_scheme = "bls_aggregated"
+
+{bls_table}"#,
+            validators = render_validators(&v),
+            bls_table = render_bls_table(&v),
+        );
+        let cons = parse(&s).consensus.expect("consensus");
+        let resolved = cons.resolve_genesis_bls_keys().unwrap();
+        // PoPs were minted under `ChainId::TEST`; verifying them
+        // against a different chain_id must fail.
+        let other = ChainId([0xCC; 32]);
+        let err = cons.verify_genesis_bls_pops(&resolved, &other).unwrap_err();
+        assert!(
+            err.to_string().contains("PoP failed verification"),
+            "got: {err}",
+        );
     }
 
     #[test]
@@ -2168,7 +2243,12 @@ listen_addr = "127.0.0.1:8080"
             bls_table = render_bls_table(&v),
         );
         let cons = parse(&s).consensus.expect("consensus");
-        let err = cons.resolve_genesis_bls_keys().unwrap_err();
+        // Structural decode succeeds — the tamper is a cryptographic
+        // failure, surfaced by `verify_genesis_bls_pops`.
+        let resolved = cons.resolve_genesis_bls_keys().unwrap();
+        let err = cons
+            .verify_genesis_bls_pops(&resolved, &ChainId::TEST)
+            .unwrap_err();
         assert!(
             err.to_string().contains("PoP failed verification"),
             "got: {err}",

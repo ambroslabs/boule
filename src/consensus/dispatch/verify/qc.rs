@@ -38,22 +38,39 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
-    let QcVerification::Verify {
-        scheme,
-        bls_key_history,
-        min_v_eff_delay: _,
-    } = qc_verification
-    else {
-        return Ok(());
+    let (scheme, bls_key_history, genesis_hash) = match qc_verification {
+        #[cfg(test)]
+        QcVerification::Skip => return Ok(()),
+        QcVerification::Verify {
+            scheme,
+            bls_key_history,
+            min_v_eff_delay: _,
+            genesis_hash,
+        } => (scheme, bls_key_history, genesis_hash),
     };
+
+    // Audit finding 7-4 (issue #418): a view-0 QC is the genesis
+    // convention — every honest replica builds the same QC over the
+    // genesis block hash. Reject view-0 QCs over any other block hash
+    // here at ingress, before the unconditional skip below would
+    // otherwise let a forged "genesis QC" past. The safety core's
+    // parent walk catches this downstream too, but defense-in-depth
+    // says reject the malformed envelope at the boundary rather than
+    // relying on the safety core.
+    if qc.view == 0 && qc.block_hash != *genesis_hash {
+        return Err(IngressError::InvalidQcAggregate {
+            view: 0,
+            scheme: scheme.name(),
+        });
+    }
 
     // Genesis QCs are a convention, not a cryptographic commitment:
     // every honest replica builds the same QC at view 0 over the
     // genesis block hash with all-zero placeholder signatures (see
     // `crate::consensus::hotstuff::qc::genesis_qc`). Aggregate
     // verification cannot succeed against placeholder sigs, and the
-    // safety core checks the QC's block_hash against the genesis hash
-    // downstream, so skipping at view 0 is safe.
+    // block_hash check above pins the QC to the real genesis, so
+    // skipping at view 0 is safe.
     //
     // QCs with no signers at any other view also have nothing to
     // verify cryptographically — accept them and let the safety core
@@ -62,7 +79,8 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
         return Ok(());
     }
 
-    let vs = history.set_at(qc.view);
+    let vs_at = history.set_at(qc.view);
+    let vs = vs_at.for_view(qc.view);
     // Each partial in the QC is the Ed25519 / BLS signature on the
     // domain-separated Signed<Vote> envelope preimage — the same bytes
     // the voter signed in `Signed::sign(vote, signer)`. Reconstruct
@@ -120,7 +138,7 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
                 view: qc.view,
                 scheme: scheme.name(),
             })?;
-            let pubkeys = bls_history.pubkeys_for_set(&vs, qc.view).map_err(|_| {
+            let pubkeys = bls_history.pubkeys_for_set(vs, qc.view).map_err(|_| {
                 IngressError::InvalidQcAggregate {
                     view: qc.view,
                     scheme: scheme.name(),
@@ -139,8 +157,8 @@ pub(in crate::consensus::dispatch) fn verify_qc_if_requested(
 /// Soft-verify the `high_qc` piggyback on a [`TimeoutVote`](crate::consensus::hotstuff::qc::TimeoutVote).
 ///
 /// Returns `true` if the piggyback is either absent, accompanied by a
-/// [`QcVerification::Skip`] policy (legacy / test fixture path), or
-/// passes both well-formedness and aggregate-signature verification
+/// `QcVerification::Skip` policy (legacy / test fixture path —
+/// `cfg(test)`-only), or passes both well-formedness and aggregate-signature verification
 /// against the validator set authoritative at `qc.view`. Returns
 /// `false` if the piggyback is structurally malformed or fails
 /// aggregate verification — the caller must then drop the piggyback
@@ -167,14 +185,15 @@ pub(in crate::consensus::dispatch) fn verify_high_qc_piggyback(
     let Some(qc) = high_qc else {
         return true;
     };
+    #[cfg(test)]
     if matches!(qc_verification, QcVerification::Skip) {
         return true;
     }
     // The piggyback's bitmap is sized for the validator set authoritative
     // at `qc.view` (the same set that voted to mint the QC). Reject
     // bitmap-shape divergence before paying for an aggregate verify.
-    let vs = history.set_at(qc.view);
-    if !qc.is_well_formed(&vs) {
+    let vs_at = history.set_at(qc.view);
+    if !qc.is_well_formed(vs_at.for_view(qc.view)) {
         return false;
     }
     verify_qc_if_requested(qc, history, key_history, qc_verification, chain_id).is_ok()

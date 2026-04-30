@@ -53,6 +53,7 @@ use crate::consensus::api::CommitNotifier;
 use crate::consensus::crashpoint::crashpoint;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
 use crate::consensus::hotstuff::Locked;
+use crate::consensus::hotstuff::qc::VerifiedQc;
 use crate::consensus::hotstuff::qc::genesis_qc_bls;
 use crate::consensus::hotstuff::qc::{ConsensusMsg, TimeoutVote, quorum_size};
 use crate::consensus::hotstuff::step::{
@@ -1001,7 +1002,12 @@ impl ConsensusNode {
         // build a proposal on first boot without waiting for a QC-forming
         // vote round. Every honest replica derives the same QC from the
         // shared `(genesis, validator_set_len)` config.
-        hs_state.high_qc = Some(boot_qc);
+        //
+        // The dispatch verifier (`verify_qc_if_requested`)
+        // short-circuits at `view == 0 || signer_count == 0`, so the
+        // genesis QC is trusted by convention and the unchecked wrap
+        // is exactly equivalent. Audit finding 5-1 / issue #408.
+        hs_state.high_qc = Some(VerifiedQc::unchecked(boot_qc));
         let eviction_counters = CacheEvictionCounters::default();
         let core = HotStuffCore::with_limits(
             self_id,
@@ -1110,7 +1116,10 @@ impl ConsensusNode {
     /// kept for tests and harnesses that need to inject a hand-built QC
     /// (e.g. to start from a mid-chain state).
     pub fn with_genesis_qc(mut self, qc: QuorumCertificate) -> Self {
-        self.core.set_high_qc(qc);
+        // Test/harness seed path. Production callers go through
+        // `ConsensusNode::new`, which mints the cluster-agreed genesis
+        // QC instead. Audit finding 5-1 / issue #408.
+        self.core.set_high_qc(VerifiedQc::unchecked(qc));
         self
     }
 
@@ -1171,12 +1180,12 @@ impl ConsensusNode {
         let high_qc = state.high_qc.as_ref().map(|qc| {
             let height = state
                 .pending_blocks
-                .get(&qc.block_hash)
+                .get(&qc.block_hash())
                 .map(|b| b.header.height);
             QcStatus {
-                view: qc.view,
+                view: qc.view(),
                 height,
-                block_hash: hex::encode(qc.block_hash),
+                block_hash: hex::encode(qc.block_hash()),
             }
         });
 
@@ -1654,6 +1663,7 @@ impl ConsensusNode {
                 &mut rebuilt_key,
                 self.signature_scheme,
                 self.min_v_eff_delay,
+                &self.chain_id,
             );
             apply_rotation_commands_to_histories(
                 block,
@@ -1891,7 +1901,7 @@ impl ConsensusNode {
             self_id = %node_id_to_base58(&self.self_id),
             last_committed_height = self.last_committed_height.load(Ordering::Relaxed),
             last_committed_view = self.last_committed_view,
-            high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view),
+            high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view()),
             last_voted_view = self.core.state().last_voted_view,
             locked_view = ?self.core.state().locked.as_ref().map(|l| l.view),
             validator_set_size = self.validator_set.len(),
@@ -1927,7 +1937,7 @@ impl ConsensusNode {
             .state()
             .high_qc
             .as_ref()
-            .map(|qc| qc.view)
+            .map(|qc| qc.view())
             .unwrap_or(0)
             .max(self.core.state().last_voted_view);
         let boot_actions = self.step_pacemaker(PacemakerEvent::OnQc(boot_view));
@@ -2014,11 +2024,15 @@ impl ConsensusNode {
                             }
                             // Verify QC aggregates at ingress per the chain's scheme
                             // (#332). Closes the Byzantine-leader-ships-bogus-QC
-                            // vector for both Ed25519 and BLS chains.
+                            // vector for both Ed25519 and BLS chains. The
+                            // `genesis_hash` is threaded so the verifier can
+                            // reject view-0 QCs over an attacker-chosen block
+                            // hash (#418, audit finding 7-4).
                             let qc_verification = dispatch::QcVerification::Verify {
                                 scheme: self.signature_scheme,
                                 bls_key_history: self.bls_key_history.as_ref(),
                                 min_v_eff_delay: self.min_v_eff_delay,
+                                genesis_hash: self.core.state().genesis_hash,
                             };
                             match dispatch::ingress_with_qc_verification(
                                 from,
@@ -2521,9 +2535,16 @@ impl ConsensusNode {
             view: manifest.view,
             last_committed_hash: block_hash,
         };
-        let safety_persist_actions =
-            self.core
-                .adopt_snapshot(block.clone(), manifest.commit_qc.clone(), manifest.view);
+        // `manifest.commit_qc` survived `SnapshotManifest::verify`
+        // upstream of `restore_from_snapshot` (well-formedness, quorum,
+        // and `commit_qc.block_hash == manifest.block_hash`), so wrap
+        // unchecked here is the audited-by-name snapshot trust path.
+        // Audit finding 5-1 / issue #408.
+        let safety_persist_actions = self.core.adopt_snapshot(
+            block.clone(),
+            VerifiedQc::unchecked(manifest.commit_qc.clone()),
+            manifest.view,
+        );
         let mut safety_persist_writes: Vec<(&'static [u8], Vec<u8>)> = Vec::new();
         for action in &safety_persist_actions {
             match action {
@@ -2957,7 +2978,7 @@ impl ConsensusNode {
                             requesting_height = expected_height,
                             triggered_by = reason.as_str(),
                             our_view = self.pacemaker.current_view(),
-                            our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view),
+                            our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view()),
                             "block_sync_request_emitted",
                         );
                         let out = dispatch::egress_block_request(hash, peer);
@@ -3206,7 +3227,12 @@ impl ConsensusNode {
     /// in this gap leaves the durable record that [`send_timeout`]
     /// replays after restart (audit finding 14-1, issue #415).
     fn persist_fresh_timeout_vote(&self, view: View) -> anyhow::Result<TimeoutVote> {
-        let high_qc = self.core.state().high_qc.clone();
+        let high_qc = self
+            .core
+            .state()
+            .high_qc
+            .as_ref()
+            .map(|qc| qc.inner().clone());
         let payload = TimeoutVote { view, high_qc };
         let bytes = encode_last_timeout_vote(&payload)?;
         self.storage
@@ -3340,7 +3366,9 @@ impl ConsensusNode {
         // NewView, but no per-message amplification beyond that.
         if view < self.pacemaker.current_view() {
             if let Some(high_qc) = self.core.state().high_qc.clone() {
-                let nv = NewView { high_qc };
+                let nv = NewView {
+                    high_qc: high_qc.into_inner(),
+                };
                 let signed_nv = Signed::sign(nv, signer.as_ref(), &self.chain_id)
                     .context("signing catch-up NewView for stale TimeoutVote")?;
                 let wire = WireMessage::NewView(signed_nv);
@@ -3352,7 +3380,7 @@ impl ConsensusNode {
                     wedged_peer = %node_id_to_base58(&signed.signer),
                     wedged_view = view,
                     our_view = self.pacemaker.current_view(),
-                    our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view),
+                    our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view()),
                     "catch_up_new_view_sent",
                 );
                 send_outbound(
@@ -3787,12 +3815,13 @@ impl ConsensusNode {
             // commit drains, but the rule must use the block's view
             // so all replicas accept or reject identically.
             let block_view = block.header.view;
-            let current_set = self.validator_history.set_at(block_view);
+            let current_set_at = self.validator_history.set_at(block_view);
             let next_members = match cmd.validate_against_with_delay_and_scheme(
-                &current_set,
+                current_set_at.for_view(block_view),
                 block_view,
                 self.min_v_eff_delay,
                 self.signature_scheme,
+                &self.chain_id,
             ) {
                 Ok(m) => m,
                 Err(e) => {
@@ -3932,6 +3961,7 @@ impl ConsensusNode {
                 &mut throwaway_key,
                 self.signature_scheme,
                 self.min_v_eff_delay,
+                &self.chain_id,
             );
             debug_assert_eq!(
                 rebuilt.to_persisted(),
@@ -4032,7 +4062,7 @@ impl ConsensusNode {
             // would leave the histories transiently disagreeing.
             if let Err(e) = envelope
                 .payload
-                .validate_scheme_consistency(self.signature_scheme)
+                .validate_scheme_consistency(self.signature_scheme, &self.chain_id)
             {
                 tracing::warn!(
                     target: TRACE_TARGET,
@@ -4265,7 +4295,8 @@ impl ConsensusNode {
         // the boot-time genesis set). After a reconfig, the snapshot
         // must embed the post-boundary committee so a fresh joiner's
         // QC verification picks the right set.
-        let active_set = self.validator_history.set_at(block.header.view);
+        let active_set_at = self.validator_history.set_at(block.header.view);
+        let active_set = active_set_at.for_view(block.header.view);
         // #325 PR D: embed the producer's full `(validator_history,
         // validator_key_history, bls_key_history?)` triple in the
         // manifest's persisted forms. The joiner installs these
@@ -4279,7 +4310,7 @@ impl ConsensusNode {
         let bls_key_history_persisted = self.bls_key_history.as_ref().map(|h| h.to_persisted());
         let manifest = SnapshotManifest::build(
             block.clone(), // `block` is `&Block` here; clone for the manifest's owned field.
-            &active_set,
+            active_set,
             self.snapshot_policy.chunk_size_bytes,
             chunk_hashes,
             commit_qc,
@@ -4452,7 +4483,11 @@ pub fn recover_state(
     // view-1 can proceed without waiting for a cross-cluster NewView
     // round. If the replica previously persisted a fresher QC we
     // overlay that below.
-    state.high_qc = Some(boot_qc);
+    //
+    // Genesis QC: dispatch verifier short-circuits at view==0 /
+    // signer_count==0 (mirrors `ConsensusNode::new`). Audit
+    // finding 5-1 / issue #408.
+    state.high_qc = Some(VerifiedQc::unchecked(boot_qc));
 
     if let Some(raw) = storage
         .get(STORAGE_KEY_LAST_VOTED_VIEW)
@@ -4472,7 +4507,15 @@ pub fn recover_state(
         .get(STORAGE_KEY_HIGH_QC)
         .context("read high_qc from storage")?
     {
-        state.high_qc = Some(decode_high_qc(&raw)?);
+        // Recovery from our own durable storage: the QC was a
+        // `VerifiedQc` at the time it was written by
+        // `persist_updates` (every code path that lands a QC in
+        // `state.high_qc` first verified it via the dispatch
+        // verifier or trusted-by-construction at one of this
+        // module's audited sites). Trust on read mirrors what we
+        // extend to `last_voted_view` and `locked` from the same
+        // store. Audit finding 5-1 / issue #408.
+        state.high_qc = Some(VerifiedQc::unchecked(decode_high_qc(&raw)?));
     }
 
     // Re-seed `pending_blocks` with the locked / high_qc blocks plus a
@@ -4492,7 +4535,7 @@ pub fn recover_state(
     // post-restart can silently fail to promote the lock for one or
     // two views before the chain refills.
     if let Some(qc) = state.high_qc.as_ref().cloned() {
-        rehydrate_ancestors(storage, &mut state, qc.block_hash)?;
+        rehydrate_ancestors(storage, &mut state, qc.block_hash())?;
     }
     if let Some(locked) = state.locked {
         rehydrate_ancestors(storage, &mut state, locked.block_hash)?;
@@ -5495,7 +5538,7 @@ mod tests {
         // seeds the cluster-agreed genesis QC so the view-1 leader can
         // propose on first boot.
         let expected = genesis_qc(&genesis(), four_validators().len());
-        assert_eq!(state.high_qc.as_ref(), Some(&expected));
+        assert_eq!(state.high_qc.as_ref().map(|q| q.inner()), Some(&expected));
         assert!(state.pending_blocks.contains_key(&genesis().hash()));
     }
 
@@ -5573,7 +5616,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.core.state().locked, Some(locked));
-        assert_eq!(recovered.core.state().high_qc.as_ref(), Some(&qc));
+        assert_eq!(
+            recovered.core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&qc)
+        );
     }
 
     #[test]
@@ -5610,7 +5656,7 @@ mod tests {
         assert_eq!(recovered.core.state().last_voted_view, 7);
         assert_eq!(recovered.core.state().locked, Some(sample_locked()));
         assert_eq!(
-            recovered.core.state().high_qc.as_ref(),
+            recovered.core.state().high_qc.as_ref().map(|q| q.inner()),
             Some(&sample_full_qc()),
         );
         // `recover` does not reset the pacemaker — it always starts at 0.
@@ -5794,7 +5840,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.core.state().locked, Some(locked));
-        assert_eq!(recovered.core.state().high_qc.as_ref(), Some(&qc));
+        assert_eq!(
+            recovered.core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&qc)
+        );
         assert!(
             recovered
                 .core
@@ -6103,7 +6152,10 @@ mod tests {
         assert_eq!(recovered.core.state().last_voted_view, 0);
         assert_eq!(recovered.core.state().locked, Some(sample_locked()));
         let expected = genesis_qc(&genesis(), four_validators().len());
-        assert_eq!(recovered.core.state().high_qc.as_ref(), Some(&expected));
+        assert_eq!(
+            recovered.core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&expected)
+        );
     }
 
     // ── D/E-series: event loop ────────────────────────────────────────────────
@@ -6159,7 +6211,10 @@ mod tests {
         // somebody has already proposed.
         let node = make_node(nid(1));
         let expected = genesis_qc(&genesis(), four_validators().len());
-        assert_eq!(node.core.state().high_qc.as_ref(), Some(&expected));
+        assert_eq!(
+            node.core.state().high_qc.as_ref().map(|q| q.inner()),
+            Some(&expected)
+        );
 
         // And `become_leader(1)` must now yield an
         // Action::Broadcast(Proposal) (preceded by the
@@ -6299,9 +6354,17 @@ mod tests {
         // Both histories carry the new boundary.
         assert_eq!(node.validator_history.boundary_count(), 2);
         assert_eq!(node.core.state().validator_history.boundary_count(), 2);
-        assert_eq!(*node.validator_history.set_at(v_eff), five_validators());
         assert_eq!(
-            *node.core.state().validator_history.set_at(v_eff),
+            *node.validator_history.set_at(v_eff).for_view(v_eff),
+            five_validators()
+        );
+        assert_eq!(
+            *node
+                .core
+                .state()
+                .validator_history
+                .set_at(v_eff)
+                .for_view(v_eff),
             five_validators()
         );
 
@@ -6411,12 +6474,21 @@ mod tests {
         // history's now-non-genesis boundary at v_eff_a conflicts with
         // any `v_eff >= v_eff_a`.
         assert_eq!(node.validator_history.boundary_count(), 2);
-        assert_eq!(*node.validator_history.set_at(v_eff_a), five_validators());
+        assert_eq!(
+            *node.validator_history.set_at(v_eff_a).for_view(v_eff_a),
+            five_validators()
+        );
         // v_eff_b is past the only non-genesis boundary, so the same
         // post-boundary set applies — confirming cmd_b did NOT land
         // (otherwise the set would be six_validators).
-        assert_eq!(*node.validator_history.set_at(v_eff_b), five_validators());
-        assert_ne!(*node.validator_history.set_at(v_eff_b), six_validators());
+        assert_eq!(
+            *node.validator_history.set_at(v_eff_b).for_view(v_eff_b),
+            five_validators()
+        );
+        assert_ne!(
+            *node.validator_history.set_at(v_eff_b).for_view(v_eff_b),
+            six_validators()
+        );
     }
 
     /// #254: a reconfig committed by one ConsensusNode must be visible
@@ -6478,11 +6550,16 @@ mod tests {
             "safety-core history must mirror the boundary after replay",
         );
         assert_eq!(
-            *recovered.validator_history.set_at(v_eff),
+            *recovered.validator_history.set_at(v_eff).for_view(v_eff),
             five_validators()
         );
         assert_eq!(
-            *recovered.core.state().validator_history.set_at(v_eff),
+            *recovered
+                .core
+                .state()
+                .validator_history
+                .set_at(v_eff)
+                .for_view(v_eff),
             five_validators()
         );
 
@@ -8326,7 +8403,12 @@ mod tests {
             "in-memory locked must reference the snapshot view",
         );
         assert_eq!(
-            joiner_node.core.state().high_qc.as_ref().map(|qc| qc.view),
+            joiner_node
+                .core
+                .state()
+                .high_qc
+                .as_ref()
+                .map(|qc| qc.view()),
             Some(snapshot_view),
             "in-memory high_qc must reference the snapshot view",
         );
@@ -8366,7 +8448,7 @@ mod tests {
             .high_qc
             .as_ref()
             .expect("recovered high_qc must be present");
-        assert_eq!(recovered_high_qc, &expected_commit_qc);
+        assert_eq!(recovered_high_qc.inner(), &expected_commit_qc);
     }
 
     /// Joiner multi-source happy path (#230 acceptance criterion 1):
@@ -9152,6 +9234,7 @@ mod tests {
             scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
             min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+            genesis_hash: node.core.state().genesis_hash,
         };
         let dispatches = crate::consensus::dispatch::ingress_with_qc_verification(
             byzantine.node_id(),
@@ -9285,7 +9368,7 @@ mod tests {
             .high_qc
             .as_ref()
             .expect("genesis_qc must seed high_qc on a fresh node")
-            .view;
+            .view();
 
         // Inject a stale TimeoutVote(view=5) from the wedged peer
         // through the ingress + dispatch path.
@@ -9427,7 +9510,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.core.state().last_voted_view, 10);
-        assert_eq!(recovered.core.state().high_qc.as_ref().unwrap().view, 9);
+        assert_eq!(recovered.core.state().high_qc.as_ref().unwrap().view(), 9);
 
         // Build a self-signer whose node_id matches recovered.self_id
         // (= nid(1) here is a synthetic placeholder, not derived from a
@@ -9444,7 +9527,7 @@ mod tests {
             .state()
             .high_qc
             .as_ref()
-            .map(|qc| qc.view)
+            .map(|qc| qc.view())
             .unwrap_or(0)
             .max(recovered.core.state().last_voted_view);
         let boot_actions = recovered.step_pacemaker(PacemakerEvent::OnQc(boot_view));
@@ -10035,6 +10118,7 @@ mod tests {
             scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
             min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
+            genesis_hash: node.core.state().genesis_hash,
         };
         let dispatches = ingress_with_qc_verification(
             leader_id,
