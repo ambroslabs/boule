@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::consensus::View;
+use crate::consensus::api::CommitNotifier;
 use crate::consensus::dispatch::{self, Dispatch, Outbound};
 use crate::consensus::hotstuff::Locked;
 use crate::consensus::hotstuff::qc::genesis_qc_bls;
@@ -674,9 +675,11 @@ pub struct ConsensusNode {
     /// the [`HotStuffCore`] at construction so all four caches feed
     /// into one consistent set of cumulative counts.
     eviction_counters: CacheEvictionCounters,
-    /// Optional channel to notify an observer (e.g. a test harness) of
-    /// each committed block. `None` in production builds.
-    commit_tx: Option<tokio::sync::mpsc::UnboundedSender<Block>>,
+    /// Optional [`CommitNotifier`] fired after each block is committed
+    /// and applied. `None` in production builds today; consumed by the
+    /// simulator for liveness assertions and by future observer-mode
+    /// (#308) / out-of-process Application (#225) wiring.
+    commit_notifier: Option<Arc<dyn CommitNotifier>>,
     /// Peer-membership snapshot used by [`ConsensusNode::build_status`].
     /// Populated from [`Discovery`] events inside [`ConsensusNode::run`];
     /// before `run` starts (or in tests that bypass it) the set is empty
@@ -894,7 +897,7 @@ impl ConsensusNode {
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
             eviction_counters,
-            commit_tx: None,
+            commit_notifier: None,
             peers_connected: HashSet::new(),
             last_committed_height,
             last_committed_view: 0,
@@ -944,13 +947,21 @@ impl ConsensusNode {
         self
     }
 
-    /// Attach a commit observer.
+    /// Attach a [`CommitNotifier`] (issue #373).
     ///
-    /// Every block committed by the event loop is sent on `tx`. Intended
-    /// for test harnesses (e.g. `SimCluster`); production callers leave
-    /// this unset (`None`) and observe commits via the state machine.
-    pub fn with_commit_observer(mut self, tx: tokio::sync::mpsc::UnboundedSender<Block>) -> Self {
-        self.commit_tx = Some(tx);
+    /// Every block committed by the event loop is reported via
+    /// [`CommitNotifier::on_commit`] after the block has been applied
+    /// to the state machine, persisted, and had its tagged reconfig
+    /// (#272) and rotation (#260) payloads processed. Intended for
+    /// test harnesses (e.g. `SimCluster`), observer-mode nodes (#308),
+    /// and external indexers; production callers without an observer
+    /// leave this unset (`None`).
+    ///
+    /// The callback runs on the consensus event loop — implementations
+    /// must not block (forward to a channel or atomic). See the
+    /// [`CommitNotifier`] doc-comment for the full contract.
+    pub fn with_commit_notifier(mut self, notifier: Arc<dyn CommitNotifier>) -> Self {
+        self.commit_notifier = Some(notifier);
         self
     }
 
@@ -1268,7 +1279,7 @@ impl ConsensusNode {
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
             eviction_counters,
-            commit_tx: None,
+            commit_notifier: None,
             peers_connected: HashSet::new(),
             last_committed_height,
             last_committed_view: last_committed.view,
@@ -3294,8 +3305,8 @@ impl ConsensusNode {
         // the reconfig has applied — though in practice committing
         // both in the same block is unusual).
         self.apply_committed_rotations(&block);
-        if let Some(tx) = &self.commit_tx {
-            let _ = tx.send(block);
+        if let Some(notifier) = &self.commit_notifier {
+            notifier.on_commit(&block, &block.header.state_commitment, block.header.view);
         }
     }
 
