@@ -17,7 +17,8 @@ use super::domain::vote_preimage;
 /// On `bls_aggregated` chains, require an attached BLS partial signature
 /// on every inbound `Vote` and verify it against the signer's BLS pubkey
 /// at `signed.payload.view`. On `ed25519_collected` chains (or under
-/// [`QcVerification::Skip`]) the optional partial is ignored.
+/// the `cfg(test)`-only `QcVerification::Skip`) the optional partial
+/// is ignored.
 ///
 /// The BLS partial signs the same canonical pre-image that the QC
 /// aggregate verifier reconstructs over `(view, block_hash)`: the
@@ -33,13 +34,14 @@ pub(in crate::consensus::dispatch) fn verify_bls_partial_if_required(
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
-    let QcVerification::Verify {
-        scheme,
-        bls_key_history,
-        min_v_eff_delay: _,
-    } = qc_verification
-    else {
-        return Ok(());
+    let (scheme, bls_key_history) = match qc_verification {
+        #[cfg(test)]
+        QcVerification::Skip => return Ok(()),
+        QcVerification::Verify {
+            scheme,
+            bls_key_history,
+            min_v_eff_delay: _,
+        } => (scheme, bls_key_history),
     };
     if *scheme != SignatureSchemeChoice::BlsAggregated {
         return Ok(());
