@@ -328,7 +328,8 @@ pub fn apply_rotation_commands_to_histories(
 ///   [`crate::replication::block::BlockHeader::validator_history_commitment`]
 ///   field;
 /// - the follower at proposal-receive time (in
-///   [`crate::consensus::dispatch::ingress`]), to verify the leader's
+///   [`crate::consensus::dispatch::ingress_with_qc_verification`]),
+///   to verify the leader's
 ///   stamped value matches what the follower would compute over its
 ///   own histories under the proposed block's commands.
 ///
