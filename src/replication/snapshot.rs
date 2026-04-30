@@ -1298,6 +1298,109 @@ mod tests {
         m.verify(&vs).unwrap();
     }
 
+    /// #311: a manifest carrying a non-trivial
+    /// [`crate::consensus::validator_key_history::ValidatorKeyHistory`]
+    /// (one rotation already applied) round-trips through postcard
+    /// and verifies. This pins the snapshot-onboarding correctness
+    /// gap from #311: without the embedded persisted form, a fresh
+    /// joiner restoring from a post-rotation snapshot would inherit
+    /// a genesis-only key history and reject every QC whose signer
+    /// is the rotated validator at view ≥ `v_eff`.
+    #[test]
+    fn manifest_round_trips_with_rotated_validator_key_history() {
+        use crate::consensus::history_commitment::validator_history_commitment_v1;
+        use crate::consensus::validator_history::ValidatorSetHistory;
+        use crate::consensus::validator_key_history::ValidatorKeyHistory;
+        use crate::consensus::validator_rotation::ValidatorKeyRotation;
+        use crate::consensus::validator_set::Pubkey;
+
+        let validator_set = validator_set_len_4();
+        let set_hist = ValidatorSetHistory::from_genesis(validator_set.clone());
+        let mut key_hist = ValidatorKeyHistory::new(validator_set.iter().copied());
+
+        // Rotate the lowest-indexed validator at v_eff = 100 (committed
+        // at view 50; well past the V_EFF_MIN_DELAY guard).
+        let rotated_genesis_pk: NodeId = validator_set
+            .iter()
+            .next()
+            .expect("len-4 set has a first element")
+            .into_node_id();
+        let new_pubkey: NodeId = [0xAB; 32];
+        let v_eff: View = 100;
+        key_hist
+            .apply_rotation(
+                &ValidatorKeyRotation {
+                    validator: rotated_genesis_pk,
+                    new_pubkey,
+                    v_eff,
+                    new_bls_pubkey: None,
+                    new_bls_pop: None,
+                },
+                50,
+            )
+            .expect("rotation applies cleanly to a fresh history");
+
+        let commitment = validator_history_commitment_v1(&set_hist, &key_hist, None);
+
+        // Mint the snapshot block at a view past v_eff so the post-
+        // rotation history is what the chain has stamped.
+        let mut block = sample_block(200, 200, [0xCD; 32]);
+        block.header.validator_history_commitment = commitment;
+        let qc = quorum_qc(&validator_set, block.hash());
+        let payload = b"snapshot bytes".repeat(8);
+        let chunks_with_hashes = chunk_snapshot(&payload, 16);
+        let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
+
+        let manifest = SnapshotManifest::build(
+            block,
+            &validator_set,
+            16,
+            chunk_hashes,
+            qc,
+            1_700_000_000,
+            set_hist.to_persisted(),
+            key_hist.to_persisted(),
+            None,
+        );
+
+        // The manifest verifies: the embedded histories' v1 hash
+        // matches the block's stamped commitment.
+        manifest.verify(&validator_set).unwrap();
+
+        // Postcard round-trips byte-for-byte.
+        let bytes = postcard::to_stdvec(&manifest).unwrap();
+        let restored: SnapshotManifest = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored, manifest);
+        restored.verify(&validator_set).unwrap();
+
+        // The decoded persisted form rebuilds back into a key history
+        // whose `key_at` knows about the rotation. This is the load-
+        // bearing property for #311: a post-restore joiner verifying
+        // a vote at view ≥ v_eff signed by `new_pubkey` resolves
+        // through this key history to the correct stable id and
+        // accepts the signature.
+        let rebuilt_key =
+            ValidatorKeyHistory::from_persisted(restored.validator_key_history.clone())
+                .expect("persisted form decodes");
+        let stable =
+            crate::consensus::validator_set::ValidatorId::from_genesis_pubkey(rotated_genesis_pk);
+        assert_eq!(
+            rebuilt_key.key_at(&stable, v_eff - 1),
+            Some(Pubkey::from_node_id(rotated_genesis_pk)),
+            "pre-v_eff lookups must resolve to the genesis key",
+        );
+        assert_eq!(
+            rebuilt_key.key_at(&stable, v_eff),
+            Some(Pubkey::from_node_id(new_pubkey)),
+            "at-v_eff lookups must resolve to the rotated key",
+        );
+        assert_eq!(
+            rebuilt_key.validator_for(&Pubkey::from_node_id(new_pubkey)),
+            Some(stable),
+            "the new pubkey resolves through the reverse index to the rotated validator",
+        );
+    }
+
     /// PR D of #325: a manifest whose embedded validator-history
     /// triple does not match `block.header.validator_history_commitment`
     /// must be rejected at `verify()` with the new
