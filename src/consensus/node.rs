@@ -798,6 +798,14 @@ pub struct ConsensusNode {
     /// Shared with the builder's own `Arc<AtomicU64>` so the two
     /// always agree without locking.
     dropped_commands: Arc<AtomicU64>,
+    /// Cumulative count of vote-equivocation incidents the safety core
+    /// has surfaced via
+    /// [`crate::consensus::hotstuff::step::Action::EquivocationEvidence`]
+    /// (audit finding 3-1, issue #409). Incremented at the
+    /// [`apply_safety_actions`] dispatch site, so the counter and the
+    /// matching WARN log advance in lockstep. Surfaced under
+    /// [`ConsensusStatus::equivocations_detected`].
+    equivocations_detected: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -1009,6 +1017,7 @@ impl ConsensusNode {
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
+            equivocations_detected: Arc::new(AtomicU64::new(0)),
             last_committed_view: 0,
             status_tx: None,
             rate_limiter: None,
@@ -1229,6 +1238,7 @@ impl ConsensusNode {
                 timeout_buckets: self.eviction_counters.timeout_buckets(),
             },
             dropped_commands: self.dropped_commands.load(Ordering::Relaxed),
+            equivocations_detected: self.equivocations_detected.load(Ordering::Relaxed),
         }
     }
 
@@ -1409,6 +1419,7 @@ impl ConsensusNode {
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
+            equivocations_detected: Arc::new(AtomicU64::new(0)),
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
@@ -2937,6 +2948,30 @@ impl ConsensusNode {
 
                 SafetyAction::Commit(block) => {
                     self.apply_commit(block);
+                }
+
+                SafetyAction::EquivocationEvidence {
+                    voter,
+                    view,
+                    block_a,
+                    block_b,
+                } => {
+                    // Audit finding 3-1 (#409): the safety core just
+                    // observed a stable validator voting for two
+                    // distinct block_hash values at the same view.
+                    // Surface as a WARN with structured fields so
+                    // operators can grep for evidence and a future
+                    // slashing pipeline can attach without further
+                    // safety-core changes.
+                    self.equivocations_detected.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        voter = %node_id_to_base58(voter.as_node_id()),
+                        view,
+                        block_a = ?block_a,
+                        block_b = ?block_b,
+                        "consensus_equivocation_detected",
+                    );
                 }
             }
         }

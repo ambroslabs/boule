@@ -174,6 +174,7 @@ mod tests {
             mempool_size: 0,
             cache_evictions: crate::consensus::status::CacheEvictionStatus::default(),
             dropped_commands: 0,
+            equivocations_detected: 0,
         }
     }
 
