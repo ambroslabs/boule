@@ -10,8 +10,8 @@ use std::sync::atomic::Ordering;
 use crate::consensus::hotstuff::qc::quorum_size;
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::status::{
-    BUCKET_VIEW_WINDOW, CacheEvictionStatus, ConsensusStatus, LockedStatus, ParkedProposalStatus,
-    QcStatus, TimeoutBucketStatus, VoteBucketStatus,
+    BUCKET_VIEW_WINDOW, BackpressureStatus, CacheEvictionStatus, ConsensusStatus, LockedStatus,
+    ParkedProposalStatus, QcStatus, TimeoutBucketStatus, VoteBucketStatus,
 };
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::{Height, View};
@@ -164,6 +164,13 @@ impl ConsensusNode {
             },
             dropped_commands: self.dropped_commands.load(Ordering::Relaxed),
             equivocations_detected: self.equivocations_detected.load(Ordering::Relaxed),
+            backpressure: BackpressureStatus {
+                gossip_sink_overflow_total: self
+                    .gossip_sink_overflows
+                    .as_ref()
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .unwrap_or(0),
+            },
         }
     }
 }

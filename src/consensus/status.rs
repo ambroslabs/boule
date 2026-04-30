@@ -122,6 +122,30 @@ pub struct CacheEvictionStatus {
     pub timeout_buckets: u64,
 }
 
+/// Cumulative count of drops on the production drop-on-full back-pressure
+/// paths. See `docs/backpressure.md` for the policy table; in short,
+/// these are paths where a sender would otherwise have to choose between
+/// blocking forever (wedging consensus) and dropping silently (causing
+/// hard-to-diagnose request loss). The drop is the right behaviour;
+/// surfacing the counter is what makes the back-pressure visible
+/// instead of invisible.
+///
+/// Counters are monotonic for the lifetime of the node and reset on
+/// restart. A small non-zero value is not itself a fault — gossip and
+/// peer-list pushes have multiple delivery paths and tolerate isolated
+/// drops — but sustained growth points at a wedged peer connection or
+/// an undersized per-peer queue (#163 design notes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BackpressureStatus {
+    /// Drops from
+    /// [`crate::p2p::overlay::gossip::sink::OverlaySink::send_to`]'s
+    /// `try_send` falling back on `Full`. Used by the gossip overlay's
+    /// peer-list publisher and the overlay run loop's per-peer
+    /// unicasts. Always zero on a node configured for mesh-mode
+    /// overlay (no gossip sink in play).
+    pub gossip_sink_overflow_total: u64,
+}
+
 /// A snapshot of a consensus node's live state, returned by
 /// `GET /consensus/status`.
 ///
@@ -185,6 +209,10 @@ pub struct ConsensusStatus {
     /// the same evidence.
     #[serde(default)]
     pub equivocations_detected: u64,
+    /// Cumulative drop counts on the production drop-on-full
+    /// back-pressure paths. See [`BackpressureStatus`].
+    #[serde(default)]
+    pub backpressure: BackpressureStatus,
 }
 
 /// How far on either side of `current_view` to include in the bucket
@@ -249,6 +277,9 @@ mod tests {
             },
             dropped_commands: 11,
             equivocations_detected: 2,
+            backpressure: BackpressureStatus {
+                gossip_sink_overflow_total: 5,
+            },
         }
     }
 
@@ -306,6 +337,9 @@ mod tests {
 
         // Vote-equivocation counter (audit 3-1, #409).
         assert_eq!(json["equivocations_detected"], 2);
+
+        // Back-pressure overflow counters (#163 / #486).
+        assert_eq!(json["backpressure"]["gossip_sink_overflow_total"], 5);
     }
 
     #[test]
@@ -363,6 +397,7 @@ mod tests {
             cache_evictions: CacheEvictionStatus::default(),
             dropped_commands: 0,
             equivocations_detected: 0,
+            backpressure: BackpressureStatus::default(),
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["current_view"], 0);

@@ -464,6 +464,7 @@ async fn start_consensus(
         event_rx,
         overlay_shutdown,
         overlay_joins,
+        gossip_sink_overflows,
     } = build_overlay_wiring(
         overlay_cfg,
         p2p_cmd_tx,
@@ -513,6 +514,10 @@ async fn start_consensus(
     // blob was tampered with or rolled back, and we refuse to start.
     node.verify_persisted_history_consistency()
         .context("verifying persisted validator histories against committed chain (#325 PR B)")?;
+
+    if let Some(counter) = gossip_sink_overflows {
+        node = node.with_gossip_sink_overflow_counter(counter);
+    }
 
     let initial_status = Arc::new(node.build_status());
     let (status_tx, status_rx) = watch::channel(initial_status);
@@ -663,6 +668,12 @@ struct OverlayWiring {
     event_rx: mpsc::Receiver<p2p::ProtocolEvent>,
     overlay_shutdown: Option<oneshot::Sender<()>>,
     overlay_joins: Vec<tokio::task::JoinHandle<()>>,
+    /// Shared overflow counter from the gossip [`OverlaySink`], when
+    /// `mode = OverlayMode::Gossip`. `None` for mesh-mode (no sink).
+    /// Plumbed into [`ConsensusNode::with_gossip_sink_overflow_counter`]
+    /// so [`crate::consensus::status::BackpressureStatus`] surfaces the
+    /// running drop count.
+    gossip_sink_overflows: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Branch on `overlay_cfg.mode` and assemble the consensus-facing
@@ -699,6 +710,7 @@ async fn build_overlay_wiring(
                 event_rx: handle.event_rx,
                 overlay_shutdown: None,
                 overlay_joins: Vec::new(),
+                gossip_sink_overflows: None,
             })
         }
         OverlayMode::Gossip => {
@@ -717,6 +729,7 @@ async fn build_overlay_wiring(
             let handle = reg_rx.await?;
 
             let sink = Arc::new(OverlaySink::new(handle.send_tx));
+            let gossip_sink_overflows = Some(sink.overflow_counter());
             let dialer = Arc::new(DialerCtxAdapter::new(dialer_ctx));
 
             // Mix self_id into the rng_seed so each node's RNG draws
@@ -774,6 +787,7 @@ async fn build_overlay_wiring(
                     handles.publisher_join,
                     handles.maintenance_join,
                 ],
+                gossip_sink_overflows,
             })
         }
     }

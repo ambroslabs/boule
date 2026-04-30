@@ -246,6 +246,15 @@ pub struct ConsensusNode {
     /// simulator for liveness assertions and by future observer-mode
     /// (#308) / out-of-process Application (#225) wiring.
     commit_notifier: Option<Arc<dyn CommitNotifier>>,
+    /// Shared overflow counter from
+    /// [`crate::p2p::overlay::gossip::sink::OverlaySink`] when the node
+    /// is wired to a gossip-mode overlay (issue #163 / #486). When
+    /// `Some`, [`ConsensusNode::build_status`] reads its current value
+    /// and surfaces it under
+    /// [`crate::consensus::status::BackpressureStatus::gossip_sink_overflow_total`].
+    /// `None` for mesh-mode runs and for the simulator's mesh harness —
+    /// the field defaults to zero in `ConsensusStatus` in those cases.
+    gossip_sink_overflows: Option<Arc<AtomicU64>>,
     /// Peer-membership snapshot used by [`ConsensusNode::build_status`].
     /// Populated from [`Discovery`] events inside [`ConsensusNode::run`];
     /// before `run` starts (or in tests that bypass it) the set is empty
@@ -438,6 +447,7 @@ impl ConsensusNode {
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
             eviction_counters,
             commit_notifier: None,
+            gossip_sink_overflows: None,
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
@@ -504,6 +514,19 @@ impl ConsensusNode {
     /// [`CommitNotifier`] doc-comment for the full contract.
     pub fn with_commit_notifier(mut self, notifier: Arc<dyn CommitNotifier>) -> Self {
         self.commit_notifier = Some(notifier);
+        self
+    }
+
+    /// Wire the gossip-mode overlay's
+    /// [`crate::p2p::overlay::gossip::sink::OverlaySink`] overflow
+    /// counter into this node so
+    /// [`crate::consensus::status::BackpressureStatus::gossip_sink_overflow_total`]
+    /// reflects the running drop count. Pass the `Arc<AtomicU64>`
+    /// returned by `OverlaySink::overflow_counter()` at construction
+    /// time. Mesh-mode wiring leaves this `None` and the status field
+    /// stays at zero.
+    pub fn with_gossip_sink_overflow_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.gossip_sink_overflows = Some(counter);
         self
     }
 
@@ -753,6 +776,7 @@ impl ConsensusNode {
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
             eviction_counters,
             commit_notifier: None,
+            gossip_sink_overflows: None,
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
@@ -1107,6 +1131,36 @@ mod tests {
         assert!(
             node.core.state().pending_blocks.contains_key(&g_hash),
             "genesis block must be pre-seeded into pending_blocks",
+        );
+    }
+
+    #[test]
+    fn build_status_default_backpressure_is_zero() {
+        // Mesh-mode wiring leaves the gossip-sink overflow counter
+        // unset; the status field must default to zero rather than
+        // omitting the section.
+        let node = make_node(nid(1));
+        let status = node.build_status();
+        assert_eq!(status.backpressure.gossip_sink_overflow_total, 0);
+    }
+
+    #[test]
+    fn build_status_surfaces_wired_gossip_sink_overflow_counter() {
+        // Wire a fresh counter, bump it, and assert build_status reads
+        // the live value. This is the seam between OverlaySink (#486)
+        // and the public ConsensusStatus JSON.
+        let counter = Arc::new(AtomicU64::new(0));
+        let node = make_node(nid(1)).with_gossip_sink_overflow_counter(Arc::clone(&counter));
+
+        assert_eq!(
+            node.build_status().backpressure.gossip_sink_overflow_total,
+            0
+        );
+
+        counter.fetch_add(7, Ordering::Relaxed);
+        assert_eq!(
+            node.build_status().backpressure.gossip_sink_overflow_total,
+            7
         );
     }
 
