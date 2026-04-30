@@ -524,6 +524,14 @@ impl BlockBuilder for MempoolBlockBuilder {
     ///    successful `apply` per the [`StateMachine`] contract that a
     ///    failed command is a no-op.
     /// 3. Restore the SM to the snapshot.
+    ///
+    /// Determinism: `pending_blocks` is read by hash-only `.get()`
+    /// during the parent-pointer walk (see
+    /// [`uncommitted_ancestor_chain`]) — never iterated. The chain is
+    /// then applied in `Vec` order. Two honest replicas computing
+    /// `state_commitment` for the same `(parent, candidate-commands)`
+    /// will produce byte-equal `Block`s, regardless of the underlying
+    /// `HashMap` iteration order. Audit Finding 5-3 / issue #426.
     fn build(
         &self,
         parent: &Block,
@@ -653,6 +661,13 @@ impl BlockBuilder for MempoolBlockBuilder {
 ///   live below this line), or
 /// - the cursor's `parent_hash` is missing from `pending_blocks`
 ///   (post-commit prune has removed the last-committed block).
+///
+/// `pending_blocks` is read **by hash-only `.get()`** — never iterated.
+/// The walk's order comes from the parent-pointer chain itself, so the
+/// underlying `HashMap`'s non-deterministic iteration order is not
+/// observable in the result. This is the determinism property the
+/// builder relies on for cross-replica equality of `state_commitment`
+/// (audit Finding 5-3 / issue #426).
 fn uncommitted_ancestor_chain(
     parent: &Block,
     pending_blocks: &HashMap<BlockHash, Block>,
