@@ -587,27 +587,57 @@ impl HotStuffCore {
     /// - Adopts `commit_qc` as `high_qc`. The same view-monotonicity
     ///   argument applies: the joiner's prior `high_qc` is at most
     ///   the genesis QC (view 0).
+    /// - Bumps `last_voted_view` up to `snapshot_view` so the
+    ///   joiner cannot vote at a lower view after adopting a
+    ///   snapshot whose committed chain extends well past view 0.
+    ///   Without this, a crash between snapshot adoption and the
+    ///   first post-snapshot durable write would let
+    ///   [`recover_state`](crate::consensus::node::recover_state)
+    ///   rehydrate `last_voted_view = 0`, trivially satisfying
+    ///   `safe_to_vote`'s `view > last_voted_view` check on a
+    ///   conflicting fork (audit finding 4-3 / issue #406).
+    ///
+    /// Returns the [`Action::Persist`] sequence the caller must flush
+    /// durably *before* any further consensus action. The integration
+    /// layer's `restore_from_snapshot` folds these writes into the
+    /// same atomic batch as its `block` / `last_committed` writes so a
+    /// crash inside the restore window leaves either zero or all of
+    /// the snapshot's state on disk — never the dangerous middle
+    /// where `high_qc` is fresh but `locked` and `last_voted_view`
+    /// are stale.
     ///
     /// Caller must verify `commit_qc` is well-formed under the
     /// validator set and has quorum
     /// ([`crate::replication::snapshot::SnapshotManifest::verify`])
     /// before calling. The integration layer's `restore_from_snapshot`
     /// already enforces this.
+    #[must_use = "callers must flush the returned Persist actions atomically; see audit finding 4-3"]
     pub fn adopt_snapshot(
         &mut self,
         snapshot_block: Block,
         commit_qc: QuorumCertificate,
         snapshot_view: View,
-    ) {
+    ) -> Vec<Action> {
         let block_hash = snapshot_block.hash();
         let height = snapshot_block.header.height;
         self.state.insert_pending(snapshot_block);
-        self.state.locked = Some(super::Locked {
+        let locked = super::Locked {
             view: snapshot_view,
             height,
             block_hash,
-        });
-        self.state.high_qc = Some(commit_qc);
+        };
+        self.state.locked = Some(locked);
+        self.state.high_qc = Some(commit_qc.clone());
+        if snapshot_view > self.state.last_voted_view {
+            self.state.last_voted_view = snapshot_view;
+        }
+        vec![
+            Action::Persist(StateUpdate::VotedInView {
+                view: snapshot_view,
+            }),
+            Action::Persist(StateUpdate::Locked(locked)),
+            Action::Persist(StateUpdate::HighQc(commit_qc)),
+        ]
     }
 
     /// Leader path: build and return a `Broadcast(Proposal)` action for
