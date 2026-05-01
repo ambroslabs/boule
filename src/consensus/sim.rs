@@ -4330,6 +4330,125 @@ mod tests {
         assert_no_conflicts(&committed);
     }
 
+    /// **#526 / parent #185 acceptance criterion 2.** Pin the
+    /// post-restart catch-up wall-time target. Open a multi-block
+    /// gap by partitioning one replica while survivors keep
+    /// committing, heal the partition, and assert the lagging
+    /// replica catches up to the pre-heal survivor frontier within
+    /// **≤5s of simulated time**.
+    ///
+    /// 5s simulated at the production-default `timeout_base_ms = 500ms`
+    /// is the proxy for #185's "≤5s wall-clock on a default
+    /// GitHub-hosted runner" target — at that timeout a real-world
+    /// testnet's 5s budget translates to ≤10 pacemaker view ticks,
+    /// which the bulk-range RPC (#520 + #522) closes in a single
+    /// round trip when the per-response cap (64 blocks) covers the
+    /// gap. The dedicated retry timer (#518) keeps a single dropped
+    /// `BlockRangeRequest` from extending the budget.
+    ///
+    /// Pre-#185 (single-block walk-back, no retry timer) the
+    /// equivalent catch-up consumed `O(gap × view_timeout)` —
+    /// `30 × 500 ms = 15s` — well above this assertion's budget.
+    /// The same `advance_and_yield_until` pattern the rest of the
+    /// suite uses keeps wall-clock comfortably under the 15s
+    /// per-test budget called out in `CLAUDE.md`.
+    #[tokio::test]
+    async fn block_sync_catchup_completes_within_185_budget() {
+        tokio::time::pause();
+
+        // 4-node cluster at the production-default 500ms base. The
+        // §9b walkthrough runs 7 nodes, but block-sync semantics
+        // are independent of cluster size — a 4-node cluster
+        // exercises exactly the requester / responder paths the
+        // §9b operator-driven test would.
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(500)).await;
+
+        // Phase 1 — warm up so survivors have a real chain tip
+        // before we partition.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(10), |c| {
+                c.peek_commit_heights().iter().all(|&h| h >= 3)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "warm-up: every replica must commit at least 3 blocks before partition. \
+             heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        // Phase 2 — partition one replica so it freezes while
+        // survivors keep advancing. The same shape the existing
+        // `divergent_restart_*` tests use, except we heal rather
+        // than restart so the focus stays on bulk-range catch-up
+        // rather than the recover path.
+        let lagging_idx = 0;
+        cluster.partition_node(lagging_idx);
+
+        let baseline_for_survivors = cluster.peek_commit_heights();
+        let n = baseline_for_survivors.len();
+        // Open a 30+ block gap on the lagging replica. 30 is the
+        // canonical number from #185 ("30-block gap"); we let
+        // simulated time run up to 30s so the assertion is robust
+        // to an unlucky leader-rotation order.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(30), |c| {
+                let h = c.peek_commit_heights();
+                (0..n)
+                    .filter(|&i| i != lagging_idx)
+                    .all(|i| h[i] >= baseline_for_survivors[i] + 30)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "survivors did not gain >= 30 commits in 30s simulated. heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let pre_heal_heights = cluster.peek_commit_heights();
+        let max_survivor_pre_heal = (0..n)
+            .filter(|&i| i != lagging_idx)
+            .map(|i| pre_heal_heights[i])
+            .max()
+            .unwrap();
+        let gap = max_survivor_pre_heal - pre_heal_heights[lagging_idx];
+        assert!(
+            gap >= 30,
+            "test setup expects >= 30-block gap before heal; got lagging={} survivors_max={}",
+            pre_heal_heights[lagging_idx],
+            max_survivor_pre_heal,
+        );
+
+        // Phase 3 — heal. Catch-up budget starts here.
+        cluster.heal_node(lagging_idx);
+
+        // Phase 4 — assert catch-up within 5s simulated. The
+        // lagging replica must reach at least the survivor frontier
+        // observed at heal time (a fixed target rather than a
+        // moving one — the survivors keep advancing, but pinning
+        // to `max_survivor_pre_heal` is the strict version of
+        // "closed the pre-heal gap").
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                c.peek_commit_heights()[lagging_idx] >= max_survivor_pre_heal
+            })
+            .await;
+        let post_heal_heights = cluster.peek_commit_heights();
+        assert!(
+            satisfied,
+            "block-sync catch-up exceeded 5s simulated budget (#526 / #185 AC 2). \
+             pre_heal={pre_heal_heights:?} pre_heal_max_survivor={max_survivor_pre_heal} \
+             post_heal={post_heal_heights:?} gap_remaining={}",
+            (max_survivor_pre_heal as i64) - (post_heal_heights[lagging_idx] as i64),
+        );
+
+        // Sanity: no fork in either pre-heal or post-heal commit
+        // logs. Block-sync is a liveness mechanism; safety must
+        // hold regardless of how fast catch-up runs.
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
     // ── L-series: network partition + heal proptests (#133) ──────────────────
     //
     // The K-series above use fixed scenarios (one node partitioned for a
