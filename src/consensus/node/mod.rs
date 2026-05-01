@@ -55,7 +55,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
+use std::time::Duration;
+
 use crate::consensus::api::CommitNotifier;
+use crate::consensus::block_sync_retry_timer::{
+    BlockSyncRetryTimer, DEFAULT_INITIAL_DELAY as BLOCK_SYNC_RETRY_INITIAL_DELAY,
+    DEFAULT_MAX_DELAY as BLOCK_SYNC_RETRY_MAX_DELAY, next_delay as next_retry_delay,
+};
 use crate::consensus::dispatch::{self, Outbound};
 use crate::consensus::hotstuff::qc::{ConsensusMsg, VerifiedQc, genesis_qc_bls};
 use crate::consensus::hotstuff::step::{BlockBuilder, HotStuffCore, StateUpdate};
@@ -876,6 +882,16 @@ impl ConsensusNode {
         let (timer_tx, mut timer_rx) = mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
+        // Dedicated block-sync retry timer (#512). Decoupled from the
+        // pacemaker view timer so a single-shot `RequestBlock` lost in
+        // flight recovers in `O(100ms)` rather than `O(view_timeout)`.
+        // The timer is *single-shot* — re-armed after each fire from
+        // [`Self::ensure_block_sync_retry_timer_armed`] iff the safety
+        // core still has at least one in-flight request.
+        let (retry_timer_tx, mut retry_timer_rx) = mpsc::channel::<()>(4);
+        let mut retry_timer = BlockSyncRetryTimer::new(retry_timer_tx);
+        let mut retry_timer_delay: Option<Duration> = None;
+
         // Boot-time snapshot of recovered durable state. Logged once
         // per node start so operators can correlate "did we come up
         // already behind the live cluster?" with downstream block-sync
@@ -942,6 +958,17 @@ impl ConsensusNode {
                 Some(view) = timer_rx.recv() => {
                     let pm_actions = self.step_pacemaker(PacemakerEvent::OnTimeout(view));
                     self.apply_pacemaker_actions(pm_actions, broadcaster.as_ref(), &mut view_timer, &signer)
+                        .await?;
+                }
+
+                Some(()) = retry_timer_rx.recv() => {
+                    // Dedicated block-sync retry tick (#512). Walks
+                    // every still-tracked `block_sync_inflight` entry
+                    // and emits one `RequestBlock` per parent. The
+                    // re-arm at end-of-iteration handles exponential
+                    // backoff and cancellation when the tracker drains.
+                    let actions = self.core.step_block_sync_retry_tick();
+                    self.apply_safety_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer)
                         .await?;
                 }
 
@@ -1063,6 +1090,18 @@ impl ConsensusNode {
                 else => break,
             }
 
+            // Re-arm or cancel the dedicated block-sync retry timer
+            // (#512) based on whether the safety core still has any
+            // in-flight `RequestBlock` after this iteration's actions
+            // were applied. The timer is single-shot, so this is the
+            // only re-arm site — fires that handled `step_block_sync_retry_tick`
+            // already returned through the matching `select!` arm above
+            // and the inflight tracker may have been emptied (parent
+            // arrived, budget exhausted) or re-populated (new
+            // proposal's parent missing). Cancel/arm decisions are
+            // idempotent.
+            self.maintain_block_sync_retry_timer(&mut retry_timer, &mut retry_timer_delay);
+
             // Publish a fresh snapshot at the end of every iteration,
             // after all dispatched actions have been applied. No hot-
             // path locking — just a shallow rebuild and a watch-channel
@@ -1071,7 +1110,42 @@ impl ConsensusNode {
         }
 
         view_timer.cancel();
+        retry_timer.cancel();
         Ok(())
+    }
+
+    /// Re-arm or cancel the dedicated block-sync retry timer (#512)
+    /// based on whether the safety core still has any in-flight
+    /// `RequestBlock` after the current iteration's actions were
+    /// applied.
+    ///
+    /// - When inflight is non-empty and no timer is armed: arm with
+    ///   the next exponential-backoff delay (initial on the first
+    ///   arm of a fresh inflight burst).
+    /// - When inflight is non-empty and a timer is already armed:
+    ///   no-op (the prior arming will fire and re-trigger this
+    ///   helper).
+    /// - When inflight is empty: cancel the timer and reset the
+    ///   backoff so the next burst starts from the initial delay.
+    fn maintain_block_sync_retry_timer(
+        &self,
+        retry_timer: &mut BlockSyncRetryTimer,
+        retry_timer_delay: &mut Option<Duration>,
+    ) {
+        if self.core.has_any_block_sync_inflight() {
+            if !retry_timer.is_armed() {
+                let delay = next_retry_delay(
+                    *retry_timer_delay,
+                    BLOCK_SYNC_RETRY_INITIAL_DELAY,
+                    BLOCK_SYNC_RETRY_MAX_DELAY,
+                );
+                retry_timer.arm(delay);
+                *retry_timer_delay = Some(delay);
+            }
+        } else {
+            retry_timer.cancel();
+            *retry_timer_delay = None;
+        }
     }
 }
 // ── Tests ─────────────────────────────────────────────────────────────────────

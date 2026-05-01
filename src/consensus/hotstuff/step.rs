@@ -277,6 +277,16 @@ pub enum BlockSyncReason {
     /// #224 closed the view-skew leg of). See
     /// [`HotStuffCore::on_new_view_received`].
     UnknownHighQcOnNewView,
+    /// Retry emission: the integration layer's dedicated block-sync
+    /// retry timer fired (#512) while at least one
+    /// [`BlockSyncInflight`] entry was still pending. Decoupled from
+    /// view cadence: the timer fires on a wall-clock schedule
+    /// (default 200 ms initial, exponential to a cap), so a
+    /// single-shot `RequestBlock` lost in flight recovers in
+    /// `O(100ms)` rather than `O(view_timeout)` regardless of how
+    /// fast the cluster is making views. See
+    /// [`HotStuffCore::step_block_sync_retry_tick`].
+    RetryTimerTick,
 }
 
 impl BlockSyncReason {
@@ -286,6 +296,7 @@ impl BlockSyncReason {
             BlockSyncReason::UnknownParentOnProposal => "unknown_parent_on_proposal",
             BlockSyncReason::StillParkedOnPacemakerAdvance => "still_parked_on_pacemaker_advance",
             BlockSyncReason::UnknownHighQcOnNewView => "unknown_high_qc_on_new_view",
+            BlockSyncReason::RetryTimerTick => "retry_timer_tick",
         }
     }
 }
@@ -630,6 +641,52 @@ impl HotStuffCore {
     /// pollute `pending_blocks` (#434).
     pub fn has_inflight_block_request(&self, hash: &BlockHash) -> bool {
         self.block_sync_inflight.contains_key(hash)
+    }
+
+    /// Whether any `RequestBlock` is currently in flight (any parent
+    /// hash). The integration layer reads this after each safety-core
+    /// step to decide whether to (re-)arm the dedicated block-sync
+    /// retry timer (#512); when false, the timer is cancelled so an
+    /// idle node never wakes up just to confirm there's nothing to
+    /// retry.
+    pub fn has_any_block_sync_inflight(&self) -> bool {
+        !self.block_sync_inflight.is_empty()
+    }
+
+    /// Wall-clock-driven retry tick. Walks every still-tracked
+    /// `block_sync_inflight` entry and emits at most one
+    /// `Action::RequestBlock` per parent, regardless of view-elapsed
+    /// backoff — the cadence of this method is enforced by the
+    /// integration layer's [`BlockSyncRetryTimer`] (#512), which
+    /// schedules ticks on a wall-clock schedule (default 200 ms
+    /// initial, exponential to a cap). The per-parent attempt budget
+    /// (`block_sync_max_attempts`) and the per-peer rotation budget
+    /// (`block_sync_per_peer_attempts`) are still respected: a parent
+    /// whose budget is exhausted has its parked proposals dropped here,
+    /// matching the pacemaker-driven retry path's behaviour.
+    ///
+    /// The view-based backoff in `try_emit_block_sync_retry` is
+    /// deliberately bypassed for this entry point: the timer-driven
+    /// schedule serves the same throttling purpose, and applying both
+    /// would push the first retry past the next pacemaker tick — which
+    /// is exactly the latency this method exists to eliminate.
+    ///
+    /// Returns the actions to feed through `apply_safety_actions`. The
+    /// caller is expected to (re-)arm the retry timer afterwards iff
+    /// [`Self::has_any_block_sync_inflight`] is still true.
+    ///
+    /// [`BlockSyncRetryTimer`]: crate::consensus::block_sync_retry_timer::BlockSyncRetryTimer
+    pub fn step_block_sync_retry_tick(&mut self) -> Vec<Action> {
+        // Sorted iteration so replay/property tests stay byte-identical
+        // regardless of `HashMap` ordering — same discipline as
+        // `on_pacemaker_advance`'s parent-hash walk.
+        let parents: std::collections::BTreeSet<BlockHash> =
+            self.block_sync_inflight.keys().copied().collect();
+        let mut actions = Vec::with_capacity(parents.len());
+        for parent_hash in parents {
+            actions.extend(self.run_block_sync_retry_tick_for_parent(parent_hash));
+        }
+        actions
     }
 
     /// Test-only: install a `block_sync_inflight` entry for `hash` as
@@ -1538,6 +1595,40 @@ impl HotStuffCore {
             peer,
             expected_height: snapshot.expected_height,
             reason,
+        }]
+    }
+
+    /// Retry-timer-driven retry path: like
+    /// [`Self::run_block_sync_retry_for_parent`] but without the
+    /// view-elapsed backoff gate, since the
+    /// [`BlockSyncRetryTimer`](crate::consensus::block_sync_retry_timer::BlockSyncRetryTimer)
+    /// already enforces a wall-clock schedule. Still drops parked
+    /// proposals when the per-parent attempt budget is exhausted, and
+    /// still rotates peers via `pick_block_sync_peer`. See #512.
+    fn run_block_sync_retry_tick_for_parent(&mut self, parent_hash: BlockHash) -> Vec<Action> {
+        let snapshot = match self.block_sync_inflight.get(&parent_hash) {
+            Some(e) => *e,
+            None => return Vec::new(),
+        };
+        if snapshot.attempts >= self.limits.block_sync_max_attempts {
+            self.drop_parked_for_parent(parent_hash);
+            return Vec::new();
+        }
+        let peer = pick_block_sync_peer(
+            snapshot.original_sender,
+            snapshot.attempts,
+            self.limits.block_sync_per_peer_attempts,
+            &self.state.validator_set,
+            self.self_id,
+        );
+        let entry = self.block_sync_inflight.get_mut(&parent_hash).unwrap();
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.last_asked_view = self.state.current_view;
+        vec![Action::RequestBlock {
+            hash: parent_hash,
+            peer,
+            expected_height: snapshot.expected_height,
+            reason: BlockSyncReason::RetryTimerTick,
         }]
     }
 
@@ -4515,6 +4606,114 @@ mod tests {
             // initial = 0 disables backoff entirely (`unbounded_for_tests`).
             assert_eq!(block_sync_backoff_views(1, 0, 0), 0);
             assert_eq!(block_sync_backoff_views(99, 0, 0), 0);
+        }
+
+        // ── #512: dedicated retry timer ─────────────────────────────────────
+        //
+        // The wall-clock retry timer fires `step_block_sync_retry_tick`
+        // independent of the pacemaker. Its emission rules differ from
+        // the pacemaker-driven path in one place: the view-elapsed
+        // backoff gate is bypassed, since cadence is enforced
+        // externally by [`BlockSyncRetryTimer`]. The per-parent
+        // attempt budget and per-peer rotation budget still apply.
+
+        /// A retry tick on an idle core (no inflight) is a no-op.
+        #[test]
+        fn block_sync_retry_tick_is_noop_when_no_inflight() {
+            let mut core = make_core(1);
+            assert!(!core.has_any_block_sync_inflight());
+            let actions = core.step_block_sync_retry_tick();
+            assert!(actions.is_empty());
+            assert!(!core.has_any_block_sync_inflight());
+        }
+
+        /// Single inflight entry → retry tick emits exactly one
+        /// `RequestBlock(RetryTimerTick)`. Crucially the same
+        /// `current_view` is used as on the parking step: the
+        /// view-elapsed backoff guard does NOT block the emission, so
+        /// a single-shot loss recovers within the timer's wall-clock
+        /// schedule rather than waiting for the next pacemaker tick.
+        #[test]
+        fn block_sync_retry_tick_emits_when_view_unchanged() {
+            let mut core = make_core(1);
+            let genesis = Block::genesis([0; 32], [0; 32]);
+            let chain = chain_from_genesis(&genesis, &[1, 2], nid(2));
+            let block_v1 = chain[0].clone();
+            let block_v2 = chain[1].clone();
+            let justify_v1 = dummy_qc(View(1), block_v1.hash());
+
+            // Park v2 — fires the initial RequestBlock(UnknownParentOnProposal).
+            let initial = core.step(Event::ProposalReceived(
+                crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                    block_v2.clone(),
+                    justify_v1,
+                    nid(2),
+                )),
+            ));
+            assert_eq!(initial.len(), 1);
+            assert!(matches!(initial[0], Action::RequestBlock { .. }));
+            let view_at_park = core.state().current_view;
+
+            // Wall-clock retry tick at the **same view** as the park —
+            // the pacemaker has not advanced yet. The view-based
+            // pacemaker-driven path's `should_retry_block_sync` would
+            // suppress this (elapsed views < backoff); the dedicated
+            // retry tick must emit anyway.
+            assert!(core.has_any_block_sync_inflight());
+            let retry = core.step_block_sync_retry_tick();
+            assert_eq!(retry.len(), 1, "retry tick must emit one RequestBlock");
+            assert!(matches!(
+                retry[0],
+                Action::RequestBlock {
+                    hash: _,
+                    peer: _,
+                    expected_height: _,
+                    reason: BlockSyncReason::RetryTimerTick,
+                }
+            ));
+            assert_eq!(
+                core.state().current_view,
+                view_at_park,
+                "retry tick must not advance the view",
+            );
+            assert!(
+                core.has_any_block_sync_inflight(),
+                "inflight tracker remains until the parent arrives",
+            );
+        }
+
+        /// Once the per-parent attempt budget is spent, the retry tick
+        /// drops the parked proposals and clears the inflight entry —
+        /// matches the pacemaker-driven path's exhaustion behaviour.
+        #[test]
+        fn block_sync_retry_tick_drops_parked_when_budget_exhausted() {
+            // max_attempts = 1: the initial probe consumes the entire
+            // per-parent budget, so the next tick has nothing left to
+            // try and must drop the parked proposal.
+            let mut core = make_rotation_core(1, /* per_peer = */ 1, /* max = */ 1);
+            let parent: BlockHash = [0xCD; 32];
+            let child = orphan_child(parent, 1, nid(3));
+            let justify = dummy_qc(View(0), core.state().genesis_hash);
+            let _ = core.step(Event::ProposalReceived(
+                crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                    child,
+                    justify,
+                    nid(2),
+                )),
+            ));
+            assert!(core.has_any_block_sync_inflight());
+            assert_eq!(core.parked_proposals.len(), 1);
+
+            // Budget already spent on the initial probe (max_attempts = 1).
+            // The tick must drop the parked proposal and clear inflight,
+            // emitting no further RequestBlock.
+            let retry = core.step_block_sync_retry_tick();
+            assert!(
+                retry.is_empty(),
+                "no RequestBlock on the budget-exhausted path; got {retry:?}",
+            );
+            assert!(!core.has_any_block_sync_inflight());
+            assert!(core.parked_proposals.is_empty());
         }
     }
 

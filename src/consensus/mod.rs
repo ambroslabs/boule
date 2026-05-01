@@ -39,6 +39,7 @@ use std::ops::{Add, AddAssign, Sub, SubAssign};
 use serde::{Deserialize, Serialize};
 
 pub mod api;
+pub mod block_sync_retry_timer;
 pub mod bls_key_history;
 pub(crate) mod crashpoint;
 pub mod dispatch;
