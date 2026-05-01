@@ -2,7 +2,6 @@ use std::io::Write;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 
@@ -148,7 +147,7 @@ async fn spawn_node_with_schema(peers: &[PeerDesc<'_>], schema: IdentitySchema) 
     };
 
     let config = format!(
-        "[node]\nlisten_addr = \"127.0.0.1:0\"\n{scalar_field}addr_file = \"{addr_file_path}\"\n{identity_table}\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}"
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\n{scalar_field}addr_file = \"{addr_file_path}\"\n{identity_table}\n[api]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}"
     );
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -202,7 +201,7 @@ async fn wait_until_ready(node: &NodeGuard, timeout: Duration) {
                 node.api_port
             );
         }
-        if client.get(node.api_url("/messages")).send().await.is_ok() {
+        if client.get(node.api_url("/peers")).send().await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -222,32 +221,6 @@ async fn wait_for_peer_count(node: &NodeGuard, expected: usize, timeout: Duratio
         if let Ok(resp) = client.get(node.api_url("/peers")).send().await {
             if let Ok(peers) = resp.json::<Value>().await {
                 if peers.as_array().map(|a| a.len()).unwrap_or(0) >= expected {
-                    return;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn poll_for_message(node: &NodeGuard, content: &str, timeout: Duration) {
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + timeout;
-    loop {
-        if Instant::now() > deadline {
-            panic!(
-                "message '{}' did not appear on node {} in time",
-                content, node.api_port
-            );
-        }
-        if let Ok(resp) = client.get(node.api_url("/messages")).send().await {
-            if let Ok(msgs) = resp.json::<Value>().await {
-                if msgs
-                    .as_array()
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .any(|m| m["content"] == content)
-                {
                     return;
                 }
             }
@@ -292,103 +265,6 @@ async fn start_cluster() -> (NodeGuard, NodeGuard, NodeGuard) {
     (node1, node2, node3)
 }
 
-fn expiry_from_now(secs: i64) -> DateTime<Utc> {
-    Utc::now() + chrono::Duration::seconds(secs)
-}
-
-#[tokio::test]
-async fn test_message_propagates_to_all_nodes() {
-    let (node1, node2, node3) = start_cluster().await;
-
-    let client = reqwest::Client::new();
-    let expiry = expiry_from_now(60);
-
-    let resp = client
-        .post(node1.api_url("/messages"))
-        .json(&json!({ "content": "hello cluster", "expiry": expiry }))
-        .send()
-        .await
-        .expect("POST /messages failed");
-    assert_eq!(resp.status(), 201);
-
-    let prop_timeout = Duration::from_secs(5);
-    poll_for_message(&node2, "hello cluster", prop_timeout).await;
-    poll_for_message(&node3, "hello cluster", prop_timeout).await;
-}
-
-#[tokio::test]
-async fn test_duplicate_messages_are_deduplicated() {
-    let (node1, node2, node3) = start_cluster().await;
-    let _ = (&node2, &node3); // keep alive
-
-    let client = reqwest::Client::new();
-    let expiry = expiry_from_now(60);
-    let body = json!({ "content": "unique message", "expiry": expiry });
-
-    let r1 = client
-        .post(node1.api_url("/messages"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r1.status(), 201);
-
-    // Same content + same expiry — must deduplicate.
-    let r2 = client
-        .post(node1.api_url("/messages"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    assert!(r2.status().is_success());
-
-    // No wait: dedup runs synchronously inside POST /messages on node1, so
-    // the second response returning is already proof the store has settled.
-    let messages: Value = client
-        .get(node1.api_url("/messages"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-
-    let count = messages
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|m| m["content"] == "unique message")
-        .count();
-    assert_eq!(
-        count, 1,
-        "expected exactly one copy after dedup, got {count}"
-    );
-}
-
-#[tokio::test]
-async fn test_expired_messages_are_rejected() {
-    let (node1, node2, node3) = start_cluster().await;
-    let _ = (&node2, &node3); // keep alive
-
-    let client = reqwest::Client::new();
-    let past_expiry = expiry_from_now(-1);
-
-    let resp = client
-        .post(node1.api_url("/messages"))
-        .json(&json!({ "content": "already expired", "expiry": past_expiry }))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 400);
-}
-
-// Expiry-cleanup coverage lives in the deterministic simulator now — see
-// `src/sim/sim_gossip.rs::expired_messages_are_cleaned_up_under_sim_clock`.
-// The wall-clock version of this test used to sleep 8s here, which made CI
-// flaky and dominated the runtime of this file; the sim-clock port runs
-// the same scenario (inject, expire, cleanup sweep) in virtual time.
-
 /// Boots two nodes with `[node.identity] backend = "file"` (the new schema)
 /// and verifies they connect to each other. Covers the end-to-end path that
 /// the backward-compat legacy tests don't exercise.
@@ -411,70 +287,6 @@ async fn test_new_identity_schema_end_to_end() {
     let mesh_timeout = Duration::from_secs(10);
     wait_for_peer_count(&node1, 1, mesh_timeout).await;
     wait_for_peer_count(&node2, 1, mesh_timeout).await;
-}
-
-/// Round-trips a ping RPC between two real nodes, exercising the full
-/// protocol-multiplexer → RPC framing → handler-dispatch path.
-#[tokio::test]
-async fn test_ping_rpc_round_trip_between_nodes() {
-    let node1 = spawn_node(&[]).await;
-    let node2 = spawn_node(&[PeerDesc {
-        p2p_addr: &node1.p2p_addr,
-        node_id: &node1.node_id,
-    }])
-    .await;
-
-    let ready_timeout = Duration::from_secs(10);
-    wait_until_ready(&node1, ready_timeout).await;
-    wait_until_ready(&node2, ready_timeout).await;
-
-    let mesh_timeout = Duration::from_secs(10);
-    wait_for_peer_count(&node1, 1, mesh_timeout).await;
-    wait_for_peer_count(&node2, 1, mesh_timeout).await;
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(node1.api_url(&format!("/rpc/ping/{}", node2.node_id)))
-        .json(&json!({ "payload": "hello rpc" }))
-        .send()
-        .await
-        .expect("POST /rpc/ping failed");
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["payload"], "hello rpc");
-
-    // And the reverse direction, to make sure both sides are wired up.
-    let resp = client
-        .post(node2.api_url(&format!("/rpc/ping/{}", node1.node_id)))
-        .json(&json!({ "payload": "back atcha" }))
-        .send()
-        .await
-        .expect("POST /rpc/ping failed");
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["payload"], "back atcha");
-}
-
-#[tokio::test]
-async fn test_ping_rpc_to_unknown_peer_fails() {
-    let node = spawn_node(&[]).await;
-    wait_until_ready(&node, Duration::from_secs(10)).await;
-
-    // Valid base58 but a node ID that isn't connected. The call should time
-    // out (since SendTo drops silently to unknown peers) rather than succeed.
-    // Use a short per-call timeout so the test stays under the wall-clock
-    // budget; the timeout path is identical regardless of duration.
-    let fake_peer = "11111111111111111111111111111111";
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(node.api_url(&format!("/rpc/ping/{fake_peer}")))
-        .json(&json!({ "payload": "lost in space", "timeout_ms": 300 }))
-        .send()
-        .await
-        .expect("POST /rpc/ping failed");
-    // 504 Gateway Timeout — handler maps RpcError::Timeout to that status.
-    assert_eq!(resp.status(), 504);
 }
 
 /// Regression test for #114. Spawns a full-mesh 4-node cluster where every
@@ -596,7 +408,7 @@ async fn launch_once_for_discovery(key_path: &str) -> DiscoveryInfo {
     let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
 
     let config = format!(
-        "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n"
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\n"
     );
     let mut config_file = NamedTempFile::new().unwrap();
     config_file.write_all(config.as_bytes()).unwrap();
@@ -661,7 +473,7 @@ async fn spawn_node_fixed_port(
         .collect();
 
     let config = format!(
-        "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}"
+        "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}"
     );
     let mut config_file = NamedTempFile::new().unwrap();
     config_file.write_all(config.as_bytes()).unwrap();
@@ -831,7 +643,7 @@ async fn spawn_consensus_node(
     // test tight.
     let config = format!(
         "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n{peer_lines}\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
     );
     let mut config_file = NamedTempFile::new().unwrap();
@@ -1005,7 +817,7 @@ async fn spawn_consensus_node_gossip(
 
     let config = format!(
         "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [overlay]\nmode = \"gossip\"\noutbound_target = {target_degree}\npeer_gossip_interval_ms = {peer_gossip_interval_ms}\nmesh_check_interval_ms = {mesh_check_interval_ms}\nbootstrap_addrs = {bootstrap_toml}\n\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
     );
@@ -1230,7 +1042,7 @@ async fn spawn_consensus_node_inbound_disabled(
     // never bound; pick `127.0.0.1:0` so the parser is happy.
     let config = format!(
         "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [p2p]\ninbound_disabled = true\n\n\
         [overlay]\nmode = \"gossip\"\noutbound_target = {target_degree}\npeer_gossip_interval_ms = 250\nmesh_check_interval_ms = 250\nbootstrap_addrs = [{bootstrap_toml}]\n\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
@@ -1800,7 +1612,7 @@ async fn test_self_id_in_peers_list_fails_to_start() {
     let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
     let config = format!(
         "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [[peers]]\naddr = \"127.0.0.1:9999\"\nnode_id = \"{}\"\n",
         info.node_id,
     );
@@ -1853,7 +1665,7 @@ async fn test_self_loopback_dial_is_refused_at_handshake() {
     // is self. The dialer must catch it at TLS-handshake time.
     let config = format!(
         "[node]\nlisten_addr = \"{p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [[peers]]\naddr = \"{p2p_addr}\"\n",
     );
     let mut config_file = NamedTempFile::new().unwrap();

@@ -2,11 +2,10 @@
 //! liveness simulation covering the `f = 1` scenario from #22's
 //! verification criteria.
 //!
-//! The sim uses a hand-rolled bus rather than [`crate::sim::SimDriver`]
-//! because the pacemaker has no I/O — a full driver would just add
-//! indirection. The bus is a plain synchronous loop over the four
-//! pacemakers and a mock safety-core that issues QCs / TCs when quorum
-//! is reached.
+//! The sim uses a hand-rolled synchronous bus because the pacemaker has
+//! no I/O — a full driver would just add indirection. The bus is a plain
+//! loop over the four pacemakers and a mock safety-core that issues
+//! QCs / TCs when quorum is reached.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -417,8 +417,7 @@ fn write_starter_config(path: &Path) -> anyhow::Result<()> {
          backend = \"file\"\n\
          path    = \"{key_path}\"\n\n\
          [api]\n\
-         listen_addr = \"127.0.0.1:8000\"\n\
-         cleanup_interval_secs = 60\n\n\
+         listen_addr = \"127.0.0.1:8000\"\n\n\
          # [[peers]]\n\
          # addr    = \"127.0.0.1:7001\"\n\
          # node_id = \"<peer NodeId from their `init` output>\"\n\n\

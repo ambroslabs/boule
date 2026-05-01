@@ -47,8 +47,6 @@ pub mod wire;
 /// Existing protocol IDs in the binary:
 /// | ID | Owner |
 /// |---:|---|
-/// | `0x01` | [`crate::gossip`] (best-effort message overlay) |
-/// | `0x02` | [`crate::ping`] |
 /// | `0x03` | [`crate::consensus::node`] |
 /// | `0x04` | this overlay |
 pub const PROTOCOL_ID: u8 = 0x04;

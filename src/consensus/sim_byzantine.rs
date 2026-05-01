@@ -1,7 +1,5 @@
 //! Protocol-level Byzantine adversaries for the consensus simulator (#132).
 //!
-//! Companion to [`crate::sim::sim_adversary`], which covers
-//! network-layer byte-mutation hooks (`FlipFirstByte`, `ZeroPayload`).
 //! This module sits at the [`crate::consensus::hotstuff::HotStuffCore`]
 //! action boundary — adversaries intercept the stream of
 //! [`crate::p2p::ProtocolOutbound`] frames their node would emit, decode

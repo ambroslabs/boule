@@ -107,7 +107,6 @@ listen_addr = "0.0.0.0:7000"
 
 [api]
 listen_addr = "127.0.0.1:8080"
-cleanup_interval_secs = 60
 
 # [[peers]]
 # addr = "127.0.0.1:7001"

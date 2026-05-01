@@ -1,13 +1,10 @@
 //! Crash-injection harness regression tests (issue #420).
 //!
-//! Companion to [`crate::sim::sim_crash`] (driver-level crash-recovery
-//! invariants on disk-backed Storage/Wal) and
-//! [`crate::consensus::sim_byzantine`] (protocol-level adversary
-//! injection). This module sits one level higher: it injects a
-//! consensus-event-loop *process kill* at a named persistence boundary
-//! via the [`crate::consensus::crashpoint`] seam, then restarts the
-//! crashed replica and re-engages the cluster against the same
-//! durable state.
+//! Companion to [`crate::consensus::sim_byzantine`] (protocol-level
+//! adversary injection). This module injects a consensus-event-loop
+//! *process kill* at a named persistence boundary via the
+//! [`crate::consensus::crashpoint`] seam, then restarts the crashed
+//! replica and re-engages the cluster against the same durable state.
 //!
 //! # Why this harness exists
 //!

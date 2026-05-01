@@ -16,8 +16,8 @@
 //!
 //! # Quick start
 //!
-//! Registering ping RPC as `main.rs` does (see `src/ping.rs` for the full
-//! integration):
+//! Register a protocol ID, build an [`Rpc`] with handlers for each method
+//! you want to serve, then issue calls:
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -26,9 +26,16 @@
 //! use ambros_p2p::clock::{Clock, TokioClock};
 //! use ambros_p2p::p2p::{self, PeerCommand};
 //! use ambros_p2p::p2p::rpc::RpcBuilder;
-//! use ambros_p2p::ping;
 //! use bytes::Bytes;
 //! use tokio::sync::{mpsc, oneshot};
+//! use tokio_util::sync::CancellationToken;
+//!
+//! const PROTOCOL_ID: u8 = 0x10;
+//! const METHOD_ECHO: u16 = 0x0001;
+//!
+//! async fn echo(_peer: p2p::NodeId, body: Bytes, _cancel: CancellationToken) -> Result<Bytes, Bytes> {
+//!     Ok(body)
+//! }
 //!
 //! # async fn wiring(
 //! #     p2p_cmd_tx: mpsc::Sender<PeerCommand>,
@@ -39,8 +46,8 @@
 //! let (reg_tx, reg_rx) = oneshot::channel();
 //! p2p_cmd_tx
 //!     .send(PeerCommand::RegisterProtocol {
-//!         id: ping::PROTOCOL_ID,
-//!         max_frame_bytes: Some(ping::MAX_FRAME_BYTES),
+//!         id: PROTOCOL_ID,
+//!         max_frame_bytes: Some(64 * 1024),
 //!         reply: reg_tx,
 //!     })
 //!     .await?;
@@ -49,12 +56,12 @@
 //! // 2. Build an Rpc with handlers for each method ID you want to serve.
 //! let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 //! let rpc = RpcBuilder::new()
-//!     .handler(ping::METHOD_PING, ping::echo)
+//!     .handler(METHOD_ECHO, echo)
 //!     .spawn(handle, clock);
 //!
 //! // 3. Issue calls with the returned handle.
 //! let reply = rpc
-//!     .call(peer, ping::METHOD_PING, payload, Duration::from_secs(2))
+//!     .call(peer, METHOD_ECHO, payload, Duration::from_secs(2))
 //!     .await?;
 //! # let _ = reply;
 //! # Ok(())
@@ -436,20 +443,27 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Bytes, Bytes>> + Sen
 /// The blanket implementation below means any `Fn(NodeId, Bytes,
 /// CancellationToken) -> impl Future<Output = Result<Bytes, Bytes>>` is a
 /// valid handler, so the typical registration is just a closure or a free
-/// async function — see [`ping::echo`](../../ping/fn.echo.html):
+/// async function:
 ///
 /// ```no_run
 /// use std::sync::Arc;
 ///
 /// use ambros_p2p::clock::{Clock, TokioClock};
-/// use ambros_p2p::p2p::ProtocolHandle;
+/// use ambros_p2p::p2p::{NodeId, ProtocolHandle};
 /// use ambros_p2p::p2p::rpc::RpcBuilder;
-/// use ambros_p2p::ping;
+/// use bytes::Bytes;
+/// use tokio_util::sync::CancellationToken;
+///
+/// const METHOD_ECHO: u16 = 0x0001;
+///
+/// async fn echo(_peer: NodeId, body: Bytes, _cancel: CancellationToken) -> Result<Bytes, Bytes> {
+///     Ok(body)
+/// }
 ///
 /// # fn wiring(handle: ProtocolHandle) {
 /// let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 /// let rpc = RpcBuilder::new()
-///     .handler(ping::METHOD_PING, ping::echo)
+///     .handler(METHOD_ECHO, echo)
 ///     .spawn(handle, clock);
 /// # let _ = rpc;
 /// # }
@@ -503,26 +517,30 @@ where
 /// use std::sync::Arc;
 ///
 /// use ambros_p2p::clock::{Clock, TokioClock};
-/// use ambros_p2p::p2p::ProtocolHandle;
+/// use ambros_p2p::p2p::{NodeId, ProtocolHandle};
 /// use ambros_p2p::p2p::rpc::RpcBuilder;
-/// use ambros_p2p::ping;
 /// use bytes::Bytes;
 /// use tokio_util::sync::CancellationToken;
 ///
-/// # fn wiring(protocol_handle: ProtocolHandle) {
+/// const METHOD_ECHO: u16 = 0x0001;
 /// const METHOD_STATUS: u16 = 0x0002;
 ///
+/// async fn echo(_peer: NodeId, body: Bytes, _cancel: CancellationToken) -> Result<Bytes, Bytes> {
+///     Ok(body)
+/// }
+///
 /// async fn status_handler(
-///     _peer: ambros_p2p::p2p::NodeId,
+///     _peer: NodeId,
 ///     _body: Bytes,
 ///     _cancel: CancellationToken,
 /// ) -> Result<Bytes, Bytes> {
 ///     Ok(Bytes::from_static(b"ok"))
 /// }
 ///
+/// # fn wiring(protocol_handle: ProtocolHandle) {
 /// let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 /// let rpc = RpcBuilder::new()
-///     .handler(ping::METHOD_PING, ping::echo)
+///     .handler(METHOD_ECHO, echo)
 ///     .handler(METHOD_STATUS, status_handler)
 ///     .spawn(protocol_handle, clock);
 /// # let _ = rpc;

@@ -311,8 +311,7 @@ fn write_minimal_config(layout: &NodeLayout) -> anyhow::Result<()> {
          path    = \"{key}\"\n\
          \n\
          [api]\n\
-         listen_addr = \"127.0.0.1:0\"\n\
-         cleanup_interval_secs = 60\n",
+         listen_addr = \"127.0.0.1:0\"\n",
         addr = layout.addr_path.display(),
         key = layout.key_path.display(),
     );
@@ -421,7 +420,6 @@ fn write_final_config(
          {bls_node_identity_toml}\n\
          [api]\n\
          listen_addr = \"{api}\"\n\
-         cleanup_interval_secs = 60\n\
          \n\
          [overlay]\n\
          mode            = \"gossip\"\n\

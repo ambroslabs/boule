@@ -150,7 +150,6 @@ path    = "./testnet/node1/node.key"
 
 [api]
 listen_addr = "127.0.0.1:8000"
-cleanup_interval_secs = 60
 ```
 
 `testnet/node2/config.toml`:
@@ -165,7 +164,6 @@ path    = "./testnet/node2/node.key"
 
 [api]
 listen_addr = "127.0.0.1:8001"
-cleanup_interval_secs = 60
 ```
 
 `testnet/node3/config.toml`:
@@ -180,7 +178,6 @@ path    = "./testnet/node3/node.key"
 
 [api]
 listen_addr = "127.0.0.1:8002"
-cleanup_interval_secs = 60
 ```
 
 ---
@@ -432,7 +429,6 @@ path    = "testnet4/node1/node.key"
 
 [api]
 listen_addr = "127.0.0.1:<auto>"
-cleanup_interval_secs = 60
 
 [overlay]
 mode            = "gossip"
