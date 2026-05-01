@@ -49,6 +49,32 @@ Conventions:
 - After every scenario: `testnet snap`, `testnet verify-safety` (capture
   exit code), `testnet telemetry`. A non-zero `verify-safety` exit is the
   most serious kind of failure.
+- After every scenario, also run the **back-pressure check** below. Any
+  per-node `backpressure.*` counter that is *non-zero and growing* is a
+  failure to flag. (See `docs/backpressure.md`; the policy is that
+  steady-state runs report zero, and a non-zero value means a
+  documented drop class fired — usually a wedged peer or undersized
+  queue.)
+
+### Back-pressure check (every scenario, all tiers)
+
+For each surviving node `node*`:
+
+```sh
+PORT=$(jq -r ".\"$NODE\".api_addr" $WD/state.json | cut -d: -f2)
+curl -s http://127.0.0.1:$PORT/consensus/status \
+  | jq '{node: "'$NODE'", backpressure}'
+```
+
+Pass: every node reports `gossip_sink_overflow_total: 0` (and any future
+counters added under `.backpressure.*` stay at zero). A small one-shot
+non-zero on a node that just rejoined a partition is acceptable as long
+as it stops growing within ~5 s; capture both samples in the report.
+
+Fail: a counter that *increases* across two consecutive snapshots taken
+~5 s apart on a cluster that's otherwise healthy (committing, no
+partition, all peers reachable). Surface this in the report alongside
+the trial's `verify-safety` and telemetry output.
 
 Build cost is ~3–4 min cold and roughly free if the release artifacts
 already exist for the current HEAD.
@@ -449,6 +475,8 @@ For every failure (across any scenario):
 - Post-failure `testnet snap` output verbatim.
 - Post-failure `testnet verify-safety` exit code.
 - Post-failure `testnet telemetry` output verbatim.
+- Per-node `/consensus/status` `.backpressure` block from the
+  back-pressure check (both samples if the trial took two).
 - Last 30 lines of `testnet logs <node>` for the most-stuck node
   (lowest height).
 - `bootstrap_peers` from `state.json` if relevant.
