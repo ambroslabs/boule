@@ -600,6 +600,12 @@ pub struct ConnectionLimitsConfig {
     /// single source IP. Set to `usize::MAX` to disable per-IP
     /// counting.
     pub max_per_ip: usize,
+    /// Hard ceiling on total registered connections regardless of
+    /// direction (#187 / `[overlay].total_max`). Set to `usize::MAX`
+    /// to disable. Acts as a safety net above `max_inbound +
+    /// max_outbound` so a misconfigured operator cannot accidentally
+    /// admit more direct peers than the overlay was sized for.
+    pub max_total: usize,
 }
 
 impl ConnectionLimitsConfig {
@@ -611,6 +617,10 @@ impl ConnectionLimitsConfig {
             max_inbound: 64,
             max_outbound: 64,
             max_per_ip: 4,
+            // No total cap by default at the `[p2p.limits]` layer; the
+            // overlay-layer cap from #187 lands a tighter limit when
+            // it's plumbed through `node.rs`.
+            max_total: usize::MAX,
         }
     }
 
@@ -622,6 +632,7 @@ impl ConnectionLimitsConfig {
             max_inbound: usize::MAX,
             max_outbound: usize::MAX,
             max_per_ip: usize::MAX,
+            max_total: usize::MAX,
         }
     }
 }
@@ -638,6 +649,8 @@ pub enum RejectReason {
     TotalOutbound,
     /// `max_per_ip` is saturated for the connection's source IP.
     PerIp,
+    /// `max_total` (overlay total ceiling, #187) is saturated.
+    Total,
 }
 
 impl RejectReason {
@@ -647,6 +660,7 @@ impl RejectReason {
             Self::TotalInbound => "max_inbound",
             Self::TotalOutbound => "max_outbound",
             Self::PerIp => "max_per_ip",
+            Self::Total => "max_total",
         }
     }
 }
@@ -688,10 +702,20 @@ impl ConnectionLimiter {
             return Err(RejectReason::PerIp);
         }
 
+        // Total ceiling (#187). Checked before the per-direction caps
+        // so an inbound admit doesn't briefly bump the counter past
+        // `max_total` even if the per-direction cap would have caught
+        // it on its own.
+        let inbound_cur = self.inbound.load(Ordering::Acquire);
+        let outbound_cur = self.outbound.load(Ordering::Acquire);
+        if inbound_cur.saturating_add(outbound_cur) >= self.config.max_total {
+            self.rejects.fetch_add(1, Ordering::Relaxed);
+            return Err(RejectReason::Total);
+        }
+
         match direction {
             Direction::Inbound => {
-                let cur = self.inbound.load(Ordering::Acquire);
-                if cur >= self.config.max_inbound {
+                if inbound_cur >= self.config.max_inbound {
                     self.rejects.fetch_add(1, Ordering::Relaxed);
                     return Err(RejectReason::TotalInbound);
                 }
@@ -700,8 +724,7 @@ impl ConnectionLimiter {
                 self.inbound.fetch_add(1, Ordering::AcqRel);
             }
             Direction::Outbound => {
-                let cur = self.outbound.load(Ordering::Acquire);
-                if cur >= self.config.max_outbound {
+                if outbound_cur >= self.config.max_outbound {
                     self.rejects.fetch_add(1, Ordering::Relaxed);
                     return Err(RejectReason::TotalOutbound);
                 }
@@ -755,6 +778,12 @@ impl ConnectionLimiter {
     /// Currently registered outbound connections.
     pub fn outbound(&self) -> usize {
         self.outbound.load(Ordering::Relaxed)
+    }
+
+    /// Currently registered connections in either direction. Counts
+    /// against `max_total` (#187).
+    pub fn total(&self) -> usize {
+        self.inbound().saturating_add(self.outbound())
     }
 }
 
@@ -1121,6 +1150,7 @@ mod tests {
             max_inbound: 2,
             max_outbound: 99,
             max_per_ip: 99,
+            max_total: usize::MAX,
         });
         assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 1)).is_ok());
         assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 2)).is_ok());
@@ -1141,6 +1171,7 @@ mod tests {
             max_inbound: 99,
             max_outbound: 1,
             max_per_ip: 99,
+            max_total: usize::MAX,
         });
         assert!(cl.try_admit(Direction::Outbound, ipv4(10, 0, 0, 1)).is_ok());
         assert_eq!(
@@ -1155,6 +1186,7 @@ mod tests {
             max_inbound: 99,
             max_outbound: 99,
             max_per_ip: 2,
+            max_total: usize::MAX,
         });
         // Three connections from one IP — third refused.
         assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 1)).is_ok());
@@ -1167,12 +1199,46 @@ mod tests {
         assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 2)).is_ok());
     }
 
+    /// #187 / #511 acceptance: `max_total` is enforced before the
+    /// per-direction caps so an inbound flood that fits within
+    /// `max_inbound` still gets refused once the cluster's total
+    /// direct-peer ceiling is hit.
+    #[test]
+    fn connection_limiter_caps_total_across_directions() {
+        let cl = ConnectionLimiter::new(ConnectionLimitsConfig {
+            max_inbound: 99,
+            max_outbound: 99,
+            max_per_ip: 99,
+            max_total: 3,
+        });
+        // One outbound + two inbound saturates max_total = 3.
+        assert!(cl.try_admit(Direction::Outbound, ipv4(10, 0, 0, 1)).is_ok());
+        assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 2)).is_ok());
+        assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 3)).is_ok());
+        assert_eq!(cl.total(), 3);
+        // Fourth (regardless of direction) is refused with the new
+        // RejectReason::Total even though both per-direction caps
+        // still have headroom.
+        assert_eq!(
+            cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 4)),
+            Err(RejectReason::Total)
+        );
+        assert_eq!(
+            cl.try_admit(Direction::Outbound, ipv4(10, 0, 0, 5)),
+            Err(RejectReason::Total)
+        );
+        // Releasing one slot reopens admission.
+        cl.release(Direction::Inbound, ipv4(10, 0, 0, 2));
+        assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 6)).is_ok());
+    }
+
     #[test]
     fn release_removes_per_ip_entry_at_zero() {
         let cl = ConnectionLimiter::new(ConnectionLimitsConfig {
             max_inbound: 99,
             max_outbound: 99,
             max_per_ip: 1,
+            max_total: usize::MAX,
         });
         let ip = ipv4(10, 0, 0, 1);
         assert!(cl.try_admit(Direction::Inbound, ip).is_ok());

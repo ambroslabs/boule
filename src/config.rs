@@ -678,12 +678,17 @@ impl P2pLimitsConfig {
     }
 
     /// Project the connection-cap fields into the runtime
-    /// [`crate::p2p::limits::ConnectionLimitsConfig`] shape.
+    /// [`crate::p2p::limits::ConnectionLimitsConfig`] shape. The
+    /// overlay-layer `max_total` cap (#187) is not sourced from
+    /// `[p2p.limits]`; callers that want the merged view (combining
+    /// `[overlay].total_max`) build the runtime config in
+    /// `crate::node::build_connection_limiter`.
     pub fn connection_limits(&self) -> crate::p2p::limits::ConnectionLimitsConfig {
         crate::p2p::limits::ConnectionLimitsConfig {
             max_inbound: self.max_inbound_connections,
             max_outbound: self.max_outbound_connections,
             max_per_ip: self.max_connections_per_ip,
+            max_total: usize::MAX,
         }
     }
 

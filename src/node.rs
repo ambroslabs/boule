@@ -116,11 +116,16 @@ pub async fn run(
         let pgt = peer_gone_tx.clone();
         let dtx = discovery_tx.clone();
         let our_id = identity.node_id;
-        let connection_limiter = config
-            .p2p
-            .limits
-            .as_ref()
-            .map(|l| Arc::new(p2p::limits::ConnectionLimiter::new(l.connection_limits())));
+        // The connection limiter combines two config sources:
+        //   - `[p2p.limits]` (issue #134): abuse-protection caps that
+        //     fire on outright floods and per-IP saturation. Optional;
+        //     when absent we still want overlay-level caps (#187) to
+        //     apply.
+        //   - `[overlay]` (issue #187): degree-aware caps tied to the
+        //     gossip overlay's partial-mesh sizing. Active in
+        //     `mode = "gossip"`; in `mode = "mesh"` the operator opts
+        //     out by definition (full N–1 connectivity).
+        let connection_limiter = build_connection_limiter(&config);
         tokio::spawn(p2p::manager::run(
             our_id,
             p2p_cmd_rx,
@@ -542,6 +547,50 @@ async fn start_consensus(
         overlay_shutdown,
         overlay_joins,
     })
+}
+
+/// Merge `[p2p.limits]` (issue #134, abuse-protection caps) and
+/// `[overlay]` (#187, overlay-degree-aware caps) into a single
+/// [`p2p::limits::ConnectionLimitsConfig`] for the manager's
+/// admission gate. Returns `None` only when neither source
+/// contributes a binding limit, in which case the manager runs
+/// without a connection limiter (the simulator and gossip-only test
+/// paths).
+///
+/// Behaviour:
+///
+/// - `[p2p.limits]` absent + `mode = "mesh"` → no limiter (back-compat).
+/// - `[p2p.limits]` absent + `mode = "gossip"` → limiter built from
+///   overlay caps only; outbound and per-IP fall through to
+///   `usize::MAX` (no abuse protection without `[p2p.limits]`).
+/// - Both present + `mode = "gossip"` → tighter of the two
+///   `max_inbound`s wins; overlay's `total_max` is the only source
+///   for `max_total`.
+/// - `mode = "mesh"` ignores overlay caps regardless — the operator
+///   explicitly opted into N–1 connectivity.
+fn build_connection_limiter(config: &Config) -> Option<Arc<p2p::limits::ConnectionLimiter>> {
+    use p2p::limits::ConnectionLimitsConfig;
+
+    let limits = config.p2p.limits.as_ref().map(|l| l.connection_limits());
+    let overlay_caps_active = config.overlay.mode == OverlayMode::Gossip;
+
+    let merged = match (limits, overlay_caps_active) {
+        (None, false) => return None,
+        (None, true) => ConnectionLimitsConfig {
+            max_inbound: config.overlay.inbound_max,
+            max_outbound: usize::MAX,
+            max_per_ip: usize::MAX,
+            max_total: config.overlay.total_max,
+        },
+        (Some(l), false) => l,
+        (Some(l), true) => ConnectionLimitsConfig {
+            max_inbound: l.max_inbound.min(config.overlay.inbound_max),
+            max_outbound: l.max_outbound,
+            max_per_ip: l.max_per_ip,
+            max_total: l.max_total.min(config.overlay.total_max),
+        },
+    };
+    Some(Arc::new(p2p::limits::ConnectionLimiter::new(merged)))
 }
 
 /// Bundle returned by [`reconcile_bls_identity`] on `bls_aggregated`
