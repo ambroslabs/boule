@@ -280,6 +280,16 @@ pub struct ConsensusNode {
     /// the per-peer rate limiter (#134) — see
     /// [`block_sync::BlockSyncCreditWindow`].
     pub(super) block_sync_credit: Arc<block_sync::BlockSyncCreditWindow>,
+    /// Outstanding bulk-range `BlockRangeRequest`s, keyed by
+    /// `(from_height, to_height)` (#515). Inserted on emission so a
+    /// fresh proposal arriving while the previous range is still
+    /// in-flight does not double-emit. Cleared on
+    /// [`Dispatch::ReceiveBlockRange`]. Decoupled from
+    /// [`HotStuffCore::block_sync_inflight`] (which keys by
+    /// content-hash for the single-block fallback path) — the two
+    /// trackers compose: a recovering node typically holds one or
+    /// two range entries plus zero or more single-hash entries.
+    block_sync_range_inflight: HashMap<(Height, Height), NodeId>,
     /// Peer-membership snapshot used by [`ConsensusNode::build_status`].
     /// Populated from [`Discovery`] events inside [`ConsensusNode::run`];
     /// before `run` starts (or in tests that bypass it) the set is empty
@@ -475,6 +485,7 @@ impl ConsensusNode {
             gossip_sink_overflows: None,
             peer_outbound_overflows: None,
             block_sync_credit: Arc::new(block_sync::BlockSyncCreditWindow::new()),
+            block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
@@ -818,6 +829,7 @@ impl ConsensusNode {
             gossip_sink_overflows: None,
             peer_outbound_overflows: None,
             block_sync_credit: Arc::new(block_sync::BlockSyncCreditWindow::new()),
+            block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
@@ -3864,6 +3876,158 @@ mod tests {
         assert!(
             !pending.contains_key(&range_block_at(9).hash()),
             "above-range block must be dropped",
+        );
+    }
+
+    // ── Bulk-range requester gap detection (#515) ──────────────────────
+
+    /// Drain outbound frames into a Vec until the channel is empty,
+    /// decoding each `SendTo` into `(NodeId, WireMessage)`.
+    fn drain_send_to_outbound(
+        outbound_rx: &mut tokio::sync::mpsc::Receiver<ProtocolOutbound>,
+    ) -> Vec<(NodeId, WireMessage)> {
+        let mut out = Vec::new();
+        while let Ok(frame) = outbound_rx.try_recv() {
+            if let ProtocolOutbound::SendTo { node_id, payload } = frame
+                && let Ok(w) = postcard::from_bytes::<WireMessage>(&payload)
+            {
+                out.push((node_id, w));
+            }
+        }
+        out
+    }
+
+    /// A proposal whose parent height sits more than two blocks above
+    /// the local commit frontier triggers BOTH a single-block
+    /// `BlockRequest` (the safety core's path for the immediate
+    /// missing parent) AND a `BlockRangeRequest` for
+    /// `[last_committed + 1, parent_height]` (#515). The two compose:
+    /// the range request collapses catch-up into one round trip and
+    /// the single-block path stays as the unknown-parent-by-itself
+    /// fallback.
+    #[tokio::test]
+    async fn proposal_with_multi_block_gap_emits_both_request_block_and_range_request() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let proposer_signer = fresh_signer();
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Last committed height stays at 0 (fresh node). Proposer
+        // ships a proposal at height 31 with an unknown parent (i.e.
+        // the safety core will park the proposal and emit
+        // RequestBlock for the parent at height 30).
+        let parent_hash: BlockHash = [0xAB; 32];
+        let dispatch = synthetic_proposal_dispatch(&proposer_signer, 31, 31, parent_hash);
+        let proposer_id = proposer_signer.node_id();
+
+        node.apply_dispatch(dispatch, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .expect("apply_dispatch");
+
+        let frames = drain_send_to_outbound(&mut outbound_rx);
+        let mut saw_request_block = false;
+        let mut saw_range_request = false;
+        for (to, w) in &frames {
+            match w {
+                WireMessage::BlockRequest(_) => {
+                    assert_eq!(*to, proposer_id);
+                    saw_request_block = true;
+                }
+                WireMessage::BlockRangeRequest {
+                    from_height,
+                    to_height,
+                } => {
+                    assert_eq!(*to, proposer_id);
+                    assert_eq!(*from_height, Height(1));
+                    assert_eq!(*to_height, Height(30));
+                    saw_range_request = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_request_block,
+            "safety core's single-block path must still fire; saw {frames:?}",
+        );
+        assert!(
+            saw_range_request,
+            "multi-block gap must fire BlockRangeRequest; saw {frames:?}",
+        );
+    }
+
+    /// A second proposal with the same gap window (still pre-commit)
+    /// must NOT re-emit the same `BlockRangeRequest` while the prior
+    /// request is in flight — the inflight tracker dedups.
+    #[tokio::test]
+    async fn second_proposal_with_same_gap_window_dedups_range_request() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let proposer_signer = fresh_signer();
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let parent_hash: BlockHash = [0xAB; 32];
+        // First proposal at height 31 — fires the range request.
+        let d1 = synthetic_proposal_dispatch(&proposer_signer, 31, 31, parent_hash);
+        node.apply_dispatch(d1, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .expect("apply_dispatch 1");
+        let _drained1 = drain_send_to_outbound(&mut outbound_rx);
+
+        // Second proposal at height 32 (still parent_hash unknown,
+        // still a multi-block gap from height 0). The to_height
+        // shifts to 31, but [from=1, to=31] is a fresh window so it
+        // emits. To exercise the same-window dedup we use the same
+        // proposal again.
+        let d2 = synthetic_proposal_dispatch(&proposer_signer, 31, 31, parent_hash);
+        node.apply_dispatch(d2, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .expect("apply_dispatch 2");
+
+        let frames = drain_send_to_outbound(&mut outbound_rx);
+        let range_emissions: Vec<_> = frames
+            .iter()
+            .filter(|(_, w)| matches!(w, WireMessage::BlockRangeRequest { .. }))
+            .collect();
+        assert!(
+            range_emissions.is_empty(),
+            "second proposal with same (from, to) window must not re-emit range request; saw {range_emissions:?}",
+        );
+    }
+
+    /// A proposal whose parent is exactly one block above the commit
+    /// frontier (no multi-block gap) must NOT trigger a
+    /// `BlockRangeRequest` — the single-block path covers it. Pins
+    /// the boundary condition.
+    #[tokio::test]
+    async fn proposal_with_single_block_gap_does_not_emit_range_request() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let proposer_signer = fresh_signer();
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Proposal at height 2 with parent at 1 — the single-block
+        // RequestBlock path covers this; no range request needed.
+        let parent_hash: BlockHash = [0xCD; 32];
+        let dispatch = synthetic_proposal_dispatch(&proposer_signer, 2, 2, parent_hash);
+
+        node.apply_dispatch(dispatch, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .expect("apply_dispatch");
+
+        let frames = drain_send_to_outbound(&mut outbound_rx);
+        let range_emissions: Vec<_> = frames
+            .iter()
+            .filter(|(_, w)| matches!(w, WireMessage::BlockRangeRequest { .. }))
+            .collect();
+        assert!(
+            range_emissions.is_empty(),
+            "single-block gap must not trigger BlockRangeRequest; saw {range_emissions:?}",
         );
     }
 

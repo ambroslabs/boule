@@ -123,6 +123,7 @@ impl ConsensusNode {
                 // proposal's height before consuming the event, so
                 // the snapshot-fetch state machine can decide
                 // whether to fast-path the joiner past block-sync.
+                let mut multi_block_gap_proposer: Option<(NodeId, crate::consensus::Height)> = None;
                 if let SafetyEvent::ProposalReceived(signed) = &ev {
                     let signed = signed.inner();
                     let proposer = signed.signer;
@@ -135,10 +136,35 @@ impl ConsensusNode {
                     );
                     self.apply_snapshot_sync_actions(actions, broadcaster, view_timer, signer)
                         .await?;
+                    // Bulk-range gap detection (#515): if the
+                    // incoming proposal sits well above our commit
+                    // frontier, the safety core's single-block
+                    // RequestBlock is going to walk the chain
+                    // backwards one parent at a time. Stash the
+                    // proposer and proposal_height so we can fire a
+                    // BlockRangeRequest in addition to the
+                    // single-block path — only when the safety
+                    // core's response actually emits a RequestBlock
+                    // (i.e. the parent is missing).
+                    multi_block_gap_proposer = Some((proposer, proposal_height));
                 }
                 let actions = self.step_safety(ev);
+                let safety_emitted_request_block = actions
+                    .iter()
+                    .any(|a| matches!(a, SafetyAction::RequestBlock { .. }));
                 self.apply_safety_actions(actions, broadcaster, view_timer, signer)
                     .await?;
+                if safety_emitted_request_block
+                    && let Some((proposer, proposal_height)) = multi_block_gap_proposer
+                {
+                    self.maybe_emit_block_range_request(
+                        proposer,
+                        proposal_height,
+                        broadcaster,
+                        signer,
+                    )
+                    .await?;
+                }
             }
 
             Dispatch::Pacemaker(ev) => {
@@ -533,6 +559,71 @@ impl ConsensusNode {
         out
     }
 
+    /// Bulk-range gap detection (#515): when a proposal arrives
+    /// whose parent is not in `pending_blocks` and whose height sits
+    /// more than two blocks above the commit frontier, fire a
+    /// [`WireMessage::BlockRangeRequest`] to the proposer in addition
+    /// to the safety core's single-block `RequestBlock` for the
+    /// immediate parent. The single-block path keeps working as a
+    /// fallback for the unknown-parent-but-only-one-block-away case
+    /// the existing tests cover; the range request collapses
+    /// multi-block catch-up into one round trip.
+    ///
+    /// Dedup: re-emissions for the same `(from_height, to_height)`
+    /// pair while a previous request is still in flight are
+    /// suppressed. The matching [`Dispatch::ReceiveBlockRange`]
+    /// handler clears the inflight entry on arrival.
+    async fn maybe_emit_block_range_request(
+        &mut self,
+        proposer: NodeId,
+        proposal_height: crate::consensus::Height,
+        broadcaster: &dyn Broadcaster,
+        _signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        // Asking ourselves for blocks is a no-op the safety core
+        // already drops on the RequestBlock side; mirror that here.
+        if proposer == self.self_id {
+            return Ok(());
+        }
+        let last_committed = self.last_committed_height.load(Ordering::Relaxed);
+        let parent_height = proposal_height.0.saturating_sub(1);
+        // Only fire when the gap is more than one block — the
+        // single-block path covers the trailing case.
+        if parent_height <= last_committed.saturating_add(1) {
+            return Ok(());
+        }
+        let from_height = crate::consensus::Height(last_committed.saturating_add(1));
+        let cap = crate::consensus::node::BLOCK_RANGE_RESPONSE_MAX_BLOCKS as u64;
+        // Cap the upper bound to from_height + cap - 1 so the
+        // requested span never exceeds the responder's per-response
+        // budget. Larger gaps pipeline naturally as subsequent
+        // proposals arrive (each ProposalReceived event re-evaluates
+        // the gap from the new commit frontier).
+        let to_height = crate::consensus::Height(parent_height.min(from_height.0 + cap - 1));
+        let key = (from_height, to_height);
+        if self.block_sync_range_inflight.contains_key(&key) {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                from_height = from_height.0,
+                to_height = to_height.0,
+                proposer = %node_id_to_base58(&proposer),
+                "block_sync_range_request_suppressed_already_inflight",
+            );
+            return Ok(());
+        }
+        self.block_sync_range_inflight.insert(key, proposer);
+        tracing::info!(
+            target: TRACE_TARGET,
+            from_height = from_height.0,
+            to_height = to_height.0,
+            proposer = %node_id_to_base58(&proposer),
+            "block_sync_range_request_emitted",
+        );
+        let out = dispatch::egress_block_range_request(from_height, to_height, proposer);
+        send_outbound(broadcaster, out).await;
+        Ok(())
+    }
+
     /// Apply a bulk-range response: validate each block's height
     /// against the echoed `[from_height, to_height]`, insert the
     /// well-formed blocks into the safety core's `pending_blocks`,
@@ -560,6 +651,13 @@ impl ConsensusNode {
             block_count,
             "block_sync_range_response_received",
         );
+        // Drop the matching range-inflight entry (#515). Done
+        // *before* the inserts so a follow-up proposal arriving
+        // mid-iteration can re-emit a fresh range request — the
+        // dedup guard in [`Self::maybe_emit_block_range_request`]
+        // would otherwise suppress the next emission.
+        self.block_sync_range_inflight
+            .remove(&(from_height, to_height));
         let mut inserted = 0u64;
         let mut last_height: Option<crate::consensus::Height> = None;
         for block in blocks {
