@@ -82,6 +82,7 @@ use crate::storage::{Storage, Wal};
 
 mod action_interpreter;
 mod block_builder;
+mod block_sync;
 mod commit;
 mod config;
 mod persistence;
@@ -263,6 +264,13 @@ pub struct ConsensusNode {
     /// [`crate::consensus::status::BackpressureStatus::peer_outbound_overflow_total`].
     /// `None` for the simulator's mesh harness (no real p2p manager).
     peer_outbound_overflows: Option<Arc<AtomicU64>>,
+    /// Per-peer credit window for the block-sync responder (#498).
+    /// `apply_dispatch`'s `Dispatch::ServeBlock` arm acquires a credit
+    /// before serving and releases it on completion via the
+    /// [`block_sync::CreditGuard`]'s `Drop`. Defense-in-depth above
+    /// the per-peer rate limiter (#134) — see
+    /// [`block_sync::BlockSyncCreditWindow`].
+    pub(super) block_sync_credit: Arc<block_sync::BlockSyncCreditWindow>,
     /// Peer-membership snapshot used by [`ConsensusNode::build_status`].
     /// Populated from [`Discovery`] events inside [`ConsensusNode::run`];
     /// before `run` starts (or in tests that bypass it) the set is empty
@@ -457,6 +465,7 @@ impl ConsensusNode {
             commit_notifier: None,
             gossip_sink_overflows: None,
             peer_outbound_overflows: None,
+            block_sync_credit: Arc::new(block_sync::BlockSyncCreditWindow::new()),
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
@@ -799,6 +808,7 @@ impl ConsensusNode {
             commit_notifier: None,
             gossip_sink_overflows: None,
             peer_outbound_overflows: None,
+            block_sync_credit: Arc::new(block_sync::BlockSyncCreditWindow::new()),
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,

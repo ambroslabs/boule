@@ -153,6 +153,19 @@ pub struct BackpressureStatus {
     /// counted (manager-shutdown noise).
     #[serde(default)]
     pub peer_outbound_overflow_total: u64,
+    /// Drops from the block-sync responder's per-peer outstanding-
+    /// request cap (#498). Each increment is one `RequestBlock` the
+    /// responder declined to serve because the issuing peer already
+    /// had `BLOCK_SYNC_OUTSTANDING_PER_PEER` requests in flight at
+    /// this node. Defense-in-depth above the per-peer rate limiter
+    /// (#134) — the rate limiter caps inbound RPS, the credit window
+    /// caps concurrent serves. Synchronous serving today means the
+    /// counter is moved by the cap only under genuinely concurrent
+    /// dispatch (e.g. a future async responder); on the synchronous
+    /// run-loop path the count never exceeds 1 and this counter
+    /// stays at zero. Closed-channel failures are not counted.
+    #[serde(default)]
+    pub block_sync_serve_drops_total: u64,
 }
 
 /// A snapshot of a consensus node's live state, returned by
@@ -289,6 +302,7 @@ mod tests {
             backpressure: BackpressureStatus {
                 gossip_sink_overflow_total: 5,
                 peer_outbound_overflow_total: 9,
+                block_sync_serve_drops_total: 2,
             },
         }
     }
@@ -348,9 +362,10 @@ mod tests {
         // Vote-equivocation counter (audit 3-1, #409).
         assert_eq!(json["equivocations_detected"], 2);
 
-        // Back-pressure overflow counters (#163 / #486).
+        // Back-pressure overflow counters (#163 / #486 / #498).
         assert_eq!(json["backpressure"]["gossip_sink_overflow_total"], 5);
         assert_eq!(json["backpressure"]["peer_outbound_overflow_total"], 9);
+        assert_eq!(json["backpressure"]["block_sync_serve_drops_total"], 2);
     }
 
     #[test]
