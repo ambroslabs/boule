@@ -1,10 +1,15 @@
 //! `lines` — count Rust source lines, tokei-style, with an impl-vs-test split.
 //!
-//! Usage: `cargo run --bin lines -- [--per-file|-f] [PATH]`
+//! Usage: `cargo run --bin lines -- [--per-file|-f|--ls|-l] [PATH]`
 //!         (PATH defaults to `src`)
 //!
-//! Default aggregation is one row per top-level subdirectory under PATH.
-//! `--per-file` switches to one row per `.rs` file.
+//! Aggregation modes:
+//!   * default (`--by-subdir` implicit) — one row per top-level subdirectory
+//!     under PATH; files directly in PATH are aggregated into a `.` row.
+//!   * `--ls` / `-l` — list each entry directly under PATH: top-level files
+//!     get their own row, subdirectories aggregate everything beneath them
+//!     into a single row.
+//!   * `--per-file` / `-f` — one row per `.rs` file, fully recursive.
 //!
 //! Each `.rs` file under PATH is classified line-by-line as:
 //!   * blank   — only whitespace
@@ -49,19 +54,29 @@ impl Counts {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    BySubdir,
+    PerFile,
+    Ls,
+}
+
 fn main() -> ExitCode {
-    let mut per_file = false;
+    let mut mode = Mode::BySubdir;
     let mut path: Option<PathBuf> = None;
     for arg in env::args().skip(1) {
         match arg.as_str() {
-            "--per-file" | "-f" => per_file = true,
+            "--per-file" | "-f" => mode = Mode::PerFile,
+            "--ls" | "-l" => mode = Mode::Ls,
             "--help" | "-h" => {
                 print_help();
                 return ExitCode::SUCCESS;
             }
             s if s.starts_with('-') => {
                 eprintln!("error: unknown flag: {s}");
-                eprintln!("usage: lines [--per-file|-f] [PATH]   (PATH defaults to `src`)");
+                eprintln!(
+                    "usage: lines [--per-file|-f|--ls|-l] [PATH]   (PATH defaults to `src`)"
+                );
                 return ExitCode::from(2);
             }
             _ => {
@@ -114,15 +129,13 @@ fn main() -> ExitCode {
         let counts = classify_file(&src, is_test);
         total.add(counts);
         by_dir.entry(bucket_for(f, &root)).or_default().add(counts);
-        if per_file {
-            per_file_rows.push((f.clone(), counts));
-        }
+        per_file_rows.push((f.clone(), counts));
     }
 
-    if per_file {
-        print_per_file(&root, &per_file_rows, total);
-    } else {
-        print_table(&root, &by_dir, total);
+    match mode {
+        Mode::BySubdir => print_table(&root, &by_dir, total),
+        Mode::PerFile => print_per_file(&root, &per_file_rows, total),
+        Mode::Ls => print_ls(&root, &per_file_rows, total),
     }
     ExitCode::SUCCESS
 }
@@ -660,14 +673,17 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 // ----- output ---------------------------------------------------------------
 
 fn print_help() {
-    println!("usage: lines [--per-file|-f] [PATH]   (PATH defaults to `src`)");
+    println!("usage: lines [--per-file|-f|--ls|-l] [PATH]   (PATH defaults to `src`)");
     println!();
     println!("Walks `.rs` files under PATH and prints a tokei-style table of");
     println!("file/line counts, with the Code column split into Impl + Test.");
     println!();
     println!("Aggregation:");
-    println!("  default     one row per top-level subdirectory under PATH");
-    println!("  --per-file  one row per `.rs` file");
+    println!("  default       one row per top-level subdirectory under PATH;");
+    println!("                files directly in PATH go in a `.` row");
+    println!("  --ls, -l      one row per entry directly under PATH:");
+    println!("                top-level files individually, subdirs aggregated");
+    println!("  --per-file    one row per `.rs` file, fully recursive");
     println!();
     println!("Test classification:");
     println!("  - lines inside `#[cfg(test)]` item bodies (brace-balanced)");
@@ -721,6 +737,88 @@ fn print_per_file(root: &Path, rows: &[(PathBuf, Counts)], total: Counts) {
     println!(
         " {:<pw$} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
         format!("Total ({} files)", total.files),
+        total.lines,
+        total.code(),
+        total.code_impl,
+        total.code_test,
+        total.comments,
+        total.blanks,
+        pw = path_w,
+    );
+    println!("{bar}");
+    print_summary_footer(total);
+}
+
+fn print_ls(root: &Path, rows: &[(PathBuf, Counts)], total: Counts) {
+    // Group every file by its first-level entry under `root`. Top-level files
+    // end up as their own entry (filename); files deeper in a subdir all
+    // collapse onto that subdir's entry, recursively.
+    use std::ffi::OsString;
+    let mut entries: BTreeMap<OsString, (bool, Counts)> = BTreeMap::new();
+    for (path, counts) in rows {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let mut comps = rel.components();
+        let Some(first) = comps.next() else { continue };
+        let is_top_file = comps.next().is_none();
+        let key = first.as_os_str().to_owned();
+        let entry = entries
+            .entry(key)
+            .or_insert((is_top_file, Counts::default()));
+        entry.1.add(*counts);
+    }
+
+    let display_entries: Vec<(String, Counts)> = entries
+        .into_iter()
+        .map(|(name, (is_file, c))| {
+            let s = name.to_string_lossy().into_owned();
+            (if is_file { s } else { format!("{s}/") }, c)
+        })
+        .collect();
+
+    let mut path_w = "Entry (under …)".len() + root.display().to_string().len();
+    for (n, _) in &display_entries {
+        path_w = path_w.max(n.len());
+    }
+    path_w = path_w.clamp(28, 64);
+
+    let bar_w = path_w + 1 + 7 + 1 + 9 + 1 + 9 + 1 + 9 + 1 + 9 + 1 + 9 + 1 + 7 + 2;
+    let bar = "=".repeat(bar_w);
+    println!("{bar}");
+    println!(" Lines = Code + Comments + Blanks    |    Code = Impl + Test");
+    println!("{bar}");
+    let header_path = format!("Entry (under {})", root.display());
+    println!(
+        " {:<pw$} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+        header_path,
+        "Files",
+        "Lines",
+        "Code",
+        "Impl",
+        "Test",
+        "Comments",
+        "Blanks",
+        pw = path_w,
+    );
+    println!("{bar}");
+    for (name, c) in &display_entries {
+        println!(
+            " {:<pw$} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+            name,
+            c.files,
+            c.lines,
+            c.code(),
+            c.code_impl,
+            c.code_test,
+            c.comments,
+            c.blanks,
+            pw = path_w,
+        );
+    }
+    println!("{bar}");
+    println!(
+        " {:<pw$} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+        "Total",
+        total.files,
         total.lines,
         total.code(),
         total.code_impl,
