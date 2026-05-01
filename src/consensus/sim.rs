@@ -2408,7 +2408,7 @@ impl SimCluster {
                 },
                 maintenance: MeshMaintenanceConfig {
                     interval: Duration::from_secs(1),
-                    target_degree,
+                    outbound_target: target_degree,
                 },
                 dedup_capacity: 4096,
                 dedup_ttl: Duration::from_secs(60),

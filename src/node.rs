@@ -781,8 +781,11 @@ async fn build_overlay_wiring(
             }
 
             info!(
-                "overlay: gossip (target_degree={}, bootstrap_addrs={})",
-                overlay_cfg.target_degree,
+                "overlay: gossip (outbound_target={}, inbound_max={}, total_max={}, \
+                 bootstrap_addrs={})",
+                overlay_cfg.outbound_target,
+                overlay_cfg.inbound_max,
+                overlay_cfg.total_max,
                 overlay_cfg.bootstrap_addrs.len()
             );
 

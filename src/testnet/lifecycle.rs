@@ -424,8 +424,8 @@ fn write_final_config(
          cleanup_interval_secs = 60\n\
          \n\
          [overlay]\n\
-         mode          = \"gossip\"\n\
-         target_degree = {target_degree}\n\
+         mode            = \"gossip\"\n\
+         outbound_target = {target_degree}\n\
          \n\
          [consensus]\n\
          validators       = [{validators_toml}]\n\

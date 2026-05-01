@@ -435,8 +435,8 @@ listen_addr = "127.0.0.1:<auto>"
 cleanup_interval_secs = 60
 
 [overlay]
-mode          = "gossip"
-target_degree = 8
+mode            = "gossip"
+outbound_target = 8
 
 [consensus]
 validators      = ["<node1-id>", "<node2-id>", "<node3-id>", "<node4-id>"]
@@ -459,10 +459,16 @@ Notes worth knowing:
   the fault-tolerance experiments below). Omitting it falls back to an
   in-memory backend — fine for a throwaway demo but with no crash
   recovery.
-- `[overlay].target_degree` is the partial-mesh fan-out the gossip
-  overlay maintains. The driver bootstraps each node with a small
-  ring-neighbour `[[peers]]` block; gossip discovers the rest. Pass
-  `--target-degree T` to override.
+- `[overlay].outbound_target` is the partial-mesh outbound fan-out
+  the gossip overlay maintains (renamed from the legacy `target_degree`
+  knob in #187; the alias still parses with a deprecation warning).
+  The driver bootstraps each node with a small ring-neighbour
+  `[[peers]]` block; gossip discovers the rest. Pass `--target-degree T`
+  to the testnet `new` command to override (the flag name is kept
+  stable; it now writes the post-#187 `outbound_target` field).
+  `[overlay].inbound_max` and `[overlay].total_max` cap accepted
+  inbound and total direct connections respectively; the driver omits
+  them so each node picks up the conservative defaults (16 / 24).
 - `genesis_seed_hex` and `propose_limit` are omitted — every replica
   picks up the same defaults, which is sufficient for a laptop
   cluster. Set them by hand when reproducing a specific genesis or

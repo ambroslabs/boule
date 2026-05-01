@@ -23,7 +23,7 @@
 //!   peers every [`super::peer_list_task::PeerListGossipConfig::interval`].
 //! - [`super::maintenance::run_mesh_maintenance`] — dials extra peers
 //!   from the table when the direct-peer count is below
-//!   [`super::maintenance::MeshMaintenanceConfig::target_degree`].
+//!   [`super::maintenance::MeshMaintenanceConfig::outbound_target`].
 //!
 //! Both share the orchestrator's `PeerTable` and `Arc<LockedVec>` of
 //! direct peers; both shut down when the orchestrator's shutdown is
@@ -175,7 +175,7 @@ impl GossipOverlayConfig {
             },
             maintenance: MeshMaintenanceConfig {
                 interval: Duration::from_millis(cfg.mesh_check_interval_ms),
-                target_degree: cfg.target_degree,
+                outbound_target: cfg.outbound_target,
             },
             dedup_capacity: cfg.dedup_capacity,
             dedup_ttl: Duration::from_millis(cfg.dedup_ttl_ms),

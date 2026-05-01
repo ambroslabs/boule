@@ -13,16 +13,25 @@ cleanup_interval_secs = 60
 # legacy N–1-direct-connections behaviour. All other knobs apply only
 # in gossip mode and default to the values shown below.
 #
-# In gossip mode each node maintains at most `target_degree` direct
-# TCP/TLS connections (default 8); the rest of the validator set is
-# learned through periodic peer-list pushes from those direct
-# neighbours. New operators populate `bootstrap_addrs` with one or two
-# seed addresses to reach the network on first boot — peer-list
-# gossip teaches them about everyone else within a few ticks.
+# In gossip mode each node dials toward `outbound_target` direct
+# TCP/TLS connections (default 8) and accepts at most `inbound_max`
+# inbound peers (default 16); `total_max` (default 24) is a hard
+# ceiling on registered direct peers regardless of direction. The
+# rest of the validator set is learned through periodic peer-list
+# pushes from those direct neighbours. New operators populate
+# `bootstrap_addrs` with one or two seed addresses to reach the
+# network on first boot — peer-list gossip teaches them about
+# everyone else within a few ticks.
+#
+# `target_degree` is retained as a deprecated alias (#187): when
+# present, it sets `outbound_target = inbound_max = total_max = N`
+# and emits a warning at config load.
 #
 # [overlay]
 # mode = "gossip"               # "gossip" (default) | "mesh"
-# target_degree = 8             # max direct peers per node
+# outbound_target = 8           # outbound dial floor (#187)
+# inbound_max = 16              # inbound cap (#187)
+# total_max = 24                # total ceiling (#187)
 # peer_gossip_interval_ms = 5000
 # peer_gossip_fanout = 3
 # mesh_check_interval_ms = 5000

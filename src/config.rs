@@ -850,6 +850,20 @@ fn default_max_violations() -> u32 {
 /// [`crate::p2p::overlay::gossip::overlay::GossipOverlayConfig`]), so a
 /// node that omits `[overlay]` entirely gets the breakdown-comment
 /// defaults from issue #137.
+///
+/// # Direct-peer budgets (#187)
+///
+/// `outbound_target` is a soft floor that the maintenance loop dials
+/// toward; `inbound_max` is a hard cap on accepted inbound connections;
+/// `total_max` is a hard ceiling on registered direct peers regardless
+/// of direction. Splitting the single `target_degree` knob into these
+/// three numbers lets operators run generous outbound (peers we chose,
+/// sized for partition resilience) alongside conservative inbound
+/// (anyone can dial us, including a Byzantine flood).
+///
+/// `target_degree` is retained as a deprecated alias: when present it
+/// sets `outbound_target = inbound_max = total_max = N` and emits a
+/// warning at config load.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct OverlayConfig {
     /// Which overlay implementation to use. Defaults to `gossip`
@@ -859,10 +873,28 @@ pub struct OverlayConfig {
     /// `mode = "mesh"`.
     #[serde(default)]
     pub mode: OverlayMode,
-    /// Upper bound on direct peer count for the partial-mesh
-    /// maintenance loop. Used in `mode = "gossip"` only.
-    #[serde(default = "default_target_degree")]
-    pub target_degree: usize,
+    /// Soft floor on the outbound direct-peer count maintained by the
+    /// partial-mesh maintenance loop (#187). Used in `mode = "gossip"`
+    /// only.
+    #[serde(default = "default_outbound_target")]
+    pub outbound_target: usize,
+    /// Hard cap on inbound direct connections (#187). A fresh inbound
+    /// TLS handshake past this cap is closed cleanly. Used in
+    /// `mode = "gossip"` only.
+    #[serde(default = "default_inbound_max")]
+    pub inbound_max: usize,
+    /// Hard ceiling on total registered direct peers regardless of
+    /// direction (#187). Acts as a safety net above
+    /// `outbound_target + inbound_max`. Used in `mode = "gossip"`
+    /// only.
+    #[serde(default = "default_total_max")]
+    pub total_max: usize,
+    /// Deprecated alias for the three direct-peer budget knobs. When
+    /// present, sets `outbound_target = inbound_max = total_max = N`
+    /// and emits a warning at config load. Prefer the explicit knobs
+    /// for new configs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_degree: Option<usize>,
     /// Peer-list publisher tick interval, milliseconds. Used in
     /// `mode = "gossip"` only.
     #[serde(default = "default_peer_gossip_interval_ms")]
@@ -896,7 +928,10 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             mode: OverlayMode::default(),
-            target_degree: default_target_degree(),
+            outbound_target: default_outbound_target(),
+            inbound_max: default_inbound_max(),
+            total_max: default_total_max(),
+            target_degree: None,
             peer_gossip_interval_ms: default_peer_gossip_interval_ms(),
             peer_gossip_fanout: default_peer_gossip_fanout(),
             mesh_check_interval_ms: default_mesh_check_interval_ms(),
@@ -904,6 +939,33 @@ impl Default for OverlayConfig {
             dedup_ttl_ms: default_dedup_ttl_ms(),
             peer_table_capacity: default_peer_table_capacity(),
             bootstrap_addrs: Vec::new(),
+        }
+    }
+}
+
+impl OverlayConfig {
+    /// Resolve the deprecated `target_degree` alias into the split
+    /// `outbound_target` / `inbound_max` / `total_max` knobs (#187).
+    ///
+    /// When `target_degree = N` is present in the parsed config this
+    /// overwrites all three new knobs with `N` and clears the alias —
+    /// matching the breakdown comment on #187 — and emits a warning so
+    /// operators see the rename in their logs. When the alias is
+    /// absent this is a no-op.
+    ///
+    /// Called automatically from [`load`]; tests that bypass `load`
+    /// (using `toml::from_str` directly) should call this if they
+    /// want to observe alias-resolved values.
+    pub fn resolve_deprecated_aliases(&mut self) {
+        if let Some(n) = self.target_degree.take() {
+            warn!(
+                "`[overlay] target_degree` is deprecated (#187); use \
+                 `outbound_target`, `inbound_max`, and `total_max` \
+                 instead. Setting all three to {n} for compatibility."
+            );
+            self.outbound_target = n;
+            self.inbound_max = n;
+            self.total_max = n;
         }
     }
 }
@@ -918,8 +980,9 @@ pub enum OverlayMode {
     Mesh,
     /// Partial-mesh gossip overlay (issue #137). Default since
     /// stack 9 of #137 — operators get bounded direct-peer count
-    /// (`target_degree`, default 8) without coordinated config
-    /// rollouts when the validator set grows.
+    /// (`outbound_target`, default 8, plus the inbound caps from
+    /// #187) without coordinated config rollouts when the validator
+    /// set grows.
     #[default]
     Gossip,
 }
@@ -941,8 +1004,24 @@ pub struct UiConfig {
     pub output_format: OutputFormat,
 }
 
-fn default_target_degree() -> usize {
+fn default_outbound_target() -> usize {
     8
+}
+
+/// Hard cap on inbound connections (#187). Sized so a healthy
+/// outbound_target=8 deployment has 2× headroom for inbound peers,
+/// which limits the consequences of a Byzantine inbound flood without
+/// starving honest peers that legitimately want to dial us.
+fn default_inbound_max() -> usize {
+    16
+}
+
+/// Hard ceiling on total registered direct peers (#187), regardless
+/// of direction. `outbound_target + inbound_max` for the defaults so
+/// it acts as a safety net rather than the binding limit in steady
+/// state.
+fn default_total_max() -> usize {
+    24
 }
 
 fn default_peer_gossip_interval_ms() -> u64 {
@@ -971,7 +1050,11 @@ fn default_peer_table_capacity() -> usize {
 
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     let text = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&text)?;
+    let mut config: Config = toml::from_str(&text)?;
+    // Migrate `[overlay] target_degree = N` → split knobs (#187).
+    // Doing this once at load keeps the rest of the binary on the
+    // post-#187 names without per-call branching.
+    config.overlay.resolve_deprecated_aliases();
     Ok(config)
 }
 
@@ -980,7 +1063,7 @@ impl Config {
     ///
     /// Rejects any static `[[peers]]` entry whose `node_id` matches the
     /// local node — a self-dial would loop back to our own listener,
-    /// count against `target_degree`, and surface as a real peer in
+    /// count against `outbound_target`, and surface as a real peer in
     /// `/peers`. TOFU `bootstrap_addrs` carry no `node_id`, so the
     /// equivalent check there is deferred to the dialer / listener
     /// handshake guards (see `src/p2p/dialer.rs` and
@@ -1660,9 +1743,13 @@ listen_addr = "127.0.0.1:8080"
 "#,
         );
         // Defaults match the breakdown-comment values on #137,
-        // including `mode = "gossip"` after the stack-9 cutover.
+        // including `mode = "gossip"` after the stack-9 cutover, and
+        // the split direct-peer budgets from #187.
         assert_eq!(c.overlay.mode, OverlayMode::Gossip);
-        assert_eq!(c.overlay.target_degree, 8);
+        assert_eq!(c.overlay.outbound_target, 8);
+        assert_eq!(c.overlay.inbound_max, 16);
+        assert_eq!(c.overlay.total_max, 24);
+        assert_eq!(c.overlay.target_degree, None);
         assert_eq!(c.overlay.peer_gossip_interval_ms, 5_000);
         assert_eq!(c.overlay.peer_gossip_fanout, 3);
         assert_eq!(c.overlay.mesh_check_interval_ms, 5_000);
@@ -1708,7 +1795,39 @@ mode = "gossip"
         );
         assert_eq!(c.overlay.mode, OverlayMode::Gossip);
         // Section-present, knob-absent: defaults still apply.
-        assert_eq!(c.overlay.target_degree, 8);
+        assert_eq!(c.overlay.outbound_target, 8);
+        assert_eq!(c.overlay.inbound_max, 16);
+        assert_eq!(c.overlay.total_max, 24);
+    }
+
+    /// #187 backwards-compat: a config with the deprecated
+    /// `target_degree = N` knob still parses, and after
+    /// `resolve_deprecated_aliases` runs it's projected onto all three
+    /// new direct-peer-budget knobs.
+    #[test]
+    fn overlay_target_degree_alias_sets_all_three_split_knobs() {
+        let mut c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[overlay]
+mode = "gossip"
+target_degree = 11
+"#,
+        );
+        // Before resolution: alias visible, split knobs at defaults.
+        assert_eq!(c.overlay.target_degree, Some(11));
+        assert_eq!(c.overlay.outbound_target, 8);
+        // After resolution: alias cleared, split knobs all set to N.
+        c.overlay.resolve_deprecated_aliases();
+        assert_eq!(c.overlay.target_degree, None);
+        assert_eq!(c.overlay.outbound_target, 11);
+        assert_eq!(c.overlay.inbound_max, 11);
+        assert_eq!(c.overlay.total_max, 11);
     }
 
     #[test]
@@ -1723,7 +1842,9 @@ listen_addr = "127.0.0.1:8080"
 
 [overlay]
 mode = "gossip"
-target_degree = 12
+outbound_target = 12
+inbound_max = 20
+total_max = 32
 peer_gossip_interval_ms = 2500
 peer_gossip_fanout = 5
 mesh_check_interval_ms = 7500
@@ -1734,7 +1855,9 @@ bootstrap_addrs = ["127.0.0.1:7100", "127.0.0.1:7200"]
 "#,
         );
         assert_eq!(c.overlay.mode, OverlayMode::Gossip);
-        assert_eq!(c.overlay.target_degree, 12);
+        assert_eq!(c.overlay.outbound_target, 12);
+        assert_eq!(c.overlay.inbound_max, 20);
+        assert_eq!(c.overlay.total_max, 32);
         assert_eq!(c.overlay.peer_gossip_interval_ms, 2_500);
         assert_eq!(c.overlay.peer_gossip_fanout, 5);
         assert_eq!(c.overlay.mesh_check_interval_ms, 7_500);
@@ -1923,9 +2046,9 @@ max_violations = 20
         // A static [[peers]] entry whose node_id matches the local TLS
         // identity is a configuration footgun: the dialer would TLS-
         // handshake against its own listener (we hold both keys),
-        // count the loopback against target_degree, and surface it in
-        // /peers. validate() rejects it at boot with a clear pointer
-        // to the offending entry.
+        // count the loopback against outbound_target, and surface it
+        // in /peers. validate() rejects it at boot with a clear
+        // pointer to the offending entry.
         let self_id: NodeId = [7u8; 32];
         let raw = node_id_to_base58(&self_id);
         let toml_str = format!(
