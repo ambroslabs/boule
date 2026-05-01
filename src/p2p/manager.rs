@@ -1289,6 +1289,7 @@ mod tests {
             max_inbound: 2,
             max_outbound: 99,
             max_per_ip: 99,
+            max_total: usize::MAX,
         }));
         let mgr = TestManager::start_with_limiter(nid(1), Some(Arc::clone(&limiter)));
         let _h = mgr.register(0x01).await;
@@ -1320,6 +1321,7 @@ mod tests {
             max_inbound: 99,
             max_outbound: 99,
             max_per_ip: 2,
+            max_total: usize::MAX,
         }));
         let mgr = TestManager::start_with_limiter(nid(1), Some(Arc::clone(&limiter)));
         let _h = mgr.register(0x01).await;
@@ -1338,6 +1340,86 @@ mod tests {
         assert_eq!(mgr.list_peers().await.len(), 3);
     }
 
+    /// #187 / #511 acceptance: a 100-connection inbound flood at
+    /// `inbound_max = 8` admits exactly 8 connections; the remaining
+    /// 92 increment the limiter's reject counter and never land in
+    /// the peer table. Drives the manager directly (rather than the
+    /// listener) since the ConnectionLimiter is the layer that
+    /// enforces the cap regardless of where the inbound originates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_flood_stops_at_inbound_max() {
+        // overlay.inbound_max = 8 in the limiter; max_per_ip is
+        // bumped well past the flood size so the per-IP cap doesn't
+        // fire first (we want this test to exercise the inbound cap
+        // specifically — the per-IP cap has its own coverage above).
+        let limiter = Arc::new(ConnectionLimiter::new(ConnectionLimitsConfig {
+            max_inbound: 8,
+            max_outbound: 99,
+            max_per_ip: 200,
+            max_total: usize::MAX,
+        }));
+        let mgr = TestManager::start_with_limiter(nid(1), Some(Arc::clone(&limiter)));
+        let _h = mgr.register(0x01).await;
+
+        // Send the 100 NewConnection messages back-to-back from
+        // distinct NodeIds + IPs. Keep the duplex remote ends alive
+        // for the duration of the test so the manager's per-peer
+        // write task doesn't observe a dropped pipe and tear down.
+        let mut remotes = Vec::with_capacity(100);
+        for i in 0..100u32 {
+            let (local, remote) = duplex(1024);
+            remotes.push(remote);
+            // Distinct NodeIds; the byte pattern doesn't matter so
+            // long as it's unique. Use the index in the first two
+            // bytes so up to 65k flood entries stay distinct.
+            let mut id = [0u8; 32];
+            id[0..2].copy_from_slice(&(i as u16).to_be_bytes());
+            // Distinct IPs: 10.0.<hi>.<lo>.
+            let ip_hi = (i >> 8) as u8;
+            let ip_lo = i as u8;
+            let src = sa(10, 0, ip_hi, ip_lo, 7000);
+            mgr.internal_tx
+                .send(ManagerMsg::NewConnection {
+                    node_id: id,
+                    addr: src,
+                    direction: Direction::Inbound,
+                    stream: Box::new(local),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Wait for the manager to process all 100 messages. Poll-with-
+        // budget pattern from CLAUDE.md: stop as soon as the steady
+        // state is observable, capped at well under the 15s ceiling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let peers = mgr.list_peers().await.len();
+            let rejects = limiter.rejects();
+            if peers == 8 && rejects >= 92 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "did not converge within 5s: peers={peers}, rejects={rejects} \
+                     (expected 8 / >=92)",
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            limiter.inbound(),
+            8,
+            "exactly inbound_max connections accepted",
+        );
+        assert!(
+            limiter.rejects() >= 92,
+            "remaining 92 attempts must register as rejects; got {}",
+            limiter.rejects()
+        );
+    }
+
     /// `Disconnect` releases the connection-limiter slot so a fresh
     /// dial from the same IP can be admitted again.
     #[tokio::test]
@@ -1346,6 +1428,7 @@ mod tests {
             max_inbound: 1,
             max_outbound: 99,
             max_per_ip: 99,
+            max_total: usize::MAX,
         }));
         let mgr = TestManager::start_with_limiter(nid(1), Some(Arc::clone(&limiter)));
         let _h = mgr.register(0x01).await;
