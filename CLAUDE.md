@@ -23,8 +23,28 @@ check.
 - When an issue is code-complete, open a PR and monitor CI to green.
 - Reference the issue in the PR body with a closing keyword (`Closes #N`,
   `Fixes #N`) so it auto-closes on merge.
-- Do **not** merge. Wait for human review and let the human merge.
-- If CI fails, fix it on the same branch and push again.
+- For a single PR with no stack: once CI is green, squash-merge with
+  `gh pr merge <N> --squash --delete-branch`. Rebase first if the
+  branch is behind `main`.
+- For a **stack of PRs**, set each PR's base to its parent (PR2 → PR1,
+  PR3 → PR2), not to `main`. When the whole stack is ready, collapse
+  it into the bottom PR before landing on main:
+    1. Top-down, squash-merge each child into its parent
+       (`gh pr merge <child> --squash --delete-branch`). The child
+       PR's content lands on the parent's branch as a single commit
+       and the child PR auto-closes. GitHub auto-retargets the next-
+       up PR's base to the now-deleted child's parent, so the chain
+       collapses cleanly.
+    2. After every intermediate squash, the bottom PR's branch
+       contains the whole stack as one commit per former-child plus
+       its own commits. Rebase onto current `main` if needed.
+    3. Squash-merge the bottom PR to `main`. `main` gets one commit
+       per stack, titled after the bottom PR.
+- If pre-merge CI fails, fix on the same branch and push.
+- If a merge fails on a CI flake (single test, passes on rerun, no
+  recent change to that test), retry once. If it fails again on the
+  same test, file an issue for the flake and stop.
+- Don't merge a draft PR or one whose CI hasn't actually run.
 
 ## Issue labels
 
