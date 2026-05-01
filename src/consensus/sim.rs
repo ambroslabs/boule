@@ -5746,6 +5746,144 @@ mod tests {
         }
     }
 
+    // ── Block-sync flood (#498) ───────────────────────────────────────────────
+
+    /// Issue #498 acceptance: a peer that floods `RequestBlock` frames
+    /// at our node must not destabilize block-sync — the per-peer rate
+    /// limiter's `RequestBlock` bucket caps inbound RPS, the per-peer
+    /// credit window
+    /// ([`block_sync::BlockSyncCreditWindow`])
+    /// caps concurrent serves. Together they ensure a flood is dropped
+    /// at the limiter boundary rather than queued through the run loop
+    /// and into the storage layer.
+    ///
+    /// The test injects N raw `BlockRequest` frames at one node from a
+    /// non-validator source, asserts the rate limiter dropped most of
+    /// them, and asserts the cluster's commit progress is unaffected.
+    /// The credit-window drops counter stays at zero because serving is
+    /// synchronous — that's the documented behaviour today, but the
+    /// counter wiring is exercised by the `BlockSyncCreditWindow` unit
+    /// tests in `consensus/node/block_sync.rs`.
+    #[tokio::test]
+    async fn block_sync_request_flood_is_capped_by_rate_limiter() {
+        tokio::time::pause();
+
+        // Tighten the RequestBlock per-second cap so a small flood is
+        // sufficient to trip the limiter without flooding for several
+        // wall-seconds. The default is 8.0/sec — at 4.0/sec a 64-frame
+        // flood lands well above the bucket capacity.
+        let mut config = crate::p2p::limits::RateLimitsConfig::production_defaults();
+        config.request_block_per_sec = 4.0;
+        let (mut cluster, limiters) =
+            SimCluster::spawn_with_rate_limits(4, Duration::from_millis(50), config).await;
+
+        // Warm up just enough that every node has committed at least
+        // one block — that proves the cluster is past genesis-bootstrap
+        // before we inject the flood. A 1-second budget is comfortable;
+        // a healthy cluster commits its first block in a handful of
+        // virtual-time ticks under the 50ms timeout base.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(1), |c| {
+                c.peek_commit_heights().iter().all(|&h| h >= 1)
+            })
+            .await;
+        assert!(
+            warmed,
+            "warm-up failed; heights = {:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        // Inject the flood at node 1, attributed to node 0. Use the
+        // genesis hash because every node can serve it from durable
+        // storage. We hit the inbound `event_tx` directly to bypass
+        // any sender-side rate limiting and isolate the responder
+        // boundary.
+        let target_idx = 1;
+        let from_node = cluster.node_ids[0];
+        let target_node = cluster.node_ids[target_idx];
+        let target_hash = cluster.genesis.hash();
+        let wire = crate::consensus::node::WireMessage::BlockRequest(target_hash);
+        let bytes: Bytes = postcard::to_stdvec(&wire).unwrap().into();
+
+        let event_tx = cluster
+            .event_txs
+            .get(&target_node)
+            .expect("target_idx must have an event_tx slot")
+            .lock()
+            .clone();
+
+        const FLOOD_COUNT: usize = 64;
+        for _ in 0..FLOOD_COUNT {
+            event_tx
+                .send(ProtocolEvent::Message {
+                    from: from_node,
+                    payload: bytes.clone(),
+                })
+                .await
+                .expect("event_rx alive — node task should still be running");
+        }
+
+        // Yield enough rounds for the run loop to pull every queued
+        // event through ingress and through the rate limiter. We
+        // poll the limiter's drop counter as the early-exit signal —
+        // once the limiter has rejected more than half the flood,
+        // the bucket is drained and further yielding only adds cost.
+        for _ in 0..(FLOOD_COUNT * 4) {
+            yield_now().await;
+            let drops = limiters[target_idx]
+                .counters()
+                .drops(crate::p2p::limits::MessageKind::RequestBlock);
+            if drops > (FLOOD_COUNT as u64) / 2 {
+                break;
+            }
+        }
+
+        // The rate limiter's `RequestBlock` bucket is capacity ≈
+        // request_block_per_sec × burst_seconds = 4 × 1.0 = 4. So we
+        // expect roughly FLOOD_COUNT - 4 drops (give or take the
+        // bucket's slow refill). Assert the conservative bound: more
+        // than half the flood was dropped at the limiter boundary.
+        let drops = limiters[target_idx]
+            .counters()
+            .drops(crate::p2p::limits::MessageKind::RequestBlock);
+        assert!(
+            drops > (FLOOD_COUNT as u64) / 2,
+            "expected > {} RequestBlock drops on node {target_idx}; got {drops}",
+            FLOOD_COUNT / 2,
+        );
+
+        // The credit window's drops counter stays at zero — synchronous
+        // serving never reaches the cap. This is the documented
+        // behaviour; if it ever flips non-zero on this test it means
+        // the responder went concurrent without re-thinking the cap.
+        // (We don't have direct access to a node's status from the sim
+        // harness, so leave this as an inline comment rather than an
+        // assertion — the counter is asserted in
+        // `BlockSyncCreditWindow`'s unit tests.)
+
+        // Cluster still makes progress past the flood — the limiter
+        // shielded consensus from the burst, so the per-view cadence
+        // continued unaffected. We assert each node gained at least
+        // one *additional* commit since the warm-up baseline; that
+        // proves the cluster wasn't wedged by the flood.
+        let baseline = cluster.peek_commit_heights();
+        let progressed = cluster
+            .advance_and_yield_until(Duration::from_secs(2), |c| {
+                let now = c.peek_commit_heights();
+                now.iter().zip(baseline.iter()).all(|(a, b)| a > b)
+            })
+            .await;
+        assert!(
+            progressed,
+            "cluster failed to progress past flood; baseline={baseline:?}, \
+             now={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
     // ── #255: validator-set reconfiguration end-to-end ────────────────────
 
     /// 5-node cluster commits a `ReconfigCommand` that removes one

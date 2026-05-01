@@ -81,6 +81,7 @@ test fixtures with smaller channels do not appear here.
 | View-timer events | `consensus/node/mod.rs:820` | `mpsc<View>` | 4 | `send().await` | **Block** | Single-producer (`ViewTimer`); the run loop drains promptly. A backlog ⇒ pacemaker is starved, which is itself a bug we want to surface, not paper over. |
 | Safety-action persist | `consensus/node/action_interpreter.rs:395,598` | direct call to `persist_updates` | n/a (synchronous) | propagates `?` error | **Block (synchronous)** | Persist-before-send is the durability invariant for HotStuff safety. There is *no* queue between the safety core and storage; the run loop awaits the storage write inline. A storage error currently returns up the stack and aborts the run loop, which is correct — see `docs/storage-durability.md`. |
 | Safety-action outbound | via `Broadcaster` trait → `ProtocolHandle::send_tx` | `mpsc<ProtocolOutbound>` | 256 | `send().await` | **Block** | Outbound consensus messages back-pressure the action loop, which back-pressures the safety core, which is exactly the right behavior. |
+| Block-sync responder credit window | `consensus/node/block_sync.rs` | `HashMap<NodeId, u32>` (per-peer outstanding count) | `BLOCK_SYNC_OUTSTANDING_PER_PEER` (=4) | drop with counter increment when count == cap | **Drop + counter (defense-in-depth)** | Defense-in-depth above the per-peer rate limiter (#134, default 8 RPS). The synchronous responder serves at most one `RequestBlock` at a time per peer, so the cap never fires today; the structure is in place so a future async responder cannot leak unbounded concurrent serves into the storage layer. Drops surface as `ConsensusStatus.backpressure.block_sync_serve_drops_total`. |
 | `ConsensusStatus` watch | `consensus/api.rs:185` | `watch<Arc<ConsensusStatus>>` | 1 | replace-and-publish | **Latest-wins** | Status is a snapshot, not an event log. Receivers always observe the most recent value; intermediate states are intentionally collapsible. |
 
 ### Mempool
@@ -141,11 +142,17 @@ The audit identified three gaps that are tracked as sub-issues of #163:
   `SimCluster::spawn_with_slow_disk` wires
   [`crate::storage::ThrottledStorage`] /
   [`crate::storage::ThrottledWal`] adapters per node. Slow-node
-  primitive + slow-peer integration test still open as #497;
-  block-sync credit window + sync-flood test as #498. Tracing-burst
-  test was dropped — the property (tracing subscriber doesn't gate
-  consensus) is provided by `tracing-subscriber` defaults rather
-  than by our code.
+  primitive landed (#497): `SimCluster::set_slow_node` /
+  `spawn_with_slow_node` install a per-node bridge between the
+  inbound event channel and the consensus run loop that sleeps for a
+  runtime-mutable delay before forwarding. Block-sync credit window
+  landed (#498): per-peer concurrency cap on the responder
+  ([`block_sync::BlockSyncCreditWindow`]), surfaced as
+  `ConsensusStatus.backpressure.block_sync_serve_drops_total`, plus
+  a sim flood test that drives the per-peer rate limiter past its
+  bucket capacity. Tracing-burst test was dropped — the property
+  (tracing subscriber doesn't gate consensus) is provided by
+  `tracing-subscriber` defaults rather than by our code.
 
 ## Cross-references
 

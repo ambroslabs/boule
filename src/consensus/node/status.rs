@@ -175,6 +175,10 @@ impl ConsensusNode {
                     .as_ref()
                     .map(|c| c.load(Ordering::Relaxed))
                     .unwrap_or(0),
+                block_sync_serve_drops_total: self
+                    .block_sync_credit
+                    .drops_counter()
+                    .load(Ordering::Relaxed),
             },
         }
     }
