@@ -109,9 +109,12 @@ pub use persistence::{
     decode_block, decode_high_qc, decode_last_committed, decode_last_timeout_vote, decode_locked,
     decode_proposed_in_view, decode_voted_view, encode_block, encode_high_qc,
     encode_last_committed, encode_last_timeout_vote, encode_locked, encode_proposed_in_view,
-    encode_voted_view, load_block_from_storage, recover_state,
+    encode_voted_view, load_block_from_storage, load_block_range_from_storage, recover_state,
 };
-pub use wire::{BlockResponsePayload, MAX_FRAME_BYTES, PROTOCOL_ID, WireMessage};
+pub use wire::{
+    BLOCK_RANGE_RESPONSE_MAX_BLOCKS, BlockRangeResponsePayload, BlockResponsePayload,
+    MAX_FRAME_BYTES, PROTOCOL_ID, WireMessage,
+};
 
 use persistence::RecentQcCache;
 use timeout_bucket::TimeoutBucket;
@@ -3642,6 +3645,228 @@ mod tests {
         );
     }
 
+    // ── Bulk-range RPC (#514) — ServeBlockRange / ReceiveBlockRange ────
+
+    /// Build a deterministic block at the given height, parented to
+    /// the genesis block. View is set equal to height for clarity.
+    fn range_block_at(height: u64) -> Block {
+        use crate::replication::block::BlockHeader;
+        Block {
+            header: BlockHeader {
+                parent_hash: genesis().hash(),
+                height: Height(height),
+                view: View(height),
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        }
+    }
+
+    /// `Dispatch::ServeBlockRange` returns blocks from `pending_blocks`
+    /// inside the requested span, in ascending-height order. The
+    /// signed envelope echoes the request span and the responder's
+    /// signer matches the local node.
+    #[tokio::test]
+    async fn serve_block_range_returns_blocks_within_span_from_pending_blocks() {
+        let mut node = make_node(nid(1));
+        // Seed pending_blocks with heights 5..=8.
+        for h in 5..=8u64 {
+            node.core.insert_pending_block(range_block_at(h));
+        }
+
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        node.apply_dispatch(
+            Dispatch::ServeBlockRange {
+                from_height: Height(6),
+                to_height: Height(8),
+                to: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        match outbound_rx.recv().await.expect("outbound") {
+            ProtocolOutbound::SendTo { node_id, payload } => {
+                assert_eq!(node_id, nid(2));
+                let wire: WireMessage =
+                    postcard::from_bytes(&payload).expect("decode BlockRangeResponse");
+                match wire {
+                    WireMessage::BlockRangeResponse(got) => {
+                        assert_eq!(got.payload.from_height, Height(6));
+                        assert_eq!(got.payload.to_height, Height(8));
+                        assert_eq!(got.signer, signer.node_id());
+                        let heights: Vec<u64> = got
+                            .payload
+                            .blocks
+                            .iter()
+                            .map(|b| b.header.height.0)
+                            .collect();
+                        assert_eq!(heights, vec![6, 7, 8]);
+                    }
+                    other => panic!("expected BlockRangeResponse, got {other:?}"),
+                }
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
+    }
+
+    /// `Dispatch::ServeBlockRange` for a span that has no overlap with
+    /// pending_blocks or storage returns an empty block vector — the
+    /// responder still emits a (signed) BlockRangeResponse so the
+    /// requester can advance off the inflight entry.
+    #[tokio::test]
+    async fn serve_block_range_returns_empty_when_responder_holds_nothing() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        node.apply_dispatch(
+            Dispatch::ServeBlockRange {
+                from_height: Height(100),
+                to_height: Height(105),
+                to: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        match outbound_rx.recv().await.expect("outbound") {
+            ProtocolOutbound::SendTo { payload, .. } => {
+                let wire: WireMessage = postcard::from_bytes(&payload).expect("decode");
+                match wire {
+                    WireMessage::BlockRangeResponse(got) => {
+                        assert_eq!(got.payload.from_height, Height(100));
+                        assert_eq!(got.payload.to_height, Height(105));
+                        assert!(got.payload.blocks.is_empty());
+                    }
+                    other => panic!("expected BlockRangeResponse, got {other:?}"),
+                }
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
+    }
+
+    /// `Dispatch::ServeBlockRange` truncates the response at
+    /// `BLOCK_RANGE_RESPONSE_MAX_BLOCKS` even when the requested span
+    /// is wider. The requester pipelines further requests starting at
+    /// `last_received_height + 1`.
+    #[tokio::test]
+    async fn serve_block_range_caps_response_at_max() {
+        let cap = crate::consensus::node::BLOCK_RANGE_RESPONSE_MAX_BLOCKS as u64;
+        let mut node = make_node(nid(1));
+        // Seed cap+8 blocks above the cap so the responder must
+        // truncate.
+        for h in 1..=(cap + 8) {
+            node.core.insert_pending_block(range_block_at(h));
+        }
+
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        node.apply_dispatch(
+            Dispatch::ServeBlockRange {
+                from_height: Height(1),
+                to_height: Height(cap + 8),
+                to: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        match outbound_rx.recv().await.expect("outbound") {
+            ProtocolOutbound::SendTo { payload, .. } => {
+                let wire: WireMessage = postcard::from_bytes(&payload).expect("decode");
+                match wire {
+                    WireMessage::BlockRangeResponse(got) => {
+                        assert_eq!(got.payload.blocks.len(), cap as usize);
+                        // Ascending order, contiguous starting at from_height.
+                        let heights: Vec<u64> = got
+                            .payload
+                            .blocks
+                            .iter()
+                            .map(|b| b.header.height.0)
+                            .collect();
+                        assert_eq!(heights[0], 1);
+                        for w in heights.windows(2) {
+                            assert_eq!(w[1], w[0] + 1);
+                        }
+                    }
+                    other => panic!("expected BlockRangeResponse, got {other:?}"),
+                }
+            }
+            other => panic!("expected SendTo, got {other:?}"),
+        }
+    }
+
+    /// `Dispatch::ReceiveBlockRange` inserts every well-formed block
+    /// (height inside echoed span, strictly ascending) into
+    /// pending_blocks. Out-of-range entries are dropped, matching the
+    /// `ingress_block_range_response`'s shape contract.
+    #[tokio::test]
+    async fn receive_block_range_inserts_in_range_blocks_and_drops_out_of_range() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Build a deliberately-mixed response: heights 4 (out-of-range),
+        // 5, 6 (in-range), 9 (out-of-range). The handler must keep
+        // 5 and 6 only.
+        let blocks = vec![
+            range_block_at(4),
+            range_block_at(5),
+            range_block_at(6),
+            range_block_at(9),
+        ];
+
+        node.apply_dispatch(
+            Dispatch::ReceiveBlockRange {
+                from_height: Height(5),
+                to_height: Height(7),
+                blocks,
+                from: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        let pending = &node.core.state().pending_blocks;
+        assert!(pending.contains_key(&range_block_at(5).hash()));
+        assert!(pending.contains_key(&range_block_at(6).hash()));
+        assert!(
+            !pending.contains_key(&range_block_at(4).hash()),
+            "below-range block must be dropped",
+        );
+        assert!(
+            !pending.contains_key(&range_block_at(9).hash()),
+            "above-range block must be dropped",
+        );
+    }
+
     // ── Snapshot wire protocol (#228) — serving handlers ────────────────
 
     /// Helper: write a fully-populated snapshot (manifest + chunks)
@@ -7117,6 +7342,8 @@ mod tests {
             snapshot_manifest_response_per_sec: 1.0,
             snapshot_chunk_request_per_sec: 1.0,
             snapshot_chunk_response_per_sec: 1.0,
+            block_range_request_per_sec: 1.0,
+            block_range_response_per_sec: 1.0,
             bytes_per_sec: 1024.0 * 1024.0, // generous, isolate the test on per-kind
             burst_seconds: 1.0,
             violation_window: std::time::Duration::from_secs(60),
@@ -7279,6 +7506,8 @@ mod tests {
             snapshot_manifest_response_per_sec: 4.0,
             snapshot_chunk_request_per_sec: 4.0,
             snapshot_chunk_response_per_sec: 4.0,
+            block_range_request_per_sec: 4.0,
+            block_range_response_per_sec: 4.0,
             bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
             violation_window: std::time::Duration::from_secs(60),

@@ -421,6 +421,68 @@ pub fn load_block_from_storage(
     }
 }
 
+/// Walk the committed-chain from `tip_hash` backwards, collecting
+/// blocks whose `header.height` falls inside `[from_height, to_height]`
+/// (inclusive on both ends). Caps the returned vector at `cap` blocks
+/// regardless of how wide the requested span is — the responder's
+/// per-response budget for the bulk-range RPC (#514). Walks stop as
+/// soon as the cursor's height drops below `from_height`.
+///
+/// Returns blocks in ascending-height order. Returns `Ok(Vec::new())`
+/// when `tip_hash == [0; 32]` (no committed chain yet) or when the
+/// walk finds nothing inside the range.
+///
+/// Storage today is keyed by content-hash — there is no height-
+/// indexed key, so the walk-by-parent path is the canonical way to
+/// resolve a height range. Cost is `O(tip_height - to_height + (to -
+/// from) + 1)` in storage reads, which dominates `from_height` close
+/// to the tip — the common catch-up case.
+pub fn load_block_range_from_storage(
+    storage: &dyn Storage,
+    tip_hash: BlockHash,
+    from_height: Height,
+    to_height: Height,
+    cap: usize,
+) -> anyhow::Result<Vec<Block>> {
+    if from_height > to_height || cap == 0 {
+        return Ok(Vec::new());
+    }
+    if tip_hash == [0u8; 32] {
+        return Ok(Vec::new());
+    }
+    let mut collected: Vec<Block> = Vec::new();
+    let mut cursor = tip_hash;
+    loop {
+        let block = match load_block_from_storage(storage, &cursor)? {
+            Some(b) => b,
+            None => break,
+        };
+        let h = block.header.height;
+        if h < from_height {
+            break;
+        }
+        let parent = block.header.parent_hash;
+        if h <= to_height {
+            collected.push(block);
+            if collected.len() >= cap {
+                break;
+            }
+        }
+        // Sentinel for genesis: parent_hash on a genesis block is
+        // (by convention) something that does not resolve to another
+        // block. The next iteration's load_block_from_storage will
+        // return None and we exit cleanly.
+        if h == Height::ZERO {
+            break;
+        }
+        cursor = parent;
+    }
+    // Walked tip → from, so `collected` is descending. Reverse for
+    // ascending wire order.
+    collected.reverse();
+    Ok(collected)
+}
+
 /// Extract a fresh `BlsKeyHistory` containing only the genesis
 /// (`v_eff = 0`) entries of `loaded`. Used by the recovery rebuild
 /// path (#325 PR B) as the seed for replaying the chain's BLS

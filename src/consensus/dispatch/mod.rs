@@ -61,17 +61,19 @@ pub mod ingress;
 pub mod verify;
 
 pub use egress::{
-    egress_block_request, egress_block_response, egress_consensus_msg_with_loopback, egress_safety,
+    egress_block_range_request, egress_block_range_response, egress_block_request,
+    egress_block_response, egress_consensus_msg_with_loopback, egress_safety,
     egress_snapshot_chunk_request, egress_snapshot_chunk_response,
     egress_snapshot_manifest_request, egress_snapshot_manifest_response,
 };
 #[cfg(test)]
 pub use ingress::{ingress, ingress_wire};
 pub use ingress::{
-    ingress_block_request, ingress_block_response, ingress_new_view, ingress_proposal,
-    ingress_snapshot_chunk_request, ingress_snapshot_chunk_response,
-    ingress_snapshot_manifest_request, ingress_snapshot_manifest_response, ingress_timeout_vote,
-    ingress_vote, ingress_wire_with_qc_verification, ingress_with_qc_verification,
+    ingress_block_range_request, ingress_block_range_response, ingress_block_request,
+    ingress_block_response, ingress_new_view, ingress_proposal, ingress_snapshot_chunk_request,
+    ingress_snapshot_chunk_response, ingress_snapshot_manifest_request,
+    ingress_snapshot_manifest_response, ingress_timeout_vote, ingress_vote,
+    ingress_wire_with_qc_verification, ingress_with_qc_verification,
 };
 
 // Re-imports referenced from doc-comments above.
@@ -177,6 +179,31 @@ pub enum Dispatch {
         height: Height,
         chunk_idx: u32,
         payload: Option<bytes::Bytes>,
+        from: NodeId,
+    },
+    /// Peer asked for a contiguous block range (#514). The
+    /// integration layer serves blocks in `[from_height, to_height]`
+    /// from `pending_blocks` plus durable storage, capping the
+    /// response at
+    /// [`crate::consensus::node::BLOCK_RANGE_RESPONSE_MAX_BLOCKS`].
+    ServeBlockRange {
+        from_height: Height,
+        to_height: Height,
+        to: NodeId,
+    },
+    /// Peer replied to our [`WireMessage::BlockRangeRequest`] (#514).
+    ///
+    /// `from_height` / `to_height` echo the matching range request.
+    /// `blocks` is the contiguous run the responder served, in
+    /// ascending height order. The integration layer validates
+    /// each block's height falls inside the echoed range, drops
+    /// blocks outside it as ill-formed, and inserts the rest into
+    /// `pending_blocks`. The requester-side state machine that
+    /// pipelines further range requests lives in #515.
+    ReceiveBlockRange {
+        from_height: Height,
+        to_height: Height,
+        blocks: Vec<crate::replication::block::Block>,
         from: NodeId,
     },
 }

@@ -370,6 +370,232 @@ impl ConsensusNode {
                 self.apply_snapshot_sync_actions(actions, broadcaster, view_timer, signer)
                     .await?;
             }
+
+            // Bulk-range serve (#514). Same per-peer credit window
+            // (#498) as the single-block ServeBlock arm — a flood of
+            // range requests from one peer is bounded by the same
+            // outstanding-serve cap.
+            Dispatch::ServeBlockRange {
+                from_height,
+                to_height,
+                to,
+            } => {
+                let _credit = match self.block_sync_credit.try_acquire(to) {
+                    Some(guard) => guard,
+                    None => {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            from = %node_id_to_base58(&to),
+                            from_height = from_height.0,
+                            to_height = to_height.0,
+                            "block_sync_range_serve_dropped_at_credit_window",
+                        );
+                        return Ok(());
+                    }
+                };
+                let blocks = self.collect_block_range(from_height, to_height);
+                let block_count = blocks.len();
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    from = %node_id_to_base58(&to),
+                    from_height = from_height.0,
+                    to_height = to_height.0,
+                    block_count,
+                    "block_sync_range_request_received",
+                );
+                let out = dispatch::egress_block_range_response(
+                    from_height,
+                    to_height,
+                    blocks,
+                    to,
+                    signer.as_ref(),
+                    &self.chain_id,
+                )?;
+                send_outbound(broadcaster, out).await;
+            }
+
+            // Bulk-range receive (#514). The per-block insert and the
+            // `parked_proposals` re-drive land here. The requester-
+            // side state machine that pipelines further range
+            // requests is wired by #515 — this PR only does the
+            // basic insert so an out-of-order range response cannot
+            // pollute the safety state.
+            Dispatch::ReceiveBlockRange {
+                from_height,
+                to_height,
+                blocks,
+                from,
+            } => {
+                self.handle_block_range_response(
+                    from_height,
+                    to_height,
+                    blocks,
+                    from,
+                    broadcaster,
+                    view_timer,
+                    signer,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect blocks whose `header.height` falls inside
+    /// `[from_height, to_height]` (inclusive) for the bulk-range RPC
+    /// (#514). Looks in `pending_blocks` first (in-memory fast path
+    /// for blocks above the commit frontier) and walks durable
+    /// storage from the recorded chain tip backwards for committed
+    /// blocks below.
+    ///
+    /// Returns blocks in ascending-height order. Truncates to
+    /// [`crate::consensus::node::BLOCK_RANGE_RESPONSE_MAX_BLOCKS`].
+    fn collect_block_range(
+        &self,
+        from_height: crate::consensus::Height,
+        to_height: crate::consensus::Height,
+    ) -> Vec<crate::replication::block::Block> {
+        if from_height > to_height {
+            return Vec::new();
+        }
+        let cap = crate::consensus::node::BLOCK_RANGE_RESPONSE_MAX_BLOCKS;
+
+        // Pending-blocks fast path: collect uncommitted blocks in the
+        // requested span. These dominate the catch-up case where the
+        // recovering node is asking about heights at or just above
+        // the cluster's current commit frontier.
+        let mut out: Vec<crate::replication::block::Block> = self
+            .core
+            .state()
+            .pending_blocks
+            .values()
+            .filter(|b| b.header.height >= from_height && b.header.height <= to_height)
+            .cloned()
+            .collect();
+
+        // Storage walk: pick up committed blocks below the pending-
+        // blocks frontier. The lookup is gated on `last_committed`
+        // being present; on a fresh node the storage walk is a
+        // no-op and `out` carries whatever pending_blocks held.
+        let last_committed_raw = match self
+            .storage
+            .get(crate::consensus::node::STORAGE_KEY_LAST_COMMITTED)
+        {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    error = %e,
+                    "block_range_serve_last_committed_lookup_failed",
+                );
+                None
+            }
+        };
+        if let Some(raw) = last_committed_raw {
+            match crate::consensus::node::decode_last_committed(&raw) {
+                Ok(lc) => {
+                    let storage_blocks = match crate::consensus::node::load_block_range_from_storage(
+                        self.storage.as_ref(),
+                        lc.last_committed_hash,
+                        from_height,
+                        to_height,
+                        cap,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!(
+                                target: TRACE_TARGET,
+                                error = %e,
+                                "block_range_serve_storage_walk_failed",
+                            );
+                            Vec::new()
+                        }
+                    };
+                    out.extend(storage_blocks);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: TRACE_TARGET,
+                        error = %e,
+                        "block_range_serve_last_committed_decode_failed",
+                    );
+                }
+            }
+        }
+
+        // Dedup by hash (a committed pending entry may also appear in
+        // storage), sort ascending by height, truncate at the cap.
+        let mut seen: std::collections::HashSet<crate::replication::block::BlockHash> =
+            std::collections::HashSet::new();
+        out.retain(|b| seen.insert(b.hash()));
+        out.sort_by_key(|b| b.header.height);
+        out.truncate(cap);
+        out
+    }
+
+    /// Apply a bulk-range response: validate each block's height
+    /// against the echoed `[from_height, to_height]`, insert the
+    /// well-formed blocks into the safety core's `pending_blocks`,
+    /// and re-drive the parked-proposals walk via a single
+    /// `PacemakerAdvance(current_view)` after all inserts have
+    /// landed. The requester-side pipelining state machine (#515)
+    /// hooks in on top of this.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_block_range_response(
+        &mut self,
+        from_height: crate::consensus::Height,
+        to_height: crate::consensus::Height,
+        blocks: Vec<crate::replication::block::Block>,
+        from: NodeId,
+        broadcaster: &dyn Broadcaster,
+        view_timer: &mut ViewTimer,
+        signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        let block_count = blocks.len();
+        tracing::info!(
+            target: TRACE_TARGET,
+            from = %node_id_to_base58(&from),
+            from_height = from_height.0,
+            to_height = to_height.0,
+            block_count,
+            "block_sync_range_response_received",
+        );
+        let mut inserted = 0u64;
+        let mut last_height: Option<crate::consensus::Height> = None;
+        for block in blocks {
+            let h = block.header.height;
+            if h < from_height || h > to_height {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    from = %node_id_to_base58(&from),
+                    from_height = from_height.0,
+                    to_height = to_height.0,
+                    block_height = h.0,
+                    "block_sync_range_block_out_of_range",
+                );
+                continue;
+            }
+            if let Some(prev) = last_height
+                && h <= prev
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    from = %node_id_to_base58(&from),
+                    prev_height = prev.0,
+                    block_height = h.0,
+                    "block_sync_range_blocks_not_strictly_ascending",
+                );
+                continue;
+            }
+            last_height = Some(h);
+            self.core.insert_pending_block(block);
+            inserted += 1;
+        }
+        if inserted > 0 {
+            let current = self.pacemaker.current_view();
+            let actions = self.step_safety(SafetyEvent::PacemakerAdvance(current));
+            self.apply_safety_actions(actions, broadcaster, view_timer, signer)
+                .await?;
         }
         Ok(())
     }

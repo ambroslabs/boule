@@ -8,6 +8,7 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::consensus::Height;
 use crate::consensus::hotstuff::qc::TimeoutVote;
 use crate::crypto::signed::{Signed, SignedMessage};
 use crate::replication::block::{Block, BlockHash};
@@ -47,6 +48,56 @@ pub struct BlockResponsePayload {
 
 impl SignedMessage for BlockResponsePayload {
     const DOMAIN: &'static str = "ambros.consensus.block_response.v1";
+}
+
+/// Maximum number of blocks a single
+/// [`WireMessage::BlockRangeResponse`] may carry. Sized to keep a
+/// realistic response under [`MAX_FRAME_BYTES`] even when individual
+/// blocks are at the higher end of typical sizes (see issue #185 for
+/// the bulk-range RPC design). Requesters that need a wider span
+/// pipeline subsequent range requests once the first response lands.
+pub const BLOCK_RANGE_RESPONSE_MAX_BLOCKS: usize = 64;
+
+/// Signed payload of a [`WireMessage::BlockRangeResponse`].
+///
+/// `from_height` and `to_height` echo the matching
+/// [`WireMessage::BlockRangeRequest`] so the responder's signature
+/// commits to the exact range it claims to be serving — a Byzantine
+/// responder who fills the response with blocks outside the requested
+/// span (or with the wrong contiguous run) is non-repudiable evidence
+/// for slashing under the same model as
+/// [`BlockResponsePayload`].
+///
+/// `blocks` is the contiguous run of blocks in **ascending height
+/// order**; gaps inside the requested span are encoded by the
+/// responder simply not including those heights (the requester can
+/// follow up with a tighter request or a single-block
+/// [`WireMessage::BlockRequest`] for any specific gap). The vector
+/// is capped at [`BLOCK_RANGE_RESPONSE_MAX_BLOCKS`] regardless of how
+/// wide the request is.
+///
+/// Receivers must drop a response whose blocks fall outside
+/// `[from_height, to_height]`, whose height ordering is not strictly
+/// ascending, or whose `from_height`/`to_height` do not match an
+/// outstanding range-inflight entry (the requester-side
+/// implementation in #515 enforces this gate).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockRangeResponsePayload {
+    /// First height of the requested span (inclusive).
+    pub from_height: Height,
+    /// Last height of the requested span (inclusive).
+    pub to_height: Height,
+    /// Contiguous blocks in ascending height order. Empty when the
+    /// responder holds nothing inside `[from_height, to_height]`;
+    /// truncated to [`BLOCK_RANGE_RESPONSE_MAX_BLOCKS`] when the
+    /// requested span is wider than the per-response cap. The
+    /// requester pipelines the next range starting at
+    /// `blocks.last().header.height + 1` in that case.
+    pub blocks: Vec<Block>,
+}
+
+impl SignedMessage for BlockRangeResponsePayload {
+    const DOMAIN: &'static str = "ambros.consensus.block_range_response.v1";
 }
 
 /// Every message sent over the `PROTOCOL_ID` channel is one of these
@@ -125,6 +176,30 @@ pub enum WireMessage {
         chunk_idx: u32,
         payload: Option<Bytes>,
     },
+    /// Ask a peer for a contiguous run of blocks by height (issue
+    /// #185 / #514). Compresses the catch-up window: a recovering
+    /// node that detects a multi-block gap issues one range request
+    /// instead of N sequential single-block [`WireMessage::BlockRequest`]
+    /// emissions.
+    ///
+    /// The responder caps the reply at
+    /// [`BLOCK_RANGE_RESPONSE_MAX_BLOCKS`] regardless of how wide the
+    /// requested span is; requesters pipeline the next range starting
+    /// at the last-received height + 1.
+    ///
+    /// Inclusive on both ends. `from_height > to_height` is an
+    /// ill-formed request and the responder replies with an empty
+    /// `blocks` vector.
+    BlockRangeRequest {
+        from_height: Height,
+        to_height: Height,
+    },
+    /// Reply to a [`WireMessage::BlockRangeRequest`]. The signed
+    /// payload echoes `from_height` / `to_height` so a Byzantine
+    /// responder who serves blocks outside the requested span is
+    /// non-repudiable evidence for slashing — same discipline as
+    /// [`BlockResponsePayload`].
+    BlockRangeResponse(Signed<BlockRangeResponsePayload>),
 }
 
 /// Serde adapter for `Option<BlsPartialSig>` — a 96-byte fixed array that

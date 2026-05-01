@@ -706,6 +706,8 @@ impl P2pLimitsConfig {
             snapshot_manifest_response_per_sec: self.rate.snapshot_manifest_response_per_sec,
             snapshot_chunk_request_per_sec: self.rate.snapshot_chunk_request_per_sec,
             snapshot_chunk_response_per_sec: self.rate.snapshot_chunk_response_per_sec,
+            block_range_request_per_sec: self.rate.block_range_request_per_sec,
+            block_range_response_per_sec: self.rate.block_range_response_per_sec,
             bytes_per_sec: self.rate.bytes_per_sec,
             burst_seconds: self.rate.burst_seconds,
             violation_window: std::time::Duration::from_secs(self.violations.window_secs),
@@ -743,6 +745,12 @@ pub struct P2pRateLimitsConfig {
     /// Steady-state inbound rate of `SnapshotChunkResponse` frames.
     #[serde(default = "default_snapshot_chunk_response_per_sec")]
     pub snapshot_chunk_response_per_sec: f64,
+    /// Steady-state inbound rate of `BlockRangeRequest` frames (#514).
+    #[serde(default = "default_block_range_request_per_sec")]
+    pub block_range_request_per_sec: f64,
+    /// Steady-state inbound rate of `BlockRangeResponse` frames (#514).
+    #[serde(default = "default_block_range_response_per_sec")]
+    pub block_range_response_per_sec: f64,
     #[serde(default = "default_bytes_per_sec")]
     pub bytes_per_sec: f64,
     /// Burst capacity = `rate × burst_seconds`. A 1.0s burst window is
@@ -765,6 +773,8 @@ impl Default for P2pRateLimitsConfig {
             snapshot_manifest_response_per_sec: default_snapshot_manifest_response_per_sec(),
             snapshot_chunk_request_per_sec: default_snapshot_chunk_request_per_sec(),
             snapshot_chunk_response_per_sec: default_snapshot_chunk_response_per_sec(),
+            block_range_request_per_sec: default_block_range_request_per_sec(),
+            block_range_response_per_sec: default_block_range_response_per_sec(),
             bytes_per_sec: default_bytes_per_sec(),
             burst_seconds: default_burst_seconds(),
         }
@@ -830,6 +840,12 @@ fn default_snapshot_chunk_request_per_sec() -> f64 {
 }
 fn default_snapshot_chunk_response_per_sec() -> f64 {
     32.0
+}
+fn default_block_range_request_per_sec() -> f64 {
+    8.0
+}
+fn default_block_range_response_per_sec() -> f64 {
+    8.0
 }
 fn default_bytes_per_sec() -> f64 {
     1024.0 * 1024.0
