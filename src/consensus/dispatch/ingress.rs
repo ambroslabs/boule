@@ -166,6 +166,13 @@ pub fn ingress_wire_with_qc_verification(
         } => Ok(ingress_snapshot_chunk_response(
             height, chunk_idx, payload, from,
         )),
+        WireMessage::BlockRangeRequest {
+            from_height,
+            to_height,
+        } => Ok(ingress_block_range_request(from_height, to_height, from)),
+        WireMessage::BlockRangeResponse(signed) => {
+            ingress_block_range_response(signed, from, key_history, chain_id)
+        }
     }
 }
 
@@ -381,6 +388,59 @@ pub fn ingress_block_response(
     Ok(vec![Dispatch::ReceiveBlock {
         requested_hash,
         block,
+        from,
+    }])
+}
+
+/// Convert an inbound `BlockRangeRequest` into a
+/// [`Dispatch::ServeBlockRange`] (#514).
+pub fn ingress_block_range_request(
+    from_height: crate::consensus::Height,
+    to_height: crate::consensus::Height,
+    from: NodeId,
+) -> Vec<Dispatch> {
+    vec![Dispatch::ServeBlockRange {
+        from_height,
+        to_height,
+        to: from,
+    }]
+}
+
+/// Convert an inbound signed `BlockRangeResponse` into a
+/// [`Dispatch::ReceiveBlockRange`] (#514).
+///
+/// Verifies the responder's pubkey is known to `key_history` (i.e.
+/// resolves to a stable
+/// [`crate::consensus::validator_set::ValidatorId`]) and that the
+/// envelope signature is valid. Mirror of [`ingress_block_response`]
+/// — same trust model, with the additional invariant that responses
+/// must be inside the echoed `[from_height, to_height]` and in
+/// strictly ascending height order. The shape check happens here so
+/// a malformed response is rejected before it can pollute the
+/// requester's `pending_blocks` map. Validation against an
+/// outstanding range-inflight entry lives at the integration layer
+/// (#515 wires that gate).
+pub fn ingress_block_range_response(
+    signed: Signed<crate::consensus::node::BlockRangeResponsePayload>,
+    from: NodeId,
+    key_history: &ValidatorKeyHistory,
+    chain_id: &ChainId,
+) -> Result<Vec<Dispatch>, IngressError> {
+    use crate::consensus::validator_set::Pubkey;
+    let signer_pk = Pubkey::from_node_id(signed.signer);
+    if key_history.validator_for(&signer_pk).is_none() {
+        return Err(IngressError::UnknownSigner(signed.signer));
+    }
+    verify_sig(&signed, chain_id)?;
+    let crate::consensus::node::BlockRangeResponsePayload {
+        from_height,
+        to_height,
+        blocks,
+    } = signed.payload;
+    Ok(vec![Dispatch::ReceiveBlockRange {
+        from_height,
+        to_height,
+        blocks,
         from,
     }])
 }

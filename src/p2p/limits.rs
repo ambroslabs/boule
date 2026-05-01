@@ -73,12 +73,17 @@ pub enum MessageKind {
     SnapshotChunkRequest,
     /// `WireMessage::SnapshotChunkResponse` — postcard tag 9.
     SnapshotChunkResponse,
+    /// `WireMessage::BlockRangeRequest` — postcard tag 10. Bulk-range
+    /// catch-up RPC introduced in #514 (parent #185).
+    BlockRangeRequest,
+    /// `WireMessage::BlockRangeResponse` — postcard tag 11.
+    BlockRangeResponse,
 }
 
 impl MessageKind {
     /// Iteration helper used by the rate limiter to construct one
     /// bucket per kind in a fixed order.
-    pub const ALL: [MessageKind; 10] = [
+    pub const ALL: [MessageKind; 12] = [
         MessageKind::Proposal,
         MessageKind::Vote,
         MessageKind::NewView,
@@ -89,6 +94,8 @@ impl MessageKind {
         MessageKind::SnapshotManifestResponse,
         MessageKind::SnapshotChunkRequest,
         MessageKind::SnapshotChunkResponse,
+        MessageKind::BlockRangeRequest,
+        MessageKind::BlockRangeResponse,
     ];
 
     /// Map a `WireMessage`'s first postcard byte to a `MessageKind`.
@@ -107,6 +114,8 @@ impl MessageKind {
             7 => Self::SnapshotManifestResponse,
             8 => Self::SnapshotChunkRequest,
             9 => Self::SnapshotChunkResponse,
+            10 => Self::BlockRangeRequest,
+            11 => Self::BlockRangeResponse,
             _ => return None,
         })
     }
@@ -124,6 +133,8 @@ impl MessageKind {
             Self::SnapshotManifestResponse => "SnapshotManifestResponse",
             Self::SnapshotChunkRequest => "SnapshotChunkRequest",
             Self::SnapshotChunkResponse => "SnapshotChunkResponse",
+            Self::BlockRangeRequest => "BlockRangeRequest",
+            Self::BlockRangeResponse => "BlockRangeResponse",
         }
     }
 
@@ -139,6 +150,8 @@ impl MessageKind {
             Self::SnapshotManifestResponse => 7,
             Self::SnapshotChunkRequest => 8,
             Self::SnapshotChunkResponse => 9,
+            Self::BlockRangeRequest => 10,
+            Self::BlockRangeResponse => 11,
         }
     }
 }
@@ -246,6 +259,14 @@ pub struct RateLimitsConfig {
     /// Steady-state rate of `SnapshotChunkResponse` frames. Mirrors
     /// the request side.
     pub snapshot_chunk_response_per_sec: f64,
+    /// Steady-state rate of `BlockRangeRequest` frames received from a
+    /// peer. Sized for catch-up: a recovering replica issues at most
+    /// a handful of range requests in flight per peer (#514).
+    pub block_range_request_per_sec: f64,
+    /// Steady-state rate of `BlockRangeResponse` frames received from
+    /// a peer. Mirrors the request side; each request elicits at most
+    /// one response.
+    pub block_range_response_per_sec: f64,
     /// Per-peer wire-bytes/sec ceiling, applied independently of the
     /// per-kind buckets so a flood of any one kind that fits within
     /// its bucket can still be dropped on bytes alone.
@@ -284,6 +305,8 @@ impl RateLimitsConfig {
             snapshot_manifest_response_per_sec: HUGE,
             snapshot_chunk_request_per_sec: HUGE,
             snapshot_chunk_response_per_sec: HUGE,
+            block_range_request_per_sec: HUGE,
+            block_range_response_per_sec: HUGE,
             bytes_per_sec: HUGE,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),
@@ -314,6 +337,13 @@ impl RateLimitsConfig {
             snapshot_manifest_response_per_sec: 4.0,
             snapshot_chunk_request_per_sec: 32.0,
             snapshot_chunk_response_per_sec: 32.0,
+            // Block-range RPC: bursty during catch-up but rare in
+            // steady state. A recovering replica typically pipelines
+            // a handful of requests at a time; 8/s leaves plenty of
+            // headroom for rotation across peers without inviting a
+            // flood vector.
+            block_range_request_per_sec: 8.0,
+            block_range_response_per_sec: 8.0,
             bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),
@@ -333,6 +363,8 @@ impl RateLimitsConfig {
             MessageKind::SnapshotManifestResponse => self.snapshot_manifest_response_per_sec,
             MessageKind::SnapshotChunkRequest => self.snapshot_chunk_request_per_sec,
             MessageKind::SnapshotChunkResponse => self.snapshot_chunk_response_per_sec,
+            MessageKind::BlockRangeRequest => self.block_range_request_per_sec,
+            MessageKind::BlockRangeResponse => self.block_range_response_per_sec,
         }
     }
 
@@ -376,7 +408,7 @@ pub struct RateLimitCounters {
 
 #[derive(Debug, Default)]
 struct RateLimitCountersInner {
-    by_kind: [AtomicU64; 10],
+    by_kind: [AtomicU64; 12],
     bytes: AtomicU64,
     disconnects: AtomicU64,
 }
@@ -423,7 +455,7 @@ impl RateLimitCounters {
 // ── PeerState + RateLimiter ──────────────────────────────────────────────────
 
 struct PeerState {
-    buckets: [TokenBucket; 10],
+    buckets: [TokenBucket; 12],
     bytes_bucket: TokenBucket,
     /// Monotonic instants of recent violations, oldest first.
     violations: VecDeque<Duration>,
@@ -449,6 +481,8 @@ impl PeerState {
                 mk(MessageKind::SnapshotManifestResponse),
                 mk(MessageKind::SnapshotChunkRequest),
                 mk(MessageKind::SnapshotChunkResponse),
+                mk(MessageKind::BlockRangeRequest),
+                mk(MessageKind::BlockRangeResponse),
             ],
             bytes_bucket: TokenBucket::new(config.bytes_per_sec, config.bytes_capacity(), now),
             violations: VecDeque::new(),
@@ -887,6 +921,25 @@ mod tests {
         let bytes = postcard::to_allocvec(&resp).expect("encode");
         assert_eq!(bytes[0], 9, "SnapshotChunkResponse must serialize at tag 9");
 
+        let req = WireMessage::BlockRangeRequest {
+            from_height: crate::consensus::Height(0),
+            to_height: crate::consensus::Height(0),
+        };
+        let bytes = postcard::to_allocvec(&req).expect("encode");
+        assert_eq!(bytes[0], 10, "BlockRangeRequest must serialize at tag 10");
+
+        let resp = WireMessage::BlockRangeResponse(Signed {
+            payload: crate::consensus::node::BlockRangeResponsePayload {
+                from_height: crate::consensus::Height(0),
+                to_height: crate::consensus::Height(0),
+                blocks: Vec::new(),
+            },
+            signer: [0u8; 32],
+            sig: [0u8; 64],
+        });
+        let bytes = postcard::to_allocvec(&resp).expect("encode");
+        assert_eq!(bytes[0], 11, "BlockRangeResponse must serialize at tag 11");
+
         // Round-trip the classification helper for every documented tag.
         for (tag, kind) in [
             (0, MessageKind::Proposal),
@@ -899,10 +952,12 @@ mod tests {
             (7, MessageKind::SnapshotManifestResponse),
             (8, MessageKind::SnapshotChunkRequest),
             (9, MessageKind::SnapshotChunkResponse),
+            (10, MessageKind::BlockRangeRequest),
+            (11, MessageKind::BlockRangeResponse),
         ] {
             assert_eq!(MessageKind::from_wire_tag(tag), Some(kind));
         }
-        assert_eq!(MessageKind::from_wire_tag(10), None);
+        assert_eq!(MessageKind::from_wire_tag(12), None);
         assert_eq!(MessageKind::from_wire_tag(0xFF), None);
     }
 
@@ -963,6 +1018,8 @@ mod tests {
             snapshot_manifest_response_per_sec: 4.0,
             snapshot_chunk_request_per_sec: 4.0,
             snapshot_chunk_response_per_sec: 4.0,
+            block_range_request_per_sec: 4.0,
+            block_range_response_per_sec: 4.0,
             bytes_per_sec: 4096.0,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),

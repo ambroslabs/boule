@@ -111,6 +111,53 @@ pub fn egress_block_response(
     Ok(Outbound::SendTo { to, payload })
 }
 
+/// Encode a [`BlockRangeRequest`] as a `SendTo` outbound frame (#514).
+///
+/// [`BlockRangeRequest`]: WireMessage::BlockRangeRequest
+pub fn egress_block_range_request(
+    from_height: crate::consensus::Height,
+    to_height: crate::consensus::Height,
+    to: NodeId,
+) -> Outbound {
+    let wire = WireMessage::BlockRangeRequest {
+        from_height,
+        to_height,
+    };
+    let payload = codec::encode(&wire).expect("BlockRangeRequest encoding must not fail");
+    Outbound::SendTo { to, payload }
+}
+
+/// Encode a [`BlockRangeResponse`] as a `SendTo` outbound frame (#514),
+/// signing the payload so an out-of-range or wrong-shape response is
+/// non-repudiable evidence — same trust model as
+/// [`egress_block_response`].
+///
+/// `from_height` / `to_height` echo the matching `BlockRangeRequest`.
+/// `blocks` is the contiguous run the responder is serving, in
+/// strictly ascending height order; the caller is responsible for
+/// having capped the slice at
+/// [`crate::consensus::node::BLOCK_RANGE_RESPONSE_MAX_BLOCKS`].
+///
+/// [`BlockRangeResponse`]: WireMessage::BlockRangeResponse
+pub fn egress_block_range_response(
+    from_height: crate::consensus::Height,
+    to_height: crate::consensus::Height,
+    blocks: Vec<Block>,
+    to: NodeId,
+    signer: &dyn Signer,
+    chain_id: &ChainId,
+) -> anyhow::Result<Outbound> {
+    let payload = crate::consensus::node::BlockRangeResponsePayload {
+        from_height,
+        to_height,
+        blocks,
+    };
+    let signed = Signed::sign(payload, signer, chain_id)?;
+    let wire = WireMessage::BlockRangeResponse(signed);
+    let payload = codec::encode(&wire).map_err(anyhow::Error::from)?;
+    Ok(Outbound::SendTo { to, payload })
+}
+
 /// Encode a [`SnapshotManifestRequest`] as a `SendTo` outbound frame.
 ///
 /// [`SnapshotManifestRequest`]: WireMessage::SnapshotManifestRequest
@@ -311,7 +358,9 @@ pub fn egress_consensus_msg_with_loopback(
         | WireMessage::SnapshotManifestRequest { .. }
         | WireMessage::SnapshotManifestResponse(_)
         | WireMessage::SnapshotChunkRequest { .. }
-        | WireMessage::SnapshotChunkResponse { .. } => {
+        | WireMessage::SnapshotChunkResponse { .. }
+        | WireMessage::BlockRangeRequest { .. }
+        | WireMessage::BlockRangeResponse(_) => {
             unreachable!("sign_consensus_msg always produces Proposal/Vote/NewView wire variants")
         }
     };
