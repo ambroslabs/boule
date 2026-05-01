@@ -25,9 +25,9 @@
 //!
 //! # Determinism
 //!
-//! Time is taken from an [`Arc<dyn Clock>`] (monotonic), so the sim's
-//! [`crate::sim::SimClock`] drives the rate-limiter under virtual time
-//! exactly like in production.
+//! Time is taken from an [`Arc<dyn Clock>`] (monotonic), so a virtual
+//! `SimClock` drives the rate-limiter under virtual time exactly like
+//! in production.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;

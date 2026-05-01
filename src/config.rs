@@ -176,12 +176,6 @@ pub struct PeerConfig {
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ApiConfig {
     pub listen_addr: SocketAddr,
-    #[serde(default = "default_cleanup_interval")]
-    pub cleanup_interval_secs: u64,
-}
-
-fn default_cleanup_interval() -> u64 {
-    60
 }
 
 /// HotStuff consensus configuration. Opt-in via the top-level

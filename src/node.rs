@@ -1,5 +1,5 @@
-//! Top-level node runtime: wires the transport, gossip, ping RPC and
-//! optional HotStuff consensus into a single ctrl-c-driven process.
+//! Top-level node runtime: wires the transport and optional HotStuff
+//! consensus into a single ctrl-c-driven process.
 //!
 //! Lives in the library (rather than `main.rs`) so the integration
 //! tests and the `start` subcommand share one definition of "what a
@@ -21,7 +21,6 @@ use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::status::ConsensusStatus;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{NodeSigner, Signer};
-use crate::gossip;
 use crate::p2p::dialer::DialerCtx;
 use crate::p2p::identity::NodeIdentity;
 use crate::p2p::manager::ManagerMsg;
@@ -34,7 +33,6 @@ use crate::p2p::overlay::{Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaste
 use crate::p2p::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
 use crate::p2p::tls_protocol::TlsConnectionProtocol;
 use crate::p2p::{self, ConnectionProtocol};
-use crate::ping;
 use crate::replication::block::Block;
 use crate::replication::impls::{CounterStateMachine, InMemoryMempool};
 use crate::replication::state_machine::StateMachine;
@@ -101,11 +99,9 @@ pub async fn run(
     }
 
     let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-    let store = Arc::new(gossip::store::GossipStore::new());
 
     let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
     let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (peer_gone_tx, _) = broadcast::channel::<p2p::NodeId>(64);
     // Discovery deltas (`PeerAdded`/`PeerRemoved`) feed `MeshDiscovery`
     // and any other consumer that wants a topology-change event stream.
@@ -136,45 +132,6 @@ pub async fn run(
             connection_limiter,
         ))
     };
-
-    // Register the gossip protocol before spawning TlsConnectionProtocol so
-    // PeerConnected events are never missed. Gossip is retained as a
-    // best-effort overlay alongside consensus — the integration tests
-    // exercise it as the simplest available consumer of the multiplex
-    // layer, and operators use `/messages` and `/peers` for ad-hoc
-    // mesh introspection.
-    let (reg_tx, reg_rx) = oneshot::channel();
-    p2p_cmd_tx
-        .send(p2p::PeerCommand::RegisterProtocol {
-            id: gossip::PROTOCOL_ID,
-            max_frame_bytes: Some(gossip::MAX_FRAME_BYTES),
-            reply: reg_tx,
-        })
-        .await?;
-    let gossip_handle = reg_rx.await?;
-    let gossip_send_tx = gossip_handle.send_tx.clone();
-
-    let engine_handle = {
-        let store = Arc::clone(&store);
-        let clock = Arc::clone(&clock);
-        tokio::spawn(gossip::engine::run(gossip_handle, store, clock))
-    };
-
-    // Register the ping RPC protocol on its own ID and build an Rpc client
-    // with the echo handler registered for incoming calls. Useful for
-    // measuring per-hop RPC latency without spinning up consensus.
-    let (ping_reg_tx, ping_reg_rx) = oneshot::channel();
-    p2p_cmd_tx
-        .send(p2p::PeerCommand::RegisterProtocol {
-            id: ping::PROTOCOL_ID,
-            max_frame_bytes: Some(ping::MAX_FRAME_BYTES),
-            reply: ping_reg_tx,
-        })
-        .await?;
-    let ping_handle = ping_reg_rx.await?;
-    let ping_rpc = p2p::rpc::RpcBuilder::new()
-        .handler(ping::METHOD_PING, ping::echo)
-        .spawn(ping_handle, Arc::clone(&clock));
 
     // The gossip overlay needs an outbound dialer for both
     // `Discovery::add_bootstrap` (TOFU dials of operator-supplied
@@ -254,26 +211,11 @@ pub async fn run(
         None
     };
 
-    let cleanup_handle = {
-        let store = Arc::clone(&store);
-        let interval = config.api.cleanup_interval_secs;
-        let srx = shutdown_rx.clone();
-        let clock = Arc::clone(&clock);
-        tokio::spawn(gossip::cleanup::run(store, interval, srx, clock))
-    };
-
     // Bind the API listener here so we know the actual port before writing addr_file.
     let api_listener = TcpListener::bind(config.api.listen_addr).await?;
     let api_actual_addr = api_listener.local_addr()?;
     let api_handle = {
-        let mut app = axum::Router::new()
-            .merge(p2p::api::router(p2p_cmd_tx.clone()))
-            .merge(gossip::api::router(
-                Arc::clone(&store),
-                gossip_send_tx,
-                Arc::clone(&clock),
-            ))
-            .merge(ping::router(ping_rpc));
+        let mut app = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx.clone()));
         if let Some(rc) = consensus_runtime.as_ref() {
             app = app.merge(crate::consensus::api::router(rc.status_rx.clone()));
         }
@@ -305,7 +247,6 @@ pub async fn run(
 
     tokio::signal::ctrl_c().await?;
     info!("shutting down...");
-    let _ = shutdown_tx.send(true);
     drop(p2p_cmd_tx);
 
     let (consensus_join, overlay_joins) = match consensus_runtime {
@@ -321,8 +262,6 @@ pub async fn run(
 
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = manager_handle.await;
-        let _ = engine_handle.await;
-        let _ = cleanup_handle.await;
         let _ = api_handle.await;
         let _ = protocol_handle.await;
         if let Some(h) = consensus_join {

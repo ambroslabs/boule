@@ -21,26 +21,21 @@
 //!   │  Ed25519 signing    │              │ Storage + Wal KV    │
 //!   └─────────────────────┘              └─────────────────────┘
 //!                │                                  │
-//!                │          dissemination           │
-//!                │       ┌──────────────────┐       │
-//!                └──────▶│    gossip (§)    │◀──────┘
-//!                        │  store + engine  │
-//!                        └────────┬─────────┘
-//!                                 │ ProtocolHandle
-//!                                 ▼
-//!                        ┌──────────────────┐
-//!                        │      p2p (§)     │
-//!                        │  TLS transport,  │
-//!                        │  rpc, manager    │
-//!                        └────────┬─────────┘
-//!                                 │ Clock + network I/O
-//!                 ┌───────────────┴───────────────┐
-//!                 ▼                               ▼
-//!        ┌─────────────────┐              ┌─────────────────┐
-//!        │    clock (§)    │              │     sim (§)     │
-//!        │  real / virtual │              │ deterministic   │
-//!        │      time       │              │ test harness    │
-//!        └─────────────────┘              └─────────────────┘
+//!                └──────────────┬───────────────────┘
+//!                               │ ProtocolHandle
+//!                               ▼
+//!                      ┌──────────────────┐
+//!                      │      p2p (§)     │
+//!                      │  TLS transport,  │
+//!                      │  rpc, manager    │
+//!                      └────────┬─────────┘
+//!                               │ Clock + network I/O
+//!                               ▼
+//!                      ┌──────────────────┐
+//!                      │    clock (§)     │
+//!                      │  real / virtual  │
+//!                      │       time       │
+//!                      └──────────────────┘
 //! ```
 //!
 //! - [`consensus`] — HotStuff-style BFT replica, including the safety
@@ -52,18 +47,10 @@
 //! - [`p2p`] — TLS-authenticated transport, a protocol multiplexer, a peer
 //!   manager, and a request/response [`p2p::rpc`] layer on top of it. The
 //!   node's [`p2p::identity`] (Ed25519) IS its overlay address.
-//! - [`gossip`] — best-effort dissemination of opaque application messages,
-//!   built on a [`p2p::ProtocolHandle`]. Retained alongside consensus as a
-//!   simple consumer of the multiplex layer (and the integration tests'
-//!   easiest end-to-end probe of the transport).
 //! - [`crypto`] — application-level signed envelopes that survive being
 //!   forwarded through intermediaries or reconstructed from storage.
 //! - [`clock`] — object-safe time abstraction; real [`clock::TokioClock`]
 //!   in production, virtual `SimClock` in tests.
-//! - `sim` — test-only deterministic simulator that plugs in at the
-//!   [`p2p::ConnectionProtocol`] seam, replaces the network with in-memory
-//!   pipes, and drives virtual time. Behind `#[cfg(test)]` so it does not
-//!   ship in the binary.
 //! - [`storage`] — [`storage::Storage`] (mutable KV) and [`storage::Wal`]
 //!   (append-only log) traits. An in-memory backend serves the simulator;
 //!   a `redb`-backed backend provides crash-safe durability. HotStuff's
@@ -86,13 +73,9 @@ pub mod clock;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
-pub mod gossip;
 pub mod node;
 pub mod p2p;
 pub mod paths;
-pub mod ping;
 pub mod replication;
-#[cfg(test)]
-mod sim;
 pub mod storage;
 pub mod testnet;
