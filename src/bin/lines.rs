@@ -1,6 +1,10 @@
 //! `lines` — count Rust source lines, tokei-style, with an impl-vs-test split.
 //!
-//! Usage: `cargo run --bin lines -- [PATH]`  (PATH defaults to `src`).
+//! Usage: `cargo run --bin lines -- [--per-file|-f] [PATH]`
+//!         (PATH defaults to `src`)
+//!
+//! Default aggregation is one row per top-level subdirectory under PATH.
+//! `--per-file` switches to one row per `.rs` file.
 //!
 //! Each `.rs` file under PATH is classified line-by-line as:
 //!   * blank   — only whitespace
@@ -46,11 +50,30 @@ impl Counts {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let root = args
-        .first()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("src"));
+    let mut per_file = false;
+    let mut path: Option<PathBuf> = None;
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--per-file" | "-f" => per_file = true,
+            "--help" | "-h" => {
+                print_help();
+                return ExitCode::SUCCESS;
+            }
+            s if s.starts_with('-') => {
+                eprintln!("error: unknown flag: {s}");
+                eprintln!("usage: lines [--per-file|-f] [PATH]   (PATH defaults to `src`)");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if path.is_some() {
+                    eprintln!("error: multiple paths given");
+                    return ExitCode::from(2);
+                }
+                path = Some(PathBuf::from(&arg));
+            }
+        }
+    }
+    let root = path.unwrap_or_else(|| PathBuf::from("src"));
 
     if !root.exists() {
         eprintln!("error: path not found: {}", root.display());
@@ -79,6 +102,7 @@ fn main() -> ExitCode {
     }
 
     let mut by_dir: BTreeMap<PathBuf, Counts> = BTreeMap::new();
+    let mut per_file_rows: Vec<(PathBuf, Counts)> = Vec::with_capacity(files.len());
     let mut total = Counts::default();
 
     for f in &files {
@@ -90,9 +114,16 @@ fn main() -> ExitCode {
         let counts = classify_file(&src, is_test);
         total.add(counts);
         by_dir.entry(bucket_for(f, &root)).or_default().add(counts);
+        if per_file {
+            per_file_rows.push((f.clone(), counts));
+        }
     }
 
-    print_table(&root, &by_dir, total);
+    if per_file {
+        print_per_file(&root, &per_file_rows, total);
+    } else {
+        print_table(&root, &by_dir, total);
+    }
     ExitCode::SUCCESS
 }
 
@@ -628,6 +659,102 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 // ----- output ---------------------------------------------------------------
 
+fn print_help() {
+    println!("usage: lines [--per-file|-f] [PATH]   (PATH defaults to `src`)");
+    println!();
+    println!("Walks `.rs` files under PATH and prints a tokei-style table of");
+    println!("file/line counts, with the Code column split into Impl + Test.");
+    println!();
+    println!("Aggregation:");
+    println!("  default     one row per top-level subdirectory under PATH");
+    println!("  --per-file  one row per `.rs` file");
+    println!();
+    println!("Test classification:");
+    println!("  - lines inside `#[cfg(test)]` item bodies (brace-balanced)");
+    println!("  - all lines in files declared from a parent module via");
+    println!("    `#[cfg(test)] mod NAME;`");
+    println!("  - all lines under a Cargo crate's `tests/` or `benches/` dir");
+    println!();
+    println!("Skipped during recursion: `target/`, dot-directories like `.git`.");
+}
+
+fn print_per_file(root: &Path, rows: &[(PathBuf, Counts)], total: Counts) {
+    // Pick a path-column width that fits the longest path under the root.
+    let mut path_w = "File (under …)".len() + root.display().to_string().len();
+    for (p, _) in rows {
+        path_w = path_w.max(display_rel(p, root).len());
+    }
+    path_w = path_w.clamp(28, 64);
+
+    let bar_w = path_w + 1 + 9 + 1 + 9 + 1 + 9 + 1 + 9 + 1 + 9 + 1 + 7 + 2;
+    let bar = "=".repeat(bar_w);
+    println!("{bar}");
+    println!(" Lines = Code + Comments + Blanks    |    Code = Impl + Test");
+    println!("{bar}");
+    let header_path = format!("File (under {})", root.display());
+    println!(
+        " {:<pw$} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+        header_path,
+        "Lines",
+        "Code",
+        "Impl",
+        "Test",
+        "Comments",
+        "Blanks",
+        pw = path_w,
+    );
+    println!("{bar}");
+    for (p, c) in rows {
+        println!(
+            " {:<pw$} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+            display_rel(p, root),
+            c.lines,
+            c.code(),
+            c.code_impl,
+            c.code_test,
+            c.comments,
+            c.blanks,
+            pw = path_w,
+        );
+    }
+    println!("{bar}");
+    println!(
+        " {:<pw$} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
+        format!("Total ({} files)", total.files),
+        total.lines,
+        total.code(),
+        total.code_impl,
+        total.code_test,
+        total.comments,
+        total.blanks,
+        pw = path_w,
+    );
+    println!("{bar}");
+    print_summary_footer(total);
+}
+
+fn print_summary_footer(total: Counts) {
+    let code = total.code();
+    if code > 0 && total.lines > 0 {
+        let pct_total = 100.0 * total.code_test as f64 / total.lines as f64;
+        let pct_code = 100.0 * total.code_test as f64 / code as f64;
+        let test_to_impl = total.code_test as f64 / total.code_impl.max(1) as f64;
+        println!(
+            " test code: {:.1}% of all lines ({} / {})",
+            pct_total,
+            with_thousands(total.code_test),
+            with_thousands(total.lines),
+        );
+        println!(
+            "            {:.1}% of code lines ({} / {}; \"code\" excludes comments + blanks)",
+            pct_code,
+            with_thousands(total.code_test),
+            with_thousands(code),
+        );
+        println!("            {:.2}× impl code", test_to_impl);
+    }
+}
+
 fn print_table(root: &Path, by_dir: &BTreeMap<PathBuf, Counts>, total: Counts) {
     let header_path = format!("Path (under {})", root.display());
     let bar = "=".repeat(96);
@@ -665,25 +792,7 @@ fn print_table(root: &Path, by_dir: &BTreeMap<PathBuf, Counts>, total: Counts) {
         total.blanks,
     );
     println!("{bar}");
-    let code = total.code();
-    if code > 0 && total.lines > 0 {
-        let pct_total = 100.0 * total.code_test as f64 / total.lines as f64;
-        let pct_code = 100.0 * total.code_test as f64 / code as f64;
-        let test_to_impl = total.code_test as f64 / total.code_impl.max(1) as f64;
-        println!(
-            " test code: {:.1}% of all lines ({} / {})",
-            pct_total,
-            with_thousands(total.code_test),
-            with_thousands(total.lines),
-        );
-        println!(
-            "            {:.1}% of code lines ({} / {}; \"code\" excludes comments + blanks)",
-            pct_code,
-            with_thousands(total.code_test),
-            with_thousands(code),
-        );
-        println!("            {:.2}× impl code", test_to_impl);
-    }
+    print_summary_footer(total);
 }
 
 fn with_thousands(n: usize) -> String {
