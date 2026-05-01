@@ -1006,7 +1006,7 @@ async fn spawn_consensus_node_gossip(
     let config = format!(
         "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
-        [overlay]\nmode = \"gossip\"\ntarget_degree = {target_degree}\npeer_gossip_interval_ms = {peer_gossip_interval_ms}\nmesh_check_interval_ms = {mesh_check_interval_ms}\nbootstrap_addrs = {bootstrap_toml}\n\n\
+        [overlay]\nmode = \"gossip\"\noutbound_target = {target_degree}\npeer_gossip_interval_ms = {peer_gossip_interval_ms}\nmesh_check_interval_ms = {mesh_check_interval_ms}\nbootstrap_addrs = {bootstrap_toml}\n\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
     );
     let mut config_file = NamedTempFile::new().unwrap();
@@ -1232,7 +1232,7 @@ async fn spawn_consensus_node_inbound_disabled(
         "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\ncleanup_interval_secs = 5\n\n\
         [p2p]\ninbound_disabled = true\n\n\
-        [overlay]\nmode = \"gossip\"\ntarget_degree = {target_degree}\npeer_gossip_interval_ms = 250\nmesh_check_interval_ms = 250\nbootstrap_addrs = [{bootstrap_toml}]\n\n\
+        [overlay]\nmode = \"gossip\"\noutbound_target = {target_degree}\npeer_gossip_interval_ms = 250\nmesh_check_interval_ms = 250\nbootstrap_addrs = [{bootstrap_toml}]\n\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
     );
     let mut config_file = NamedTempFile::new().unwrap();

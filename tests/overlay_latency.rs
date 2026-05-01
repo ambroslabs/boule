@@ -285,7 +285,7 @@ async fn spawn_gossip(n: usize, k: usize) -> Harness {
             },
             maintenance: MeshMaintenanceConfig {
                 interval: Duration::from_secs(60),
-                target_degree: k,
+                outbound_target: k,
             },
             dedup_capacity: 16384,
             dedup_ttl: Duration::from_secs(120),

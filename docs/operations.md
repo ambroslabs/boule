@@ -96,7 +96,7 @@ overlay uses that connection as the seed for peer-list discovery. As
 soon as the bootstrap peer's peer-list gossip arrives, the
 outbound-only node learns about the remaining reachable validators and
 opens additional outbound connections to them, up to
-`[overlay] target_degree`.
+`[overlay] outbound_target`.
 
 ### Two-or-more outbound-only validators
 

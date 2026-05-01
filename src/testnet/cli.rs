@@ -236,11 +236,16 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
         i += 1;
     }
     let nodes = nodes.ok_or_else(|| anyhow::anyhow!("`new` requires --nodes <N>"))?;
-    // Match `OverlayConfig::default().target_degree` when --target-degree
-    // is omitted. The issue's k+3 minimum applies only when the operator
-    // is sweeping a sparse-mesh preset; the default for casual `new`
-    // invocations should keep enough redundancy that killing 2 nodes in
-    // a 7-node cluster doesn't partition the survivors.
+    // Match `OverlayConfig::default().outbound_target` when
+    // --target-degree is omitted. The issue's k+3 minimum applies
+    // only when the operator is sweeping a sparse-mesh preset; the
+    // default for casual `new` invocations should keep enough
+    // redundancy that killing 2 nodes in a 7-node cluster doesn't
+    // partition the survivors. The driver continues to accept
+    // `--target-degree` as the user-facing flag (the testnet CLI is
+    // distinct from the per-node `[overlay]` schema), but it now
+    // writes the post-#187 `outbound_target` knob in each node's
+    // generated config.
     let target_degree = target_degree.unwrap_or(8);
     let spec = TopologySpec {
         nodes,

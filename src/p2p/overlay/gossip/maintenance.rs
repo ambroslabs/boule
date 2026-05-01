@@ -1,10 +1,10 @@
 //! Partial-mesh maintenance loop.
 //!
 //! Once per [`MeshMaintenanceConfig::interval`], compares the
-//! currently-direct peer count against `target_degree` and, if there's
-//! a deficit, asks the [`Dialer`] to start outbound dial loops for
-//! enough fresh candidates from the [`super::peer_table::PeerTable`]
-//! to close the gap.
+//! currently-direct peer count against `outbound_target` and, if
+//! there's a deficit, asks the [`Dialer`] to start outbound dial
+//! loops for enough fresh candidates from the
+//! [`super::peer_table::PeerTable`] to close the gap.
 //!
 //! # What "direct" means
 //!
@@ -46,10 +46,11 @@
 //!
 //! Not implemented yet — the maintenance loop only fills upward.
 //! Validator clusters churn slowly enough that growing past
-//! `target_degree` happens only briefly when a previously-unreachable
+//! `outbound_target` happens only briefly when a previously-unreachable
 //! peer comes back online and we're already at K with replacements.
-//! A future enhancement can add proactive trim if profiling shows
-//! we're sitting above K under steady-state.
+//! A future enhancement (#513, sub of #187) adds proactive trim once
+//! the realised outbound count drifts above the target for ≥ 2
+//! consecutive ticks.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -69,22 +70,24 @@ use super::peer_list_task::DirectPeers;
 use super::peer_table::PeerTable;
 
 /// Knobs for [`run_mesh_maintenance`]. Defaults match the breakdown
-/// comment on issue #137.
+/// comment on issue #137 plus the direct-peer budget split from #187.
 #[derive(Debug, Clone)]
 pub struct MeshMaintenanceConfig {
     /// How often the loop wakes up and re-evaluates the deficit.
     pub interval: Duration,
-    /// Upper bound on the number of direct peers we want to maintain.
-    /// When `direct_peers().len() < target_degree`, the loop spawns
-    /// dialers for the difference.
-    pub target_degree: usize,
+    /// Soft floor on the number of outbound direct peers we want to
+    /// maintain. When `direct_peers().len() < outbound_target`, the
+    /// loop spawns dialers for the difference. Renamed from
+    /// `target_degree` in #187 to disambiguate from the new inbound
+    /// and total caps.
+    pub outbound_target: usize,
 }
 
 impl Default for MeshMaintenanceConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(5),
-            target_degree: 8,
+            outbound_target: 8,
         }
     }
 }
@@ -163,12 +166,12 @@ pub fn tick_once(
     rng: &mut ChaCha20Rng,
 ) -> usize {
     let direct_now = direct.snapshot();
-    if direct_now.len() >= config.target_degree {
+    if direct_now.len() >= config.outbound_target {
         return 0;
     }
 
     let direct_set: HashSet<NodeId> = direct_now.iter().copied().collect();
-    let deficit = config.target_degree - direct_now.len();
+    let deficit = config.outbound_target - direct_now.len();
 
     // Candidate set: peers in the table we are neither connected to
     // nor already dialing, and that advertise `reachable = true`.
@@ -243,7 +246,7 @@ mod tests {
     fn cfg(target: usize) -> MeshMaintenanceConfig {
         MeshMaintenanceConfig {
             interval: Duration::from_secs(5),
-            target_degree: target,
+            outbound_target: target,
         }
     }
 
@@ -277,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn does_nothing_when_at_target_degree() {
+    fn does_nothing_when_at_outbound_target() {
         let table = PeerTable::new(nid(0), 32);
         for i in 1..=10u8 {
             table.upsert(nid(i), addr(7000 + i as u16), 100);
@@ -359,7 +362,7 @@ mod tests {
     fn unreachable_peers_are_never_dialed() {
         // Issue #138: outbound-only peers (advertising reachable=false)
         // must be filtered out of the candidate pool. A reachable node
-        // with target_degree=4 and a table of 1 reachable + 6
+        // with outbound_target=4 and a table of 1 reachable + 6
         // unreachable should only dial the one reachable peer.
         let table = PeerTable::new(nid(0), 32);
         table.upsert_with_reachable(nid(1), addr(7001), 100, true);
@@ -394,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn convergence_to_target_degree_when_dials_succeed() {
+    fn convergence_to_outbound_target_when_dials_succeed() {
         // Simulate: every dial "succeeds" and shows up in the direct
         // set on the next tick. Target degree 8; table has 25
         // candidates. We expect convergence in a single tick.

@@ -12,7 +12,7 @@
 //! — but instead of relying on the peer manager's full N–1 connection
 //! table, it:
 //!
-//! 1. Maintains direct TCP/TLS connections to ≤ `target_degree` peers
+//! 1. Maintains direct TCP/TLS connections to ≤ `outbound_target` peers
 //!    (default 8).
 //! 2. Learns about other peers through periodic peer-list gossip with
 //!    those direct neighbours.
