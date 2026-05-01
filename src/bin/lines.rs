@@ -74,9 +74,7 @@ fn main() -> ExitCode {
             }
             s if s.starts_with('-') => {
                 eprintln!("error: unknown flag: {s}");
-                eprintln!(
-                    "usage: lines [--per-file|-f|--ls|-l] [PATH]   (PATH defaults to `src`)"
-                );
+                eprintln!("usage: lines [--per-file|-f|--ls|-l] [PATH]   (PATH defaults to `src`)");
                 return ExitCode::from(2);
             }
             _ => {
