@@ -339,6 +339,15 @@ struct SpawnExtras {
     /// index `i`). `None` falls back to uniform weight = 1, the
     /// pre-#463 cluster shape. Length must equal `n` if supplied.
     weights: Option<Vec<u64>>,
+    /// Per-node slow-disk write delay (#496). When `Some(delays)`,
+    /// each node's `Storage` and `Wal` are wrapped in
+    /// [`crate::storage::ThrottledStorage`] /
+    /// [`crate::storage::ThrottledWal`] using the per-index delay
+    /// (`Duration::ZERO` is allowed and means "no throttling for this
+    /// slot"). Length must equal `n` if supplied. Used by the slow-disk
+    /// back-pressure test to verify that consensus blocks (rather than
+    /// drops) when one node's persist path is slow.
+    slow_disk_delays: Option<Vec<Duration>>,
 }
 
 /// An in-memory cluster of N consensus nodes connected by channel-backed
@@ -514,6 +523,50 @@ impl SimCluster {
         .0
     }
 
+    /// Spawn `n` honest nodes with per-node slow-disk write delays
+    /// (#496). Each `slow_disk_delays[i]` wraps node `i`'s `Storage`
+    /// and `Wal` in a [`crate::storage::ThrottledStorage`] /
+    /// [`crate::storage::ThrottledWal`] adapter that adds a
+    /// `std::thread::sleep` of that duration to every write.
+    /// `Duration::ZERO` slots run un-throttled. Used by the slow-disk
+    /// back-pressure test to verify that consensus blocks (rather than
+    /// drops) when one node's persist path is slow.
+    ///
+    /// # Threading caveat
+    ///
+    /// Tests using this should run under the default tokio
+    /// **multi-thread** runtime (`#[tokio::test(flavor = "multi_thread")]`)
+    /// and avoid `tokio::time::pause()` — the throttled storage uses
+    /// blocking `std::thread::sleep`, which under `current_thread` would
+    /// block every other task on the executor for the duration of each
+    /// write. The slow node's wall-clock delay is the load-bearing
+    /// observable here, so real time is the right driver.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `slow_disk_delays.len() != n`.
+    pub async fn spawn_with_slow_disk(
+        n: usize,
+        timeout_base: Duration,
+        slow_disk_delays: Vec<Duration>,
+    ) -> Self {
+        assert_eq!(
+            slow_disk_delays.len(),
+            n,
+            "spawn_with_slow_disk: slow_disk_delays.len() must equal n",
+        );
+        Self::spawn_inner(
+            n,
+            timeout_base,
+            SpawnExtras {
+                slow_disk_delays: Some(slow_disk_delays),
+                ..SpawnExtras::default()
+            },
+        )
+        .await
+        .0
+    }
+
     /// Spawn `n` honest nodes configured for the BLS-aggregated chain
     /// scheme (#354 step 2).
     ///
@@ -549,6 +602,7 @@ impl SimCluster {
                     crate::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
                 ),
                 weights: None,
+                slow_disk_delays: None,
             },
         )
         .await
@@ -585,6 +639,7 @@ impl SimCluster {
                 adversaries: Some(adversaries),
                 signature_scheme: None,
                 weights: None,
+                slow_disk_delays: None,
             },
         )
         .await
@@ -613,6 +668,7 @@ impl SimCluster {
                 adversaries: None,
                 signature_scheme: None,
                 weights: None,
+                slow_disk_delays: None,
             },
         )
         .await
@@ -628,6 +684,7 @@ impl SimCluster {
             adversaries,
             signature_scheme,
             weights,
+            slow_disk_delays,
         } = extras;
         let scheme = signature_scheme.unwrap_or_default();
         if let Some(adv) = adversaries.as_ref() {
@@ -635,6 +692,9 @@ impl SimCluster {
         }
         if let Some(ws) = weights.as_ref() {
             assert_eq!(ws.len(), n, "weights slots must equal n");
+        }
+        if let Some(d) = slow_disk_delays.as_ref() {
+            assert_eq!(d.len(), n, "slow_disk_delays slots must equal n");
         }
         assert!(n >= 4, "BFT requires at least 4 nodes (3f+1 with f=1)");
 
@@ -787,10 +847,29 @@ impl SimCluster {
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
             let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(256));
             mempools_captured.push(Arc::clone(&mempool));
-            let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-            let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
-            storages_for_restart.push(Arc::clone(&storage));
-            wals_for_restart.push(Arc::clone(&wal));
+            let raw_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+            let raw_wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+            // Slow-disk wrap (#496): if this slot has a non-zero delay,
+            // present a ThrottledStorage / ThrottledWal to consensus
+            // while still capturing the raw inner Arc for the restart
+            // path so a later `restart_all_with_recover` round-trips
+            // against the same on-disk state.
+            let (storage, wal): (Arc<dyn Storage>, Arc<dyn Wal>) =
+                match slow_disk_delays.as_ref().and_then(|d| d.get(idx).copied()) {
+                    Some(delay) if delay > Duration::ZERO => (
+                        Arc::new(crate::storage::ThrottledStorage::new(
+                            Arc::clone(&raw_storage),
+                            delay,
+                        )),
+                        Arc::new(crate::storage::ThrottledWal::new(
+                            Arc::clone(&raw_wal),
+                            delay,
+                        )),
+                    ),
+                    _ => (Arc::clone(&raw_storage), Arc::clone(&raw_wal)),
+                };
+            storages_for_restart.push(raw_storage);
+            wals_for_restart.push(raw_wal);
 
             let (commit_tx, commit_rx) = mpsc::channel::<Block>(SIM_COMMIT_CHANNEL_CAP);
             commit_rxs.push(commit_rx);
@@ -2665,6 +2744,60 @@ mod tests {
         assert!(
             reference.windows(2).all(|w| w[1].0 == w[0].0 + 1),
             "three-chain heights must be strictly consecutive: {reference:?}",
+        );
+    }
+
+    // ── Slow-disk back-pressure (#496) ────────────────────────────────────────
+
+    /// Wrap one node's storage in [`crate::storage::ThrottledStorage`]
+    /// with a per-write delay; assert the cluster's persist-blocks-rather-
+    /// than-drops invariant holds (every node still commits, the slow
+    /// node lags but doesn't violate safety).
+    ///
+    /// Uses the multi-thread runtime + real wall clock because
+    /// `ThrottledStorage` blocks the executor with `std::thread::sleep`.
+    /// Under `current_thread + start_paused` the throttled writes would
+    /// wedge every other task on the same thread, defeating the test's
+    /// shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slow_disk_node_lags_but_does_not_wedge_or_violate_safety() {
+        // 50 ms persist delay on node 3 only. Combined with the 50 ms
+        // view-timer base this throttles node 3's commit cadence below
+        // the fast nodes' but still well above zero, so we can observe
+        // strict-inequality lag while staying under the 15-second
+        // per-test budget.
+        let slow_delay = Duration::from_millis(50);
+        let mut cluster = SimCluster::spawn_with_slow_disk(
+            4,
+            Duration::from_millis(50),
+            vec![Duration::ZERO, Duration::ZERO, Duration::ZERO, slow_delay],
+        )
+        .await;
+
+        // Drive the cluster for 3 seconds of real wall-clock — fast
+        // nodes should commit on the order of dozens of blocks; the
+        // slow node fewer.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // Every node committed at least one block — the slow path
+        // back-pressures consensus but does not wedge it.
+        for (i, node_commits) in committed.iter().enumerate() {
+            assert!(
+                !node_commits.is_empty(),
+                "node {i} produced no commits — slow disk should block, not wedge",
+            );
+        }
+
+        // No commits dropped on any commit channel — back-pressure on
+        // the persist path must not propagate forward as silent drops
+        // on the commit fan-out.
+        assert_eq!(
+            cluster.total_commit_overflows(),
+            0,
+            "no commits should overflow the bounded notifier channel",
         );
     }
 
