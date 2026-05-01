@@ -137,10 +137,15 @@ The audit identified three gaps that are tracked as sub-issues of #163:
   timestamps; once a peer hits `SLOW_PEER_OVERFLOW_THRESHOLD` overflows
   inside `SLOW_PEER_OVERFLOW_WINDOW`, the manager kicks it with the
   same cleanup path `PeerCommand::Disconnect` performs.
-- **Phase 4 sim primitives** — slow-node and slow-disk primitives for
-  `SimCluster` so the four named tests in #163 (slow peer, slow disk,
-  sync flood, tracing burst) can be expressed deterministically.
-  Filed as a follow-up after the metrics land.
+- **Phase 4 sim primitives** — slow-disk landed (#496):
+  `SimCluster::spawn_with_slow_disk` wires
+  [`crate::storage::ThrottledStorage`] /
+  [`crate::storage::ThrottledWal`] adapters per node. Slow-node
+  primitive + slow-peer integration test still open as #497;
+  block-sync credit window + sync-flood test as #498. Tracing-burst
+  test was dropped — the property (tracing subscriber doesn't gate
+  consensus) is provided by `tracing-subscriber` defaults rather
+  than by our code.
 
 ## Cross-references
 

@@ -27,6 +27,7 @@
 
 pub mod disk;
 pub mod memory;
+pub mod throttled;
 
 use bytes::Bytes;
 
@@ -37,6 +38,8 @@ use bytes::Bytes;
 pub use disk::{DiskStorage, DiskWal};
 #[allow(unused_imports)]
 pub use memory::{MemoryStorage, MemoryWal};
+#[allow(unused_imports)]
+pub use throttled::{ThrottledStorage, ThrottledWal};
 
 /// A boxed iterator over WAL entries. Used in [`Wal::iter_from`].
 pub type WalIter<'a> = Box<dyn Iterator<Item = anyhow::Result<(Lsn, Bytes)>> + Send + 'a>;
