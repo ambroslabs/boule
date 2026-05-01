@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
@@ -93,6 +94,16 @@ pub async fn run(
     // Used to distinguish current vs. replaced connections when a PeerGone
     // arrives (see #114 / the tie-breaker path in `register_connection`).
     let mut next_conn_id: ConnectionId = 0;
+    // Cumulative count of per-peer outbound `write_tx.try_send` failures
+    // due to a full channel — both `SendTo` and `Broadcast` paths feed
+    // it. Cloned into every [`ProtocolHandle`] returned by
+    // [`PeerCommand::RegisterProtocol`] so a consumer (consensus) can
+    // surface the running drop count via
+    // [`crate::consensus::status::BackpressureStatus`]. `Closed`
+    // failures are intentionally not counted: they fire when a peer
+    // disconnects mid-send and would mask real back-pressure events.
+    // (#163 / #486 follow-up.)
+    let peer_outbound_overflows = Arc::new(AtomicU64::new(0));
 
     loop {
         tokio::select! {
@@ -189,14 +200,27 @@ pub async fn run(
                         match outbound {
                             ProtocolOutbound::Broadcast(payload) => {
                                 let tagged = tag(protocol_id, payload);
-                                broadcast_msg(&peers, tagged);
+                                broadcast_msg(&peers, tagged, &peer_outbound_overflows);
                             }
                             ProtocolOutbound::SendTo { node_id, payload } => {
                                 let tagged = tag(protocol_id, payload);
                                 let id = node_id_to_base58(&node_id);
                                 if let Some(slot) = peers.get(&node_id) {
-                                    if slot.write_tx.try_send(tagged).is_err() {
-                                        warn!("SendTo {id}: channel full or closed");
+                                    match slot.write_tx.try_send(tagged) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            // Per-peer write channel is at capacity. Bump
+                                            // the back-pressure counter (#486) so the drop
+                                            // is visible in `ConsensusStatus.backpressure`,
+                                            // and warn for log-side correlation.
+                                            peer_outbound_overflows.fetch_add(1, Ordering::Relaxed);
+                                            warn!("SendTo {id}: channel full");
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            // Closed channels are shutdown noise — counting
+                                            // them would mask real back-pressure events.
+                                            warn!("SendTo {id}: channel closed");
+                                        }
                                     }
                                 } else {
                                     warn!("SendTo unknown peer {id}");
@@ -237,7 +261,11 @@ pub async fn run(
                                 protocol_caps.write().remove(&id);
                             }
                         }
-                        let _ = reply.send(ProtocolHandle { send_tx, event_rx });
+                        let _ = reply.send(ProtocolHandle {
+                            send_tx,
+                            event_rx,
+                            peer_outbound_overflows: Arc::clone(&peer_outbound_overflows),
+                        });
                     }
                     Some(PeerCommand::Disconnect { node_id }) => {
                         let id = node_id_to_base58(&node_id);
@@ -420,11 +448,22 @@ fn tag(protocol_id: u8, payload: Bytes) -> Bytes {
     buf.freeze()
 }
 
-fn broadcast_msg(peers: &BTreeMap<NodeId, PeerSlot>, msg: Bytes) {
+fn broadcast_msg(
+    peers: &BTreeMap<NodeId, PeerSlot>,
+    msg: Bytes,
+    peer_outbound_overflows: &Arc<AtomicU64>,
+) {
     for (node_id, slot) in peers {
         let id = node_id_to_base58(node_id);
-        if slot.write_tx.try_send(msg.clone()).is_err() {
-            warn!("broadcast to {id}: channel full or closed, skipping");
+        match slot.write_tx.try_send(msg.clone()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                peer_outbound_overflows.fetch_add(1, Ordering::Relaxed);
+                warn!("broadcast to {id}: channel full, skipping");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("broadcast to {id}: channel closed, skipping");
+            }
         }
     }
 }
@@ -664,6 +703,47 @@ mod tests {
         // bytes are 0x00000000.
         assert_eq!(&read_buf[..4], &[0, 0, 0, 5]); // frame length = 5
         assert_eq!(read_buf[4], 0x01); // protocol tag
+
+        // Back-pressure metric (#486): the slow peer's duplex (64 KiB)
+        // + write_tx (64 frames at any size) can absorb a few hundred
+        // small frames. The test floods with 5-byte payloads which
+        // never overflow the underlying duplex buffer. The counter is
+        // exercised explicitly in
+        // `send_to_full_channel_increments_overflow_counter` below
+        // using larger payloads.
+    }
+
+    #[tokio::test]
+    async fn send_to_full_channel_increments_overflow_counter() {
+        // To force a real overflow we have to flood enough bytes to
+        // fill both the per-peer write_tx (64 frames) AND the
+        // 64-KiB duplex buffer the test fixture wires up. Use 4-KiB
+        // payloads × 200 frames = 800 KiB ≫ ~65 KiB capacity, so the
+        // tail of the burst lands on a full write_tx and bumps the
+        // counter.
+        let mgr = TestManager::start(nid(1));
+        let h = mgr.register(0x01).await;
+        let _slow = add_peer(&mgr, nid(20)).await;
+
+        let payload = Bytes::from(vec![0xAB; 4 * 1024]);
+        let before = h.peer_outbound_overflows.load(Ordering::Relaxed);
+        for _ in 0..200 {
+            h.send_tx
+                .send(ProtocolOutbound::SendTo {
+                    node_id: nid(20),
+                    payload: payload.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        // Let the manager drain the ProtocolSend queue into the slow
+        // peer's write_tx so the try_send-Full failures actually fire.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after = h.peer_outbound_overflows.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "send_to overflow counter must advance under flood (before={before} after={after})",
+        );
     }
 
     #[tokio::test]

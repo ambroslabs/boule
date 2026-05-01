@@ -100,6 +100,9 @@ pub mod tls;
 #[allow(missing_docs)]
 pub mod tls_protocol;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
 use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -309,7 +312,7 @@ pub enum ProtocolEvent {
 /// use bytes::Bytes;
 ///
 /// # async fn wiring(handle: ProtocolHandle) {
-/// let ProtocolHandle { send_tx, mut event_rx } = handle;
+/// let ProtocolHandle { send_tx, mut event_rx, peer_outbound_overflows: _ } = handle;
 ///
 /// while let Some(event) = event_rx.recv().await {
 ///     match event {
@@ -335,4 +338,13 @@ pub struct ProtocolHandle {
     /// this protocol ID arrives here. Dropping the receiver implicitly
     /// unregisters the protocol for future events.
     pub event_rx: mpsc::Receiver<ProtocolEvent>,
+    /// Shared with the peer manager. Increments every time the
+    /// per-peer outbound `write_tx.try_send` returns `Full` — i.e. the
+    /// transport-level back-pressure event the
+    /// [`crate::consensus::status::BackpressureStatus::peer_outbound_overflow_total`]
+    /// metric counts. Wired through to consensus so a single counter
+    /// covers `SendTo` + `Broadcast` outbound drops on every protocol.
+    /// Closed-channel failures are intentionally not counted (see
+    /// `docs/backpressure.md`).
+    pub peer_outbound_overflows: Arc<AtomicU64>,
 }

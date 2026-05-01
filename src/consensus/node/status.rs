@@ -170,6 +170,11 @@ impl ConsensusNode {
                     .as_ref()
                     .map(|c| c.load(Ordering::Relaxed))
                     .unwrap_or(0),
+                peer_outbound_overflow_total: self
+                    .peer_outbound_overflows
+                    .as_ref()
+                    .map(|c| c.load(Ordering::Relaxed))
+                    .unwrap_or(0),
             },
         }
     }

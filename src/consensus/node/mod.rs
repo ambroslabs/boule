@@ -255,6 +255,14 @@ pub struct ConsensusNode {
     /// `None` for mesh-mode runs and for the simulator's mesh harness —
     /// the field defaults to zero in `ConsensusStatus` in those cases.
     gossip_sink_overflows: Option<Arc<AtomicU64>>,
+    /// Shared overflow counter from the p2p manager — counts every
+    /// `try_send` `Full` on a per-peer outbound `write_tx`, across both
+    /// `SendTo` and `Broadcast` paths. Cloned from the
+    /// [`crate::p2p::ProtocolHandle`] returned at registration. When
+    /// `Some`, surfaced via
+    /// [`crate::consensus::status::BackpressureStatus::peer_outbound_overflow_total`].
+    /// `None` for the simulator's mesh harness (no real p2p manager).
+    peer_outbound_overflows: Option<Arc<AtomicU64>>,
     /// Peer-membership snapshot used by [`ConsensusNode::build_status`].
     /// Populated from [`Discovery`] events inside [`ConsensusNode::run`];
     /// before `run` starts (or in tests that bypass it) the set is empty
@@ -448,6 +456,7 @@ impl ConsensusNode {
             eviction_counters,
             commit_notifier: None,
             gossip_sink_overflows: None,
+            peer_outbound_overflows: None,
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
@@ -527,6 +536,18 @@ impl ConsensusNode {
     /// stays at zero.
     pub fn with_gossip_sink_overflow_counter(mut self, counter: Arc<AtomicU64>) -> Self {
         self.gossip_sink_overflows = Some(counter);
+        self
+    }
+
+    /// Wire the p2p manager's per-peer outbound overflow counter into
+    /// this node. Pass the `Arc<AtomicU64>` carried by every
+    /// [`crate::p2p::ProtocolHandle`]
+    /// (`peer_outbound_overflows`) — there's a single shared counter per
+    /// manager, so handing in the consensus-protocol's clone is fine.
+    /// Surfaced via
+    /// [`crate::consensus::status::BackpressureStatus::peer_outbound_overflow_total`].
+    pub fn with_peer_outbound_overflow_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.peer_outbound_overflows = Some(counter);
         self
     }
 
@@ -777,6 +798,7 @@ impl ConsensusNode {
             eviction_counters,
             commit_notifier: None,
             gossip_sink_overflows: None,
+            peer_outbound_overflows: None,
             peers_connected: HashSet::new(),
             last_committed_height,
             dropped_commands,
@@ -1161,6 +1183,29 @@ mod tests {
         assert_eq!(
             node.build_status().backpressure.gossip_sink_overflow_total,
             7
+        );
+    }
+
+    #[test]
+    fn build_status_surfaces_wired_peer_outbound_overflow_counter() {
+        // Same seam but for the per-peer outbound counter that
+        // ProtocolHandle hands back from the p2p manager.
+        let counter = Arc::new(AtomicU64::new(0));
+        let node = make_node(nid(1)).with_peer_outbound_overflow_counter(Arc::clone(&counter));
+
+        assert_eq!(
+            node.build_status()
+                .backpressure
+                .peer_outbound_overflow_total,
+            0
+        );
+
+        counter.fetch_add(13, Ordering::Relaxed);
+        assert_eq!(
+            node.build_status()
+                .backpressure
+                .peer_outbound_overflow_total,
+            13
         );
     }
 

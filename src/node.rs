@@ -465,6 +465,7 @@ async fn start_consensus(
         overlay_shutdown,
         overlay_joins,
         gossip_sink_overflows,
+        peer_outbound_overflows,
     } = build_overlay_wiring(
         overlay_cfg,
         p2p_cmd_tx,
@@ -518,6 +519,7 @@ async fn start_consensus(
     if let Some(counter) = gossip_sink_overflows {
         node = node.with_gossip_sink_overflow_counter(counter);
     }
+    node = node.with_peer_outbound_overflow_counter(peer_outbound_overflows);
 
     let initial_status = Arc::new(node.build_status());
     let (status_tx, status_rx) = watch::channel(initial_status);
@@ -674,6 +676,12 @@ struct OverlayWiring {
     /// so [`crate::consensus::status::BackpressureStatus`] surfaces the
     /// running drop count.
     gossip_sink_overflows: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Shared overflow counter from the p2p manager — clones of the
+    /// same `Arc<AtomicU64>` carried in every `ProtocolHandle` returned
+    /// by `PeerCommand::RegisterProtocol`. Plumbed into
+    /// [`ConsensusNode::with_peer_outbound_overflow_counter`] so the
+    /// status field reflects every per-peer outbound `try_send` `Full`.
+    peer_outbound_overflows: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Branch on `overlay_cfg.mode` and assemble the consensus-facing
@@ -704,6 +712,7 @@ async fn build_overlay_wiring(
                 .await?;
             let handle = reg_rx.await?;
             info!("overlay: mesh");
+            let peer_outbound_overflows = Arc::clone(&handle.peer_outbound_overflows);
             Ok(OverlayWiring {
                 broadcaster: Arc::new(MeshBroadcaster::new(handle.send_tx)),
                 discovery: MeshDiscovery::spawn(discovery_tx.subscribe()),
@@ -711,6 +720,7 @@ async fn build_overlay_wiring(
                 overlay_shutdown: None,
                 overlay_joins: Vec::new(),
                 gossip_sink_overflows: None,
+                peer_outbound_overflows,
             })
         }
         OverlayMode::Gossip => {
@@ -727,6 +737,7 @@ async fn build_overlay_wiring(
                 })
                 .await?;
             let handle = reg_rx.await?;
+            let peer_outbound_overflows = Arc::clone(&handle.peer_outbound_overflows);
 
             let sink = Arc::new(OverlaySink::new(handle.send_tx));
             let gossip_sink_overflows = Some(sink.overflow_counter());
@@ -788,6 +799,7 @@ async fn build_overlay_wiring(
                     handles.maintenance_join,
                 ],
                 gossip_sink_overflows,
+                peer_outbound_overflows,
             })
         }
     }
