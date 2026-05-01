@@ -1240,10 +1240,12 @@ mod tests {
             ProtocolHandle {
                 send_tx: a_send_tx,
                 event_rx: a_event_rx,
+                peer_outbound_overflows: Arc::new(AtomicU64::new(0)),
             },
             ProtocolHandle {
                 send_tx: b_send_tx,
                 event_rx: b_event_rx,
+                peer_outbound_overflows: Arc::new(AtomicU64::new(0)),
             },
             Bridge {
                 alive,

@@ -144,6 +144,15 @@ pub struct BackpressureStatus {
     /// unicasts. Always zero on a node configured for mesh-mode
     /// overlay (no gossip sink in play).
     pub gossip_sink_overflow_total: u64,
+    /// Drops from the per-peer outbound `write_tx.try_send` in the p2p
+    /// manager — both `SendTo` and `Broadcast` paths feed the same
+    /// counter. Each increment is one frame that didn't make it onto a
+    /// peer's write channel because it was at capacity (the
+    /// must-deliver-or-disconnect path's drop side; see
+    /// `docs/backpressure.md`). Closed-channel failures are not
+    /// counted (manager-shutdown noise).
+    #[serde(default)]
+    pub peer_outbound_overflow_total: u64,
 }
 
 /// A snapshot of a consensus node's live state, returned by
@@ -279,6 +288,7 @@ mod tests {
             equivocations_detected: 2,
             backpressure: BackpressureStatus {
                 gossip_sink_overflow_total: 5,
+                peer_outbound_overflow_total: 9,
             },
         }
     }
@@ -340,6 +350,7 @@ mod tests {
 
         // Back-pressure overflow counters (#163 / #486).
         assert_eq!(json["backpressure"]["gossip_sink_overflow_total"], 5);
+        assert_eq!(json["backpressure"]["peer_outbound_overflow_total"], 9);
     }
 
     #[test]

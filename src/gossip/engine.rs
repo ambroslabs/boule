@@ -14,6 +14,7 @@ pub async fn run(handle: ProtocolHandle, store: Arc<GossipStore>, clock: Arc<dyn
     let ProtocolHandle {
         send_tx,
         mut event_rx,
+        peer_outbound_overflows: _,
     } = handle;
 
     while let Some(event) = event_rx.recv().await {

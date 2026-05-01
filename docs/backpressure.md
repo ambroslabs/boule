@@ -50,7 +50,7 @@ test fixtures with smaller channels do not appear here.
 
 | Path | File:line | Type | Capacity | Send-side on full | Policy | Rationale |
 |------|-----------|------|----------|-------------------|--------|-----------|
-| Per-peer outbound bytes (`write_tx`) | `p2p/manager.rs:326,351` | `mpsc<Bytes>` | 64 | `try_send` → drop + warn (`p2p/manager.rs:198`) | Drop + counter *(target: block+disconnect)* | Carries every consensus and overlay message destined for one peer. Today drops silently when the peer's TCP buffer or socket task is wedged; #486 / #163-PR4 will add overflow counters and a slow-peer disconnect threshold. |
+| Per-peer outbound bytes (`write_tx`) | `p2p/manager.rs:326,351` | `mpsc<Bytes>` | 64 | `try_send` → drop + counter + warn (`p2p/manager.rs:198`, `:431`) | Drop + counter *(target: block+disconnect, see #490)* | Carries every consensus and overlay message destined for one peer. Drops on `Full` increment a single shared counter handed out via every `ProtocolHandle.peer_outbound_overflows`; surfaced through `ConsensusStatus.backpressure.peer_outbound_overflow_total`. Closed-channel failures are intentionally not counted (manager-shutdown noise). #490 adds the slow-peer disconnect heuristic on top. |
 | Per-peer inbound (`internal_tx`) | `p2p/manager.rs:472` | `mpsc<ManagerMsg>` | 64 | `send().await` (`p2p/connection.rs:64`) | **Block** | Connection task back-pressures the read loop; a slow manager naturally throttles all peers. The manager is single-threaded so this is safe — it cannot starve one peer for another. |
 | Manager command channel (`cmd_tx`) | `p2p/manager.rs:471` | `mpsc<PeerCommand>` | 16 | `send().await` | **Block** | Used for `RegisterProtocol`/`Disconnect`/`ListPeers`. Not on the data plane. |
 | `peer_gone` broadcast | `p2p/manager.rs:473` | `broadcast<NodeId>` | 16 | broadcast::send (lagging receivers see `Lagged`) | **Drop on lag (best-effort)** | Subscribers re-poll `known_peers()` to recover from a `Lagged` error. |
@@ -125,13 +125,12 @@ The audit identified three gaps that are tracked as sub-issues of #163:
   at [`SIM_COMMIT_CHANNEL_CAP`](../src/consensus/sim.rs); the
   notifier increments a per-node overflow counter on drop, surfaced
   in `SimCluster::total_commit_overflows()`.
-- **#486** — Partially landed: the gossip sink now tracks an
-  `AtomicU64` overflow counter and surfaces through
-  `ConsensusStatus.backpressure.gossip_sink_overflow_total`. The
-  per-peer outbound `write_tx` drop site (`p2p/manager.rs:198`) and
-  the production consensus event channel are still uncounted; threading
-  a counter through `ProtocolHandle` is the natural next step (#486
-  follow-up).
+- **#486** (closed) — counters wired for both the gossip sink
+  (`backpressure.gossip_sink_overflow_total`) and the per-peer outbound
+  `write_tx` (`backpressure.peer_outbound_overflow_total`) via a
+  single shared counter on every `ProtocolHandle`. The production
+  consensus event channel uses `send().await` (block-on-full), so it
+  doesn't need a counter.
 - **#163-PR4 (not yet filed)** — Slow-peer disconnect heuristic for
   per-peer outbound. The drop is wired (`p2p/manager.rs:198`) but
   there's no "after K consecutive overflows in window W, disconnect"
