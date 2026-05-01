@@ -728,10 +728,21 @@ robust to bursty commits: a single new QC can extend
 commit rule, so `max(others) − mine` routinely jumps to 5+ for a
 single sample even on a healthy cluster (issue #396). The median
 tracks the cluster body, which is what "X has caught up" really
-means. Block-sync walks back one parent per pacemaker tick, so the
-wait time is still bounded by the gap (issue #185 tracks the planned
-bulk-range RPC + dedicated retry timer), but the driver no longer
-under-or-overshoots a fixed sleep.
+means. Catch-up itself is now O(1) round trip per
+[`BLOCK_RANGE_RESPONSE_MAX_BLOCKS`]-block window: the recovering
+node detects a multi-block gap from the next proposal it sees and
+fires a [`BlockRangeRequest`] for `[last_committed + 1,
+proposal_parent_height]` to the proposer, the responder serves up
+to the per-response cap (default 64 blocks), and the requester
+inserts every well-formed block in one shot. A single-shot
+[`BlockRequest`] lost in flight recovers in `O(100ms)` rather than
+`O(view_timeout)` thanks to the dedicated retry timer (#512 /
+#518). The combination is issue #185's bulk-range catch-up window
+fix, shipped across #518 / #520 / #522.
+
+[`BlockRangeRequest`]: ../src/consensus/node/wire.rs
+[`BLOCK_RANGE_RESPONSE_MAX_BLOCKS`]: ../src/consensus/node/wire.rs
+[`BlockRequest`]: ../src/consensus/node/wire.rs
 
 The block-sync round-trip is visible at `RUST_LOG=info`; `telemetry`
 exposes the same events as a tabular summary rather than asking
@@ -747,6 +758,12 @@ operators to grep:
   proposal.
 - `block_sync_response_received` (one per parent the cluster serves
   back) — confirms the round-trip completed.
+- `block_sync_range_request_emitted` + `block_sync_range_response_received`
+  (#185 / #520 / #522) — fires when the recovering node detects a
+  multi-block gap and pipelines one `BlockRangeRequest` covering up
+  to 64 blocks. The presence of this pair after a restart is the
+  visible signature that bulk-range catch-up engaged rather than
+  the single-block walk-back.
 - `gossip_send_to_dispatched` (one per emitted `BlockRequest`,
   `target_is_direct` reporting whether the requested peer was a
   current direct neighbour). Under the sparse-mesh `[[peers]]` layout
@@ -827,11 +844,13 @@ The available `op =` values match the CLI: `wait_all_reach_height`,
 > writes `[overlay].mode = "gossip"` because that's the default since
 > issue #137 stack 9 / commit 5b05aa3, and because the §9b sparse-ring
 > layout depends on issue #178 (`RequestBlock` retry on
-> `PacemakerAdvance`) and issue #182 (unicast routed through the
-> gossip mesh) to converge reliably. Operators on builds that
-> predate those fixes need to write configs by hand with
-> `[overlay].mode = "mesh"` or a full N − 1 `[[peers]]` list — the
-> driver does not paper over those older topologies.
+> `PacemakerAdvance`), issue #182 (unicast routed through the
+> gossip mesh), and issue #185 (bulk-range RPC + dedicated retry
+> timer, shipped across #518 / #520 / #522) to converge reliably
+> within a single `wait --catch-up-to-cluster` poll budget.
+> Operators on builds that predate those fixes need to write configs
+> by hand with `[overlay].mode = "mesh"` or a full N − 1 `[[peers]]`
+> list — the driver does not paper over those older topologies.
 
 > **What this isn't.** "Kill the process" simulates **fail-stop**: a
 > node simply stops sending and receiving. True Byzantine behavior
