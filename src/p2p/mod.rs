@@ -26,37 +26,33 @@
 //!
 //! # Registering a new protocol
 //!
-//! The canonical example is gossip's registration as `main.rs` does it:
+//! Send a [`PeerCommand::RegisterProtocol`] over the manager's command
+//! channel and wait for the reply oneshot to hand back a
+//! [`ProtocolHandle`] you can drive a protocol task from:
 //!
 //! ```no_run
-//! use std::sync::Arc;
-//!
-//! use ambros_p2p::clock::{Clock, TokioClock};
-//! use ambros_p2p::gossip::{self, store::GossipStore};
-//! use ambros_p2p::p2p::{self, PeerCommand, ProtocolHandle};
+//! use ambros_p2p::p2p::{PeerCommand, ProtocolHandle};
 //! use tokio::sync::{mpsc, oneshot};
 //!
 //! # async fn wiring(p2p_cmd_tx: mpsc::Sender<PeerCommand>) -> anyhow::Result<()> {
+//! const MY_PROTOCOL_ID: u8 = 0x10;
 //! let (reg_tx, reg_rx) = oneshot::channel();
 //! p2p_cmd_tx
 //!     .send(PeerCommand::RegisterProtocol {
-//!         id: gossip::PROTOCOL_ID,
-//!         max_frame_bytes: Some(gossip::MAX_FRAME_BYTES),
+//!         id: MY_PROTOCOL_ID,
+//!         max_frame_bytes: Some(64 * 1024),
 //!         reply: reg_tx,
 //!     })
 //!     .await?;
-//! let handle: ProtocolHandle = reg_rx.await?;
+//! let _handle: ProtocolHandle = reg_rx.await?;
 //!
 //! // Spawn the protocol task with its handle; it owns `send_tx` / `event_rx`.
-//! let store = Arc::new(GossipStore::new());
-//! let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-//! tokio::spawn(gossip::engine::run(handle, store, clock));
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Ping's registration in `src/ping.rs` shows how to layer `rpc::Rpc` on
-//! top of a raw handle to get matched request/response semantics.
+//! For matched request/response semantics, layer [`rpc::Rpc`] on top of a
+//! raw handle — see [`rpc::RpcBuilder`] for the constructor.
 
 #![warn(missing_docs)]
 

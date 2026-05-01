@@ -1,29 +1,14 @@
 //! HTTP admin surface for the peer manager.
 //!
 //! Exposes read-only endpoints that are mounted into the node's main
-//! [`axum::Router`] in `main.rs`:
+//! [`axum::Router`] in `node::run` alongside any application routers:
 //!
 //! ```no_run
-//! use std::sync::Arc;
-//!
-//! use ambros_p2p::clock::{Clock, TokioClock};
-//! use ambros_p2p::gossip::{self, store::GossipStore};
-//! use ambros_p2p::p2p::{self, PeerCommand, ProtocolOutbound};
-//! use ambros_p2p::p2p::rpc::Rpc;
-//! use ambros_p2p::ping;
+//! use ambros_p2p::p2p::{self, PeerCommand};
 //! use tokio::sync::mpsc;
 //!
-//! # fn wiring(
-//! #     p2p_cmd_tx: mpsc::Sender<PeerCommand>,
-//! #     gossip_send_tx: mpsc::Sender<ProtocolOutbound>,
-//! #     ping_rpc: Rpc,
-//! # ) {
-//! let store = Arc::new(GossipStore::new());
-//! let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-//! let app = axum::Router::new()
-//!     .merge(p2p::api::router(p2p_cmd_tx))
-//!     .merge(gossip::api::router(store, gossip_send_tx, clock))
-//!     .merge(ping::router(ping_rpc));
+//! # fn wiring(p2p_cmd_tx: mpsc::Sender<PeerCommand>) {
+//! let app = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx));
 //! # let _ = app;
 //! # }
 //! ```
