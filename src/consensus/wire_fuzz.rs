@@ -180,7 +180,11 @@ fn arb_block(genesis_hash: BlockHash) -> impl Strategy<Value = Block> {
 }
 
 fn arb_proposal(genesis_hash: BlockHash) -> impl Strategy<Value = Proposal> {
-    (arb_block(genesis_hash), arb_qc()).prop_map(|(block, justify)| Proposal { block, justify })
+    (arb_block(genesis_hash), arb_qc()).prop_map(|(block, justify)| Proposal {
+        block,
+        justify,
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    })
 }
 
 fn arb_vote() -> impl Strategy<Value = Vote> {
@@ -224,8 +228,12 @@ fn arb_signed_wire_bytes_and_signer() -> impl Strategy<Value = (Vec<u8>, NodeId)
         (arb_signer_idx(), arb_vote()).prop_map(|(idx, v)| {
             let signer = &signer_pool()[idx];
             let signed = Signed::sign(v, signer, &ChainId::TEST).expect("sign Vote");
-            let bytes = postcard::to_stdvec(&WireMessage::Vote(signed, None))
-                .expect("encode WireMessage::Vote");
+            let bytes = postcard::to_stdvec(&WireMessage::Vote(
+                signed,
+                None,
+                crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+            ))
+            .expect("encode WireMessage::Vote");
             (bytes, signer.node_id())
         }),
         (arb_signer_idx(), arb_new_view()).prop_map(|(idx, nv)| {
@@ -380,6 +388,7 @@ impl ReplicaSet {
                 let state = HotStuffState::new(validators.clone(), genesis.clone());
                 let builder = Arc::new(TestBlockBuilder { proposer: nid });
                 HotStuffCore::new(nid, state, builder)
+                    .with_skip_endorsement_verification_for_tests()
             })
             .collect();
         let inboxes = (0..n).map(|_| VecDeque::new()).collect();
@@ -441,7 +450,9 @@ impl ReplicaSet {
                 }
                 Action::Persist(_)
                 | Action::RequestBlock { .. }
-                | Action::EquivocationEvidence { .. } => {}
+                | Action::EquivocationEvidence { .. }
+                | Action::ProposalEquivocationEvidence { .. }
+                | Action::VoteRejectedInvalidEndorsement { .. } => {}
             }
         }
     }
@@ -482,13 +493,14 @@ fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
                 sig,
             }))
         }
-        ConsensusMsg::Vote(payload) => {
+        ConsensusMsg::Vote(payload, _) => {
             Event::VoteReceived(crate::consensus::hotstuff::step::VoteVariant::Ed25519(
                 crate::consensus::dispatch::Verified::unchecked(Signed {
                     payload,
                     signer: source,
                     sig,
                 }),
+                crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
             ))
         }
         ConsensusMsg::NewView(payload) => {
@@ -517,6 +529,7 @@ fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
         payload: Proposal {
             block: block_v1,
             justify: genesis_qc,
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
         },
         signer: leader_nid,
         sig: [0u8; 64],
@@ -664,7 +677,11 @@ fn malformed_signed_proposal(p: MalformedProposalInputs) -> Signed<Proposal> {
         justify.add_signature(i, [i as u8 + 1; 64]);
     }
     Signed {
-        payload: Proposal { block, justify },
+        payload: Proposal {
+            block,
+            justify,
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+        },
         signer: p.sender,
         sig: [0u8; 64],
     }
@@ -726,7 +743,7 @@ proptest! {
                         signer: sender,
                         sig: [0u8; 64],
                     };
-                    replicas.inject(target, Event::VoteReceived(crate::consensus::hotstuff::step::VoteVariant::Ed25519(crate::consensus::dispatch::Verified::unchecked(signed))));
+                    replicas.inject(target, Event::VoteReceived(crate::consensus::hotstuff::step::VoteVariant::Ed25519(crate::consensus::dispatch::Verified::unchecked(signed), crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder())));
                 }
                 FuzzStep::InjectBytesNewView { target, sender_idx, qc_view, qc_block_hash } => {
                     let sender = replicas.validators.get(sender_idx).unwrap().into_node_id();
@@ -856,7 +873,8 @@ proptest! {
         };
         let counters = CacheEvictionCounters::default();
         let builder = Arc::new(TestBlockBuilder { proposer: self_id });
-        let mut core = HotStuffCore::with_limits(self_id, state, builder, limits, counters);
+        let mut core = HotStuffCore::with_limits(self_id, state, builder, limits, counters)
+            .with_skip_endorsement_verification_for_tests();
 
         for step in steps {
             let event = match step {
@@ -869,7 +887,7 @@ proptest! {
                                 signer,
                                 sig: [0u8; 64],
                             }),
-                        ),
+                        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder()),
                     )
                 }
                 CacheStep::ParkedProposal { sender_idx, view, height, parent_seed } => {
@@ -893,7 +911,7 @@ proptest! {
                         justify.add_signature(i, [i as u8 + 1; 64]);
                     }
                     Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
-                        payload: Proposal { block, justify },
+                        payload: Proposal { block, justify, leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder() },
                         signer: sender,
                         sig: [0u8; 64],
                     }))
@@ -915,7 +933,7 @@ proptest! {
                         justify.add_signature(i, [i as u8 + 1; 64]);
                     }
                     Event::ProposalReceived(crate::consensus::dispatch::Verified::unchecked(Signed {
-                        payload: Proposal { block, justify },
+                        payload: Proposal { block, justify, leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder() },
                         signer: sender,
                         sig: [0u8; 64],
                     }))

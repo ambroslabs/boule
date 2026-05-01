@@ -16,7 +16,7 @@
 use bytes::Bytes;
 
 use crate::consensus::hotstuff::ConsensusMsg;
-use crate::consensus::hotstuff::qc::Vote;
+use crate::consensus::hotstuff::qc::{LeaderEndorsement, Vote};
 use crate::consensus::hotstuff::step::Action as SafetyAction;
 use crate::consensus::node::WireMessage;
 use crate::consensus::pacemaker;
@@ -70,7 +70,9 @@ pub fn egress_safety(
         // Non-wire actions: handled by the event loop directly.
         SafetyAction::Persist(_)
         | SafetyAction::Commit(_)
-        | SafetyAction::EquivocationEvidence { .. } => Ok(None),
+        | SafetyAction::EquivocationEvidence { .. }
+        | SafetyAction::ProposalEquivocationEvidence { .. }
+        | SafetyAction::VoteRejectedInvalidEndorsement { .. } => Ok(None),
     }
 }
 
@@ -226,10 +228,26 @@ pub(in crate::consensus::dispatch) fn sign_consensus_msg(
 ) -> anyhow::Result<WireMessage> {
     match msg {
         ConsensusMsg::Proposal(p) => {
-            let signed = Signed::sign(p.clone(), signer, chain_id)?;
+            // #506: stamp the leader endorsement before signing the
+            // outer envelope. The safety core's `build_proposal_at_view`
+            // emits the proposal with a placeholder envelope because
+            // it has no signer access; egress is the only place with
+            // the leader's key, so it is the only place that can
+            // produce the endorsement signature. The endorsement is
+            // signed over a *distinct* `LeaderEndorsement` domain
+            // (`ambros.hotstuff.leader_endorsement.v1`) so the bytes
+            // cannot be misused as a Vote signature even though the
+            // payload `(view, block_hash)` overlaps.
+            let view = p.block.header.view;
+            let block_hash = p.block.hash();
+            let endorsement =
+                Signed::sign(LeaderEndorsement { view, block_hash }, signer, chain_id)?;
+            let mut p = p.clone();
+            p.leader_endorsement = endorsement;
+            let signed = Signed::sign(p, signer, chain_id)?;
             Ok(WireMessage::Proposal(signed))
         }
-        ConsensusMsg::Vote(v) => {
+        ConsensusMsg::Vote(v, leader_endorsement) => {
             let signed = Signed::sign(v.clone(), signer, chain_id)?;
             let bls_partial = match bls_signer {
                 Some(bs) => {
@@ -238,7 +256,11 @@ pub(in crate::consensus::dispatch) fn sign_consensus_msg(
                 }
                 None => None,
             };
-            Ok(WireMessage::Vote(signed, bls_partial))
+            Ok(WireMessage::Vote(
+                signed,
+                bls_partial,
+                leader_endorsement.clone(),
+            ))
         }
         ConsensusMsg::NewView(nv) => {
             let signed = Signed::sign(nv.clone(), signer, chain_id)?;
@@ -325,7 +347,7 @@ pub fn egress_consensus_msg_with_loopback(
                 Dispatch::Pacemaker(pacemaker::Event::OnQc(justify_view)),
             ]
         }
-        WireMessage::Vote(signed, bls_partial) => {
+        WireMessage::Vote(signed, bls_partial, leader_endorsement) => {
             // Carry the BLS partial through the loopback so the
             // self-vote on a BLS chain folds the partial into the
             // leader's QC bucket — the next-view leader voting on
@@ -333,10 +355,15 @@ pub fn egress_consensus_msg_with_loopback(
             // like any peer's vote (#118 + #354 step 2). The variant
             // mirrors the wire path: presence of a partial means BLS;
             // absence means Ed25519 (#372).
+            //
+            // The `leader_endorsement` is also threaded through so
+            // the loopback safety-core branch runs the same #506
+            // verification path as a wire-driven vote.
             let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
             let variant = crate::consensus::hotstuff::step::VoteVariant::from_optional_partial(
                 verified,
                 bls_partial,
+                leader_endorsement,
             );
             vec![Dispatch::Safety(
                 crate::consensus::hotstuff::step::Event::VoteReceived(variant),

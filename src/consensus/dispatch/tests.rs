@@ -80,6 +80,7 @@ fn ingress_proposal_happy_path() {
     let proposal = Proposal {
         block: genesis(),
         justify: sample_qc(),
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let signed = Signed::sign(proposal.clone(), &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
@@ -130,7 +131,11 @@ fn ingress_proposal_emits_on_qc_at_justify_view() {
         header,
         commands: vec![],
     };
-    let proposal = Proposal { block, justify };
+    let proposal = Proposal {
+        block,
+        justify,
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    };
     let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
     let bytes = postcard::to_stdvec(&wire).unwrap();
@@ -160,6 +165,7 @@ fn ingress_proposal_unknown_signer_rejected() {
     let proposal = Proposal {
         block: genesis(),
         justify: sample_qc(),
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
@@ -177,6 +183,7 @@ fn ingress_proposal_bad_signature_rejected() {
     let proposal = Proposal {
         block: genesis(),
         justify: sample_qc(),
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let mut signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
     signed.sig[0] ^= 0xFF; // corrupt the signature
@@ -200,7 +207,11 @@ fn ingress_vote_happy_path() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap();
@@ -396,6 +407,7 @@ fn egress_broadcast_encodes_signed_proposal() {
     let proposal = Proposal {
         block: genesis(),
         justify: qc.clone(),
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let action = crate::consensus::hotstuff::step::Action::Broadcast(
         crate::consensus::hotstuff::ConsensusMsg::Proposal(proposal),
@@ -422,7 +434,10 @@ fn egress_send_to_encodes_vote() {
     };
     let action = crate::consensus::hotstuff::step::Action::SendTo(
         target,
-        crate::consensus::hotstuff::ConsensusMsg::Vote(vote),
+        crate::consensus::hotstuff::ConsensusMsg::Vote(
+            vote,
+            crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+        ),
     );
 
     let out = egress_safety(&action, &signer, None, &ChainId::TEST)
@@ -433,7 +448,7 @@ fn egress_send_to_encodes_vote() {
     };
     assert_eq!(to, target);
     let decoded: WireMessage = postcard::from_bytes(&payload).unwrap();
-    assert!(matches!(decoded, WireMessage::Vote(_, _)));
+    assert!(matches!(decoded, WireMessage::Vote(_, _, _)));
 }
 
 #[test]
@@ -487,6 +502,7 @@ fn egress_broadcast_proposal_is_verifiable() {
     let proposal = Proposal {
         block: genesis(),
         justify: sample_qc(),
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let action = crate::consensus::hotstuff::step::Action::Broadcast(
         crate::consensus::hotstuff::ConsensusMsg::Proposal(proposal.clone()),
@@ -776,7 +792,11 @@ fn vote_at_v_eff_verifies_against_post_boundary_set() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &new_signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     // Succeeds against the history that contains the boundary.
@@ -811,7 +831,11 @@ fn vote_at_v_eff_rejected_without_boundary() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &new_signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -849,7 +873,11 @@ fn vote_before_boundary_verifies_against_pre_boundary_set() {
         block_hash: [0xCD; 32],
     };
     let signed = Signed::sign(vote, &old_signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress(
@@ -900,6 +928,7 @@ fn proposal_at_v_eff_verifies_against_post_boundary_set() {
     let proposal = Proposal {
         block,
         justify: sample_qc(),
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let signed = Signed::sign(proposal, &new_signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
@@ -1120,7 +1149,11 @@ fn vote_after_rotation_signed_with_new_key_accepted() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &new, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress(
@@ -1187,7 +1220,11 @@ fn spanning_vote_pre_rotation_view_signed_with_old_key_accepted() {
         block_hash: [0xCD; 32],
     };
     let signed = Signed::sign(vote, &old, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress(
@@ -1222,7 +1259,11 @@ fn vote_after_rotation_signed_with_stale_old_key_rejected() {
         block_hash: [0xEF; 32],
     };
     let signed = Signed::sign(vote, &old, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -1257,7 +1298,11 @@ fn vote_before_rotation_signed_with_future_new_key_rejected() {
         block_hash: [0x12; 32],
     };
     let signed = Signed::sign(vote, &new, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -1291,7 +1336,11 @@ fn vote_signed_by_unrelated_key_rejected() {
         block_hash: [0x77; 32],
     };
     let signed = Signed::sign(vote, &attacker, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -1333,6 +1382,7 @@ fn proposal_after_rotation_signed_with_new_key_accepted() {
             commands: vec![],
         },
         justify: sample_qc(),
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let signed = Signed::sign(proposal, &new, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
@@ -1438,7 +1488,11 @@ fn vote_from_removed_validator_after_v_eff_rejected() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &removed, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -1458,7 +1512,11 @@ fn vote_from_removed_validator_after_v_eff_rejected() {
         block_hash: [0xCD; 32],
     };
     let signed = Signed::sign(vote, &removed, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress(
@@ -1551,7 +1609,11 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
             SignatureSchemeChoice::Ed25519Collected,
             crate::consensus::reconfig::MIN_V_EFF_DELAY,
         );
-    let proposal = Proposal { block, justify: qc };
+    let proposal = Proposal {
+        block,
+        justify: qc,
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    };
     let signed = Signed::sign(proposal, leader, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
     let bytes = postcard::to_stdvec(&wire).unwrap();
@@ -1612,7 +1674,11 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
         },
         commands: vec![],
     };
-    let proposal = Proposal { block, justify: qc };
+    let proposal = Proposal {
+        block,
+        justify: qc,
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    };
     let signed = Signed::sign(proposal, leader, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
     let bytes = postcard::to_stdvec(&wire).unwrap();
@@ -1671,7 +1737,11 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
         },
         commands: vec![],
     };
-    let proposal = Proposal { block, justify: qc };
+    let proposal = Proposal {
+        block,
+        justify: qc,
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    };
     let signed = Signed::sign(proposal, leader, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
     let bytes = postcard::to_stdvec(&wire).unwrap();
@@ -1995,6 +2065,7 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
     let proposal = Proposal {
         block,
         justify: sample_qc(),
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
@@ -2050,6 +2121,7 @@ fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
     let proposal = Proposal {
         block: genesis(),
         justify: forged_justify,
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
@@ -2116,6 +2188,7 @@ fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
     let proposal = Proposal {
         block,
         justify: bls_qc,
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);
@@ -2190,7 +2263,11 @@ fn ingress_vote_on_bls_chain_accepts_valid_bls_partial() {
     let block_hash = [0xAA; 32];
 
     let (signed, partial) = make_signed_vote_with_bls_partial(&signer, &bls_sk, view, block_hash);
-    let wire = WireMessage::Vote(signed, Some(partial));
+    let wire = WireMessage::Vote(
+        signed,
+        Some(partial),
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let history = ValidatorSetHistory::from_genesis(vs.clone());
@@ -2229,7 +2306,11 @@ fn ingress_vote_on_bls_chain_rejects_missing_bls_partial() {
     // Vote with no BLS partial attached (None).
     let vote = Vote { view, block_hash };
     let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(
+        signed,
+        None,
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let history = ValidatorSetHistory::from_genesis(vs.clone());
@@ -2268,7 +2349,11 @@ fn ingress_vote_on_bls_chain_rejects_tampered_bls_partial() {
     let (signed, mut partial) =
         make_signed_vote_with_bls_partial(&signer, &bls_sk, view, block_hash);
     partial[10] ^= 0xFF;
-    let wire = WireMessage::Vote(signed, Some(partial));
+    let wire = WireMessage::Vote(
+        signed,
+        Some(partial),
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let history = ValidatorSetHistory::from_genesis(vs.clone());
@@ -2313,7 +2398,11 @@ fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
         crate::crypto::signed::preimage::<Vote>(&signed.payload, &ChainId::TEST).unwrap();
     let partial =
         crate::crypto::sig_scheme::BlsAggregated::sign_partial(&bls_sk_b, &preimage_bytes).unwrap();
-    let wire = WireMessage::Vote(signed, Some(partial));
+    let wire = WireMessage::Vote(
+        signed,
+        Some(partial),
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let history = ValidatorSetHistory::from_genesis(vs.clone());
@@ -2357,7 +2446,11 @@ fn ingress_vote_on_ed25519_chain_ignores_bls_partial_field() {
     // Ship a junk BLS partial alongside the vote — it must be ignored.
     let vote = Vote { view, block_hash };
     let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, Some([0xFFu8; 96]));
+    let wire = WireMessage::Vote(
+        signed,
+        Some([0xFFu8; 96]),
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let history = ValidatorSetHistory::from_genesis(vs.clone());
@@ -2397,7 +2490,11 @@ fn ingress_vote_on_bls_chain_rejects_when_bls_history_absent() {
     let block_hash = [0x11; 32];
 
     let (signed, partial) = make_signed_vote_with_bls_partial(&signer, &bls_sk, view, block_hash);
-    let wire = WireMessage::Vote(signed, Some(partial));
+    let wire = WireMessage::Vote(
+        signed,
+        Some(partial),
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let history = ValidatorSetHistory::from_genesis(vs.clone());
@@ -2439,7 +2536,11 @@ fn ingress_vote_with_skip_does_not_validate_bls_partial() {
     };
     let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
     // Junk BLS partial — would not verify under any pubkey.
-    let wire = WireMessage::Vote(signed, Some([0u8; 96]));
+    let wire = WireMessage::Vote(
+        signed,
+        Some([0u8; 96]),
+        crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+    );
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs)
@@ -2460,6 +2561,7 @@ fn ingress_with_skip_lets_invalid_aggregate_through() {
     let proposal = Proposal {
         block: genesis(),
         justify: bogus_qc,
+        leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
     };
     let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::Proposal(signed);

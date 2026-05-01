@@ -236,7 +236,7 @@ impl VoteObserver {
                         // that survives the match, so reborrow via a
                         // local. Avoid `into_inner` to keep zero-copy
                         // semantics in the common case.
-                        if let Ok(crate::consensus::node::WireMessage::Vote(signed, _)) =
+                        if let Ok(crate::consensus::node::WireMessage::Vote(signed, _, _)) =
                             postcard::from_bytes::<crate::consensus::node::WireMessage>(&inner)
                         {
                             self.record(
@@ -251,7 +251,7 @@ impl VoteObserver {
                 }
             }
         };
-        if let Ok(crate::consensus::node::WireMessage::Vote(signed, _)) =
+        if let Ok(crate::consensus::node::WireMessage::Vote(signed, _, _)) =
             postcard::from_bytes::<crate::consensus::node::WireMessage>(wire_bytes)
         {
             self.record(
@@ -476,6 +476,17 @@ pub struct SimCluster {
     /// pre-restart counter (irrelevant for the suite at the time of
     /// writing — none of it restarts).
     equivocations_counters: Vec<Arc<AtomicU64>>,
+    /// Per-node clones of [`ConsensusNode::proposal_equivocations_counter`]
+    /// (#506). Sibling to [`Self::equivocations_counters`] but counts
+    /// leader-side proposal equivocation observed via the vote-stream
+    /// `leader_endorsement` channel. Captured at spawn time.
+    proposal_equivocations_counters: Vec<Arc<AtomicU64>>,
+    /// Per-node clones of
+    /// [`ConsensusNode::votes_rejected_invalid_endorsement_counter`]
+    /// (#506). Ticks for every vote dropped at safety-core ingress
+    /// because its `leader_endorsement` did not verify against the
+    /// leader-of-`vote.view`'s pubkey.
+    votes_rejected_invalid_endorsement_counters: Vec<Arc<AtomicU64>>,
     /// Per-node runtime-mutable processing delay in microseconds,
     /// keyed by `NodeId`. Used by the slow-node bridge (#497) inserted
     /// between each node's inbound `event_rx` and its consensus
@@ -906,6 +917,9 @@ impl SimCluster {
         // test can read the running count via
         // `SimCluster::peek_equivocations_detected`.
         let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut votes_rejected_invalid_endorsement_counters: Vec<Arc<AtomicU64>> =
+            Vec::with_capacity(n);
 
         for (idx, (nid, event_rx)) in event_rxs.into_iter().enumerate() {
             let signer = signer_map[&nid].clone();
@@ -1063,6 +1077,9 @@ impl SimCluster {
             // `SimCluster::peek_equivocations_detected` see updates the
             // run loop applies after each ingress tick.
             equivocations_counters.push(node.equivocations_counter());
+            proposal_equivocations_counters.push(node.proposal_equivocations_counter());
+            votes_rejected_invalid_endorsement_counters
+                .push(node.votes_rejected_invalid_endorsement_counter());
 
             // Slow-node bridge (#497): the route-task side writes into
             // `event_rx`'s sender; the bridge drains `event_rx`,
@@ -1113,6 +1130,8 @@ impl SimCluster {
             timeout_base,
             vote_observer,
             equivocations_counters,
+            proposal_equivocations_counters,
+            votes_rejected_invalid_endorsement_counters,
             slow_node_delays_us,
         };
         (cluster, limiters)
@@ -1381,6 +1400,29 @@ impl SimCluster {
     /// assert the evidence-emission path is exercised end-to-end.
     pub fn peek_equivocations_detected(&self, idx: usize) -> u64 {
         self.equivocations_counters[idx].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of leader proposal-equivocation incidents node
+    /// `idx`'s integration layer has surfaced via
+    /// [`crate::consensus::hotstuff::step::Action::ProposalEquivocationEvidence`]
+    /// (audit finding L5-1, issue #506). Sibling to
+    /// [`Self::peek_equivocations_detected`]; counts leader-side
+    /// equivocation observed via the vote-stream `leader_endorsement`
+    /// channel. Used by the twin-mode adversary suite to assert
+    /// detection coverage including the transport-restricted case
+    /// where no honest replica directly receives both proposals.
+    pub fn peek_proposal_equivocations_detected(&self, idx: usize) -> u64 {
+        self.proposal_equivocations_counters[idx].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of votes node `idx`'s safety core dropped at
+    /// ingress because their `leader_endorsement` field did not verify
+    /// against the leader-of-`vote.view`'s pubkey (issue #506). Used
+    /// by the fake-hash-rejection adversary test to assert ingress
+    /// rejection ticks the counter without any bucket/dedupe
+    /// side-effects.
+    pub fn peek_votes_rejected_invalid_endorsement(&self, idx: usize) -> u64 {
+        self.votes_rejected_invalid_endorsement_counters[idx].load(Ordering::Relaxed)
     }
 
     /// Non-destructively report the highest committed [`Block`] height
@@ -2328,6 +2370,9 @@ impl SimCluster {
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut mempools_captured_gossip: Vec<Arc<dyn Mempool>> = Vec::new();
         let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut votes_rejected_invalid_endorsement_counters: Vec<Arc<AtomicU64>> =
+            Vec::with_capacity(n);
         // Hold the overlay shutdown senders for the lifetime of the
         // SimCluster — dropping them eagerly wakes the orchestrator's
         // `_ = &mut self.shutdown` select arm and tears the run loop
@@ -2381,6 +2426,9 @@ impl SimCluster {
             let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
                 .with_commit_notifier(commit_notifier);
             equivocations_counters.push(node.equivocations_counter());
+            proposal_equivocations_counters.push(node.proposal_equivocations_counter());
+            votes_rejected_invalid_endorsement_counters
+                .push(node.votes_rejected_invalid_endorsement_counter());
 
             // Per-node outbound channel: orchestrator's OverlaySink writes
             // here; the route task reads on the other side.
@@ -2564,6 +2612,8 @@ impl SimCluster {
             timeout_base,
             vote_observer,
             equivocations_counters,
+            proposal_equivocations_counters,
+            votes_rejected_invalid_endorsement_counters,
             slow_node_delays_us: Arc::new(slow_node_delays_us),
         }
     }
@@ -6501,7 +6551,11 @@ mod tests {
                 block_hash: [0xAB; 32],
             };
             let signed = Signed::sign(vote, signer, &chain_id).expect("sign vote");
-            WireMessage::Vote(signed, None)
+            WireMessage::Vote(
+                signed,
+                None,
+                crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+            )
         };
 
         let rotated_validator_id = ValidatorId::from_genesis_pubkey(rotated_validator);

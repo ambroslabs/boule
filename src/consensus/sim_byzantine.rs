@@ -49,12 +49,28 @@ use proptest::prelude::*;
 
 use super::sim::{Adversary, AdversaryCtx, SimCluster, assert_no_conflicts};
 use crate::consensus::View;
-use crate::consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote, Vote};
+use crate::consensus::hotstuff::qc::{LeaderEndorsement, QuorumCertificate, TimeoutVote, Vote};
 use crate::consensus::hotstuff::{NewView, Proposal};
 use crate::consensus::node::WireMessage;
-use crate::crypto::signed::{ChainId, Signed};
+use crate::crypto::signed::{ChainId, Signed, Signer};
 use crate::p2p::{NodeId, ProtocolOutbound};
 use crate::replication::block::Block;
+
+/// Mint a valid leader-endorsement envelope (#506) for `(view,
+/// block_hash)` under `chain_id` using `signer`. Called by adversaries
+/// that synthesize their own proposals (e.g. the twin-proposal
+/// adversary forging a second proposal at the same view) — the
+/// envelope's `signer` field self-attributes to the byzantine, so the
+/// aggregator-side dedupe keys on the byzantine's stable id.
+fn mint_endorsement(
+    view: View,
+    block_hash: [u8; 32],
+    signer: &dyn Signer,
+    chain_id: &ChainId,
+) -> Signed<LeaderEndorsement> {
+    Signed::sign(LeaderEndorsement { view, block_hash }, signer, chain_id)
+        .expect("LeaderEndorsement signing cannot fail (own signer is healthy)")
+}
 
 // ── Wire helpers ─────────────────────────────────────────────────────────────
 
@@ -121,6 +137,7 @@ impl Adversary for EquivocatorAdversary {
         let proposal_b = Proposal {
             block: block_b,
             justify: signed_a.payload.justify.clone(),
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
         };
         let signed_b = Signed::sign(proposal_b, ctx.signer.as_ref(), &ChainId::TEST)
             .expect("equivocator re-signing must not fail (own signer is healthy)");
@@ -168,7 +185,7 @@ impl Adversary for VoteWithholderAdversary {
     fn intercept(&self, _ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound> {
         let payload = outbound_payload(&outbound);
         match decode(&payload) {
-            Some(WireMessage::Vote(_, _)) => Vec::new(),
+            Some(WireMessage::Vote(_, _, _)) => Vec::new(),
             _ => vec![outbound],
         }
     }
@@ -214,7 +231,7 @@ impl Adversary for StaleReplayerAdversary {
         let mut s = self.state.lock();
         if matches!(
             decode(&payload),
-            Some(WireMessage::Proposal(_) | WireMessage::Vote(_, _) | WireMessage::NewView(_),)
+            Some(WireMessage::Proposal(_) | WireMessage::Vote(_, _, _) | WireMessage::NewView(_),)
         ) && s.history.len() < 64
         {
             s.history.push(payload);
@@ -456,6 +473,7 @@ impl Adversary for ForgedHistoryCommitmentAdversary {
         let proposal = Proposal {
             block,
             justify: signed.payload.justify.clone(),
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
         };
         let signed_b = Signed::sign(proposal, ctx.signer.as_ref(), &ChainId::TEST)
             .expect("forged-commitment adversary re-signing must not fail");
@@ -547,7 +565,7 @@ impl Adversary for TwinValidatorAdversary {
             return vec![outbound];
         };
         match (self.kind, decoded) {
-            (TwinKind::Vote, WireMessage::Vote(signed_a, bls_partial)) => {
+            (TwinKind::Vote, WireMessage::Vote(signed_a, bls_partial, _)) => {
                 // Forge a twin Vote at the same view with a mutated
                 // block_hash. The mutated hash points to no real block,
                 // but the recipient-side equivocation detector in
@@ -576,19 +594,38 @@ impl Adversary for TwinValidatorAdversary {
                 // block_hash. The Ed25519 envelope still verifies, the
                 // dedupe map still fires, so the test invariant holds
                 // on either chain scheme.
-                let payload_b = encode(&WireMessage::Vote(signed_b, bls_partial));
+                let payload_b = encode(&WireMessage::Vote(
+                    signed_b,
+                    bls_partial,
+                    crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+                ));
                 vec![outbound, ProtocolOutbound::Broadcast(payload_b)]
             }
             (TwinKind::Proposal, WireMessage::Proposal(signed_a)) => {
-                // Forge a twin Proposal at the same view whose
-                // `state_commitment` is mutated so the block hash
-                // diverges from the original. Both proposals are
-                // broadcast to every peer (unlike the
-                // [`EquivocatorAdversary`] split of 1+2): every honest
-                // replica observes both forks at the same view, but
-                // each only votes for one (the safety core's
-                // `last_voted_view` monotonic check rejects the second
-                // by view-equality).
+                // Transport-restricted equivocation (#506 acceptance
+                // criterion): forge a twin Proposal at the same view
+                // whose `state_commitment` is mutated so the block
+                // hash diverges, then split the cluster — half the
+                // honest peers receive the original, the other half
+                // receive the forgery. With `n = 4` and a single
+                // Byzantine slot, the 3 honest peers split 1 + 2:
+                // *no honest replica receives both forks*, yet the
+                // detection still fires because each honest replica
+                // attaches the byzantine's leader-endorsement
+                // envelope to its outbound vote. Every aggregator
+                // that sees votes from both subsets resolves the
+                // proposer's stable id from the endorsement's
+                // `signer` field and hits the
+                // `proposal_endorsement_dedupe` map at
+                // `(view, byzantine_id)` with two distinct
+                // `block_hash` values — emitting
+                // `Action::ProposalEquivocationEvidence`.
+                //
+                // This is the canonical demonstration that #506's
+                // detection is transport-agnostic: a Byzantine
+                // leader who carefully avoids letting any one honest
+                // replica see both proposals still cannot evade the
+                // vote-stream-based detector.
                 let block_a = signed_a.payload.block.clone();
                 let mut header_b = block_a.header.clone();
                 header_b.state_commitment[0] ^= 0x01;
@@ -596,14 +633,39 @@ impl Adversary for TwinValidatorAdversary {
                     header: header_b,
                     commands: block_a.commands.clone(),
                 };
+                let view_b = block_b.header.view;
+                let block_hash_b = block_b.hash();
+                let endorsement_b =
+                    mint_endorsement(view_b, block_hash_b, ctx.signer.as_ref(), &ctx.chain_id);
                 let proposal_b = Proposal {
                     block: block_b,
                     justify: signed_a.payload.justify.clone(),
+                    leader_endorsement: endorsement_b,
                 };
                 let signed_b = Signed::sign(proposal_b, ctx.signer.as_ref(), &ctx.chain_id)
                     .expect("twin proposal re-signing must not fail");
+                let payload_a = outbound_payload(&outbound);
                 let payload_b = encode(&WireMessage::Proposal(signed_b));
-                vec![outbound, ProtocolOutbound::Broadcast(payload_b)]
+
+                let peers: Vec<NodeId> = ctx
+                    .validators
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != ctx.my_id)
+                    .collect();
+                let half = peers.len() / 2;
+                peers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, peer)| ProtocolOutbound::SendTo {
+                        node_id: peer,
+                        payload: if i < half {
+                            payload_a.clone()
+                        } else {
+                            payload_b.clone()
+                        },
+                    })
+                    .collect()
             }
             (TwinKind::TimeoutVote, WireMessage::TimeoutVote(signed_a)) => {
                 // Forge a twin TimeoutVote at the same view whose
@@ -923,32 +985,31 @@ mod tests {
             })?;
         }
 
-        /// **Twin-mode vote** (issue #421 / audit finding 14-2) —
-        /// byzantine emits an honest Vote and additionally broadcasts
-        /// a forged twin Vote at the same view with a mutated
-        /// `block_hash`, both signed under the shared validator key.
-        /// Honest replicas hit the `(view, voter_id)` dedupe map
-        /// landed in #409 on the second arrival and emit
-        /// `Action::EquivocationEvidence`; the integration layer
-        /// increments
-        /// [`crate::consensus::status::ConsensusStatus::equivocations_detected`].
-        /// Safety: the dedupe drops the second partial on the floor,
-        /// so neither bucket inflates with conflicting signatures.
-        /// Liveness: the byzantine's *first* Vote still folds into
-        /// the bucket the proposed block hashes to, leaving honest
-        /// quorum formation unaffected.
+        /// **Twin-mode vote** — byzantine emits an honest Vote and
+        /// additionally broadcasts a forged twin Vote at the same view
+        /// with a mutated `block_hash`, both signed under the shared
+        /// validator key. The forged twin reuses the **original**
+        /// `leader_endorsement` envelope (the same one carried by the
+        /// honest vote), so the endorsement's `payload.block_hash`
+        /// disagrees with the forged vote's mutated `block_hash`.
         ///
-        /// In addition to the safety + liveness floors enforced by
-        /// `run_one_property`, this property asserts the
-        /// evidence-emission path is exercised end-to-end:
-        /// `equivocations_detected` is `> 0` on at least
-        /// `f + 1 = 2` honest replicas. Per-replica detection runs
-        /// independently on each receiver, and the byzantine emits
-        /// twin votes on every view it participates in, so a
-        /// HONEST_FLOOR-of-3 commit run reliably accumulates
-        /// detections everywhere.
+        /// Pre-#506 (audit 14-2 / #421): honest replicas hit the
+        /// `(view, voter_id)` dedupe (audit 3-1 / #409) on the second
+        /// arrival and emitted `Action::EquivocationEvidence`.
+        /// Post-#506: the endorsement-payload check fires *first* —
+        /// the safety core rejects the forged vote at ingress with
+        /// `Action::VoteRejectedInvalidEndorsement`, so the
+        /// voter-dedupe entry is never written. The protection is
+        /// stricter (same Byzantine-voter behaviour, dropped earlier
+        /// in the pipeline) and surfaces via
+        /// [`crate::consensus::status::ConsensusStatus::votes_rejected_invalid_endorsement`].
+        ///
+        /// Safety: the rejection drops the forgery before any bucket /
+        /// dedupe state is touched. Liveness: the byzantine's *first*
+        /// (honest) Vote still folds into the legitimate bucket,
+        /// leaving honest quorum formation unaffected.
         #[test]
-        fn proptest_twin_vote_preserves_safety_and_emits_evidence(
+        fn proptest_twin_vote_invalid_endorsement_rejected(
             victim in 0usize..4,
         ) {
             run_paused(|| async move {
@@ -968,41 +1029,85 @@ mod tests {
                      baseline = {baseline:?}, final = {final_heights:?}",
                 );
 
-                let evidence_counts: Vec<u64> = honest
+                let rejection_counts: Vec<u64> = honest
                     .iter()
-                    .map(|&i| cluster.peek_equivocations_detected(i))
+                    .map(|&i| cluster.peek_votes_rejected_invalid_endorsement(i))
                     .collect();
-                let detectors = evidence_counts.iter().filter(|&&c| c > 0).count();
+                let detectors = rejection_counts.iter().filter(|&&c| c > 0).count();
                 prop_assert!(
                     detectors >= 2,
-                    "twin-vote adversary at index {victim}: expected the equivocation \
-                     evidence path to fire on ≥ f+1 = 2 honest replicas, got {detectors} \
-                     (per-honest counts = {evidence_counts:?})",
+                    "twin-vote adversary at index {victim}: expected the
+                     `votes_rejected_invalid_endorsement` rejection path to fire on ≥ f+1 = 2 \
+                     honest replicas, got {detectors} (per-honest counts = {rejection_counts:?})",
                 );
                 Ok::<(), TestCaseError>(())
             })?;
         }
 
-        /// **Twin-mode proposal** (issue #421) — byzantine leader
+        /// **Twin-mode proposal** (issue #421 / #506) — byzantine leader
         /// broadcasts an honest Proposal and additionally a forged
         /// twin Proposal at the same view whose `state_commitment` is
-        /// mutated, both signed under the shared validator key. Both
-        /// proposals reach every honest replica (unlike the existing
-        /// [`EquivocatorAdversary`], which carves a 1+2 split).
+        /// mutated, both signed under the shared validator key. Each
+        /// proposal carries its own valid [`LeaderEndorsement`]
+        /// envelope minted by the byzantine over the matching `(view,
+        /// block_hash)`. Both proposals reach every honest replica
+        /// (unlike the existing [`EquivocatorAdversary`], which carves
+        /// a 1+2 split).
+        ///
         /// Safety: each honest replica's `last_voted_view` monotonic
-        /// check ensures it votes for at most one of the two
-        /// proposals at view V; the other is dropped. Liveness: when
-        /// honest replicas converge on the same fork the QC forms
-        /// normally; when they vote on different forks neither side
-        /// reaches quorum, the pacemaker times out, and the next-view
-        /// honest leader recovers — the same wedge the equivocator
-        /// property already exercises.
+        /// check ensures it votes for at most one of the two proposals
+        /// at view V; the other is dropped. Liveness: when honest
+        /// replicas converge on the same fork the QC forms normally;
+        /// when they vote on different forks neither side reaches
+        /// quorum, the pacemaker times out, and the next-view honest
+        /// leader recovers — the same wedge the equivocator property
+        /// already exercises.
+        ///
+        /// Detection (#506): each fork's voters propagate the
+        /// matching endorsement into their votes. Aggregators that
+        /// see votes from both halves resolve the proposer's stable
+        /// id from the endorsement's `signer` field, hit the
+        /// `proposal_endorsement_dedupe` map at `(view,
+        /// byzantine_id)` with two distinct `block_hash` values, and
+        /// emit `Action::ProposalEquivocationEvidence` — independent
+        /// of whether either honest replica directly received both
+        /// proposals (the detection runs entirely on the vote
+        /// stream). Asserts that the evidence-emission path fires on
+        /// ≥ f+1 = 2 honest replicas during a HONEST_FLOOR-of-3
+        /// commit run.
         #[test]
-        fn proptest_twin_proposal_preserves_safety_and_liveness(
+        fn proptest_twin_proposal_emits_evidence(
             victim in 0usize..4,
         ) {
             run_paused(|| async move {
-                run_one_property(victim, AdvKind::TwinProposal).await
+                let (mut cluster, honest) =
+                    spawn_with_one_adversary(victim, build_adversary(AdvKind::TwinProposal)).await;
+                let baseline = cluster.peek_commit_heights();
+                let (satisfied, final_heights) =
+                    run_until_honest_floor_or_cap(&mut cluster, &honest, &baseline).await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                prop_assert!(
+                    satisfied,
+                    "twin-proposal adversary at index {victim}: honest nodes did not all gain \
+                     ≥ {HONEST_FLOOR} commits within {SIM_CAP:?} simulated; \
+                     baseline = {baseline:?}, final = {final_heights:?}",
+                );
+
+                let evidence_counts: Vec<u64> = honest
+                    .iter()
+                    .map(|&i| cluster.peek_proposal_equivocations_detected(i))
+                    .collect();
+                let detectors = evidence_counts.iter().filter(|&&c| c > 0).count();
+                prop_assert!(
+                    detectors >= 2,
+                    "twin-proposal adversary at index {victim}: expected \
+                     `proposal_equivocations_detected` to fire on ≥ f+1 = 2 honest replicas, \
+                     got {detectors} (per-honest counts = {evidence_counts:?})",
+                );
+                Ok::<(), TestCaseError>(())
             })?;
         }
 

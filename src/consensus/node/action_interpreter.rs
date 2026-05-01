@@ -804,7 +804,7 @@ impl ConsensusNode {
                         &self.chain_id,
                     )?;
                     let msg_is_proposal = matches!(msg, ConsensusMsg::Proposal(_));
-                    let msg_is_vote = matches!(msg, ConsensusMsg::Vote(_));
+                    let msg_is_vote = matches!(msg, ConsensusMsg::Vote(_, _));
                     send_outbound(broadcaster, Outbound::Broadcast(payload)).await;
                     // After a Proposal hits the wire the leader has a
                     // de-facto commitment to view N — but
@@ -833,7 +833,7 @@ impl ConsensusNode {
                         &self.validator_key_history,
                         &self.chain_id,
                     )?;
-                    let msg_is_vote = matches!(msg, ConsensusMsg::Vote(_));
+                    let msg_is_vote = matches!(msg, ConsensusMsg::Vote(_, _));
                     if target == self.self_id {
                         tracing::debug!(
                             target: TRACE_TARGET,
@@ -930,6 +930,48 @@ impl ConsensusNode {
                         block_a = ?block_a,
                         block_b = ?block_b,
                         "consensus_equivocation_detected",
+                    );
+                }
+
+                SafetyAction::ProposalEquivocationEvidence {
+                    leader,
+                    view,
+                    block_a,
+                    block_b,
+                } => {
+                    // #506: leader minted two distinct proposals at
+                    // the same view, detected on the vote stream via
+                    // the `leader_endorsement` field. Sibling to
+                    // `EquivocationEvidence` (voter equivocation);
+                    // wired identically — WARN log + counter tick — so
+                    // a future slashing pipeline can attach without
+                    // further safety-core changes.
+                    self.proposal_equivocations_detected
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        leader = %node_id_to_base58(leader.as_node_id()),
+                        view = view.0,
+                        block_a = ?block_a,
+                        block_b = ?block_b,
+                        "consensus_proposal_equivocation_detected",
+                    );
+                }
+
+                SafetyAction::VoteRejectedInvalidEndorsement { voter, view } => {
+                    // #506: vote arrived whose `leader_endorsement`
+                    // did not verify against the leader-of-`view`'s
+                    // pubkey. Drop on the floor; tick the rejection
+                    // counter so operators can grep for the symptom
+                    // (a Byzantine voter fabricating endorsement
+                    // bytes for a `(view, block_hash)` they made up).
+                    self.votes_rejected_invalid_endorsement
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        voter = %node_id_to_base58(voter.as_node_id()),
+                        view = view.0,
+                        "consensus_vote_rejected_invalid_endorsement",
                     );
                 }
             }
@@ -1078,7 +1120,7 @@ impl ConsensusNode {
             }) => {
                 let voted = actions
                     .iter()
-                    .any(|a| matches!(a, SafetyAction::Broadcast(ConsensusMsg::Vote(_))));
+                    .any(|a| matches!(a, SafetyAction::Broadcast(ConsensusMsg::Vote(_, _))));
                 let parked = actions
                     .iter()
                     .any(|a| matches!(a, SafetyAction::RequestBlock { .. }));

@@ -665,10 +665,29 @@ impl VerifiedQc {
 
 /// A leader's proposal for a new block at some view, justified by a QC
 /// over its parent.
+///
+/// `leader_endorsement` is a `Signed<LeaderEndorsement>` envelope the
+/// proposer minted over `LeaderEndorsement { view: block.header.view,
+/// block_hash: block.hash() }` (chain-id-bound). Voters extract this
+/// field on `on_proposal_received` and propagate it through their
+/// votes so any aggregator can detect leader-side proposal
+/// equivocation from the vote stream alone (#506). The envelope is
+/// self-attributing: its `signer` field carries the proposer's pubkey,
+/// so aggregators resolve the leader's stable [`ValidatorId`]
+/// independent of whatever leader selector the cluster uses.
+///
+/// The envelope is filled in by the egress layer at proposal-emit
+/// time; the safety core's `build_proposal_at_view` emits `Proposal`
+/// with a placeholder envelope (the safety core has no signer access —
+/// see [`crate::consensus::dispatch::egress::sign_consensus_msg`] for
+/// the fill-in site).
+///
+/// [`ValidatorId`]: crate::consensus::validator_set::ValidatorId
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proposal {
     pub block: Block,
     pub justify: QuorumCertificate,
+    pub leader_endorsement: crate::crypto::signed::Signed<LeaderEndorsement>,
 }
 
 impl SignedMessage for Proposal {
@@ -684,6 +703,60 @@ pub struct Vote {
 
 impl SignedMessage for Vote {
     const DOMAIN: &'static str = "ambros.hotstuff.vote.v1";
+}
+
+/// A leader's commitment that they proposed `block_hash` at `view`. The
+/// leader signs `LeaderEndorsement { view, block_hash }` at proposal-emit
+/// time; voters propagate the resulting `Signed<LeaderEndorsement>`
+/// envelope into their votes so any aggregator can detect leader-side
+/// proposal equivocation from the vote stream alone — independent of
+/// whether the aggregator directly received both proposals (#506).
+///
+/// The signed envelope (rather than a bare `[u8; 64]`) is used so the
+/// signer's pubkey rides on the wire alongside the signature: aggregators
+/// resolve the signer through `ValidatorKeyHistory::validator_for` to
+/// land in the leader's stable [`ValidatorId`], which keys the dedupe
+/// map. This makes the detection independent of whatever leader
+/// selector the cluster uses (round-robin, weighted-accumulator, etc.):
+/// the endorsement is self-attributing.
+///
+/// The DOMAIN is distinct from [`Vote`]'s so an endorsement signature
+/// cannot be misused as a vote signature even when the `(view,
+/// block_hash)` payload bytes are identical: the chain-id-bound
+/// pre-image diverges in the embedded domain bytes.
+///
+/// [`ValidatorId`]: crate::consensus::validator_set::ValidatorId
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderEndorsement {
+    pub view: View,
+    pub block_hash: BlockHash,
+}
+
+impl SignedMessage for LeaderEndorsement {
+    const DOMAIN: &'static str = "ambros.hotstuff.leader_endorsement.v1";
+}
+
+impl LeaderEndorsement {
+    /// All-zero placeholder envelope (#506). The safety core's
+    /// `build_proposal_at_view` emits Proposals carrying this
+    /// placeholder because it has no signer access; the egress layer's
+    /// `sign_consensus_msg` overwrites the field with a real
+    /// `Signed<LeaderEndorsement>` before the proposal hits the wire.
+    /// Test fixtures that bypass the egress layer (constructing
+    /// `Signed<Proposal>` literals directly) also use this helper —
+    /// `HotStuffCore::with_skip_endorsement_verification_for_tests`
+    /// keeps the safety-core verification quiet so the placeholder
+    /// flows through without rejection.
+    pub fn placeholder() -> crate::crypto::signed::Signed<Self> {
+        crate::crypto::signed::Signed {
+            payload: Self {
+                view: View::ZERO,
+                block_hash: [0u8; 32],
+            },
+            signer: [0u8; 32],
+            sig: [0u8; 64],
+        }
+    }
 }
 
 /// A replica entering a new view and announcing the highest QC it
@@ -729,9 +802,26 @@ impl SignedMessage for TimeoutVote {
 /// [`Action::SendTo`]: super::step::Action::SendTo
 /// [`Signed`]: crate::crypto::signed::Signed
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Proposal` carries a `Block` plus a `QuorumCertificate` plus the
+// `Signed<LeaderEndorsement>` envelope (#506); on the wire side this
+// cost is unavoidable, and on the in-memory `ConsensusMsg` side
+// boxing would add an indirection on every emission for a marginal
+// memory saving. Same trade-off as `Event::ProposalReceived` below.
+#[allow(clippy::large_enum_variant)]
 pub enum ConsensusMsg {
     Proposal(Proposal),
-    Vote(Vote),
+    /// A vote with the leader's endorsement (#506) routed alongside the
+    /// vote payload so peer aggregators can detect leader
+    /// proposal-equivocation from the vote stream alone. The
+    /// endorsement is a `Signed<LeaderEndorsement>` envelope so the
+    /// signer's pubkey rides with the signature; aggregators resolve
+    /// the leader's stable [`ValidatorId`] from it. Sits outside the
+    /// [`Vote`] payload so the canonical `(view, block_hash)`
+    /// pre-image — which the QC aggregate verifier reconstructs —
+    /// remains byte-stable across the change.
+    ///
+    /// [`ValidatorId`]: crate::consensus::validator_set::ValidatorId
+    Vote(Vote, crate::crypto::signed::Signed<LeaderEndorsement>),
     NewView(NewView),
 }
 
@@ -1008,6 +1098,7 @@ mod tests {
         let proposal = Proposal {
             block: Block::genesis([0; 32], [0; 32]),
             justify,
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
         };
         let signed = Signed::sign(proposal.clone(), &signer, &ChainId::TEST).unwrap();
         signed.verify(&signer.node_id(), &ChainId::TEST).unwrap();
@@ -1070,6 +1161,8 @@ mod tests {
             payload: Proposal {
                 block: Block::genesis([0; 32], [0; 32]),
                 justify: QuorumCertificate::new(vote.view, vote.block_hash, vs.len()),
+                leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(
+                ),
             },
             signer: signed_vote.signer,
             sig: signed_vote.sig,
@@ -1085,6 +1178,7 @@ mod tests {
         let msg = ConsensusMsg::Proposal(Proposal {
             block: Block::genesis([0; 32], [0; 32]),
             justify,
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
         });
         let wire = postcard::to_stdvec(&msg).unwrap();
         let back: ConsensusMsg = postcard::from_bytes(&wire).unwrap();

@@ -130,7 +130,7 @@ pub const TRACE_TARGET: &str = "ambros_p2p::consensus";
 pub(super) fn msg_kind(msg: &ConsensusMsg) -> &'static str {
     match msg {
         ConsensusMsg::Proposal(_) => "Proposal",
-        ConsensusMsg::Vote(_) => "Vote",
+        ConsensusMsg::Vote(_, _) => "Vote",
         ConsensusMsg::NewView(_) => "NewView",
     }
 }
@@ -316,6 +316,22 @@ pub struct ConsensusNode {
     /// matching WARN log advance in lockstep. Surfaced under
     /// [`ConsensusStatus::equivocations_detected`].
     equivocations_detected: Arc<AtomicU64>,
+    /// Cumulative count of leader proposal-equivocation incidents the
+    /// safety core has surfaced via
+    /// [`crate::consensus::hotstuff::step::Action::ProposalEquivocationEvidence`]
+    /// (audit finding L5-1, issue #506). Parallel to
+    /// `equivocations_detected` but counts *leader*-side equivocation
+    /// (two distinct `block_hash` values bound to the same `(view,
+    /// leader_id)` via the leader-endorsement signature on accepted
+    /// votes), not voter-side equivocation. Surfaced under
+    /// [`ConsensusStatus::proposal_equivocations_detected`].
+    proposal_equivocations_detected: Arc<AtomicU64>,
+    /// Cumulative count of votes the safety core dropped at ingress
+    /// because their `leader_endorsement` field did not verify against
+    /// the leader-of-`vote.view`'s pubkey (audit finding L5-1, issue
+    /// #506). Surfaced under
+    /// [`ConsensusStatus::votes_rejected_invalid_endorsement`].
+    votes_rejected_invalid_endorsement: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -459,7 +475,8 @@ impl ConsensusNode {
             config.limits,
             eviction_counters.clone(),
         )
-        .with_signature_scheme(config.signature_scheme);
+        .with_signature_scheme(config.signature_scheme)
+        .with_chain_id(chain_id);
 
         let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         let validator_key_history = ValidatorKeyHistory::new(config.validator_set.iter().copied());
@@ -490,6 +507,8 @@ impl ConsensusNode {
             last_committed_height,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
+            proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
+            votes_rejected_invalid_endorsement: Arc::new(AtomicU64::new(0)),
             last_committed_view: View::ZERO,
             status_tx: None,
             rate_limiter: None,
@@ -639,6 +658,21 @@ impl ConsensusNode {
         Arc::clone(&self.equivocations_detected)
     }
 
+    /// Clone the shared proposal-equivocation counter (audit finding
+    /// L5-1, issue #506). Same lifecycle as [`Self::equivocations_counter`]
+    /// but counts leader-side equivocation observed via the
+    /// vote-stream `leader_endorsement` channel.
+    pub fn proposal_equivocations_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.proposal_equivocations_detected)
+    }
+
+    /// Clone the shared invalid-endorsement-vote-rejection counter
+    /// (issue #506). Ticks for every vote the safety core dropped at
+    /// ingress because its `leader_endorsement` did not verify.
+    pub fn votes_rejected_invalid_endorsement_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.votes_rejected_invalid_endorsement)
+    }
+
     /// Borrow the eviction counters this node aggregates across the
     /// safety-core and timeout-vote caches. Exposed for tests and
     /// for [`build_status`](Self::build_status) to project into the
@@ -760,6 +794,11 @@ impl ConsensusNode {
             None => View::ZERO,
         };
         let eviction_counters = CacheEvictionCounters::default();
+        // #324: derive the chain id once from genesis, then thread the
+        // same value into both the safety core (#506 leader-endorsement
+        // verification) and the integration-layer signing path. Same
+        // derivation as `ConsensusNode::new`.
+        let chain_id = ChainId::from_genesis_hash(config.genesis.hash());
         let mut core = HotStuffCore::with_limits(
             self_id,
             hs_state,
@@ -768,7 +807,8 @@ impl ConsensusNode {
             eviction_counters.clone(),
         )
         .with_signature_scheme(config.signature_scheme)
-        .with_proposed_in_view(proposed_in_view);
+        .with_proposed_in_view(proposed_in_view)
+        .with_chain_id(chain_id);
 
         // #254: replay each post-genesis boundary into the safety
         // core's history so vote tally / QC sizing / proposal-time
@@ -803,10 +843,6 @@ impl ConsensusNode {
             None => ValidatorKeyHistory::from_set_history(&validator_history),
         };
 
-        // #324: same derivation as `ConsensusNode::new` — recover paths
-        // must produce the same `ChainId` as a fresh boot, since both
-        // share the same genesis bytes.
-        let chain_id = ChainId::from_genesis_hash(config.genesis.hash());
         Ok(Self {
             self_id,
             core,
@@ -834,6 +870,8 @@ impl ConsensusNode {
             last_committed_height,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
+            proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
+            votes_rejected_invalid_endorsement: Arc::new(AtomicU64::new(0)),
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
@@ -1342,6 +1380,8 @@ mod tests {
             payload: Proposal {
                 block: sample_block(),
                 justify: sample_qc(),
+                leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(
+                ),
             },
             signer: nid(1),
             sig: dummy_sig(),
@@ -1364,6 +1404,7 @@ mod tests {
                 sig: dummy_sig(),
             },
             None,
+            crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
         );
         let encoded = postcard::to_stdvec(&msg).unwrap();
         let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
@@ -1383,6 +1424,7 @@ mod tests {
                 sig: dummy_sig(),
             },
             Some([0xCDu8; 96]),
+            crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
         );
         let encoded = postcard::to_stdvec(&msg).unwrap();
         let decoded: WireMessage = postcard::from_bytes(&encoded).unwrap();
@@ -4497,7 +4539,11 @@ mod tests {
         // peeks at `signed.payload.block.header.height` and
         // `signed.signer`, both of which we control.
         let justify = genesis_qc(&genesis(), &four_validators());
-        let proposal = Proposal { block, justify };
+        let proposal = Proposal {
+            block,
+            justify,
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+        };
         let signed = Signed::sign(proposal, signer, &ChainId::TEST).expect("sign proposal");
         Dispatch::Safety(SafetyEvent::ProposalReceived(
             crate::consensus::dispatch::Verified::unchecked(signed),
@@ -6691,7 +6737,10 @@ mod tests {
         };
         let action = SafetyAction::SendTo(
             self_id,
-            crate::consensus::hotstuff::ConsensusMsg::Vote(vote),
+            crate::consensus::hotstuff::ConsensusMsg::Vote(
+                vote,
+                crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+            ),
         );
 
         node.apply_safety_actions(vec![action], broadcaster.as_ref(), &mut view_timer, &signer)
@@ -6725,8 +6774,13 @@ mod tests {
             view: View(3),
             block_hash: [0x7A; 32],
         };
-        let action =
-            SafetyAction::SendTo(peer, crate::consensus::hotstuff::ConsensusMsg::Vote(vote));
+        let action = SafetyAction::SendTo(
+            peer,
+            crate::consensus::hotstuff::ConsensusMsg::Vote(
+                vote,
+                crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+            ),
+        );
 
         node.apply_safety_actions(vec![action], broadcaster.as_ref(), &mut view_timer, &signer)
             .await
@@ -6739,7 +6793,7 @@ mod tests {
             ProtocolOutbound::SendTo { node_id, payload } => {
                 assert_eq!(node_id, peer);
                 let decoded: WireMessage = postcard::from_bytes(&payload).unwrap();
-                assert!(matches!(decoded, WireMessage::Vote(_, _)));
+                assert!(matches!(decoded, WireMessage::Vote(_, _, _)));
             }
             other => panic!("expected SendTo to peer, got {other:?}"),
         }
@@ -6952,7 +7006,7 @@ mod tests {
         }
         impl Broadcaster for OrderingBroadcaster {
             fn broadcast(&self, payload: Bytes) -> BoxFuture<'_, ()> {
-                if let Ok(WireMessage::Vote(signed, _)) =
+                if let Ok(WireMessage::Vote(signed, _, _)) =
                     postcard::from_bytes::<WireMessage>(&payload)
                 {
                     self.log
@@ -7042,7 +7096,11 @@ mod tests {
                 node.min_v_eff_delay,
             );
         let justify = crate::consensus::hotstuff::qc::genesis_qc(&parent, &vs);
-        let proposal = Proposal { block, justify };
+        let proposal = Proposal {
+            block,
+            justify,
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+        };
         let signed_proposal =
             Signed::sign(proposal, &leader_signer, &node.chain_id).expect("sign proposal");
         let wire = WireMessage::Proposal(signed_proposal);
@@ -7183,7 +7241,7 @@ mod tests {
         }
         impl Broadcaster for OrderingBroadcaster {
             fn broadcast(&self, payload: Bytes) -> BoxFuture<'_, ()> {
-                if let Ok(WireMessage::Vote(signed, _)) =
+                if let Ok(WireMessage::Vote(signed, _, _)) =
                     postcard::from_bytes::<WireMessage>(&payload)
                 {
                     self.log
@@ -7283,6 +7341,7 @@ mod tests {
         let proposal_v3 = Proposal {
             block: b_v3,
             justify: justify_v2,
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
         };
         let signed_v3 =
             Signed::sign(proposal_v3, &leader_signer, &node.chain_id).expect("sign proposal");
@@ -7306,7 +7365,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                SafetyAction::Broadcast(crate::consensus::hotstuff::ConsensusMsg::Vote(_))
+                SafetyAction::Broadcast(crate::consensus::hotstuff::ConsensusMsg::Vote(_, _))
             )),
             "test setup: safe-to-vote must emit Broadcast(Vote); actions={actions:?}",
         );

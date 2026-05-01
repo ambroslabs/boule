@@ -164,6 +164,12 @@ impl ConsensusNode {
             },
             dropped_commands: self.dropped_commands.load(Ordering::Relaxed),
             equivocations_detected: self.equivocations_detected.load(Ordering::Relaxed),
+            proposal_equivocations_detected: self
+                .proposal_equivocations_detected
+                .load(Ordering::Relaxed),
+            votes_rejected_invalid_endorsement: self
+                .votes_rejected_invalid_endorsement
+                .load(Ordering::Relaxed),
             backpressure: BackpressureStatus {
                 gossip_sink_overflow_total: self
                     .gossip_sink_overflows

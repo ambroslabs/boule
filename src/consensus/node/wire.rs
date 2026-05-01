@@ -142,6 +142,16 @@ pub enum WireMessage {
         Signed<crate::consensus::hotstuff::qc::Vote>,
         #[serde(with = "serde_optional_bls_partial")]
         Option<crate::crypto::sig_scheme::BlsPartialSig>,
+        /// Leader endorsement (#506): a self-attributing
+        /// `Signed<LeaderEndorsement>` envelope the proposer minted
+        /// over `LeaderEndorsement { view, block_hash }` and that the
+        /// voter copied verbatim from the proposal it is responding to.
+        /// Sits **outside** the inner [`Signed<Vote>`] envelope for the
+        /// same byte-stability reason as the BLS partial — a QC
+        /// aggregate verifier reconstructs the canonical
+        /// `(view, block_hash)` Vote pre-image and must not see this
+        /// extra payload.
+        Signed<crate::consensus::hotstuff::qc::LeaderEndorsement>,
     ),
     NewView(Signed<crate::consensus::hotstuff::NewView>),
     /// A replica's signed notice that it is giving up on a view. A

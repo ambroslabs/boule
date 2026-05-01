@@ -132,9 +132,10 @@ pub fn ingress_wire_with_qc_verification(
         WireMessage::Proposal(signed) => {
             ingress_proposal(signed, history, key_history, qc_verification, chain_id)
         }
-        WireMessage::Vote(signed, bls_partial) => ingress_vote(
+        WireMessage::Vote(signed, bls_partial, leader_endorsement) => ingress_vote(
             signed,
             bls_partial,
+            leader_endorsement,
             history,
             key_history,
             qc_verification,
@@ -230,9 +231,20 @@ pub fn ingress_proposal(
 
 /// Verify a `Signed<Vote>` envelope (plus the optional BLS partial)
 /// and emit the safety-core `VoteReceived` event.
+///
+/// The `leader_endorsement` envelope is passed through to the safety
+/// core without verification at this layer — verification fits more
+/// naturally where the validator set at `vote.view` is already in
+/// scope. The safety core's `on_vote_received` runs the verify and
+/// emits
+/// [`crate::consensus::hotstuff::step::Action::VoteRejectedInvalidEndorsement`]
+/// on failure, ticking
+/// [`crate::consensus::status::ConsensusStatus::votes_rejected_invalid_endorsement`]
+/// at the integration layer.
 pub fn ingress_vote(
     signed: Signed<Vote>,
     bls_partial: Option<crate::crypto::sig_scheme::BlsPartialSig>,
+    leader_endorsement: Signed<crate::consensus::hotstuff::qc::LeaderEndorsement>,
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
     qc_verification: &QcVerification<'_>,
@@ -248,8 +260,11 @@ pub fn ingress_vote(
     // core can dispatch on the type instead of a defensive runtime
     // check.
     let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
-    let variant =
-        crate::consensus::hotstuff::step::VoteVariant::from_optional_partial(verified, bls_partial);
+    let variant = crate::consensus::hotstuff::step::VoteVariant::from_optional_partial(
+        verified,
+        bls_partial,
+        leader_endorsement,
+    );
     Ok(vec![Dispatch::Safety(SafetyEvent::VoteReceived(variant))])
 }
 

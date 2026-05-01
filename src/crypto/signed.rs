@@ -291,7 +291,7 @@ pub(crate) fn preimage<T: Serialize + SignedMessage>(
 /// bincode (same either way) and any non-binary format we might use later
 /// for debug dumps (JSON: `[u8; 64]` becomes a 64-element array, with
 /// `serde_bytes` semantics it stays a hex/b64 blob in human formats).
-mod serde_sig {
+pub mod serde_sig {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
     pub fn serialize<S: Serializer>(sig: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {

@@ -308,7 +308,11 @@ mod tests {
     // ── safe_to_vote ────────────────────────────────────────────
 
     fn proposal(block: Block, justify: QuorumCertificate) -> Proposal {
-        Proposal { block, justify }
+        Proposal {
+            block,
+            justify,
+            leader_endorsement: crate::consensus::hotstuff::qc::LeaderEndorsement::placeholder(),
+        }
     }
 
     #[test]
