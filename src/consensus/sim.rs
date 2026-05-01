@@ -348,6 +348,14 @@ struct SpawnExtras {
     /// back-pressure test to verify that consensus blocks (rather than
     /// drops) when one node's persist path is slow.
     slow_disk_delays: Option<Vec<Duration>>,
+    /// Per-node initial event-bridge delay (#497). When `Some(delays)`,
+    /// each node's inbound `ProtocolEvent` stream is drained by a
+    /// bridge task that sleeps for the per-index delay between
+    /// receiving and forwarding. The delays are runtime-mutable via
+    /// [`SimCluster::set_slow_node`] regardless of the constructor
+    /// value — this field only seeds the initial delays.
+    /// Length must equal `n` if supplied.
+    slow_node_delays: Option<Vec<Duration>>,
 }
 
 /// An in-memory cluster of N consensus nodes connected by channel-backed
@@ -468,6 +476,14 @@ pub struct SimCluster {
     /// pre-restart counter (irrelevant for the suite at the time of
     /// writing — none of it restarts).
     equivocations_counters: Vec<Arc<AtomicU64>>,
+    /// Per-node runtime-mutable processing delay in microseconds,
+    /// keyed by `NodeId`. Used by the slow-node bridge (#497) inserted
+    /// between each node's inbound `event_rx` and its consensus
+    /// `run()` loop: the bridge reads the atomic on each event and
+    /// sleeps for that long before forwarding. Mutable via
+    /// [`SimCluster::set_slow_node`]. Each `Arc` is shared with the
+    /// running bridge task spawned in [`SimCluster::spawn_inner`].
+    slow_node_delays_us: Arc<HashMap<NodeId, Arc<AtomicU64>>>,
 }
 
 impl SimCluster {
@@ -567,6 +583,48 @@ impl SimCluster {
         .0
     }
 
+    /// Spawn `n` honest nodes with per-node initial event-bridge
+    /// delays (#497). Each `slow_node_delays[i]` seeds the per-event
+    /// sleep that node `i`'s inbound bridge applies between receiving
+    /// a `ProtocolEvent` from the route task and forwarding it to the
+    /// consensus run loop. `Duration::ZERO` slots run un-throttled.
+    /// The delays are runtime-mutable via
+    /// [`SimCluster::set_slow_node`] regardless of the constructor
+    /// value.
+    ///
+    /// Use this (or `set_slow_node`) to throttle one node's
+    /// processing without altering its disk path. The slow-disk
+    /// constructor [`SimCluster::spawn_with_slow_disk`] is the right
+    /// primitive when the goal is specifically to exercise the
+    /// persist-blocks-consensus invariant; this one is the right
+    /// primitive when the goal is general consumption-side
+    /// back-pressure on the inbound queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `slow_node_delays.len() != n` or `n < 4`.
+    pub async fn spawn_with_slow_node(
+        n: usize,
+        timeout_base: Duration,
+        slow_node_delays: Vec<Duration>,
+    ) -> Self {
+        assert_eq!(
+            slow_node_delays.len(),
+            n,
+            "spawn_with_slow_node: slow_node_delays.len() must equal n",
+        );
+        Self::spawn_inner(
+            n,
+            timeout_base,
+            SpawnExtras {
+                slow_node_delays: Some(slow_node_delays),
+                ..SpawnExtras::default()
+            },
+        )
+        .await
+        .0
+    }
+
     /// Spawn `n` honest nodes configured for the BLS-aggregated chain
     /// scheme (#354 step 2).
     ///
@@ -603,6 +661,7 @@ impl SimCluster {
                 ),
                 weights: None,
                 slow_disk_delays: None,
+                slow_node_delays: None,
             },
         )
         .await
@@ -640,6 +699,7 @@ impl SimCluster {
                 signature_scheme: None,
                 weights: None,
                 slow_disk_delays: None,
+                slow_node_delays: None,
             },
         )
         .await
@@ -669,6 +729,7 @@ impl SimCluster {
                 signature_scheme: None,
                 weights: None,
                 slow_disk_delays: None,
+                slow_node_delays: None,
             },
         )
         .await
@@ -685,6 +746,7 @@ impl SimCluster {
             signature_scheme,
             weights,
             slow_disk_delays,
+            slow_node_delays,
         } = extras;
         let scheme = signature_scheme.unwrap_or_default();
         if let Some(adv) = adversaries.as_ref() {
@@ -695,6 +757,9 @@ impl SimCluster {
         }
         if let Some(d) = slow_disk_delays.as_ref() {
             assert_eq!(d.len(), n, "slow_disk_delays slots must equal n");
+        }
+        if let Some(d) = slow_node_delays.as_ref() {
+            assert_eq!(d.len(), n, "slow_node_delays slots must equal n");
         }
         assert!(n >= 4, "BFT requires at least 4 nodes (3f+1 with f=1)");
 
@@ -792,6 +857,24 @@ impl SimCluster {
             event_rxs.push((nid, rx));
         }
         let event_txs = Arc::new(event_txs);
+
+        // Per-node runtime-mutable processing delay in microseconds
+        // (#497). Each node has an `Arc<AtomicU64>` keyed by `NodeId`
+        // that the per-node bridge task (spawned in the loop below)
+        // reads on every event. Initialized from `slow_node_delays` if
+        // supplied; otherwise zero. Mutable at runtime via
+        // [`SimCluster::set_slow_node`].
+        let mut slow_node_delays_us: HashMap<NodeId, Arc<AtomicU64>> = HashMap::new();
+        for (i, v) in vs.iter().enumerate() {
+            let nid = v.into_node_id();
+            let initial_us = slow_node_delays
+                .as_ref()
+                .and_then(|d| d.get(i).copied())
+                .map(|d| d.as_micros().min(u64::MAX as u128) as u64)
+                .unwrap_or(0);
+            slow_node_delays_us.insert(nid, Arc::new(AtomicU64::new(initial_us)));
+        }
+        let slow_node_delays_us = Arc::new(slow_node_delays_us);
 
         // Per-replica vote-uniqueness observer (issue #422). Default-on
         // for every mesh-mode cluster; passed by `Arc` clone into each
@@ -981,11 +1064,26 @@ impl SimCluster {
             // run loop applies after each ingress tick.
             equivocations_counters.push(node.equivocations_counter());
 
+            // Slow-node bridge (#497): the route-task side writes into
+            // `event_rx`'s sender; the bridge drains `event_rx`,
+            // sleeps for the per-node configured delay, then forwards
+            // to the consensus node's `consensus_event_rx`. With
+            // delay=0 this is a one-hop forward (the cost is one
+            // channel send per event, which is cheap).
+            let consensus_event_rx =
+                spawn_event_bridge(event_rx, Arc::clone(&slow_node_delays_us[&nid]));
+
             tokio::spawn(async move {
                 let _ = crate::consensus::crashpoint::CRASH_SLOT
                     .scope(crash_slot, async move {
-                        node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
-                            .await
+                        node.run(
+                            broadcaster,
+                            discovery,
+                            consensus_event_rx,
+                            signer,
+                            shutdown_rx,
+                        )
+                        .await
                     })
                     .await;
             });
@@ -1015,6 +1113,7 @@ impl SimCluster {
             timeout_base,
             vote_observer,
             equivocations_counters,
+            slow_node_delays_us,
         };
         (cluster, limiters)
     }
@@ -1050,6 +1149,31 @@ impl SimCluster {
     /// [`heal_node`]: SimCluster::heal_node
     pub fn partition_node(&self, idx: usize) {
         self.partitioned.lock().insert(self.node_ids[idx]);
+    }
+
+    /// Set node `idx`'s per-event processing delay (#497). The
+    /// per-node bridge between the route task and the consensus
+    /// `run()` loop will sleep for `delay` before forwarding each
+    /// inbound event from this point on; passing `Duration::ZERO`
+    /// resets the node to un-throttled processing.
+    ///
+    /// Used to model "slow node" scenarios — a node that drains its
+    /// inbound queue more slowly than peers send to it. With the
+    /// in-memory `.send().await` mesh used by [`SimCluster`], the
+    /// observable shape is that fast peers' route tasks block on
+    /// delivery to the slow node once its inbound channel fills,
+    /// rather than the silently-dropping shape that the production
+    /// `p2p::manager` uses (where `try_send`-on-full triggers the
+    /// slow-peer disconnect heuristic from
+    /// [`crate::p2p::manager::SLOW_PEER_OVERFLOW_THRESHOLD`]). The
+    /// production heuristic itself is unit-tested in
+    /// `src/p2p/manager.rs`; this primitive lets sim-level tests
+    /// exercise the persist-/process-blocks-consensus shape end-to-end
+    /// against the safety core.
+    pub fn set_slow_node(&self, idx: usize, delay: Duration) {
+        let nid = self.node_ids[idx];
+        let micros = delay.as_micros().min(u64::MAX as u128) as u64;
+        self.slow_node_delays_us[&nid].store(micros, Ordering::Relaxed);
     }
 
     /// Remove node `idx` from the partition set, restoring full connectivity.
@@ -1513,11 +1637,25 @@ impl SimCluster {
             let crash_slot = crate::consensus::crashpoint::CrashSlot::empty();
             new_crash_slots.push(crash_slot.clone());
 
+            // Re-wrap the inbound stream in a slow-node bridge (#497)
+            // so any pre-restart `set_slow_node` configuration keeps
+            // applying after the restart. The per-node delay
+            // `Arc<AtomicU64>` is owned by `self.slow_node_delays_us`
+            // and persists across restart.
+            let consensus_event_rx =
+                spawn_event_bridge(event_rx, Arc::clone(&self.slow_node_delays_us[&nid]));
+
             tokio::spawn(async move {
                 let _ = crate::consensus::crashpoint::CRASH_SLOT
                     .scope(crash_slot, async move {
-                        node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
-                            .await
+                        node.run(
+                            broadcaster,
+                            discovery,
+                            consensus_event_rx,
+                            signer,
+                            shutdown_rx,
+                        )
+                        .await
                     })
                     .await;
             });
@@ -1735,11 +1873,23 @@ impl SimCluster {
         let crash_slot = crate::consensus::crashpoint::CrashSlot::empty();
         self.crash_slots[idx] = crash_slot.clone();
 
+        // Re-wrap the reborn node's inbound stream in a slow-node
+        // bridge (#497) so any pre-crash `set_slow_node` configuration
+        // keeps applying after recovery.
+        let consensus_event_rx =
+            spawn_event_bridge(event_rx, Arc::clone(&self.slow_node_delays_us[&nid]));
+
         tokio::spawn(async move {
             let _ = crate::consensus::crashpoint::CRASH_SLOT
                 .scope(crash_slot, async move {
-                    node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
-                        .await
+                    node.run(
+                        broadcaster,
+                        discovery,
+                        consensus_event_rx,
+                        signer,
+                        shutdown_rx,
+                    )
+                    .await
                 })
                 .await;
         });
@@ -1827,6 +1977,38 @@ impl Drop for SimCluster {
 ///
 /// Self-delivery is suppressed in both broadcast and send-to paths so
 /// the sim matches the production p2p semantics (`src/p2p/manager.rs`).
+/// Spawn a slow-node bridge (#497) that drains `raw_rx`, sleeps for
+/// the per-event delay configured on `delay_us`, and forwards to the
+/// returned receiver. With `delay_us == 0` (the default) this is a
+/// one-hop forward — the cost is one channel send per event, which
+/// under the sim's `current_thread + start_paused` model is cheap
+/// enough that running it unconditionally per node is simpler than
+/// gating on "is any test using set_slow_node?". The forward channel
+/// is bounded at the same 1024 cap as the raw channel so the bridge
+/// itself does not introduce additional buffering when the consensus
+/// run loop is keeping up.
+fn spawn_event_bridge(
+    mut raw_rx: mpsc::Receiver<ProtocolEvent>,
+    delay_us: Arc<AtomicU64>,
+) -> mpsc::Receiver<ProtocolEvent> {
+    let (forward_tx, forward_rx) = mpsc::channel::<ProtocolEvent>(1024);
+    tokio::spawn(async move {
+        while let Some(ev) = raw_rx.recv().await {
+            let micros = delay_us.load(Ordering::Relaxed);
+            if micros > 0 {
+                tokio::time::sleep(Duration::from_micros(micros)).await;
+            }
+            if forward_tx.send(ev).await.is_err() {
+                // Consensus run loop dropped its receiver — node
+                // shutdown is in flight; drain pending events from
+                // raw_rx until its sender side closes too.
+                break;
+            }
+        }
+    });
+    forward_rx
+}
+
 /// The integration layer loops self-addressed consensus actions back
 /// into the local safety core inside
 /// `ConsensusNode::apply_safety_actions`; duplicating the delivery here
@@ -2344,6 +2526,17 @@ impl SimCluster {
 
         let commit_cache: Vec<Vec<Block>> = (0..n).map(|_| Vec::new()).collect();
 
+        // Slow-node bridge (#497) is mesh-only; gossip-mode clusters
+        // pass through the GossipOverlay before reaching consensus,
+        // and inserting a bridge there is out of scope for #497. Seed
+        // a delay map of zeros keyed by NodeId so the field is
+        // populated; calls to `set_slow_node` against a gossip-mode
+        // cluster will mutate the atomic but no bridge is reading it.
+        let mut slow_node_delays_us: HashMap<NodeId, Arc<AtomicU64>> = HashMap::new();
+        for nid in &node_ids {
+            slow_node_delays_us.insert(*nid, Arc::new(AtomicU64::new(0)));
+        }
+
         SimCluster {
             commit_rxs,
             commit_overflow_counters,
@@ -2371,6 +2564,7 @@ impl SimCluster {
             timeout_base,
             vote_observer,
             equivocations_counters,
+            slow_node_delays_us: Arc::new(slow_node_delays_us),
         }
     }
 }
@@ -2798,6 +2992,215 @@ mod tests {
             cluster.total_commit_overflows(),
             0,
             "no commits should overflow the bounded notifier channel",
+        );
+    }
+
+    // ── Slow-node back-pressure (#497) ────────────────────────────────────────
+
+    /// Throttle one node's inbound `ProtocolEvent` consumption via the
+    /// per-node bridge installed by [`SimCluster::set_slow_node`];
+    /// assert the cluster's progress invariants hold (every node still
+    /// commits, the slow node lags strictly behind a fast node, no
+    /// commits are dropped on the bounded notifier).
+    ///
+    /// This is the consumption-side analogue of the slow-disk test
+    /// above: instead of throttling the persist boundary, this test
+    /// throttles the inbound dispatch boundary. Both are valid
+    /// "single slow node" shapes.
+    ///
+    /// # Why no slow-peer-disconnect assertion
+    ///
+    /// The disconnect heuristic from #490 lives in
+    /// `src/p2p/manager.rs::SlowPeerTracker` and fires on
+    /// `try_send`-on-full of the per-peer outbound `write_tx` queue.
+    /// The sim's mesh routing uses `.send().await` (not `try_send`),
+    /// so the production-shape "fast peer drops a slow peer" path is
+    /// not exercised by this harness. Wiring the sim through the real
+    /// `p2p::manager` (or backporting the tracker into the route
+    /// task) would let the assertion go end-to-end; both are larger
+    /// refactors and are intentionally not part of #497. The
+    /// disconnect heuristic itself is unit-tested in
+    /// `src/p2p/manager.rs`'s test module — what this test verifies
+    /// is the consumption-side back-pressure shape that the
+    /// disconnect heuristic protects against.
+    #[tokio::test]
+    async fn slow_node_lags_but_cluster_still_commits() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn_with_slow_node(
+            4,
+            Duration::from_millis(50),
+            vec![
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::from_millis(20),
+            ],
+        )
+        .await;
+
+        // Drive paused virtual time forward until the fast nodes have
+        // produced a comfortable margin of commits over the slow
+        // node. Per CLAUDE.md "Test performance" guidance, poll on
+        // the observable rather than fixed iteration counts. With
+        // tokio::time::pause and a 20ms slow-node delay, each yield
+        // round advances either consensus work or the bridge's
+        // sleep, but the slow node's commit cadence is throttled
+        // proportionally.
+        let mut early_exit = false;
+        for _ in 0..2_000 {
+            yield_now().await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+
+            let heights = cluster.peek_commit_heights();
+            // We want to assert lag, so look for a fast/slow gap of
+            // at least a few blocks. With slow-node index 3, indices
+            // 0..3 are fast.
+            let fast_max = heights[..3].iter().copied().max().unwrap_or(0);
+            let slow_h = heights[3];
+            if fast_max >= 5 && slow_h < fast_max && heights.iter().all(|&h| h > 0) {
+                early_exit = true;
+                break;
+            }
+        }
+        assert!(
+            early_exit,
+            "slow_node test did not reach steady-state lag within budget; \
+             heights = {:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // Every node committed at least one block — the slow path
+        // back-pressures consensus but does not wedge it.
+        for (i, node_commits) in committed.iter().enumerate() {
+            assert!(
+                !node_commits.is_empty(),
+                "node {i} produced no commits — slow-node throttle should \
+                 lag, not wedge",
+            );
+        }
+
+        // The slow node lags strictly behind the fastest fast node.
+        let lengths: Vec<usize> = committed.iter().map(|c| c.len()).collect();
+        let fast_max = lengths[..3].iter().copied().max().unwrap();
+        let slow_len = lengths[3];
+        assert!(
+            slow_len < fast_max,
+            "slow node should lag a fast node strictly: \
+             lengths = {lengths:?}",
+        );
+
+        // No commits dropped on any commit channel.
+        assert_eq!(
+            cluster.total_commit_overflows(),
+            0,
+            "no commits should overflow the bounded notifier channel",
+        );
+    }
+
+    /// `set_slow_node` is runtime-mutable: a node spawned with no
+    /// initial throttle can be slowed mid-test, and resetting back to
+    /// `Duration::ZERO` removes the per-event sleep. This test
+    /// exercises the on-then-off transition to make sure the bridge
+    /// task picks up the atomic update without a respawn.
+    #[tokio::test]
+    async fn set_slow_node_runtime_toggle_resumes_full_speed() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Phase 1: warm up un-throttled. Every node should commit
+        // multiple blocks within the budget.
+        for _ in 0..400 {
+            yield_now().await;
+            tokio::time::advance(Duration::from_millis(5)).await;
+            if cluster.peek_commit_heights().iter().all(|&h| h >= 3) {
+                break;
+            }
+        }
+        assert!(
+            cluster.peek_commit_heights().iter().all(|&h| h >= 3),
+            "phase 1 failed to reach baseline commits: heights = {:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        // Phase 2: throttle node 3 mid-test, advance, observe lag.
+        let phase2_baseline = cluster.peek_commit_heights();
+        cluster.set_slow_node(3, Duration::from_millis(20));
+        for _ in 0..1_500 {
+            yield_now().await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+            let heights = cluster.peek_commit_heights();
+            let fast_gain = heights[..3]
+                .iter()
+                .zip(phase2_baseline[..3].iter())
+                .map(|(a, b)| a - b)
+                .max()
+                .unwrap_or(0);
+            let slow_gain = heights[3] - phase2_baseline[3];
+            if fast_gain >= 5 && slow_gain < fast_gain {
+                break;
+            }
+        }
+        let after_throttle = cluster.peek_commit_heights();
+        let fast_gain = after_throttle[..3]
+            .iter()
+            .zip(phase2_baseline[..3].iter())
+            .map(|(a, b)| a - b)
+            .max()
+            .unwrap_or(0);
+        let slow_gain = after_throttle[3] - phase2_baseline[3];
+        assert!(
+            fast_gain > slow_gain,
+            "phase 2: throttled node 3 should gain fewer commits than the \
+             fastest fast node — fast_gain={fast_gain}, slow_gain={slow_gain}",
+        );
+
+        // Phase 3: clear the throttle and observe the slow node
+        // catching back up — its post-clear gain is at least a third
+        // of the fastest fast node's gain (it can't always match
+        // exactly because it had to drain backlog first).
+        let phase3_baseline = cluster.peek_commit_heights();
+        cluster.set_slow_node(3, Duration::ZERO);
+        for _ in 0..1_500 {
+            yield_now().await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+            let heights = cluster.peek_commit_heights();
+            let post_clear_slow = heights[3] - phase3_baseline[3];
+            let post_clear_fast = heights[..3]
+                .iter()
+                .zip(phase3_baseline[..3].iter())
+                .map(|(a, b)| a - b)
+                .max()
+                .unwrap_or(0);
+            if post_clear_fast >= 5 && post_clear_slow * 3 >= post_clear_fast {
+                break;
+            }
+        }
+        let final_heights = cluster.peek_commit_heights();
+        let post_clear_slow = final_heights[3] - phase3_baseline[3];
+        let post_clear_fast = final_heights[..3]
+            .iter()
+            .zip(phase3_baseline[..3].iter())
+            .map(|(a, b)| a - b)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            post_clear_slow * 3 >= post_clear_fast,
+            "phase 3: cleared throttle should let node 3 commit at a \
+             comparable cadence — post_clear_slow={post_clear_slow}, \
+             post_clear_fast={post_clear_fast}",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+        assert_eq!(
+            cluster.total_commit_overflows(),
+            0,
+            "no commits should overflow",
         );
     }
 
