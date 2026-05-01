@@ -1,7 +1,7 @@
 //! `lines` — count Rust source lines, tokei-style, with an impl-vs-test split.
 //!
-//! Usage: `cargo run --bin lines -- [--per-file|-f|--ls|-l] [PATH]`
-//!         (PATH defaults to `src`)
+//! Usage: `cargo run --bin lines -- [--per-file|-f|--ls|-l] [--sort KEY] [-r] [PATH]`
+//!         (PATH defaults to `.`)
 //!
 //! Aggregation modes:
 //!   * default (`--by-subdir` implicit) — one row per top-level subdirectory
@@ -10,6 +10,12 @@
 //!     get their own row, subdirectories aggregate everything beneath them
 //!     into a single row.
 //!   * `--per-file` / `-f` — one row per `.rs` file, fully recursive.
+//!
+//! Sorting (applies to all modes; the Total row is unaffected):
+//!   * `--sort KEY` / `-s KEY` where KEY ∈ {path, files, lines, code, impl,
+//!     test, comments, blanks}. Default is `path`. Numeric keys default to
+//!     descending (largest first); `path` defaults to ascending. `--reverse`
+//!     / `-r` flips whichever default is in effect.
 //!
 //! Each `.rs` file under PATH is classified line-by-line as:
 //!   * blank   — only whitespace
@@ -61,20 +67,91 @@ enum Mode {
     Ls,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortBy {
+    Path,
+    Files,
+    Lines,
+    Code,
+    Impl,
+    Test,
+    Comments,
+    Blanks,
+}
+
+impl SortBy {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "path" | "name" => Some(Self::Path),
+            "files" => Some(Self::Files),
+            "lines" => Some(Self::Lines),
+            "code" => Some(Self::Code),
+            "impl" => Some(Self::Impl),
+            "test" => Some(Self::Test),
+            "comments" => Some(Self::Comments),
+            "blanks" => Some(Self::Blanks),
+            _ => None,
+        }
+    }
+
+    fn key(self, c: &Counts) -> usize {
+        match self {
+            Self::Path => 0,
+            Self::Files => c.files,
+            Self::Lines => c.lines,
+            Self::Code => c.code(),
+            Self::Impl => c.code_impl,
+            Self::Test => c.code_test,
+            Self::Comments => c.comments,
+            Self::Blanks => c.blanks,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let mut mode = Mode::BySubdir;
+    let mut sort_by = SortBy::Path;
+    let mut reverse = false;
     let mut path: Option<PathBuf> = None;
-    for arg in env::args().skip(1) {
+    let mut args = env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--per-file" | "-f" => mode = Mode::PerFile,
             "--ls" | "-l" => mode = Mode::Ls,
+            "--reverse" | "-r" => reverse = true,
+            "--sort" | "-s" => {
+                let Some(value) = args.next() else {
+                    eprintln!(
+                        "error: --sort requires a value (path|files|lines|code|impl|test|comments|blanks)"
+                    );
+                    return ExitCode::from(2);
+                };
+                let Some(by) = SortBy::parse(&value) else {
+                    eprintln!(
+                        "error: unknown --sort key: {value} (expected path|files|lines|code|impl|test|comments|blanks)"
+                    );
+                    return ExitCode::from(2);
+                };
+                sort_by = by;
+            }
+            s if let Some(value) = s.strip_prefix("--sort=") => {
+                let Some(by) = SortBy::parse(value) else {
+                    eprintln!(
+                        "error: unknown --sort key: {value} (expected path|files|lines|code|impl|test|comments|blanks)"
+                    );
+                    return ExitCode::from(2);
+                };
+                sort_by = by;
+            }
             "--help" | "-h" => {
                 print_help();
                 return ExitCode::SUCCESS;
             }
             s if s.starts_with('-') => {
                 eprintln!("error: unknown flag: {s}");
-                eprintln!("usage: lines [--per-file|-f|--ls|-l] [PATH]   (PATH defaults to `src`)");
+                eprintln!(
+                    "usage: lines [--per-file|-f|--ls|-l] [--sort KEY] [--reverse|-r] [PATH]"
+                );
                 return ExitCode::from(2);
             }
             _ => {
@@ -86,7 +163,7 @@ fn main() -> ExitCode {
             }
         }
     }
-    let root = path.unwrap_or_else(|| PathBuf::from("src"));
+    let root = path.unwrap_or_else(|| PathBuf::from("."));
 
     if !root.exists() {
         eprintln!("error: path not found: {}", root.display());
@@ -131,9 +208,9 @@ fn main() -> ExitCode {
     }
 
     match mode {
-        Mode::BySubdir => print_table(&root, &by_dir, total),
-        Mode::PerFile => print_per_file(&root, &per_file_rows, total),
-        Mode::Ls => print_ls(&root, &per_file_rows, total),
+        Mode::BySubdir => print_table(&root, &by_dir, total, sort_by, reverse),
+        Mode::PerFile => print_per_file(&root, &per_file_rows, total, sort_by, reverse),
+        Mode::Ls => print_ls(&root, &per_file_rows, total, sort_by, reverse),
     }
     ExitCode::SUCCESS
 }
@@ -671,7 +748,10 @@ fn find_subseq(hay: &[u8], needle: &[u8]) -> Option<usize> {
 // ----- output ---------------------------------------------------------------
 
 fn print_help() {
-    println!("usage: lines [--per-file|-f|--ls|-l] [PATH]   (PATH defaults to `src`)");
+    println!(
+        "usage: lines [--per-file|-f|--ls|-l] [--sort KEY] [--reverse|-r] [PATH]\n         \
+         (PATH defaults to `.`)"
+    );
     println!();
     println!("Walks `.rs` files under PATH and prints a tokei-style table of");
     println!("file/line counts, with the Code column split into Impl + Test.");
@@ -683,6 +763,20 @@ fn print_help() {
     println!("                top-level files individually, subdirs aggregated");
     println!("  --per-file    one row per `.rs` file, fully recursive");
     println!();
+    println!("Sorting (applies to all modes; the Total row is unaffected):");
+    println!("  --sort KEY    sort rows by one of:");
+    println!("                  path     alphabetical (default)");
+    println!("                  files    file count");
+    println!("                  lines    total lines");
+    println!("                  code     impl + test");
+    println!("                  impl     impl code");
+    println!("                  test     test code");
+    println!("                  comments comment lines");
+    println!("                  blanks   blank lines");
+    println!("                Numeric keys default to descending (largest first);");
+    println!("                `path` defaults to ascending.");
+    println!("  --reverse, -r flip the default direction of the chosen key");
+    println!();
     println!("Test classification:");
     println!("  - lines inside `#[cfg(test)]` item bodies (brace-balanced)");
     println!("  - all lines in files declared from a parent module via");
@@ -692,10 +786,41 @@ fn print_help() {
     println!("Skipped during recursion: `target/`, dot-directories like `.git`.");
 }
 
-fn print_per_file(root: &Path, rows: &[(PathBuf, Counts)], total: Counts) {
+fn sort_rows<K: Ord + Clone>(rows: &mut [(K, Counts)], by: SortBy, reverse: bool) {
+    // Numeric keys: descending by default (largest first — what people want
+    // when sorting "by size"). Path: ascending by default.
+    let descend_default = !matches!(by, SortBy::Path);
+    let descending = descend_default ^ reverse;
+    rows.sort_by(|a, b| match by {
+        SortBy::Path => a.0.cmp(&b.0),
+        _ => {
+            let ka = by.key(&a.1);
+            let kb = by.key(&b.1);
+            if descending {
+                kb.cmp(&ka).then_with(|| a.0.cmp(&b.0))
+            } else {
+                ka.cmp(&kb).then_with(|| a.0.cmp(&b.0))
+            }
+        }
+    });
+    if matches!(by, SortBy::Path) && reverse {
+        rows.reverse();
+    }
+}
+
+fn print_per_file(
+    root: &Path,
+    rows: &[(PathBuf, Counts)],
+    total: Counts,
+    sort_by: SortBy,
+    reverse: bool,
+) {
+    let mut rows: Vec<(PathBuf, Counts)> = rows.to_vec();
+    sort_rows(&mut rows, sort_by, reverse);
+
     // Pick a path-column width that fits the longest path under the root.
     let mut path_w = "File (under …)".len() + root.display().to_string().len();
-    for (p, _) in rows {
+    for (p, _) in &rows {
         path_w = path_w.max(display_rel(p, root).len());
     }
     path_w = path_w.clamp(28, 64);
@@ -718,7 +843,7 @@ fn print_per_file(root: &Path, rows: &[(PathBuf, Counts)], total: Counts) {
         pw = path_w,
     );
     println!("{bar}");
-    for (p, c) in rows {
+    for (p, c) in &rows {
         println!(
             " {:<pw$} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
             display_rel(p, root),
@@ -747,7 +872,13 @@ fn print_per_file(root: &Path, rows: &[(PathBuf, Counts)], total: Counts) {
     print_summary_footer(total);
 }
 
-fn print_ls(root: &Path, rows: &[(PathBuf, Counts)], total: Counts) {
+fn print_ls(
+    root: &Path,
+    rows: &[(PathBuf, Counts)],
+    total: Counts,
+    sort_by: SortBy,
+    reverse: bool,
+) {
     // Group every file by its first-level entry under `root`. Top-level files
     // end up as their own entry (filename); files deeper in a subdir all
     // collapse onto that subdir's entry, recursively.
@@ -765,13 +896,14 @@ fn print_ls(root: &Path, rows: &[(PathBuf, Counts)], total: Counts) {
         entry.1.add(*counts);
     }
 
-    let display_entries: Vec<(String, Counts)> = entries
+    let mut display_entries: Vec<(String, Counts)> = entries
         .into_iter()
         .map(|(name, (is_file, c))| {
             let s = name.to_string_lossy().into_owned();
             (if is_file { s } else { format!("{s}/") }, c)
         })
         .collect();
+    sort_rows(&mut display_entries, sort_by, reverse);
 
     let mut path_w = "Entry (under …)".len() + root.display().to_string().len();
     for (n, _) in &display_entries {
@@ -851,7 +983,16 @@ fn print_summary_footer(total: Counts) {
     }
 }
 
-fn print_table(root: &Path, by_dir: &BTreeMap<PathBuf, Counts>, total: Counts) {
+fn print_table(
+    root: &Path,
+    by_dir: &BTreeMap<PathBuf, Counts>,
+    total: Counts,
+    sort_by: SortBy,
+    reverse: bool,
+) {
+    let mut rows: Vec<(PathBuf, Counts)> = by_dir.iter().map(|(p, c)| (p.clone(), *c)).collect();
+    sort_rows(&mut rows, sort_by, reverse);
+
     let header_path = format!("Path (under {})", root.display());
     let bar = "=".repeat(96);
     println!("{bar}");
@@ -862,7 +1003,7 @@ fn print_table(root: &Path, by_dir: &BTreeMap<PathBuf, Counts>, total: Counts) {
         header_path, "Files", "Lines", "Code", "Impl", "Test", "Comments", "Blanks",
     );
     println!("{bar}");
-    for (dir, c) in by_dir {
+    for (dir, c) in &rows {
         println!(
             " {:<28} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
             display_rel(dir, root),
@@ -1010,5 +1151,103 @@ mod tests {
         assert_eq!(c.code_impl, 0);
         assert_eq!(c.code_test, 2);
         assert_eq!(c.comments, 1);
+    }
+
+    fn rows() -> Vec<(String, Counts)> {
+        vec![
+            (
+                "alpha".to_string(),
+                Counts {
+                    files: 1,
+                    lines: 100,
+                    code_impl: 10,
+                    code_test: 20,
+                    comments: 50,
+                    blanks: 20,
+                },
+            ),
+            (
+                "bravo".to_string(),
+                Counts {
+                    files: 1,
+                    lines: 200,
+                    code_impl: 30,
+                    code_test: 5,
+                    comments: 100,
+                    blanks: 65,
+                },
+            ),
+            (
+                "charlie".to_string(),
+                Counts {
+                    files: 1,
+                    lines: 50,
+                    code_impl: 1,
+                    code_test: 40,
+                    comments: 5,
+                    blanks: 4,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn sort_path_is_ascending_default() {
+        let mut r = rows();
+        sort_rows(&mut r, SortBy::Path, false);
+        let names: Vec<_> = r.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
+    }
+
+    #[test]
+    fn sort_lines_is_descending_default() {
+        let mut r = rows();
+        sort_rows(&mut r, SortBy::Lines, false);
+        let names: Vec<_> = r.iter().map(|(n, _)| n.as_str()).collect();
+        // bravo=200, alpha=100, charlie=50
+        assert_eq!(names, vec!["bravo", "alpha", "charlie"]);
+    }
+
+    #[test]
+    fn sort_impl_descending() {
+        let mut r = rows();
+        sort_rows(&mut r, SortBy::Impl, false);
+        let names: Vec<_> = r.iter().map(|(n, _)| n.as_str()).collect();
+        // bravo=30, alpha=10, charlie=1
+        assert_eq!(names, vec!["bravo", "alpha", "charlie"]);
+    }
+
+    #[test]
+    fn sort_test_descending() {
+        let mut r = rows();
+        sort_rows(&mut r, SortBy::Test, false);
+        let names: Vec<_> = r.iter().map(|(n, _)| n.as_str()).collect();
+        // charlie=40, alpha=20, bravo=5
+        assert_eq!(names, vec!["charlie", "alpha", "bravo"]);
+    }
+
+    #[test]
+    fn sort_reverse_flips_default() {
+        let mut r = rows();
+        sort_rows(&mut r, SortBy::Lines, true);
+        let names: Vec<_> = r.iter().map(|(n, _)| n.as_str()).collect();
+        // ascending: charlie=50, alpha=100, bravo=200
+        assert_eq!(names, vec!["charlie", "alpha", "bravo"]);
+
+        let mut r = rows();
+        sort_rows(&mut r, SortBy::Path, true);
+        let names: Vec<_> = r.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["charlie", "bravo", "alpha"]);
+    }
+
+    #[test]
+    fn sort_by_parses_known_keys() {
+        assert!(matches!(SortBy::parse("code"), Some(SortBy::Code)));
+        assert!(matches!(SortBy::parse("impl"), Some(SortBy::Impl)));
+        assert!(matches!(SortBy::parse("test"), Some(SortBy::Test)));
+        assert!(matches!(SortBy::parse("path"), Some(SortBy::Path)));
+        assert!(matches!(SortBy::parse("name"), Some(SortBy::Path)));
+        assert!(SortBy::parse("Code").is_none()); // case-sensitive
+        assert!(SortBy::parse("garbage").is_none());
     }
 }
