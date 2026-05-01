@@ -148,6 +148,27 @@ impl ConsensusNode {
             }
 
             Dispatch::ServeBlock { hash, to } => {
+                // Per-peer credit window (#498). Acquires one
+                // outstanding-serve credit; if `to` is already at
+                // [`block_sync::BLOCK_SYNC_OUTSTANDING_PER_PEER`],
+                // drop the request silently (with counter increment)
+                // rather than queueing it. The synchronous serving
+                // path that ships today never reaches the cap (one
+                // serve at a time), but a future async responder
+                // would; the gate is here so a refactor cannot leak
+                // unbounded concurrent serves into the storage layer.
+                let _credit = match self.block_sync_credit.try_acquire(to) {
+                    Some(guard) => guard,
+                    None => {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            from = %node_id_to_base58(&to),
+                            hash = ?hash,
+                            "block_sync_serve_dropped_at_credit_window",
+                        );
+                        return Ok(());
+                    }
+                };
                 // Look in the in-memory `pending_blocks` cache first;
                 // fall back to durable storage for blocks that were
                 // committed before this replica restarted (where the
