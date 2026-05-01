@@ -636,6 +636,34 @@ impl Dialer for DialerCtxAdapter {
         // shutdown.
         std::mem::drop(self.ctx.spawn(addr, expected));
     }
+
+    fn disconnect(&self, node_id: NodeId) {
+        // Trim path (#187 / #513). Dispatch a `Disconnect` to the
+        // manager via the same command channel the rest of the
+        // overlay uses; the manager removes the peer and frees the
+        // limiter slot. Best-effort — if the channel is full or the
+        // manager has already exited (shutdown race), we log and
+        // move on, because the maintenance loop's next tick will
+        // observe the (still-direct) peer and try again, or the
+        // entire overlay will tear down.
+        let Some(peer_cmd_tx) = self.ctx.peer_cmd_tx.as_ref() else {
+            tracing::warn!(
+                peer = %super::super::super::tls::node_id_to_base58(&node_id),
+                "mesh maintenance: no PeerCommand channel; cannot trim outbound peer",
+            );
+            return;
+        };
+        if peer_cmd_tx
+            .try_send(super::super::super::PeerCommand::Disconnect { node_id })
+            .is_err()
+        {
+            tracing::warn!(
+                peer = %super::super::super::tls::node_id_to_base58(&node_id),
+                "mesh maintenance: PeerCommand::Disconnect dispatch failed (channel \
+                 full or closed); leaving peer in place",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
