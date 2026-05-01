@@ -34,11 +34,12 @@ Three policies cover every path in the system today:
 | **Block+disconnect** *(target)* | Per-peer outbound for must-deliver consensus messages | Bounded queue → block briefly → disconnect peer if a stall threshold is exceeded |
 | **Drop + counter** | Best-effort overlays with multiple delivery paths (gossip, peer-list) | `try_send`; on `Full` increment a counter and `warn` |
 
-The "block+disconnect" target is partially in place today: the per-peer
-outbound `write_tx` (`p2p::manager`) is bounded and `try_send` drops on
-full. The drop side of the contract is wired, but neither the counter
-nor the eventual disconnect heuristic exists yet — see
-**Known gaps** below.
+The "block+disconnect" target landed in #486 + #490: the per-peer
+outbound `write_tx` (`p2p::manager`) drops on `Full`, increments a
+shared overflow counter, and tracks per-peer overflow timestamps in a
+sliding window; once a peer accumulates one full channel-worth of
+overflows inside the window the manager kicks it via the same cleanup
+path `PeerCommand::Disconnect` performs.
 
 ## Per-path table
 
@@ -50,7 +51,7 @@ test fixtures with smaller channels do not appear here.
 
 | Path | File:line | Type | Capacity | Send-side on full | Policy | Rationale |
 |------|-----------|------|----------|-------------------|--------|-----------|
-| Per-peer outbound bytes (`write_tx`) | `p2p/manager.rs:326,351` | `mpsc<Bytes>` | 64 | `try_send` → drop + counter + warn (`p2p/manager.rs:198`, `:431`) | Drop + counter *(target: block+disconnect, see #490)* | Carries every consensus and overlay message destined for one peer. Drops on `Full` increment a single shared counter handed out via every `ProtocolHandle.peer_outbound_overflows`; surfaced through `ConsensusStatus.backpressure.peer_outbound_overflow_total`. Closed-channel failures are intentionally not counted (manager-shutdown noise). #490 adds the slow-peer disconnect heuristic on top. |
+| Per-peer outbound bytes (`write_tx`) | `p2p/manager.rs:326,351` | `mpsc<Bytes>` | 64 | `try_send` → drop + counter + warn; per-peer slow-peer tracker → disconnect after `SLOW_PEER_OVERFLOW_THRESHOLD` (=64) overflows in `SLOW_PEER_OVERFLOW_WINDOW` (=10s) | **Drop + counter + slow-peer disconnect** | Carries every consensus and overlay message destined for one peer. Drops on `Full` increment a single shared counter (`ConsensusStatus.backpressure.peer_outbound_overflow_total`) and a per-peer sliding-window tracker. A peer that accumulates one full channel-worth of consecutive drops within the window is kicked via the same cleanup `PeerCommand::Disconnect` performs — the must-deliver-or-disconnect contract's escape valve. Closed-channel failures are not counted. (#486 + #490.) |
 | Per-peer inbound (`internal_tx`) | `p2p/manager.rs:472` | `mpsc<ManagerMsg>` | 64 | `send().await` (`p2p/connection.rs:64`) | **Block** | Connection task back-pressures the read loop; a slow manager naturally throttles all peers. The manager is single-threaded so this is safe — it cannot starve one peer for another. |
 | Manager command channel (`cmd_tx`) | `p2p/manager.rs:471` | `mpsc<PeerCommand>` | 16 | `send().await` | **Block** | Used for `RegisterProtocol`/`Disconnect`/`ListPeers`. Not on the data plane. |
 | `peer_gone` broadcast | `p2p/manager.rs:473` | `broadcast<NodeId>` | 16 | broadcast::send (lagging receivers see `Lagged`) | **Drop on lag (best-effort)** | Subscribers re-poll `known_peers()` to recover from a `Lagged` error. |
@@ -131,12 +132,11 @@ The audit identified three gaps that are tracked as sub-issues of #163:
   single shared counter on every `ProtocolHandle`. The production
   consensus event channel uses `send().await` (block-on-full), so it
   doesn't need a counter.
-- **#163-PR4 (not yet filed)** — Slow-peer disconnect heuristic for
-  per-peer outbound. The drop is wired (`p2p/manager.rs:198`) but
-  there's no "after K consecutive overflows in window W, disconnect"
-  rule; a stuck peer just keeps logging warns. Filed once the metrics
-  in #486 are in place — the disconnect heuristic should consume the
-  same counter.
+- ~~**#490** — Slow-peer disconnect heuristic for per-peer outbound.~~
+  Landed: `p2p/manager` tracks a per-peer sliding window of overflow
+  timestamps; once a peer hits `SLOW_PEER_OVERFLOW_THRESHOLD` overflows
+  inside `SLOW_PEER_OVERFLOW_WINDOW`, the manager kicks it with the
+  same cleanup path `PeerCommand::Disconnect` performs.
 - **Phase 4 sim primitives** — slow-node and slow-disk primitives for
   `SimCluster` so the four named tests in #163 (slow peer, slow disk,
   sync flood, tracing burst) can be expressed deterministically.

@@ -1,13 +1,69 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
+
+/// Per-peer outbound `write_tx.try_send` `Full` count that trips a
+/// slow-peer disconnect when accumulated within
+/// [`SLOW_PEER_OVERFLOW_WINDOW`] (#490).
+///
+/// Default 64 — equal to the per-peer write_tx capacity; one full
+/// channel-worth of consecutive drops over the window means the peer's
+/// socket / connection task is almost certainly wedged. Hard-coded for
+/// now; configurable knob can land later if production runs need it.
+pub const SLOW_PEER_OVERFLOW_THRESHOLD: usize = 64;
+
+/// Sliding window for [`SLOW_PEER_OVERFLOW_THRESHOLD`]. Drops older
+/// than this age out of the count, so a peer that briefly stalled and
+/// recovered isn't penalised forever.
+pub const SLOW_PEER_OVERFLOW_WINDOW: Duration = Duration::from_secs(10);
+
+/// Per-peer sliding-window record of `write_tx` overflow timestamps,
+/// used by the slow-peer disconnect heuristic (#490).
+struct SlowPeerTracker {
+    overflows: VecDeque<Instant>,
+    /// Set true after a disconnect has been triggered for this peer so
+    /// the heuristic doesn't keep re-firing while the manager processes
+    /// the disconnect cleanup; reset when the peer re-registers.
+    disconnect_dispatched: bool,
+}
+
+impl SlowPeerTracker {
+    fn new() -> Self {
+        Self {
+            overflows: VecDeque::new(),
+            disconnect_dispatched: false,
+        }
+    }
+
+    /// Record one overflow; return `true` iff this push pushed the
+    /// in-window count past [`SLOW_PEER_OVERFLOW_THRESHOLD`] for the
+    /// first time (so the caller fires exactly one disconnect per
+    /// streak).
+    fn record_overflow(&mut self, now: Instant) -> bool {
+        let cutoff = now - SLOW_PEER_OVERFLOW_WINDOW;
+        while self.overflows.front().is_some_and(|t| *t < cutoff) {
+            self.overflows.pop_front();
+        }
+        if self.overflows.is_empty() {
+            self.disconnect_dispatched = false;
+        }
+        self.overflows.push_back(now);
+        if self.overflows.len() >= SLOW_PEER_OVERFLOW_THRESHOLD && !self.disconnect_dispatched {
+            self.disconnect_dispatched = true;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 use super::connection;
 use super::connection::ProtocolCaps;
@@ -104,6 +160,13 @@ pub async fn run(
     // disconnects mid-send and would mask real back-pressure events.
     // (#163 / #486 follow-up.)
     let peer_outbound_overflows = Arc::new(AtomicU64::new(0));
+    // Per-peer sliding window of overflow timestamps (#490). When a
+    // peer accumulates [`SLOW_PEER_OVERFLOW_THRESHOLD`] overflows
+    // within [`SLOW_PEER_OVERFLOW_WINDOW`], the manager kicks the
+    // peer with the same cleanup path `PeerCommand::Disconnect`
+    // takes — the back-pressure policy in `docs/backpressure.md`
+    // calls this the "must-deliver-or-disconnect" escape valve.
+    let mut slow_peer_trackers: HashMap<NodeId, SlowPeerTracker> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -174,6 +237,7 @@ pub async fn run(
                             if let Some(limiter) = connection_limiter.as_ref() {
                                 limiter.release(slot.direction, slot.addr.ip());
                             }
+                            slow_peer_trackers.remove(&node_id);
                             let _ = peer_gone_tx.send(node_id);
                             let _ = discovery_tx.send(DiscoveryEvent::PeerRemoved(node_id));
                             for event_tx in protocols.values() {
@@ -200,11 +264,28 @@ pub async fn run(
                         match outbound {
                             ProtocolOutbound::Broadcast(payload) => {
                                 let tagged = tag(protocol_id, payload);
-                                broadcast_msg(&peers, tagged, &peer_outbound_overflows);
+                                let trip = broadcast_msg(
+                                    &peers,
+                                    tagged,
+                                    &peer_outbound_overflows,
+                                    &mut slow_peer_trackers,
+                                );
+                                for slow_peer in trip {
+                                    disconnect_peer_for_overflow(
+                                        slow_peer,
+                                        &mut peers,
+                                        &protocols,
+                                        &peer_gone_tx,
+                                        &discovery_tx,
+                                        connection_limiter.as_ref(),
+                                        &mut slow_peer_trackers,
+                                    );
+                                }
                             }
                             ProtocolOutbound::SendTo { node_id, payload } => {
                                 let tagged = tag(protocol_id, payload);
                                 let id = node_id_to_base58(&node_id);
+                                let mut trip_disconnect = false;
                                 if let Some(slot) = peers.get(&node_id) {
                                     match slot.write_tx.try_send(tagged) {
                                         Ok(()) => {}
@@ -212,9 +293,17 @@ pub async fn run(
                                             // Per-peer write channel is at capacity. Bump
                                             // the back-pressure counter (#486) so the drop
                                             // is visible in `ConsensusStatus.backpressure`,
-                                            // and warn for log-side correlation.
+                                            // record the timestamp in the per-peer
+                                            // sliding window (#490) and kick the peer
+                                            // if it crosses the threshold.
                                             peer_outbound_overflows.fetch_add(1, Ordering::Relaxed);
                                             warn!("SendTo {id}: channel full");
+                                            let tracker = slow_peer_trackers
+                                                .entry(node_id)
+                                                .or_insert_with(SlowPeerTracker::new);
+                                            if tracker.record_overflow(Instant::now()) {
+                                                trip_disconnect = true;
+                                            }
                                         }
                                         Err(mpsc::error::TrySendError::Closed(_)) => {
                                             // Closed channels are shutdown noise — counting
@@ -224,6 +313,17 @@ pub async fn run(
                                     }
                                 } else {
                                     warn!("SendTo unknown peer {id}");
+                                }
+                                if trip_disconnect {
+                                    disconnect_peer_for_overflow(
+                                        node_id,
+                                        &mut peers,
+                                        &protocols,
+                                        &peer_gone_tx,
+                                        &discovery_tx,
+                                        connection_limiter.as_ref(),
+                                        &mut slow_peer_trackers,
+                                    );
                                 }
                             }
                         }
@@ -273,6 +373,7 @@ pub async fn run(
                             if let Some(limiter) = connection_limiter.as_ref() {
                                 limiter.release(slot.direction, slot.addr.ip());
                             }
+                            slow_peer_trackers.remove(&node_id);
                             // Broadcast the disconnect immediately instead
                             // of waiting for the connection task's PeerGone
                             // to land — that stale PeerGone will now see a
@@ -448,11 +549,18 @@ fn tag(protocol_id: u8, payload: Bytes) -> Bytes {
     buf.freeze()
 }
 
+/// Broadcast `msg` to every peer; on per-peer `Full` failures, bump
+/// the global overflow counter and the per-peer slow-peer tracker.
+/// Returns the [`NodeId`]s whose tracker tripped this call so the
+/// caller can disconnect them outside the borrow on `peers`.
 fn broadcast_msg(
     peers: &BTreeMap<NodeId, PeerSlot>,
     msg: Bytes,
     peer_outbound_overflows: &Arc<AtomicU64>,
-) {
+    slow_peer_trackers: &mut HashMap<NodeId, SlowPeerTracker>,
+) -> Vec<NodeId> {
+    let mut to_disconnect = Vec::new();
+    let now = Instant::now();
     for (node_id, slot) in peers {
         let id = node_id_to_base58(node_id);
         match slot.write_tx.try_send(msg.clone()) {
@@ -460,12 +568,53 @@ fn broadcast_msg(
             Err(mpsc::error::TrySendError::Full(_)) => {
                 peer_outbound_overflows.fetch_add(1, Ordering::Relaxed);
                 warn!("broadcast to {id}: channel full, skipping");
+                let tracker = slow_peer_trackers
+                    .entry(*node_id)
+                    .or_insert_with(SlowPeerTracker::new);
+                if tracker.record_overflow(now) {
+                    to_disconnect.push(*node_id);
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 warn!("broadcast to {id}: channel closed, skipping");
             }
         }
     }
+    to_disconnect
+}
+
+/// Tear down `node_id`'s peer slot and notify the rest of the system,
+/// matching the cleanup `PeerCommand::Disconnect` performs. Used by
+/// the slow-peer disconnect heuristic (#490) so the
+/// must-deliver-or-disconnect contract from `docs/backpressure.md`
+/// has a real escape valve.
+fn disconnect_peer_for_overflow(
+    node_id: NodeId,
+    peers: &mut BTreeMap<NodeId, PeerSlot>,
+    protocols: &BTreeMap<u8, mpsc::Sender<ProtocolEvent>>,
+    peer_gone_tx: &broadcast::Sender<NodeId>,
+    discovery_tx: &broadcast::Sender<DiscoveryEvent>,
+    connection_limiter: Option<&Arc<ConnectionLimiter>>,
+    slow_peer_trackers: &mut HashMap<NodeId, SlowPeerTracker>,
+) {
+    let id = node_id_to_base58(&node_id);
+    let Some(slot) = peers.remove(&node_id) else {
+        return;
+    };
+    if let Some(limiter) = connection_limiter {
+        limiter.release(slot.direction, slot.addr.ip());
+    }
+    let _ = peer_gone_tx.send(node_id);
+    let _ = discovery_tx.send(DiscoveryEvent::PeerRemoved(node_id));
+    for event_tx in protocols.values() {
+        let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id });
+    }
+    slow_peer_trackers.remove(&node_id);
+    info!(
+        "slow-peer disconnect: {id} hit {} write_tx overflows in {}s — kicking",
+        SLOW_PEER_OVERFLOW_THRESHOLD,
+        SLOW_PEER_OVERFLOW_WINDOW.as_secs(),
+    );
 }
 
 #[cfg(test)]
@@ -711,6 +860,84 @@ mod tests {
         // exercised explicitly in
         // `send_to_full_channel_increments_overflow_counter` below
         // using larger payloads.
+    }
+
+    #[test]
+    fn slow_peer_tracker_fires_once_per_streak() {
+        // The first push past THRESHOLD returns true; subsequent
+        // pushes within the window return false (so the manager
+        // doesn't keep firing PeerGone events while the disconnect
+        // cleanup is in flight).
+        let mut t = SlowPeerTracker::new();
+        let now = Instant::now();
+        for i in 0..SLOW_PEER_OVERFLOW_THRESHOLD - 1 {
+            assert!(!t.record_overflow(now + Duration::from_millis(i as u64)));
+        }
+        // The threshold-th push trips.
+        assert!(
+            t.record_overflow(now + Duration::from_millis(SLOW_PEER_OVERFLOW_THRESHOLD as u64))
+        );
+        // Subsequent pushes don't re-trip.
+        assert!(
+            !t.record_overflow(
+                now + Duration::from_millis(SLOW_PEER_OVERFLOW_THRESHOLD as u64 + 1)
+            )
+        );
+    }
+
+    #[test]
+    fn slow_peer_tracker_ages_out_old_overflows() {
+        // Overflows older than the window are pruned, so a peer that
+        // briefly stalled and recovered isn't penalised forever.
+        let mut t = SlowPeerTracker::new();
+        let now = Instant::now();
+        // Push enough to be near threshold, all in the *past* window.
+        for i in 0..SLOW_PEER_OVERFLOW_THRESHOLD - 1 {
+            t.record_overflow(now + Duration::from_millis(i as u64));
+        }
+        // Jump forward past the window; the next push sees an empty
+        // window and does not trip even though many pushes preceded it.
+        let later = now + SLOW_PEER_OVERFLOW_WINDOW + Duration::from_secs(1);
+        assert!(!t.record_overflow(later));
+        assert_eq!(t.overflows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_peer_is_disconnected_after_threshold_overflows() {
+        // The slow-peer disconnect heuristic (#490) kicks the peer
+        // once SLOW_PEER_OVERFLOW_THRESHOLD writes hit `Full` within
+        // SLOW_PEER_OVERFLOW_WINDOW. Flood a non-draining peer with
+        // 4-KiB frames × 200 (well past the 64-frame threshold +
+        // 64-KiB duplex buffer) and assert the peer is removed from
+        // the manager's `peers` map and a PeerGone broadcast fires.
+        let mut mgr = TestManager::start(nid(1));
+        let h = mgr.register(0x01).await;
+        let _slow = add_peer(&mgr, nid(20)).await;
+
+        // Sanity: peer is registered before the flood.
+        assert!(mgr.has_peer(nid(20)).await);
+
+        let payload = Bytes::from(vec![0xAB; 4 * 1024]);
+        for _ in 0..200 {
+            h.send_tx
+                .send(ProtocolOutbound::SendTo {
+                    node_id: nid(20),
+                    payload: payload.clone(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // Wait for PeerGone — that's the load-bearing observable. Emits
+        // exactly once per disconnect via `peer_gone_tx`.
+        let gone = tokio::time::timeout(Duration::from_secs(2), mgr.peer_gone_rx.recv())
+            .await
+            .expect("peer_gone broadcast times out — slow-peer disconnect did not fire")
+            .expect("peer_gone channel closed");
+        assert_eq!(gone, nid(20));
+
+        // Peer is also removed from the manager's authoritative map.
+        assert!(!mgr.has_peer(nid(20)).await);
     }
 
     #[tokio::test]
