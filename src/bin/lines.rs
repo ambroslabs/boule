@@ -632,6 +632,8 @@ fn print_table(root: &Path, by_dir: &BTreeMap<PathBuf, Counts>, total: Counts) {
     let header_path = format!("Path (under {})", root.display());
     let bar = "=".repeat(96);
     println!("{bar}");
+    println!(" Lines = Code + Comments + Blanks    |    Code = Impl + Test");
+    println!("{bar}");
     println!(
         " {:<28} {:>7} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}",
         header_path, "Files", "Lines", "Code", "Impl", "Test", "Comments", "Blanks",
@@ -664,14 +666,38 @@ fn print_table(root: &Path, by_dir: &BTreeMap<PathBuf, Counts>, total: Counts) {
     );
     println!("{bar}");
     let code = total.code();
-    if code > 0 {
-        let test_pct = 100.0 * total.code_test as f64 / code as f64;
+    if code > 0 && total.lines > 0 {
+        let pct_total = 100.0 * total.code_test as f64 / total.lines as f64;
+        let pct_code = 100.0 * total.code_test as f64 / code as f64;
         let test_to_impl = total.code_test as f64 / total.code_impl.max(1) as f64;
         println!(
-            " test code: {:.1}% of code  ({:.2}× impl)",
-            test_pct, test_to_impl
+            " test code: {:.1}% of all lines ({} / {})",
+            pct_total,
+            with_thousands(total.code_test),
+            with_thousands(total.lines),
         );
+        println!(
+            "            {:.1}% of code lines ({} / {}; \"code\" excludes comments + blanks)",
+            pct_code,
+            with_thousands(total.code_test),
+            with_thousands(code),
+        );
+        println!("            {:.2}× impl code", test_to_impl);
     }
+}
+
+fn with_thousands(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let len = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
 }
 
 fn display_rel(p: &Path, root: &Path) -> String {
