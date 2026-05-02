@@ -290,7 +290,13 @@ pub struct ConsensusNode {
     /// content-hash for the single-block fallback path) — the two
     /// trackers compose: a recovering node typically holds one or
     /// two range entries plus zero or more single-hash entries.
-    block_sync_range_inflight: HashMap<(Height, Height), NodeId>,
+    ///
+    /// The value carries enough state for the dedicated retry timer
+    /// (#530) to re-emit a dropped request without waiting for the next
+    /// `ProposalReceived` to re-trigger gap detection: the addressed
+    /// peer, the per-entry attempt count, and the wall-clock instant of
+    /// the most recent emission.
+    block_sync_range_inflight: HashMap<(Height, Height), BlockSyncRangeInflight>,
     /// Peer-membership snapshot used by [`ConsensusNode::build_status`].
     /// Populated from [`Discovery`] events inside [`ConsensusNode::run`];
     /// before `run` starts (or in tests that bypass it) the set is empty
@@ -384,6 +390,35 @@ pub struct ConsensusNode {
     /// fails because a sibling deployment with a different genesis has
     /// a different `ChainId`.
     chain_id: ChainId,
+}
+
+/// Per-`(from_height, to_height)` retry accounting for
+/// [`WireMessage::BlockRangeRequest`] (#530). Mirror of the
+/// [`HotStuffCore`]'s hash-keyed `BlockSyncInflight` for the
+/// single-block path: the dedicated retry timer walks both maps so a
+/// dropped range request recovers in `O(100ms)` rather than waiting
+/// for the next `ProposalReceived` to re-trigger gap detection.
+#[derive(Debug, Clone)]
+pub(super) struct BlockSyncRangeInflight {
+    /// Peer the most recent emission was addressed to. Retries re-ask
+    /// the same peer; per-peer rotation for range requests is a
+    /// follow-up (#530 explicitly carves it out of scope), so all
+    /// attempts within a single inflight entry hit one address.
+    pub(super) peer: NodeId,
+    /// Number of `BlockRangeRequest` emissions for this span so far,
+    /// including the initial probe. Compared against
+    /// [`crate::consensus::limits::CacheLimits::block_sync_max_attempts`]
+    /// before each retry — when exhausted the entry is dropped and the
+    /// next `ProposalReceived` is left to re-trigger gap detection
+    /// from the current commit frontier.
+    pub(super) attempts: u32,
+    /// `tokio::time::Instant` of the most recent emission. The retry
+    /// walk skips any entry whose elapsed wall-clock since
+    /// `last_asked_at` is below the configured retry threshold —
+    /// guards against an immediate re-emission when the timer ticks
+    /// shortly after a fresh insert from
+    /// [`super::action_interpreter`]'s `maybe_emit_block_range_request`.
+    pub(super) last_asked_at: tokio::time::Instant,
 }
 
 impl ConsensusNode {
@@ -1014,6 +1049,20 @@ impl ConsensusNode {
                     let actions = self.core.step_block_sync_retry_tick();
                     self.apply_safety_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer)
                         .await?;
+                    // Range-keyed retry walk (#530) shares the same
+                    // wall-clock cadence as the hash-keyed path above:
+                    // a dropped `BlockRangeRequest` recovers in
+                    // `O(100ms)` rather than waiting for the next
+                    // `ProposalReceived` to re-trigger gap detection.
+                    // The per-entry `BLOCK_SYNC_RETRY_INITIAL_DELAY`
+                    // quiescence threshold guards against immediate
+                    // re-emission when this tick fires shortly after a
+                    // fresh `maybe_emit_block_range_request` insert.
+                    self.maintain_block_sync_range_retry(
+                        broadcaster.as_ref(),
+                        BLOCK_SYNC_RETRY_INITIAL_DELAY,
+                    )
+                    .await?;
                 }
 
                 disc = discovery_events.recv() => {
@@ -1159,24 +1208,31 @@ impl ConsensusNode {
     }
 
     /// Re-arm or cancel the dedicated block-sync retry timer (#512)
-    /// based on whether the safety core still has any in-flight
-    /// `RequestBlock` after the current iteration's actions were
-    /// applied.
+    /// based on whether the safety core or the integration layer has
+    /// any in-flight block-sync request after the current iteration's
+    /// actions were applied. Both the hash-keyed `block_sync_inflight`
+    /// (single-block path) and the range-keyed
+    /// `block_sync_range_inflight` (#530) keep the timer alive — a
+    /// dropped `BlockRangeRequest` would otherwise wait for the next
+    /// `ProposalReceived` to re-trigger gap detection, which on a
+    /// quiet cluster can stretch to seconds.
     ///
-    /// - When inflight is non-empty and no timer is armed: arm with
-    ///   the next exponential-backoff delay (initial on the first
-    ///   arm of a fresh inflight burst).
-    /// - When inflight is non-empty and a timer is already armed:
-    ///   no-op (the prior arming will fire and re-trigger this
+    /// - When either tracker is non-empty and no timer is armed: arm
+    ///   with the next exponential-backoff delay (initial on the
+    ///   first arm of a fresh inflight burst).
+    /// - When either tracker is non-empty and a timer is already
+    ///   armed: no-op (the prior arming will fire and re-trigger this
     ///   helper).
-    /// - When inflight is empty: cancel the timer and reset the
+    /// - When both trackers are empty: cancel the timer and reset the
     ///   backoff so the next burst starts from the initial delay.
     fn maintain_block_sync_retry_timer(
         &self,
         retry_timer: &mut BlockSyncRetryTimer,
         retry_timer_delay: &mut Option<Duration>,
     ) {
-        if self.core.has_any_block_sync_inflight() {
+        let any_inflight =
+            self.core.has_any_block_sync_inflight() || !self.block_sync_range_inflight.is_empty();
+        if any_inflight {
             if !retry_timer.is_armed() {
                 let delay = next_retry_delay(
                     *retry_timer_delay,
@@ -1204,8 +1260,14 @@ impl ConsensusNode {
         to_height: Height,
         peer: NodeId,
     ) {
-        self.block_sync_range_inflight
-            .insert((from_height, to_height), peer);
+        self.block_sync_range_inflight.insert(
+            (from_height, to_height),
+            BlockSyncRangeInflight {
+                peer,
+                attempts: 1,
+                last_asked_at: tokio::time::Instant::now(),
+            },
+        );
     }
 
     /// Test-only: read a `block_sync_range_inflight` entry. Returns
@@ -1220,7 +1282,22 @@ impl ConsensusNode {
     ) -> Option<NodeId> {
         self.block_sync_range_inflight
             .get(&(from_height, to_height))
-            .copied()
+            .map(|e| e.peer)
+    }
+
+    /// Test-only: read a `block_sync_range_inflight` entry's attempt
+    /// counter. Returns `None` when no entry exists for the given
+    /// span. Used by the `#530` range-retry tests to assert the
+    /// counter advances on each retry walk.
+    #[cfg(test)]
+    pub(crate) fn block_sync_range_inflight_attempts_for_test(
+        &self,
+        from_height: Height,
+        to_height: Height,
+    ) -> Option<u32> {
+        self.block_sync_range_inflight
+            .get(&(from_height, to_height))
+            .map(|e| e.attempts)
     }
 }
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -4230,6 +4307,219 @@ mod tests {
             range_emissions.is_empty(),
             "single-block gap must not trigger BlockRangeRequest; saw {range_emissions:?}",
         );
+    }
+
+    // ── Range-keyed retry timer (#530) ───────────────────────────────────
+
+    /// Wall-clock-driven retry walk re-emits the next
+    /// `BlockRangeRequest` for an entry whose elapsed since
+    /// `last_asked_at` has crossed the configured threshold. Pins the
+    /// #530 acceptance criterion: a dropped first range request
+    /// recovers in `<= 500ms simulated` rather than waiting for the
+    /// next `ProposalReceived` to re-trigger gap detection.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_block_range_request_retries_within_500ms_simulated() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let proposer_signer = fresh_signer();
+        let proposer_id = proposer_signer.node_id();
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Multi-block gap: parent at height 30 is missing on this
+        // (fresh) node. The proposal arrival fires the initial
+        // `BlockRangeRequest` for [1, 30] to the proposer.
+        let parent_hash: BlockHash = [0xAB; 32];
+        let dispatch = synthetic_proposal_dispatch(&proposer_signer, 31, 31, parent_hash);
+        node.apply_dispatch(dispatch, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .expect("apply_dispatch");
+
+        let initial = drain_send_to_outbound(&mut outbound_rx);
+        let initial_range: Vec<_> = initial
+            .iter()
+            .filter(|(_, w)| matches!(w, WireMessage::BlockRangeRequest { .. }))
+            .collect();
+        assert_eq!(
+            initial_range.len(),
+            1,
+            "exactly one BlockRangeRequest must fire on the initial gap; saw {initial:?}",
+        );
+        // Simulate the request being lost in flight: drained above
+        // and never delivered. The inflight entry remains, attempts=1.
+        assert_eq!(
+            node.block_sync_range_inflight_attempts_for_test(Height(1), Height(30)),
+            Some(1),
+        );
+
+        // Advance simulated time to the retry threshold and drive the
+        // wall-clock retry walk. The threshold matches the dedicated
+        // retry timer's initial delay (200ms); the AC budget is 500ms,
+        // so a single tick at the threshold satisfies it with margin.
+        tokio::time::advance(BLOCK_SYNC_RETRY_INITIAL_DELAY).await;
+        node.maintain_block_sync_range_retry(broadcaster.as_ref(), BLOCK_SYNC_RETRY_INITIAL_DELAY)
+            .await
+            .expect("retry walk");
+
+        let retried = drain_send_to_outbound(&mut outbound_rx);
+        let retry_range: Vec<_> = retried
+            .iter()
+            .filter_map(|(to, w)| match w {
+                WireMessage::BlockRangeRequest {
+                    from_height,
+                    to_height,
+                } => Some((*to, *from_height, *to_height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            retry_range,
+            vec![(proposer_id, Height(1), Height(30))],
+            "retry walk must re-emit one BlockRangeRequest with the same span; saw {retried:?}",
+        );
+        assert_eq!(
+            node.block_sync_range_inflight_attempts_for_test(Height(1), Height(30)),
+            Some(2),
+            "attempts counter must advance on retry",
+        );
+    }
+
+    /// A retry walk that fires shortly after a fresh insert (less than
+    /// the per-entry quiescence threshold) must not re-emit. Guards
+    /// against an immediate retry when the timer ticks within
+    /// milliseconds of the initial probe.
+    #[tokio::test(start_paused = true)]
+    async fn range_retry_walk_below_threshold_is_a_noop() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let proposer_signer = fresh_signer();
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let parent_hash: BlockHash = [0xAB; 32];
+        let dispatch = synthetic_proposal_dispatch(&proposer_signer, 31, 31, parent_hash);
+        node.apply_dispatch(dispatch, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .expect("apply_dispatch");
+        let _drained = drain_send_to_outbound(&mut outbound_rx);
+
+        // Advance well below the threshold (50ms vs 200ms default).
+        tokio::time::advance(Duration::from_millis(50)).await;
+        node.maintain_block_sync_range_retry(broadcaster.as_ref(), BLOCK_SYNC_RETRY_INITIAL_DELAY)
+            .await
+            .expect("retry walk");
+
+        let frames = drain_send_to_outbound(&mut outbound_rx);
+        let range_emissions: Vec<_> = frames
+            .iter()
+            .filter(|(_, w)| matches!(w, WireMessage::BlockRangeRequest { .. }))
+            .collect();
+        assert!(
+            range_emissions.is_empty(),
+            "below-threshold retry walk must not re-emit; saw {range_emissions:?}",
+        );
+        assert_eq!(
+            node.block_sync_range_inflight_attempts_for_test(Height(1), Height(30)),
+            Some(1),
+            "attempts counter must stay at 1 when the walk skips",
+        );
+    }
+
+    /// The per-entry attempt budget bounds retry forever. Once the
+    /// counter hits `block_sync_max_attempts`, the next walk drops the
+    /// inflight entry instead of re-emitting — the next
+    /// `ProposalReceived` will re-trigger gap detection from the
+    /// current commit frontier with a fresh sender.
+    #[tokio::test(start_paused = true)]
+    async fn range_retry_drops_entry_when_attempts_budget_exhausted() {
+        let mut node = make_node_with_block_sync_max_attempts(nid(1), 3);
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+
+        // Pretend a BlockRangeRequest for [5, 7] has been emitted three
+        // times to nid(2) without a response — the inflight tracker is
+        // at the budget ceiling.
+        node.install_block_sync_range_inflight_for_test(Height(5), Height(7), nid(2));
+        // `install_*` records `attempts = 1`; bump to the cap so the
+        // next walk crosses the budget check.
+        if let Some(entry) = node
+            .block_sync_range_inflight
+            .get_mut(&(Height(5), Height(7)))
+        {
+            entry.attempts = 3;
+        }
+
+        tokio::time::advance(BLOCK_SYNC_RETRY_INITIAL_DELAY).await;
+        node.maintain_block_sync_range_retry(broadcaster.as_ref(), BLOCK_SYNC_RETRY_INITIAL_DELAY)
+            .await
+            .expect("retry walk");
+
+        assert!(
+            node.block_sync_range_inflight_attempts_for_test(Height(5), Height(7))
+                .is_none(),
+            "exhausted entry must be dropped from the tracker",
+        );
+        let frames = drain_send_to_outbound(&mut outbound_rx);
+        let range_emissions: Vec<_> = frames
+            .iter()
+            .filter(|(_, w)| matches!(w, WireMessage::BlockRangeRequest { .. }))
+            .collect();
+        assert!(
+            range_emissions.is_empty(),
+            "exhausted entry must not re-emit on the same walk; saw {range_emissions:?}",
+        );
+    }
+
+    /// Build a `ConsensusNode` with `block_sync_max_attempts` capped at
+    /// `max`. Used by the #530 retry tests to exercise the budget-
+    /// exhaustion drop path without having to issue `max-1` real
+    /// emissions.
+    fn make_node_with_block_sync_max_attempts(self_id: NodeId, max: u32) -> ConsensusNode {
+        let vs = four_validators();
+        let mut limits = CacheLimits::unbounded_for_tests();
+        limits.block_sync_max_attempts = max;
+        let mut cfg = NodeConfigForConsensus::for_testing(vs, genesis());
+        cfg.limits = limits;
+        ConsensusNode::new(
+            self_id,
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(256)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        )
+    }
+
+    /// The retry timer stays armed while only the range tracker has
+    /// entries — `maintain_block_sync_retry_timer` must consider both
+    /// the safety-core single-block map and the integration-layer
+    /// range map. Without this, a dropped `BlockRangeRequest` would
+    /// stall waiting for the next `ProposalReceived`.
+    #[tokio::test(start_paused = true)]
+    async fn retry_timer_stays_armed_while_range_inflight_is_nonempty() {
+        let mut node = make_node(nid(1));
+        node.install_block_sync_range_inflight_for_test(Height(1), Height(30), nid(2));
+
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let mut retry_timer = BlockSyncRetryTimer::new(timer_tx);
+        let mut delay: Option<Duration> = None;
+
+        node.maintain_block_sync_retry_timer(&mut retry_timer, &mut delay);
+        assert!(
+            retry_timer.is_armed(),
+            "retry timer must be armed when only range inflight is non-empty",
+        );
+        assert_eq!(delay, Some(BLOCK_SYNC_RETRY_INITIAL_DELAY));
+
+        // Drain the entry; the next call must cancel the timer.
+        node.block_sync_range_inflight.clear();
+        node.maintain_block_sync_retry_timer(&mut retry_timer, &mut delay);
+        assert!(
+            !retry_timer.is_armed(),
+            "retry timer must be cancelled once both trackers drain",
+        );
+        assert_eq!(delay, None);
     }
 
     // ── Snapshot wire protocol (#228) — serving handlers ────────────────
