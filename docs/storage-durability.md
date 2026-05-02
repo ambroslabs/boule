@@ -193,6 +193,37 @@ on modern hardware — comfortably below the consensus per-step budget.
 consensus replays the WAL (per-entry checksum). Either way, see
 [Operator runbook](#operator-runbook).
 
+### Persisted validator-history blob diverges from the committed chain
+
+Tested in
+[`verify_persisted_history_consistency_rejects_byte_flip_in_v_eff`](../src/consensus/node/mod.rs),
+[`verify_persisted_history_consistency_rejects_extra_boundary`](../src/consensus/node/mod.rs),
+and
+[`verify_persisted_history_consistency_rejects_tampered_genesis_member`](../src/consensus/node/mod.rs).
+
+At startup, [`ConsensusNode::verify_persisted_history_consistency`](../src/consensus/node/persistence.rs)
+walks every committed block from genesis to `last_committed_hash`
+and rebuilds the `(validator_history, validator_key_history,
+bls_key_history?)` triple from each block's reconfig and rotation
+commands. It asserts that (a) each block's stamped
+`validator_history_commitment` matches the rebuilt triple at that
+point in the walk, and (b) the loaded persisted blobs equal the
+end-of-walk rebuilt blobs byte-for-byte. Either check failing
+means the persisted blob no longer matches the committed chain —
+realistic causes are disk bit-flip, partial-fsync on a non-
+conforming filesystem, manual restore from a stale backup or
+partial state copy across hosts, or deliberate tampering.
+
+**Behavior:** the check returns `Err` (no panic), the error chains
+back through `node::run` → `handle_start` → `main`, and `main`
+prints `error: verifying persisted validator histories against
+committed chain (#325 PR B): <discriminating message>` and exits
+non-zero. No consensus signing happens against the divergent
+state. Audit finding L4-2 / issue [#504][issue-504]; the
+engineering work landed in [#325 PR B][issue-325].
+
+**Operator action:** see [Operator runbook](#operator-runbook).
+
 ### Truncated tail (e.g. partial write of a torn page)
 
 Implicit in the SIGKILL test (the only realistic way to produce a torn
@@ -267,6 +298,52 @@ What to do:
    confirm a clean start, and for the height advancing to confirm
    block-sync caught it up.
 
+### "Node won't start: validator history is inconsistent with the committed chain"
+
+Symptoms in logs: the wrapped-context prefix
+`verifying persisted validator histories against committed chain (#325 PR B)`
+followed by one of the discriminating error messages from
+[`verify_persisted_history_consistency`](../src/consensus/node/persistence.rs):
+
+- `validator_history_commitment mismatch at block height=<H> view=<V>
+  hash=<hex>: block claims <hex> but rebuild from chain produces
+  <hex>` — a per-block check failed; the named block's stamped
+  commitment doesn't match the triple rebuilt from the chain walk
+  up to that point.
+- `validator_history_rebuild_mismatch: loaded validator_history does
+  not match rebuild from chain` — the persisted set-history blob
+  diverges at end-of-walk.
+- `validator_key_history_rebuild_mismatch: ...` — same, for the
+  key-history blob.
+- `bls_key_history_rebuild_mismatch: ...` — same, for the BLS
+  key-history blob (BLS chains only).
+- `validator history rebuild: walked-chain genesis hash <hex> does
+  not match configured genesis hash <hex>` — the persisted block
+  store's genesis differs from this node's configured genesis (the
+  block store may be from a different chain entirely).
+
+What to do:
+
+1. **Stop the node** (it's already exited; ensure systemd /
+   supervisor isn't restart-looping it).
+2. **Take a copy of the broken `storage_dir`** — useful for
+   post-mortem to identify the divergent boundary.
+3. **Choose a recovery path:**
+   - **(preferred)** Restore `storage_dir` from a recent backup,
+     then start the node. It will catch up to the cluster's tip
+     via block-sync.
+   - **(fallback)** Wipe `storage_dir` entirely and re-join as a
+     fresh replica. Same caveats as the WAL-corrupt case: only
+     when a quorum of peers is alive and uncorrupted; never wipe
+     more than one node at a time without coordinating.
+4. **Restart the node.** Watch for `consensus_resumed` in logs and
+   for the height advancing to confirm block-sync caught it up.
+
+**Do not edit the persisted blobs by hand to "make the check
+pass."** The divergence is the symptom, not the disease. Bypassing
+the gate leaves the cluster signing against state inconsistent with
+the committed chain — exactly the failure mode the gate prevents.
+
 ### "Node exits with `No space left on device` / `File too large`"
 
 The node fail-stopped because a `Storage::apply_batch` or `Wal::flush`
@@ -287,3 +364,5 @@ unmounted, permissions changed, hardware fault), fix it, and restart.
 
 [issue-136]: https://github.com/zrbecker/ambros-p2p/issues/136
 [issue-197]: https://github.com/zrbecker/ambros-p2p/issues/197
+[issue-325]: https://github.com/zrbecker/ambros-p2p/issues/325
+[issue-504]: https://github.com/zrbecker/ambros-p2p/issues/504
