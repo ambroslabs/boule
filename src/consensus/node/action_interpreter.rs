@@ -932,6 +932,31 @@ impl ConsensusNode {
                         "consensus_equivocation_detected",
                     );
                 }
+
+                SafetyAction::ProposalEquivocationEvidence {
+                    leader,
+                    view,
+                    block_a,
+                    block_b,
+                } => {
+                    // Audit finding L5-1: the safety core just
+                    // observed a stable leader proposing two distinct
+                    // block_hash values at the same view. Sibling
+                    // handler of `EquivocationEvidence` above —
+                    // separate counter and event name so operator
+                    // dashboards can attribute proposer-side vs.
+                    // voter-side Byzantine activity independently.
+                    self.proposal_equivocations_detected
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        leader = %node_id_to_base58(leader.as_node_id()),
+                        view = view.0,
+                        block_a = ?block_a,
+                        block_b = ?block_b,
+                        "consensus_proposal_equivocation_detected",
+                    );
+                }
             }
         }
 

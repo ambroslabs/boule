@@ -441,7 +441,8 @@ impl ReplicaSet {
                 }
                 Action::Persist(_)
                 | Action::RequestBlock { .. }
-                | Action::EquivocationEvidence { .. } => {}
+                | Action::EquivocationEvidence { .. }
+                | Action::ProposalEquivocationEvidence { .. } => {}
             }
         }
     }

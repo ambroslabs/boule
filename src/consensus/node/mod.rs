@@ -316,6 +316,14 @@ pub struct ConsensusNode {
     /// matching WARN log advance in lockstep. Surfaced under
     /// [`ConsensusStatus::equivocations_detected`].
     equivocations_detected: Arc<AtomicU64>,
+    /// Cumulative count of proposal-equivocation incidents the safety
+    /// core has surfaced via
+    /// [`crate::consensus::hotstuff::step::Action::ProposalEquivocationEvidence`]
+    /// (audit finding L5-1). Sibling of [`Self::equivocations_detected`]
+    /// — proposer-side detection lives on its own counter so the
+    /// voter-side metric stays interpretable. Surfaced under
+    /// [`ConsensusStatus::proposal_equivocations_detected`].
+    proposal_equivocations_detected: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -490,6 +498,7 @@ impl ConsensusNode {
             last_committed_height,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
+            proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
             last_committed_view: View::ZERO,
             status_tx: None,
             rate_limiter: None,
@@ -637,6 +646,16 @@ impl ConsensusNode {
     /// having to subscribe to a status publisher.
     pub fn equivocations_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.equivocations_detected)
+    }
+
+    /// Clone the shared proposal-equivocation counter (audit finding
+    /// L5-1). The same `Arc` the integration layer increments on every
+    /// `Action::ProposalEquivocationEvidence` it observes; sibling of
+    /// [`Self::equivocations_counter`] used by
+    /// [`crate::consensus::sim::SimCluster::peek_proposal_equivocations_detected`]
+    /// to verify the proposer-side detection path end-to-end.
+    pub fn proposal_equivocations_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.proposal_equivocations_detected)
     }
 
     /// Borrow the eviction counters this node aggregates across the
@@ -834,6 +853,7 @@ impl ConsensusNode {
             last_committed_height,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
+            proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,

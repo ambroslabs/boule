@@ -476,6 +476,14 @@ pub struct SimCluster {
     /// pre-restart counter (irrelevant for the suite at the time of
     /// writing — none of it restarts).
     equivocations_counters: Vec<Arc<AtomicU64>>,
+    /// Per-node clones of [`ConsensusNode::proposal_equivocations_counter`].
+    /// Sibling of [`Self::equivocations_counters`] for the proposer-side
+    /// detector landed in audit finding L5-1; populated at spawn time
+    /// so a test can read each honest replica's running
+    /// proposal-equivocation count via
+    /// [`SimCluster::peek_proposal_equivocations_detected`] without
+    /// subscribing to a status publisher.
+    proposal_equivocations_counters: Vec<Arc<AtomicU64>>,
     /// Per-node runtime-mutable processing delay in microseconds,
     /// keyed by `NodeId`. Used by the slow-node bridge (#497) inserted
     /// between each node's inbound `event_rx` and its consensus
@@ -906,6 +914,9 @@ impl SimCluster {
         // test can read the running count via
         // `SimCluster::peek_equivocations_detected`.
         let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        // Per-node proposal-equivocation counter Arcs (audit finding
+        // L5-1), captured here for the same reason.
+        let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
 
         for (idx, (nid, event_rx)) in event_rxs.into_iter().enumerate() {
             let signer = signer_map[&nid].clone();
@@ -1063,6 +1074,10 @@ impl SimCluster {
             // `SimCluster::peek_equivocations_detected` see updates the
             // run loop applies after each ingress tick.
             equivocations_counters.push(node.equivocations_counter());
+            // Same capture for the proposer-side counter (audit finding
+            // L5-1), surfaced via
+            // `SimCluster::peek_proposal_equivocations_detected`.
+            proposal_equivocations_counters.push(node.proposal_equivocations_counter());
 
             // Slow-node bridge (#497): the route-task side writes into
             // `event_rx`'s sender; the bridge drains `event_rx`,
@@ -1113,6 +1128,7 @@ impl SimCluster {
             timeout_base,
             vote_observer,
             equivocations_counters,
+            proposal_equivocations_counters,
             slow_node_delays_us,
         };
         (cluster, limiters)
@@ -1381,6 +1397,18 @@ impl SimCluster {
     /// assert the evidence-emission path is exercised end-to-end.
     pub fn peek_equivocations_detected(&self, idx: usize) -> u64 {
         self.equivocations_counters[idx].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of proposal-equivocation incidents node `idx`'s
+    /// integration layer has surfaced via
+    /// [`crate::consensus::hotstuff::step::Action::ProposalEquivocationEvidence`]
+    /// (audit finding L5-1). Sibling of
+    /// [`Self::peek_equivocations_detected`] for the proposer-side
+    /// detector — used by the twin-mode adversary suite to assert the
+    /// `TwinKind::Proposal` branch lights up the same `Arc<AtomicU64>`
+    /// the run loop increments.
+    pub fn peek_proposal_equivocations_detected(&self, idx: usize) -> u64 {
+        self.proposal_equivocations_counters[idx].load(Ordering::Relaxed)
     }
 
     /// Non-destructively report the highest committed [`Block`] height
@@ -2328,6 +2356,7 @@ impl SimCluster {
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
         let mut mempools_captured_gossip: Vec<Arc<dyn Mempool>> = Vec::new();
         let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
         // Hold the overlay shutdown senders for the lifetime of the
         // SimCluster — dropping them eagerly wakes the orchestrator's
         // `_ = &mut self.shutdown` select arm and tears the run loop
@@ -2381,6 +2410,7 @@ impl SimCluster {
             let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
                 .with_commit_notifier(commit_notifier);
             equivocations_counters.push(node.equivocations_counter());
+            proposal_equivocations_counters.push(node.proposal_equivocations_counter());
 
             // Per-node outbound channel: orchestrator's OverlaySink writes
             // here; the route task reads on the other side.
@@ -2564,6 +2594,7 @@ impl SimCluster {
             timeout_base,
             vote_observer,
             equivocations_counters,
+            proposal_equivocations_counters,
             slow_node_delays_us: Arc::new(slow_node_delays_us),
         }
     }
