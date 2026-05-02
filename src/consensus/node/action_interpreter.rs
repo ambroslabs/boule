@@ -246,6 +246,29 @@ impl ConsensusNode {
                         pending_blocks_size = self.core.state().pending_blocks.len(),
                         "block_sync_request_unfindable",
                     );
+                    // Best-effort signal that the miss was caused by
+                    // pruning rather than "block we never saw" (#194):
+                    // we cannot distinguish the two without knowing
+                    // the requested block's height, so fire whenever
+                    // pruning is configured and could plausibly have
+                    // discarded the hash. Lets operators tell when
+                    // peers are asking for blocks past their
+                    // retention horizon.
+                    let last_committed = self
+                        .last_committed_height
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if self.block_retention_window > 0
+                        && last_committed >= self.block_retention_window
+                    {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            from = %node_id_to_base58(&to),
+                            hash = ?hash,
+                            last_committed_height = last_committed,
+                            retention_window = self.block_retention_window,
+                            "block_sync_responder_pruned_miss",
+                        );
+                    }
                 }
                 let out = dispatch::egress_block_response(
                     hash,

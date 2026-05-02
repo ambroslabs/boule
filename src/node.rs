@@ -394,6 +394,7 @@ async fn start_consensus(
         },
         min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
         signature_scheme: cons_cfg.signature_scheme,
+        block_retention_window: cons_cfg.block_retention_window,
     };
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -1014,6 +1015,7 @@ mod tests {
             snapshot_chunk_size_bytes: 1024,
             signature_scheme: scheme,
             validators_bls: vec![],
+            block_retention_window: 0,
         }
     }
 

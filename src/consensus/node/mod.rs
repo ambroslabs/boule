@@ -103,13 +103,14 @@ pub use block_builder::MempoolBlockBuilder;
 pub use config::NodeConfigForConsensus;
 pub use persistence::{
     LastCommitted, RECENT_QC_CACHE_CAPACITY, STORAGE_KEY_BLOCK_PREFIX, STORAGE_KEY_BLS_KEY_HISTORY,
-    STORAGE_KEY_HIGH_QC, STORAGE_KEY_LAST_COMMITTED, STORAGE_KEY_LAST_TIMEOUT_VOTE,
-    STORAGE_KEY_LAST_VOTED_VIEW, STORAGE_KEY_LOCKED, STORAGE_KEY_PROPOSED_IN_VIEW,
-    STORAGE_KEY_VALIDATOR_HISTORY, STORAGE_KEY_VALIDATOR_KEY_HISTORY, block_storage_key,
-    decode_block, decode_high_qc, decode_last_committed, decode_last_timeout_vote, decode_locked,
-    decode_proposed_in_view, decode_voted_view, encode_block, encode_high_qc,
-    encode_last_committed, encode_last_timeout_vote, encode_locked, encode_proposed_in_view,
-    encode_voted_view, load_block_from_storage, load_block_range_from_storage, recover_state,
+    STORAGE_KEY_HEIGHT_PREFIX, STORAGE_KEY_HIGH_QC, STORAGE_KEY_LAST_COMMITTED,
+    STORAGE_KEY_LAST_TIMEOUT_VOTE, STORAGE_KEY_LAST_VOTED_VIEW, STORAGE_KEY_LOCKED,
+    STORAGE_KEY_PROPOSED_IN_VIEW, STORAGE_KEY_VALIDATOR_HISTORY, STORAGE_KEY_VALIDATOR_KEY_HISTORY,
+    block_storage_key, decode_block, decode_height_storage_key, decode_high_qc,
+    decode_last_committed, decode_last_timeout_vote, decode_locked, decode_proposed_in_view,
+    decode_voted_view, encode_block, encode_high_qc, encode_last_committed,
+    encode_last_timeout_vote, encode_locked, encode_proposed_in_view, encode_voted_view,
+    height_storage_key, load_block_from_storage, load_block_range_from_storage, recover_state,
 };
 pub use wire::{
     BLOCK_RANGE_RESPONSE_MAX_BLOCKS, BlockRangeResponsePayload, BlockResponsePayload,
@@ -364,6 +365,12 @@ pub struct ConsensusNode {
     /// can update it through a `&self` receiver — the existing
     /// signature is consumed by many tests with shared (`&`) borrows.
     recent_qcs: Mutex<RecentQcCache>,
+    /// Number of committed blocks to retain in the durable block store
+    /// (`consensus/block/<hash>`) below `last_committed`. Older
+    /// committed blocks (and their `consensus/height/<be_u64>` index
+    /// entries) are deleted in the same atomic batch as each commit.
+    /// `0` disables pruning entirely (archive mode). See #194.
+    pub(super) block_retention_window: u64,
     /// Joiner-side snapshot-fetch state machine (#229). Watches
     /// inbound proposals for lag, drives manifest+chunk fetch from a
     /// single peer, and emits an action for the integration layer to
@@ -506,6 +513,7 @@ impl ConsensusNode {
             snapshot_policy: config.snapshot_policy,
             min_v_eff_delay: config.min_v_eff_delay,
             recent_qcs: Mutex::new(RecentQcCache::default()),
+            block_retention_window: config.block_retention_window,
             snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync::new(
                 config.snapshot_policy,
             ),
@@ -861,6 +869,7 @@ impl ConsensusNode {
             snapshot_policy: config.snapshot_policy,
             min_v_eff_delay: config.min_v_eff_delay,
             recent_qcs: Mutex::new(RecentQcCache::default()),
+            block_retention_window: config.block_retention_window,
             snapshot_sync: crate::consensus::snapshot_sync::SnapshotSync::new(
                 config.snapshot_policy,
             ),
@@ -8461,5 +8470,207 @@ mod tests {
         recovered
             .verify_persisted_history_consistency()
             .expect("BLS happy-path consistency check must pass");
+    }
+
+    // ── #194: block-store retention / pruning ────────────────────────────────
+
+    /// Build a sequential commit-shaped block at `(height, view)` whose
+    /// `parent_hash` is `parent`. Uses the same shape as `sample_block`
+    /// (no commands, zero state commitment) so `apply_commit` runs
+    /// without state-machine complaints. The returned block's hash is
+    /// distinct from sibling heights because `BlockHeader.height`
+    /// participates in `block.hash()`.
+    fn empty_block(parent_hash: BlockHash, height: u64, view: u64) -> Block {
+        Block {
+            header: BlockHeader {
+                parent_hash,
+                height: Height(height),
+                view: View(view),
+                proposer: nid(1),
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: vec![],
+        }
+    }
+
+    /// Drive `apply_commit` over a contiguous chain of `count` blocks
+    /// starting at height 1 (parent = genesis). Returns the per-height
+    /// hashes in order so callers can probe storage for specific
+    /// blocks.
+    fn commit_n_blocks(node: &mut ConsensusNode, count: u64) -> Vec<BlockHash> {
+        let mut parent = genesis().hash();
+        let mut hashes = Vec::with_capacity(count as usize);
+        for h in 1..=count {
+            let block = empty_block(parent, h, h);
+            parent = block.hash();
+            hashes.push(parent);
+            node.apply_commit(block);
+        }
+        hashes
+    }
+
+    fn make_node_with_retention(self_id: NodeId, retention: u64) -> ConsensusNode {
+        let mut cfg = test_config(four_validators());
+        cfg.block_retention_window = retention;
+        ConsensusNode::new(
+            self_id,
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        )
+    }
+
+    #[test]
+    fn commit_writes_height_index() {
+        // Sanity check the new secondary index: every committed block
+        // must be reachable by both `consensus/block/<hash>` and
+        // `consensus/height/<be_u64>`. With retention disabled (the
+        // test default) nothing is pruned, so all four heights stay
+        // resident.
+        let mut node = make_node_with_retention(nid(1), 0);
+        let hashes = commit_n_blocks(&mut node, 4);
+
+        for (i, hash) in hashes.iter().enumerate() {
+            let height = Height((i as u64) + 1);
+            let height_key = height_storage_key(height);
+            let raw = node
+                .storage
+                .get(&height_key)
+                .expect("get height key")
+                .expect("height index entry must exist");
+            let stored: BlockHash = raw.as_ref().try_into().expect("32-byte hash");
+            assert_eq!(&stored, hash, "height index must point at block hash");
+
+            let block_key = block_storage_key(hash);
+            assert!(
+                node.storage
+                    .get(&block_key)
+                    .expect("get block key")
+                    .is_some(),
+                "block payload must persist alongside the height index",
+            );
+        }
+    }
+
+    #[test]
+    fn commit_prunes_blocks_below_window() {
+        // Retention = 2 → after committing heights 1..=5, the prune
+        // floor on the last commit is `last_committed_height - window
+        // = 5 - 2 = 3`, so heights 1 and 2 are deleted from both
+        // `consensus/block/<hash>` and `consensus/height/<be_u64>`,
+        // while heights 3, 4, 5 remain.
+        let mut node = make_node_with_retention(nid(1), 2);
+        let hashes = commit_n_blocks(&mut node, 5);
+
+        for (i, hash) in hashes.iter().enumerate() {
+            let height = (i as u64) + 1;
+            let block_key = block_storage_key(hash);
+            let height_key = height_storage_key(Height(height));
+            let block_present = node.storage.get(&block_key).unwrap().is_some();
+            let height_present = node.storage.get(&height_key).unwrap().is_some();
+            if height < 3 {
+                assert!(
+                    !block_present,
+                    "height {height}: block payload must be pruned",
+                );
+                assert!(
+                    !height_present,
+                    "height {height}: height index must be pruned",
+                );
+            } else {
+                assert!(
+                    block_present,
+                    "height {height}: in-window block must be retained",
+                );
+                assert!(
+                    height_present,
+                    "height {height}: in-window height index must be retained",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn commit_with_window_zero_keeps_all_blocks() {
+        // Archive mode: retention=0 disables pruning entirely. Every
+        // committed block survives the commit batch, no matter how far
+        // the chain advances past the implicit "window".
+        let mut node = make_node_with_retention(nid(1), 0);
+        let hashes = commit_n_blocks(&mut node, 8);
+
+        for (i, hash) in hashes.iter().enumerate() {
+            let height = Height((i as u64) + 1);
+            let block_key = block_storage_key(hash);
+            let height_key = height_storage_key(height);
+            assert!(
+                node.storage.get(&block_key).unwrap().is_some(),
+                "archive mode: height {} block must remain",
+                height.0,
+            );
+            assert!(
+                node.storage.get(&height_key).unwrap().is_some(),
+                "archive mode: height {} index must remain",
+                height.0,
+            );
+        }
+    }
+
+    #[test]
+    fn pruned_block_lookup_returns_none() {
+        // After pruning, `load_block_from_storage` (the responder-side
+        // fallback consulted by `Dispatch::ServeBlock`) returns
+        // `Ok(None)` for the pruned hash, which the dispatch-layer
+        // egress turns into `BlockResponse(None)` for the requesting
+        // peer.
+        let mut node = make_node_with_retention(nid(1), 1);
+        let hashes = commit_n_blocks(&mut node, 4);
+        // window=1 with last_committed_height=4 → prune below 3, so
+        // heights 1 and 2 are pruned, height 3 and 4 retained.
+        let pruned_hash = hashes[0];
+        let retained_hash = hashes[2];
+        assert!(
+            load_block_from_storage(node.storage.as_ref(), &pruned_hash)
+                .unwrap()
+                .is_none(),
+            "pruned block must not be loadable",
+        );
+        assert!(
+            load_block_from_storage(node.storage.as_ref(), &retained_hash)
+                .unwrap()
+                .is_some(),
+            "in-window block must still be loadable",
+        );
+    }
+
+    #[test]
+    fn commit_below_retention_window_skips_pruning() {
+        // Chain is shorter than the retention window — no block is
+        // ever a prune candidate, even though the index is populated.
+        let mut node = make_node_with_retention(nid(1), 100);
+        let hashes = commit_n_blocks(&mut node, 4);
+
+        for (i, hash) in hashes.iter().enumerate() {
+            let height = Height((i as u64) + 1);
+            assert!(
+                node.storage
+                    .get(&block_storage_key(hash))
+                    .unwrap()
+                    .is_some(),
+                "short-chain commit must not prune (height {})",
+                height.0,
+            );
+            assert!(
+                node.storage
+                    .get(&height_storage_key(height))
+                    .unwrap()
+                    .is_some(),
+                "short-chain height index must persist (height {})",
+                height.0,
+            );
+        }
     }
 }

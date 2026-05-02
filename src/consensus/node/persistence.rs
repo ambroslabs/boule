@@ -93,6 +93,17 @@ pub const STORAGE_KEY_LAST_TIMEOUT_VOTE: &[u8] = b"consensus/last_timeout_vote";
 /// every replica can serve from.
 pub const STORAGE_KEY_BLOCK_PREFIX: &[u8] = b"consensus/block/";
 
+/// Storage-key prefix for the secondary index that maps each committed
+/// block's `height` to its content-hash. Written atomically with
+/// `consensus/block/<hash>` on commit; the prune-on-commit pass walks
+/// this index in ascending-height order to find blocks that have aged
+/// out of the configured retention window (#194).
+///
+/// Keys are formed as `{STORAGE_KEY_HEIGHT_PREFIX}{height_be_u64}` so
+/// the redb lex-sorted scan yields heights in ascending numeric order.
+/// See [`height_storage_key`].
+pub const STORAGE_KEY_HEIGHT_PREFIX: &[u8] = b"consensus/height/";
+
 /// Storage key for the (height, view) of the most recently committed
 /// block. Restored at startup so [`crate::consensus::status::ConsensusStatus::last_committed_height`]
 /// reflects the durable chain even before the run loop sees its first
@@ -227,6 +238,28 @@ pub fn block_storage_key(hash: &BlockHash) -> Vec<u8> {
     key.extend_from_slice(STORAGE_KEY_BLOCK_PREFIX);
     key.extend_from_slice(hash);
     key
+}
+
+/// Compose the storage key for the height-index entry of a committed
+/// block: `STORAGE_KEY_HEIGHT_PREFIX || height.to_be_bytes()`. The
+/// big-endian encoding is load-bearing — redb sorts keys
+/// lexicographically and we rely on that order matching numeric height
+/// for the prune-on-commit range scan (#194).
+pub fn height_storage_key(height: Height) -> Vec<u8> {
+    let raw = height.0.to_be_bytes();
+    let mut key = Vec::with_capacity(STORAGE_KEY_HEIGHT_PREFIX.len() + raw.len());
+    key.extend_from_slice(STORAGE_KEY_HEIGHT_PREFIX);
+    key.extend_from_slice(&raw);
+    key
+}
+
+/// Decode the big-endian u64 height from a `consensus/height/<be_u64>`
+/// key. Returns `None` if the key does not have the expected prefix or
+/// the trailing eight-byte payload.
+pub fn decode_height_storage_key(key: &[u8]) -> Option<Height> {
+    let suffix = key.strip_prefix(STORAGE_KEY_HEIGHT_PREFIX)?;
+    let bytes: [u8; 8] = suffix.try_into().ok()?;
+    Some(Height(u64::from_be_bytes(bytes)))
 }
 
 /// Serialize a committed [`Block`] for the durable block store. See
