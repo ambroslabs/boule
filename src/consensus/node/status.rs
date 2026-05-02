@@ -205,6 +205,11 @@ impl ConsensusNode {
                     .block_sync_credit
                     .drops_counter()
                     .load(Ordering::Relaxed),
+                p2p_egress_byte_drops_total: self
+                    .rate_limiter
+                    .as_ref()
+                    .map(|l| l.counters().outbound_drops_total())
+                    .unwrap_or(0),
             },
         }
     }
