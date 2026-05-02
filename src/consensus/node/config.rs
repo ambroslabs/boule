@@ -54,6 +54,13 @@ pub struct NodeConfigForConsensus {
     /// and the "node built for the wrong scheme" mismatch check lands
     /// in #292.
     pub signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice,
+
+    /// Number of committed blocks to retain in the durable block store
+    /// (`consensus/block/<hash>`) below `last_committed`. Older
+    /// committed blocks are deleted in the same atomic batch as each
+    /// commit, alongside their secondary-index entry. `0` disables
+    /// pruning (archive mode); see #194 for the policy rationale.
+    pub block_retention_window: u64,
 }
 
 impl NodeConfigForConsensus {
@@ -77,6 +84,11 @@ impl NodeConfigForConsensus {
             snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
             min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
             signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
+            // Tests build short chains — keep everything by default so
+            // an integration test that walks the committed chain by
+            // hand never trips over a pruned block. Tests that exercise
+            // pruning override this explicitly.
+            block_retention_window: 0,
         }
     }
 }

@@ -935,6 +935,7 @@ impl SimCluster {
                 snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
                 signature_scheme: scheme,
+                block_retention_window: 0,
             };
 
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -1611,6 +1612,7 @@ impl SimCluster {
                 snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
                 signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
+                block_retention_window: 0,
             };
             // Fresh state machine and mempool — the previous session's
             // state machine doesn't survive a process restart in
@@ -1853,6 +1855,7 @@ impl SimCluster {
             snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
             min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
             signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
+            block_retention_window: 0,
         };
         let sm: Arc<Mutex<Box<dyn StateMachine>>> =
             Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
@@ -2393,6 +2396,7 @@ impl SimCluster {
                 snapshot_policy: crate::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: crate::consensus::reconfig::MIN_V_EFF_DELAY,
                 signature_scheme: crate::crypto::sig_scheme::SignatureSchemeChoice::default(),
+                block_retention_window: 0,
             };
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));

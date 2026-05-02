@@ -247,6 +247,15 @@ pub struct ConsensusConfig {
     /// [`ConsensusConfig::resolve_genesis_bls_keys`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validators_bls: Vec<ValidatorBlsEntry>,
+    /// Number of committed blocks to retain in `kv.redb` below
+    /// `last_committed`. Older committed blocks are deleted in the
+    /// same atomic batch as each commit. `0` disables pruning entirely
+    /// (archive mode — every committed block is kept). The block-sync
+    /// responder serves `BlockResponse(None)` for any pruned hash, so
+    /// the window is "how stale is the laggiest peer we want to
+    /// serve?" — not a safety knob.
+    #[serde(default = "default_block_retention_window")]
+    pub block_retention_window: u64,
 }
 
 /// One row of [`ConsensusConfig::validators_bls`]: the BLS half of a
@@ -598,6 +607,16 @@ fn default_snapshot_retention_count() -> usize {
 
 fn default_snapshot_chunk_size_bytes() -> u32 {
     1024 * 1024
+}
+
+/// Default committed-block retention window (#194). Sized to comfortably
+/// exceed any plausibly-laggy peer in normal operation: at the
+/// `timeout_base_ms = 200` testnet rate, 10k blocks is roughly 30
+/// minutes of wall-clock; at production block times of a few seconds,
+/// it's hours. Operators with archive nodes or slower-catch-up
+/// requirements can override either way (`0` disables pruning).
+fn default_block_retention_window() -> u64 {
+    10_000
 }
 
 /// Configuration for the p2p layer that is independent of the overlay

@@ -7,12 +7,13 @@ use std::sync::atomic::Ordering;
 
 use crate::consensus::Height;
 use crate::consensus::crashpoint::crashpoint;
-use crate::replication::block::Block;
-use crate::storage::StorageExt;
+use crate::replication::block::{Block, BlockHash};
+use crate::storage::{Storage, StorageExt};
 
 use super::{
-    ConsensusNode, LastCommitted, STORAGE_KEY_LAST_COMMITTED, TRACE_TARGET, block_storage_key,
-    encode_block, encode_last_committed,
+    ConsensusNode, LastCommitted, STORAGE_KEY_HEIGHT_PREFIX, STORAGE_KEY_LAST_COMMITTED,
+    TRACE_TARGET, block_storage_key, decode_height_storage_key, encode_block,
+    encode_last_committed, height_storage_key,
 };
 
 impl ConsensusNode {
@@ -68,22 +69,57 @@ impl ConsensusNode {
                 .store(block.header.height.0, Ordering::Relaxed);
             self.last_committed_view = block.header.view;
         }
-        // Persist (block, last_committed) atomically so the responder
-        // path and the status snapshot agree on durable state. See the
-        // doc-comment for the why.
+        // Persist (block, height-index, last_committed) atomically so
+        // the responder path and the status snapshot agree on durable
+        // state. The height index lets us cheaply find the oldest
+        // committed blocks at prune time without scanning the full
+        // hash-keyed table — see the doc-comment for the rest of the
+        // why. Pruning runs in the same batch (#194) so a crash mid-
+        // commit either leaves the chain unchanged or advances by one
+        // commit; there's no intermediate "wrote new block but didn't
+        // delete old one" state to recover from.
         let block_hash = block.hash();
         let key = block_storage_key(&block_hash);
+        let height_key = height_storage_key(block.header.height);
         let last_committed = LastCommitted {
             height: Height(self.last_committed_height.load(Ordering::Relaxed)),
             view: self.last_committed_view,
             last_committed_hash: block_hash,
+        };
+        // Compute the prune set up front so the batch closure stays
+        // pure (no `?` paths inside): a backend error during the
+        // pre-scan should fail the whole commit-persist below, not
+        // poison a partially-built batch.
+        let prune_targets = match prune_targets_for_commit(
+            self.storage.as_ref(),
+            last_committed.height,
+            self.block_retention_window,
+        ) {
+            Ok(targets) => targets,
+            Err(e) => {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    height = block.header.height.0,
+                    view = block.header.view.0,
+                    error = %e,
+                    "block_prune_scan_failed",
+                );
+                Vec::new()
+            }
         };
         let put_result = (|| -> anyhow::Result<()> {
             let block_bytes = encode_block(&block)?;
             let last_committed_bytes = encode_last_committed(&last_committed)?;
             self.storage.batch(|b| {
                 b.put(&key, &block_bytes);
+                b.put(&height_key, &block_hash);
                 b.put(STORAGE_KEY_LAST_COMMITTED, &last_committed_bytes);
+                for target in &prune_targets {
+                    b.delete(&target.height_key);
+                    if let Some(block_key) = &target.block_key {
+                        b.delete(block_key);
+                    }
+                }
                 Ok(())
             })
         })();
@@ -163,5 +199,82 @@ impl ConsensusNode {
         if let Some(notifier) = &self.commit_notifier {
             notifier.on_commit(&block, &block.header.state_commitment, block.header.view);
         }
+        // Emit one pruning trace per evicted block. Done after the
+        // durable batch lands so the counter and the disk state agree.
+        // Each event surfaces the height that was pruned and the
+        // post-commit retention floor so an operator can read the log
+        // and recompute the window without cross-referencing config.
+        for target in &prune_targets {
+            tracing::debug!(
+                target: TRACE_TARGET,
+                pruned_height = target.height.map(|h| h.0),
+                malformed_index = target.block_key.is_none(),
+                last_committed_height = last_committed.height.0,
+                retention_window = self.block_retention_window,
+                "block_pruned",
+            );
+        }
     }
+}
+
+/// One block to evict on the current commit. `block_key` is `None`
+/// when the height-index row was structurally malformed (its value
+/// was not a 32-byte hash); the index row is still scheduled for
+/// deletion to stop it tripping every future commit.
+#[derive(Debug)]
+struct PruneTarget {
+    height: Option<Height>,
+    height_key: Vec<u8>,
+    block_key: Option<Vec<u8>>,
+}
+
+/// Compute the blocks to evict from durable storage as part of the
+/// current commit. Returns an empty vec when:
+///
+/// - `retention_window == 0` (archive mode),
+/// - `last_committed_height < retention_window` (chain not yet long
+///   enough to have anything past the floor),
+/// - or the height index is empty.
+///
+/// Otherwise scans `consensus/height/*` in ascending order and
+/// collects every `(h, hash)` pair with `h < last_committed_height -
+/// retention_window`. The scan is bounded: redb returns the index in
+/// numeric order (because the keys are big-endian u64), and on a
+/// healthy node only a single entry is below the floor on each
+/// commit. Operators flipping retention on after a long archive run
+/// may see a one-time burst here — that's intentional. See #194.
+fn prune_targets_for_commit(
+    storage: &dyn Storage,
+    last_committed_height: Height,
+    retention_window: u64,
+) -> anyhow::Result<Vec<PruneTarget>> {
+    if retention_window == 0 {
+        return Ok(Vec::new());
+    }
+    let prune_below = match last_committed_height.0.checked_sub(retention_window) {
+        Some(floor) => floor,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for (key, hash_bytes) in storage.scan_prefix(STORAGE_KEY_HEIGHT_PREFIX)? {
+        let height = decode_height_storage_key(&key);
+        if let Some(h) = height
+            && h.0 >= prune_below
+        {
+            // Heights are stored big-endian and scan_prefix yields in
+            // ascending lex order, so once we cross the floor every
+            // remaining entry is in-window.
+            break;
+        }
+        let block_key: Option<Vec<u8>> = (*hash_bytes)
+            .try_into()
+            .ok()
+            .map(|hash: BlockHash| block_storage_key(&hash));
+        out.push(PruneTarget {
+            height,
+            height_key: key.to_vec(),
+            block_key,
+        });
+    }
+    Ok(out)
 }
