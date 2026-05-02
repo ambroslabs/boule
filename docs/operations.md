@@ -401,24 +401,52 @@ operator.
 
 ### Producing the new key
 
-Mint the new key under any of the existing `KeyProvider` backends
-(file, env, encrypted file, exec, keyring). The choice can match or
-differ from the current `validator_identity` backend — rotation is
-the natural moment to migrate from a hot backend to colder
-storage (`file` → keyring/HSM).
+The `rotation propose` subcommand (issue #313) mints the new key
+under a `file` or `encrypted-file` backend, signs the
+[`DualSignedRotation`] envelope under the chain's `chain_id`, and
+prints the encoded payload as hex on stdout. Operators can drop the
+hex into any validator's mempool to propose the rotation.
 
-For the file backend, today, you'll generate the new keypair
-out-of-band (e.g. with `openssl genpkey -algorithm Ed25519`) and
-write the PKCS#8 DER bytes to a fresh path. The `key migrate`
-subcommand (introduced with the split network/validator identity in
-issue #141) moves an *existing* identity between backends; it does
-not mint new keys.
+```sh
+# Ed25519 chain — mint new.key on the spot, sign, print payload.
+ambros-p2p rotation propose \
+    --config /etc/ambros-p2p/config.toml \
+    --new-key-backend file \
+    --new-key-path /etc/ambros-p2p/new.key \
+    --v-eff 5000
+```
 
-A future CLI subcommand will wrap "mint + sign + submit" into a
-single command (parallel to `reconfig add-validator` /
-`reconfig remove-validator` from issue #251). Until that lands,
-operators construct rotation transactions programmatically against
-the `DualSignedRotation::sign` API.
+On `bls_aggregated` chains a rotation must atomically swap both the
+Ed25519 and BLS halves of the validator's identity (#358), so the
+CLI also takes a `--new-bls-key-*` pair and bundles a chain-bound
+BLS proof-of-possession into the payload:
+
+```sh
+# BLS chain — mint both halves, sign, bundle PoP, print payload.
+ambros-p2p rotation propose \
+    --config /etc/ambros-p2p/config.toml \
+    --new-key-backend file \
+    --new-key-path /etc/ambros-p2p/new.key \
+    --new-bls-key-backend file \
+    --new-bls-key-path /etc/ambros-p2p/new-bls.key \
+    --v-eff 5000
+```
+
+The current consensus signing key is read from
+`[node.validator_identity]` (or, on legacy single-key configs, from
+`[node.identity]`); rotation never mints the *current* key, only
+the new one. The new-key backend can match or differ from the
+current backend — rotation is the natural moment to migrate from a
+hot backend to colder storage (`file` → `encrypted-file` → HSM).
+Backends without a path (`env`, `exec`, `keyring`) are not yet
+supported by `rotation propose`; mint those out-of-band and use the
+`DualSignedRotation::sign` API directly until the CLI grows
+backend-specific provisioning flags.
+
+The `key migrate` subcommand (introduced with the split
+network/validator identity in issue #141) is a different operation:
+it moves an *existing* identity between backends, but does not
+publish a rotation transaction.
 
 ### Choosing `v_eff`
 
@@ -444,34 +472,38 @@ lead time in production:
 A rotation transaction is a tagged opaque payload in a
 `Block.commands` slot, mirroring how `ReconfigCommand` is carried
 (see [the reconfig runbook](testnet-local.md)). The on-the-wire
-form is `b"VKROT\0" || postcard(DualSignedRotation)`; the
-constructor is `DualSignedRotation::sign(payload, current, new)`.
+form is `b"VKROT\0" || postcard(DualSignedRotation)`. Either of
+the following two paths produces those bytes:
 
-Pseudocode for a one-off submission, until the wrapping CLI
-subcommand lands:
+1. **`rotation propose` (recommended).** The subcommand above
+   prints the hex-encoded payload on stdout. Pipe into any in-process
+   mempool route the operator already exposes (the `reconfig`
+   subcommands use the same convention).
 
-```rust
-use ambros_p2p::consensus::validator_rotation::{
-    DualSignedRotation, ValidatorKeyRotation,
-};
+2. **Programmatic.** For backends `rotation propose` doesn't yet
+   support (`env` / `exec` / `keyring`), or for one-off scripts:
+   ```rust
+   use ambros_p2p::consensus::validator_rotation::{
+       DualSignedRotation, ValidatorKeyRotation,
+   };
+   let payload = ValidatorKeyRotation {
+       validator: <validator's currently-active pubkey>,
+       new_pubkey: <new signer's pubkey>,
+       v_eff: <chosen effective view>,
+       new_bls_pubkey: <Some on BLS chains, None otherwise>,
+       new_bls_pop: <Some on BLS chains, None otherwise>,
+   };
+   let envelope = DualSignedRotation::sign(
+       payload, &*current_signer, &*new_signer, &chain_id,
+   )?;
+   let bytes = envelope.encode_command();
+   ```
 
-let payload = ValidatorKeyRotation {
-    validator: <validator's currently-active pubkey>,
-    new_pubkey: <new signer's pubkey>,
-    v_eff: <chosen effective view>,
-};
-let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer)?;
-let bytes = envelope.encode_command();
-// Inject into the validator's mempool by any in-process route, or
-// have a colocated peer accept it via gossip.
-```
-
-The encoded bytes can be dropped into any validator's mempool;
-whichever validator is the leader of the next view picks it up,
-proposes it inside a block, and the standard 3-chain commit rule
-seals it. Every replica's `apply_committed_rotations` then runs
-the same dual-signature check independently — no replica trusts
-another's verdict.
+Whichever validator is the leader of the next view picks the bytes
+up from its mempool, proposes them inside a block, and the standard
+3-chain commit rule seals it. Every replica's
+`apply_committed_rotations` then runs the same dual-signature check
+independently — no replica trusts another's verdict.
 
 ### Provisioning the new key on the running node
 

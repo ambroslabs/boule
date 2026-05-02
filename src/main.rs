@@ -69,6 +69,7 @@ async fn dispatch(args: &[String]) -> anyhow::Result<()> {
         "config" => handle_config(&args[1..]),
         "snapshot" => handle_snapshot_subcommand(&args[1..]),
         "reconfig" => handle_reconfig_subcommand(&args[1..]),
+        "rotation" => handle_rotation_subcommand(&args[1..]),
         "--help" | "-h" | "help" => {
             print_usage();
             Ok(())
@@ -133,6 +134,23 @@ fn print_usage() {
     println!("      Build a tagged ReconfigCommand payload that removes a");
     println!("      validator at view `v_eff` and print it as hex on stdout.");
     println!("      Same rules as add-validator (floor, v_eff delay).");
+    println!();
+    println!("  rotation propose --new-key-backend <file|encrypted-file>");
+    println!("                   --new-key-path <path> [--new-key-passphrase-env <var>]");
+    println!("                   [--new-bls-key-backend file --new-bls-key-path <path>]");
+    println!("                   --v-eff <view> [--config <path>]");
+    println!("      Build a tagged DualSignedRotation payload that rotates the");
+    println!("      validator's consensus signing key at view `v_eff` and print");
+    println!("      it as hex on stdout. The current signer is read from");
+    println!("      `[node.validator_identity]` (or, when absent, the network");
+    println!("      identity). The new key is minted under the chosen backend if");
+    println!("      the path doesn't already exist. On `bls_aggregated` chains,");
+    println!("      the BLS half is also minted (or reloaded) and bundled into the");
+    println!("      payload along with a chain-bound proof-of-possession.");
+    println!(
+        "      `v_eff` must be at least `current_view + {}`.",
+        ambros_p2p::consensus::validator_rotation::V_EFF_MIN_DELAY,
+    );
     println!();
     println!("  config [--config <path>] [--format human|json|toml] [--raw|--edit|--path]");
     println!("      Print or edit the node's effective configuration. Default");
@@ -1338,6 +1356,324 @@ fn handle_reconfig_change_weight(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── `rotation` subcommand (#313) ───────────────────────────────────────────
+
+fn handle_rotation_subcommand(args: &[String]) -> anyhow::Result<()> {
+    let sub = args
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("missing rotation subcommand (try: propose)"))?;
+    match sub.as_str() {
+        "propose" => handle_rotation_propose(&args[1..]),
+        other => anyhow::bail!("unknown `rotation` subcommand: {other}"),
+    }
+}
+
+#[derive(Debug, Default)]
+struct RotationProposeArgs {
+    config_path: Option<PathBuf>,
+    new_key_backend: Option<String>,
+    new_key_path: Option<PathBuf>,
+    new_key_passphrase_env: Option<String>,
+    new_bls_key_backend: Option<String>,
+    new_bls_key_path: Option<PathBuf>,
+    v_eff: Option<u64>,
+}
+
+fn parse_rotation_propose_args(args: &[String]) -> anyhow::Result<RotationProposeArgs> {
+    let mut out = RotationProposeArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" | "-c" => {
+                i += 1;
+                out.config_path =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--config requires a path")
+                    })?));
+            }
+            "--new-key-backend" => {
+                i += 1;
+                out.new_key_backend = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--new-key-backend requires a value"))?
+                        .clone(),
+                );
+            }
+            "--new-key-path" => {
+                i += 1;
+                out.new_key_path =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--new-key-path requires a path")
+                    })?));
+            }
+            "--new-key-passphrase-env" => {
+                i += 1;
+                out.new_key_passphrase_env = Some(
+                    args.get(i)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("--new-key-passphrase-env requires a variable name")
+                        })?
+                        .clone(),
+                );
+            }
+            "--new-bls-key-backend" => {
+                i += 1;
+                out.new_bls_key_backend = Some(
+                    args.get(i)
+                        .ok_or_else(|| anyhow::anyhow!("--new-bls-key-backend requires a value"))?
+                        .clone(),
+                );
+            }
+            "--new-bls-key-path" => {
+                i += 1;
+                out.new_bls_key_path =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--new-bls-key-path requires a path")
+                    })?));
+            }
+            "--v-eff" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("--v-eff requires a view number"))?;
+                out.v_eff = Some(
+                    raw.parse::<u64>()
+                        .map_err(|e| anyhow::anyhow!("invalid --v-eff {raw:?}: {e}"))?,
+                );
+            }
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("unknown rotation propose flag: {other}"),
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// Translate the `--new-key-backend` + path/passphrase flags into an
+/// [`IdentityConfig`]. The CLI deliberately accepts only the two
+/// path-bearing backends — `file` and `encrypted-file` — because they
+/// can self-provision a fresh key when the path doesn't yet exist
+/// (which is the common rotation path: "mint a new key, sign with it,
+/// submit"). Read-only backends (env, exec, keyring) need bespoke flags
+/// and an out-of-band provisioning step; operators using those should
+/// rotate by hand against the `DualSignedRotation::sign` API for now.
+fn build_new_identity_config_for_rotation(
+    backend: &str,
+    path: Option<PathBuf>,
+    passphrase_env: Option<String>,
+) -> anyhow::Result<IdentityConfig> {
+    match backend {
+        "file" => Ok(IdentityConfig::File {
+            path: path
+                .ok_or_else(|| anyhow::anyhow!("--new-key-backend file requires --new-key-path"))?,
+            allow_insecure_perms: false,
+        }),
+        "encrypted-file" => Ok(IdentityConfig::EncryptedFile {
+            path: path.ok_or_else(|| {
+                anyhow::anyhow!("--new-key-backend encrypted-file requires --new-key-path")
+            })?,
+            passphrase_env,
+        }),
+        "env" | "exec" | "keyring" => anyhow::bail!(
+            "--new-key-backend `{backend}` is not supported by `rotation propose` yet \
+             (read-only backends need separate provisioning); use `file` or `encrypted-file`",
+        ),
+        other => anyhow::bail!(
+            "--new-key-backend `{other}` is not a valid backend (try: file, encrypted-file)",
+        ),
+    }
+}
+
+/// Outcome of building a rotation envelope from CLI inputs. Captured as
+/// a struct so tests can assert on the resolved fields without re-doing
+/// the whole orchestration.
+#[derive(Debug)]
+struct RotationProposeOutcome {
+    envelope: ambros_p2p::consensus::validator_rotation::DualSignedRotation,
+    /// True iff the chain's `signature_scheme` is `bls_aggregated` and
+    /// the rotation therefore carries a BLS pubkey + PoP.
+    bls_chain: bool,
+}
+
+/// Orchestration core of `rotation propose` — resolves the current
+/// validator key from config, mints (or reloads) the new Ed25519 key,
+/// mints (or reloads) the new BLS key on BLS chains, builds a
+/// chain-bound [`DualSignedRotation`], and returns it. Lives as a free
+/// function so unit tests can drive the same flow without spawning a
+/// process.
+fn build_rotation_envelope(args: &RotationProposeArgs) -> anyhow::Result<RotationProposeOutcome> {
+    use ambros_p2p::consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+    use ambros_p2p::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use ambros_p2p::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
+    use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+
+    let v_eff = ambros_p2p::consensus::View(
+        args.v_eff
+            .ok_or_else(|| anyhow::anyhow!("rotation propose requires --v-eff <view>"))?,
+    );
+    let new_backend = args.new_key_backend.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("rotation propose requires --new-key-backend <file|encrypted-file>")
+    })?;
+    let config_path = resolve_config_path(args.config_path.clone())?;
+    let config = config::load(&config_path)?;
+    let cons = config.consensus.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--config {} has no [consensus] section; rotation requires the \
+             chain's signature_scheme + chain_id to bundle a chain-bound payload",
+            config_path.display(),
+        )
+    })?;
+    let chain_id = ambros_p2p::node::derive_chain_id(cons)?;
+
+    // Reject scheme/flag mismatches *before* minting any new keys so a
+    // misconfigured invocation leaves no half-provisioned files behind.
+    // Operators expect dry-fail semantics here — the same property the
+    // `add-validator` reconfig CLI provides on a BLS/Ed25519 mismatch.
+    match cons.signature_scheme {
+        SignatureSchemeChoice::BlsAggregated => {
+            if args.new_bls_key_backend.is_none() {
+                anyhow::bail!(
+                    "[consensus].signature_scheme = \"bls_aggregated\" but no \
+                     --new-bls-key-backend was supplied; BLS chains rotate both halves \
+                     atomically (#358)",
+                );
+            }
+        }
+        SignatureSchemeChoice::Ed25519Collected => {
+            if args.new_bls_key_backend.is_some() || args.new_bls_key_path.is_some() {
+                anyhow::bail!(
+                    "[consensus].signature_scheme = \"ed25519_collected\" but a \
+                     --new-bls-key-* flag was supplied; Ed25519 chains have no use for \
+                     BLS keys (remove the flag)",
+                );
+            }
+        }
+    }
+
+    // Resolve the *current* validator signer. Mirrors the precedence
+    // `start` uses: prefer `[node.validator_identity]` if present;
+    // otherwise fall back to the network identity (the legacy single-
+    // key setup). Either way, the signer must already exist on disk —
+    // rotation never mints the *current* key, only the new one.
+    let (current_id_cfg, current_slot) = match config::resolve_validator_identity(&config.node) {
+        Some(cfg) => (cfg, "validator"),
+        None => match config::resolve_identity(&config.node) {
+            Some(cfg) => (cfg, "network (legacy single-key)"),
+            None => anyhow::bail!(
+                "--config {} has no [node.validator_identity] or [node.identity]; \
+                 rotation needs an existing consensus signing key to produce sig_old",
+                config_path.display(),
+            ),
+        },
+    };
+    let current_provider = config::build_provider(&current_id_cfg)?;
+    let current_identity = current_provider.try_load()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no current consensus key found via the {} `{}` backend; provision it via \
+             `ambros-p2p init` (or out-of-band) before rotating",
+            current_slot,
+            current_id_cfg.backend_name(),
+        )
+    })?;
+    let current_signer = NodeSigner::from_identity(&current_identity)?;
+
+    // Resolve / provision the *new* Ed25519 key.
+    let new_id_cfg = build_new_identity_config_for_rotation(
+        new_backend,
+        args.new_key_path.clone(),
+        args.new_key_passphrase_env.clone(),
+    )?;
+    let new_provider = config::build_provider(&new_id_cfg)?;
+    let new_identity = if new_provider.is_provisioning_capable() {
+        new_provider.load_or_init()?
+    } else {
+        new_provider.try_load()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "new key backend `{}` is read-only and no key is yet provisioned; \
+                 mint the key out-of-band first",
+                new_id_cfg.backend_name(),
+            )
+        })?
+    };
+    let new_signer = NodeSigner::from_identity(&new_identity)?;
+
+    // BLS half. Scheme/flag-presence consistency was already enforced
+    // up front; this block now only runs the actual provisioning on
+    // BLS chains.
+    let bls_chain = matches!(cons.signature_scheme, SignatureSchemeChoice::BlsAggregated);
+    let (new_bls_pubkey, new_bls_pop) = if bls_chain {
+        let backend = args
+            .new_bls_key_backend
+            .as_deref()
+            .expect("BLS-flag presence verified above");
+        if backend != "file" {
+            anyhow::bail!("--new-bls-key-backend `{backend}` is not supported (only `file` today)",);
+        }
+        let bls_path = args.new_bls_key_path.clone().ok_or_else(|| {
+            anyhow::anyhow!("--new-bls-key-backend file requires --new-bls-key-path")
+        })?;
+        let bls_provider = BlsKeyFile::new(bls_path);
+        let bls_id = bls_provider.load_or_init()?;
+        let pop = BlsAggregated::sign_pop(&bls_id.secret, &chain_id)
+            .map_err(|e| anyhow::anyhow!("signing BLS PoP: {e:?}"))?;
+        (Some(bls_id.public), Some(pop))
+    } else {
+        (None, None)
+    };
+
+    let payload = ValidatorKeyRotation {
+        validator: current_signer.node_id(),
+        new_pubkey: new_signer.node_id(),
+        v_eff,
+        new_bls_pubkey,
+        new_bls_pop,
+    };
+
+    // Surface a no-op rotation as a CLI-level error — the engine would
+    // reject it via `validate_structural` at commit time anyway, but
+    // catching it here saves the operator a round-trip and a confusing
+    // "NewKeyEqualsValidator" log line on every replica.
+    if payload.new_pubkey == payload.validator {
+        anyhow::bail!(
+            "new_pubkey equals current validator key; the --new-key-path is already \
+             pointing at the active consensus key — pick a different path",
+        );
+    }
+    payload
+        .validate_scheme_consistency(cons.signature_scheme, &chain_id)
+        .map_err(|e| anyhow::anyhow!("rotation payload failed scheme-consistency check: {e}"))?;
+
+    let envelope = DualSignedRotation::sign(payload, &current_signer, &new_signer, &chain_id)?;
+    Ok(RotationProposeOutcome {
+        envelope,
+        bls_chain,
+    })
+}
+
+fn handle_rotation_propose(args: &[String]) -> anyhow::Result<()> {
+    use ambros_p2p::p2p::tls::node_id_to_base58;
+
+    let parsed = parse_rotation_propose_args(args)?;
+    let outcome = build_rotation_envelope(&parsed)?;
+    let bytes = outcome.envelope.encode_command();
+    println!("{}", hex::encode(&bytes));
+    eprintln!(
+        "rotation built: validator={} new_pubkey={} v_eff={} bls_chain={}",
+        node_id_to_base58(&outcome.envelope.payload.validator),
+        node_id_to_base58(&outcome.envelope.payload.new_pubkey),
+        outcome.envelope.payload.v_eff.0,
+        outcome.bls_chain,
+    );
+    eprintln!(
+        "submit the hex above into a validator's mempool to propose the rotation \
+         (no admin RPC yet; route is operator-specific)"
+    );
+    Ok(())
+}
+
 /// Open the [`crate::replication::SnapshotStore`] backed by the
 /// configured consensus `storage_dir`. Errors if `[consensus]` or
 /// `storage_dir` is missing — there is no meaningful place to put
@@ -1445,5 +1781,468 @@ mod tests {
         // PoP under a different chain_id.
         let other = ChainId([0xCC; 32]);
         assert!(BlsAggregated::verify_pop(&derived, &id.public, &other).is_err());
+    }
+
+    // ── `rotation propose` (#313) ───────────────────────────────────────
+
+    /// Mint a fresh Ed25519 file-backed validator key and return its
+    /// path together with the base58-encoded NodeId. Both halves are
+    /// what the rotation tests need to write a usable config TOML.
+    fn mint_validator_key(path: &Path) -> String {
+        use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+        let cfg = ambros_p2p::config::IdentityConfig::File {
+            path: path.to_path_buf(),
+            allow_insecure_perms: false,
+        };
+        let provider = ambros_p2p::config::build_provider(&cfg).unwrap();
+        let id = provider.load_or_init().unwrap();
+        let signer = NodeSigner::from_identity(&id).unwrap();
+        ambros_p2p::p2p::tls::node_id_to_base58(&signer.node_id())
+    }
+
+    fn write_ed25519_chain_config(
+        config_path: &Path,
+        current_key_path: &Path,
+        validator_b58: &str,
+    ) {
+        let text = format!(
+            "[node]\n\
+             listen_addr = \"127.0.0.1:7000\"\n\n\
+             [node.identity]\n\
+             backend = \"file\"\n\
+             path = \"{key}\"\n\n\
+             [node.validator_identity]\n\
+             backend = \"file\"\n\
+             path = \"{key}\"\n\n\
+             [api]\n\
+             listen_addr = \"127.0.0.1:8000\"\n\n\
+             [consensus]\n\
+             validators = [\"{val}\"]\n\
+             signature_scheme = \"ed25519_collected\"\n",
+            key = current_key_path.display(),
+            val = validator_b58,
+        );
+        std::fs::write(config_path, text).unwrap();
+    }
+
+    fn write_bls_chain_config(
+        config_path: &Path,
+        current_key_path: &Path,
+        validator_b58: &str,
+        validator_bls_pubkey_hex: &str,
+        validator_bls_pop_hex: &str,
+    ) {
+        let text = format!(
+            "[node]\n\
+             listen_addr = \"127.0.0.1:7000\"\n\n\
+             [node.identity]\n\
+             backend = \"file\"\n\
+             path = \"{key}\"\n\n\
+             [node.validator_identity]\n\
+             backend = \"file\"\n\
+             path = \"{key}\"\n\n\
+             [api]\n\
+             listen_addr = \"127.0.0.1:8000\"\n\n\
+             [consensus]\n\
+             validators = [\"{val}\"]\n\
+             signature_scheme = \"bls_aggregated\"\n\n\
+             [[consensus.validators_bls]]\n\
+             node_id = \"{val}\"\n\
+             bls_pubkey = \"{pk}\"\n\
+             bls_pop = \"{pop}\"\n",
+            key = current_key_path.display(),
+            val = validator_b58,
+            pk = validator_bls_pubkey_hex,
+            pop = validator_bls_pop_hex,
+        );
+        std::fs::write(config_path, text).unwrap();
+    }
+
+    #[test]
+    fn rotation_propose_ed25519_chain_builds_verifiable_envelope() {
+        // End-to-end: real config + real existing validator key on
+        // disk → minted new key → signed envelope that verifies under
+        // the validator's current pubkey and the chain's chain_id.
+        // This is the CLI-level integration test called for in the
+        // issue's acceptance criteria.
+        use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+
+        let dir = TempDir::new().unwrap();
+        let current_key = dir.path().join("current.key");
+        let validator_b58 = mint_validator_key(&current_key);
+        let config_path = dir.path().join("config.toml");
+        write_ed25519_chain_config(&config_path, &current_key, &validator_b58);
+
+        let new_key = dir.path().join("new.key");
+        assert!(!new_key.exists(), "new key must not pre-exist");
+        let args = RotationProposeArgs {
+            config_path: Some(config_path.clone()),
+            new_key_backend: Some("file".into()),
+            new_key_path: Some(new_key.clone()),
+            new_key_passphrase_env: None,
+            new_bls_key_backend: None,
+            new_bls_key_path: None,
+            v_eff: Some(500),
+        };
+        let outcome = build_rotation_envelope(&args).expect("rotation propose must succeed");
+
+        // The new key must have been minted on the spot.
+        assert!(
+            new_key.exists(),
+            "new key file must be created by load_or_init"
+        );
+        assert!(!outcome.bls_chain);
+        assert!(outcome.envelope.payload.new_bls_pubkey.is_none());
+        assert!(outcome.envelope.payload.new_bls_pop.is_none());
+        assert_eq!(outcome.envelope.payload.v_eff.0, 500);
+
+        // Recover the current and new signers independently and confirm
+        // they match the envelope.
+        let current_id =
+            ambros_p2p::config::build_provider(&ambros_p2p::config::IdentityConfig::File {
+                path: current_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
+        let current_signer = NodeSigner::from_identity(&current_id).unwrap();
+        let new_id =
+            ambros_p2p::config::build_provider(&ambros_p2p::config::IdentityConfig::File {
+                path: new_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
+        let new_signer = NodeSigner::from_identity(&new_id).unwrap();
+        assert_eq!(outcome.envelope.payload.validator, current_signer.node_id());
+        assert_eq!(outcome.envelope.payload.new_pubkey, new_signer.node_id());
+
+        // Cryptographic round-trip: the envelope must verify under the
+        // chain's chain_id and the current pubkey, exactly the path
+        // `apply_committed_rotations` exercises at commit time.
+        let cfg = ambros_p2p::config::load(&config_path).unwrap();
+        let chain_id = ambros_p2p::node::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        outcome
+            .envelope
+            .verify(&current_signer.node_id(), &chain_id)
+            .expect("envelope must verify");
+
+        // And the encoded bytes carry the rotation tag, so an operator
+        // can drop them straight into a `Block.commands` slot.
+        let bytes = outcome.envelope.encode_command();
+        assert!(
+            ambros_p2p::consensus::validator_rotation::DualSignedRotation::is_rotation_payload(
+                &bytes,
+            ),
+        );
+    }
+
+    #[test]
+    fn rotation_propose_idempotent_when_new_key_already_exists() {
+        // Re-running with a pre-minted `new_key_path` must reload it
+        // (not overwrite) and produce a payload pointing at the same
+        // pubkey. Operators retry rotations after fixing a mistyped
+        // `--v-eff`; the new key should not flip on every retry.
+        use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+
+        let dir = TempDir::new().unwrap();
+        let current_key = dir.path().join("current.key");
+        let validator_b58 = mint_validator_key(&current_key);
+        let config_path = dir.path().join("config.toml");
+        write_ed25519_chain_config(&config_path, &current_key, &validator_b58);
+
+        let new_key = dir.path().join("new.key");
+        let args = RotationProposeArgs {
+            config_path: Some(config_path.clone()),
+            new_key_backend: Some("file".into()),
+            new_key_path: Some(new_key.clone()),
+            new_key_passphrase_env: None,
+            new_bls_key_backend: None,
+            new_bls_key_path: None,
+            v_eff: Some(500),
+        };
+        let first = build_rotation_envelope(&args).unwrap();
+        let second = build_rotation_envelope(&args).unwrap();
+
+        let new_id =
+            ambros_p2p::config::build_provider(&ambros_p2p::config::IdentityConfig::File {
+                path: new_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
+        let new_signer = NodeSigner::from_identity(&new_id).unwrap();
+        assert_eq!(first.envelope.payload.new_pubkey, new_signer.node_id());
+        assert_eq!(second.envelope.payload.new_pubkey, new_signer.node_id());
+    }
+
+    #[test]
+    fn rotation_propose_rejects_bls_flags_on_ed25519_chain() {
+        // Ed25519-chain config + BLS flag must error before any key is
+        // minted, mirroring `add-validator`'s ergonomics.
+        let dir = TempDir::new().unwrap();
+        let current_key = dir.path().join("current.key");
+        let validator_b58 = mint_validator_key(&current_key);
+        let config_path = dir.path().join("config.toml");
+        write_ed25519_chain_config(&config_path, &current_key, &validator_b58);
+
+        let new_key = dir.path().join("new.key");
+        let new_bls = dir.path().join("new-bls.key");
+        let args = RotationProposeArgs {
+            config_path: Some(config_path.clone()),
+            new_key_backend: Some("file".into()),
+            new_key_path: Some(new_key.clone()),
+            new_key_passphrase_env: None,
+            new_bls_key_backend: Some("file".into()),
+            new_bls_key_path: Some(new_bls.clone()),
+            v_eff: Some(500),
+        };
+        let err = build_rotation_envelope(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("ed25519_collected"),
+            "unexpected error: {err}",
+        );
+        // The Ed25519 path must reject BLS flags before any key is
+        // touched on disk — operators expect dry-fail semantics here.
+        assert!(!new_bls.exists());
+    }
+
+    #[test]
+    fn rotation_propose_bls_chain_bundles_bls_key_and_pop() {
+        // BLS-chain happy path: both halves are minted, the envelope
+        // carries a chain-bound PoP, and the payload passes
+        // `validate_scheme_consistency` (which is what the engine runs
+        // at commit time).
+        use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+
+        let dir = TempDir::new().unwrap();
+        let current_key = dir.path().join("current.key");
+        let validator_b58 = mint_validator_key(&current_key);
+
+        // Generate a BLS keypair for the genesis validator entry.
+        // The PoP is bogus (its pre-image is chain_id-bound but
+        // chain_id depends on the entry itself); that's OK because the
+        // rotation path never verifies the *genesis* PoP — only its
+        // own freshly-derived one.
+        let mut ikm = [0u8; 32];
+        ikm[0] = 0xAA;
+        let (_genesis_sk, genesis_pk) = BlsAggregated::keygen(&ikm).unwrap();
+        let genesis_pk_hex = hex::encode(genesis_pk);
+        let genesis_pop_hex = hex::encode([0u8; 96]);
+
+        let config_path = dir.path().join("config.toml");
+        write_bls_chain_config(
+            &config_path,
+            &current_key,
+            &validator_b58,
+            &genesis_pk_hex,
+            &genesis_pop_hex,
+        );
+
+        let new_key = dir.path().join("new.key");
+        let new_bls = dir.path().join("new-bls.key");
+        let args = RotationProposeArgs {
+            config_path: Some(config_path.clone()),
+            new_key_backend: Some("file".into()),
+            new_key_path: Some(new_key.clone()),
+            new_key_passphrase_env: None,
+            new_bls_key_backend: Some("file".into()),
+            new_bls_key_path: Some(new_bls.clone()),
+            v_eff: Some(500),
+        };
+        let outcome = build_rotation_envelope(&args).expect("BLS rotation must succeed");
+
+        assert!(outcome.bls_chain);
+        assert!(new_bls.exists(), "BLS key file must be minted");
+        let env_pk = outcome
+            .envelope
+            .payload
+            .new_bls_pubkey
+            .expect("must carry BLS pubkey");
+        let env_pop = outcome
+            .envelope
+            .payload
+            .new_bls_pop
+            .as_ref()
+            .expect("must carry PoP");
+
+        // The envelope's BLS pubkey must match the file we just minted.
+        let bls_id = BlsKeyFile::new(new_bls.clone()).load_or_init().unwrap();
+        assert_eq!(env_pk, bls_id.public);
+
+        // The PoP must verify under the chain's chain_id (the same
+        // check `apply_committed_rotations` runs through
+        // `validate_scheme_consistency`).
+        let cfg = ambros_p2p::config::load(&config_path).unwrap();
+        let chain_id = ambros_p2p::node::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        BlsAggregated::verify_pop(env_pop, &env_pk, &chain_id)
+            .expect("BLS PoP must verify under the chain's chain_id");
+
+        // Scheme-consistency check passes — same surface the engine
+        // hits at commit time.
+        outcome
+            .envelope
+            .payload
+            .validate_scheme_consistency(
+                ambros_p2p::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
+                &chain_id,
+            )
+            .expect("must pass scheme-consistency under the BLS scheme");
+
+        // And the dual-Ed25519 signatures still verify.
+        let current_id =
+            ambros_p2p::config::build_provider(&ambros_p2p::config::IdentityConfig::File {
+                path: current_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
+        let current_signer = NodeSigner::from_identity(&current_id).unwrap();
+        outcome
+            .envelope
+            .verify(&current_signer.node_id(), &chain_id)
+            .expect("Ed25519 dual-signature must verify on BLS chains too");
+    }
+
+    #[test]
+    fn rotation_propose_bls_chain_requires_bls_key_flags() {
+        let dir = TempDir::new().unwrap();
+        let current_key = dir.path().join("current.key");
+        let validator_b58 = mint_validator_key(&current_key);
+        let mut ikm = [0u8; 32];
+        ikm[0] = 0xAB;
+        let (_sk, pk) = BlsAggregated::keygen(&ikm).unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_bls_chain_config(
+            &config_path,
+            &current_key,
+            &validator_b58,
+            &hex::encode(pk),
+            &hex::encode([0u8; 96]),
+        );
+
+        let new_key = dir.path().join("new.key");
+        let args = RotationProposeArgs {
+            config_path: Some(config_path),
+            new_key_backend: Some("file".into()),
+            new_key_path: Some(new_key.clone()),
+            new_key_passphrase_env: None,
+            new_bls_key_backend: None,
+            new_bls_key_path: None,
+            v_eff: Some(500),
+        };
+        let err = build_rotation_envelope(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("--new-bls-key-backend"),
+            "unexpected error: {err}",
+        );
+        // No Ed25519 key gets minted either: we fail before touching disk.
+        assert!(!new_key.exists());
+    }
+
+    #[test]
+    fn rotation_propose_rejects_v_eff_too_close_when_validated_at_current_view() {
+        // build_rotation_envelope itself doesn't know "current_view"
+        // (that lives on the running node), but the engine enforces
+        // V_EFF_MIN_DELAY at commit time. We exercise the constant
+        // here so a future change to the floor surfaces in a CLI test
+        // rather than only in the consensus layer.
+        let payload = ambros_p2p::consensus::validator_rotation::ValidatorKeyRotation {
+            validator: [1u8; 32],
+            new_pubkey: [2u8; 32],
+            v_eff: ambros_p2p::consensus::View(11),
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        };
+        // current_view=10, v_eff=11 → < current+2; must be rejected.
+        assert!(payload.validate_structural(10).is_err());
+    }
+
+    #[test]
+    fn parse_rotation_propose_args_round_trips() {
+        let args: Vec<String> = [
+            "--config",
+            "/tmp/c.toml",
+            "--new-key-backend",
+            "file",
+            "--new-key-path",
+            "/tmp/n.key",
+            "--v-eff",
+            "100",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let parsed = parse_rotation_propose_args(&args).unwrap();
+        assert_eq!(parsed.config_path.unwrap(), PathBuf::from("/tmp/c.toml"));
+        assert_eq!(parsed.new_key_backend.as_deref(), Some("file"));
+        assert_eq!(parsed.new_key_path.unwrap(), PathBuf::from("/tmp/n.key"));
+        assert_eq!(parsed.v_eff, Some(100));
+        assert!(parsed.new_bls_key_backend.is_none());
+    }
+
+    #[test]
+    fn parse_rotation_propose_args_rejects_unknown_flag() {
+        let args = ["--no-such-flag"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let err = parse_rotation_propose_args(&args).unwrap_err();
+        assert!(err.to_string().contains("--no-such-flag"));
+    }
+
+    #[test]
+    fn parse_rotation_propose_args_rejects_invalid_v_eff() {
+        let args = ["--v-eff", "not-a-number"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        let err = parse_rotation_propose_args(&args).unwrap_err();
+        assert!(err.to_string().contains("--v-eff"));
+    }
+
+    #[test]
+    fn build_new_identity_config_for_rotation_supports_path_backends() {
+        let cfg =
+            build_new_identity_config_for_rotation("file", Some(PathBuf::from("/tmp/k")), None)
+                .unwrap();
+        assert!(matches!(
+            cfg,
+            ambros_p2p::config::IdentityConfig::File { .. }
+        ));
+        assert_eq!(cfg.backend_name(), "file");
+
+        let cfg = build_new_identity_config_for_rotation(
+            "encrypted-file",
+            Some(PathBuf::from("/tmp/k")),
+            Some("PASS".into()),
+        )
+        .unwrap();
+        assert_eq!(cfg.backend_name(), "encrypted-file");
+    }
+
+    #[test]
+    fn build_new_identity_config_for_rotation_rejects_read_only_backends() {
+        for backend in ["env", "exec", "keyring"] {
+            let err = build_new_identity_config_for_rotation(backend, None, None).unwrap_err();
+            assert!(
+                err.to_string().contains("not supported"),
+                "{backend}: {err}",
+            );
+        }
+    }
+
+    #[test]
+    fn build_new_identity_config_for_rotation_rejects_unknown_backend() {
+        let err = build_new_identity_config_for_rotation("hsm", None, None).unwrap_err();
+        assert!(err.to_string().contains("not a valid backend"));
     }
 }
