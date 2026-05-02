@@ -848,7 +848,13 @@ impl ConsensusNode {
                 "block_sync_range_request_retry_emitted",
             );
             let out = dispatch::egress_block_range_request(from_height, to_height, peer);
-            send_outbound(broadcaster, out).await;
+            send_outbound(
+                broadcaster,
+                self.rate_limiter.as_deref(),
+                &self.peers_connected,
+                out,
+            )
+            .await;
         }
         Ok(())
     }
