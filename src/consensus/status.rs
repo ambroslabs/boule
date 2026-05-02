@@ -168,6 +168,42 @@ pub struct BackpressureStatus {
     pub block_sync_serve_drops_total: u64,
 }
 
+/// One entry in a validator's signing-key history. `v_eff` is the view
+/// at which `pubkey` became the validator's active signing key; the
+/// genesis entry's `v_eff` is `0`. Sibling of
+/// [`crate::consensus::validator_key_history::PersistedKeyEntry`] but
+/// with the pubkey rendered as base58 so the JSON shape matches the
+/// rest of `ConsensusStatus`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RotationEntry {
+    pub v_eff: View,
+    /// base58-encoded [`NodeId`](crate::p2p::NodeId).
+    pub pubkey: String,
+}
+
+/// One validator's full signing-key timeline as seen by the local node
+/// (#314). Surfaces what each replica believes about every validator's
+/// active key plus every rotation it has applied, so an oncall operator
+/// can answer "is the cluster in agreement on the active signing key
+/// for validator V?" by diffing this field across `/consensus/status`
+/// responses from different replicas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorKeyStatus {
+    /// base58-encoded stable identifier — the validator's genesis
+    /// pubkey, or whatever pubkey it was added under via reconfig.
+    /// Stable across rotations.
+    pub stable_id: String,
+    /// base58-encoded current active signing key — equal to
+    /// `entries.last().pubkey` and surfaced as a top-level field for
+    /// quick "what key should I see signing right now?" lookups.
+    pub active_pubkey: String,
+    /// One entry per `(v_eff, pubkey)` boundary in the validator's
+    /// history, in chronological order. `entries[0]` is always the
+    /// genesis entry (`v_eff = 0` for genesis-seeded validators, or the
+    /// reconfig view at which the validator was added).
+    pub entries: Vec<RotationEntry>,
+}
+
 /// A snapshot of a consensus node's live state, returned by
 /// `GET /consensus/status`.
 ///
@@ -201,6 +237,13 @@ pub struct ConsensusStatus {
     /// Every validator in the committee, base58-encoded and sorted in
     /// the order used for round-robin leader rotation.
     pub validator_set: Vec<String>,
+    /// Every validator the local key history knows about (#314), with
+    /// each one's full rotation timeline. Sorted by `stable_id` for a
+    /// deterministic JSON shape. Includes validators that have left
+    /// the active set — the key history retains them so spanning votes
+    /// from their tenure stay verifiable.
+    #[serde(default)]
+    pub validator_keys: Vec<ValidatorKeyStatus>,
     pub mempool_size: usize,
     /// Cumulative cache-eviction counters across the four bounded
     /// consensus caches. See [`CacheEvictionStatus`].
@@ -306,6 +349,30 @@ mod tests {
                 "BHx4E18joU7w95zGkJwuCJ6RY8HMZC394aezTXTES5yA".to_string(),
                 "DmX44PdK8JNVZUkbLTpD3W5ngmVnWBGyYrmFhh2Mkdb4".to_string(),
             ],
+            validator_keys: vec![
+                ValidatorKeyStatus {
+                    stable_id: "B3CRZ1KHU3cvFUPbPtWq8v9aaqC6eexaQqqjMrDrXgNX".to_string(),
+                    active_pubkey: "B3CRZ1KHU3cvFUPbPtWq8v9aaqC6eexaQqqjMrDrXgNX".to_string(),
+                    entries: vec![RotationEntry {
+                        v_eff: View(0),
+                        pubkey: "B3CRZ1KHU3cvFUPbPtWq8v9aaqC6eexaQqqjMrDrXgNX".to_string(),
+                    }],
+                },
+                ValidatorKeyStatus {
+                    stable_id: "BHx4E18joU7w95zGkJwuCJ6RY8HMZC394aezTXTES5yA".to_string(),
+                    active_pubkey: "RotatedKeyExampleBase58XXXXXXXXXXXXXXXXXXXXXX".to_string(),
+                    entries: vec![
+                        RotationEntry {
+                            v_eff: View(0),
+                            pubkey: "BHx4E18joU7w95zGkJwuCJ6RY8HMZC394aezTXTES5yA".to_string(),
+                        },
+                        RotationEntry {
+                            v_eff: View(120),
+                            pubkey: "RotatedKeyExampleBase58XXXXXXXXXXXXXXXXXXXXXX".to_string(),
+                        },
+                    ],
+                },
+            ],
             mempool_size: 0,
             cache_evictions: CacheEvictionStatus {
                 vote_buckets: 7,
@@ -366,6 +433,42 @@ mod tests {
         // Peers + validator set.
         assert_eq!(json["peers_connected"].as_array().unwrap().len(), 2);
         assert_eq!(json["validator_set"].as_array().unwrap().len(), 3);
+
+        // Validator-key history (#314): one entry per known validator,
+        // each with its own rotation timeline.
+        assert_eq!(json["validator_keys"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            json["validator_keys"][0]["stable_id"],
+            "B3CRZ1KHU3cvFUPbPtWq8v9aaqC6eexaQqqjMrDrXgNX"
+        );
+        assert_eq!(
+            json["validator_keys"][0]["active_pubkey"],
+            "B3CRZ1KHU3cvFUPbPtWq8v9aaqC6eexaQqqjMrDrXgNX"
+        );
+        assert_eq!(
+            json["validator_keys"][0]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(json["validator_keys"][0]["entries"][0]["v_eff"], 0);
+        assert_eq!(
+            json["validator_keys"][1]["stable_id"],
+            "BHx4E18joU7w95zGkJwuCJ6RY8HMZC394aezTXTES5yA"
+        );
+        assert_eq!(
+            json["validator_keys"][1]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(json["validator_keys"][1]["entries"][1]["v_eff"], 120);
+        assert_eq!(
+            json["validator_keys"][1]["active_pubkey"],
+            json["validator_keys"][1]["entries"][1]["pubkey"]
+        );
 
         // Cache-eviction counters surface as a nested object.
         assert_eq!(json["cache_evictions"]["vote_buckets"], 7);
@@ -439,6 +542,7 @@ mod tests {
             pending_blocks_count: 0,
             peers_connected: Vec::new(),
             validator_set: Vec::new(),
+            validator_keys: Vec::new(),
             mempool_size: 0,
             cache_evictions: CacheEvictionStatus::default(),
             dropped_commands: 0,
@@ -451,6 +555,7 @@ mod tests {
         assert_eq!(json["last_committed_height"], 0);
         assert!(json["locked"].is_null());
         assert!(json["vote_buckets"].as_array().unwrap().is_empty());
+        assert!(json["validator_keys"].as_array().unwrap().is_empty());
         assert_eq!(json["cache_evictions"]["vote_buckets"], 0);
         assert_eq!(json["cache_evictions"]["parked_proposals"], 0);
         assert_eq!(json["cache_evictions"]["pending_blocks"], 0);

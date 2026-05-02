@@ -300,6 +300,24 @@ impl ValidatorKeyHistory {
             .map(ValidatorId::from_genesis_pubkey)
     }
 
+    /// Iterate every validator's full key timeline in stable
+    /// byte-lexicographic order of stable id. For each validator, the
+    /// inner iterator yields `(v_eff, pubkey)` entries in chronological
+    /// order — `entries.next()` is always the genesis (or
+    /// reconfig-add) entry. Intended for operator-facing introspection
+    /// (`/consensus/status`, #314); the verification path uses
+    /// [`Self::key_at`] / [`Self::validator_for`] instead.
+    pub fn iter(
+        &self,
+    ) -> impl Iterator<Item = (ValidatorId, impl Iterator<Item = (View, NodeId)> + '_)> + '_ {
+        self.by_stable_id.iter().map(|(stable_id, entries)| {
+            (
+                ValidatorId::from_genesis_pubkey(*stable_id),
+                entries.iter().map(|e| (e.v_eff, e.pubkey)),
+            )
+        })
+    }
+
     /// Apply a rotation that has just been committed at `commit_view`.
     ///
     /// The rotation's signatures are *not* re-checked here — that's
@@ -514,6 +532,38 @@ mod tests {
     fn new_deduplicates_identical_genesis_entries() {
         let h = ValidatorKeyHistory::new([vid(1), vid(1), vid(2)]);
         assert_eq!(h.validators().count(), 2);
+    }
+
+    #[test]
+    fn iter_yields_full_timeline_per_validator_in_stable_order() {
+        // Powers the operator-facing `validator_keys` field on
+        // `/consensus/status` (#314): for each validator, the inner
+        // iterator yields the genesis entry first followed by every
+        // applied rotation, in chronological order.
+        let mut h = ValidatorKeyHistory::new([vid(2), vid(1)]);
+        h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
+        h.apply_rotation(&rot(nid(10), nid(20), 200), 150).unwrap();
+
+        let collected: Vec<(ValidatorId, Vec<(View, NodeId)>)> = h
+            .iter()
+            .map(|(v, entries)| (v, entries.collect()))
+            .collect();
+
+        // Outer order is stable byte-lexicographic, matching `validators()`.
+        assert_eq!(collected[0].0, vid(1));
+        assert_eq!(collected[1].0, vid(2));
+
+        // Validator 1 has its genesis entry plus two rotations.
+        assert_eq!(
+            collected[0].1,
+            vec![
+                (View(0), nid(1)),
+                (View(100), nid(10)),
+                (View(200), nid(20)),
+            ],
+        );
+        // Validator 2 has only its genesis entry.
+        assert_eq!(collected[1].1, vec![(View(0), nid(2))]);
     }
 
     #[test]
