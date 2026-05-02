@@ -249,6 +249,40 @@ pub enum Action {
         block_a: BlockHash,
         block_b: BlockHash,
     },
+    /// A leader just signed a proposal at `view` for `block_b` after
+    /// previously signing a proposal at the same `view` for a *different*
+    /// `block_a`. This is a slashable proposal-equivocation: an honest
+    /// leader proposes at most one block per view (any second proposal
+    /// would split honest replicas across forks and stall its own
+    /// view), so two distinct `(view, block_hash)` proposals from the
+    /// same stable leader id are non-repudiable evidence of a Byzantine
+    /// proposer.
+    ///
+    /// Sibling of [`Self::EquivocationEvidence`] (which covers the
+    /// voter-side analogue, audit finding 3-1 / #409) — kept as a
+    /// separate variant rather than a discriminator-tagged extension
+    /// so exhaustive `match` arms still enforce per-kind handling and
+    /// the field names match semantics (`leader` here vs `voter`
+    /// there).
+    ///
+    /// Detected by [`HotStuffCore::step`]'s
+    /// [`Event::ProposalReceived`] dispatch via the
+    /// `(view, leader_id) → block_hash` `proposal_dedupe` map: a
+    /// vacant entry records the first sighting; a same-`block_hash`
+    /// re-delivery is idempotent; a different-`block_hash` arrival
+    /// emits this evidence. Unlike vote equivocation, both forks are
+    /// admitted into `pending_blocks` (each replica's
+    /// `last_voted_view` monotonic prevents it from voting for both).
+    /// Audit finding L5-1; the integration layer logs at WARN, ticks
+    /// [`crate::consensus::status::ConsensusStatus::proposal_equivocations_detected`],
+    /// and otherwise treats this as informational pending the
+    /// future slashing pipeline.
+    ProposalEquivocationEvidence {
+        leader: ValidatorId,
+        view: View,
+        block_a: BlockHash,
+        block_b: BlockHash,
+    },
 }
 
 /// Why the safety core emitted [`Action::RequestBlock`]. Surfaced via
@@ -391,6 +425,21 @@ pub struct HotStuffCore {
     /// [`Self::evict_vote_buckets_below`] so a Byzantine flood of
     /// low-view distinct-hash votes can't pin memory.
     vote_dedupe: HashMap<(View, ValidatorId), BlockHash>,
+    /// Per-`(view, leader)` proposal-hash dedup, the proposer-side
+    /// analogue of [`Self::vote_dedupe`] (audit finding L5-1). The first
+    /// proposal a stable leader id contributes at a given view records
+    /// its `block_hash` here; any subsequent proposal at the same view
+    /// from the same leader for a *different* `block_hash` is
+    /// equivocation evidence and emits
+    /// [`Action::ProposalEquivocationEvidence`]. Both forks are still
+    /// admitted into `pending_blocks` — each replica's
+    /// `last_voted_view` monotonic prevents it from voting for both, so
+    /// admitting both is harmless and avoids losing block-sync utility
+    /// (a parked child of either fork can still be unparked once its
+    /// parent arrives). Garbage-collected alongside [`Self::vote_bucket`]
+    /// in [`Self::evict_vote_buckets_below`] so a Byzantine flood of
+    /// low-view distinct-hash proposals can't pin memory.
+    proposal_dedupe: HashMap<(View, ValidatorId), BlockHash>,
     /// Proposals we received before their parent landed. Keyed by the
     /// proposal's own block hash so a later `PacemakerAdvance` can
     /// re-evaluate every parked child whose parent has since arrived.
@@ -512,6 +561,7 @@ impl HotStuffCore {
             state,
             vote_bucket: HashMap::new(),
             vote_dedupe: HashMap::new(),
+            proposal_dedupe: HashMap::new(),
             parked_proposals: HashMap::new(),
             block_sync_inflight: HashMap::new(),
             proposed_in_view: View::ZERO,
@@ -929,7 +979,27 @@ impl HotStuffCore {
     /// safe-by-default).
     pub fn step(&mut self, event: Event) -> Vec<Action> {
         let actions = match event {
-            Event::ProposalReceived(verified) => self.on_proposal_received(verified.into_inner()),
+            Event::ProposalReceived(verified) => {
+                // Resolve the leader's stable `ValidatorId` from the
+                // ingress-stamped envelope so the dedupe map keys on
+                // identity that survives a key rotation (#394).
+                // Re-dispatch from the parked-proposals path inside
+                // [`Self::on_proposal_received`] reuses the same
+                // `block_hash` we keyed on first arrival, so dedupe
+                // running once at the entry point covers both the
+                // happy and parked re-delivery paths idempotently —
+                // exactly the same shape as the vote-side detector
+                // (audit finding 3-1, #409).
+                let (signed, leader_id) = verified.into_parts();
+                let view = signed.payload.block.header.view;
+                let block_hash = signed.payload.block.hash();
+                let mut actions = Vec::new();
+                if let Some(ev) = self.check_proposal_dedupe(view, leader_id, block_hash) {
+                    actions.push(ev);
+                }
+                actions.extend(self.on_proposal_received(signed));
+                actions
+            }
             Event::VoteReceived(variant) => self.on_vote_received(variant),
             Event::NewViewReceived(verified) => self.on_new_view_received(verified.into_inner()),
             Event::PacemakerAdvance(v) => self.on_pacemaker_advance(v),
@@ -948,6 +1018,46 @@ impl HotStuffCore {
         debug_assert_lock_durable_before_vote(&actions);
 
         actions
+    }
+
+    /// Consult [`Self::proposal_dedupe`] for a `(view, leader)` arrival
+    /// and decide whether this proposal is a sibling of one we have
+    /// already recorded under the same key.
+    ///
+    /// - **Vacant** → record the first sighting and return `None` so the
+    ///   caller proceeds with normal processing.
+    /// - **Occupied with same `block_hash`** → idempotent re-delivery
+    ///   (e.g. a parked-proposal un-park, or a duplicate frame), return
+    ///   `None`.
+    /// - **Occupied with different `block_hash`** → return
+    ///   [`Action::ProposalEquivocationEvidence`] so the integration
+    ///   layer can log/count. The recorded hash stays the *first* one
+    ///   we saw (no overwrite) so a third fork from the same leader at
+    ///   the same view triggers evidence against the first sighting,
+    ///   not against the most-recent — predictable behaviour for the
+    ///   future slashing pipeline.
+    fn check_proposal_dedupe(
+        &mut self,
+        view: View,
+        leader: ValidatorId,
+        block_hash: BlockHash,
+    ) -> Option<Action> {
+        match self.proposal_dedupe.entry((view, leader)) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(block_hash);
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(e) if *e.get() == block_hash => None,
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let block_a = *e.get();
+                Some(Action::ProposalEquivocationEvidence {
+                    leader,
+                    view,
+                    block_a,
+                    block_b: block_hash,
+                })
+            }
+        }
     }
 
     /// Handle an inbound [`Proposal`]. Branches land in separate
@@ -1719,6 +1829,13 @@ impl HotStuffCore {
     /// maps share the same view-keyed life cycle so the dedup map
     /// can't pin memory under a Byzantine flood of low-view distinct-
     /// hash votes.
+    ///
+    /// [`Self::proposal_dedupe`] is swept under the same cutoff for
+    /// the same reason (audit finding L5-1): a leader's record at a
+    /// long-past view is no longer actionable evidence — proposals at
+    /// `view < current_view` cannot vote-form a fresher QC than what
+    /// we already hold, so retaining their dedup state is dead weight
+    /// for memory.
     fn evict_vote_buckets_below(&mut self, gc_below: View) {
         let before = self.vote_bucket.len();
         self.vote_bucket.retain(|(view, _), _| *view >= gc_below);
@@ -1736,6 +1853,8 @@ impl HotStuffCore {
             );
         }
         self.vote_dedupe.retain(|(view, _), _| *view >= gc_below);
+        self.proposal_dedupe
+            .retain(|(view, _), _| *view >= gc_below);
     }
 
     /// Drop the lowest-`view` `vote_bucket` entry if the map is at cap.
@@ -2242,13 +2361,14 @@ mod tests {
     // ── D3: vote-only-once at same view ──────────────────────────────
 
     #[test]
-    fn second_proposal_at_same_view_emits_no_vote() {
+    fn second_proposal_at_same_view_emits_no_vote_but_emits_equivocation_evidence() {
         let mut core = make_core(1);
         let genesis = Block::genesis([0; 32], [0; 32]);
         let justify = dummy_qc(View(0), genesis.hash());
 
         // First proposal at view 1 — vote emitted.
         let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let block_a_hash = block_a.hash();
         let _ = core.step(Event::ProposalReceived(
             crate::consensus::dispatch::Verified::unchecked(signed_proposal(
                 block_a,
@@ -2258,12 +2378,19 @@ mod tests {
         ));
         assert_eq!(core.state().last_voted_view, View(1));
 
-        // Second proposal at view 1 with a DIFFERENT block. Same
-        // view, different state_commitment → different hash. This is
-        // the fork-attempt shape the safe-to-vote view check rules
-        // out; we assert explicitly that no `Vote` action is
-        // produced, and that `high_qc` / `last_voted_view` stay put
-        // (HighQc adoption is gated on safe_to_vote firing).
+        // Second proposal at view 1 with a DIFFERENT block from the
+        // same leader. Same view, different state_commitment →
+        // different hash. Two effects layer on top of each other:
+        //
+        // 1. The safe-to-vote view check rules out a second vote, so
+        //    `last_voted_view` and `high_qc` stay put.
+        // 2. The proposal-equivocation detector (audit finding L5-1)
+        //    fires on the second arrival — distinct `block_hash`
+        //    from the same `(view, leader)` is non-repudiable
+        //    evidence of a Byzantine proposer — and emits exactly one
+        //    `Action::ProposalEquivocationEvidence`. The fork is
+        //    still admitted into `pending_blocks` so a later
+        //    block-sync resolution against this hash succeeds.
         let block_b = Block {
             header: BlockHeader {
                 parent_hash: genesis.hash(),
@@ -2282,9 +2409,16 @@ mod tests {
             crate::consensus::dispatch::Verified::unchecked(signed_b),
         ));
 
-        assert!(
-            second.is_empty(),
-            "a second proposal at the same view must emit no actions: {second:?}",
+        assert_eq!(
+            second,
+            vec![Action::ProposalEquivocationEvidence {
+                leader: vid(2),
+                view: View(1),
+                block_a: block_a_hash,
+                block_b: block_b_hash,
+            }],
+            "a second proposal at the same view must emit only \
+             ProposalEquivocationEvidence (no second vote): {second:?}",
         );
         assert_eq!(core.state().last_voted_view, View(1));
         // The forked block IS inserted into pending_blocks — the
@@ -3841,6 +3975,311 @@ mod tests {
         )));
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], Action::EquivocationEvidence { .. }));
+    }
+
+    // ── L5-1: proposal-equivocation detection (sibling of vote dedupe) ──
+
+    /// Build a fork-at-`view` whose `state_commitment` byte differs by
+    /// `tag`, so two calls with distinct `tag` values produce two
+    /// blocks with the same `(view, parent_hash, height)` triple but
+    /// different `block_hash`. Models the on-the-wire shape of a
+    /// Byzantine leader broadcasting two distinct proposals at the
+    /// same view.
+    fn fork_at_view(
+        parent_hash: BlockHash,
+        view: impl Into<View>,
+        proposer: NodeId,
+        tag: u8,
+    ) -> Block {
+        let view = view.into();
+        Block {
+            header: BlockHeader {
+                parent_hash,
+                height: Height(1),
+                view,
+                proposer,
+                state_commitment: [tag; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: Vec::new(),
+        }
+    }
+
+    /// Two distinct proposals from the same stable leader at the same
+    /// view for two distinct `block_hash` values must produce
+    /// [`Action::ProposalEquivocationEvidence`] on the second arrival.
+    /// Both forks are still admitted into `pending_blocks` — the
+    /// detector is informational, not a drop. Acceptance criterion
+    /// from issue #506.
+    #[test]
+    fn second_proposal_at_same_view_for_different_block_emits_proposal_equivocation_evidence() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let justify = dummy_qc(View(0), genesis.hash());
+
+        let block_a = fork_at_view(genesis.hash(), 1, nid(2), 0xAA);
+        let block_b = fork_at_view(genesis.hash(), 1, nid(2), 0xBB);
+        let block_a_hash = block_a.hash();
+        let block_b_hash = block_b.hash();
+        assert_ne!(
+            block_a_hash, block_b_hash,
+            "fork_at_view tag must perturb the block hash",
+        );
+
+        let _ = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block_a,
+                justify.clone(),
+                nid(2),
+            )),
+        ));
+        assert_eq!(
+            core.proposal_dedupe.get(&(View(1), vid(2))),
+            Some(&block_a_hash),
+            "first proposal must record the leader's block_hash",
+        );
+
+        let actions = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block_b,
+                justify,
+                nid(2),
+            )),
+        ));
+
+        // Evidence is emitted *first*, before any side effects of the
+        // fork's normal processing. The integration layer's match arm
+        // sees the equivocation up-front.
+        assert!(
+            matches!(
+                actions.first(),
+                Some(Action::ProposalEquivocationEvidence {
+                    leader,
+                    view,
+                    block_a,
+                    block_b,
+                }) if *leader == vid(2)
+                    && *view == View(1)
+                    && *block_a == block_a_hash
+                    && *block_b == block_b_hash,
+            ),
+            "first emitted action must be ProposalEquivocationEvidence: {actions:?}",
+        );
+        // Fork still admitted — both forks land in pending_blocks.
+        assert!(core.state().pending_blocks.contains_key(&block_b_hash));
+        // Recorded hash stays the *first* sighting; a third fork would
+        // also be measured against block_a.
+        assert_eq!(
+            core.proposal_dedupe.get(&(View(1), vid(2))),
+            Some(&block_a_hash),
+            "dedupe map must not overwrite on conflict — slashing pipeline \
+             relies on the first sighting being canonical",
+        );
+    }
+
+    /// A duplicate of the same `(leader, view, block_hash)` is
+    /// idempotent: no equivocation emitted, downstream actions match
+    /// what an honest re-delivery (e.g. a parked-proposal un-park or
+    /// a duplicate frame) would produce.
+    #[test]
+    fn duplicate_proposal_for_same_block_does_not_emit_proposal_equivocation_evidence() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let justify = dummy_qc(View(0), genesis.hash());
+        let block = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+
+        let _ = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block.clone(),
+                justify.clone(),
+                nid(2),
+            )),
+        ));
+        let again = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block,
+                justify,
+                nid(2),
+            )),
+        ));
+        assert!(
+            !again
+                .iter()
+                .any(|a| matches!(a, Action::ProposalEquivocationEvidence { .. })),
+            "duplicate proposal must not emit equivocation evidence: {again:?}",
+        );
+    }
+
+    /// Distinct leaders proposing distinct blocks at the same view do
+    /// not trigger equivocation — the dedup key includes the leader.
+    /// Concretely: a Byzantine fork attempt where two *different*
+    /// validators each propose at the same view is not the shape we're
+    /// detecting (only the safety-rule path catches that).
+    #[test]
+    fn proposals_from_distinct_leaders_for_distinct_blocks_do_not_emit_evidence() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let justify = dummy_qc(View(0), genesis.hash());
+        let block_a = fork_at_view(genesis.hash(), 1, nid(2), 0xAA);
+        let block_b = fork_at_view(genesis.hash(), 1, nid(3), 0xBB);
+
+        let one = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block_a,
+                justify.clone(),
+                nid(2),
+            )),
+        ));
+        let two = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block_b,
+                justify,
+                nid(3),
+            )),
+        ));
+        for actions in [&one, &two] {
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::ProposalEquivocationEvidence { .. })),
+                "distinct leaders must not trip proposal-equivocation: {actions:?}",
+            );
+        }
+    }
+
+    /// The same leader proposing at *different* views for different
+    /// blocks is normal HotStuff progress, not equivocation: the
+    /// per-view dedup key separates them.
+    #[test]
+    fn same_leader_at_different_views_does_not_emit_proposal_evidence() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let justify = dummy_qc(View(0), genesis.hash());
+
+        // View 1 is leader nid(2) under round-robin; view 5 is also
+        // nid(2) (4-validator wrap-around). Two distinct proposals
+        // from the same leader at distinct views produce no evidence.
+        let block_v1 = fork_at_view(genesis.hash(), 1, nid(2), 0xAA);
+        let block_v5 = fork_at_view(genesis.hash(), 5, nid(2), 0xBB);
+
+        let v1 = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block_v1,
+                justify.clone(),
+                nid(2),
+            )),
+        ));
+        let v5 = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block_v5,
+                justify,
+                nid(2),
+            )),
+        ));
+        for actions in [&v1, &v5] {
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, Action::ProposalEquivocationEvidence { .. })),
+                "same leader at distinct views must not trip equivocation: {actions:?}",
+            );
+        }
+    }
+
+    /// Memory bound: the proposal-dedupe map is GC'd in
+    /// [`HotStuffCore::evict_vote_buckets_below`], which fires on
+    /// `PacemakerAdvance`. After advancing past the recorded view, a
+    /// previously-seen `(leader, view)` pair no longer detects
+    /// equivocation — the entry has been swept out alongside the
+    /// matching `vote_bucket` entry. Mirrors the
+    /// `vote_dedupe` GC test exactly.
+    #[test]
+    fn pacemaker_advance_garbage_collects_proposal_dedupe() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let justify = dummy_qc(View(0), genesis.hash());
+        let view: View = View(1);
+        let block = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+
+        let _ = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_proposal(
+                block,
+                justify,
+                nid(2),
+            )),
+        ));
+        assert!(core.proposal_dedupe.contains_key(&(view, vid(2))));
+
+        let _ = core.step(Event::PacemakerAdvance(view + 1));
+        assert!(
+            !core.proposal_dedupe.contains_key(&(view, vid(2))),
+            "proposal_dedupe entry must be GC'd alongside its vote_bucket",
+        );
+    }
+
+    /// Idempotency under un-park: a parked proposal whose parent
+    /// arrives later is re-dispatched through `on_proposal_received`
+    /// from `on_pacemaker_advance`. The re-dispatch hits the dedupe
+    /// map with the same `(view, leader, block_hash)` it inserted on
+    /// first arrival, so no spurious evidence fires. Without this
+    /// guarantee every parked-then-re-delivered honest proposal would
+    /// look like equivocation against itself.
+    #[test]
+    fn parked_proposal_redispatch_does_not_self_trigger_equivocation_evidence() {
+        let mut core = make_core(1);
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let parent = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
+        let parent_hash = parent.hash();
+        let child = Block {
+            header: BlockHeader {
+                parent_hash,
+                height: Height(2),
+                view: View(2),
+                proposer: nid(3),
+                state_commitment: [0; 32],
+                commands_commitment: Block::commands_commitment(&[]),
+                validator_history_commitment: [0; 32],
+            },
+            commands: Vec::new(),
+        };
+        let child_hash = child.hash();
+        let parent_qc = dummy_qc(View(1), parent_hash);
+        let signed_child = signed_proposal(child, parent_qc, nid(3));
+
+        // Phase 1: child arrives with parent missing → parks. Dedupe
+        // records (view=2, leader=vid(3)) → child_hash.
+        let _ = core.step(Event::ProposalReceived(
+            crate::consensus::dispatch::Verified::unchecked(signed_child),
+        ));
+        assert!(core.parked_proposals.contains_key(&child_hash));
+        assert_eq!(
+            core.proposal_dedupe.get(&(View(2), vid(3))),
+            Some(&child_hash),
+        );
+
+        // Phase 2: out-of-band, parent arrives in pending_blocks.
+        core.state.insert_pending(parent);
+
+        // Phase 3: PacemakerAdvance(View(2)) un-parks the child and
+        // re-dispatches through `on_proposal_received`. The
+        // `evict_vote_buckets_below(2)` sweep that runs first leaves
+        // the (view=2, leader=vid(3)) dedupe entry in place
+        // (`view >= gc_below`); the un-park itself bypasses
+        // [`HotStuffCore::step`] (and therefore `check_proposal_dedupe`
+        // entirely), so no spurious evidence fires either way.
+        let actions = core.step(Event::PacemakerAdvance(View(2)));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ProposalEquivocationEvidence { .. })),
+            "un-park re-dispatch must not self-trigger evidence: {actions:?}",
+        );
+        assert_eq!(
+            core.proposal_dedupe.get(&(View(2), vid(3))),
+            Some(&child_hash),
+            "the recorded dedupe entry must survive the un-park unchanged",
+        );
     }
 
     // ── D7: parked proposal re-dispatch after parent arrives ────────
@@ -5614,13 +6053,15 @@ mod tests {
                         // Safety-core effects the harness doesn't
                         // model. `Persist` is durability, `RequestBlock`
                         // is sync; both are integration-layer jobs.
-                        // `EquivocationEvidence` is informational
-                        // (logged + counter-incremented) — the harness
-                        // counts the action presence rather than acting
-                        // on it.
+                        // `EquivocationEvidence` and
+                        // `ProposalEquivocationEvidence` are
+                        // informational (logged + counter-incremented)
+                        // — the harness counts the action presence
+                        // rather than acting on it.
                         Action::Persist(_)
                         | Action::RequestBlock { .. }
-                        | Action::EquivocationEvidence { .. } => {}
+                        | Action::EquivocationEvidence { .. }
+                        | Action::ProposalEquivocationEvidence { .. } => {}
                     }
                 }
             }

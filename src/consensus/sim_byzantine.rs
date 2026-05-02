@@ -492,9 +492,15 @@ pub enum TwinKind {
     /// Safety holds via the safety core's `last_voted_view` monotonic
     /// — each replica votes for at most one of the two proposals; the
     /// other is dropped on the floor at the receive-side safety check.
-    /// No equivocation evidence is produced today (Proposal-equivocation
-    /// detection is future work; the dedupe map in #409 covers Vote
-    /// only).
+    /// Honest replicas hit the `(view, leader_id)` proposal-dedupe map
+    /// landed in audit finding L5-1 on the second arrival and emit
+    /// [`crate::consensus::hotstuff::step::Action::ProposalEquivocationEvidence`];
+    /// the integration layer increments
+    /// [`crate::consensus::status::ConsensusStatus::proposal_equivocations_detected`]
+    /// — read via
+    /// [`crate::consensus::sim::SimCluster::peek_proposal_equivocations_detected`]
+    /// so the proptest property can confirm the proposer-side
+    /// evidence-emission path is exercised end-to-end.
     Proposal,
     /// Twin TimeoutVote envelopes: pass the original through and
     /// additionally broadcast a forged TimeoutVote at the same view
@@ -983,26 +989,64 @@ mod tests {
             })?;
         }
 
-        /// **Twin-mode proposal** (issue #421) — byzantine leader
-        /// broadcasts an honest Proposal and additionally a forged
-        /// twin Proposal at the same view whose `state_commitment` is
-        /// mutated, both signed under the shared validator key. Both
-        /// proposals reach every honest replica (unlike the existing
-        /// [`EquivocatorAdversary`], which carves a 1+2 split).
-        /// Safety: each honest replica's `last_voted_view` monotonic
-        /// check ensures it votes for at most one of the two
-        /// proposals at view V; the other is dropped. Liveness: when
-        /// honest replicas converge on the same fork the QC forms
-        /// normally; when they vote on different forks neither side
-        /// reaches quorum, the pacemaker times out, and the next-view
-        /// honest leader recovers — the same wedge the equivocator
-        /// property already exercises.
+        /// **Twin-mode proposal** (issue #421 / audit finding L5-1) —
+        /// byzantine leader broadcasts an honest Proposal and
+        /// additionally a forged twin Proposal at the same view whose
+        /// `state_commitment` is mutated, both signed under the shared
+        /// validator key. Both proposals reach every honest replica
+        /// (unlike the existing [`EquivocatorAdversary`], which carves
+        /// a 1+2 split). Safety: each honest replica's
+        /// `last_voted_view` monotonic check ensures it votes for at
+        /// most one of the two proposals at view V; the other is
+        /// dropped. Liveness: when honest replicas converge on the
+        /// same fork the QC forms normally; when they vote on
+        /// different forks neither side reaches quorum, the pacemaker
+        /// times out, and the next-view honest leader recovers — the
+        /// same wedge the equivocator property already exercises.
+        ///
+        /// In addition to the safety + liveness floors enforced by
+        /// `run_one_property`, this property asserts the proposer-side
+        /// evidence-emission path is exercised end-to-end:
+        /// `proposal_equivocations_detected` is `> 0` on at least
+        /// `f + 1 = 2` honest replicas. The byzantine becomes leader
+        /// once per `n` views in round-robin, and a HONEST_FLOOR-of-3
+        /// commit run takes enough views that at least one of those
+        /// leadership turns lands on the byzantine — both forks reach
+        /// every honest replica via the broadcast, so each receiver
+        /// trips its dedupe map independently.
         #[test]
-        fn proptest_twin_proposal_preserves_safety_and_liveness(
+        fn proptest_twin_proposal_preserves_safety_and_emits_evidence(
             victim in 0usize..4,
         ) {
             run_paused(|| async move {
-                run_one_property(victim, AdvKind::TwinProposal).await
+                let (mut cluster, honest) =
+                    spawn_with_one_adversary(victim, build_adversary(AdvKind::TwinProposal)).await;
+                let baseline = cluster.peek_commit_heights();
+                let (satisfied, final_heights) =
+                    run_until_honest_floor_or_cap(&mut cluster, &honest, &baseline).await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                prop_assert!(
+                    satisfied,
+                    "twin-proposal adversary at index {victim}: honest nodes did not all gain \
+                     ≥ {HONEST_FLOOR} commits within {SIM_CAP:?} simulated; \
+                     baseline = {baseline:?}, final = {final_heights:?}",
+                );
+
+                let evidence_counts: Vec<u64> = honest
+                    .iter()
+                    .map(|&i| cluster.peek_proposal_equivocations_detected(i))
+                    .collect();
+                let detectors = evidence_counts.iter().filter(|&&c| c > 0).count();
+                prop_assert!(
+                    detectors >= 2,
+                    "twin-proposal adversary at index {victim}: expected the \
+                     proposal-equivocation evidence path to fire on ≥ f+1 = 2 honest replicas, \
+                     got {detectors} (per-honest counts = {evidence_counts:?})",
+                );
+                Ok::<(), TestCaseError>(())
             })?;
         }
 

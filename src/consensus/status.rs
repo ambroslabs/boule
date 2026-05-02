@@ -231,6 +231,22 @@ pub struct ConsensusStatus {
     /// the same evidence.
     #[serde(default)]
     pub equivocations_detected: u64,
+    /// Cumulative count of proposal-equivocation incidents detected by
+    /// the safety core (audit finding L5-1): a single stable validator
+    /// id contributing proposals for two distinct `block_hash` values
+    /// at the same view. Each incident corresponds to one
+    /// [`crate::consensus::hotstuff::step::Action::ProposalEquivocationEvidence`]
+    /// emitted by the safety core; the integration layer increments
+    /// this counter and logs the event at WARN. Sibling of
+    /// [`Self::equivocations_detected`] — a separate counter so
+    /// proposer-side and voter-side Byzantine activity stay
+    /// independently observable. Monotonic for the lifetime of the
+    /// node — resets on restart but never decrements during a run. A
+    /// non-zero value indicates a Byzantine leader is detectable on
+    /// the wire; future slashing pipelines will consume the same
+    /// evidence.
+    #[serde(default)]
+    pub proposal_equivocations_detected: u64,
     /// Cumulative drop counts on the production drop-on-full
     /// back-pressure paths. See [`BackpressureStatus`].
     #[serde(default)]
@@ -299,6 +315,7 @@ mod tests {
             },
             dropped_commands: 11,
             equivocations_detected: 2,
+            proposal_equivocations_detected: 4,
             backpressure: BackpressureStatus {
                 gossip_sink_overflow_total: 5,
                 peer_outbound_overflow_total: 9,
@@ -362,6 +379,9 @@ mod tests {
         // Vote-equivocation counter (audit 3-1, #409).
         assert_eq!(json["equivocations_detected"], 2);
 
+        // Proposal-equivocation counter (audit L5-1).
+        assert_eq!(json["proposal_equivocations_detected"], 4);
+
         // Back-pressure overflow counters (#163 / #486 / #498).
         assert_eq!(json["backpressure"]["gossip_sink_overflow_total"], 5);
         assert_eq!(json["backpressure"]["peer_outbound_overflow_total"], 9);
@@ -423,6 +443,7 @@ mod tests {
             cache_evictions: CacheEvictionStatus::default(),
             dropped_commands: 0,
             equivocations_detected: 0,
+            proposal_equivocations_detected: 0,
             backpressure: BackpressureStatus::default(),
         };
         let json = serde_json::to_value(&s).unwrap();
@@ -436,5 +457,6 @@ mod tests {
         assert_eq!(json["cache_evictions"]["timeout_buckets"], 0);
         assert_eq!(json["dropped_commands"], 0);
         assert_eq!(json["equivocations_detected"], 0);
+        assert_eq!(json["proposal_equivocations_detected"], 0);
     }
 }
