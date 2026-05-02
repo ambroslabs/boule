@@ -1191,6 +1191,37 @@ impl ConsensusNode {
             *retry_timer_delay = None;
         }
     }
+
+    /// Test-only: install a `block_sync_range_inflight` entry as if a
+    /// `BlockRangeRequest` had just been emitted to `peer` for the
+    /// given span. Lets the integration-layer dispatch tests (#531)
+    /// exercise the `BlockRangeResponse` inflight gate without
+    /// standing up a full multi-block parked-proposal flow.
+    #[cfg(test)]
+    pub(crate) fn install_block_sync_range_inflight_for_test(
+        &mut self,
+        from_height: Height,
+        to_height: Height,
+        peer: NodeId,
+    ) {
+        self.block_sync_range_inflight
+            .insert((from_height, to_height), peer);
+    }
+
+    /// Test-only: read a `block_sync_range_inflight` entry. Returns
+    /// `Some(peer)` when an entry exists for the given span, `None`
+    /// otherwise. Used to assert the inflight gate's "consume on
+    /// receipt" behaviour from the dispatch tests.
+    #[cfg(test)]
+    pub(crate) fn block_sync_range_inflight_peer_for_test(
+        &self,
+        from_height: Height,
+        to_height: Height,
+    ) -> Option<NodeId> {
+        self.block_sync_range_inflight
+            .get(&(from_height, to_height))
+            .copied()
+    }
 }
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -3861,8 +3892,10 @@ mod tests {
 
     /// `Dispatch::ReceiveBlockRange` inserts every well-formed block
     /// (height inside echoed span, strictly ascending) into
-    /// pending_blocks. Out-of-range entries are dropped, matching the
-    /// `ingress_block_range_response`'s shape contract.
+    /// pending_blocks when the response matches an outstanding
+    /// inflight entry. Out-of-range entries are dropped, matching the
+    /// `ingress_block_range_response`'s shape contract. The matching
+    /// inflight entry is consumed on receipt (#531).
     #[tokio::test]
     async fn receive_block_range_inserts_in_range_blocks_and_drops_out_of_range() {
         let mut node = make_node(nid(1));
@@ -3870,6 +3903,11 @@ mod tests {
         let (broadcaster, _outbound_rx) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Pretend we just emitted a BlockRangeRequest for [5, 7] to
+        // peer nid(2). The inflight gate (#531) requires this entry
+        // before the response is admitted.
+        node.install_block_sync_range_inflight_for_test(Height(5), Height(7), nid(2));
 
         // Build a deliberately-mixed response: heights 4 (out-of-range),
         // 5, 6 (in-range), 9 (out-of-range). The handler must keep
@@ -3906,6 +3944,63 @@ mod tests {
             !pending.contains_key(&range_block_at(9).hash()),
             "above-range block must be dropped",
         );
+        assert!(
+            node.block_sync_range_inflight_peer_for_test(Height(5), Height(7))
+                .is_none(),
+            "matching inflight entry must be cleared on receipt",
+        );
+    }
+
+    /// `Dispatch::ReceiveBlockRange` whose `(from_height, to_height)`
+    /// pair has no matching `block_sync_range_inflight` entry must be
+    /// dropped before any block reaches `pending_blocks`. Without the
+    /// gate a Byzantine peer could pollute the cache with arbitrary
+    /// blocks the requester never asked for (audit symmetry to
+    /// `receive_block_drops_unsolicited_response` from the single-
+    /// block path; issue #531).
+    #[tokio::test]
+    async fn receive_block_range_drops_unsolicited_response() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, _outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // No install_block_sync_range_inflight_for_test call: the
+        // response below is unsolicited.
+        let pending_before = node.core.state().pending_blocks.len();
+
+        let blocks = vec![range_block_at(5), range_block_at(6), range_block_at(7)];
+
+        node.apply_dispatch(
+            Dispatch::ReceiveBlockRange {
+                from_height: Height(5),
+                to_height: Height(7),
+                blocks,
+                from: nid(2),
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch");
+
+        assert_eq!(
+            node.core.state().pending_blocks.len(),
+            pending_before,
+            "unsolicited BlockRangeResponse must not insert into pending_blocks",
+        );
+        for h in 5..=7 {
+            assert!(
+                !node
+                    .core
+                    .state()
+                    .pending_blocks
+                    .contains_key(&range_block_at(h).hash()),
+                "unsolicited block at height {h} must not appear in pending_blocks",
+            );
+        }
     }
 
     // ── Bulk-range requester gap detection (#515) ──────────────────────

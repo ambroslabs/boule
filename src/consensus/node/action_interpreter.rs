@@ -647,13 +647,22 @@ impl ConsensusNode {
         Ok(())
     }
 
-    /// Apply a bulk-range response: validate each block's height
-    /// against the echoed `[from_height, to_height]`, insert the
-    /// well-formed blocks into the safety core's `pending_blocks`,
-    /// and re-drive the parked-proposals walk via a single
-    /// `PacemakerAdvance(current_view)` after all inserts have
-    /// landed. The requester-side pipelining state machine (#515)
-    /// hooks in on top of this.
+    /// Apply a bulk-range response: validate the echoed
+    /// `[from_height, to_height]` matches an outstanding
+    /// `block_sync_range_inflight` entry, validate each block's height
+    /// against that span, insert the well-formed blocks into the
+    /// safety core's `pending_blocks`, and re-drive the parked-
+    /// proposals walk via a single `PacemakerAdvance(current_view)`
+    /// after all inserts have landed.
+    ///
+    /// The inflight gate (#531) mirrors the single-block path's
+    /// `has_inflight_block_request` check: an unsolicited response
+    /// (one whose `(from_height, to_height)` pair has no matching
+    /// inflight entry) is dropped before any block reaches
+    /// `pending_blocks`. Without the gate a Byzantine peer could
+    /// pollute the cache with arbitrary blocks the requester never
+    /// asked for, evicting legitimate entries via the lowest-height
+    /// eviction policy.
     #[allow(clippy::too_many_arguments)]
     async fn handle_block_range_response(
         &mut self,
@@ -674,13 +683,26 @@ impl ConsensusNode {
             block_count,
             "block_sync_range_response_received",
         );
-        // Drop the matching range-inflight entry (#515). Done
-        // *before* the inserts so a follow-up proposal arriving
-        // mid-iteration can re-emit a fresh range request — the
-        // dedup guard in [`Self::maybe_emit_block_range_request`]
-        // would otherwise suppress the next emission.
-        self.block_sync_range_inflight
-            .remove(&(from_height, to_height));
+        // Inflight gate (#531). Drop the matching range-inflight
+        // entry; if the response doesn't match an outstanding entry
+        // it is unsolicited and must not pollute `pending_blocks`.
+        // Mirror of the single-block path's
+        // `has_inflight_block_request` check (#434).
+        if self
+            .block_sync_range_inflight
+            .remove(&(from_height, to_height))
+            .is_none()
+        {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                from = %node_id_to_base58(&from),
+                from_height = from_height.0,
+                to_height = to_height.0,
+                block_count,
+                "block_sync_range_response_unrequested",
+            );
+            return Ok(());
+        }
         let mut inserted = 0u64;
         let mut last_height: Option<crate::consensus::Height> = None;
         for block in blocks {

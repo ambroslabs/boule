@@ -79,8 +79,12 @@ pub const BLOCK_RANGE_RESPONSE_MAX_BLOCKS: usize = 64;
 /// Receivers must drop a response whose blocks fall outside
 /// `[from_height, to_height]`, whose height ordering is not strictly
 /// ascending, or whose `from_height`/`to_height` do not match an
-/// outstanding range-inflight entry (the requester-side
-/// implementation in #515 enforces this gate).
+/// outstanding range-inflight entry. The shape gate (in-range,
+/// strictly-ascending) is enforced in
+/// [`crate::consensus::dispatch::ingress::ingress_block_range_response`];
+/// the inflight gate is enforced in `handle_block_range_response`
+/// at the integration layer (#531) — the symmetric defense to the
+/// single-block path's `has_inflight_block_request` check (#434).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockRangeResponsePayload {
     /// First height of the requested span (inclusive).
