@@ -11,7 +11,8 @@ use crate::consensus::hotstuff::qc::quorum_size;
 use crate::consensus::pacemaker::Pacemaker;
 use crate::consensus::status::{
     BUCKET_VIEW_WINDOW, BackpressureStatus, CacheEvictionStatus, ConsensusStatus, LockedStatus,
-    ParkedProposalStatus, QcStatus, TimeoutBucketStatus, VoteBucketStatus,
+    ParkedProposalStatus, QcStatus, RotationEntry, TimeoutBucketStatus, ValidatorKeyStatus,
+    VoteBucketStatus,
 };
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::{Height, View};
@@ -140,6 +141,27 @@ impl ConsensusNode {
             .map(|v| crate::p2p::tls::node_id_to_base58(v.as_node_id()))
             .collect();
 
+        // by_stable_id is a BTreeMap, so iter() already yields
+        // validators in byte-lexicographic order — no extra sort needed.
+        let validator_keys: Vec<ValidatorKeyStatus> = self
+            .validator_key_history
+            .iter()
+            .map(|(stable_id, entries)| {
+                let entries: Vec<RotationEntry> = entries
+                    .map(|(v_eff, pubkey)| RotationEntry {
+                        v_eff,
+                        pubkey: crate::p2p::tls::node_id_to_base58(&pubkey),
+                    })
+                    .collect();
+                let active_pubkey = entries.last().map(|e| e.pubkey.clone()).unwrap_or_default();
+                ValidatorKeyStatus {
+                    stable_id: crate::p2p::tls::node_id_to_base58(stable_id.as_node_id()),
+                    active_pubkey,
+                    entries,
+                }
+            })
+            .collect();
+
         ConsensusStatus {
             node_id: crate::p2p::tls::node_id_to_base58(&self.self_id),
             self_role,
@@ -155,6 +177,7 @@ impl ConsensusNode {
             pending_blocks_count: state.pending_blocks.len(),
             peers_connected,
             validator_set,
+            validator_keys,
             mempool_size: self.mempool.len(),
             cache_evictions: CacheEvictionStatus {
                 vote_buckets: self.eviction_counters.vote_bucket(),

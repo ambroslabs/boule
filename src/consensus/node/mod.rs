@@ -1368,6 +1368,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_status_surfaces_validator_keys_with_genesis_entries() {
+        // Acceptance criterion 1 (#314): the snapshot has one
+        // validator_keys entry per validator in the seeded key history,
+        // each with a single genesis rotation entry.
+        let node = make_node(nid(1));
+        let status = node.build_status();
+        assert_eq!(status.validator_keys.len(), 4);
+        // BTreeMap iteration order = byte-lexicographic, which for the
+        // [b; 32] test ids matches the validator-set ordering. Every
+        // entry has a single genesis rotation at view 0, with
+        // active_pubkey == stable_id.
+        for v in &status.validator_keys {
+            assert_eq!(v.entries.len(), 1);
+            assert_eq!(v.entries[0].v_eff, View(0));
+            assert_eq!(v.entries[0].pubkey, v.stable_id);
+            assert_eq!(v.active_pubkey, v.stable_id);
+        }
+        // Every stable_id appears in the validator set as of this
+        // snapshot view (acceptance criterion 3).
+        for v in &status.validator_keys {
+            assert!(
+                status.validator_set.contains(&v.stable_id),
+                "stable_id {} missing from validator_set",
+                v.stable_id,
+            );
+        }
+    }
+
+    #[test]
+    fn build_status_surfaces_rotation_in_validator_keys() {
+        // Acceptance criterion 2 (#314): after an applied rotation, the
+        // affected validator's entries vector grows to length 2 and
+        // active_pubkey advances to the new key.
+        use crate::consensus::validator_rotation::{V_EFF_MIN_DELAY, ValidatorKeyRotation};
+
+        let mut node = make_node(nid(1));
+
+        let new_key = nid(42);
+        let commit_view = View(10);
+        let v_eff = commit_view + V_EFF_MIN_DELAY;
+        let rotation = ValidatorKeyRotation {
+            validator: nid(2),
+            new_pubkey: new_key,
+            v_eff,
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        };
+        node.validator_key_history
+            .apply_rotation(&rotation, commit_view)
+            .expect("rotation applies cleanly to seeded history");
+
+        let status = node.build_status();
+        let stable_id_b58 = crate::p2p::tls::node_id_to_base58(&nid(2));
+        let new_key_b58 = crate::p2p::tls::node_id_to_base58(&new_key);
+
+        let rotated = status
+            .validator_keys
+            .iter()
+            .find(|v| v.stable_id == stable_id_b58)
+            .expect("rotated validator must surface in validator_keys");
+        assert_eq!(rotated.entries.len(), 2);
+        assert_eq!(rotated.entries[0].v_eff, View(0));
+        assert_eq!(rotated.entries[0].pubkey, stable_id_b58);
+        assert_eq!(rotated.entries[1].v_eff, v_eff);
+        assert_eq!(rotated.entries[1].pubkey, new_key_b58);
+        assert_eq!(rotated.active_pubkey, new_key_b58);
+
+        // Other validators' timelines must remain at length 1.
+        for v in &status.validator_keys {
+            if v.stable_id != stable_id_b58 {
+                assert_eq!(v.entries.len(), 1);
+                assert_eq!(v.active_pubkey, v.stable_id);
+            }
+        }
+    }
+
     // ── A2: WireMessage roundtrip ────────────────────────────────────────────
 
     fn sample_block() -> Block {
