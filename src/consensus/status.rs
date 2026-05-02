@@ -166,6 +166,17 @@ pub struct BackpressureStatus {
     /// stays at zero. Closed-channel failures are not counted.
     #[serde(default)]
     pub block_sync_serve_drops_total: u64,
+    /// Drops from the per-peer outbound bytes/sec cap (#553). Each
+    /// increment is one egress frame the rate limiter declined to
+    /// hand to the transport because the recipient peer's outbound
+    /// bucket was empty — typically a `BlockRangeResponse` that
+    /// would have amplified a tiny incoming `BlockRangeRequest` into
+    /// hundreds of KB on the wire. Sustained growth points at a
+    /// Byzantine peer pulling more egress out of the responder than
+    /// `outbound_bytes_per_sec` allows, or at an under-sized
+    /// outbound bucket throttling honest catch-up.
+    #[serde(default)]
+    pub p2p_egress_byte_drops_total: u64,
 }
 
 /// One entry in a validator's signing-key history. `v_eff` is the view
@@ -387,6 +398,7 @@ mod tests {
                 gossip_sink_overflow_total: 5,
                 peer_outbound_overflow_total: 9,
                 block_sync_serve_drops_total: 2,
+                p2p_egress_byte_drops_total: 13,
             },
         }
     }
@@ -485,10 +497,11 @@ mod tests {
         // Proposal-equivocation counter (audit L5-1).
         assert_eq!(json["proposal_equivocations_detected"], 4);
 
-        // Back-pressure overflow counters (#163 / #486 / #498).
+        // Back-pressure overflow counters (#163 / #486 / #498 / #553).
         assert_eq!(json["backpressure"]["gossip_sink_overflow_total"], 5);
         assert_eq!(json["backpressure"]["peer_outbound_overflow_total"], 9);
         assert_eq!(json["backpressure"]["block_sync_serve_drops_total"], 2);
+        assert_eq!(json["backpressure"]["p2p_egress_byte_drops_total"], 13);
     }
 
     #[test]

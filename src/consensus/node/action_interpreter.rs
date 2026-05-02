@@ -277,7 +277,13 @@ impl ConsensusNode {
                     signer.as_ref(),
                     &self.chain_id,
                 )?;
-                send_outbound(broadcaster, out).await;
+                send_outbound(
+                    broadcaster,
+                    self.rate_limiter.as_deref(),
+                    &self.peers_connected,
+                    out,
+                )
+                .await;
             }
 
             // Block arrived in response to an earlier RequestBlock;
@@ -460,7 +466,13 @@ impl ConsensusNode {
                     signer.as_ref(),
                     &self.chain_id,
                 )?;
-                send_outbound(broadcaster, out).await;
+                send_outbound(
+                    broadcaster,
+                    self.rate_limiter.as_deref(),
+                    &self.peers_connected,
+                    out,
+                )
+                .await;
             }
 
             // Bulk-range receive (#514). The per-block insert and the
@@ -643,7 +655,13 @@ impl ConsensusNode {
             "block_sync_range_request_emitted",
         );
         let out = dispatch::egress_block_range_request(from_height, to_height, proposer);
-        send_outbound(broadcaster, out).await;
+        send_outbound(
+            broadcaster,
+            self.rate_limiter.as_deref(),
+            &self.peers_connected,
+            out,
+        )
+        .await;
         Ok(())
     }
 
@@ -850,7 +868,13 @@ impl ConsensusNode {
                     )?;
                     let msg_is_proposal = matches!(msg, ConsensusMsg::Proposal(_));
                     let msg_is_vote = matches!(msg, ConsensusMsg::Vote(_));
-                    send_outbound(broadcaster, Outbound::Broadcast(payload)).await;
+                    send_outbound(
+                        broadcaster,
+                        self.rate_limiter.as_deref(),
+                        &self.peers_connected,
+                        Outbound::Broadcast(payload),
+                    )
+                    .await;
                     // After a Proposal hits the wire the leader has a
                     // de-facto commitment to view N — but
                     // `proposed_in_view` is in-memory only (audit
@@ -898,6 +922,8 @@ impl ConsensusNode {
                         );
                         send_outbound(
                             broadcaster,
+                            self.rate_limiter.as_deref(),
+                            &self.peers_connected,
                             Outbound::SendTo {
                                 to: target,
                                 payload,
@@ -946,7 +972,13 @@ impl ConsensusNode {
                             "block_sync_request_emitted",
                         );
                         let out = dispatch::egress_block_request(hash, peer);
-                        send_outbound(broadcaster, out).await;
+                        send_outbound(
+                            broadcaster,
+                            self.rate_limiter.as_deref(),
+                            &self.peers_connected,
+                            out,
+                        )
+                        .await;
                     }
                 }
 

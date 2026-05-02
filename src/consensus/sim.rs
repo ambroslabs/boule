@@ -6038,6 +6038,131 @@ mod tests {
         assert_no_conflicts(&committed);
     }
 
+    // ── Egress amplification flood (#553) ─────────────────────────────────────
+
+    /// Issue #553 acceptance: a Byzantine peer flooding
+    /// `BlockRangeRequest` frames cannot pull more than
+    /// `outbound_bytes_per_sec` of responses out of the responder.
+    /// The per-peer outbound bytes bucket on
+    /// [`crate::p2p::limits::RateLimiter`] caps egress regardless of
+    /// how cheap the inbound requests are — the asymmetric
+    /// request/response cost the issue documents (16 B request,
+    /// hundreds of KB response) is bounded at the egress boundary.
+    ///
+    /// We tighten `outbound_bytes_per_sec` to a value smaller than a
+    /// single `BlockRangeResponse` envelope (signed payload + header)
+    /// so the bucket cannot admit even the first response a flood
+    /// would produce. After yielding enough rounds for the run loop
+    /// to pull every request through ingress and the responder's
+    /// per-peer credit window, the limiter's outbound-drops counter
+    /// reflects every dropped response — the proxy measurement for
+    /// "no bytes pulled out".
+    #[tokio::test]
+    async fn block_range_response_flood_is_capped_by_outbound_byte_cap() {
+        tokio::time::pause();
+
+        // Tight outbound budget: 32 bytes/sec is below the wire size of
+        // any signed `BlockRangeResponse` envelope (32 signer + 64 sig +
+        // payload header alone exceed the cap), so every response the
+        // responder builds is dropped at the egress admit. Keep ingress
+        // generous so the requests admit cleanly and the test isolates
+        // the egress boundary.
+        let mut config = crate::p2p::limits::RateLimitsConfig::production_defaults();
+        config.outbound_bytes_per_sec = 32.0;
+        config.block_range_request_per_sec = 1_000.0;
+        config.bytes_per_sec = 1.0e9;
+        config.max_violations = u32::MAX;
+        let (mut cluster, limiters) =
+            SimCluster::spawn_with_rate_limits(4, Duration::from_millis(50), config).await;
+
+        // Warm-up: every node commits at least one block so the
+        // responder has a non-trivial pending_blocks frontier. The
+        // responses' contents do not matter for this assertion — we
+        // care that the egress admit refused them — but a warmed
+        // cluster proves we're past genesis-bootstrap before the flood.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(1), |c| {
+                c.peek_commit_heights().iter().all(|&h| h >= 1)
+            })
+            .await;
+        assert!(
+            warmed,
+            "warm-up failed; heights = {:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        // Inject the flood at node 1, attributed to node 0. Hit the
+        // inbound `event_tx` directly to bypass any sender-side rate
+        // limiting and isolate the responder boundary.
+        let target_idx = 1;
+        let from_node = cluster.node_ids[0];
+        let target_node = cluster.node_ids[target_idx];
+        let wire = crate::consensus::node::WireMessage::BlockRangeRequest {
+            from_height: crate::consensus::Height(0),
+            to_height: crate::consensus::Height(64),
+        };
+        let bytes: Bytes = postcard::to_stdvec(&wire).unwrap().into();
+
+        let event_tx = cluster
+            .event_txs
+            .get(&target_node)
+            .expect("target_idx must have an event_tx slot")
+            .lock()
+            .clone();
+
+        const FLOOD_COUNT: usize = 32;
+        for _ in 0..FLOOD_COUNT {
+            event_tx
+                .send(ProtocolEvent::Message {
+                    from: from_node,
+                    payload: bytes.clone(),
+                })
+                .await
+                .expect("event_rx alive — node task should still be running");
+        }
+
+        // Yield enough rounds for the run loop to pull every queued
+        // event through ingress, build each response, and try the
+        // outbound admit. We early-exit once outbound_drops_total
+        // exceeds half the flood — at that point the egress bucket
+        // is observably bounding the response stream and further
+        // yielding only adds cost.
+        for _ in 0..(FLOOD_COUNT * 8) {
+            yield_now().await;
+            if limiters[target_idx].counters().outbound_drops_total() > (FLOOD_COUNT as u64) / 2 {
+                break;
+            }
+        }
+
+        let outbound_drops = limiters[target_idx].counters().outbound_drops_total();
+        assert!(
+            outbound_drops > (FLOOD_COUNT as u64) / 2,
+            "expected > {} outbound drops on node {target_idx} under {FLOOD_COUNT}-frame \
+             BlockRangeRequest flood; got {outbound_drops}",
+            FLOOD_COUNT / 2,
+        );
+
+        // Cluster still makes progress past the flood — the egress cap
+        // shielded the responder from amplification without wedging
+        // consensus. Assert each node gains at least one *additional*
+        // commit since the warm-up baseline.
+        let baseline = cluster.peek_commit_heights();
+        let progressed = cluster
+            .advance_and_yield_until(Duration::from_secs(2), |c| {
+                let now = c.peek_commit_heights();
+                now.iter().zip(baseline.iter()).all(|(a, b)| a > b)
+            })
+            .await;
+        assert!(
+            progressed,
+            "cluster failed to progress past egress flood; baseline={baseline:?}, now={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
     // ── #255: validator-set reconfiguration end-to-end ────────────────────
 
     /// 5-node cluster commits a `ReconfigCommand` that removes one

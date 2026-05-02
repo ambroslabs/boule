@@ -1,17 +1,28 @@
 //! Per-peer rate limiting and connection caps for the p2p layer
-//! (issue #134).
+//! (issue #134; egress cap added in #553).
 //!
 //! Two independent limiters live here:
 //!
 //! - [`RateLimiter`] enforces per-peer token buckets keyed by
-//!   [`MessageKind`] (one bucket per consensus message type) plus a
-//!   per-peer wire-bytes/sec cap. The consensus integration layer
-//!   classifies an inbound frame's first byte into a [`MessageKind`],
-//!   asks `admit`, and either drops or dispatches based on the
-//!   [`Decision`]. After K violations within a sliding window of W
-//!   seconds, [`Decision::Disconnect`] is returned exactly once per
-//!   peer — the caller is responsible for tearing down the connection
+//!   [`MessageKind`] (one bucket per consensus message type), a
+//!   per-peer **inbound** wire-bytes/sec cap, and a per-peer
+//!   **outbound** wire-bytes/sec cap (#553). The consensus
+//!   integration layer classifies an inbound frame's first byte
+//!   into a [`MessageKind`], asks [`RateLimiter::admit`], and either
+//!   drops or dispatches based on the [`Decision`]. After K
+//!   violations within a sliding window of W seconds,
+//!   [`Decision::Disconnect`] is returned exactly once per peer —
+//!   the caller is responsible for tearing down the connection
 //!   (typically by sending [`crate::p2p::PeerCommand::Disconnect`]).
+//!   On egress, every directed `SendTo` frame is charged against
+//!   the recipient peer's outbound bucket via
+//!   [`RateLimiter::admit_outbound`]; on overflow the caller skips
+//!   the send. The outbound cap defends against the
+//!   request/response amplification vector where a Byzantine peer
+//!   sends tiny [`MessageKind::BlockRangeRequest`] frames at low
+//!   ingress cost and pulls hundreds of KB of
+//!   [`MessageKind::BlockRangeResponse`] out of the responder per
+//!   request.
 //!
 //! - [`ConnectionLimiter`] enforces global inbound / outbound /
 //!   per-source-IP caps at the manager. The listener and dialer pass
@@ -271,6 +282,16 @@ pub struct RateLimitsConfig {
     /// per-kind buckets so a flood of any one kind that fits within
     /// its bucket can still be dropped on bytes alone.
     pub bytes_per_sec: f64,
+    /// Per-peer outbound wire-bytes/sec ceiling (#553). Symmetric to
+    /// [`Self::bytes_per_sec`] but charged on egress: every directed
+    /// frame the node hands to the transport is consulted against the
+    /// recipient peer's outbound bucket. Defends against the
+    /// request/response amplification vector where a Byzantine peer
+    /// sends tiny [`MessageKind::BlockRangeRequest`]s at low ingress
+    /// cost and pulls hundreds of KB of [`MessageKind::BlockRangeResponse`]
+    /// out of the responder per request — the ingress bucket sees only
+    /// the cheap requests while egress goes uncapped.
+    pub outbound_bytes_per_sec: f64,
     /// Burst window in seconds; capacity for each bucket is
     /// `rate_per_sec * burst_seconds`.
     pub burst_seconds: f64,
@@ -308,6 +329,7 @@ impl RateLimitsConfig {
             block_range_request_per_sec: HUGE,
             block_range_response_per_sec: HUGE,
             bytes_per_sec: HUGE,
+            outbound_bytes_per_sec: HUGE,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),
             max_violations: u32::MAX,
@@ -345,6 +367,15 @@ impl RateLimitsConfig {
             block_range_request_per_sec: 8.0,
             block_range_response_per_sec: 8.0,
             bytes_per_sec: 1024.0 * 1024.0,
+            // Sized symmetric to `bytes_per_sec`. Honest steady-state
+            // egress on a 4-validator cluster is dominated by proposals
+            // (~16/sec × a few KB) and votes (next-leader unicast at
+            // similar cadence) — comfortably under 1 MiB/sec per peer.
+            // Bulk-range catch-up bursts up to
+            // [`crate::consensus::node::BLOCK_RANGE_RESPONSE_MAX_BLOCKS`]
+            // blocks per response and is the dominant drainer; the cap
+            // bounds amplification without throttling honest catch-up.
+            outbound_bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),
             max_violations: 100,
@@ -378,6 +409,10 @@ impl RateLimitsConfig {
     fn bytes_capacity(&self) -> f64 {
         (self.bytes_per_sec * self.burst_seconds).max(1.0)
     }
+
+    fn outbound_bytes_capacity(&self) -> f64 {
+        (self.outbound_bytes_per_sec * self.burst_seconds).max(1.0)
+    }
 }
 
 // ── Decision + counters ──────────────────────────────────────────────────────
@@ -410,6 +445,7 @@ pub struct RateLimitCounters {
 struct RateLimitCountersInner {
     by_kind: [AtomicU64; 12],
     bytes: AtomicU64,
+    outbound_bytes: AtomicU64,
     disconnects: AtomicU64,
 }
 
@@ -434,6 +470,16 @@ impl RateLimitCounters {
         self.inner.bytes.load(Ordering::Relaxed)
     }
 
+    /// Cumulative drops attributed to the outbound bytes/sec cap (#553).
+    /// Each increment is one egress frame the limiter declined to hand
+    /// to the transport because the recipient peer's outbound bucket
+    /// was empty — typically a [`MessageKind::BlockRangeResponse`] the
+    /// responder skipped to stop a Byzantine peer from amplifying tiny
+    /// requests into hundreds of KB/sec of egress.
+    pub fn outbound_drops_total(&self) -> u64 {
+        self.inner.outbound_bytes.load(Ordering::Relaxed)
+    }
+
     /// Cumulative `Decision::Disconnect` returns.
     pub fn disconnects(&self) -> u64 {
         self.inner.disconnects.load(Ordering::Relaxed)
@@ -447,6 +493,10 @@ impl RateLimitCounters {
         self.inner.bytes.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn inc_outbound_bytes(&self) {
+        self.inner.outbound_bytes.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn inc_disconnects(&self) {
         self.inner.disconnects.fetch_add(1, Ordering::Relaxed);
     }
@@ -457,6 +507,12 @@ impl RateLimitCounters {
 struct PeerState {
     buckets: [TokenBucket; 12],
     bytes_bucket: TokenBucket,
+    /// Per-peer egress bytes/sec ceiling (#553). Independent of
+    /// `bytes_bucket` so the inbound-vs-outbound budgets do not
+    /// cross-contaminate — a peer that floods cheap requests cannot
+    /// drain its own ingress budget AND our egress budget out of the
+    /// same pool.
+    outbound_bytes_bucket: TokenBucket,
     /// Monotonic instants of recent violations, oldest first.
     violations: VecDeque<Duration>,
     /// True after the limiter returned [`Decision::Disconnect`] once
@@ -485,6 +541,11 @@ impl PeerState {
                 mk(MessageKind::BlockRangeResponse),
             ],
             bytes_bucket: TokenBucket::new(config.bytes_per_sec, config.bytes_capacity(), now),
+            outbound_bytes_bucket: TokenBucket::new(
+                config.outbound_bytes_per_sec,
+                config.outbound_bytes_capacity(),
+                now,
+            ),
             violations: VecDeque::new(),
             disconnect_dispatched: false,
         }
@@ -587,6 +648,39 @@ impl RateLimiter {
             return Decision::Disconnect;
         }
         Decision::Drop
+    }
+
+    /// Decide whether to admit or drop an outbound frame addressed to
+    /// `peer` (#553). `bytes_len` is charged against the recipient
+    /// peer's `outbound_bytes_bucket`; on overflow the caller skips
+    /// the send and the [`RateLimitCounters::outbound_drops_total`]
+    /// counter is incremented.
+    ///
+    /// Returns either [`Decision::Allow`] or [`Decision::Drop`]; the
+    /// outbound path never returns [`Decision::Disconnect`] because
+    /// dropping our own outbound frames does not warrant tearing down
+    /// the connection — the inbound limiter is the canonical
+    /// disconnect trigger.
+    ///
+    /// Dropping a directed response (e.g. [`MessageKind::BlockRangeResponse`])
+    /// is safe under the existing protocol: the requester's
+    /// inflight/timeout state machine treats the silence identically
+    /// to a packet loss event and re-requests on its own cadence.
+    pub fn admit_outbound(&self, peer: NodeId, bytes_len: usize) -> Decision {
+        let now = self.clock.now_monotonic();
+        let mut state = self.state.lock();
+        let peer_state = state
+            .entry(peer)
+            .or_insert_with(|| PeerState::new(&self.config, now));
+        if peer_state
+            .outbound_bytes_bucket
+            .try_take(now, bytes_len as f64)
+        {
+            Decision::Allow
+        } else {
+            self.counters.inc_outbound_bytes();
+            Decision::Drop
+        }
     }
 
     /// Forget a peer's accumulated state. Call when the connection is
@@ -1021,6 +1115,7 @@ mod tests {
             block_range_request_per_sec: 4.0,
             block_range_response_per_sec: 4.0,
             bytes_per_sec: 4096.0,
+            outbound_bytes_per_sec: 4096.0,
             burst_seconds: 1.0,
             violation_window: Duration::from_secs(10),
             max_violations: 5,
@@ -1127,6 +1222,104 @@ mod tests {
         assert_eq!(limiter.admit(nid(1), MessageKind::Vote, 1), Decision::Drop);
         assert_eq!(limiter.counters().bytes_drops(), 1);
         assert_eq!(limiter.counters().drops(MessageKind::Vote), 0);
+    }
+
+    /// #553 acceptance: a tiny outbound budget drains after a single
+    /// over-cap response and the limiter returns `Decision::Drop` on
+    /// subsequent egress; budget refills with time.
+    #[test]
+    fn admit_outbound_drains_then_refills() {
+        let clock = ManualClock::new();
+        let mut config = limits_for_test();
+        config.outbound_bytes_per_sec = 100.0;
+        let limiter = RateLimiter::new(config, clock.clone());
+
+        // First 100 bytes admitted.
+        assert_eq!(limiter.admit_outbound(nid(1), 100), Decision::Allow);
+        // Bucket empty — next byte denied.
+        assert_eq!(limiter.admit_outbound(nid(1), 1), Decision::Drop);
+        assert_eq!(limiter.counters().outbound_drops_total(), 1);
+        // Per-kind / inbound-bytes counters are not touched.
+        assert_eq!(limiter.counters().bytes_drops(), 0);
+
+        // Refill: 1 second at 100 B/s rate brings the bucket back.
+        clock.set(Duration::from_secs(1));
+        assert_eq!(limiter.admit_outbound(nid(1), 100), Decision::Allow);
+    }
+
+    /// #553 acceptance: outbound bucket is independent of the inbound
+    /// bytes bucket — a peer that drains its ingress budget by sending
+    /// large frames still has its outbound bucket intact, and vice
+    /// versa.
+    #[test]
+    fn admit_outbound_independent_of_inbound_bytes_bucket() {
+        let clock = ManualClock::new();
+        let mut config = limits_for_test();
+        config.bytes_per_sec = 100.0;
+        config.outbound_bytes_per_sec = 100.0;
+        let limiter = RateLimiter::new(config, clock.clone());
+
+        // Drain inbound bytes by ingressing 100 bytes.
+        assert_eq!(
+            limiter.admit(nid(1), MessageKind::Vote, 100),
+            Decision::Allow
+        );
+        // Outbound budget is still full.
+        assert_eq!(limiter.admit_outbound(nid(1), 100), Decision::Allow);
+        // Both buckets now drained — inbound-byte and outbound-byte
+        // drops increment independently.
+        assert_eq!(limiter.admit(nid(1), MessageKind::Vote, 1), Decision::Drop);
+        assert_eq!(limiter.admit_outbound(nid(1), 1), Decision::Drop);
+        assert_eq!(limiter.counters().bytes_drops(), 1);
+        assert_eq!(limiter.counters().outbound_drops_total(), 1);
+    }
+
+    /// #553: a Byzantine peer sending tiny inbound `BlockRangeRequest`s
+    /// at low ingress cost cannot pull more egress out of the responder
+    /// than `outbound_bytes_per_sec` allows. Models the responder's
+    /// per-peer outbound bucket directly: simulate one cheap request
+    /// (16 bytes ingress) eliciting a fat response (8 KB egress) and
+    /// assert the response budget bounds total egress to roughly the
+    /// configured cap regardless of how many requests arrive.
+    #[test]
+    fn admit_outbound_bounds_block_range_amplification() {
+        let clock = ManualClock::new();
+        let mut config = limits_for_test();
+        // 16 KiB/sec outbound budget — large enough to admit two 8 KiB
+        // responses per second, the third drops.
+        config.outbound_bytes_per_sec = 16_384.0;
+        // Generous inbound buckets so the request side never trips.
+        config.bytes_per_sec = 1.0e9;
+        config.block_range_request_per_sec = 1_000.0;
+        let limiter = RateLimiter::new(config, clock.clone());
+        let attacker = nid(7);
+
+        // Attacker sends 100 cheap range requests; ingress admits all.
+        for _ in 0..100 {
+            assert_eq!(
+                limiter.admit(attacker, MessageKind::BlockRangeRequest, 16),
+                Decision::Allow
+            );
+        }
+        // Responder tries to serve each at 8 KiB; the first two pass
+        // (16 KiB capacity at t=0), the rest are dropped at the
+        // outbound cap.
+        let response_bytes = 8 * 1024;
+        let mut admitted = 0u64;
+        let mut dropped = 0u64;
+        for _ in 0..100 {
+            match limiter.admit_outbound(attacker, response_bytes) {
+                Decision::Allow => admitted += 1,
+                Decision::Drop => dropped += 1,
+                Decision::Disconnect => panic!("egress path must not Disconnect"),
+            }
+        }
+        assert_eq!(
+            admitted, 2,
+            "outbound budget admits exactly two 8 KiB frames"
+        );
+        assert_eq!(dropped, 98);
+        assert_eq!(limiter.counters().outbound_drops_total(), 98);
     }
 
     #[test]

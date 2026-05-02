@@ -140,7 +140,13 @@ impl ConsensusNode {
         let bytes = postcard::to_stdvec(&wire)
             .map(Bytes::from)
             .context("encoding TimeoutVote")?;
-        send_outbound(broadcaster, Outbound::Broadcast(bytes)).await;
+        send_outbound(
+            broadcaster,
+            self.rate_limiter.as_deref(),
+            &self.peers_connected,
+            Outbound::Broadcast(bytes),
+        )
+        .await;
         // The envelope under STORAGE_KEY_LAST_TIMEOUT_VOTE is durable
         // before this send returns (see persist_fresh_timeout_vote);
         // a crash here therefore replays the same payload on restart
@@ -227,6 +233,8 @@ impl ConsensusNode {
                 );
                 send_outbound(
                     broadcaster,
+                    self.rate_limiter.as_deref(),
+                    &self.peers_connected,
                     Outbound::SendTo {
                         to: signed.signer,
                         payload,

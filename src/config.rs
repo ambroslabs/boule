@@ -722,6 +722,7 @@ impl P2pLimitsConfig {
             block_range_request_per_sec: self.rate.block_range_request_per_sec,
             block_range_response_per_sec: self.rate.block_range_response_per_sec,
             bytes_per_sec: self.rate.bytes_per_sec,
+            outbound_bytes_per_sec: self.rate.outbound_bytes_per_sec,
             burst_seconds: self.rate.burst_seconds,
             violation_window: std::time::Duration::from_secs(self.violations.window_secs),
             max_violations: self.violations.max_violations,
@@ -766,6 +767,13 @@ pub struct P2pRateLimitsConfig {
     pub block_range_response_per_sec: f64,
     #[serde(default = "default_bytes_per_sec")]
     pub bytes_per_sec: f64,
+    /// Per-peer outbound wire-bytes/sec ceiling (#553). Symmetric to
+    /// `bytes_per_sec` but charged on egress: caps how much a single
+    /// peer can pull out of this responder per second, regardless of
+    /// how cheap their inbound requests were. Defends against the
+    /// `BlockRangeRequest`/`BlockRangeResponse` amplification vector.
+    #[serde(default = "default_outbound_bytes_per_sec")]
+    pub outbound_bytes_per_sec: f64,
     /// Burst capacity = `rate × burst_seconds`. A 1.0s burst window is
     /// large enough that a leader's view-change recovery flurry stays
     /// within budget without admitting sustained over-rate.
@@ -789,6 +797,7 @@ impl Default for P2pRateLimitsConfig {
             block_range_request_per_sec: default_block_range_request_per_sec(),
             block_range_response_per_sec: default_block_range_response_per_sec(),
             bytes_per_sec: default_bytes_per_sec(),
+            outbound_bytes_per_sec: default_outbound_bytes_per_sec(),
             burst_seconds: default_burst_seconds(),
         }
     }
@@ -861,6 +870,9 @@ fn default_block_range_response_per_sec() -> f64 {
     8.0
 }
 fn default_bytes_per_sec() -> f64 {
+    1024.0 * 1024.0
+}
+fn default_outbound_bytes_per_sec() -> f64 {
     1024.0 * 1024.0
 }
 fn default_burst_seconds() -> f64 {

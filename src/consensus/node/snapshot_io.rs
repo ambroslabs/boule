@@ -67,7 +67,13 @@ impl ConsensusNode {
                         "snapshot_manifest_request_sent",
                     );
                     let out = dispatch::egress_snapshot_manifest_request(None, peer);
-                    send_outbound(broadcaster, out).await;
+                    send_outbound(
+                        broadcaster,
+                        self.rate_limiter.as_deref(),
+                        &self.peers_connected,
+                        out,
+                    )
+                    .await;
                 }
                 SnapshotSyncAction::SendChunkRequest {
                     peer,
@@ -82,7 +88,13 @@ impl ConsensusNode {
                         "snapshot_chunk_request_sent",
                     );
                     let out = dispatch::egress_snapshot_chunk_request(height, chunk_idx, peer);
-                    send_outbound(broadcaster, out).await;
+                    send_outbound(
+                        broadcaster,
+                        self.rate_limiter.as_deref(),
+                        &self.peers_connected,
+                        out,
+                    )
+                    .await;
                 }
                 SnapshotSyncAction::Restore { manifest, payload } => {
                     let height = manifest.height;
@@ -401,7 +413,13 @@ impl ConsensusNode {
             "snapshot_manifest_request_received",
         );
         let out = dispatch::egress_snapshot_manifest_response(manifest, to);
-        send_outbound(broadcaster, out).await;
+        send_outbound(
+            broadcaster,
+            self.rate_limiter.as_deref(),
+            &self.peers_connected,
+            out,
+        )
+        .await;
     }
 
     /// Serve a [`crate::consensus::dispatch::Dispatch::ServeSnapshotChunk`]
@@ -437,7 +455,13 @@ impl ConsensusNode {
             "snapshot_chunk_request_received",
         );
         let out = dispatch::egress_snapshot_chunk_response(height.0, chunk_idx, payload, to);
-        send_outbound(broadcaster, out).await;
+        send_outbound(
+            broadcaster,
+            self.rate_limiter.as_deref(),
+            &self.peers_connected,
+            out,
+        )
+        .await;
     }
 
     /// Build and persist a snapshot of the state machine at `block`'s

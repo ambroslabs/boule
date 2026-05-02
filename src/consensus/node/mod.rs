@@ -162,10 +162,50 @@ pub(super) fn pacemaker_event_kind(ev: &PacemakerEvent) -> &'static str {
 /// [`Broadcaster`] trait object. The trait's implementations decide
 /// whether to drop on backpressure; today's `MeshBroadcaster` preserves
 /// the previous "send-and-await" semantics by awaiting an mpsc send.
-pub(super) async fn send_outbound(broadcaster: &dyn Broadcaster, out: Outbound) {
+///
+/// When `rate_limiter` is `Some`, the per-peer egress byte cap (#553)
+/// is consulted on every directed [`Outbound::SendTo`]: the recipient
+/// peer's outbound bucket is charged the wire size and the frame is
+/// dropped (logged as `p2p_egress_byte_drop`) on overflow.
+///
+/// [`Outbound::Broadcast`] is intentionally not gated by the egress
+/// cap. The cap is a per-peer bucket; broadcasts fan out uniformly
+/// to every connected peer, so no single peer's request rate can
+/// amplify a broadcast's bytes/sec asymmetrically. Honest broadcast
+/// cadence (proposals at the leader's view rate, timeout votes on
+/// rotation) is also independent of any peer's behaviour, so a
+/// per-peer bucket is the wrong tool for bounding it. The
+/// amplification vector the issue defends against
+/// (`BlockRangeRequest` → `BlockRangeResponse`) is exclusively
+/// `SendTo`, which the cap does cover. `peers_connected` is accepted
+/// here so a future extension that splits broadcasts into per-peer
+/// `SendTo`s — e.g. when [`Broadcaster`] gains recipient filtering —
+/// can wire the per-peer admit without further plumbing.
+pub(super) async fn send_outbound(
+    broadcaster: &dyn Broadcaster,
+    rate_limiter: Option<&RateLimiter>,
+    _peers_connected: &HashSet<NodeId>,
+    out: Outbound,
+) {
     match out {
-        Outbound::Broadcast(b) => broadcaster.broadcast(b).await,
-        Outbound::SendTo { to, payload } => broadcaster.send_to(to, payload).await,
+        Outbound::Broadcast(payload) => broadcaster.broadcast(payload).await,
+        Outbound::SendTo { to, payload } => {
+            if let Some(limiter) = rate_limiter
+                && matches!(
+                    limiter.admit_outbound(to, payload.len()),
+                    crate::p2p::limits::Decision::Drop
+                )
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    peer = %node_id_to_base58(&to),
+                    bytes = payload.len(),
+                    "p2p_egress_byte_drop",
+                );
+                return;
+            }
+            broadcaster.send_to(to, payload).await
+        }
     }
 }
 
@@ -7710,6 +7750,7 @@ mod tests {
             block_range_request_per_sec: 1.0,
             block_range_response_per_sec: 1.0,
             bytes_per_sec: 1024.0 * 1024.0, // generous, isolate the test on per-kind
+            outbound_bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
             violation_window: std::time::Duration::from_secs(60),
             max_violations: 5,
@@ -7874,6 +7915,7 @@ mod tests {
             block_range_request_per_sec: 4.0,
             block_range_response_per_sec: 4.0,
             bytes_per_sec: 1024.0 * 1024.0,
+            outbound_bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
             violation_window: std::time::Duration::from_secs(60),
             max_violations: 1_000_000, // never disconnect in this test
