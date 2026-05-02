@@ -703,6 +703,16 @@ impl HotStuffCore {
         !self.block_sync_inflight.is_empty()
     }
 
+    /// Per-parent retry budget for `RequestBlock`. Read-only mirror of
+    /// the configured [`CacheLimits::block_sync_max_attempts`]. The
+    /// integration layer's range-keyed retry walk (#530) reads this so
+    /// the bulk-range path enforces the same per-entry budget as the
+    /// safety core's hash-keyed path without duplicating the policy
+    /// constant.
+    pub fn block_sync_max_attempts(&self) -> u32 {
+        self.limits.block_sync_max_attempts
+    }
+
     /// Wall-clock-driven retry tick. Walks every still-tracked
     /// `block_sync_inflight` entry and emits at most one
     /// `Action::RequestBlock` per parent, regardless of view-elapsed

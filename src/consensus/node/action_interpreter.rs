@@ -24,8 +24,8 @@ use crate::p2p::overlay::Broadcaster;
 use crate::p2p::tls::node_id_to_base58;
 
 use super::{
-    ConsensusNode, TRACE_TARGET, load_block_from_storage, msg_kind, pacemaker_event_kind,
-    send_outbound, update_kind,
+    BlockSyncRangeInflight, ConsensusNode, TRACE_TARGET, load_block_from_storage, msg_kind,
+    pacemaker_event_kind, send_outbound, update_kind,
 };
 
 /// Snapshot of the tracing fields we want to log around a safety-core
@@ -646,7 +646,14 @@ impl ConsensusNode {
             );
             return Ok(());
         }
-        self.block_sync_range_inflight.insert(key, proposer);
+        self.block_sync_range_inflight.insert(
+            key,
+            BlockSyncRangeInflight {
+                peer: proposer,
+                attempts: 1,
+                last_asked_at: tokio::time::Instant::now(),
+            },
+        );
         tracing::info!(
             target: TRACE_TARGET,
             from_height = from_height.0,
@@ -757,6 +764,97 @@ impl ConsensusNode {
             let actions = self.step_safety(SafetyEvent::PacemakerAdvance(current));
             self.apply_safety_actions(actions, broadcaster, view_timer, signer)
                 .await?;
+        }
+        Ok(())
+    }
+
+    /// Wall-clock-driven retry walk for `block_sync_range_inflight`
+    /// (#530). Mirror of
+    /// [`crate::consensus::hotstuff::HotStuffCore::step_block_sync_retry_tick`]
+    /// for the integration-layer-keyed bulk-range path: re-emits one
+    /// [`WireMessage::BlockRangeRequest`] per still-tracked
+    /// `(from_height, to_height)` entry whose elapsed wall-clock since
+    /// the last emission has crossed `retry_threshold`, and drops any
+    /// entry whose attempt count has hit
+    /// [`crate::consensus::hotstuff::HotStuffCore::block_sync_max_attempts`].
+    /// The cadence is governed by the integration layer's
+    /// [`BlockSyncRetryTimer`]; this method only enforces the per-entry
+    /// quiescence threshold so a tick that fires shortly after a fresh
+    /// insert from `maybe_emit_block_range_request` does not
+    /// immediately re-emit.
+    ///
+    /// On budget exhaustion the entry is removed and the next
+    /// `ProposalReceived` event is left to re-trigger gap detection
+    /// from the current commit frontier — the matching
+    /// [`crate::consensus::node::ConsensusNode::maintain_block_sync_retry_timer`]
+    /// hook will cancel the wall-clock timer when the map drains, so
+    /// an idle node never wakes just to confirm there's nothing to
+    /// retry.
+    ///
+    /// [`WireMessage::BlockRangeRequest`]: crate::consensus::node::WireMessage::BlockRangeRequest
+    /// [`BlockSyncRetryTimer`]: crate::consensus::block_sync_retry_timer::BlockSyncRetryTimer
+    pub(super) async fn maintain_block_sync_range_retry(
+        &mut self,
+        broadcaster: &dyn Broadcaster,
+        retry_threshold: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        if self.block_sync_range_inflight.is_empty() {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        let max_attempts = self.core.block_sync_max_attempts();
+        // Sorted iteration so replay/property tests stay byte-identical
+        // regardless of `HashMap` ordering — same discipline as the
+        // safety core's `step_block_sync_retry_tick` walk.
+        let keys: std::collections::BTreeSet<(Height, Height)> =
+            self.block_sync_range_inflight.keys().copied().collect();
+        let mut to_drop: Vec<(Height, Height)> = Vec::new();
+        let mut to_emit: Vec<(Height, Height, NodeId)> = Vec::new();
+        for key in keys {
+            let entry = self
+                .block_sync_range_inflight
+                .get_mut(&key)
+                .expect("key just enumerated must still be present");
+            if entry.attempts >= max_attempts {
+                to_drop.push(key);
+                continue;
+            }
+            if now.duration_since(entry.last_asked_at) < retry_threshold {
+                continue;
+            }
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.last_asked_at = now;
+            to_emit.push((key.0, key.1, entry.peer));
+        }
+        for key in to_drop {
+            if let Some(entry) = self.block_sync_range_inflight.remove(&key) {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    from_height = key.0.0,
+                    to_height = key.1.0,
+                    peer = %node_id_to_base58(&entry.peer),
+                    attempts = entry.attempts,
+                    max_attempts,
+                    "block_sync_range_request_dropped_attempts_exhausted",
+                );
+            }
+        }
+        for (from_height, to_height, peer) in to_emit {
+            tracing::info!(
+                target: TRACE_TARGET,
+                from_height = from_height.0,
+                to_height = to_height.0,
+                peer = %node_id_to_base58(&peer),
+                "block_sync_range_request_retry_emitted",
+            );
+            let out = dispatch::egress_block_range_request(from_height, to_height, peer);
+            send_outbound(
+                broadcaster,
+                self.rate_limiter.as_deref(),
+                &self.peers_connected,
+                out,
+            )
+            .await;
         }
         Ok(())
     }
