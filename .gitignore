@@ -10,8 +10,7 @@
 
 # Local config overrides
 config.local.toml
-.claude/settings.local.json
-.claude/worktrees/
+.claude/
 
 # IDE
 .idea/
