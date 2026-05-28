@@ -4,9 +4,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use boule_transport::limits::Direction;
 use super::manager::ManagerMsg;
 use super::tls::{NodeId, TlsStream, extract_node_id, node_id_to_base58};
+use boule_transport::limits::Direction;
 use tokio_rustls::TlsAcceptor;
 
 pub async fn run(

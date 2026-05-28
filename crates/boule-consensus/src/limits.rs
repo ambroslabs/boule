@@ -133,7 +133,8 @@ impl CacheLimits {
             parked_proposals_capacity: boule::config::DEFAULT_PARKED_PROPOSALS_CAPACITY,
             pending_blocks_capacity: boule::config::DEFAULT_PENDING_BLOCKS_CAPACITY,
             timeout_buckets_capacity: boule::config::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
-            block_sync_initial_backoff_views: boule::config::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
+            block_sync_initial_backoff_views:
+                boule::config::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
             block_sync_max_backoff_views: boule::config::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
             block_sync_per_peer_attempts: boule::config::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
             block_sync_max_attempts: boule::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,

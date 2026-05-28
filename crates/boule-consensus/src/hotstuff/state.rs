@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::limits::CacheEvictionCounters;
+use crate::replication::block::{Block, BlockHash};
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_set::ValidatorSet;
 use crate::{Height, View};
-use crate::replication::block::{Block, BlockHash};
 
 use super::qc::VerifiedQc;
 

@@ -67,10 +67,10 @@ impl SlowPeerTracker {
 
 use super::connection;
 use super::connection::ProtocolCaps;
-use boule_transport::limits::{ConnectionLimiter, Direction};
 use super::overlay::DiscoveryEvent;
 use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
+use boule_transport::limits::{ConnectionLimiter, Direction};
 
 /// Monotonic per-connection identity assigned by the manager. Used to
 /// distinguish connections to the same peer so a tie-breaker replacement

@@ -57,6 +57,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use std::time::Duration;
 
+use boule::crypto::signed::{ChainId, Signer};
+use boule::storage::{Storage, Wal};
 use boule_consensus::api::CommitNotifier;
 use boule_consensus::block_sync_retry_timer::{
     BlockSyncRetryTimer, DEFAULT_INITIAL_DELAY as BLOCK_SYNC_RETRY_INITIAL_DELAY,
@@ -71,20 +73,18 @@ use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::pacemaker::Pacemaker;
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::pacemaker::timeout::ExponentialBackoff;
+use boule_consensus::replication::mempool::Mempool;
+use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_history::ValidatorSetHistory;
 use boule_consensus::validator_key_history::ValidatorKeyHistory;
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
-use boule::crypto::signed::{ChainId, Signer};
 use boule_transport::limits::RateLimiter;
 use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use boule_transport_tcp::tls::node_id_to_base58;
 use boule_transport_tcp::{NodeId, ProtocolEvent};
-use boule_consensus::replication::mempool::Mempool;
-use boule_consensus::replication::state_machine::StateMachine;
-use boule::storage::{Storage, Wal};
 
 mod action_interpreter;
 mod block_builder;
@@ -99,6 +99,10 @@ mod status;
 mod timeout_bucket;
 
 pub use block_builder::MempoolBlockBuilder;
+pub use boule_consensus::wire::{
+    BLOCK_RANGE_RESPONSE_MAX_BLOCKS, BlockRangeResponsePayload, BlockResponsePayload,
+    MAX_FRAME_BYTES, PROTOCOL_ID, WireMessage,
+};
 pub use config::NodeConfigForConsensus;
 pub use persistence::{
     LastCommitted, RECENT_QC_CACHE_CAPACITY, STORAGE_KEY_BLOCK_PREFIX, STORAGE_KEY_BLS_KEY_HISTORY,
@@ -110,10 +114,6 @@ pub use persistence::{
     decode_voted_view, encode_block, encode_high_qc, encode_last_committed,
     encode_last_timeout_vote, encode_locked, encode_proposed_in_view, encode_voted_view,
     height_storage_key, load_block_from_storage, load_block_range_from_storage, recover_state,
-};
-pub use boule_consensus::wire::{
-    BLOCK_RANGE_RESPONSE_MAX_BLOCKS, BlockRangeResponsePayload, BlockResponsePayload,
-    MAX_FRAME_BYTES, PROTOCOL_ID, WireMessage,
 };
 
 use persistence::RecentQcCache;
@@ -734,7 +734,7 @@ impl ConsensusNode {
     /// L5-1). The same `Arc` the integration layer increments on every
     /// `Action::ProposalEquivocationEvidence` it observes; sibling of
     /// [`Self::equivocations_counter`] used by
-    /// [`boule_consensus::sim::SimCluster::peek_proposal_equivocations_detected`]
+    /// [`crate::sim::SimCluster::peek_proposal_equivocations_detected`]
     /// to verify the proposer-side detection path end-to-end.
     pub fn proposal_equivocations_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.proposal_equivocations_detected)
@@ -1353,18 +1353,18 @@ mod tests {
     // Re-imports for short-name access in tests (the production code
     // moved to topical submodules under `node/`, so the symbols are no
     // longer brought into scope by this file's top-level `use` block).
+    use boule::crypto::signed::Signed;
+    use boule::storage::{MemoryStorage, MemoryWal};
     use boule_consensus::dispatch::Dispatch;
     use boule_consensus::hotstuff::Locked;
     use boule_consensus::hotstuff::qc::TimeoutVote;
     use boule_consensus::hotstuff::step::{Action as SafetyAction, Event as SafetyEvent};
     use boule_consensus::limits::CacheLimits;
-    use boule_consensus::validator_set::ValidatorSet;
-    use boule::crypto::signed::Signed;
-    use boule_transport_tcp::NodeId;
-    use boule_transport::limits::MessageKind;
     use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
     use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
-    use boule::storage::{MemoryStorage, MemoryWal};
+    use boule_consensus::validator_set::ValidatorSet;
+    use boule_transport::limits::MessageKind;
+    use boule_transport_tcp::NodeId;
 
     fn nid(b: u8) -> NodeId {
         [b; 32]
@@ -2990,7 +2990,8 @@ mod tests {
         tokio::sync::mpsc::Receiver<ProtocolOutbound>,
     ) {
         let (send_tx, send_rx) = tokio::sync::mpsc::channel::<ProtocolOutbound>(16);
-        let bc: Arc<dyn Broadcaster> = Arc::new(boule_transport_tcp::overlay::MeshBroadcaster::new(send_tx));
+        let bc: Arc<dyn Broadcaster> =
+            Arc::new(boule_transport_tcp::overlay::MeshBroadcaster::new(send_tx));
         (bc, send_rx)
     }
 
@@ -3047,7 +3048,8 @@ mod tests {
     fn apply_commit_advances_state_machine_and_drains_mempool() {
         use boule_consensus::replication::impls::counter_sm::CounterCommand;
 
-        let mp: Arc<dyn boule_consensus::replication::mempool::Mempool> = Arc::new(InMemoryMempool::new(64));
+        let mp: Arc<dyn boule_consensus::replication::mempool::Mempool> =
+            Arc::new(InMemoryMempool::new(64));
         let cmd = CounterCommand::Increment.encode();
         mp.insert(cmd.clone()).unwrap();
         assert_eq!(mp.len(), 1);
@@ -3071,9 +3073,10 @@ mod tests {
                 view: View(1),
                 proposer: nid(1),
                 state_commitment: [0u8; 32],
-                commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
-                    std::slice::from_ref(&cmd),
-                ),
+                commands_commitment:
+                    boule_consensus::replication::block::Block::commands_commitment(
+                        std::slice::from_ref(&cmd),
+                    ),
                 validator_history_commitment: [0; 32],
             },
             commands: vec![cmd],
@@ -3117,7 +3120,9 @@ mod tests {
             view: View(view),
             proposer,
             state_commitment: [0u8; 32],
-            commands_commitment: boule_consensus::replication::block::Block::commands_commitment(&commands),
+            commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
+                &commands,
+            ),
             validator_history_commitment: [0; 32],
         };
         boule_consensus::replication::block::Block { header, commands }
@@ -3272,7 +3277,9 @@ mod tests {
             view: View(0),
             proposer: nid(1),
             state_commitment: [0u8; 32],
-            commands_commitment: boule_consensus::replication::block::Block::commands_commitment(&commands),
+            commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
+                &commands,
+            ),
             validator_history_commitment: [0; 32],
         };
         let block = boule_consensus::replication::block::Block { header, commands };
@@ -3422,7 +3429,9 @@ mod tests {
             view: View(0),
             proposer: nid(1),
             state_commitment: [0u8; 32],
-            commands_commitment: boule_consensus::replication::block::Block::commands_commitment(&commands),
+            commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
+                &commands,
+            ),
             validator_history_commitment: [0; 32],
         };
         let block = boule_consensus::replication::block::Block { header, commands };
@@ -3487,9 +3496,9 @@ mod tests {
 
         use bytes::Bytes;
 
+        use boule::storage::WriteBatch;
         use boule_consensus::api::CommitNotifier;
         use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
-        use boule::storage::WriteBatch;
 
         // Storage wrapper: reads/single-key writes pass through to an
         // inner `MemoryStorage`, but every `apply_batch` returns an
@@ -4571,7 +4580,9 @@ mod tests {
         chunk_size: u32,
         n_chunks: u32,
     ) -> boule_consensus::replication::snapshot::SnapshotManifest {
-        use boule_consensus::replication::snapshot::{SnapshotManifest, SnapshotStore, chunk_snapshot};
+        use boule_consensus::replication::snapshot::{
+            SnapshotManifest, SnapshotStore, chunk_snapshot,
+        };
 
         let payload: Vec<u8> = (0..n_chunks * chunk_size)
             .map(|i| (i & 0xFF) as u8)
@@ -4596,9 +4607,8 @@ mod tests {
                     view: View(7),
                     proposer: [0u8; 32],
                     state_commitment: [0xCD; 32],
-                    commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
-                        &commands,
-                    ),
+                    commands_commitment:
+                        boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
                 },
                 commands,
@@ -5107,9 +5117,8 @@ mod tests {
                     view: View(50),
                     proposer: server_node_id,
                     state_commitment: expected_commitment,
-                    commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
-                        &commands,
-                    ),
+                    commands_commitment:
+                        boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
                 },
                 commands,
@@ -5549,9 +5558,9 @@ mod tests {
     #[tokio::test]
     async fn joiner_restore_installs_rotated_validator_key_history() {
         use boule_consensus::history_commitment::validator_history_commitment_v1;
+        use boule_consensus::replication::impls::counter_sm::CounterCommand;
         use boule_consensus::validator_key_history::PersistedValidatorKeyHistory;
         use boule_consensus::validator_rotation::ValidatorKeyRotation;
-        use boule_consensus::replication::impls::counter_sm::CounterCommand;
 
         let server_signer = fresh_signer();
         let server_node_id = server_signer.node_id();
@@ -5622,9 +5631,8 @@ mod tests {
                     view: View(50),
                     proposer: server_node_id,
                     state_commitment: expected_commitment,
-                    commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
-                        &commands,
-                    ),
+                    commands_commitment:
+                        boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: commitment,
                 },
                 commands,
@@ -5753,7 +5761,9 @@ mod tests {
     /// `view > last_voted_view` check is trivially satisfied).
     #[tokio::test]
     async fn restore_then_restart_preserves_locked_high_qc_and_last_voted_view() {
-        use boule_consensus::replication::impls::counter_sm::{CounterCommand, CounterStateMachine};
+        use boule_consensus::replication::impls::counter_sm::{
+            CounterCommand, CounterStateMachine,
+        };
 
         let server_signer = fresh_signer();
         let server_node_id = server_signer.node_id();
@@ -5799,9 +5809,8 @@ mod tests {
                     view: snapshot_view,
                     proposer: server_node_id,
                     state_commitment: expected_commitment,
-                    commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
-                        &commands,
-                    ),
+                    commands_commitment:
+                        boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
                 },
                 commands,
@@ -5958,7 +5967,8 @@ mod tests {
         let expected_commitment = server_sm.lock().state_commitment();
         // 2-byte chunks over the ~10-byte u64::MAX postcard varint
         // → ≥ 4 chunks for the workpool to fan out across.
-        let chunks_with_hashes = boule_consensus::replication::snapshot::chunk_snapshot(&snapshot_payload, 2);
+        let chunks_with_hashes =
+            boule_consensus::replication::snapshot::chunk_snapshot(&snapshot_payload, 2);
         assert!(chunks_with_hashes.len() >= 4, "need ≥ 4 chunks for fanout");
         let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
         let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
@@ -5972,9 +5982,8 @@ mod tests {
                     view: View(50),
                     proposer: server_ids[0],
                     state_commitment: expected_commitment,
-                    commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
-                        &commands,
-                    ),
+                    commands_commitment:
+                        boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
                 },
                 commands,
@@ -6165,7 +6174,8 @@ mod tests {
         )));
         server_sm.lock().restore(&snapshot_payload).unwrap();
         let expected_commitment = server_sm.lock().state_commitment();
-        let chunks_with_hashes = boule_consensus::replication::snapshot::chunk_snapshot(&snapshot_payload, 2);
+        let chunks_with_hashes =
+            boule_consensus::replication::snapshot::chunk_snapshot(&snapshot_payload, 2);
         let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();
         let chunks: Vec<bytes::Bytes> = chunks_with_hashes.into_iter().map(|(c, _)| c).collect();
         let snapshot_block = {
@@ -6178,9 +6188,8 @@ mod tests {
                     view: View(50),
                     proposer: server_ids[0],
                     state_commitment: expected_commitment,
-                    commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
-                        &commands,
-                    ),
+                    commands_commitment:
+                        boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
                 },
                 commands,
@@ -7219,10 +7228,8 @@ mod tests {
             view: View(7),
             block_hash: [0x42; 32],
         };
-        let action = SafetyAction::SendTo(
-            self_id,
-            boule_consensus::hotstuff::ConsensusMsg::Vote(vote),
-        );
+        let action =
+            SafetyAction::SendTo(self_id, boule_consensus::hotstuff::ConsensusMsg::Vote(vote));
 
         node.apply_safety_actions(vec![action], broadcaster.as_ref(), &mut view_timer, &signer)
             .await
@@ -7407,10 +7414,10 @@ mod tests {
         use parking_lot::Mutex as PlMutex;
 
         use boule::clock::BoxFuture;
+        use boule::storage::{Storage, WriteBatch};
         use boule_consensus::dispatch::ingress_with_qc_verification;
         use boule_consensus::hotstuff::Proposal;
         use boule_transport_tcp::overlay::Broadcaster;
-        use boule::storage::{Storage, WriteBatch};
 
         #[derive(Debug, Clone, PartialEq, Eq)]
         enum OrderEvent {
@@ -7445,7 +7452,7 @@ mod tests {
                 // Snapshot the view-write (if any) before consuming the
                 // batch; record only after the inner write succeeds.
                 let mut written_view: Option<View> = None;
-                for op in &batch.ops {
+                for op in batch.ops() {
                     if let boule::storage::WriteOp::Put(key, value) = op {
                         if key.as_slice() == STORAGE_KEY_LAST_VOTED_VIEW {
                             if let Ok(v) = decode_voted_view(value) {
@@ -7509,9 +7516,7 @@ mod tests {
         let self_signer = fresh_signer();
         let leader_signer = fresh_signer();
         let mut ids: Vec<boule_consensus::validator_set::ValidatorId> = vec![
-            boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(
-                self_signer.node_id(),
-            ),
+            boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(self_signer.node_id()),
             boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(
                 leader_signer.node_id(),
             ),
@@ -7650,10 +7655,10 @@ mod tests {
         use parking_lot::Mutex as PlMutex;
 
         use boule::clock::BoxFuture;
+        use boule::storage::{Storage, WriteBatch};
         use boule_consensus::hotstuff::Proposal;
         use boule_consensus::hotstuff::qc::QuorumCertificate;
         use boule_transport_tcp::overlay::Broadcaster;
-        use boule::storage::{Storage, WriteBatch};
 
         #[derive(Debug, Clone, PartialEq, Eq)]
         enum OrderEvent {
@@ -7680,7 +7685,7 @@ mod tests {
             }
             fn apply_batch(&self, batch: WriteBatch) -> anyhow::Result<()> {
                 let mut written_lock_view: Option<View> = None;
-                for op in &batch.ops {
+                for op in batch.ops() {
                     if let boule::storage::WriteOp::Put(key, value) = op {
                         if key.as_slice() == STORAGE_KEY_LOCKED {
                             if let Ok(l) = decode_locked(value) {
@@ -7738,9 +7743,7 @@ mod tests {
         let self_signer = fresh_signer();
         let leader_signer = fresh_signer();
         let mut ids: Vec<boule_consensus::validator_set::ValidatorId> = vec![
-            boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(
-                self_signer.node_id(),
-            ),
+            boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(self_signer.node_id()),
             boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(
                 leader_signer.node_id(),
             ),
@@ -7954,7 +7957,6 @@ mod tests {
         include_str!("snapshot_io.rs"),
         include_str!("status.rs"),
         include_str!("timeout_bucket.rs"),
-        include_str!("wire.rs"),
     );
 
     /// Each name in [`EXPECTED_OPERATOR_TRACE_MESSAGES`] must appear
@@ -8004,8 +8006,8 @@ mod tests {
     // ── RateLimiter integration (issue #134) ────────────────────────────────
 
     use boule::clock::{Clock, TokioClock};
-    use boule_transport_tcp::PeerCommand;
     use boule_transport::limits::{RateLimiter, RateLimitsConfig};
+    use boule_transport_tcp::PeerCommand;
 
     /// Build a `WireMessage::BlockRequest([0; 32])` postcard frame.
     /// Cheap to construct (no signing required) and decodes cleanly
@@ -8317,7 +8319,8 @@ mod tests {
 
         node.apply_commit(block.clone());
 
-        let store = boule_consensus::replication::snapshot::SnapshotStore::new(Arc::clone(&storage));
+        let store =
+            boule_consensus::replication::snapshot::SnapshotStore::new(Arc::clone(&storage));
         let manifest = store
             .load_manifest(5)
             .unwrap()
@@ -8879,8 +8882,8 @@ mod tests {
     /// silently rot.
     #[test]
     fn verify_persisted_history_consistency_bls_happy_path() {
-        use boule_consensus::bls_key_history::BlsKeyHistory;
         use boule::crypto::sig_scheme::{BlsPublicKey, SignatureSchemeChoice};
+        use boule_consensus::bls_key_history::BlsKeyHistory;
 
         // Synthesize 4 BLS pubkeys (deterministic, since the test
         // only exercises the bookkeeping path; PoP verification is

@@ -38,15 +38,15 @@
 //! locks down.
 //!
 //! [`crashpoint!`]: boule_consensus::crashpoint::crashpoint
-//! [`SimCluster::arm_crashpoint`]: boule_consensus::sim::SimCluster::arm_crashpoint
-//! [`SimCluster::kill_node`]: boule_consensus::sim::SimCluster::kill_node
-//! [`SimCluster::restart_node_with_recover`]: boule_consensus::sim::SimCluster::restart_node_with_recover
+//! [`SimCluster::arm_crashpoint`]: crate::sim::SimCluster::arm_crashpoint
+//! [`SimCluster::kill_node`]: crate::sim::SimCluster::kill_node
+//! [`SimCluster::restart_node_with_recover`]: crate::sim::SimCluster::restart_node_with_recover
 
 use std::time::Duration;
 
 use tokio::task::yield_now;
 
-use boule_consensus::sim::{SimCluster, assert_no_conflicts};
+use crate::sim::{SimCluster, assert_no_conflicts};
 
 /// Drive the cluster yield-by-yield until either `done` returns `true`
 /// or the budget runs out. Reports `true` when the predicate fired.
@@ -113,10 +113,10 @@ async fn yield_until_crashpoint_fires(cluster: &mut SimCluster, idx: usize, budg
 ///    commits.
 #[tokio::test]
 async fn after_broadcast_vote_crashpoint_fires_and_node_restarts() {
-    use boule_consensus::View;
     use crate::consensus_node::{
         STORAGE_KEY_LAST_VOTED_VIEW, STORAGE_KEY_LOCKED, decode_locked, decode_voted_view,
     };
+    use boule_consensus::View;
 
     tokio::time::pause();
 

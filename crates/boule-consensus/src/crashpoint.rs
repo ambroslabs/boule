@@ -53,7 +53,7 @@ tokio::task_local! {
     /// handle, hand another clone into the consensus task via
     /// [`tokio::task_local::LocalKey::scope`], and arm the slot from
     /// outside while the macro fires from inside.
-    pub(crate) static CRASH_SLOT: CrashSlot;
+    pub static CRASH_SLOT: CrashSlot;
 }
 
 /// Test-side handle for arming a [`CRASH_SLOT`]. Constructed by the

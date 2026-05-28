@@ -17,7 +17,7 @@
 //! force the adversary to know the node's private state machine. The
 //! cleaner seam is the network edge: every outbound frame the honest
 //! core emits passes through the per-node routing task in
-//! [`boule_consensus::sim::SimCluster`]'s spawn path, and the
+//! [`crate::sim::SimCluster`]'s spawn path, and the
 //! [`Adversary`] hook taps into that exact stream. Adversaries get the
 //! node's own [`boule::crypto::signed::Signer`] so any envelope they
 //! craft passes recipient-side signature verification — testing
@@ -48,13 +48,13 @@ use parking_lot::Mutex;
 use proptest::prelude::*;
 
 use super::sim::{Adversary, AdversaryCtx, SimCluster, assert_no_conflicts};
+use boule::crypto::signed::{ChainId, Signed};
 use boule_consensus::View;
 use boule_consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote, Vote};
 use boule_consensus::hotstuff::{NewView, Proposal};
-use boule_consensus::wire::WireMessage;
-use boule::crypto::signed::{ChainId, Signed};
-use boule_transport_tcp::{NodeId, ProtocolOutbound};
 use boule_consensus::replication::block::Block;
+use boule_consensus::wire::WireMessage;
+use boule_transport_tcp::{NodeId, ProtocolOutbound};
 
 // ── Wire helpers ─────────────────────────────────────────────────────────────
 
@@ -498,7 +498,7 @@ pub enum TwinKind {
     /// the integration layer increments
     /// [`boule_consensus::status::ConsensusStatus::proposal_equivocations_detected`]
     /// — read via
-    /// [`boule_consensus::sim::SimCluster::peek_proposal_equivocations_detected`]
+    /// [`crate::sim::SimCluster::peek_proposal_equivocations_detected`]
     /// so the proptest property can confirm the proposer-side
     /// evidence-emission path is exercised end-to-end.
     Proposal,
@@ -642,7 +642,7 @@ mod tests {
 
     /// Run an async sim scenario on a fresh `current_thread` Tokio
     /// runtime with virtual time paused. Mirrors the `run_paused`
-    /// helper in [`boule_consensus::sim`]'s L-series proptests.
+    /// helper in [`crate::sim`]'s L-series proptests.
     fn run_paused<Fut, T>(fut: impl FnOnce() -> Fut) -> T
     where
         Fut: std::future::Future<Output = T>,

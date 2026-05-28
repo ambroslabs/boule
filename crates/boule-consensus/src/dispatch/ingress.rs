@@ -11,14 +11,14 @@
 use crate::hotstuff::NewView;
 use crate::hotstuff::qc::{TimeoutVote, Vote};
 use crate::hotstuff::{Proposal, step::Event as SafetyEvent};
-use crate::wire::WireMessage;
 use crate::pacemaker;
-use crate::validator_history::ValidatorSetHistory;
-use crate::validator_key_history::ValidatorKeyHistory;
-use boule::crypto::signed::{ChainId, Signed};
-use boule::identity::NodeId;
 use crate::replication::block::BlockHash;
 use crate::replication::snapshot::SnapshotManifest;
+use crate::validator_history::ValidatorSetHistory;
+use crate::validator_key_history::ValidatorKeyHistory;
+use crate::wire::WireMessage;
+use boule::crypto::signed::{ChainId, Signed};
+use boule::identity::NodeId;
 
 use super::codec;
 use super::verify::bls_partial::verify_bls_partial_if_required;
@@ -60,7 +60,7 @@ use super::{Dispatch, IngressError, QcVerification, Verified};
 /// aggregate verification if a production caller ever picked it up.
 /// Production wires [`ingress_with_qc_verification`] with
 /// [`QcVerification::Verify`] directly.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub fn ingress(
     from: NodeId,
     bytes: &[u8],
@@ -100,7 +100,7 @@ pub fn ingress_with_qc_verification(
 /// Exposed for unit tests that construct wire messages directly. Gated
 /// to `cfg(test)` for the same reason as [`ingress`] (audit finding
 /// 10-4, issue #413).
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub fn ingress_wire(
     from: NodeId,
     msg: WireMessage,
@@ -248,8 +248,7 @@ pub fn ingress_vote(
     // core can dispatch on the type instead of a defensive runtime
     // check.
     let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
-    let variant =
-        crate::hotstuff::step::VoteVariant::from_optional_partial(verified, bls_partial);
+    let variant = crate::hotstuff::step::VoteVariant::from_optional_partial(verified, bls_partial);
     Ok(vec![Dispatch::Safety(SafetyEvent::VoteReceived(variant))])
 }
 

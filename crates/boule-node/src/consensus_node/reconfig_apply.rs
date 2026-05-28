@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use boule_consensus::View;
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
-use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::replication::block::Block;
+use boule_consensus::validator_set::ValidatorSet;
 
 use super::{ConsensusNode, STORAGE_KEY_VALIDATOR_HISTORY, TRACE_TARGET};
 

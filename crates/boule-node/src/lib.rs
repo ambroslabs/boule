@@ -27,27 +27,29 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
+use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
 use boule::clock::{Clock, TokioClock};
 use boule::config::{BlsIdentityConfig, Config, ConsensusConfig, OverlayConfig, OverlayMode};
-use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
+use boule::crypto::signed::{NodeSigner, Signer};
+use boule::identity::NodeIdentity;
+use boule::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
+use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
+use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_set::ValidatorSet;
-use boule::crypto::signed::{NodeSigner, Signer};
 use boule_transport_tcp::dialer::DialerCtx;
-use boule::identity::NodeIdentity;
 use boule_transport_tcp::manager::ManagerMsg;
 use boule_transport_tcp::overlay::gossip::overlay::{
     DialerCtxAdapter, GossipOverlay, GossipOverlayConfig, SpawnArgs,
 };
 use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
 use boule_transport_tcp::overlay::{self as overlay_traits};
-use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery};
+use boule_transport_tcp::overlay::{
+    Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery,
+};
 use boule_transport_tcp::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
 use boule_transport_tcp::tls_protocol::TlsConnectionProtocol;
 use boule_transport_tcp::{self as p2p, ConnectionProtocol};
-use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
-use boule_consensus::replication::state_machine::StateMachine;
-use boule::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
 
 /// Run a node from a fully-resolved configuration plus the network and
 /// (optional) validator identities. When `validator_identity` is `None`,
@@ -519,10 +521,16 @@ async fn start_consensus(
 ///   for `max_total`.
 /// - `mode = "mesh"` ignores overlay caps regardless — the operator
 ///   explicitly opted into N–1 connectivity.
-fn build_connection_limiter(config: &Config) -> Option<Arc<boule_transport::limits::ConnectionLimiter>> {
+fn build_connection_limiter(
+    config: &Config,
+) -> Option<Arc<boule_transport::limits::ConnectionLimiter>> {
     use boule_transport::limits::ConnectionLimitsConfig;
 
-    let limits = config.p2p.limits.as_ref().map(|l| boule_transport::limits::ConnectionLimitsConfig::from_config(l));
+    let limits = config
+        .p2p
+        .limits
+        .as_ref()
+        .map(boule_transport::limits::ConnectionLimitsConfig::from_config);
     let overlay_caps_active = config.overlay.mode == OverlayMode::Gossip;
 
     let merged = match (limits, overlay_caps_active) {
@@ -541,7 +549,9 @@ fn build_connection_limiter(config: &Config) -> Option<Arc<boule_transport::limi
             max_total: l.max_total.min(config.overlay.total_max),
         },
     };
-    Some(Arc::new(boule_transport::limits::ConnectionLimiter::new(merged)))
+    Some(Arc::new(boule_transport::limits::ConnectionLimiter::new(
+        merged,
+    )))
 }
 
 /// Bundle returned by [`reconcile_bls_identity`] on `bls_aggregated`
@@ -575,9 +585,9 @@ fn reconcile_bls_identity(
     genesis_bls: &[(NodeId, boule::crypto::sig_scheme::BlsPublicKey)],
     storage: &dyn boule::storage::Storage,
 ) -> anyhow::Result<Option<BlsBootstrap>> {
-    use boule_consensus::bls_key_history::PersistedBlsKeyHistory;
     use crate::consensus_node::STORAGE_KEY_BLS_KEY_HISTORY;
     use boule::crypto::sig_scheme::SignatureSchemeChoice;
+    use boule_consensus::bls_key_history::PersistedBlsKeyHistory;
 
     match cons_cfg.signature_scheme {
         SignatureSchemeChoice::Ed25519Collected => {
@@ -838,7 +848,6 @@ fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Resul
     Ok(ValidatorSet::new(validator_ids))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,9 +1006,9 @@ mod tests {
         // Persist a non-trivial history (genesis + a rotation), then
         // confirm reconcile_bls_identity reloads it instead of
         // re-seeding from genesis.
-        use boule_consensus::bls_key_history::BlsKeyHistory;
         use crate::consensus_node::STORAGE_KEY_BLS_KEY_HISTORY;
         use boule::storage::Storage as _;
+        use boule_consensus::bls_key_history::BlsKeyHistory;
 
         let dir = TempDir::new().unwrap();
         let self_id = nid(7);

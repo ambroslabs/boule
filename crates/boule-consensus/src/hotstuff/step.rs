@@ -29,10 +29,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::limits::{CacheEvictionCounters, CacheLimits};
+use crate::replication::block::{Block, BlockHash};
 use crate::{Height, View};
 use boule::crypto::signed::Signed;
 use boule::identity::NodeId;
-use crate::replication::block::{Block, BlockHash};
 
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, VerifiedQc, Vote};
 use super::safety_rules::{safe_to_vote, should_update_high_qc, three_chain_commit};
@@ -653,9 +653,7 @@ impl HotStuffCore {
     /// Iterate over the currently-accumulating vote buckets. Consumed
     /// by [`crate::status`] to surface partial-QC progress
     /// through the admin HTTP endpoint; never mutated from outside.
-    pub fn vote_buckets(
-        &self,
-    ) -> impl Iterator<Item = (&(View, BlockHash), &QuorumCertificate)> {
+    pub fn vote_buckets(&self) -> impl Iterator<Item = (&(View, BlockHash), &QuorumCertificate)> {
         self.vote_bucket.iter()
     }
 
@@ -753,8 +751,8 @@ impl HotStuffCore {
     /// for a parent at `expected_height`. Lets the integration-layer
     /// dispatch tests (#434) exercise the `BlockResponse` hash-check
     /// gates without standing up a full parked-proposal flow.
-    #[cfg(test)]
-    pub(crate) fn install_block_sync_inflight_for_test(
+    #[cfg(any(test, feature = "testing"))]
+    pub fn install_block_sync_inflight_for_test(
         &mut self,
         hash: BlockHash,
         original_sender: NodeId,
@@ -2031,8 +2029,7 @@ fn pick_block_sync_peer(
     // Same byte-equality convention as `round_robin_leader`: today
     // the wire `original_sender` and the validator set's stable id
     // share bytes (no rotation has changed signer pubkeys yet).
-    let sender_vid =
-        crate::validator_set::ValidatorId::from_genesis_pubkey(original_sender);
+    let sender_vid = crate::validator_set::ValidatorId::from_genesis_pubkey(original_sender);
     let sender_idx = validator_set.index_of(&sender_vid).unwrap_or(0);
     // Build the rotation ring: every validator after `sender_idx`
     // (wrapping), skipping `self_id`. The ring is small (validator
@@ -2079,8 +2076,8 @@ mod tests {
     //! property` additions as nested submodules.
 
     use super::*;
-    use crate::validator_set::ValidatorSet;
     use crate::replication::block::BlockHeader;
+    use crate::validator_set::ValidatorSet;
 
     // ── Fixture constants and helpers ────────────────────────────────
 
@@ -2378,11 +2375,7 @@ mod tests {
         let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
         let block_a_hash = block_a.hash();
         let _ = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block_a,
-                justify.clone(),
-                nid(2),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block_a, justify.clone(), nid(2))),
         ));
         assert_eq!(core.state().last_voted_view, View(1));
 
@@ -2579,11 +2572,7 @@ mod tests {
         let block_a = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
         let block_a_hash = block_a.hash();
         let first = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block_a,
-                justify.clone(),
-                nid(2),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block_a, justify.clone(), nid(2))),
         ));
         assert!(
             first
@@ -2609,11 +2598,7 @@ mod tests {
         };
         let block_b_hash = block_b.hash();
         let second = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block_b,
-                justify,
-                nid(3),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block_b, justify, nid(3))),
         ));
 
         assert!(
@@ -3777,8 +3762,7 @@ mod tests {
         let signed = signed_vote(view, block_hash, rotated_pk);
         // Stamp the *wrong* id — the wire pubkey bytes, which is what
         // `from_genesis_pubkey(signed.signer)` produced before #394.
-        let pre_fix_id =
-            crate::validator_set::ValidatorId::from_genesis_pubkey(rotated_pk);
+        let pre_fix_id = crate::validator_set::ValidatorId::from_genesis_pubkey(rotated_pk);
 
         let actions = core.step(Event::VoteReceived(VoteVariant::Ed25519(
             crate::dispatch::Verified::unchecked_with_signer(signed, pre_fix_id),
@@ -4036,11 +4020,7 @@ mod tests {
         );
 
         let _ = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block_a,
-                justify.clone(),
-                nid(2),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block_a, justify.clone(), nid(2))),
         ));
         assert_eq!(
             core.proposal_dedupe.get(&(View(1), vid(2))),
@@ -4049,11 +4029,7 @@ mod tests {
         );
 
         let actions = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block_b,
-                justify,
-                nid(2),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block_b, justify, nid(2))),
         ));
 
         // Evidence is emitted *first*, before any side effects of the
@@ -4105,11 +4081,7 @@ mod tests {
             )),
         ));
         let again = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block,
-                justify,
-                nid(2),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block, justify, nid(2))),
         ));
         assert!(
             !again
@@ -4133,18 +4105,10 @@ mod tests {
         let block_b = fork_at_view(genesis.hash(), 1, nid(3), 0xBB);
 
         let one = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block_a,
-                justify.clone(),
-                nid(2),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block_a, justify.clone(), nid(2))),
         ));
         let two = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block_b,
-                justify,
-                nid(3),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block_b, justify, nid(3))),
         ));
         for actions in [&one, &two] {
             assert!(
@@ -4179,11 +4143,7 @@ mod tests {
             )),
         ));
         let v5 = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block_v5,
-                justify,
-                nid(2),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block_v5, justify, nid(2))),
         ));
         for actions in [&v1, &v5] {
             assert!(
@@ -4211,11 +4171,7 @@ mod tests {
         let block = chain_from_genesis(&genesis, &[1], nid(2))[0].clone();
 
         let _ = core.step(Event::ProposalReceived(
-            crate::dispatch::Verified::unchecked(signed_proposal(
-                block,
-                justify,
-                nid(2),
-            )),
+            crate::dispatch::Verified::unchecked(signed_proposal(block, justify, nid(2))),
         ));
         assert!(core.proposal_dedupe.contains_key(&(view, vid(2))));
 
@@ -4556,9 +4512,7 @@ mod tests {
 
             // Initial probe: attempts = 1, peer = sender.
             let initial = core.step(Event::ProposalReceived(
-                crate::dispatch::Verified::unchecked(signed_proposal(
-                    child, justify, sender,
-                )),
+                crate::dispatch::Verified::unchecked(signed_proposal(child, justify, sender)),
             ));
             assert_eq!(
                 initial,
@@ -4703,9 +4657,7 @@ mod tests {
 
             // Initial probe (attempt 1).
             let _ = core.step(Event::ProposalReceived(
-                crate::dispatch::Verified::unchecked(signed_proposal(
-                    child, justify, sender,
-                )),
+                crate::dispatch::Verified::unchecked(signed_proposal(child, justify, sender)),
             ));
             assert_eq!(core.block_sync_inflight.len(), 1);
 
@@ -4783,9 +4735,7 @@ mod tests {
 
             // Initial probe at view 0; last_asked_view = 0.
             let _ = core.step(Event::ProposalReceived(
-                crate::dispatch::Verified::unchecked(signed_proposal(
-                    child, justify, sender,
-                )),
+                crate::dispatch::Verified::unchecked(signed_proposal(child, justify, sender)),
             ));
 
             // Advance to view 1 — only one view has elapsed; backoff
@@ -5142,11 +5092,7 @@ mod tests {
             let child = orphan_child(parent, 1, nid(3));
             let justify = dummy_qc(View(0), core.state().genesis_hash);
             let _ = core.step(Event::ProposalReceived(
-                crate::dispatch::Verified::unchecked(signed_proposal(
-                    child,
-                    justify,
-                    nid(2),
-                )),
+                crate::dispatch::Verified::unchecked(signed_proposal(child, justify, nid(2))),
             ));
             assert!(core.has_any_block_sync_inflight());
             assert_eq!(core.parked_proposals.len(), 1);
@@ -5188,39 +5134,34 @@ mod tests {
 
             vec![
                 Event::PacemakerAdvance(View(1)),
-                Event::ProposalReceived(crate::dispatch::Verified::unchecked(
-                    signed_proposal(chain[0].clone(), dummy_qc(View(0), genesis.hash()), nid(2)),
-                )),
-                Event::ProposalReceived(crate::dispatch::Verified::unchecked(
-                    signed_proposal(chain[1].clone(), dummy_qc(View(1), block_v1_hash), nid(2)),
-                )),
-                Event::ProposalReceived(crate::dispatch::Verified::unchecked(
-                    signed_proposal(chain[2].clone(), dummy_qc(View(2), block_v2_hash), nid(2)),
-                )),
-                Event::VoteReceived(VoteVariant::Ed25519(
-                    crate::dispatch::Verified::unchecked(signed_vote(
-                        3,
-                        block_v3_hash,
-                        nid(2),
-                    )),
-                )),
-                Event::VoteReceived(VoteVariant::Ed25519(
-                    crate::dispatch::Verified::unchecked(signed_vote(
-                        3,
-                        block_v3_hash,
-                        nid(3),
-                    )),
-                )),
-                Event::VoteReceived(VoteVariant::Ed25519(
-                    crate::dispatch::Verified::unchecked(signed_vote(
-                        3,
-                        block_v3_hash,
-                        nid(4),
-                    )),
-                )),
-                Event::NewViewReceived(crate::dispatch::Verified::unchecked(
-                    signed_newview(dummy_qc(View(99), [0x99; 32]), nid(4)),
-                )),
+                Event::ProposalReceived(crate::dispatch::Verified::unchecked(signed_proposal(
+                    chain[0].clone(),
+                    dummy_qc(View(0), genesis.hash()),
+                    nid(2),
+                ))),
+                Event::ProposalReceived(crate::dispatch::Verified::unchecked(signed_proposal(
+                    chain[1].clone(),
+                    dummy_qc(View(1), block_v1_hash),
+                    nid(2),
+                ))),
+                Event::ProposalReceived(crate::dispatch::Verified::unchecked(signed_proposal(
+                    chain[2].clone(),
+                    dummy_qc(View(2), block_v2_hash),
+                    nid(2),
+                ))),
+                Event::VoteReceived(VoteVariant::Ed25519(crate::dispatch::Verified::unchecked(
+                    signed_vote(3, block_v3_hash, nid(2)),
+                ))),
+                Event::VoteReceived(VoteVariant::Ed25519(crate::dispatch::Verified::unchecked(
+                    signed_vote(3, block_v3_hash, nid(3)),
+                ))),
+                Event::VoteReceived(VoteVariant::Ed25519(crate::dispatch::Verified::unchecked(
+                    signed_vote(3, block_v3_hash, nid(4)),
+                ))),
+                Event::NewViewReceived(crate::dispatch::Verified::unchecked(signed_newview(
+                    dummy_qc(View(99), [0x99; 32]),
+                    nid(4),
+                ))),
                 Event::PacemakerAdvance(View(100)),
             ]
         }
@@ -6151,18 +6092,16 @@ mod tests {
             fn event_from_msg(&self, source: NodeId, msg: ConsensusMsg) -> Event {
                 let sig = [0u8; 64];
                 match msg {
-                    ConsensusMsg::Proposal(payload) => Event::ProposalReceived(
-                        crate::dispatch::Verified::unchecked(Signed {
+                    ConsensusMsg::Proposal(payload) => {
+                        Event::ProposalReceived(crate::dispatch::Verified::unchecked(Signed {
                             payload,
                             signer: source,
                             sig,
-                        }),
-                    ),
+                        }))
+                    }
                     ConsensusMsg::Vote(payload) => {
                         let source_vid =
-                            crate::validator_set::ValidatorId::from_genesis_pubkey(
-                                source,
-                            );
+                            crate::validator_set::ValidatorId::from_genesis_pubkey(source);
                         let signer_idx = self
                             .validators
                             .index_of(&source_vid)
@@ -6177,13 +6116,13 @@ mod tests {
                             bls_partial,
                         ))
                     }
-                    ConsensusMsg::NewView(payload) => Event::NewViewReceived(
-                        crate::dispatch::Verified::unchecked(Signed {
+                    ConsensusMsg::NewView(payload) => {
+                        Event::NewViewReceived(crate::dispatch::Verified::unchecked(Signed {
                             payload,
                             signer: source,
                             sig,
-                        }),
-                    ),
+                        }))
+                    }
                 }
             }
         }
@@ -6421,8 +6360,7 @@ mod tests {
         ) {
             let mut replicas = ReplicaSet::new_with_byzantine_scheme(4, 1, scheme);
             let byz_nid = replicas.byzantine_nids()[0];
-            let byz_vid =
-                crate::validator_set::ValidatorId::from_genesis_pubkey(byz_nid);
+            let byz_vid = crate::validator_set::ValidatorId::from_genesis_pubkey(byz_nid);
             let byz_idx = replicas
                 .validators
                 .index_of(&byz_vid)
@@ -6613,9 +6551,7 @@ mod tests {
                         );
                         replicas.inject(
                             target_honest,
-                            Event::ProposalReceived(
-                                crate::dispatch::Verified::unchecked(proposal),
-                            ),
+                            Event::ProposalReceived(crate::dispatch::Verified::unchecked(proposal)),
                         );
                     }
                 }
@@ -6751,8 +6687,7 @@ mod tests {
         ) {
             let mut replicas = ReplicaSet::new_with_byzantine_scheme(4, 1, scheme);
             let byz_nid = replicas.byzantine_nids()[0];
-            let byz_vid =
-                crate::validator_set::ValidatorId::from_genesis_pubkey(byz_nid);
+            let byz_vid = crate::validator_set::ValidatorId::from_genesis_pubkey(byz_nid);
             let byz_idx = replicas
                 .validators
                 .index_of(&byz_vid)
@@ -6804,9 +6739,7 @@ mod tests {
                         );
                         replicas.inject(
                             target_honest,
-                            Event::ProposalReceived(
-                                crate::dispatch::Verified::unchecked(proposal),
-                            ),
+                            Event::ProposalReceived(crate::dispatch::Verified::unchecked(proposal)),
                         );
                     }
                     MixedStep::InjectNewView {
@@ -6822,9 +6755,7 @@ mod tests {
                         };
                         replicas.inject(
                             target_honest,
-                            Event::NewViewReceived(
-                                crate::dispatch::Verified::unchecked(nv),
-                            ),
+                            Event::NewViewReceived(crate::dispatch::Verified::unchecked(nv)),
                         );
                     }
                 }
@@ -6974,9 +6905,7 @@ mod tests {
             for view in 0..10 {
                 let block_hash: BlockHash = [view as u8 + 1; 32];
                 core.step(Event::VoteReceived(VoteVariant::Ed25519(
-                    crate::dispatch::Verified::unchecked(signed_vote(
-                        view, block_hash, signer,
-                    )),
+                    crate::dispatch::Verified::unchecked(signed_vote(view, block_hash, signer)),
                 )));
             }
             assert_eq!(core.vote_bucket.len(), 10);
@@ -7046,9 +6975,7 @@ mod tests {
                 child.header.state_commitment = [i as u8 + 1; 32];
                 let dummy = dummy_qc(View(0), core.state().genesis_hash);
                 let _ = core.step(Event::ProposalReceived(
-                    crate::dispatch::Verified::unchecked(signed_proposal(
-                        child, dummy, sender,
-                    )),
+                    crate::dispatch::Verified::unchecked(signed_proposal(child, dummy, sender)),
                 ));
                 assert!(
                     core.parked_proposals.len() <= cap,
@@ -7090,9 +7017,7 @@ mod tests {
                 )),
             ));
             let _ = core.step(Event::ProposalReceived(
-                crate::dispatch::Verified::unchecked(signed_proposal(
-                    child, dummy, sender,
-                )),
+                crate::dispatch::Verified::unchecked(signed_proposal(child, dummy, sender)),
             ));
             assert_eq!(core.parked_proposals.len(), 1);
             assert_eq!(core.eviction_counters().parked_proposals(), 0);

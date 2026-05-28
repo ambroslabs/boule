@@ -31,7 +31,7 @@
 //! [`ProtocolHandle`] you can drive a protocol task from:
 //!
 //! ```no_run
-//! use boule::p2p::{PeerCommand, ProtocolHandle};
+//! use boule_transport_tcp::{PeerCommand, ProtocolHandle};
 //! use tokio::sync::{mpsc, oneshot};
 //!
 //! # async fn wiring(p2p_cmd_tx: mpsc::Sender<PeerCommand>) -> anyhow::Result<()> {
@@ -130,10 +130,10 @@ pub use tls::NodeId;
 /// use std::sync::Arc;
 ///
 /// use boule::clock::{Clock, TokioClock};
-/// use boule::p2p::{ConnectionProtocol, NodeId};
-/// use boule::p2p::manager::ManagerMsg;
-/// use boule::p2p::tls::TlsIdentity;
-/// use boule::p2p::tls_protocol::TlsConnectionProtocol;
+/// use boule_transport_tcp::{ConnectionProtocol, NodeId};
+/// use boule_transport_tcp::manager::ManagerMsg;
+/// use boule_transport_tcp::tls::TlsIdentity;
+/// use boule_transport_tcp::tls_protocol::TlsConnectionProtocol;
 /// use tokio::net::TcpListener;
 /// use tokio::sync::{broadcast, mpsc};
 ///
@@ -301,7 +301,7 @@ pub enum ProtocolEvent {
 /// The typical shape is:
 ///
 /// ```no_run
-/// use boule::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
+/// use boule_transport_tcp::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 /// use bytes::Bytes;
 ///
 /// # async fn wiring(handle: ProtocolHandle) {

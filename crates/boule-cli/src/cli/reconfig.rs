@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use boule::config;
+use boule::identity::base58_to_node_id;
 use boule_consensus::View;
 use boule_consensus::reconfig::{self, ReconfigCommand};
-use boule::identity::base58_to_node_id;
 
 #[derive(Subcommand)]
 pub(crate) enum ReconfigCmd {

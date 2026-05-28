@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use boule::testnet::{lifecycle, safety, scenario, topology, wait, workdir};
+use boule_node::testnet::{lifecycle, safety, scenario, topology, wait, workdir};
 use tokio::sync::Mutex;
 
 /// Serializes every test in this file. Each test spawns a 4-node

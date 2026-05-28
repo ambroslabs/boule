@@ -56,11 +56,32 @@ boule-cli           binaries (boule, testnet)
   `to_cache_limits` → `consensus::limits::CacheLimits::from_config`;
   `connection_limits`/`rate_limits` → `p2p::limits::*::from_config`. config production
   code now has zero upward refs. boule-rs compiles + lib tests pass.
-- **Remaining:** the monolithic file-move carve (below). No partial-compile checkpoint
-  exists within it — the workspace is red until every module is moved and every
-  `crate::` path rewritten.
+- **Step 3 (committed):** monolithic file-move carve — created boule-transport,
+  boule-transport-tcp, boule-consensus, boule-node; moved every module to its target
+  crate and rewrote all `crate::` paths. `cargo check --workspace` green.
+- **Step 4:** test layer + gate — relocated orphaned integration tests, re-added the
+  cross-layer wire-tag test in boule-node, and exposed test-only items across the new
+  crate boundaries via feature flags (see below). fmt + clippy(`-D warnings`) + the full
+  `cargo test --locked` suite (~1196 tests) all pass.
 
-## Remaining carve — execution spec
+## Cross-crate test/seam features
+
+Splitting the driver out of consensus turned several in-crate `#[cfg(test)]` /
+`pub(crate)` items into cross-crate accesses. Rather than widen the production API, they
+are gated behind opt-in features enabled only by downstream dev-dependencies:
+
+- `boule-rs/testing` — `ChainId::TEST` (the all-zero sentinel stays out of production).
+- `boule-consensus/testing` — test ingress entry points (`dispatch::ingress`/`ingress_wire`),
+  `QcVerification::Skip`, `SnapshotManifest::build_for_test_genesis_histories`,
+  `HotStuffCore::install_block_sync_inflight_for_test`, `QuorumCertificate::from_raw_parts`.
+- `boule-consensus/crashpoints` — the `crashpoint!` firing path + `CrashSlot` API
+  (no-op in production; the macro compiles to an empty inlined `fire`).
+
+`boule-node`'s dev-dependencies enable `boule-rs/testing`,
+`boule-consensus/{testing,crashpoints}`; feature unification turns them on for the whole
+`cargo test --locked` build.
+
+## Remaining carve — execution spec (historical; completed in Step 3)
 
 File-move map (`git mv` into each new crate's `src/`):
 

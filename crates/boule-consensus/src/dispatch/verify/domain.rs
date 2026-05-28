@@ -8,8 +8,8 @@
 
 use crate::View;
 use crate::hotstuff::qc::Vote;
-use boule::crypto::signed::{ChainId, preimage};
 use crate::replication::block::BlockHash;
+use boule::crypto::signed::{ChainId, preimage};
 
 /// Reconstruct the canonical Vote signing pre-image for `(view,
 /// block_hash)` under `chain_id`. Used by both the QC aggregate

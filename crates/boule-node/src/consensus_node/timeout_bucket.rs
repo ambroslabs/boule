@@ -16,6 +16,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 
+use boule::crypto::signed::{Signed, Signer};
 use boule_consensus::View;
 use boule_consensus::crashpoint::crashpoint;
 use boule_consensus::dispatch::{self, Outbound};
@@ -28,16 +29,15 @@ use boule_consensus::hotstuff::step::Event as SafetyEvent;
 use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::pacemaker::HonestyThresholdEvidence as PacemakerHonestyThresholdEvidence;
 use boule_consensus::view_timer::ViewTimer;
-use boule::crypto::signed::{Signed, Signer};
 use boule_transport_tcp::NodeId;
 use boule_transport_tcp::overlay::Broadcaster;
 use boule_transport_tcp::tls::node_id_to_base58;
 
-use boule_consensus::wire::WireMessage;
 use super::{
     ConsensusNode, STORAGE_KEY_LAST_TIMEOUT_VOTE, TRACE_TARGET, decode_last_timeout_vote,
     encode_last_timeout_vote, send_outbound,
 };
+use boule_consensus::wire::WireMessage;
 
 /// Accumulator for one view's timeout votes.
 ///
@@ -402,9 +402,7 @@ impl ConsensusNode {
                 .validator_key_history
                 .validator_for(&signer_pk)
                 .unwrap_or_else(|| {
-                    boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(
-                        signer_node_id,
-                    )
+                    boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(signer_node_id)
                 });
             let safety_actions = self.step_safety(SafetyEvent::NewViewReceived(
                 dispatch::Verified::wrap_after_verify_with_signer(self_signed, signer_validator_id),

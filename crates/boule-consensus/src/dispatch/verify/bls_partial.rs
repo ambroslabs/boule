@@ -35,7 +35,7 @@ pub(in crate::dispatch) fn verify_bls_partial_if_required(
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
     let (scheme, bls_key_history) = match qc_verification {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         QcVerification::Skip => return Ok(()),
         QcVerification::Verify {
             scheme,

@@ -45,10 +45,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::hotstuff::QuorumCertificate;
+use crate::replication::block::{Block, BlockHash};
 use crate::validator_set::ValidatorSet;
 use crate::{Height, View};
 use boule::identity::NodeId;
-use crate::replication::block::{Block, BlockHash};
 use boule::storage::{Storage, StorageExt};
 
 /// Storage-key prefix under which [`SnapshotManifest`] values are
@@ -129,8 +129,7 @@ pub struct SnapshotManifest {
     pub validator_history: crate::validator_history::PersistedValidatorHistory,
     /// Persisted form of the producer's `ValidatorKeyHistory` at
     /// snapshot height (#325 PR D). See [`Self::validator_history`].
-    pub validator_key_history:
-        crate::validator_key_history::PersistedValidatorKeyHistory,
+    pub validator_key_history: crate::validator_key_history::PersistedValidatorKeyHistory,
     /// Persisted form of the producer's `BlsKeyHistory` at snapshot
     /// height on BLS chains; `None` on Ed25519 chains (#325 PR D).
     /// The Some/None discriminant must match the chain's signature
@@ -164,7 +163,7 @@ impl SnapshotManifest {
     /// build the QC over the (yet-to-be-patched) hash, then call this
     /// helper which produces a manifest that re-targets the QC to
     /// the patched hash.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn build_for_test_genesis_histories(
         mut block: Block,
         validator_set: &ValidatorSet,
@@ -173,15 +172,12 @@ impl SnapshotManifest {
         mut commit_qc: QuorumCertificate,
         created_unix_secs: u64,
     ) -> Self {
-        let set_hist = crate::validator_history::ValidatorSetHistory::from_genesis(
-            validator_set.clone(),
-        );
-        let key_hist = crate::validator_key_history::ValidatorKeyHistory::new(
-            validator_set.iter().copied(),
-        );
-        let commitment = crate::history_commitment::validator_history_commitment_v1(
-            &set_hist, &key_hist, None,
-        );
+        let set_hist =
+            crate::validator_history::ValidatorSetHistory::from_genesis(validator_set.clone());
+        let key_hist =
+            crate::validator_key_history::ValidatorKeyHistory::new(validator_set.iter().copied());
+        let commitment =
+            crate::history_commitment::validator_history_commitment_v1(&set_hist, &key_hist, None);
         block.header.validator_history_commitment = commitment;
         // `commit_qc.block_hash` may have been built against the
         // pre-patch block hash; re-target it so the manifest's
@@ -359,11 +355,10 @@ impl SnapshotManifest {
             self.validator_history.clone(),
         )
         .map_err(|_| ManifestError::ValidatorHistoryCommitmentMismatch)?;
-        let rebuilt_key =
-            crate::validator_key_history::ValidatorKeyHistory::from_persisted(
-                self.validator_key_history.clone(),
-            )
-            .map_err(|_| ManifestError::ValidatorHistoryCommitmentMismatch)?;
+        let rebuilt_key = crate::validator_key_history::ValidatorKeyHistory::from_persisted(
+            self.validator_key_history.clone(),
+        )
+        .map_err(|_| ManifestError::ValidatorHistoryCommitmentMismatch)?;
         let rebuilt_bls = match &self.bls_key_history {
             Some(p) => Some(
                 crate::bls_key_history::BlsKeyHistory::from_persisted(p.clone())
@@ -1452,8 +1447,7 @@ mod tests {
         let rebuilt_key =
             ValidatorKeyHistory::from_persisted(restored.validator_key_history.clone())
                 .expect("persisted form decodes");
-        let stable =
-            crate::validator_set::ValidatorId::from_genesis_pubkey(rotated_genesis_pk);
+        let stable = crate::validator_set::ValidatorId::from_genesis_pubkey(rotated_genesis_pk);
         assert_eq!(
             rebuilt_key.key_at(&stable, v_eff - 1),
             Some(Pubkey::from_node_id(rotated_genesis_pk)),
@@ -1487,13 +1481,13 @@ mod tests {
         // genesis-only, so the v1 hash over (genesis-only) matches
         // the snapshot block's commitment. Adding a boundary
         // diverges the rebuild's hash from the block's claim.
-        m.validator_history.boundaries.push(
-            crate::validator_history::PersistedBoundary {
+        m.validator_history
+            .boundaries
+            .push(crate::validator_history::PersistedBoundary {
                 v_eff: View(999),
                 members: vec![[0xFFu8; 32]; 4],
                 weights: vec![1; 4],
-            },
-        );
+            });
         assert_eq!(
             m.verify(&vs),
             Err(ManifestError::ValidatorHistoryCommitmentMismatch),

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::Height;
 use crate::hotstuff::qc::TimeoutVote;
-use boule::crypto::signed::{Signed, SignedMessage};
 use crate::replication::block::{Block, BlockHash};
+use boule::crypto::signed::{Signed, SignedMessage};
 
 /// Protocol ID registered with the p2p multiplexer for consensus traffic.
 /// Gossip uses `0x01`, ping-RPC uses `0x02`.

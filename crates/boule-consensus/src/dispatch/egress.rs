@@ -18,14 +18,14 @@ use bytes::Bytes;
 use crate::hotstuff::ConsensusMsg;
 use crate::hotstuff::qc::Vote;
 use crate::hotstuff::step::Action as SafetyAction;
-use crate::wire::WireMessage;
 use crate::pacemaker;
-use crate::validator_key_history::ValidatorKeyHistory;
-use crate::validator_set::{Pubkey, ValidatorId};
-use boule::crypto::signed::{ChainId, Signed, Signer, preimage};
-use boule::identity::NodeId;
 use crate::replication::block::{Block, BlockHash};
 use crate::replication::snapshot::SnapshotManifest;
+use crate::validator_key_history::ValidatorKeyHistory;
+use crate::validator_set::{Pubkey, ValidatorId};
+use crate::wire::WireMessage;
+use boule::crypto::signed::{ChainId, Signed, Signer, preimage};
+use boule::identity::NodeId;
 
 use super::codec;
 use super::{Dispatch, Outbound, Verified};
@@ -335,10 +335,8 @@ pub fn egress_consensus_msg_with_loopback(
             // mirrors the wire path: presence of a partial means BLS;
             // absence means Ed25519 (#372).
             let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
-            let variant = crate::hotstuff::step::VoteVariant::from_optional_partial(
-                verified,
-                bls_partial,
-            );
+            let variant =
+                crate::hotstuff::step::VoteVariant::from_optional_partial(verified, bls_partial);
             vec![Dispatch::Safety(
                 crate::hotstuff::step::Event::VoteReceived(variant),
             )]

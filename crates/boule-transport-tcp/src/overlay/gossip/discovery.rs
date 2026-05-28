@@ -49,9 +49,9 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use super::super::super::tls::NodeId;
-use boule_transport::overlay::{Discovery, DiscoveryEvent};
 use super::maintenance::Dialer;
 use super::peer_list_task::{DirectPeers, LockedVec};
+use boule_transport::overlay::{Discovery, DiscoveryEvent};
 
 /// Broadcast channel depth for re-published `DiscoveryEvent`s.
 ///

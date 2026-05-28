@@ -487,8 +487,8 @@ mod tests {
         use tokio_rustls::{TlsConnector, rustls};
         use zeroize::Zeroizing;
 
-        use boule::identity::NodeIdentity;
         use crate::tls::TlsIdentity;
+        use boule::identity::NodeIdentity;
 
         fn fresh_tls() -> Arc<TlsIdentity> {
             let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();

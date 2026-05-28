@@ -9,11 +9,11 @@ use parking_lot::Mutex;
 
 use boule_consensus::hotstuff::QuorumCertificate;
 use boule_consensus::hotstuff::step::BlockBuilder;
-use boule_consensus::{Height, View};
-use boule_transport_tcp::NodeId;
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
+use boule_consensus::{Height, View};
+use boule_transport_tcp::NodeId;
 
 use super::TRACE_TARGET;
 

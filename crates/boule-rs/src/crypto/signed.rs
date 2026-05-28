@@ -151,13 +151,15 @@ impl ChainId {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl ChainId {
-    /// Test sentinel: an all-zero `ChainId`. Gated to `cfg(test)` so a
-    /// production deployment cannot accidentally select the all-zero
-    /// chain id (which would be replay-compatible with every other
-    /// deployment that did the same). Production callers must derive
-    /// their `ChainId` from the genesis block via [`from_genesis_hash`].
+    /// Test sentinel: an all-zero `ChainId`. Gated behind `cfg(test)` /
+    /// the `testing` feature so a production deployment cannot
+    /// accidentally select the all-zero chain id (which would be
+    /// replay-compatible with every other deployment that did the same).
+    /// Production callers must derive their `ChainId` from the genesis
+    /// block via [`from_genesis_hash`]. Downstream crates enable
+    /// `boule-rs/testing` in their dev-dependencies to use it in tests.
     pub const TEST: Self = Self([0u8; 32]);
 }
 
@@ -269,10 +271,7 @@ where
 ///
 /// The `chain_id` is the 32-byte deployment-scoped tag from #324; see
 /// the module-level docs.
-pub fn preimage<T: Serialize + SignedMessage>(
-    payload: &T,
-    chain_id: &ChainId,
-) -> Result<Vec<u8>> {
+pub fn preimage<T: Serialize + SignedMessage>(payload: &T, chain_id: &ChainId) -> Result<Vec<u8>> {
     let domain = T::DOMAIN.as_bytes();
     if domain.len() > u32::MAX as usize {
         bail!("domain tag too long");

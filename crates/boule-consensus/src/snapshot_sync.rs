@@ -57,9 +57,9 @@ use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 
+use crate::replication::snapshot::{ManifestError, SnapshotManifest, SnapshotPolicy, verify_chunk};
 use crate::validator_set::ValidatorSet;
 use boule::identity::NodeId;
-use crate::replication::snapshot::{ManifestError, SnapshotManifest, SnapshotPolicy, verify_chunk};
 
 /// Cap on the number of chunk requests in flight at any moment
 /// across the workpool. Picked to balance bandwidth utilization
@@ -264,8 +264,7 @@ impl SnapshotSync {
         // signing pubkey (no rotation has decoupled them yet); when
         // key rotation lookups land here (#328 follow-up) this should
         // resolve via `key_history.validator_for(...)` instead.
-        let proposer_id =
-            crate::validator_set::ValidatorId::from_genesis_pubkey(proposer);
+        let proposer_id = crate::validator_set::ValidatorId::from_genesis_pubkey(proposer);
         if !validator_set.contains(&proposer_id) {
             return Vec::new();
         }

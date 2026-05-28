@@ -418,12 +418,7 @@ mod tests {
     fn weighted_sel(entries: Vec<(NodeId, u64)>) -> WeightedAccumulatorSelector {
         let weighted: Vec<_> = entries
             .into_iter()
-            .map(|(n, w)| {
-                (
-                    crate::validator_set::ValidatorId::from_genesis_pubkey(n),
-                    w,
-                )
-            })
+            .map(|(n, w)| (crate::validator_set::ValidatorId::from_genesis_pubkey(n), w))
             .collect();
         let vs = ValidatorSet::with_weights(weighted).expect("weights nonzero");
         WeightedAccumulatorSelector::from_genesis_set(Arc::new(vs))

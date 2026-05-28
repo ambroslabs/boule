@@ -41,12 +41,12 @@ use sha2::{Digest, Sha256};
 
 use crate::View;
 use crate::bls_key_history::BlsKeyHistory;
+use crate::replication::block::Block;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
 use crate::validator_set::ValidatorSet;
 use boule::crypto::sig_scheme::SignatureSchemeChoice;
 use boule::crypto::signed::ChainId;
-use crate::replication::block::Block;
 
 /// Domain tag mixed into the leading bytes of the v1 commitment. Bumped
 /// alongside the function name on any future shape change.
@@ -190,12 +190,7 @@ pub fn apply_reconfig_commands_to_set_history(
 
         let next_entries: Vec<(crate::validator_set::ValidatorId, u64)> = next_members
             .into_iter()
-            .map(|(n, w)| {
-                (
-                    crate::validator_set::ValidatorId::from_genesis_pubkey(n),
-                    w,
-                )
-            })
+            .map(|(n, w)| (crate::validator_set::ValidatorId::from_genesis_pubkey(n), w))
             .collect();
         let new_set = match ValidatorSet::with_weights(next_entries) {
             Ok(s) => s,
@@ -204,8 +199,7 @@ pub fn apply_reconfig_commands_to_set_history(
         // Snapshot the post-reconfig members for the key_history
         // mirror so we don't double-borrow `set_history` after the
         // boundary is inserted.
-        let new_members: Vec<crate::validator_set::ValidatorId> =
-            new_set.iter().copied().collect();
+        let new_members: Vec<crate::validator_set::ValidatorId> = new_set.iter().copied().collect();
         if set_history.insert_boundary(cmd.v_eff, new_set).is_err() {
             continue;
         }
@@ -214,8 +208,7 @@ pub fn apply_reconfig_commands_to_set_history(
         // silently — `from_set_history` would skip them too.
         for member in new_members {
             if !key_history.validators().any(|id| id == member) {
-                let pubkey =
-                    crate::validator_set::Pubkey::from_node_id(member.into_node_id());
+                let pubkey = crate::validator_set::Pubkey::from_node_id(member.into_node_id());
                 let _ = key_history.add_validator(pubkey, cmd.v_eff);
             }
         }
@@ -255,8 +248,7 @@ pub fn apply_rotation_commands_to_histories(
             Err(_) => continue,
         };
 
-        let validator_pk =
-            crate::validator_set::Pubkey::from_node_id(envelope.payload.validator);
+        let validator_pk = crate::validator_set::Pubkey::from_node_id(envelope.payload.validator);
         let current_key = match key_history.current_key(&validator_pk) {
             Some(k) => k,
             None => continue,

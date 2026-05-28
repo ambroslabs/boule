@@ -284,8 +284,12 @@ fn mint_bls_keys_if_needed(
     // `testnet new` doesn't expose `genesis_seed_hex`, so the cluster
     // uses the default all-zeros seed — same as a config that omits
     // the field.
-    let chain_id =
-        boule_consensus::genesis::derive_chain_id_from_parts(&validator_ids, scheme, &bls_pubkeys, [0u8; 32]);
+    let chain_id = boule_consensus::genesis::derive_chain_id_from_parts(
+        &validator_ids,
+        scheme,
+        &bls_pubkeys,
+        [0u8; 32],
+    );
 
     let mut genesis = Vec::with_capacity(pending.len());
     for entry in pending {

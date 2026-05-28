@@ -38,7 +38,9 @@ zeroize             = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # Enable the crash-injection seam in consensus for the crash-recovery sim.
-boule-consensus     = { path = "../boule-consensus", version = "0.1.0", features = ["crashpoints"] }
+boule-consensus     = { path = "../boule-consensus", version = "0.1.0", features = ["crashpoints", "testing"] }
+boule-rs            = { path = "../boule-rs", version = "0.1.0", features = ["testing"] }
 tokio               = { version = "1", features = ["full", "test-util"] }
 proptest            = { version = "1", default-features = false, features = ["std", "bit-set"] }
 tempfile            = "3"
+rcgen               = { version = "0.13", default-features = false, features = ["ring", "pem"] }

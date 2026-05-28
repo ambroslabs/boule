@@ -441,8 +441,7 @@ impl ConsensusConfig {
         // who deliberately push the chunk size to the wire-frame
         // ceiling still leave room for protocol evolution.
         const FRAME_OVERHEAD_RESERVED: usize = 64 * 1024;
-        let max_chunk_size =
-            crate::config::MAX_FRAME_BYTES.saturating_sub(FRAME_OVERHEAD_RESERVED);
+        let max_chunk_size = crate::config::MAX_FRAME_BYTES.saturating_sub(FRAME_OVERHEAD_RESERVED);
         if (self.snapshot_chunk_size_bytes as usize) > max_chunk_size {
             anyhow::bail!(
                 "consensus.snapshot_chunk_size_bytes={} exceeds wire-frame budget {} \
@@ -709,7 +708,6 @@ impl P2pLimitsConfig {
             violations: P2pViolationsConfig::default(),
         }
     }
-
 }
 
 /// Per-message-type token-bucket rates and the wire-bytes/sec ceiling.
@@ -1399,9 +1397,10 @@ pub fn build_provider(cfg: &IdentityConfig) -> anyhow::Result<Arc<dyn KeyProvide
         #[cfg(feature = "keyring-backend")]
         IdentityConfig::Keyring { service, account } => {
             let acct = account.clone().unwrap_or_else(default_keyring_account);
-            Ok(Arc::new(
-                crate::identity::keyring::KeyringKeyProvider::new(service.clone(), acct),
-            ))
+            Ok(Arc::new(crate::identity::keyring::KeyringKeyProvider::new(
+                service.clone(),
+                acct,
+            )))
         }
         #[cfg(not(feature = "keyring-backend"))]
         IdentityConfig::Keyring { .. } => {

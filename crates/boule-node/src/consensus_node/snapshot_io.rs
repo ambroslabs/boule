@@ -19,6 +19,8 @@ use std::sync::atomic::Ordering;
 use anyhow::Context;
 use bytes::Bytes;
 
+use boule::crypto::signed::Signer;
+use boule::storage::StorageExt;
 use boule_consensus::Height;
 use boule_consensus::View;
 use boule_consensus::crashpoint::crashpoint;
@@ -27,11 +29,9 @@ use boule_consensus::hotstuff::qc::VerifiedQc;
 use boule_consensus::hotstuff::step::{Action as SafetyAction, Event as SafetyEvent, StateUpdate};
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::view_timer::ViewTimer;
-use boule::crypto::signed::Signer;
 use boule_transport_tcp::NodeId;
 use boule_transport_tcp::overlay::Broadcaster;
 use boule_transport_tcp::tls::node_id_to_base58;
-use boule::storage::StorageExt;
 
 use super::{
     ConsensusNode, LastCommitted, RECENT_QC_CACHE_CAPACITY, STORAGE_KEY_BLS_KEY_HISTORY,
@@ -367,7 +367,8 @@ impl ConsensusNode {
         to: NodeId,
         broadcaster: &dyn Broadcaster,
     ) {
-        let store = boule_consensus::replication::snapshot::SnapshotStore::new(Arc::clone(&self.storage));
+        let store =
+            boule_consensus::replication::snapshot::SnapshotStore::new(Arc::clone(&self.storage));
         let manifest = match height {
             Some(h) => match store.load_manifest(h) {
                 Ok(m) => m,
@@ -432,7 +433,8 @@ impl ConsensusNode {
         to: NodeId,
         broadcaster: &dyn Broadcaster,
     ) {
-        let store = boule_consensus::replication::snapshot::SnapshotStore::new(Arc::clone(&self.storage));
+        let store =
+            boule_consensus::replication::snapshot::SnapshotStore::new(Arc::clone(&self.storage));
         let payload = match store.load_chunk(height.0, chunk_idx) {
             Ok(p) => p,
             Err(e) => {
@@ -475,7 +477,9 @@ impl ConsensusNode {
         &self,
         block: &boule_consensus::replication::block::Block,
     ) -> anyhow::Result<()> {
-        use boule_consensus::replication::snapshot::{SnapshotManifest, SnapshotStore, chunk_snapshot};
+        use boule_consensus::replication::snapshot::{
+            SnapshotManifest, SnapshotStore, chunk_snapshot,
+        };
         let block_hash = block.hash();
         // Find a QC over this block. The cache is populated whenever
         // the safety core adopts a new high_qc; by the time block

@@ -44,6 +44,8 @@ use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
+use boule::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
+use boule::identity::NodeIdentity;
 use boule_consensus::dispatch::ingress;
 use boule_consensus::hotstuff::qc::{
     ConsensusMsg, NewView, Proposal, QuorumCertificate, SignerBitmap, TimeoutVote, Vote,
@@ -51,13 +53,11 @@ use boule_consensus::hotstuff::qc::{
 use boule_consensus::hotstuff::state::HotStuffState;
 use boule_consensus::hotstuff::step::{Action, BlockBuilder, Event, HotStuffCore};
 use boule_consensus::limits::{CacheEvictionCounters, CacheLimits};
-use boule_consensus::wire::WireMessage;
-use boule_consensus::validator_set::ValidatorSet;
-use boule_consensus::{Height, View};
-use boule::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
-use boule_transport_tcp::NodeId;
-use boule::identity::NodeIdentity;
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
+use boule_consensus::validator_set::ValidatorSet;
+use boule_consensus::wire::WireMessage;
+use boule_consensus::{Height, View};
+use boule_transport_tcp::NodeId;
 
 // ── Shared signer pool ──────────────────────────────────────────────
 
@@ -135,16 +135,14 @@ fn arb_qc() -> impl Strategy<Value = QuorumCertificate> {
         arb_signer_bitmap(),
         prop::collection::vec(any::<[u8; 64]>(), 0..16),
     )
-        .prop_map(
-            |(view, block_hash, signers, signatures)| QuorumCertificate {
-                view: View(view),
+        .prop_map(|(view, block_hash, signers, signatures)| {
+            QuorumCertificate::from_raw_parts(
+                View(view),
                 block_hash,
                 signers,
-                signatures: boule_consensus::hotstuff::qc::QcSignatures::Ed25519Collected(
-                    signatures,
-                ),
-            },
-        )
+                boule_consensus::hotstuff::qc::QcSignatures::Ed25519Collected(signatures),
+            )
+        })
 }
 
 fn arb_block(genesis_hash: BlockHash) -> impl Strategy<Value = Block> {
@@ -427,9 +425,7 @@ impl ReplicaSet {
                 }
                 Action::SendTo(target_id, msg) => {
                     let target_vid =
-                        boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(
-                            target_id,
-                        );
+                        boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(target_id);
                     if let Some(target) = self.validators.index_of(&target_vid) {
                         if target < self.cores.len() {
                             self.inboxes[target].push_back(event_from_msg(source_nid, msg));

@@ -50,6 +50,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::View;
+use crate::replication::block::{Block, BlockHash};
 use crate::validator_set::ValidatorSet;
 use boule::crypto::sig_scheme::{
     AggregateVerifyError, BlsAggregate, BlsAggregated, BlsPublicKey, Ed25519Collected,
@@ -57,7 +58,6 @@ use boule::crypto::sig_scheme::{
 };
 use boule::crypto::signed::SignedMessage;
 use boule::identity::NodeId;
-use crate::replication::block::{Block, BlockHash};
 
 /// HotStuff quorum threshold over a flat (count-based) committee:
 /// `2n/3 + 1`.
@@ -244,6 +244,26 @@ mod serde_g2_aggregate {
 }
 
 impl QuorumCertificate {
+    /// Construct a QC from raw parts, including a possibly-malformed
+    /// `signers`/`signatures` pair. Test-only (gated behind `cfg(test)` /
+    /// the `testing` feature) so the wire fuzzer in `boule-node` can mint
+    /// adversarial QCs that the normal `new` + `add_signature` path would
+    /// never produce; production code must go through those constructors.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn from_raw_parts(
+        view: View,
+        block_hash: BlockHash,
+        signers: SignerBitmap,
+        signatures: QcSignatures,
+    ) -> Self {
+        Self {
+            view,
+            block_hash,
+            signers,
+            signatures,
+        }
+    }
+
     /// Start an empty Ed25519-collected QC that can accumulate up to
     /// `validator_set_len` signatures. Use [`add_signature`] to populate
     /// it.

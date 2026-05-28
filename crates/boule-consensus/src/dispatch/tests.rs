@@ -8,12 +8,12 @@ use crate::hotstuff::qc::{TimeoutVote, Vote};
 use crate::hotstuff::step::Event as SafetyEvent;
 use crate::hotstuff::{NewView, Proposal, QuorumCertificate};
 use crate::pacemaker;
+use crate::replication::block::Block;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
 use crate::validator_set::ValidatorSet;
 use boule::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
 use boule::identity::NodeIdentity;
-use crate::replication::block::Block;
 
 fn fresh_signer() -> NodeSigner {
     let kp = RcgenKeyPair::generate_for(&PKCS_ED25519).unwrap();
@@ -397,9 +397,8 @@ fn egress_broadcast_encodes_signed_proposal() {
         block: genesis(),
         justify: qc.clone(),
     };
-    let action = crate::hotstuff::step::Action::Broadcast(
-        crate::hotstuff::ConsensusMsg::Proposal(proposal),
-    );
+    let action =
+        crate::hotstuff::step::Action::Broadcast(crate::hotstuff::ConsensusMsg::Proposal(proposal));
 
     let out = egress_safety(&action, &signer, None, &ChainId::TEST)
         .unwrap()
@@ -420,10 +419,8 @@ fn egress_send_to_encodes_vote() {
         view: View(5),
         block_hash: [0x77; 32],
     };
-    let action = crate::hotstuff::step::Action::SendTo(
-        target,
-        crate::hotstuff::ConsensusMsg::Vote(vote),
-    );
+    let action =
+        crate::hotstuff::step::Action::SendTo(target, crate::hotstuff::ConsensusMsg::Vote(vote));
 
     let out = egress_safety(&action, &signer, None, &ChainId::TEST)
         .unwrap()
@@ -440,9 +437,7 @@ fn egress_send_to_encodes_vote() {
 fn egress_persist_returns_none() {
     let signer = fresh_signer();
     use crate::hotstuff::step::StateUpdate;
-    let action = crate::hotstuff::step::Action::Persist(StateUpdate::VotedInView {
-        view: View(1),
-    });
+    let action = crate::hotstuff::step::Action::Persist(StateUpdate::VotedInView { view: View(1) });
     let out = egress_safety(&action, &signer, None, &ChainId::TEST).unwrap();
     assert!(out.is_none());
 }
@@ -488,9 +483,9 @@ fn egress_broadcast_proposal_is_verifiable() {
         block: genesis(),
         justify: sample_qc(),
     };
-    let action = crate::hotstuff::step::Action::Broadcast(
-        crate::hotstuff::ConsensusMsg::Proposal(proposal.clone()),
-    );
+    let action = crate::hotstuff::step::Action::Broadcast(crate::hotstuff::ConsensusMsg::Proposal(
+        proposal.clone(),
+    ));
     let Outbound::Broadcast(payload) = egress_safety(&action, &signer, None, &ChainId::TEST)
         .unwrap()
         .unwrap()
@@ -1654,8 +1649,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
     let leader = &signers[0];
 
     // Tamper the first signature inside the QC.
-    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) = &mut qc.signatures
-    {
+    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) = &mut qc.signatures {
         sigs[0][0] ^= 0xFF;
     }
 
@@ -1709,9 +1703,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
     let (signers, vs, mut high_qc) = build_real_ed25519_qc(view, block_hash);
     let messenger = &signers[1];
 
-    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) =
-        &mut high_qc.signatures
-    {
+    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) = &mut high_qc.signatures {
         sigs[1][3] ^= 0xAA;
     }
 
@@ -1817,8 +1809,7 @@ fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback()
     // Tamper one byte of the first signature in the aggregate. The
     // bitmap and signature count remain consistent, so this slips
     // past `is_well_formed` and only fails at `verify_aggregate`.
-    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) = &mut qc.signatures
-    {
+    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) = &mut qc.signatures {
         sigs[0][0] ^= 0xFF;
     }
 

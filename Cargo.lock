@@ -437,12 +437,15 @@ dependencies = [
  "parking_lot",
  "postcard",
  "proptest",
+ "rcgen",
  "ring",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -466,6 +469,7 @@ dependencies = [
  "proptest",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
@@ -527,6 +531,7 @@ version = "0.1.0"
 dependencies = [
  "boule-rs",
  "bytes",
+ "chrono",
  "parking_lot",
  "tokio",
 ]
@@ -545,6 +550,7 @@ dependencies = [
  "futures-util",
  "parking_lot",
  "postcard",
+ "proptest",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rcgen",
@@ -557,6 +563,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

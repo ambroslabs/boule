@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use boule_consensus::View;
 use boule_consensus::limits::CacheLimits;
-use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::replication::block::Block;
+use boule_consensus::validator_set::ValidatorSet;
 
 /// Plain-data configuration for a [`super::ConsensusNode`].
 ///

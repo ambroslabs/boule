@@ -40,7 +40,7 @@ pub(in crate::dispatch) fn verify_proposal_history_commitment_if_requested(
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
     let (scheme, bls_key_history, min_v_eff_delay) = match qc_verification {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         QcVerification::Skip => return Ok(()),
         QcVerification::Verify {
             scheme,

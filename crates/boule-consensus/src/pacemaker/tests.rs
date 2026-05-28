@@ -14,9 +14,7 @@ use std::time::Duration;
 use crate::View;
 use crate::pacemaker::leader::{LeaderSelector, RoundRobinSelector};
 use crate::pacemaker::timeout::{ExponentialBackoff, TimeoutPolicy};
-use crate::pacemaker::{
-    Action, AdvanceCause, Event, HonestyThresholdEvidence, Pacemaker,
-};
+use crate::pacemaker::{Action, AdvanceCause, Event, HonestyThresholdEvidence, Pacemaker};
 use crate::validator_set::ValidatorSet;
 use boule::identity::NodeId;
 

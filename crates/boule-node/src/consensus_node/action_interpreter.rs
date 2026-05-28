@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use boule::crypto::signed::Signer;
 use boule_consensus::crashpoint::crashpoint;
 use boule_consensus::dispatch::{self, Dispatch, Outbound};
 use boule_consensus::hotstuff::ConsensusMsg;
@@ -17,9 +18,8 @@ use boule_consensus::pacemaker::Action as PacemakerAction;
 use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
-use boule::crypto::signed::Signer;
-use boule_transport_tcp::NodeId;
 use boule_transport::limits::{Decision, MessageKind};
+use boule_transport_tcp::NodeId;
 use boule_transport_tcp::overlay::Broadcaster;
 use boule_transport_tcp::tls::node_id_to_base58;
 
@@ -93,7 +93,8 @@ impl ConsensusNode {
                     // Fire-and-forget: if the channel is full or
                     // closed (manager shut down), the limiter has
                     // already recorded the disconnect-decision.
-                    let _ = cmd_tx.try_send(boule_transport_tcp::PeerCommand::Disconnect { node_id: from });
+                    let _ = cmd_tx
+                        .try_send(boule_transport_tcp::PeerCommand::Disconnect { node_id: from });
                 }
                 // Don't `forget_peer` here: the peer state's
                 // `disconnect_dispatched` latch silences any frames

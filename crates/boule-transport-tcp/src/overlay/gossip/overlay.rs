@@ -89,12 +89,11 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info};
 
-use boule::clock::Clock;
 use crate::ProtocolEvent;
 use crate::dialer::DialerCtx;
 use crate::tls::NodeId;
+use boule::clock::Clock;
 
-use boule_transport::overlay::DiscoveryEvent;
 use super::broadcaster::{GossipBroadcaster, OverlayCmd};
 use super::dedup::{InsertOutcome, MsgIdRing};
 use super::discovery::GossipDiscovery;
@@ -105,6 +104,7 @@ use super::peer_list_task::{
 };
 use super::peer_table::PeerTable;
 use super::wire::{MsgId, OverlayFrame};
+use boule_transport::overlay::DiscoveryEvent;
 
 /// Knobs for [`GossipOverlay::spawn`].
 ///
@@ -418,7 +418,7 @@ impl GossipOverlay {
         // `Broadcaster::send_to` block, which the consensus event loop
         // experiences as a stall).
         debug!(
-            target: "boule::p2p::overlay::gossip",
+            target: "boule_transport_tcp::overlay::gossip",
             msg_id = ?msg_id,
             fanout,
             cmd_channel_pending = self.cmd_rx.len(),
@@ -464,7 +464,7 @@ impl GossipOverlay {
         // by `testnet`. Frequency is one line per unicast SendTo,
         // which is bounded by block-sync request volume.
         info!(
-            target: "boule::p2p::overlay::gossip",
+            target: "boule_transport_tcp::overlay::gossip",
             target_peer = %crate::tls::node_id_to_base58(&target),
             msg_id = ?msg_id,
             fanout,
@@ -527,7 +527,7 @@ impl GossipOverlay {
                     // versus lost on the wire. `originator` lets the
                     // analyzer correlate to the original sender.
                     debug!(
-                        target: "boule::p2p::overlay::gossip",
+                        target: "boule_transport_tcp::overlay::gossip",
                         from = %crate::tls::node_id_to_base58(&from),
                         originator = %crate::tls::node_id_to_base58(&originator),
                         msg_id = ?msg_id,
@@ -549,7 +549,7 @@ impl GossipOverlay {
                     // queue overflow on the read side, etc.) before
                     // any consensus-layer logic runs.
                     debug!(
-                        target: "boule::p2p::overlay::gossip",
+                        target: "boule_transport_tcp::overlay::gossip",
                         from = %crate::tls::node_id_to_base58(&from),
                         originator = %crate::tls::node_id_to_base58(&originator),
                         msg_id = ?msg_id,
@@ -672,8 +672,8 @@ mod tests {
 
     use parking_lot::Mutex;
 
-    use boule::clock::TokioClock;
     use crate::overlay::{Broadcaster, Discovery};
+    use boule::clock::TokioClock;
 
     use super::super::wire::PeerEntry;
     use super::*;

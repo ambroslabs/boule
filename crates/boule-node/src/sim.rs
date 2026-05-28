@@ -65,27 +65,29 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{mpsc, oneshot};
 
-use boule::clock::{Clock, TokioClock};
-use boule_consensus::api::{CommitNotifier, MpscCommitNotifier};
-use boule_consensus::limits::CacheLimits;
 use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
-use boule_consensus::validator_set::ValidatorSet;
-use boule_consensus::{Height, View};
+use boule::clock::{Clock, TokioClock};
 use boule::crypto::signed::{NodeSigner, Signer};
 use boule::identity::NodeIdentity;
+use boule::storage::{MemoryStorage, MemoryWal, Storage, Wal};
+use boule_consensus::api::{CommitNotifier, MpscCommitNotifier};
+use boule_consensus::limits::CacheLimits;
+use boule_consensus::replication::block::{Block, BlockHash};
+use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
+use boule_consensus::replication::mempool::Mempool;
+use boule_consensus::replication::state_machine::StateMachine;
+use boule_consensus::validator_set::ValidatorSet;
+use boule_consensus::{Height, View};
 use boule_transport_tcp::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
 use boule_transport_tcp::overlay::gossip::overlay::{
     GossipOverlay, GossipOverlayConfig, GossipOverlayHandles, SpawnArgs,
 };
 use boule_transport_tcp::overlay::gossip::peer_list_task::{OverlayUnicast, PeerListGossipConfig};
 use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
-use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery};
+use boule_transport_tcp::overlay::{
+    Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery,
+};
 use boule_transport_tcp::{NodeId, ProtocolEvent, ProtocolOutbound};
-use boule_consensus::replication::block::{Block, BlockHash};
-use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
-use boule_consensus::replication::mempool::Mempool;
-use boule_consensus::replication::state_machine::StateMachine;
-use boule::storage::{MemoryStorage, MemoryWal, Storage, Wal};
 use bytes::Bytes;
 use rand::Rng;
 use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
@@ -1013,7 +1015,10 @@ impl SimCluster {
             // defaults leave orders-of-magnitude of headroom.
             if let Some(rl_cfg) = rate_limits.as_ref() {
                 let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-                let limiter = Arc::new(boule_transport::limits::RateLimiter::new(rl_cfg.clone(), clock));
+                let limiter = Arc::new(boule_transport::limits::RateLimiter::new(
+                    rl_cfg.clone(),
+                    clock,
+                ));
                 limiters.push(Arc::clone(&limiter));
                 node = node.with_rate_limiter(limiter, None);
             }
@@ -2645,11 +2650,11 @@ mod tests {
     use super::{
         LinkCut, SimCluster, VoteObserver, assert_no_conflicts, fresh_signer, spawn_route_task,
     };
-    use boule_consensus::View;
-    use boule_consensus::validator_set::ValidatorSet;
     use boule::crypto::signed::{ChainId, Signer};
-    use boule_transport_tcp::{NodeId, ProtocolEvent, ProtocolOutbound};
+    use boule_consensus::View;
     use boule_consensus::replication::block::Block;
+    use boule_consensus::validator_set::ValidatorSet;
+    use boule_transport_tcp::{NodeId, ProtocolEvent, ProtocolOutbound};
 
     // ── VoteObserver unit tests (issue #422) ──────────────────────────────────
 
@@ -6397,9 +6402,9 @@ mod tests {
     /// which it isn't — it's just wrong about its own BLS key).
     #[tokio::test(start_paused = true)]
     async fn bls_cluster_commits_dual_key_rotation_and_makes_progress() {
+        use boule::crypto::sig_scheme::BlsAggregated;
         use boule_consensus::View;
         use boule_consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
-        use boule::crypto::sig_scheme::BlsAggregated;
 
         let mut cluster = SimCluster::spawn_bls(4, Duration::from_millis(50)).await;
 
@@ -6539,17 +6544,17 @@ mod tests {
     ///      d. Vote(view <  v_eff) signed under NEW key  → `UnknownSigner`.
     #[tokio::test(start_paused = true)]
     async fn validator_key_rotation_spanning_votes_correctness() {
+        use crate::consensus_node::{STORAGE_KEY_VALIDATOR_KEY_HISTORY, WireMessage};
+        use boule::crypto::signed::Signed;
         use boule_consensus::View;
         use boule_consensus::dispatch::{IngressError, ingress_wire};
         use boule_consensus::hotstuff::qc::Vote;
-        use crate::consensus_node::{STORAGE_KEY_VALIDATOR_KEY_HISTORY, WireMessage};
         use boule_consensus::validator_history::ValidatorSetHistory;
         use boule_consensus::validator_key_history::{
             PersistedValidatorKeyHistory, ValidatorKeyHistory,
         };
         use boule_consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
         use boule_consensus::validator_set::{Pubkey, ValidatorId, ValidatorSet};
-        use boule::crypto::signed::Signed;
 
         let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
 

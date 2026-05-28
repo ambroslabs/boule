@@ -11,10 +11,10 @@
 
 use anyhow::Context as _;
 
-use boule::config::ConsensusConfig;
-use crate::validator_set::ValidatorSet;
-use boule::identity::{NodeId, base58_to_node_id};
 use crate::replication::block::Block;
+use crate::validator_set::ValidatorSet;
+use boule::config::ConsensusConfig;
+use boule::identity::{NodeId, base58_to_node_id};
 
 /// Derive the deployment's [`ChainId`] from a [`ConsensusConfig`]
 /// without booting a full consensus node. Used by CLI tooling
@@ -124,17 +124,13 @@ fn compute_genesis_validator_history_commitment(
     scheme: boule::crypto::sig_scheme::SignatureSchemeChoice,
     genesis_bls: &[(NodeId, boule::crypto::sig_scheme::BlsPublicKey)],
 ) -> [u8; 32] {
-    let set_hist = crate::validator_history::ValidatorSetHistory::from_genesis(
-        validator_set.clone(),
-    );
-    let key_hist = crate::validator_key_history::ValidatorKeyHistory::new(
-        validator_set.iter().copied(),
-    );
+    let set_hist =
+        crate::validator_history::ValidatorSetHistory::from_genesis(validator_set.clone());
+    let key_hist =
+        crate::validator_key_history::ValidatorKeyHistory::new(validator_set.iter().copied());
     let bls_hist = match scheme {
         boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => Some(
-            crate::bls_key_history::BlsKeyHistory::with_genesis(
-                genesis_bls.iter().copied(),
-            ),
+            crate::bls_key_history::BlsKeyHistory::with_genesis(genesis_bls.iter().copied()),
         ),
         boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => None,
     };

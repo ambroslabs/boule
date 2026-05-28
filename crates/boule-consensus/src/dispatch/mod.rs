@@ -47,13 +47,13 @@
 use bytes::Bytes;
 
 use crate::hotstuff::qc::TimeoutVote;
+use crate::replication::block::{Block, BlockHash};
+use crate::replication::snapshot::SnapshotManifest;
 use crate::validator_set::ValidatorId;
 use crate::{Height, View};
 use boule::crypto::sig_scheme::SignatureSchemeChoice;
 use boule::crypto::signed::Signed;
 use boule::identity::NodeId;
-use crate::replication::block::{Block, BlockHash};
-use crate::replication::snapshot::SnapshotManifest;
 
 pub mod codec;
 pub mod egress;
@@ -66,7 +66,7 @@ pub use egress::{
     egress_snapshot_chunk_request, egress_snapshot_chunk_response,
     egress_snapshot_manifest_request, egress_snapshot_manifest_response,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub use ingress::{ingress, ingress_wire};
 pub use ingress::{
     ingress_block_range_request, ingress_block_range_response, ingress_block_request,
@@ -399,10 +399,7 @@ impl<T> Verified<T> {
     /// `verify_proposal_history_commitment_if_requested`,
     /// `verify_bls_partial_if_required`) has returned `Ok`. Outside
     /// the crate, callers must go through [`ingress`] to land here.
-    pub fn wrap_after_verify_with_signer(
-        value: T,
-        signer_validator_id: ValidatorId,
-    ) -> Self {
+    pub fn wrap_after_verify_with_signer(value: T, signer_validator_id: ValidatorId) -> Self {
         Self {
             value,
             signer_validator_id,
@@ -498,7 +495,7 @@ impl<T> Verified<Signed<T>> {
 /// are all read by the proposal-receive validator alongside the QC
 /// verifier.
 pub enum QcVerification<'a> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     Skip,
     Verify {
         scheme: SignatureSchemeChoice,

@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-use boule_consensus::validator_rotation::{RotationProposeRequest, build_rotation_envelope};
 use boule::identity::node_id_to_base58;
+use boule_consensus::validator_rotation::{RotationProposeRequest, build_rotation_envelope};
 
 use super::shared::resolve_config_path;
 
@@ -69,11 +69,11 @@ pub(crate) fn handle_propose(args: RotationProposeArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule::crypto::sig_scheme::BlsAggregated;
     use boule_consensus::validator_rotation::{
         RotationProposeRequest, build_new_identity_config_for_rotation, build_rotation_envelope,
     };
-    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
-    use boule::crypto::sig_scheme::BlsAggregated;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -207,7 +207,8 @@ mod tests {
         assert_eq!(outcome.envelope.payload.new_pubkey, new_signer.node_id());
 
         let cfg = boule::config::load(&config_path).unwrap();
-        let chain_id = boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        let chain_id =
+            boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
         outcome
             .envelope
             .verify(&current_signer.node_id(), &chain_id)
@@ -343,7 +344,8 @@ mod tests {
         assert_eq!(env_pk, bls_id.public);
 
         let cfg = boule::config::load(&config_path).unwrap();
-        let chain_id = boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        let chain_id =
+            boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
         BlsAggregated::verify_pop(env_pop, &env_pk, &chain_id)
             .expect("BLS PoP must verify under the chain's chain_id");
 

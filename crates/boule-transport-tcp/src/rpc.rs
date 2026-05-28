@@ -24,8 +24,8 @@
 //! use std::time::Duration;
 //!
 //! use boule::clock::{Clock, TokioClock};
-//! use boule::p2p::{self, PeerCommand};
-//! use boule::p2p::rpc::RpcBuilder;
+//! use boule_transport_tcp::{self as p2p, PeerCommand};
+//! use boule_transport_tcp::rpc::RpcBuilder;
 //! use bytes::Bytes;
 //! use tokio::sync::{mpsc, oneshot};
 //! use tokio_util::sync::CancellationToken;
@@ -87,9 +87,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use boule::clock::{self, Clock};
 use crate::tls::{NodeId, node_id_to_base58};
 use crate::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
+use boule::clock::{self, Clock};
 
 /// Frame kind: an outbound request from a client. The server looks up
 /// `method_id` in its handler table and dispatches.
@@ -449,8 +449,8 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Bytes, Bytes>> + Sen
 /// use std::sync::Arc;
 ///
 /// use boule::clock::{Clock, TokioClock};
-/// use boule::p2p::{NodeId, ProtocolHandle};
-/// use boule::p2p::rpc::RpcBuilder;
+/// use boule_transport_tcp::{NodeId, ProtocolHandle};
+/// use boule_transport_tcp::rpc::RpcBuilder;
 /// use bytes::Bytes;
 /// use tokio_util::sync::CancellationToken;
 ///
@@ -517,8 +517,8 @@ where
 /// use std::sync::Arc;
 ///
 /// use boule::clock::{Clock, TokioClock};
-/// use boule::p2p::{NodeId, ProtocolHandle};
-/// use boule::p2p::rpc::RpcBuilder;
+/// use boule_transport_tcp::{NodeId, ProtocolHandle};
+/// use boule_transport_tcp::rpc::RpcBuilder;
 /// use bytes::Bytes;
 /// use tokio_util::sync::CancellationToken;
 ///

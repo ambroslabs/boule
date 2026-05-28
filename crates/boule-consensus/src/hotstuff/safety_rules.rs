@@ -132,10 +132,10 @@ pub fn three_chain_commit(new_qc: &QuorumCertificate, state: &HotStuffState) -> 
 mod tests {
     use super::super::state::Locked;
     use super::*;
+    use crate::replication::block::{Block, BlockHeader};
     use crate::validator_set::ValidatorSet;
     use crate::{Height, View};
     use boule::identity::NodeId;
-    use crate::replication::block::{Block, BlockHeader};
 
     fn nid(b: u8) -> NodeId {
         [b; 32]
