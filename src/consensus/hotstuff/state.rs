@@ -42,8 +42,7 @@ const PROTECTED_HIGH_QC_DEPTH: usize = 4;
 /// and two-chain promotion in `step::on_proposal_received` uses
 /// `height` for the monotonicity check. Nothing ships the lock on the
 /// wire (`NewView` carries `high_qc`). This matches how the HotStuff
-/// paper's Algorithm 4 tracks the lock as a node reference — see
-/// `docs/consensus/hotstuff-notes.md#the-bjustify-problem-relevant-to-b4`.
+/// paper's Algorithm 4 tracks the lock as a node reference.
 ///
 /// `height` is part of the lock rather than derived from
 /// `pending_blocks` because views can skip (validate_structural only

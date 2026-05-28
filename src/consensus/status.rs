@@ -123,7 +123,7 @@ pub struct CacheEvictionStatus {
 }
 
 /// Cumulative count of drops on the production drop-on-full back-pressure
-/// paths. See `docs/backpressure.md` for the policy table; in short,
+/// paths. In short,
 /// these are paths where a sender would otherwise have to choose between
 /// blocking forever (wedging consensus) and dropping silently (causing
 /// hard-to-diagnose request loss). The drop is the right behaviour;
@@ -148,9 +148,8 @@ pub struct BackpressureStatus {
     /// manager — both `SendTo` and `Broadcast` paths feed the same
     /// counter. Each increment is one frame that didn't make it onto a
     /// peer's write channel because it was at capacity (the
-    /// must-deliver-or-disconnect path's drop side; see
-    /// `docs/backpressure.md`). Closed-channel failures are not
-    /// counted (manager-shutdown noise).
+    /// must-deliver-or-disconnect path's drop side). Closed-channel
+    /// failures are not counted (manager-shutdown noise).
     #[serde(default)]
     pub peer_outbound_overflow_total: u64,
     /// Drops from the block-sync responder's per-peer outstanding-

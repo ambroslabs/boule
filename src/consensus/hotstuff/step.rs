@@ -170,8 +170,7 @@ pub enum StateUpdate {
     /// Replica promoted its lock via the two-chain rule. Only the
     /// (view, block_hash) pair is durable — the safety core never
     /// reads signer data off the lock, and nothing ships it on the
-    /// wire (`NewView` carries `high_qc`, not the lock). See
-    /// `docs/consensus/hotstuff-notes.md#the-bjustify-problem-relevant-to-b4`.
+    /// wire (`NewView` carries `high_qc`, not the lock).
     Locked(Locked),
     /// Replica adopted a fresher `high_qc` (seen via a proposal's
     /// justify, a freshly-formed QC, or a `NewView`).
@@ -1177,8 +1176,7 @@ impl HotStuffCore {
         //
         // Height-based comparison follows the paper; using view would
         // let a Byzantine proposer wedge us with a short chain
-        // claiming a huge view. See
-        // `docs/consensus/hotstuff-notes.md#the-chain-rules`.
+        // claiming a huge view.
         //
         // Emission order: this `Persist(Locked)` is pushed *before*
         // B3's deferred `Broadcast(Vote)` so the integration layer
@@ -5324,8 +5322,7 @@ mod tests {
         /// This is the load-bearing safety invariant of HotStuff:
         /// the safety proof's "no equivocation" guarantee depends
         /// on a restarted replica never voting twice at the same
-        /// view. See `docs/consensus/hotstuff-notes.md` "Why
-        /// monotonic vheight".
+        /// view.
         #[test]
         fn restart_does_not_revote_at_already_voted_view() {
             // Pre-restart: vote at view 1.

@@ -64,9 +64,7 @@
 //! # Running a node
 //!
 //! See the top-level [`README.md`](https://github.com/ambroslabs/boule-rs/blob/main/README.md)
-//! for build / run / test instructions and the configuration reference,
-//! and `docs/testnet-local.md` for a walkthrough of the
-//! `boule init` → `boule start` flow.
+//! for build / run / test instructions and the configuration reference.
 
 pub mod cli;
 pub mod clock;

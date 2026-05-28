@@ -444,9 +444,8 @@ op = "verify_safety"
         assert!(matches!(s.steps.last(), Some(Step::VerifySafety)));
     }
 
-    /// The TOML example in `docs/testnet-local.md` (under "Composing
-    /// custom scenarios") must parse, and its first step must be
-    /// `wait_all_healthy` — that gate is what keeps the docs example
+    /// The custom-scenario TOML example must parse, and its first step
+    /// must be `wait_all_healthy` — that gate is what keeps the example
     /// from deterministically wedging on the ring-bootstrap topology
     /// for unlucky seeds (issue #216, item 3).
     #[test]

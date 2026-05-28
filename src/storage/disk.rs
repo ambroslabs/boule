@@ -37,8 +37,7 @@
 //! `DiskStorage::open` calls `check_integrity` once at startup (the
 //! HotStuff control-plane KV is small enough that a full scan is cheap)
 //! and `DiskWal` wraps each entry with its own 8-byte checksum that's
-//! verified per-read in [`DiskWal::iter_from`]. See `docs/storage-durability.md`
-//! for the trade-off rationale.
+//! verified per-read in [`DiskWal::iter_from`].
 
 use std::path::Path;
 use std::sync::Arc;
@@ -1311,9 +1310,7 @@ mod tests {
         // header (the very first page, which holds the magic bytes,
         // the layout, and the god-byte) must be caught at open. This
         // is the strongest corruption-detection guarantee redb gives
-        // us, and the operator runbook in `docs/storage-durability.md`
-        // depends on it ("if the WAL is corrupt, the node will refuse
-        // to start").
+        // us: if the WAL is corrupt, the node will refuse to start.
         use std::io::{Read, Seek, SeekFrom, Write};
 
         let tmp = TempDir::new().unwrap();
@@ -1484,8 +1481,8 @@ mod tests {
     }
 
     /// One-off benchmark backing the open-time cost claim for
-    /// `Database::check_integrity()` in `docs/storage-durability.md`
-    /// (issue #233). Gated with `#[ignore]` so it does not run on CI;
+    /// `Database::check_integrity()` (issue #233). Gated with `#[ignore]`
+    /// so it does not run on CI;
     /// invoke explicitly via:
     ///
     /// ```sh

@@ -6,8 +6,6 @@
 //! `src/bin/testnet.rs`. Splitting it out lets integration tests call
 //! the driver functions directly (without spawning a subprocess) and
 //! lets each command live as a focused module.
-//!
-//! See `docs/testnet-local.md` §9b for the user-facing walkthrough.
 
 pub mod admin;
 pub mod cli;
