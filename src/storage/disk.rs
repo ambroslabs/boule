@@ -809,8 +809,8 @@ mod tests {
     // check is the very first thing the test does; the parent-mode logic
     // never runs in the child, preventing infinite recursion.
 
-    const CRASH_MODE: &str = "AMBROS_STORAGE_CRASH_MODE";
-    const CRASH_DB_PATH: &str = "AMBROS_STORAGE_CRASH_DB_PATH";
+    const CRASH_MODE: &str = "BOULE_STORAGE_CRASH_MODE";
+    const CRASH_DB_PATH: &str = "BOULE_STORAGE_CRASH_DB_PATH";
 
     fn spawn_crash_child(
         test_name: &str,
@@ -1001,7 +1001,7 @@ mod tests {
     // tests do not need a child since they manipulate the file in-place
     // after a clean close.
 
-    const CRASH_MARKER_PATH: &str = "AMBROS_STORAGE_CRASH_MARKER_PATH";
+    const CRASH_MARKER_PATH: &str = "BOULE_STORAGE_CRASH_MARKER_PATH";
 
     #[cfg(unix)]
     #[test]

@@ -43,7 +43,7 @@ use crate::crypto::sig_scheme::{BlsPartialSig, SignatureSchemeChoice};
 /// Tracing target shared with the integration layer; lifted here so
 /// safety-core eviction logs flow through the same `RUST_LOG` filter
 /// (see `crate::consensus::node::TRACE_TARGET`).
-const TRACE_TARGET: &str = "ambros_p2p::consensus";
+const TRACE_TARGET: &str = "boule::consensus";
 
 /// Inputs the safety core reacts to.
 ///

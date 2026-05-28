@@ -4,7 +4,7 @@
 //! [`axum::Router`] in `node::run` alongside any application routers:
 //!
 //! ```no_run
-//! use ambros_p2p::p2p::{self, PeerCommand};
+//! use boule::p2p::{self, PeerCommand};
 //! use tokio::sync::mpsc;
 //!
 //! # fn wiring(p2p_cmd_tx: mpsc::Sender<PeerCommand>) {
@@ -36,7 +36,7 @@ use super::{NodeId, PeerCommand};
 /// wiring lives in `main.rs`:
 ///
 /// ```no_run
-/// use ambros_p2p::p2p::{self, PeerCommand};
+/// use boule::p2p::{self, PeerCommand};
 /// use tokio::sync::mpsc;
 ///
 /// let (p2p_cmd_tx, _p2p_cmd_rx) = mpsc::channel::<PeerCommand>(256);

@@ -160,7 +160,7 @@ fn default_key_file() -> PathBuf {
 }
 
 fn default_keyring_service() -> String {
-    "ambros-p2p".to_string()
+    "boule".to_string()
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -1322,14 +1322,14 @@ listen_addr = "127.0.0.1:7000"
 
 [node.identity]
 backend = "env"
-env_var = "AMBROS_NODE_KEY"
+env_var = "BOULE_NODE_KEY"
 
 [api]
 listen_addr = "127.0.0.1:8080"
 "#,
         );
         match resolve_identity(&c.node).unwrap() {
-            IdentityConfig::Env { env_var } => assert_eq!(env_var, "AMBROS_NODE_KEY"),
+            IdentityConfig::Env { env_var } => assert_eq!(env_var, "BOULE_NODE_KEY"),
             _ => panic!("expected env backend"),
         }
     }
@@ -2215,7 +2215,7 @@ listen_addr = "127.0.0.1:8080"
         );
         match resolve_identity(&c.node).unwrap() {
             IdentityConfig::Keyring { service, account } => {
-                assert_eq!(service, "ambros-p2p");
+                assert_eq!(service, "boule");
                 assert!(account.is_none());
             }
             _ => panic!("expected keyring backend"),

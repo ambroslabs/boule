@@ -165,7 +165,7 @@ impl ChainId {
 ///
 /// The associated `DOMAIN` string is mixed into the signing pre-image so
 /// signatures produced for one message kind cannot be re-used as another.
-/// Choose a stable, type-unique value (e.g. `"ambros.vote.v1"`).
+/// Choose a stable, type-unique value (e.g. `"boule.vote.v1"`).
 pub trait SignedMessage {
     const DOMAIN: &'static str;
 }
@@ -201,8 +201,8 @@ where
     /// any other type, even when the byte layout happens to match.
     ///
     /// ```
-    /// use ambros_p2p::crypto::signed::{ChainId, NodeSigner, Signed, SignedMessage, Signer};
-    /// use ambros_p2p::p2p::identity::NodeIdentity;
+    /// use boule::crypto::signed::{ChainId, NodeSigner, Signed, SignedMessage, Signer};
+    /// use boule::p2p::identity::NodeIdentity;
     /// use rcgen::{KeyPair, PKCS_ED25519};
     /// use serde::{Deserialize, Serialize};
     /// use zeroize::Zeroizing;
@@ -319,7 +319,7 @@ mod tests {
     }
 
     impl SignedMessage for Vote {
-        const DOMAIN: &'static str = "ambros.test.vote.v1";
+        const DOMAIN: &'static str = "boule.test.vote.v1";
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -329,7 +329,7 @@ mod tests {
     }
 
     impl SignedMessage for Proposal {
-        const DOMAIN: &'static str = "ambros.test.proposal.v1";
+        const DOMAIN: &'static str = "boule.test.proposal.v1";
     }
 
     fn fresh_signer() -> NodeSigner {
@@ -509,7 +509,7 @@ mod tests {
 
         // Hand-craft a Signed<Proposal> that reuses the signature from the Vote.
         // Even though the struct layouts are identical, the domain separator
-        // ("ambros.test.vote.v1" vs "ambros.test.proposal.v1") makes the
+        // ("boule.test.vote.v1" vs "boule.test.proposal.v1") makes the
         // pre-images different, so the signature must not verify.
         let forged: Signed<Proposal> = Signed {
             payload: Proposal {

@@ -20,9 +20,9 @@ use super::qc::VerifiedQc;
 
 /// Tracing target for eviction logs. Same string as
 /// [`crate::consensus::node::TRACE_TARGET`] so a single
-/// `RUST_LOG=ambros_p2p::consensus=info` filter catches every cache
+/// `RUST_LOG=boule::consensus=info` filter catches every cache
 /// drop the consensus layer emits.
-const TRACE_TARGET: &str = "ambros_p2p::consensus";
+const TRACE_TARGET: &str = "boule::consensus";
 
 /// How many parent links above `high_qc.block_hash` to protect from
 /// cap-based eviction. The two-chain lock-promotion walk reaches one

@@ -418,7 +418,7 @@ impl GossipOverlay {
         // `Broadcaster::send_to` block, which the consensus event loop
         // experiences as a stall).
         debug!(
-            target: "ambros_p2p::p2p::overlay::gossip",
+            target: "boule::p2p::overlay::gossip",
             msg_id = ?msg_id,
             fanout,
             cmd_channel_pending = self.cmd_rx.len(),
@@ -464,7 +464,7 @@ impl GossipOverlay {
         // by `testnet`. Frequency is one line per unicast SendTo,
         // which is bounded by block-sync request volume.
         info!(
-            target: "ambros_p2p::p2p::overlay::gossip",
+            target: "boule::p2p::overlay::gossip",
             target_peer = %crate::p2p::tls::node_id_to_base58(&target),
             msg_id = ?msg_id,
             fanout,
@@ -527,7 +527,7 @@ impl GossipOverlay {
                     // versus lost on the wire. `originator` lets the
                     // analyzer correlate to the original sender.
                     debug!(
-                        target: "ambros_p2p::p2p::overlay::gossip",
+                        target: "boule::p2p::overlay::gossip",
                         from = %crate::p2p::tls::node_id_to_base58(&from),
                         originator = %crate::p2p::tls::node_id_to_base58(&originator),
                         msg_id = ?msg_id,
@@ -549,7 +549,7 @@ impl GossipOverlay {
                     // queue overflow on the read side, etc.) before
                     // any consensus-layer logic runs.
                     debug!(
-                        target: "ambros_p2p::p2p::overlay::gossip",
+                        target: "boule::p2p::overlay::gossip",
                         from = %crate::p2p::tls::node_id_to_base58(&from),
                         originator = %crate::p2p::tls::node_id_to_base58(&originator),
                         msg_id = ?msg_id,

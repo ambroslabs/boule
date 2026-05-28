@@ -1,5 +1,5 @@
 [package]
-name = "ambros-p2p-fuzz"
+name = "boule-rs-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -21,7 +21,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ambros-p2p    = { path = ".." }
+boule-rs      = { path = ".." }
 postcard      = { version = "1", default-features = false, features = ["use-std"] }
 bytes         = { version = "1", features = ["serde"] }
 

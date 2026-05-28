@@ -377,9 +377,9 @@ impl From<postcard::Error> for IngressError {
 /// makes this snippet compile as a regression of the typestate gate.
 ///
 /// ```compile_fail
-/// use ambros_p2p::consensus::hotstuff::Proposal;
-/// use ambros_p2p::consensus::hotstuff::step::Event;
-/// use ambros_p2p::crypto::signed::Signed;
+/// use boule::consensus::hotstuff::Proposal;
+/// use boule::consensus::hotstuff::step::Event;
+/// use boule::crypto::signed::Signed;
 /// fn forbidden(signed: Signed<Proposal>) -> Event {
 ///     // expected `Verified<Signed<Proposal>>`, found `Signed<Proposal>`
 ///     Event::ProposalReceived(signed)

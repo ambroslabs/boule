@@ -508,7 +508,7 @@ mod tests {
         // Drive the handshake — accept on a spawned task, connect on the
         // current one, so both sides make progress concurrently.
         let accept_task = tokio::spawn(async move { acceptor.accept(server_io).await });
-        let server_name = rustls::pki_types::ServerName::try_from("ambros-p2p").unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("boule").unwrap();
         let client_tls = connector.connect(server_name, client_io).await.unwrap();
         let server_tls = accept_task.await.unwrap().unwrap();
 

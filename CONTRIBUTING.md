@@ -1,4 +1,4 @@
-# Contributing to ambros-p2p
+# Contributing to boule
 
 Thank you for your interest in contributing!
 
@@ -32,8 +32,8 @@ is required.
 file ensures the correct toolchain is selected automatically.
 
 ```sh
-git clone https://github.com/ambroslabs/ambros-p2p.git
-cd ambros-p2p
+git clone https://github.com/ambroslabs/boule-rs.git
+cd boule
 cargo build
 ```
 

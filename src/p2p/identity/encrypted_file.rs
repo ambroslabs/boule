@@ -3,7 +3,7 @@
 //! On-disk format (base64-wrapped inside a PEM-like envelope):
 //!
 //! ```text
-//! magic:       "AMBROS\0"   (7 bytes)
+//! magic:       "BOULE\0\0"  (7 bytes)
 //! version:     1            (1 byte)
 //! argon_m:     u32 BE       (memory cost in KiB)
 //! argon_t:     u32 BE       (iterations)
@@ -33,12 +33,12 @@ use zeroize::Zeroizing;
 
 use super::{KeyProvider, NodeIdentity, generate_pkcs8_der};
 
-const MAGIC: &[u8; 7] = b"AMBROS\0";
+const MAGIC: &[u8; 7] = b"BOULE\0\0";
 const VERSION: u8 = 1;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = 7 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN;
-const PEM_LABEL: &str = "AMBROS ENCRYPTED PRIVATE KEY";
+const PEM_LABEL: &str = "BOULE ENCRYPTED PRIVATE KEY";
 
 const ARGON_M_KIB: u32 = 64 * 1024; // 64 MiB
 const ARGON_T: u32 = 3;
@@ -343,7 +343,7 @@ mod tests {
     fn provider_generates_and_reloads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.enc");
-        let var = "AMBROS_TEST_ENC_PASS";
+        let var = "BOULE_TEST_ENC_PASS";
         unsafe { std::env::set_var(var, "p@ssw0rd!") };
 
         let provider = EncryptedFileKeyProvider::new(path.clone(), Some(var.to_string()));
@@ -360,7 +360,7 @@ mod tests {
     fn provider_wrong_passphrase() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.enc");
-        let var = "AMBROS_TEST_ENC_PASS_WRONG";
+        let var = "BOULE_TEST_ENC_PASS_WRONG";
         unsafe { std::env::set_var(var, "correct-passphrase") };
         let provider = EncryptedFileKeyProvider::new(path.clone(), Some(var.to_string()));
         provider.load_or_init().unwrap();

@@ -1,6 +1,6 @@
-# Spinning up a local ambros-p2p testnet on a laptop
+# Spinning up a local boule testnet on a laptop
 
-This guide walks through running a small ambros-p2p cluster on a single
+This guide walks through running a small boule cluster on a single
 machine. "Testnet" here means a handful of real node processes talking to
 each other over TLS, forming a gossip mesh, and — optionally — running the
 HotStuff consensus loop.
@@ -26,12 +26,12 @@ scenario that exercises crash recovery and dynamic membership tolerance.
 Clone and build once:
 
 ```sh
-git clone https://github.com/ambroslabs/ambros-p2p.git
-cd ambros-p2p
+git clone https://github.com/ambroslabs/boule-rs.git
+cd boule
 cargo build --release
 ```
 
-The release binary lands at `target/release/ambros-p2p`. Debug builds
+The release binary lands at `target/release/boule`. Debug builds
 work too; release is just faster.
 
 ---
@@ -42,7 +42,7 @@ A node's long-term identity is an Ed25519 keypair. The base58 encoding of
 its public key *is* the node's overlay address (the `NodeId`). Two facts
 follow:
 
-1. A node's `NodeId` is not known until the first time `ambros-p2p init`
+1. A node's `NodeId` is not known until the first time `boule init`
    runs and provisions its key. So the workflow is: **`init` mints the key
    and prints the `NodeId` → paste it into peers' configs → `start`.**
 2. Peers can be configured in trust-on-first-use mode (`addr` only), or
@@ -63,12 +63,12 @@ path    = "./testnet/node1/node.key"
 listen_addr = "127.0.0.1:8000"
 ```
 
-When `--config` is omitted, `ambros-p2p` reads from the platform default:
+When `--config` is omitted, `boule` reads from the platform default:
 
 | Resource | Linux | macOS | Windows |
 | --- | --- | --- | --- |
-| Config | `$XDG_CONFIG_HOME/ambros-p2p/config.toml` (default `~/.config/ambros-p2p/config.toml`) | `~/Library/Application Support/ambros-p2p/config.toml` | `%APPDATA%\ambros-p2p\config.toml` |
-| State / WAL / storage | `$XDG_DATA_HOME/ambros-p2p/` (default `~/.local/share/ambros-p2p/`) | `~/Library/Application Support/ambros-p2p/` | `%LOCALAPPDATA%\ambros-p2p\` |
+| Config | `$XDG_CONFIG_HOME/boule/config.toml` (default `~/.config/boule/config.toml`) | `~/Library/Application Support/boule/config.toml` | `%APPDATA%\boule\config.toml` |
+| State / WAL / storage | `$XDG_DATA_HOME/boule/` (default `~/.local/share/boule/`) | `~/Library/Application Support/boule/` | `%LOCALAPPDATA%\boule\` |
 
 The walkthroughs below pass `--config` explicitly because every node
 runs on the same host and would otherwise collide on the default
@@ -99,7 +99,7 @@ path    = "./testnet/node1/node.key"
 [node.validator_identity]
 backend = "encrypted-file"
 path    = "./testnet/node1/validator.key"
-passphrase_env = "AMBROS_VALIDATOR_PASSPHRASE"
+passphrase_env = "BOULE_VALIDATOR_PASSPHRASE"
 ```
 
 Splitting them lets you rotate the TLS key (via `key migrate` or out-of-
@@ -184,11 +184,11 @@ listen_addr = "127.0.0.1:8002"
 
 ## 4. Mint each node's identity
 
-`ambros-p2p init` provisions the on-disk key for the file backend and
+`boule init` provisions the on-disk key for the file backend and
 prints the resulting `NodeId` to stdout. Run it once per node:
 
 ```sh
-./target/release/ambros-p2p init --config testnet/node1/config.toml
+./target/release/boule init --config testnet/node1/config.toml
 # stdout includes: "provisioned new node key: NodeId = <base58…>"
 ```
 
@@ -211,13 +211,13 @@ asks you to provision the key out-of-band before re-running.
 
 ### Inspect the resolved config
 
-`ambros-p2p config` prints the **fully-resolved** view: the file
+`boule config` prints the **fully-resolved** view: the file
 contents *plus* every default the node would fill in if started right
 now. It's the answer to questions like "what timeout is this node
 actually using?" without remembering the schema:
 
 ```sh
-./target/release/ambros-p2p config --config testnet/node1/config.toml | grep timeout
+./target/release/boule config --config testnet/node1/config.toml | grep timeout
 # timeout_base_ms = 200
 # timeout_max_ms = 10000
 ```
@@ -225,7 +225,7 @@ actually using?" without remembering the schema:
 For programmatic access, `--format json` pipes cleanly into `jq`:
 
 ```sh
-./target/release/ambros-p2p config --config testnet/node1/config.toml --format json \
+./target/release/boule config --config testnet/node1/config.toml --format json \
     | jq '.consensus.timeout_base_ms'
 ```
 
@@ -278,13 +278,13 @@ Open three terminals (or use `tmux`). In each one:
 
 ```sh
 # Terminal 1
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node1/config.toml
+RUST_LOG=info ./target/release/boule start --config testnet/node1/config.toml
 
 # Terminal 2 (after node1 is up)
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node2/config.toml
+RUST_LOG=info ./target/release/boule start --config testnet/node2/config.toml
 
 # Terminal 3 (after node2 is up)
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/node3/config.toml
+RUST_LOG=info ./target/release/boule start --config testnet/node3/config.toml
 ```
 
 You should see log lines on each side announcing the P2P listener, the
@@ -292,7 +292,7 @@ HTTP API listener, and (on node2/node3) the outbound dials succeeding.
 
 If `start` exits immediately with `no node key found via the 'file'
 backend`, the config points at a key path that hasn't been minted yet
-— run `ambros-p2p init --config <path>` first.
+— run `boule init --config <path>` first.
 
 ---
 
@@ -378,7 +378,7 @@ already have them:
 
 ```sh
 cargo build --release
-ls target/release/ambros-p2p target/release/testnet
+ls target/release/boule target/release/testnet
 ```
 
 ### Generate the cluster
@@ -391,7 +391,7 @@ you to pick a fresh `--workdir` or delete the old one:
 
 ```sh
 ./target/release/testnet new --nodes 4 --seed 1 --workdir testnet4 \
-    --ambros-bin ./target/release/ambros-p2p
+    --boule-bin ./target/release/boule
 ```
 
 This produces:
@@ -402,7 +402,7 @@ testnet4/
 ├── events.jsonl            # append-only log of every driver action
 ├── node1/
 │   ├── config.toml         # full config — schema below
-│   ├── node.key            # minted by `ambros-p2p init`
+│   ├── node.key            # minted by `boule init`
 │   ├── addr.json           # `addr_file` written on bind, read by the driver
 │   ├── consensus/          # WAL + block store (storage_dir)
 │   ├── pid                 # written by `up`, removed by `down`
@@ -498,9 +498,9 @@ returns once the four processes are running. Within a few seconds
 each log file should contain:
 
 ```
-INFO ambros_p2p: consensus: event loop spawned
-INFO ambros_p2p::consensus::node: consensus: committed block height=1 view=2
-INFO ambros_p2p::consensus::node: consensus: committed block height=2 view=3
+INFO boule: consensus: event loop spawned
+INFO boule::consensus::node: consensus: committed block height=1 view=2
+INFO boule::consensus::node: consensus: committed block height=2 view=3
 ... (steady stream)
 ```
 
@@ -638,9 +638,9 @@ primitives (`scenario`, `kill`, `wait`, `verify-safety`) apply.
 
 ```sh
 ./target/release/testnet new --nodes 7 --seed 1 --workdir testnet7 \
-    --ambros-bin ./target/release/ambros-p2p
+    --boule-bin ./target/release/boule
 ./target/release/testnet scenario rotating-failure-7n-f2 --seed 1 \
-    --workdir testnet7 --ambros-bin ./target/release/ambros-p2p
+    --workdir testnet7 --boule-bin ./target/release/boule
 ./target/release/testnet down --workdir testnet7
 ```
 
@@ -891,7 +891,7 @@ already got running.
 
 **Step 1: build the payload.** Use the CLI on any host (it doesn't
 talk to the cluster — just encodes the tagged bytes). For an `add`,
-you need the new validator's `NodeId` (run `ambros-p2p init` on the
+you need the new validator's `NodeId` (run `boule init` on the
 new host first to mint its key) and its routable `listen_addr`:
 
 ```sh
@@ -900,7 +900,7 @@ curl -s http://127.0.0.1:8000/consensus/status | jq .current_view
 # Pick a v_eff comfortably in the future — e.g. current_view + 100 —
 # so the reconfig has time to commit before its boundary lands.
 
-./target/release/ambros-p2p reconfig add-validator \
+./target/release/boule reconfig add-validator \
     --pubkey <new-node-NodeId-base58> \
     --addr   127.0.0.1:7004 \
     --weight 1 \
@@ -957,7 +957,7 @@ For a `remove`, the address and weight are irrelevant (the validator's
 already in the active set):
 
 ```sh
-./target/release/ambros-p2p reconfig remove-validator \
+./target/release/boule reconfig remove-validator \
     --pubkey <removed-node-NodeId-base58> \
     --v-eff  150
 ```
@@ -968,7 +968,7 @@ quorum without touching membership — use `change-weight`:
 
 ```sh
 # Halve validator X's voting weight at v_eff = current_view + 100.
-./target/release/ambros-p2p reconfig change-weight \
+./target/release/boule reconfig change-weight \
     --pubkey <existing-node-NodeId-base58> \
     --weight 1 \
     --v-eff  150
@@ -994,14 +994,14 @@ whose commands include the tagged payload. The structured event is
 `reconfig_applied` with the resulting committee size:
 
 ```
-INFO ambros_p2p::consensus: reconfig_applied height=42 view=43 v_eff=150 next_size=5
+INFO boule::consensus: reconfig_applied height=42 view=43 v_eff=150 next_size=5
 ```
 
 After `current_view` crosses `v_eff`, leader rotation observes the
 post-boundary committee — for an add, the new validator starts taking
 its leader slots; for a remove, the removed node's votes are dropped
 at ingress and the rotation skips it. Inspect the active committee by
-restarting any node: `ambros-p2p start` reads
+restarting any node: `boule start` reads
 `consensus/validator_history` (#254) on boot, replays every committed
 reconfig boundary, and prints the recovered committee in the startup
 logs.
@@ -1020,7 +1020,7 @@ re-adding it) uses a separate, dedicated mechanism — the dual-signed
 ["Rotating a validator's consensus signing key" section in
 operations.md][rotation-runbook] for the runbook.
 
-[rotation-tx]: https://github.com/ambroslabs/ambros-p2p/blob/main/src/consensus/validator_rotation.rs
+[rotation-tx]: https://github.com/ambroslabs/boule-rs/blob/main/src/consensus/validator_rotation.rs
 [rotation-runbook]: operations.md#rotating-a-validators-consensus-signing-key-issue-142
 
 Also note the older note in §2 above (under "Network identity vs.
@@ -1059,7 +1059,7 @@ rm -rf testnet testnet4 testnet7
 
 Node IDs will change after this. The driver mints fresh ones on the
 next `testnet new`; for the manual gossip walkthrough, remember to
-re-wire each `[[peers]]` block after re-running `ambros-p2p init`.
+re-wire each `[[peers]]` block after re-running `boule init`.
 
 ---
 
@@ -1070,8 +1070,8 @@ re-wire each `[[peers]]` block after re-running `ambros-p2p init`.
 | `/peers` returns `[]` on every node | One or more `[[peers]].node_id` values don't match the actual node IDs (typo or stale copy). Re-check the printed `node ID: ...` lines. |
 | `Address already in use` on start | Something else is bound to the P2P or API port. Edit `listen_addr` to use another port, or kill the stale process. |
 | Messages don't propagate | Mesh isn't formed — check `/peers` first. If peers are present but `/messages` diverges, check clocks: `expiry` comparisons use wall-clock time, and a very skewed laptop clock can make messages land already-expired. |
-| `no node key found via the '<backend>' backend` | The configured key backend is empty — run `ambros-p2p init --config <path>` (file/encrypted-file) or provision the key out-of-band (env/exec/keyring) before retrying `start`. |
-| `refusing to start in production without an explicit [node.identity]` | You set `AMBROS_ENV=production` or passed `--production`. For a laptop testnet, unset both and let the default file backend kick in. |
+| `no node key found via the '<backend>' backend` | The configured key backend is empty — run `boule init --config <path>` (file/encrypted-file) or provision the key out-of-band (env/exec/keyring) before retrying `start`. |
+| `refusing to start in production without an explicit [node.identity]` | You set `BOULE_ENV=production` or passed `--production`. For a laptop testnet, unset both and let the default file backend kick in. |
 | `[node.validator_identity] is unset — reusing the network identity for consensus signing` | Single-key fallback warning. Add a `[node.validator_identity]` table to silence it; or ignore it for laptop testnets (the fallback works as it always has). |
 | `validator pubkey differs from network pubkey — consensus dispatch routes messages by validator pubkey ...` | You set a `[node.validator_identity]` whose key bytes resolve to a different Ed25519 pubkey than the network key. Cross-pubkey routing requires validator-set reconfiguration (#140); until that lands, point both slots at the same key bytes (different backends are fine). |
 | Consensus nodes never commit | The committees don't match. Every replica's `[consensus].validators` list must be the exact same strings in the exact same order, and `genesis_seed_hex` must be identical. Check `/consensus/status` on every node — divergent `validator_set` arrays are the smoking gun. |
@@ -1085,33 +1085,33 @@ re-wire each `[[peers]]` block after re-running `ambros-p2p init`.
 ## Reference: commands used above
 
 ```sh
-# Build (produces target/release/{ambros-p2p,testnet})
+# Build (produces target/release/{boule,testnet})
 cargo build --release
 
 # ── Manual gossip walkthrough (§3–§7) ───────────────────────────────────────
 # Bootstrap a node (idempotent; mints the file/encrypted-file key,
 # creates the consensus storage_dir, prints the NodeId)
-./target/release/ambros-p2p init --config testnet/nodeN/config.toml
+./target/release/boule init --config testnet/nodeN/config.toml
 
 # Start a node
-RUST_LOG=info ./target/release/ambros-p2p start --config testnet/nodeN/config.toml
+RUST_LOG=info ./target/release/boule start --config testnet/nodeN/config.toml
 
 # Print the fully-resolved config (file + defaults). `--format json |
 # jq` is the field-selection escape hatch; `--raw` prints the file
 # unchanged; `--path` prints just the resolved file path; `--edit`
 # opens $EDITOR / $VISUAL and validates on save.
-./target/release/ambros-p2p config --config testnet/nodeN/config.toml
-./target/release/ambros-p2p config --config testnet/nodeN/config.toml --format json \
+./target/release/boule config --config testnet/nodeN/config.toml
+./target/release/boule config --config testnet/nodeN/config.toml --format json \
     | jq '.consensus.timeout_base_ms'
-./target/release/ambros-p2p config --config testnet/nodeN/config.toml --path
-./target/release/ambros-p2p config --config testnet/nodeN/config.toml --edit
+./target/release/boule config --config testnet/nodeN/config.toml --path
+./target/release/boule config --config testnet/nodeN/config.toml --edit
 
 # Print help (shows all subcommands including `key migrate`)
-./target/release/ambros-p2p --help
+./target/release/boule --help
 
 # ── Driver-managed consensus cluster (§8 onwards) ───────────────────────────
 ./target/release/testnet new --nodes 4 --workdir testnet4 \
-    --ambros-bin ./target/release/ambros-p2p
+    --boule-bin ./target/release/boule
 ./target/release/testnet up            --workdir testnet4
 ./target/release/testnet ls            --workdir testnet4   # static topology
 ./target/release/testnet snap          --workdir testnet4   # live commit/view/peers
@@ -1124,7 +1124,7 @@ RUST_LOG=info ./target/release/ambros-p2p start --config testnet/nodeN/config.to
 ./target/release/testnet wait --node node2 --catch-up-to-cluster --tolerance 2 \
     --workdir testnet4
 ./target/release/testnet scenario rotating-failure-7n-f2 --seed 1 \
-    --workdir testnet7 --ambros-bin ./target/release/ambros-p2p
+    --workdir testnet7 --boule-bin ./target/release/boule
 ./target/release/testnet down          --workdir testnet4
 
 # ── Admin API — gossip-only fields ──────────────────────────────────────────

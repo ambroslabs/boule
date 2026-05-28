@@ -119,7 +119,7 @@ pub trait Storage: Send + Sync {
     /// # Example
     ///
     /// ```
-    /// use ambros_p2p::storage::{MemoryStorage, Storage};
+    /// use boule::storage::{MemoryStorage, Storage};
     ///
     /// let store = MemoryStorage::new();
     /// store.put(b"view", &7u64.to_be_bytes()).unwrap();
@@ -164,7 +164,7 @@ pub trait Storage: Send + Sync {
 /// ```
 /// use std::sync::Arc;
 ///
-/// use ambros_p2p::storage::{MemoryStorage, Storage, StorageExt};
+/// use boule::storage::{MemoryStorage, Storage, StorageExt};
 ///
 /// let store: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 ///

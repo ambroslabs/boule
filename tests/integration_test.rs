@@ -80,11 +80,11 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::proces
     }
 }
 
-/// Synchronously run `ambros-p2p init --config <path>` so the file
+/// Synchronously run `boule init --config <path>` so the file
 /// backend mints a key before `start` is invoked. `start` refuses to
 /// run before `init`, so every spawn helper threads through this.
 fn run_init(config_path: &str) {
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let output = Command::new(bin)
         .args(["init", "--config", config_path])
         .env("RUST_LOG", "warn")
@@ -156,7 +156,7 @@ async fn spawn_node_with_schema(peers: &[PeerDesc<'_>], schema: IdentitySchema) 
 
     run_init(config_file.path().to_str().unwrap());
 
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let child = Command::new(bin)
         .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
@@ -416,7 +416,7 @@ async fn launch_once_for_discovery(key_path: &str) -> DiscoveryInfo {
 
     run_init(config_file.path().to_str().unwrap());
 
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let mut child = Command::new(bin)
         .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
@@ -481,7 +481,7 @@ async fn spawn_node_fixed_port(
 
     run_init(config_file.path().to_str().unwrap());
 
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let child = Command::new(bin)
         .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
@@ -652,7 +652,7 @@ async fn spawn_consensus_node(
 
     run_init(config_file.path().to_str().unwrap());
 
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let child = Command::new(bin)
         .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
@@ -789,7 +789,7 @@ async fn test_consensus_status_endpoint_reports_live_progress() {
 /// Spawn a consensus-running node with `[overlay] mode = "gossip"`.
 /// `[[peers]]` is left empty; reachability is driven by
 /// `bootstrap_addrs` which the gossip overlay's
-/// [`Discovery::add_bootstrap`](https://github.com/ambroslabs/ambros-p2p/issues/137)
+/// [`Discovery::add_bootstrap`](https://github.com/ambroslabs/boule-rs/issues/137)
 /// dials as TOFU.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_consensus_node_gossip(
@@ -827,7 +827,7 @@ async fn spawn_consensus_node_gossip(
 
     run_init(config_file.path().to_str().unwrap());
 
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let child = Command::new(bin)
         .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
@@ -1053,7 +1053,7 @@ async fn spawn_consensus_node_inbound_disabled(
 
     run_init(config_file.path().to_str().unwrap());
 
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let child = Command::new(bin)
         .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
@@ -1215,7 +1215,7 @@ async fn test_inbound_disabled_node_participates_via_outbound_only() {
 // These tests exercise the binary directly — no node is spawned, since the
 // subcommand reads/edits config files synchronously and never opens
 // listeners. Every test writes a self-contained config in a temp dir and
-// invokes `cargo`-built `ambros-p2p config ...`.
+// invokes `cargo`-built `boule config ...`.
 
 const SAMPLE_CONFIG: &str = r#"
 [node]
@@ -1223,7 +1223,7 @@ listen_addr = "127.0.0.1:7000"
 
 [node.identity]
 backend = "file"
-path    = "/tmp/ambros-p2p-config-test/node.key"
+path    = "/tmp/boule-config-test/node.key"
 
 [api]
 listen_addr = "127.0.0.1:8000"
@@ -1239,13 +1239,13 @@ fn write_sample_config(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn run_config(args: &[&str]) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     Command::new(bin)
         .arg("config")
         .args(args)
         .env("RUST_LOG", "warn")
         .output()
-        .expect("spawn `ambros-p2p config`")
+        .expect("spawn `boule config`")
 }
 
 #[test]
@@ -1354,7 +1354,7 @@ fn test_config_edit_with_noop_editor_succeeds() {
     // the most basic happy-path: editor opens, user makes no change.
     let dir = tempfile::tempdir().unwrap();
     let path = write_sample_config(dir.path());
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let out = Command::new(bin)
         .args(["config", "--config", path.to_str().unwrap(), "--edit"])
         .env("EDITOR", "true")
@@ -1380,7 +1380,7 @@ fn test_config_edit_aborts_on_nonzero_editor_exit() {
     // aborted, do not save". `vim :cq` produces the same.
     let dir = tempfile::tempdir().unwrap();
     let path = write_sample_config(dir.path());
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let out = Command::new(bin)
         .args(["config", "--config", path.to_str().unwrap(), "--edit"])
         .env("EDITOR", "false")
@@ -1419,7 +1419,7 @@ fn test_config_edit_rejects_invalid_save() {
         perms.set_mode(0o755);
         std::fs::set_permissions(&editor_script, perms).unwrap();
     }
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let out = Command::new(bin)
         .args(["config", "--config", path.to_str().unwrap(), "--edit"])
         .env("EDITOR", editor_script.to_str().unwrap())
@@ -1444,7 +1444,7 @@ fn test_config_edit_errors_when_file_missing() {
     // otherwise. Operators are pointed at `init` instead.
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("does-not-exist.toml");
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let out = Command::new(bin)
         .args(["config", "--config", missing.to_str().unwrap(), "--edit"])
         .env("EDITOR", "true")
@@ -1465,7 +1465,7 @@ fn test_config_edit_errors_when_file_missing() {
 // default for subcommands with structured output, and the per-invocation
 // `--format` flag overrides it. Today only `config` honours it; future
 // subcommands (`status`, `peers list`, ...) will inherit the convention via
-// the `ambros_p2p::cli` helpers.
+// the `boule::cli` helpers.
 
 const CONFIG_WITH_UI_JSON: &str = r#"
 [node]
@@ -1473,7 +1473,7 @@ listen_addr = "127.0.0.1:7000"
 
 [node.identity]
 backend = "file"
-path    = "/tmp/ambros-p2p-config-test/node.key"
+path    = "/tmp/boule-config-test/node.key"
 
 [api]
 listen_addr = "127.0.0.1:8000"
@@ -1488,7 +1488,7 @@ listen_addr = "127.0.0.1:7000"
 
 [node.identity]
 backend = "file"
-path    = "/tmp/ambros-p2p-config-test/node.key"
+path    = "/tmp/boule-config-test/node.key"
 
 [api]
 listen_addr = "127.0.0.1:8000"
@@ -1620,7 +1620,7 @@ async fn test_self_id_in_peers_list_fails_to_start() {
     config_file.write_all(config.as_bytes()).unwrap();
     config_file.flush().unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let output = Command::new(bin)
         .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")
@@ -1672,7 +1672,7 @@ async fn test_self_loopback_dial_is_refused_at_handshake() {
     config_file.write_all(config.as_bytes()).unwrap();
     config_file.flush().unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_ambros-p2p");
+    let bin = env!("CARGO_BIN_EXE_boule");
     let child = Command::new(bin)
         .args(["start", "--config", config_file.path().to_str().unwrap()])
         .env("RUST_LOG", "warn")

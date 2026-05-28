@@ -84,7 +84,7 @@ pub struct ValidatorKeyRotation {
 }
 
 impl SignedMessage for ValidatorKeyRotation {
-    const DOMAIN: &'static str = "ambros.consensus.validator_rotation.v1";
+    const DOMAIN: &'static str = "boule.consensus.validator_rotation.v1";
 }
 
 /// A [`ValidatorKeyRotation`] envelope carrying both the old-key and
@@ -672,7 +672,7 @@ mod tests {
         // and must trip a deliberate test update.
         assert_eq!(
             ValidatorKeyRotation::DOMAIN,
-            "ambros.consensus.validator_rotation.v1"
+            "boule.consensus.validator_rotation.v1"
         );
     }
 

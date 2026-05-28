@@ -311,7 +311,7 @@ impl BlsAggregated {
     /// G2-sig variant. Ties our protocol's DST to the standard
     /// proof-of-possession scheme so PoP signatures (#291) and QC
     /// signatures share the same hash-to-curve domain.
-    pub const DST: &'static [u8] = b"AMBROS_HOTSTUFF_BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+    pub const DST: &'static [u8] = b"BOULE_HOTSTUFF_BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
     /// True iff `agg` is the sentinel returned by
     /// [`Self::empty_aggregate`] — i.e. no partials have been folded in.

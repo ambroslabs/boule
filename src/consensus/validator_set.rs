@@ -70,8 +70,8 @@ use crate::p2p::NodeId;
 /// `NodeId`. Existing on-disk and on-the-wire shapes are unchanged.
 ///
 /// ```compile_fail
-/// # use ambros_p2p::consensus::validator_set::{ValidatorId, Pubkey};
-/// # use ambros_p2p::p2p::NodeId;
+/// # use boule::consensus::validator_set::{ValidatorId, Pubkey};
+/// # use boule::p2p::NodeId;
 /// // The compile_fail guard for #328: arbitrary bytes must not be
 /// // promotable to a stable validator id without going through a
 /// // lookup. If a future PR adds `From<Pubkey> for ValidatorId` (or

@@ -35,11 +35,11 @@
 
 use std::time::{Duration, Instant};
 
-use ambros_p2p::consensus::hotstuff::qc::{QuorumCertificate, Vote as ConsensusVote, quorum_size};
-use ambros_p2p::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
-use ambros_p2p::crypto::signed::{NodeSigner, Signer};
-use ambros_p2p::p2p::NodeId;
-use ambros_p2p::p2p::identity::NodeIdentity;
+use boule::consensus::hotstuff::qc::{QuorumCertificate, Vote as ConsensusVote, quorum_size};
+use boule::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
+use boule::crypto::signed::{NodeSigner, Signer};
+use boule::p2p::NodeId;
+use boule::p2p::identity::NodeIdentity;
 use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
 use zeroize::Zeroizing;
 
@@ -108,7 +108,7 @@ fn bench_ed25519(n: usize, q: usize) -> Stats {
     let signers: Vec<NodeSigner> = (0..n).map(|_| fresh_ed_signer()).collect();
     let pubkeys: Vec<NodeId> = signers.iter().map(|s| s.node_id()).collect();
     let block_hash = [0xAB; 32];
-    let view = ambros_p2p::consensus::View(1);
+    let view = boule::consensus::View(1);
     let payload = ConsensusVote { view, block_hash };
     let message = postcard::to_stdvec(&payload).expect("vote payload encoding");
 
@@ -150,7 +150,7 @@ fn bench_bls(n: usize, q: usize) -> Stats {
     let signers: Vec<(BlsSecretKey, BlsPublicKey)> = (0..n).map(bls_signer).collect();
     let pubkeys: Vec<BlsPublicKey> = signers.iter().map(|(_, pk)| *pk).collect();
     let block_hash = [0xCD; 32];
-    let view = ambros_p2p::consensus::View(1);
+    let view = boule::consensus::View(1);
     let payload = ConsensusVote { view, block_hash };
     let message = postcard::to_stdvec(&payload).expect("vote payload encoding");
 

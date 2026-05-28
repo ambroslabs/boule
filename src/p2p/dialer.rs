@@ -189,7 +189,7 @@ async fn dial(
 
     let tcp = tokio::net::TcpStream::connect(addr).await?;
     let connector = TlsConnector::from(Arc::clone(&identity.client_config));
-    let server_name = rustls::pki_types::ServerName::try_from("ambros-p2p")
+    let server_name = rustls::pki_types::ServerName::try_from("boule")
         .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
     let tls_stream = connector.connect(server_name, tcp).await?;
 

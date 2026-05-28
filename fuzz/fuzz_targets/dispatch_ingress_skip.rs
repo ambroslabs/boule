@@ -39,12 +39,12 @@
 
 use std::sync::LazyLock;
 
-use ambros_p2p::consensus::dispatch::ingress_wire;
-use ambros_p2p::consensus::node::WireMessage;
-use ambros_p2p::consensus::validator_history::ValidatorSetHistory;
-use ambros_p2p::consensus::validator_key_history::ValidatorKeyHistory;
-use ambros_p2p::consensus::validator_set::{ValidatorId, ValidatorSet};
-use ambros_p2p::crypto::signed::ChainId;
+use boule::consensus::dispatch::ingress_wire;
+use boule::consensus::node::WireMessage;
+use boule::consensus::validator_history::ValidatorSetHistory;
+use boule::consensus::validator_key_history::ValidatorKeyHistory;
+use boule::consensus::validator_set::{ValidatorId, ValidatorSet};
+use boule::crypto::signed::ChainId;
 use libfuzzer_sys::fuzz_target;
 
 /// Tiny fixed validator set. Four validators is the smallest size that

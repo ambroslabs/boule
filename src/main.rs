@@ -3,28 +3,28 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use ambros_p2p::cli::{self, OutputFormat};
-use ambros_p2p::config::{self, Config, IdentityConfig, NodeConfig};
-use ambros_p2p::node;
-use ambros_p2p::p2p::identity::KeyProvider;
-use ambros_p2p::p2p::tls::node_id_to_base58;
-use ambros_p2p::paths;
+use boule::cli::{self, OutputFormat};
+use boule::config::{self, Config, IdentityConfig, NodeConfig};
+use boule::node;
+use boule::p2p::identity::KeyProvider;
+use boule::p2p::tls::node_id_to_base58;
+use boule::paths;
 
-const ENV_PRODUCTION: &str = "AMBROS_ENV";
+const ENV_PRODUCTION: &str = "BOULE_ENV";
 
 /// Initialize the tracing subscriber.
 ///
 /// Honors two environment variables:
 ///
 /// - `RUST_LOG`: standard `tracing-subscriber` env filter. Defaults to
-///   `ambros_p2p=info`. Set to `info,ambros_p2p::consensus=debug` to get
+///   `boule=info`. Set to `info,boule::consensus=debug` to get
 ///   the structured event-boundary logs the consensus layer emits.
 /// - `RUST_LOG_FORMAT`: `pretty` (default) or `json`. JSON emits one
 ///   structured event per line, which operators can pipe through `jq` to
 ///   filter across nodes.
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "ambros_p2p=info".into());
+        .unwrap_or_else(|_| "boule=info".into());
 
     let json = std::env::var("RUST_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
@@ -82,7 +82,7 @@ async fn dispatch(args: &[String]) -> anyhow::Result<()> {
 }
 
 fn print_usage() {
-    println!("Usage: ambros-p2p <subcommand> [options]");
+    println!("Usage: boule <subcommand> [options]");
     println!();
     println!("Subcommands:");
     println!("  init [--config <path>]");
@@ -123,11 +123,11 @@ fn print_usage() {
     println!("      is supplied, the chain's signature_scheme is cross-checked.");
     println!(
         "      The consensus floor is {} validators after applying;",
-        ambros_p2p::consensus::reconfig::MIN_VALIDATOR_FLOOR,
+        boule::consensus::reconfig::MIN_VALIDATOR_FLOOR,
     );
     println!(
         "      `v_eff` must be at least `current_view + {}`.",
-        ambros_p2p::consensus::reconfig::MIN_V_EFF_DELAY,
+        boule::consensus::reconfig::MIN_V_EFF_DELAY,
     );
     println!();
     println!("  reconfig remove-validator --pubkey <base58> --v-eff <view>");
@@ -149,7 +149,7 @@ fn print_usage() {
     println!("      payload along with a chain-bound proof-of-possession.");
     println!(
         "      `v_eff` must be at least `current_view + {}`.",
-        ambros_p2p::consensus::validator_rotation::V_EFF_MIN_DELAY,
+        boule::consensus::validator_rotation::V_EFF_MIN_DELAY,
     );
     println!();
     println!("  config [--config <path>] [--format human|json|toml] [--raw|--edit|--path]");
@@ -159,7 +159,7 @@ fn print_usage() {
     println!("      `[ui] output_format`; for `config`, both `human` (the global");
     println!("      default) and `toml` render TOML, while `json` emits JSON");
     println!(
-        "      suitable for piping (e.g. `ambros-p2p config --format json | jq '.consensus.timeout_base_ms'`)."
+        "      suitable for piping (e.g. `boule config --format json | jq '.consensus.timeout_base_ms'`)."
     );
     println!("      `--raw` prints the file as-written. `--edit` opens the file");
     println!("      in $EDITOR / $VISUAL and validates the result. `--path` prints");
@@ -334,7 +334,7 @@ fn handle_init(args: &[String]) -> anyhow::Result<()> {
     // static peers list at `init` time so operators don't ship a config
     // that only fails at `start`.
     if let Some(net_id) = provider.try_load()? {
-        let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&net_id)?;
+        let tls = boule::p2p::tls::TlsIdentity::from_identity(&net_id)?;
         config.validate(&tls.node_id)?;
     }
 
@@ -366,7 +366,7 @@ fn handle_init(args: &[String]) -> anyhow::Result<()> {
     preflight_validate(&config)?;
 
     println!(
-        "init complete. Run `ambros-p2p start --config {}` to launch.",
+        "init complete. Run `boule start --config {}` to launch.",
         config_path.display()
     );
     Ok(())
@@ -383,7 +383,7 @@ fn provision_or_report(
 ) -> anyhow::Result<()> {
     match provider.try_load()? {
         Some(id) => {
-            let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&id)?;
+            let tls = boule::p2p::tls::TlsIdentity::from_identity(&id)?;
             println!(
                 "{slot} key already provisioned: NodeId = {}",
                 node_id_to_base58(&tls.node_id)
@@ -392,7 +392,7 @@ fn provision_or_report(
         None => {
             if provider.is_provisioning_capable() {
                 let new_id = provider.load_or_init()?;
-                let tls = ambros_p2p::p2p::tls::TlsIdentity::from_identity(&new_id)?;
+                let tls = boule::p2p::tls::TlsIdentity::from_identity(&new_id)?;
                 println!(
                     "provisioned new {slot} key: NodeId = {}",
                     node_id_to_base58(&tls.node_id)
@@ -417,7 +417,7 @@ fn write_starter_config(path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    let data_dir = paths::default_data_dir().unwrap_or_else(|| PathBuf::from("./ambros-p2p"));
+    let data_dir = paths::default_data_dir().unwrap_or_else(|| PathBuf::from("./boule"));
     let key_path = data_dir.join("node.key");
     let storage_dir = data_dir.join("consensus");
 
@@ -427,7 +427,7 @@ fn write_starter_config(path: &Path) -> anyhow::Result<()> {
     // the node IDs your `init` prints across the cluster) to turn on
     // HotStuff. See docs/testnet-local.md.
     let template = format!(
-        "# ambros-p2p starter config — generated by `ambros-p2p init`.\n\
+        "# boule starter config — generated by `boule init`.\n\
          # See docs/testnet-local.md for a fuller walkthrough.\n\n\
          [node]\n\
          listen_addr = \"127.0.0.1:7000\"\n\n\
@@ -459,7 +459,7 @@ fn preflight_validate(config: &Config) -> anyhow::Result<()> {
     if let Some(cons) = config.consensus.as_ref() {
         if !cons.validators.is_empty() {
             for raw in &cons.validators {
-                ambros_p2p::p2p::tls::base58_to_node_id(raw).map_err(|e| {
+                boule::p2p::tls::base58_to_node_id(raw).map_err(|e| {
                     anyhow::anyhow!(
                         "[consensus.validators] entry {raw:?} is not a valid NodeId: {e}"
                     )
@@ -492,7 +492,7 @@ async fn handle_start(args: &[String]) -> anyhow::Result<()> {
     let provider = config::build_provider(&identity_cfg)?;
     let network_identity = provider.try_load()?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no node key found via the `{}` backend. Run `ambros-p2p init --config {}` \
+            "no node key found via the `{}` backend. Run `boule init --config {}` \
              first (or provision the key out-of-band for read-only backends).",
             identity_cfg.backend_name(),
             config_path.display(),
@@ -508,7 +508,7 @@ async fn handle_start(args: &[String]) -> anyhow::Result<()> {
         let val_provider = config::build_provider(&val_cfg)?;
         let val_id = val_provider.try_load()?.ok_or_else(|| {
             anyhow::anyhow!(
-                "no validator key found via the `{}` backend. Run `ambros-p2p init --config {}` \
+                "no validator key found via the `{}` backend. Run `boule init --config {}` \
                  first (or provision the key out-of-band for read-only backends).",
                 val_cfg.backend_name(),
                 config_path.display(),
@@ -642,10 +642,7 @@ fn handle_key_migrate(args: &[String]) -> anyhow::Result<()> {
             passphrase_env: args.passphrase_env.clone(),
         },
         "keyring" => IdentityConfig::Keyring {
-            service: args
-                .service
-                .clone()
-                .unwrap_or_else(|| "ambros-p2p".to_string()),
+            service: args.service.clone().unwrap_or_else(|| "boule".to_string()),
             account: args.account.clone(),
         },
         other => anyhow::bail!("unsupported --to backend: {other}"),
@@ -782,7 +779,7 @@ fn handle_config(args: &[String]) -> anyhow::Result<()> {
 fn edit_config(config_path: &Path) -> anyhow::Result<()> {
     if !config_path.exists() {
         anyhow::bail!(
-            "no config at {} to edit; run `ambros-p2p init --config {}` first",
+            "no config at {} to edit; run `boule init --config {}` first",
             config_path.display(),
             config_path.display(),
         );
@@ -933,7 +930,7 @@ fn handle_snapshot_export(args: &[String]) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("snapshot at height {height} is missing chunk {idx}"))?;
         chunks.push(chunk);
     }
-    ambros_p2p::replication::snapshot::export_to_directory(&manifest, &chunks, &out_dir)?;
+    boule::replication::snapshot::export_to_directory(&manifest, &chunks, &out_dir)?;
     println!(
         "exported snapshot height={} view={} chunks={} into {}",
         manifest.height,
@@ -988,7 +985,7 @@ fn handle_snapshot_import(args: &[String]) -> anyhow::Result<()> {
     let config = config::load(&config_path)?;
     let store = open_snapshot_store_for_cli(&config)?;
 
-    let (manifest, chunks) = ambros_p2p::replication::snapshot::import_from_directory(&in_dir)?;
+    let (manifest, chunks) = boule::replication::snapshot::import_from_directory(&in_dir)?;
     store.save(&manifest, &chunks)?;
     println!(
         "imported snapshot height={} view={} chunks={} into consensus storage",
@@ -1115,9 +1112,9 @@ fn parse_reconfig_args(args: &[String]) -> anyhow::Result<ReconfigArgs> {
 }
 
 fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
-    use ambros_p2p::consensus::reconfig::{ReconfigCommand, ValidatorEntry};
-    use ambros_p2p::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
-    use ambros_p2p::p2p::tls::base58_to_node_id;
+    use boule::consensus::reconfig::{ReconfigCommand, ValidatorEntry};
+    use boule::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
+    use boule::p2p::tls::base58_to_node_id;
 
     let a = parse_reconfig_args(args)?;
     let pubkey_b58 = a
@@ -1128,7 +1125,7 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
         .addr
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --addr <socketaddr>"))?;
-    let v_eff = ambros_p2p::consensus::View(
+    let v_eff = boule::consensus::View(
         a.v_eff
             .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --v-eff <view>"))?,
     );
@@ -1158,7 +1155,7 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
     // Resolve the chain_id (when --config is supplied) once, up front
     // — used by the CLI's local PoP verify and threaded into
     // `derive_bls_pop_from_key_file` for fresh-mint workflows.
-    let cfg_chain_id: Option<ambros_p2p::crypto::signed::ChainId> =
+    let cfg_chain_id: Option<boule::crypto::signed::ChainId> =
         if let Some(cfg_path) = &a.config_path {
             let cfg = config::load(cfg_path)?;
             let cons = cfg.consensus.as_ref().ok_or_else(|| {
@@ -1188,7 +1185,7 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
                 }
                 _ => {}
             }
-            Some(ambros_p2p::node::derive_chain_id(cons)?)
+            Some(boule::node::derive_chain_id(cons)?)
         } else {
             None
         };
@@ -1246,8 +1243,8 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
 
 /// Read a `<pubkey_hex>:<pop_hex>` file (48-byte BLS pubkey + 96-byte
 /// PoP signature). Whitespace at either end is ignored.
-fn read_bls_pop_file(path: &Path) -> anyhow::Result<ambros_p2p::crypto::sig_scheme::BlsPop> {
-    use ambros_p2p::crypto::sig_scheme::BlsPop;
+fn read_bls_pop_file(path: &Path) -> anyhow::Result<boule::crypto::sig_scheme::BlsPop> {
+    use boule::crypto::sig_scheme::BlsPop;
     let raw = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading --bls-pop-file {}: {e}", path.display()))?;
     let trimmed = raw.trim();
@@ -1288,10 +1285,10 @@ fn read_bls_pop_file(path: &Path) -> anyhow::Result<ambros_p2p::crypto::sig_sche
 /// replay.
 fn derive_bls_pop_from_key_file(
     path: &Path,
-    chain_id: &ambros_p2p::crypto::signed::ChainId,
-) -> anyhow::Result<ambros_p2p::crypto::sig_scheme::BlsPop> {
-    use ambros_p2p::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
-    use ambros_p2p::crypto::sig_scheme::BlsAggregated;
+    chain_id: &boule::crypto::signed::ChainId,
+) -> anyhow::Result<boule::crypto::sig_scheme::BlsPop> {
+    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule::crypto::sig_scheme::BlsAggregated;
     let provider = BlsKeyFile::new(path.to_path_buf());
     let id = provider
         .load_or_init()
@@ -1301,15 +1298,15 @@ fn derive_bls_pop_from_key_file(
 }
 
 fn handle_reconfig_remove(args: &[String]) -> anyhow::Result<()> {
-    use ambros_p2p::consensus::reconfig::ReconfigCommand;
-    use ambros_p2p::p2p::tls::base58_to_node_id;
+    use boule::consensus::reconfig::ReconfigCommand;
+    use boule::p2p::tls::base58_to_node_id;
 
     let a = parse_reconfig_args(args)?;
     let pubkey_b58 = a
         .pubkey
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --pubkey <base58>"))?;
-    let v_eff = ambros_p2p::consensus::View(
+    let v_eff = boule::consensus::View(
         a.v_eff
             .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --v-eff <view>"))?,
     );
@@ -1329,15 +1326,15 @@ fn handle_reconfig_remove(args: &[String]) -> anyhow::Result<()> {
 /// validator's voting weight at and after `v_eff`. Membership is
 /// unchanged.
 fn handle_reconfig_change_weight(args: &[String]) -> anyhow::Result<()> {
-    use ambros_p2p::consensus::reconfig::ReconfigCommand;
-    use ambros_p2p::p2p::tls::base58_to_node_id;
+    use boule::consensus::reconfig::ReconfigCommand;
+    use boule::p2p::tls::base58_to_node_id;
 
     let a = parse_reconfig_args(args)?;
     let pubkey_b58 = a
         .pubkey
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("reconfig change-weight requires --pubkey <base58>"))?;
-    let v_eff = ambros_p2p::consensus::View(
+    let v_eff = boule::consensus::View(
         a.v_eff
             .ok_or_else(|| anyhow::anyhow!("reconfig change-weight requires --v-eff <view>"))?,
     );
@@ -1492,7 +1489,7 @@ fn build_new_identity_config_for_rotation(
 /// the whole orchestration.
 #[derive(Debug)]
 struct RotationProposeOutcome {
-    envelope: ambros_p2p::consensus::validator_rotation::DualSignedRotation,
+    envelope: boule::consensus::validator_rotation::DualSignedRotation,
     /// True iff the chain's `signature_scheme` is `bls_aggregated` and
     /// the rotation therefore carries a BLS pubkey + PoP.
     bls_chain: bool,
@@ -1505,12 +1502,12 @@ struct RotationProposeOutcome {
 /// function so unit tests can drive the same flow without spawning a
 /// process.
 fn build_rotation_envelope(args: &RotationProposeArgs) -> anyhow::Result<RotationProposeOutcome> {
-    use ambros_p2p::consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
-    use ambros_p2p::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
-    use ambros_p2p::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
-    use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+    use boule::consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
+    use boule::crypto::signed::{NodeSigner, Signer as _};
 
-    let v_eff = ambros_p2p::consensus::View(
+    let v_eff = boule::consensus::View(
         args.v_eff
             .ok_or_else(|| anyhow::anyhow!("rotation propose requires --v-eff <view>"))?,
     );
@@ -1526,7 +1523,7 @@ fn build_rotation_envelope(args: &RotationProposeArgs) -> anyhow::Result<Rotatio
             config_path.display(),
         )
     })?;
-    let chain_id = ambros_p2p::node::derive_chain_id(cons)?;
+    let chain_id = boule::node::derive_chain_id(cons)?;
 
     // Reject scheme/flag mismatches *before* minting any new keys so a
     // misconfigured invocation leaves no half-provisioned files behind.
@@ -1573,7 +1570,7 @@ fn build_rotation_envelope(args: &RotationProposeArgs) -> anyhow::Result<Rotatio
     let current_identity = current_provider.try_load()?.ok_or_else(|| {
         anyhow::anyhow!(
             "no current consensus key found via the {} `{}` backend; provision it via \
-             `ambros-p2p init` (or out-of-band) before rotating",
+             `boule init` (or out-of-band) before rotating",
             current_slot,
             current_id_cfg.backend_name(),
         )
@@ -1654,7 +1651,7 @@ fn build_rotation_envelope(args: &RotationProposeArgs) -> anyhow::Result<Rotatio
 }
 
 fn handle_rotation_propose(args: &[String]) -> anyhow::Result<()> {
-    use ambros_p2p::p2p::tls::node_id_to_base58;
+    use boule::p2p::tls::node_id_to_base58;
 
     let parsed = parse_rotation_propose_args(args)?;
     let outcome = build_rotation_envelope(&parsed)?;
@@ -1680,7 +1677,7 @@ fn handle_rotation_propose(args: &[String]) -> anyhow::Result<()> {
 /// snapshots otherwise.
 fn open_snapshot_store_for_cli(
     config: &Config,
-) -> anyhow::Result<ambros_p2p::replication::snapshot::SnapshotStore> {
+) -> anyhow::Result<boule::replication::snapshot::SnapshotStore> {
     let cons_cfg = config
         .consensus
         .as_ref()
@@ -1693,19 +1690,17 @@ fn open_snapshot_store_for_cli(
     })?;
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow::anyhow!("creating consensus storage_dir {}: {e}", dir.display()))?;
-    let storage: Arc<dyn ambros_p2p::storage::Storage> =
-        Arc::new(ambros_p2p::storage::DiskStorage::open(dir.join("kv.redb"))?);
-    Ok(ambros_p2p::replication::snapshot::SnapshotStore::new(
-        storage,
-    ))
+    let storage: Arc<dyn boule::storage::Storage> =
+        Arc::new(boule::storage::DiskStorage::open(dir.join("kv.redb"))?);
+    Ok(boule::replication::snapshot::SnapshotStore::new(storage))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ambros_p2p::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
-    use ambros_p2p::crypto::sig_scheme::BlsAggregated;
-    use ambros_p2p::crypto::signed::ChainId;
+    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule::crypto::sig_scheme::BlsAggregated;
+    use boule::crypto::signed::ChainId;
     use tempfile::TempDir;
 
     #[test]
@@ -1789,15 +1784,15 @@ mod tests {
     /// path together with the base58-encoded NodeId. Both halves are
     /// what the rotation tests need to write a usable config TOML.
     fn mint_validator_key(path: &Path) -> String {
-        use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
-        let cfg = ambros_p2p::config::IdentityConfig::File {
+        use boule::crypto::signed::{NodeSigner, Signer as _};
+        let cfg = boule::config::IdentityConfig::File {
             path: path.to_path_buf(),
             allow_insecure_perms: false,
         };
-        let provider = ambros_p2p::config::build_provider(&cfg).unwrap();
+        let provider = boule::config::build_provider(&cfg).unwrap();
         let id = provider.load_or_init().unwrap();
         let signer = NodeSigner::from_identity(&id).unwrap();
-        ambros_p2p::p2p::tls::node_id_to_base58(&signer.node_id())
+        boule::p2p::tls::node_id_to_base58(&signer.node_id())
     }
 
     fn write_ed25519_chain_config(
@@ -1865,7 +1860,7 @@ mod tests {
         // the validator's current pubkey and the chain's chain_id.
         // This is the CLI-level integration test called for in the
         // issue's acceptance criteria.
-        use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+        use boule::crypto::signed::{NodeSigner, Signer as _};
 
         let dir = TempDir::new().unwrap();
         let current_key = dir.path().join("current.key");
@@ -1898,25 +1893,23 @@ mod tests {
 
         // Recover the current and new signers independently and confirm
         // they match the envelope.
-        let current_id =
-            ambros_p2p::config::build_provider(&ambros_p2p::config::IdentityConfig::File {
-                path: current_key.clone(),
-                allow_insecure_perms: false,
-            })
-            .unwrap()
-            .try_load()
-            .unwrap()
-            .unwrap();
+        let current_id = boule::config::build_provider(&boule::config::IdentityConfig::File {
+            path: current_key.clone(),
+            allow_insecure_perms: false,
+        })
+        .unwrap()
+        .try_load()
+        .unwrap()
+        .unwrap();
         let current_signer = NodeSigner::from_identity(&current_id).unwrap();
-        let new_id =
-            ambros_p2p::config::build_provider(&ambros_p2p::config::IdentityConfig::File {
-                path: new_key.clone(),
-                allow_insecure_perms: false,
-            })
-            .unwrap()
-            .try_load()
-            .unwrap()
-            .unwrap();
+        let new_id = boule::config::build_provider(&boule::config::IdentityConfig::File {
+            path: new_key.clone(),
+            allow_insecure_perms: false,
+        })
+        .unwrap()
+        .try_load()
+        .unwrap()
+        .unwrap();
         let new_signer = NodeSigner::from_identity(&new_id).unwrap();
         assert_eq!(outcome.envelope.payload.validator, current_signer.node_id());
         assert_eq!(outcome.envelope.payload.new_pubkey, new_signer.node_id());
@@ -1924,8 +1917,8 @@ mod tests {
         // Cryptographic round-trip: the envelope must verify under the
         // chain's chain_id and the current pubkey, exactly the path
         // `apply_committed_rotations` exercises at commit time.
-        let cfg = ambros_p2p::config::load(&config_path).unwrap();
-        let chain_id = ambros_p2p::node::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        let cfg = boule::config::load(&config_path).unwrap();
+        let chain_id = boule::node::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
         outcome
             .envelope
             .verify(&current_signer.node_id(), &chain_id)
@@ -1935,9 +1928,7 @@ mod tests {
         // can drop them straight into a `Block.commands` slot.
         let bytes = outcome.envelope.encode_command();
         assert!(
-            ambros_p2p::consensus::validator_rotation::DualSignedRotation::is_rotation_payload(
-                &bytes,
-            ),
+            boule::consensus::validator_rotation::DualSignedRotation::is_rotation_payload(&bytes,),
         );
     }
 
@@ -1947,7 +1938,7 @@ mod tests {
         // (not overwrite) and produce a payload pointing at the same
         // pubkey. Operators retry rotations after fixing a mistyped
         // `--v-eff`; the new key should not flip on every retry.
-        use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+        use boule::crypto::signed::{NodeSigner, Signer as _};
 
         let dir = TempDir::new().unwrap();
         let current_key = dir.path().join("current.key");
@@ -1968,15 +1959,14 @@ mod tests {
         let first = build_rotation_envelope(&args).unwrap();
         let second = build_rotation_envelope(&args).unwrap();
 
-        let new_id =
-            ambros_p2p::config::build_provider(&ambros_p2p::config::IdentityConfig::File {
-                path: new_key.clone(),
-                allow_insecure_perms: false,
-            })
-            .unwrap()
-            .try_load()
-            .unwrap()
-            .unwrap();
+        let new_id = boule::config::build_provider(&boule::config::IdentityConfig::File {
+            path: new_key.clone(),
+            allow_insecure_perms: false,
+        })
+        .unwrap()
+        .try_load()
+        .unwrap()
+        .unwrap();
         let new_signer = NodeSigner::from_identity(&new_id).unwrap();
         assert_eq!(first.envelope.payload.new_pubkey, new_signer.node_id());
         assert_eq!(second.envelope.payload.new_pubkey, new_signer.node_id());
@@ -2019,7 +2009,7 @@ mod tests {
         // carries a chain-bound PoP, and the payload passes
         // `validate_scheme_consistency` (which is what the engine runs
         // at commit time).
-        use ambros_p2p::crypto::signed::{NodeSigner, Signer as _};
+        use boule::crypto::signed::{NodeSigner, Signer as _};
 
         let dir = TempDir::new().unwrap();
         let current_key = dir.path().join("current.key");
@@ -2079,8 +2069,8 @@ mod tests {
         // The PoP must verify under the chain's chain_id (the same
         // check `apply_committed_rotations` runs through
         // `validate_scheme_consistency`).
-        let cfg = ambros_p2p::config::load(&config_path).unwrap();
-        let chain_id = ambros_p2p::node::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        let cfg = boule::config::load(&config_path).unwrap();
+        let chain_id = boule::node::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
         BlsAggregated::verify_pop(env_pop, &env_pk, &chain_id)
             .expect("BLS PoP must verify under the chain's chain_id");
 
@@ -2090,21 +2080,20 @@ mod tests {
             .envelope
             .payload
             .validate_scheme_consistency(
-                ambros_p2p::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
+                boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
                 &chain_id,
             )
             .expect("must pass scheme-consistency under the BLS scheme");
 
         // And the dual-Ed25519 signatures still verify.
-        let current_id =
-            ambros_p2p::config::build_provider(&ambros_p2p::config::IdentityConfig::File {
-                path: current_key.clone(),
-                allow_insecure_perms: false,
-            })
-            .unwrap()
-            .try_load()
-            .unwrap()
-            .unwrap();
+        let current_id = boule::config::build_provider(&boule::config::IdentityConfig::File {
+            path: current_key.clone(),
+            allow_insecure_perms: false,
+        })
+        .unwrap()
+        .try_load()
+        .unwrap()
+        .unwrap();
         let current_signer = NodeSigner::from_identity(&current_id).unwrap();
         outcome
             .envelope
@@ -2155,10 +2144,10 @@ mod tests {
         // V_EFF_MIN_DELAY at commit time. We exercise the constant
         // here so a future change to the floor surfaces in a CLI test
         // rather than only in the consensus layer.
-        let payload = ambros_p2p::consensus::validator_rotation::ValidatorKeyRotation {
+        let payload = boule::consensus::validator_rotation::ValidatorKeyRotation {
             validator: [1u8; 32],
             new_pubkey: [2u8; 32],
-            v_eff: ambros_p2p::consensus::View(11),
+            v_eff: boule::consensus::View(11),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
@@ -2214,10 +2203,7 @@ mod tests {
         let cfg =
             build_new_identity_config_for_rotation("file", Some(PathBuf::from("/tmp/k")), None)
                 .unwrap();
-        assert!(matches!(
-            cfg,
-            ambros_p2p::config::IdentityConfig::File { .. }
-        ));
+        assert!(matches!(cfg, boule::config::IdentityConfig::File { .. }));
         assert_eq!(cfg.backend_name(), "file");
 
         let cfg = build_new_identity_config_for_rotation(

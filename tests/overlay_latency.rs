@@ -63,15 +63,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ambros_p2p::clock::{Clock, TokioClock};
-use ambros_p2p::p2p::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
-use ambros_p2p::p2p::overlay::gossip::overlay::{
+use boule::clock::{Clock, TokioClock};
+use boule::p2p::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
+use boule::p2p::overlay::gossip::overlay::{
     GossipOverlay, GossipOverlayConfig, GossipOverlayHandles, SpawnArgs,
 };
-use ambros_p2p::p2p::overlay::gossip::peer_list_task::PeerListGossipConfig;
-use ambros_p2p::p2p::overlay::gossip::sink::OverlaySink;
-use ambros_p2p::p2p::overlay::{Broadcaster, MeshBroadcaster};
-use ambros_p2p::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
+use boule::p2p::overlay::gossip::peer_list_task::PeerListGossipConfig;
+use boule::p2p::overlay::gossip::sink::OverlaySink;
+use boule::p2p::overlay::{Broadcaster, MeshBroadcaster};
+use boule::p2p::{NodeId, ProtocolEvent, ProtocolOutbound};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};

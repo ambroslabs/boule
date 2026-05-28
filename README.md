@@ -1,4 +1,4 @@
-# ambros-p2p
+# boule
 
 A peer-to-peer runtime written in Rust, hosting a HotStuff-style BFT
 consensus layer. Every subsystem below consensus — TLS transport, gossip,
@@ -38,7 +38,7 @@ cargo test --doc
 # default (256 cases) runs in about a second; deeper runs catch
 # rarer Byzantine interleavings. A failing case is saved to
 # `proptest-regressions/` so the exact seed persists across runs.
-PROPTEST_CASES=4096 cargo test -p ambros-p2p --lib consensus::hotstuff::step::tests::property
+PROPTEST_CASES=4096 cargo test -p boule-rs --lib consensus::hotstuff::step::tests::property
 ```
 
 Format and lint before pushing:
@@ -117,10 +117,10 @@ environment variable, an encrypted file, an OS keyring, or an external
 command; see the `[node.identity]` table and the `key migrate` subcommand
 (`cargo run -- --help`).
 
-When `--config` is omitted, `ambros-p2p` reads from the platform-specific
-default (`$XDG_CONFIG_HOME/ambros-p2p/config.toml` on Linux, the standard
-Library directory on macOS, `%APPDATA%\ambros-p2p\config.toml` on
-Windows). Run `ambros-p2p init` to write a starter template at that path
+When `--config` is omitted, `boule` reads from the platform-specific
+default (`$XDG_CONFIG_HOME/boule/config.toml` on Linux, the standard
+Library directory on macOS, `%APPDATA%\boule\config.toml` on
+Windows). Run `boule init` to write a starter template at that path
 on first use.
 
 ### Topology overlay (mesh vs. gossip)

@@ -1293,7 +1293,7 @@ impl ConsensusNode {
                 );
                 // Surface the missing-parent path at WARN so operators
                 // can see block-sync triggered without having to enable
-                // DEBUG-level logging on `ambros_p2p::consensus`. The
+                // DEBUG-level logging on `boule::consensus`. The
                 // matching `block_sync_request_emitted` event is logged
                 // at INFO from `apply_safety_actions` when the request
                 // actually leaves the node.

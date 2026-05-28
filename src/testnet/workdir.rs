@@ -5,8 +5,8 @@
 //! ```text
 //! state.json              # cluster topology + per-node static info
 //! events.jsonl            # append-only event log
-//! node{N}/config.toml     # per-node ambros-p2p config
-//! node{N}/node.key        # provisioned by `ambros-p2p init`
+//! node{N}/config.toml     # per-node boule config
+//! node{N}/node.key        # provisioned by `boule init`
 //! node{N}/consensus/      # consensus storage_dir
 //! node{N}/log             # combined stdout+stderr capture
 //! node{N}/addr.json       # written by the node binary on listener bind
@@ -148,7 +148,7 @@ pub fn parse_node_id(name: &str, count: usize) -> anyhow::Result<usize> {
     Ok(one_based - 1)
 }
 
-/// JSON shape the `ambros-p2p` binary writes to `addr_file` on listener
+/// JSON shape the `boule` binary writes to `addr_file` on listener
 /// bind. Local copy — keeps the testnet driver decoupled from internal
 /// `node` types.
 #[derive(Debug, Deserialize)]
@@ -158,7 +158,7 @@ pub struct NodeAddrFile {
     pub node_id: String,
 }
 
-/// Read and parse the addr_file emitted by a started `ambros-p2p`.
+/// Read and parse the addr_file emitted by a started `boule`.
 pub fn read_addr_file(path: &Path) -> anyhow::Result<NodeAddrFile> {
     let bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("reading addr file {}: {e}", path.display()))?;

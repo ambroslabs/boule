@@ -103,8 +103,8 @@ impl TlsIdentity {
             .try_into()
             .map_err(|_| anyhow::anyhow!("expected 32-byte Ed25519 public key"))?;
 
-        let params = CertificateParams::new(vec!["ambros-p2p".to_string()])
-            .context("building cert params")?;
+        let params =
+            CertificateParams::new(vec!["boule".to_string()]).context("building cert params")?;
         let cert = params
             .self_signed(&key_pair)
             .context("self-signing certificate")?;
@@ -362,7 +362,7 @@ mod tests {
         let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();
         let expected: NodeId = kp.public_key_raw().try_into().unwrap();
 
-        let params = CertificateParams::new(vec!["ambros-p2p".to_string()]).unwrap();
+        let params = CertificateParams::new(vec!["boule".to_string()]).unwrap();
         let cert = params.self_signed(&kp).unwrap();
         let cert_der = CertificateDer::from(cert.der().to_vec());
 

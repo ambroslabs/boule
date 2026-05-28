@@ -63,14 +63,14 @@ fn print_usage() {
     println!();
     println!("Subcommands:");
     println!("  new    --nodes N [--seed-extra K] [--target-degree T]");
-    println!("         [--seed S] [--workdir DIR] [--ambros-bin PATH]");
+    println!("         [--seed S] [--workdir DIR] [--boule-bin PATH]");
     println!("         [--timeout-base-ms MS] [--timeout-max-ms MS]");
     println!("         [--signature-scheme ed25519_collected|bls_aggregated]");
     println!("           Generate a workdir + per-node configs and mint identities.");
     println!("           On BLS chains, also mints a BLS keypair per node, computes");
     println!("           PoPs, and writes the [consensus.validators_bls] genesis table.");
     println!();
-    println!("  up [<node>] [--workdir DIR] [--ambros-bin PATH]");
+    println!("  up [<node>] [--workdir DIR] [--boule-bin PATH]");
     println!("           Spawn every node (or just <node>) listed in state.json.");
     println!();
     println!("  down [--workdir DIR]");
@@ -102,7 +102,7 @@ fn print_usage() {
     println!("  telemetry [--workdir DIR]");
     println!("           Per-node tally of well-known consensus/block-sync counters.");
     println!();
-    println!("  scenario [--workdir DIR] [--ambros-bin PATH] [--seed S] (");
+    println!("  scenario [--workdir DIR] [--boule-bin PATH] [--seed S] (");
     println!("    rotating-failure --f F");
     println!("    | rotating-failure-7n-f2");
     println!("    | disconnect-random --count N --liveness-window Ns");
@@ -117,7 +117,7 @@ fn print_usage() {
     println!("           the cluster up if needed; ctrl-c tears it down cleanly.");
     println!();
     println!("If --workdir is omitted, '{DEFAULT_WORKDIR}' is used.");
-    println!("If --ambros-bin is omitted, the binary is searched next to the testnet exe.");
+    println!("If --boule-bin is omitted, the binary is searched next to the testnet exe.");
 }
 
 // ── Shared option parsing ───────────────────────────────────────────────────
@@ -146,14 +146,14 @@ fn parse_workdir(args: &[String]) -> anyhow::Result<(PathBuf, Vec<String>)> {
     Ok((wd.unwrap_or_else(|| PathBuf::from(DEFAULT_WORKDIR)), rest))
 }
 
-fn parse_ambros_bin(args: &[String]) -> anyhow::Result<(Option<PathBuf>, Vec<String>)> {
+fn parse_boule_bin(args: &[String]) -> anyhow::Result<(Option<PathBuf>, Vec<String>)> {
     let mut bin: Option<PathBuf> = None;
     let mut rest = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--ambros-bin" => {
-                let v = pop_value(args, &mut i, "--ambros-bin")?;
+            "--boule-bin" => {
+                let v = pop_value(args, &mut i, "--boule-bin")?;
                 bin = Some(PathBuf::from(v));
             }
             other => rest.push(other.to_string()),
@@ -163,25 +163,21 @@ fn parse_ambros_bin(args: &[String]) -> anyhow::Result<(Option<PathBuf>, Vec<Str
     Ok((bin, rest))
 }
 
-/// Locate the `ambros-p2p` binary. If `explicit` is provided, use it.
+/// Locate the `boule` binary. If `explicit` is provided, use it.
 /// Otherwise look next to the current executable (the typical layout for
 /// both `cargo run --bin testnet` and a release build), and finally fall
-/// back to PATH lookup via the bare `ambros-p2p` name so an installed
+/// back to PATH lookup via the bare `boule` name so an installed
 /// build still works.
-fn resolve_ambros_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+fn resolve_boule_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(p) = explicit {
         if !p.exists() {
-            anyhow::bail!("--ambros-bin {} does not exist", p.display());
+            anyhow::bail!("--boule-bin {} does not exist", p.display());
         }
         return Ok(p);
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let candidate = parent.join(if cfg!(windows) {
-                "ambros-p2p.exe"
-            } else {
-                "ambros-p2p"
-            });
+            let candidate = parent.join(if cfg!(windows) { "boule.exe" } else { "boule" });
             if candidate.exists() {
                 return Ok(candidate);
             }
@@ -189,7 +185,7 @@ fn resolve_ambros_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     }
     // PATH fallback. We don't try to resolve eagerly — Command will
     // exec via PATH and surface a clear error if it's missing.
-    Ok(PathBuf::from("ambros-p2p"))
+    Ok(PathBuf::from("boule"))
 }
 
 // ── `new` ───────────────────────────────────────────────────────────────────
@@ -197,7 +193,7 @@ fn resolve_ambros_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
     use crate::crypto::sig_scheme::SignatureSchemeChoice;
     let (workdir, rest) = parse_workdir(args)?;
-    let (ambros_bin, rest) = parse_ambros_bin(&rest)?;
+    let (boule_bin, rest) = parse_boule_bin(&rest)?;
     let mut nodes: Option<usize> = None;
     let mut seed_extra: usize = 0;
     let mut target_degree: Option<usize> = None;
@@ -253,7 +249,7 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
         target_degree,
         seed,
     };
-    let binary = resolve_ambros_bin(ambros_bin)?;
+    let binary = resolve_boule_bin(boule_bin)?;
     let state = lifecycle::new_cluster(lifecycle::NewArgs {
         workdir: workdir.clone(),
         spec,
@@ -277,9 +273,9 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
 
 async fn cmd_up(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
-    let (ambros_bin, rest) = parse_ambros_bin(&rest)?;
+    let (boule_bin, rest) = parse_boule_bin(&rest)?;
     let state = State::load(&workdir)?;
-    let binary = resolve_ambros_bin(ambros_bin)?;
+    let binary = resolve_boule_bin(boule_bin)?;
 
     if rest.is_empty() {
         let pids = lifecycle::up_all(&workdir, &binary, &state).await?;
@@ -748,7 +744,7 @@ fn cmd_telemetry(args: &[String]) -> anyhow::Result<()> {
 
 async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
-    let (ambros_bin, rest) = parse_ambros_bin(&rest)?;
+    let (boule_bin, rest) = parse_boule_bin(&rest)?;
 
     let mut seed: u64 = 0;
     let mut file: Option<PathBuf> = None;
@@ -828,7 +824,7 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
 
     // Bring the cluster up if it isn't already, so a single `testnet
     // scenario ...` invocation works from a fresh `new`.
-    let binary = resolve_ambros_bin(ambros_bin)?;
+    let binary = resolve_boule_bin(boule_bin)?;
     let state = State::load(&workdir)?;
     let pids = lifecycle::up_all(&workdir, &binary, &state).await?;
     if !pids.is_empty() {
