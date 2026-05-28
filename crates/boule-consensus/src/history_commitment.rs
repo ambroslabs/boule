@@ -128,7 +128,7 @@ fn feed_section(hasher: &mut Sha256, bytes: &[u8]) {
 /// Apply any reconfig commands in `block` to `set_history` (and to
 /// `key_history` for any newly-added validators). Mirrors the
 /// validation rules in
-/// [`crate::wire::ConsensusNode::apply_committed_reconfigs`]
+/// `boule_node::consensus_node::ConsensusNode::apply_committed_reconfigs`
 /// but without side effects on the safety core, pacemaker, or storage.
 ///
 /// `key_history` is updated to add a fresh entry at `cmd.v_eff` for
@@ -217,7 +217,7 @@ pub fn apply_reconfig_commands_to_set_history(
 
 /// Apply any rotation commands in `block` to `key_history` and
 /// `bls_key_history` (where present). Mirrors the validation in
-/// [`crate::wire::ConsensusNode::apply_committed_rotations`].
+/// `boule_node::consensus_node::ConsensusNode::apply_committed_rotations`.
 ///
 /// `set_history` is borrowed read-only — rotations don't change set
 /// membership but the production validation looks up the validator's

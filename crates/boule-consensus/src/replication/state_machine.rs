@@ -85,7 +85,7 @@ pub trait StateMachine: Send + Sync {
     ///   `StateMachine` instance's [`Self::snapshot`] on the same
     ///   version of the state machine — the round trip is the basis
     ///   for the proposal-time fork-and-restore in
-    ///   [`crate::wire::MempoolBlockBuilder`].
+    ///   `boule_node::consensus_node::block_builder::MempoolBlockBuilder`.
     /// - **MAY** return `Err` on (a) a snapshot produced by a
     ///   *different* version of the state machine (cross-version
     ///   migration), (b) bytes corrupted on disk or in transit, or

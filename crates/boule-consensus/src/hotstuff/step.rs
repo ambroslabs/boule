@@ -130,7 +130,7 @@ pub enum VoteVariant {
 }
 
 impl VoteVariant {
-    /// Borrow the inner [`Verified`] envelope shared by both variants.
+    /// Borrow the inner [`crate::dispatch::Verified`] envelope shared by both variants.
     pub fn verified(&self) -> &crate::dispatch::Verified<Signed<Vote>> {
         match self {
             VoteVariant::Ed25519(verified) => verified,
@@ -360,7 +360,7 @@ pub trait BlockBuilder: Send + Sync {
     /// `pending_blocks` is the safety core's
     /// [`HotStuffState::pending_blocks`] map at the moment of build,
     /// passed by reference so the production
-    /// [`MempoolBlockBuilder`] can walk the *uncommitted ancestor
+    /// `MempoolBlockBuilder` can walk the *uncommitted ancestor
     /// chain* from `parent` back to the last committed boundary and
     /// fold those ancestors' commands into its `state_commitment`
     /// computation (issue #375). Implementations that don't compute a
@@ -368,7 +368,7 @@ pub trait BlockBuilder: Send + Sync {
     /// argument.
     ///
     /// Returns `Err` when the builder cannot construct a block — for
-    /// example, the production [`MempoolBlockBuilder`] returns `Err`
+    /// example, the production `MempoolBlockBuilder` returns `Err`
     /// when the state-machine fork-and-restore round trip fails
     /// (corrupt redb table, bit-flip on disk, version skew across
     /// upgrades; audit finding 4-F3, issue #326). The safety core
@@ -377,7 +377,6 @@ pub trait BlockBuilder: Send + Sync {
     /// than crashing the node.
     ///
     /// [`HotStuffState::pending_blocks`]: super::state::HotStuffState::pending_blocks
-    /// [`MempoolBlockBuilder`]: crate::wire::MempoolBlockBuilder
     fn build(
         &self,
         parent: &Block,
@@ -526,7 +525,7 @@ impl HotStuffCore {
     /// Build a fresh core around `state`, with `builder` supplying
     /// block contents when this replica is the leader. Uses
     /// [`CacheLimits::unbounded_for_tests`] — the production wiring in
-    /// [`crate::wire::ConsensusNode`] uses
+    /// `boule_node::consensus_node::ConsensusNode` uses
     /// [`HotStuffCore::with_limits`] to plumb the operator-configured
     /// caps through.
     pub fn new(self_id: NodeId, state: HotStuffState, builder: Arc<dyn BlockBuilder>) -> Self {
@@ -626,7 +625,7 @@ impl HotStuffCore {
     /// history (#272). This is the *only* sanctioned mutation of
     /// `state.validator_history` from outside `step` — driven by the
     /// integration layer's commit-time reconfig hook in
-    /// [`crate::wire::ConsensusNode::apply_commit`].
+    /// `boule_node::consensus_node::ConsensusNode::apply_commit`.
     ///
     /// `set` is the resulting set after the reconfig applies. The
     /// caller is responsible for having already validated the
@@ -813,7 +812,7 @@ impl HotStuffCore {
     ///   snapshot whose committed chain extends well past view 0.
     ///   Without this, a crash between snapshot adoption and the
     ///   first post-snapshot durable write would let
-    ///   [`recover_state`](crate::wire::recover_state)
+    ///   `recover_state`
     ///   rehydrate `last_voted_view = 0`, trivially satisfying
     ///   `safe_to_vote`'s `view > last_voted_view` check on a
     ///   conflicting fork (audit finding 4-3 / issue #406).
@@ -1471,7 +1470,7 @@ impl HotStuffCore {
         actions
     }
 
-    /// Handle a [`Event::PacemakerAdvance(v)`] signal from the outer
+    /// Handle a [`crate::hotstuff::step::Event::PacemakerAdvance`] signal from the outer
     /// driver. Four things happen, in order:
     ///
     /// 1. Record the new view on `state.current_view`. The safety
@@ -3690,7 +3689,7 @@ mod tests {
     // ── #394: post-rotation vote resolution ─────────────────────────────
 
     /// Post-rotation regression: a vote signed under a freshly-rotated
-    /// active key arrives wrapped in a [`Verified`] envelope whose
+    /// active key arrives wrapped in a [`crate::dispatch::Verified`] envelope whose
     /// `signer_validator_id` is the validator's stable id (resolved by
     /// dispatch via [`ValidatorKeyHistory::validator_for`]). The safety
     /// core must use the stamped id for the bitmap-index lookup —

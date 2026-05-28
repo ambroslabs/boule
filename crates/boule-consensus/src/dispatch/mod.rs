@@ -1,14 +1,14 @@
 //! Ingress/egress helpers and the unified `NodeEvent` / `Dispatch` enums.
 //!
 //! These are the "translation layer" between the raw p2p bytes and the pure
-//! state machines ([`HotStuffCore`] / [`Pacemaker`]):
+//! state machines ([`crate::hotstuff::step::HotStuffCore`] / [`crate::pacemaker::Pacemaker`]):
 //!
 //! - [`NodeEvent`]: unified event produced by the event loop's `select!` arms.
 //! - [`Dispatch`]: what the event loop should route after ingress.
 //! - [`Outbound`]: a ready-to-send frame for the p2p layer.
 //! - [`ingress`]: decode + verify a raw wire frame into zero or more
 //!   [`Dispatch`] items.
-//! - [`egress_safety`]: translate a HotStuff safety-core [`Action`] into an
+//! - [`egress_safety`]: translate a HotStuff safety-core [`crate::hotstuff::step::Action`] into an
 //!   [`Outbound`] frame (returns `None` for non-wire actions like
 //!   `Persist` / `Commit`).
 //!
@@ -212,7 +212,7 @@ pub enum Dispatch {
 
 /// A postcard-encoded, ready-to-send frame for the p2p layer.
 ///
-/// Wraps the same shape as [`crate::p2p::ProtocolOutbound`] but without
+/// Wraps the same shape as `boule_transport_tcp::ProtocolOutbound` but without
 /// the tokio channel dependency — the event loop converts this to
 /// `ProtocolOutbound` when sending.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,7 +485,7 @@ impl<T> Verified<Signed<T>> {
 /// no production code path can silently disable embedded-QC aggregate
 /// verification by selecting it. Test fixtures that construct QCs with
 /// placeholder signatures (no actual cryptographic content) — and the
-/// legacy [`ingress`] / [`ingress_wire`] convenience wrappers, which
+/// legacy [`ingress`] / `ingress_wire` convenience wrappers, which
 /// are themselves `cfg(test)` — are the only callers that ever
 /// observe it.
 ///

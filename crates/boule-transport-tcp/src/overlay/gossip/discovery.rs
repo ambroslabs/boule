@@ -8,7 +8,7 @@
 //!
 //! Producer side — the channel sender plus the `LockedVec` — is owned
 //! by the gossip overlay's run loop (added in a follow-up PR). The
-//! run loop calls [`GossipDiscovery::publish`] when it observes a
+//! run loop calls `GossipDiscovery::publish` when it observes a
 //! [`crate::ProtocolEvent::PeerConnected`] /
 //! `PeerDisconnected` so this module can stay decoupled from the
 //! transport plumbing.
@@ -71,7 +71,7 @@ pub struct GossipDiscovery {
     /// / `PeerDisconnected`.
     direct: Arc<LockedVec>,
     /// Re-broadcast channel for [`DiscoveryEvent`]s. The run loop
-    /// holds a clone of the sender and calls [`Self::publish`] on
+    /// holds a clone of the sender and calls `publish` on
     /// observed peer add/remove transitions.
     events: broadcast::Sender<DiscoveryEvent>,
     /// Dialer used by [`Discovery::add_bootstrap`] to start an

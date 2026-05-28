@@ -39,7 +39,7 @@ pub struct DialerCtx {
 impl DialerCtx {
     /// Spawn a [`reconnect_loop`] that maintains an outbound
     /// connection to `addr` (asserting `expected_node_id` when set).
-    /// Returns the spawned [`JoinHandle`] so callers that want to
+    /// Returns the spawned [`tokio::task::JoinHandle`] so callers that want to
     /// cancel on shutdown can hold it.
     ///
     /// Returns `None` when `expected_node_id` equals our own NodeId —

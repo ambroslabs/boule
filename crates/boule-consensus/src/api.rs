@@ -8,7 +8,7 @@
 //!   "what just committed?" that consumers like observer-mode nodes
 //!   (#308), out-of-process Application integrations (#225), and
 //!   external tooling (block explorers, metrics, snap-sync) can plug
-//!   into without modifying [`crate::node`].
+//!   into without modifying `boule_node`.
 //!
 //! HTTP endpoints currently exposed:
 //!
@@ -103,7 +103,7 @@ pub trait CommitNotifier: Send + Sync {
 /// treated as a shutdown signal; the error is swallowed.
 ///
 /// Capacity should be picked so that bursts between drains fit
-/// comfortably; for the sim, [`crate::sim::SIM_COMMIT_CHANNEL_CAP`]
+/// comfortably; for the sim, `boule_node::sim::SIM_COMMIT_CHANNEL_CAP`
 /// is a generous default. Drops are a sim bug — the harness either
 /// drains slowly enough that the cap is too low, or it forgot to drain
 /// at all.
@@ -170,7 +170,7 @@ impl CommitNotifier for MpscCommitNotifier {
 /// The value is eventually consistent, lagging by up to one event-loop
 /// iteration. In exchange, reading it never contends with the event
 /// loop's hot path. The initial value is published once at startup
-/// before [`ConsensusNode::run`](super::node::ConsensusNode::run) enters
+/// before `ConsensusNode::run` enters
 /// its select, so the endpoint returns a sane "current_view=0" snapshot
 /// rather than a 500 if it's hit in the brief window before the first
 /// tick.

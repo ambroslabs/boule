@@ -525,7 +525,7 @@ impl VerifiedQc {
     ///    `recover_state` mint the cluster-agreed genesis QC via
     ///    [`genesis_qc`] / [`genesis_qc_bls`] before the safety core
     ///    has seen any wire traffic. The dispatch verifier
-    ///    [`crate::dispatch::verify::qc::verify_qc_if_requested`]
+    ///    `crate::dispatch::verify::qc::verify_qc_if_requested`
     ///    short-circuits at `view == 0 || signer_count == 0`, so
     ///    wrapping unchecked is exactly equivalent.
     /// 2. **QC adopted from a `Verified<Signed<Proposal>>` /

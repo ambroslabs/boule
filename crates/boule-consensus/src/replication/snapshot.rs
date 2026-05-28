@@ -1,6 +1,6 @@
 //! Periodic state snapshots for fast joiner catch-up (#139, sub-task #227).
 //!
-//! A snapshot is an opaque [`StateMachine::snapshot`] blob — sliced into
+//! A snapshot is an opaque [`crate::replication::state_machine::StateMachine::snapshot`] blob — sliced into
 //! fixed-size chunks for chunked transfer over the wire — together with
 //! a [`SnapshotManifest`] that names the chunks, the validator set
 //! that was active at the snapshot height, and a quorum-bearing
@@ -14,7 +14,7 @@
 //! # Storage layout
 //!
 //! Snapshots ride on top of the [`Storage`] trait — the same KV layer
-//! that already holds committed blocks under [`STORAGE_KEY_BLOCK_PREFIX`]
+//! that already holds committed blocks under `boule_node::consensus_node::persistence::STORAGE_KEY_BLOCK_PREFIX`
 //! — rather than introducing redb-specific tables. Two prefix spaces
 //! are reserved:
 //!
@@ -251,8 +251,8 @@ impl SnapshotManifest {
     /// vector. Cheap; clones the underlying NodeIds once.
     ///
     /// Snapshots embed the wire-form `Vec<NodeId>`; reconstructing the
-    /// typed [`ValidatorSet`] promotes each entry to a [`ValidatorId`]
-    /// via [`ValidatorId::from_genesis_pubkey`]. This is allowed at
+    /// typed [`ValidatorSet`] promotes each entry to a [`crate::validator_set::ValidatorId`]
+    /// via [`crate::validator_set::ValidatorId::from_genesis_pubkey`]. This is allowed at
     /// recovery time (the snapshot was built by an honest replica that
     /// previously went through the legitimate seeding/reconfig paths).
     pub fn validator_set(&self) -> ValidatorSet {
@@ -291,7 +291,7 @@ impl SnapshotManifest {
     /// QC. The QC's `signatures` are validated at envelope ingress in
     /// production; the snapshot path inherits that trust gradient.
     /// The chunk hashes are verified separately by
-    /// [`SnapshotChunk::verify`].
+    /// `SnapshotChunk::verify`.
     pub fn verify(&self, local_validator_set: &ValidatorSet) -> Result<(), ManifestError> {
         if self.version != SNAPSHOT_FORMAT_VERSION {
             return Err(ManifestError::UnsupportedVersion {

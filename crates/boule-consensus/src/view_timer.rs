@@ -1,13 +1,13 @@
 //! Cancellable view timer for the consensus event loop.
 //!
-//! The HotStuff pacemaker emits [`pacemaker::Action::ResetTimer(Duration)`]
+//! The HotStuff pacemaker emits [`crate::pacemaker::Action::ResetTimer`]
 //! when it wants the local timer re-armed. The event loop translates that by
 //! calling [`ViewTimer::reset`], which cancels any in-flight task and spawns
 //! a new one that sleeps for the requested duration and then sends
-//! [`ViewTimerFired(view)`] on the shared channel.
+//! [`crate::dispatch::NodeEvent::ViewTimerFired`] on the shared channel.
 //!
 //! The timer fires with the *view it was armed for* so the event loop can
-//! pass that view to [`pacemaker::Event::OnTimeout(view)`] without keeping
+//! pass that view to [`crate::pacemaker::Event::OnTimeout`] without keeping
 //! additional state.
 //!
 //! # Cancellation

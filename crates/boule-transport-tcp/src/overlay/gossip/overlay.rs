@@ -48,7 +48,7 @@
 //!    [`boule_transport::overlay::Discovery::subscribe`]; routing the same
 //!    deltas through the upstream `event_rx` would be a duplicate.
 //!    (Today the consensus event loop in
-//!    [`crate::consensus::node`] explicitly ignores
+//!    `boule_node::consensus_node` explicitly ignores
 //!    `PeerConnected`/`PeerDisconnected` for the same reason.)
 //!
 //! Forwarded application payloads carried in

@@ -127,7 +127,7 @@ impl SignedMessage for BlockRangeResponsePayload {
 /// **Variant order is wire-stable.** Postcard encodes the discriminant
 /// as a varint at byte 0; reordering breaks every running peer.
 /// Adding new variants at the end is fine. The
-/// [`crate::p2p::limits::MessageKind`] enum mirrors this order and is
+/// `boule_transport::MessageKind` enum mirrors this order and is
 /// pinned by `wire_tag_layout_locked`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireMessage {

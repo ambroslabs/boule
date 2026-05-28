@@ -4,7 +4,7 @@
 //! to [`PeerListGossipConfig::fanout`] currently-direct peers (uniformly
 //! random) and pushes a postcard-encoded snapshot of the local
 //! [`super::peer_table::PeerTable`] to each. Recipients call
-//! [`apply_peer_list_frame`] to decode and merge the entries into
+//! `apply_peer_list_frame` to decode and merge the entries into
 //! their own table.
 //!
 //! This module is independent of the rest of the gossip overlay — it

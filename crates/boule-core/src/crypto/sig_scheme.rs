@@ -11,7 +11,7 @@
 //!   every partial. Verification is one pairing check. QC wire size is
 //!   constant in `n`.
 //!
-//! Both schemes are implemented at the trait level. [`QuorumCertificate`]
+//! Both schemes are implemented at the trait level. `QuorumCertificate`
 //! itself currently carries an Ed25519-shaped `signatures: Vec<[u8; 64]>`
 //! field; widening it to dispatch on either scheme (tagged enum or
 //! generic) lands when the BLS path is wired through the voting layer
@@ -35,8 +35,7 @@
 //! When BLS lands the signing surface grows to return a scheme-shaped
 //! partial; the design note for that work is in #293.
 //!
-//! [`SignerBitmap`]: crate::consensus::hotstuff::qc::SignerBitmap
-//! [`QuorumCertificate`]: crate::consensus::hotstuff::qc::QuorumCertificate
+//! [`SignerBitmap`]: crate::crypto::sig_scheme::SignerBitmap
 
 use std::fmt::{self, Debug};
 
@@ -415,7 +414,7 @@ impl BlsAggregated {
 
     /// True iff `agg` is the sentinel returned by
     /// [`Self::empty_aggregate`] — i.e. no partials have been folded in.
-    /// Used by [`crate::consensus::hotstuff::QuorumCertificate::is_well_formed`]
+    /// Used by `boule_consensus::hotstuff::qc::QuorumCertificate::is_well_formed`
     /// for a cheap structural check that pairs the bitmap state with
     /// the aggregate state, before the cryptographic
     /// [`Self::verify_aggregate`] pairing check runs.
@@ -530,7 +529,7 @@ fn pop_preimage(chain_id: &ChainId, pubkey: &BlsPublicKey) -> [u8; 32 + 48] {
 /// a `BlsPop` per `adds` entry; the reconfig validator (#293) rejects
 /// any add that lacks a PoP or whose PoP fails to verify. PoPs are
 /// persisted alongside the historical pubkey in
-/// [`crate::consensus::validator_key_history`] (#294) so historical
+/// `boule_consensus::validator_key_history` (#294) so historical
 /// validator-set lookups never trust an unverified key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlsPop {

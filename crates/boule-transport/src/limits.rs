@@ -13,7 +13,7 @@
 //!   violations within a sliding window of W seconds,
 //!   [`Decision::Disconnect`] is returned exactly once per peer —
 //!   the caller is responsible for tearing down the connection
-//!   (typically by sending [`crate::p2p::PeerCommand::Disconnect`]).
+//!   (typically by sending `boule_transport_tcp::PeerCommand::Disconnect`).
 //!   On egress, every directed `SendTo` frame is charged against
 //!   the recipient peer's outbound bucket via
 //!   [`RateLimiter::admit_outbound`]; on overflow the caller skips
@@ -59,7 +59,7 @@ use boule::identity::NodeId;
 /// of a serialized `WireMessage` (postcard
 /// encodes enum discriminants as a varint in declaration order; for
 /// the ten variants here the tag fits in a single byte). Locked in by
-/// the unit test [`tests::wire_tag_layout_locked`] below — reordering
+/// the unit test `tests::wire_tag_layout_locked` below — reordering
 /// `WireMessage` without updating this enum is a test failure, not a
 /// silent miscount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -729,14 +729,14 @@ impl RateLimiter {
 // ── ConnectionLimiter ────────────────────────────────────────────────────────
 
 /// Direction of a peer-manager connection registration. Carried on
-/// [`crate::p2p::manager::ManagerMsg::NewConnection`] so the manager
+/// `boule_transport_tcp::manager::ManagerMsg::NewConnection` so the manager
 /// can charge the right bucket in [`ConnectionLimiter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
-    /// Connection arrived via [`crate::p2p::listener::run`] — count
+    /// Connection arrived via `boule_transport_tcp::listener::run` — count
     /// against `max_inbound`.
     Inbound,
-    /// Connection arrived via [`crate::p2p::dialer::reconnect_loop`] —
+    /// Connection arrived via `boule_transport_tcp::dialer::reconnect_loop` —
     /// count against `max_outbound`.
     Outbound,
 }
@@ -832,7 +832,7 @@ impl RejectReason {
 }
 
 /// Global connection caps. Stored in the manager and consulted on
-/// every [`crate::p2p::manager::ManagerMsg::NewConnection`].
+/// every `boule_transport_tcp::manager::ManagerMsg::NewConnection`.
 pub struct ConnectionLimiter {
     config: ConnectionLimitsConfig,
     inbound: AtomicUsize,

@@ -42,7 +42,7 @@ use super::{
 };
 
 impl ConsensusNode {
-    /// Execute a slice of [`SnapshotSyncAction`]s emitted by the
+    /// Execute a slice of [`boule_consensus::snapshot_sync::SnapshotSyncAction`]s emitted by the
     /// joiner-side state machine. Each action is mapped to either a
     /// wire send (`SendManifestRequest`, `SendChunkRequest`), a
     /// state-restore call ([`Self::restore_from_snapshot`]), or a

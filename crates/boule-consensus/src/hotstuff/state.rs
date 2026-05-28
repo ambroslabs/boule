@@ -19,7 +19,7 @@ use crate::{Height, View};
 use super::qc::VerifiedQc;
 
 /// Tracing target for eviction logs. Same string as
-/// [`crate::wire::TRACE_TARGET`] so a single
+/// [`TRACE_TARGET`] so a single
 /// `RUST_LOG=boule::consensus=info` filter catches every cache
 /// drop the consensus layer emits.
 const TRACE_TARGET: &str = "boule::consensus";
@@ -36,7 +36,7 @@ const PROTECTED_HIGH_QC_DEPTH: usize = 4;
 /// diverge from.
 ///
 /// Carries the block's `view`, `height`, and `block_hash` rather than
-/// the full [`QuorumCertificate`]. The safety core never reads a
+/// the full [`crate::hotstuff::qc::QuorumCertificate`]. The safety core never reads a
 /// signature set off the lock: [`super::safety_rules::safe_to_vote`]
 /// inspects `view` (liveness rule) and `block_hash` (extension rule),
 /// and two-chain promotion in `step::on_proposal_received` uses

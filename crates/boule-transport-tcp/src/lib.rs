@@ -334,7 +334,7 @@ pub struct ProtocolHandle {
     /// Shared with the peer manager. Increments every time the
     /// per-peer outbound `write_tx.try_send` returns `Full` — i.e. the
     /// transport-level back-pressure event the
-    /// [`crate::consensus::status::BackpressureStatus::peer_outbound_overflow_total`]
+    /// `boule_consensus::status::BackpressureStatus::peer_outbound_overflow_total`
     /// metric counts. Wired through to consensus so a single counter
     /// covers `SendTo` + `Broadcast` outbound drops on every protocol.
     /// Closed-channel failures are intentionally not counted.

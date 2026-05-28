@@ -16,12 +16,12 @@
 //! - The history always contains at least one boundary (the genesis set
 //!   at `v_eff = 0`).
 //! - Boundaries are stored in strictly increasing `v_eff` order.
-//! - [`Self::set_at`] returns the rightmost boundary whose `v_eff <=
+//! - [`crate::validator_history::ValidatorSetHistory::set_at`] returns the rightmost boundary whose `v_eff <=
 //!   view` — the set authoritative at that view.
 //!
 //! # View tagging at the API boundary
 //!
-//! [`Self::set_at`] returns a [`ValidatorSetAt`], not a bare
+//! [`crate::validator_history::ValidatorSetHistory::set_at`] returns a [`ValidatorSetAt`], not a bare
 //! `Arc<ValidatorSet>` — the wrapper carries the [`View`] the lookup
 //! was scoped to and only releases the underlying set through
 //! [`ValidatorSetAt::for_view`], which debug-asserts the consumer
@@ -58,7 +58,7 @@ struct Boundary {
 ///
 /// Construct with [`Self::from_genesis`]; insert a boundary for every
 /// committed reconfiguration with [`Self::insert_boundary`]; look up the
-/// authoritative set for any view with [`Self::set_at`].
+/// authoritative set for any view with [`crate::validator_history::ValidatorSetHistory::set_at`].
 #[derive(Debug, Clone)]
 pub struct ValidatorSetHistory {
     /// Sorted by `v_eff` ascending. Index 0 is always the genesis entry

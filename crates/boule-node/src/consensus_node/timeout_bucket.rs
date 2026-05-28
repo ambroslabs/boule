@@ -45,7 +45,7 @@ use boule_consensus::wire::WireMessage;
 /// the running sum of those signers' voting weights (#461), and the
 /// freshest `high_qc` any of them reported. When `signer_weight`
 /// crosses the weighted-quorum threshold we fire
-/// [`pacemaker::Event::OnTimeoutCert`] — and we drop the bucket so
+/// [`boule_consensus::pacemaker::Event::OnTimeoutCert`] — and we drop the bucket so
 /// further duplicate timeout votes for the same view don't re-enter
 /// the pacemaker.
 #[derive(Default)]
@@ -173,7 +173,7 @@ impl ConsensusNode {
     ///    quorum via the safety core's NewView path — `high_qc`
     ///    freshness is the standard HotStuff liveness trick that
     ///    prevents a departing leader's QC from being lost.
-    /// 2. Feeds [`pacemaker::Event::OnTimeoutCert(view)`] into the
+    /// 2. Feeds [`boule_consensus::pacemaker::Event::OnTimeoutCert`] into the
     ///    pacemaker so the local view advances to `view + 1`.
     ///
     /// The bucket is dropped once fired, so late-arriving timeout

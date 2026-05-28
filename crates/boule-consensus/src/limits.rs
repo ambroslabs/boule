@@ -19,7 +19,7 @@
 //!   map is pruned on commit, but the gap between proposals and the
 //!   commit that prunes them is what an attacker exploits.
 //! - The integration layer's
-//!   [`timeout_buckets`](super::node::ConsensusNode) is keyed by `View`
+//!   `timeout_buckets` is keyed by `View`
 //!   and is dropped on TC formation, but a flood of timeout votes for
 //!   far-future views can grow it before any TC ever fires.
 //!
