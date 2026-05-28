@@ -23,6 +23,8 @@
 //! (#260) and reads via [`DualSignedRotation::is_rotation_payload`] +
 //! [`DualSignedRotation::decode_command`].
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use bytes::Bytes;
 use ring::signature::{ED25519, UnparsedPublicKey};
@@ -431,6 +433,215 @@ mod serde_sig {
             .try_into()
             .map_err(|_| D::Error::custom("signature must be exactly 64 bytes"))
     }
+}
+
+/// CLI inputs for `rotation propose`, populated by the binary's argument
+/// parser and consumed by [`build_rotation_envelope`].
+#[derive(Debug, Default)]
+pub struct RotationProposeRequest {
+    pub config_path: Option<PathBuf>,
+    pub new_key_backend: Option<String>,
+    pub new_key_path: Option<PathBuf>,
+    pub new_key_passphrase_env: Option<String>,
+    pub new_bls_key_backend: Option<String>,
+    pub new_bls_key_path: Option<PathBuf>,
+    pub v_eff: Option<u64>,
+}
+
+/// Outcome of building a rotation envelope from CLI inputs. Captured as a
+/// struct so tests can assert on the resolved fields without re-doing the
+/// whole orchestration.
+#[derive(Debug)]
+pub struct RotationProposeOutcome {
+    pub envelope: DualSignedRotation,
+    /// True iff the chain's `signature_scheme` is `bls_aggregated` and the
+    /// rotation therefore carries a BLS pubkey + PoP.
+    pub bls_chain: bool,
+}
+
+/// Translate the `--new-key-backend` + path/passphrase flags into an
+/// [`crate::config::IdentityConfig`]. Accepts only the path-bearing
+/// backends — `file` and `encrypted-file` — because they can
+/// self-provision a fresh key when the path doesn't yet exist (the common
+/// rotation path). Read-only backends (env, exec, keyring) need bespoke
+/// provisioning and should rotate against [`DualSignedRotation::sign`].
+pub fn build_new_identity_config_for_rotation(
+    backend: &str,
+    path: Option<PathBuf>,
+    passphrase_env: Option<String>,
+) -> anyhow::Result<crate::config::IdentityConfig> {
+    use crate::config::IdentityConfig;
+    match backend {
+        "file" => Ok(IdentityConfig::File {
+            path: path
+                .ok_or_else(|| anyhow::anyhow!("--new-key-backend file requires --new-key-path"))?,
+            allow_insecure_perms: false,
+        }),
+        "encrypted-file" => Ok(IdentityConfig::EncryptedFile {
+            path: path.ok_or_else(|| {
+                anyhow::anyhow!("--new-key-backend encrypted-file requires --new-key-path")
+            })?,
+            passphrase_env,
+        }),
+        "env" | "exec" | "keyring" => anyhow::bail!(
+            "--new-key-backend `{backend}` is not supported by `rotation propose` yet \
+             (read-only backends need separate provisioning); use `file` or `encrypted-file`",
+        ),
+        other => anyhow::bail!(
+            "--new-key-backend `{other}` is not a valid backend (try: file, encrypted-file)",
+        ),
+    }
+}
+
+/// Orchestration core of `rotation propose` — resolves the current
+/// validator key from `req.config_path`'s config, mints (or reloads) the
+/// new Ed25519 key, mints (or reloads) the new BLS key on BLS chains,
+/// builds a chain-bound [`DualSignedRotation`], and returns it. Lives in
+/// the library so unit tests can drive the same flow without spawning a
+/// process.
+pub fn build_rotation_envelope(
+    req: &RotationProposeRequest,
+) -> anyhow::Result<RotationProposeOutcome> {
+    use crate::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use crate::crypto::signed::NodeSigner;
+
+    let v_eff = View(
+        req.v_eff
+            .ok_or_else(|| anyhow::anyhow!("rotation propose requires --v-eff <view>"))?,
+    );
+    let new_backend = req.new_key_backend.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("rotation propose requires --new-key-backend <file|encrypted-file>")
+    })?;
+    let config_path = req
+        .config_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("rotation propose requires --config"))?;
+    let config = crate::config::load(config_path)?;
+    let cons = config.consensus.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--config {} has no [consensus] section; rotation requires the \
+             chain's signature_scheme + chain_id to bundle a chain-bound payload",
+            config_path.display(),
+        )
+    })?;
+    let chain_id = crate::node::derive_chain_id(cons)?;
+
+    // Reject scheme/flag mismatches *before* minting any new keys so a
+    // misconfigured invocation leaves no half-provisioned files behind.
+    match cons.signature_scheme {
+        SignatureSchemeChoice::BlsAggregated => {
+            if req.new_bls_key_backend.is_none() {
+                anyhow::bail!(
+                    "[consensus].signature_scheme = \"bls_aggregated\" but no \
+                     --new-bls-key-backend was supplied; BLS chains rotate both halves \
+                     atomically (#358)",
+                );
+            }
+        }
+        SignatureSchemeChoice::Ed25519Collected => {
+            if req.new_bls_key_backend.is_some() || req.new_bls_key_path.is_some() {
+                anyhow::bail!(
+                    "[consensus].signature_scheme = \"ed25519_collected\" but a \
+                     --new-bls-key-* flag was supplied; Ed25519 chains have no use for \
+                     BLS keys (remove the flag)",
+                );
+            }
+        }
+    }
+
+    // Resolve the *current* validator signer, mirroring `start`'s
+    // precedence: prefer `[node.validator_identity]`, else fall back to
+    // the network identity. The key must already exist on disk.
+    let (current_id_cfg, current_slot) =
+        match crate::config::resolve_validator_identity(&config.node) {
+            Some(cfg) => (cfg, "validator"),
+            None => match crate::config::resolve_identity(&config.node) {
+                Some(cfg) => (cfg, "network (legacy single-key)"),
+                None => anyhow::bail!(
+                    "--config {} has no [node.validator_identity] or [node.identity]; \
+                 rotation needs an existing consensus signing key to produce sig_old",
+                    config_path.display(),
+                ),
+            },
+        };
+    let current_provider = crate::config::build_provider(&current_id_cfg)?;
+    let current_identity = current_provider.try_load()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no current consensus key found via the {} `{}` backend; provision it via \
+             `boule init` (or out-of-band) before rotating",
+            current_slot,
+            current_id_cfg.backend_name(),
+        )
+    })?;
+    let current_signer = NodeSigner::from_identity(&current_identity)?;
+
+    // Resolve / provision the *new* Ed25519 key.
+    let new_id_cfg = build_new_identity_config_for_rotation(
+        new_backend,
+        req.new_key_path.clone(),
+        req.new_key_passphrase_env.clone(),
+    )?;
+    let new_provider = crate::config::build_provider(&new_id_cfg)?;
+    let new_identity = if new_provider.is_provisioning_capable() {
+        new_provider.load_or_init()?
+    } else {
+        new_provider.try_load()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "new key backend `{}` is read-only and no key is yet provisioned; \
+                 mint the key out-of-band first",
+                new_id_cfg.backend_name(),
+            )
+        })?
+    };
+    let new_signer = NodeSigner::from_identity(&new_identity)?;
+
+    // BLS half. Scheme/flag-presence consistency was already enforced
+    // up front; this block only runs the actual provisioning on BLS chains.
+    let bls_chain = matches!(cons.signature_scheme, SignatureSchemeChoice::BlsAggregated);
+    let (new_bls_pubkey, new_bls_pop) = if bls_chain {
+        let backend = req
+            .new_bls_key_backend
+            .as_deref()
+            .expect("BLS-flag presence verified above");
+        if backend != "file" {
+            anyhow::bail!("--new-bls-key-backend `{backend}` is not supported (only `file` today)",);
+        }
+        let bls_path = req.new_bls_key_path.clone().ok_or_else(|| {
+            anyhow::anyhow!("--new-bls-key-backend file requires --new-bls-key-path")
+        })?;
+        let bls_provider = BlsKeyFile::new(bls_path);
+        let bls_id = bls_provider.load_or_init()?;
+        let pop = BlsAggregated::sign_pop(&bls_id.secret, &chain_id)
+            .map_err(|e| anyhow::anyhow!("signing BLS PoP: {e:?}"))?;
+        (Some(bls_id.public), Some(pop))
+    } else {
+        (None, None)
+    };
+
+    let payload = ValidatorKeyRotation {
+        validator: current_signer.node_id(),
+        new_pubkey: new_signer.node_id(),
+        v_eff,
+        new_bls_pubkey,
+        new_bls_pop,
+    };
+
+    // Surface a no-op rotation as a CLI-level error early.
+    if payload.new_pubkey == payload.validator {
+        anyhow::bail!(
+            "new_pubkey equals current validator key; the --new-key-path is already \
+             pointing at the active consensus key — pick a different path",
+        );
+    }
+    payload
+        .validate_scheme_consistency(cons.signature_scheme, &chain_id)
+        .map_err(|e| anyhow::anyhow!("rotation payload failed scheme-consistency check: {e}"))?;
+
+    let envelope = DualSignedRotation::sign(payload, &current_signer, &new_signer, &chain_id)?;
+    Ok(RotationProposeOutcome {
+        envelope,
+        bls_chain,
+    })
 }
 
 #[cfg(test)]

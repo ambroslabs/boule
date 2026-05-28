@@ -912,6 +912,71 @@ pub fn import_from_directory(
     Ok((manifest, chunks))
 }
 
+/// Open the on-disk snapshot store described by `config`'s `[consensus]`
+/// `storage_dir`. Errors if consensus or the storage dir is unset, since
+/// in-memory storage has nothing to export from / import into. Backs the
+/// `snapshot export` / `snapshot import` CLI subcommands.
+pub fn open_snapshot_store(config: &crate::config::Config) -> anyhow::Result<SnapshotStore> {
+    let cons_cfg = config
+        .consensus
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("snapshot subcommands require [consensus] in the config"))?;
+    let dir = cons_cfg.storage_dir.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "snapshot subcommands require [consensus] storage_dir to be set; \
+             in-memory storage has nothing to export from / import into"
+        )
+    })?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("creating consensus storage_dir {}: {e}", dir.display()))?;
+    let storage: Arc<dyn Storage> =
+        Arc::new(crate::storage::DiskStorage::open(dir.join("kv.redb"))?);
+    Ok(SnapshotStore::new(storage))
+}
+
+/// Export the snapshot at `height` (or the latest, if `None`) from
+/// `store` into `out_dir` as a manifest + chunk files. Returns the
+/// exported [`SnapshotManifest`] so callers can report its details.
+pub fn export_snapshot(
+    store: &SnapshotStore,
+    height: Option<u64>,
+    out_dir: &std::path::Path,
+) -> anyhow::Result<SnapshotManifest> {
+    let height = match height {
+        Some(h) => h,
+        None => store.latest_height()?.ok_or_else(|| {
+            anyhow::anyhow!("no snapshots found in consensus storage_dir; nothing to export")
+        })?,
+    };
+    let manifest = store.load_manifest(height)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no snapshot at height {height}; available: {:?}",
+            store.list_heights().unwrap_or_default(),
+        )
+    })?;
+    let mut chunks: Vec<Bytes> = Vec::with_capacity(manifest.chunk_count as usize);
+    for idx in 0..manifest.chunk_count {
+        let chunk = store
+            .load_chunk(height, idx)?
+            .ok_or_else(|| anyhow::anyhow!("snapshot at height {height} is missing chunk {idx}"))?;
+        chunks.push(chunk);
+    }
+    export_to_directory(&manifest, &chunks, out_dir)?;
+    Ok(manifest)
+}
+
+/// Import a snapshot from `in_dir` (a directory previously produced by
+/// [`export_to_directory`]) into `store`. Returns the imported
+/// [`SnapshotManifest`].
+pub fn import_snapshot(
+    store: &SnapshotStore,
+    in_dir: &std::path::Path,
+) -> anyhow::Result<SnapshotManifest> {
+    let (manifest, chunks) = import_from_directory(in_dir)?;
+    store.save(&manifest, &chunks)?;
+    Ok(manifest)
+}
+
 /// Snapshot creation policy: how often to take snapshots, how many to
 /// keep, and how big each chunk is. See module docs for defaults.
 ///

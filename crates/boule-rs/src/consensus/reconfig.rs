@@ -22,6 +22,7 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::path::Path;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -468,9 +469,163 @@ impl ReconfigCommand {
     }
 }
 
+/// Read a `<pubkey_hex>:<pop_hex>` file (48-byte BLS pubkey + 96-byte
+/// PoP signature). Whitespace at either end is ignored. Backs the
+/// `--bls-pop-file` flag of `reconfig add-validator`.
+pub fn read_bls_pop_file(path: &Path) -> anyhow::Result<BlsPop> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading --bls-pop-file {}: {e}", path.display()))?;
+    let trimmed = raw.trim();
+    let (pk_hex, sig_hex) = trimmed.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is not in the expected `<pubkey_hex>:<pop_hex>` format",
+            path.display(),
+        )
+    })?;
+    let pk_bytes = hex::decode(pk_hex.trim())
+        .map_err(|e| anyhow::anyhow!("--bls-pop-file pubkey is not valid hex: {e}"))?;
+    let sig_bytes = hex::decode(sig_hex.trim())
+        .map_err(|e| anyhow::anyhow!("--bls-pop-file pop signature is not valid hex: {e}"))?;
+    if pk_bytes.len() != 48 {
+        anyhow::bail!(
+            "--bls-pop-file pubkey is {} bytes, expected 48",
+            pk_bytes.len(),
+        );
+    }
+    if sig_bytes.len() != 96 {
+        anyhow::bail!(
+            "--bls-pop-file pop signature is {} bytes, expected 96",
+            sig_bytes.len(),
+        );
+    }
+    let mut pubkey = [0u8; 48];
+    pubkey.copy_from_slice(&pk_bytes);
+    let mut sig = [0u8; 96];
+    sig.copy_from_slice(&sig_bytes);
+    Ok(BlsPop { pubkey, sig })
+}
+
+/// Load a [`crate::crypto::bls_key::BlsKeyFile`] and derive a
+/// chain-id-bound PoP (#410) on the fly, letting an operator generate an
+/// add-validator payload from a freshly-provisioned BLS key file in one
+/// step. The PoP pre-image binds to `chain_id` so the same key produces a
+/// different PoP per deployment, blocking cross-chain replay.
+pub fn derive_bls_pop_from_key_file(path: &Path, chain_id: &ChainId) -> anyhow::Result<BlsPop> {
+    use crate::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    let provider = BlsKeyFile::new(path.to_path_buf());
+    let id = provider
+        .load_or_init()
+        .map_err(|e| anyhow::anyhow!("loading BLS key from {}: {e}", path.display()))?;
+    BlsAggregated::sign_pop(&id.secret, chain_id)
+        .map_err(|e| anyhow::anyhow!("signing BLS PoP for {}: {e:?}", path.display()))
+}
+
+/// Build the encoded `add-validator` reconfig payload. When `config` is
+/// supplied, cross-checks the chain's `signature_scheme` against BLS-flag
+/// presence (#334), derives the chain_id for PoP binding (#410), and
+/// locally verifies any resolved PoP. `bls_pop_file` and `bls_key_file`
+/// are mutually exclusive. Backs `reconfig add-validator`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_add_validator_payload(
+    config: Option<&crate::config::Config>,
+    node_id: NodeId,
+    addr: SocketAddr,
+    v_eff: View,
+    weight: u64,
+    bls_pop_file: Option<&Path>,
+    bls_key_file: Option<&Path>,
+) -> anyhow::Result<Bytes> {
+    if bls_pop_file.is_some() && bls_key_file.is_some() {
+        anyhow::bail!(
+            "--bls-pop-file and --bls-key-file are mutually exclusive — pass one or the other.",
+        );
+    }
+    if (bls_pop_file.is_some() || bls_key_file.is_some()) && config.is_none() {
+        anyhow::bail!(
+            "--bls-pop-file / --bls-key-file requires --config so the chain_id can be derived \
+             from the genesis. BLS proof-of-possession pre-images bind to chain_id (#410); \
+             without --config the CLI cannot mint or verify the PoP.",
+        );
+    }
+
+    // Resolve the chain_id (when --config is supplied) once, up front —
+    // used by the local PoP verify and threaded into the fresh-mint path.
+    let cfg_chain_id: Option<ChainId> = if let Some(cfg) = config {
+        let cons = cfg.consensus.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--config has no [consensus] section — cannot infer scheme or chain_id")
+        })?;
+        // Scheme cross-check (#334): refuse to build a payload that would
+        // be rejected at commit time by scheme-driven enforcement.
+        match (cons.signature_scheme, bls_pop_file, bls_key_file) {
+            (SignatureSchemeChoice::BlsAggregated, None, None) => {
+                anyhow::bail!(
+                    "--config declares signature_scheme = \"bls_aggregated\" but no \
+                     --bls-pop-file or --bls-key-file was supplied. Every BLS-chain `adds` \
+                     entry must carry a proof-of-possession.",
+                );
+            }
+            (SignatureSchemeChoice::Ed25519Collected, Some(_), _)
+            | (SignatureSchemeChoice::Ed25519Collected, _, Some(_)) => {
+                anyhow::bail!(
+                    "--config declares signature_scheme = \"ed25519_collected\" but a \
+                     --bls-pop-file or --bls-key-file was supplied. Ed25519 chains have no \
+                     use for BLS keys; remove the BLS flag.",
+                );
+            }
+            _ => {}
+        }
+        Some(crate::node::derive_chain_id(cons)?)
+    } else {
+        None
+    };
+
+    // Resolve the BLS proof-of-possession from whichever flag was passed
+    // (or none, for an Ed25519 chain).
+    let bls_pop = if let Some(path) = bls_pop_file {
+        Some(read_bls_pop_file(path)?)
+    } else if let Some(path) = bls_key_file {
+        let chain_id = cfg_chain_id
+            .as_ref()
+            .expect("--config presence enforced above when --bls-key-file is set");
+        Some(derive_bls_pop_from_key_file(path, chain_id)?)
+    } else {
+        None
+    };
+
+    // Local cryptographic fast-fail before distributing the payload.
+    // Scoped to the deployment's chain_id (#410).
+    if let Some(pop) = &bls_pop {
+        let chain_id = cfg_chain_id
+            .as_ref()
+            .expect("--config presence enforced above when bls_pop is built");
+        BlsAggregated::verify_pop(pop, &pop.pubkey, chain_id).map_err(|e| {
+            anyhow::anyhow!(
+                "BLS PoP failed verification under its embedded pubkey + the chain's chain_id: \
+                 {e:?}. Re-mint the PoP for this deployment via --bls-key-file (PoP pre-images \
+                 are now chain-bound, #410).",
+            )
+        })?;
+    }
+
+    let cmd = ReconfigCommand {
+        adds: vec![ValidatorEntry {
+            node_id,
+            addr,
+            bls_pop,
+            weight,
+        }],
+        removes: vec![],
+        changes: vec![],
+        v_eff,
+    };
+    Ok(cmd.encode())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use tempfile::TempDir;
 
     fn nid(b: u8) -> NodeId {
         [b; 32]
@@ -482,6 +637,81 @@ mod tests {
 
     fn addr(p: u16) -> SocketAddr {
         format!("127.0.0.1:{p}").parse().unwrap()
+    }
+
+    #[test]
+    fn read_bls_pop_file_round_trips_with_valid_pop() {
+        // Write a valid `<pubkey_hex>:<pop_hex>` file and confirm the
+        // helper reads back a structurally-identical PoP that verifies.
+        let mut ikm = [0u8; 32];
+        ikm[0] = 0x42;
+        let (sk, pk) = BlsAggregated::keygen(&ikm).unwrap();
+        let pop = BlsAggregated::sign_pop(&sk, &ChainId([0u8; 32])).unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pop.txt");
+        std::fs::write(
+            &path,
+            format!("{}:{}\n", hex::encode(pk), hex::encode(pop.sig)),
+        )
+        .unwrap();
+
+        let parsed = read_bls_pop_file(&path).expect("must parse");
+        assert_eq!(parsed.pubkey, pop.pubkey);
+        assert_eq!(parsed.sig, pop.sig);
+        BlsAggregated::verify_pop(&parsed, &pk, &ChainId([0u8; 32]))
+            .expect("must still verify after round-trip");
+    }
+
+    #[test]
+    fn read_bls_pop_file_rejects_wrong_lengths() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.txt");
+        // Pubkey of wrong length (only 32 bytes).
+        std::fs::write(
+            &path,
+            format!("{}:{}", hex::encode([0u8; 32]), hex::encode([0u8; 96])),
+        )
+        .unwrap();
+        let err = read_bls_pop_file(&path).unwrap_err();
+        assert!(err.to_string().contains("48"), "{err}");
+
+        // Sig of wrong length (only 32 bytes).
+        std::fs::write(
+            &path,
+            format!("{}:{}", hex::encode([0u8; 48]), hex::encode([0u8; 32])),
+        )
+        .unwrap();
+        let err = read_bls_pop_file(&path).unwrap_err();
+        assert!(err.to_string().contains("96"), "{err}");
+    }
+
+    #[test]
+    fn read_bls_pop_file_rejects_missing_separator() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nosep.txt");
+        std::fs::write(&path, "deadbeef").unwrap();
+        let err = read_bls_pop_file(&path).unwrap_err();
+        assert!(err.to_string().contains("expected"), "{err}");
+    }
+
+    #[test]
+    fn derive_bls_pop_from_key_file_produces_verifiable_pop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bls.key");
+        // Provision the key file via the standard provider.
+        let provider = BlsKeyFile::new(path.clone());
+        let id = provider.load_or_init().unwrap();
+
+        let chain_id = ChainId([0x55; 32]);
+        let derived = derive_bls_pop_from_key_file(&path, &chain_id).expect("must succeed");
+        assert_eq!(derived.pubkey, id.public);
+        BlsAggregated::verify_pop(&derived, &id.public, &chain_id)
+            .expect("derived PoP must verify under the same chain_id");
+        // #410: the same key derives a different (and incompatible)
+        // PoP under a different chain_id.
+        let other = ChainId([0xCC; 32]);
+        assert!(BlsAggregated::verify_pop(&derived, &id.public, &other).is_err());
     }
 
     fn entry(b: u8, port: u16) -> ValidatorEntry {
