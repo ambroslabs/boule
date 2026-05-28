@@ -1,9 +1,9 @@
 [package]
-name = "boule-node"
+name = "boule-cli"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "A peer-to-peer runtime hosting a HotStuff-style BFT consensus layer (node binary)."
+description = "Command-line interface and node binary for boule, a HotStuff-style BFT consensus layer."
 repository = "https://github.com/ambroslabs/boule-rs"
 homepage = "https://github.com/ambroslabs/boule-rs"
 
