@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use clap::{Args, Parser, Subcommand};
 use tracing::info;
 
 use boule::cli::{self, OutputFormat};
@@ -41,198 +42,261 @@ fn init_tracing() {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     init_tracing();
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch(&args).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            std::process::exit(1);
-        }
+    if let Err(e) = dispatch(Cli::parse()).await {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
     }
 }
 
-async fn dispatch(args: &[String]) -> anyhow::Result<()> {
-    let first = match args.first().map(String::as_str) {
-        Some(s) => s,
-        None => {
-            print_usage();
-            anyhow::bail!("missing subcommand");
-        }
-    };
-    match first {
-        "init" => handle_init(&args[1..]),
-        "start" => handle_start(&args[1..]).await,
-        "key" => handle_key_subcommand(&args[1..]),
-        "config" => handle_config(&args[1..]),
-        "snapshot" => handle_snapshot_subcommand(&args[1..]),
-        "reconfig" => handle_reconfig_subcommand(&args[1..]),
-        "rotation" => handle_rotation_subcommand(&args[1..]),
-        "--help" | "-h" | "help" => {
-            print_usage();
-            Ok(())
-        }
-        other => {
-            print_usage();
-            anyhow::bail!("unknown subcommand '{other}'");
-        }
+async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    match cli.command {
+        Command::Init(a) => handle_init(a),
+        Command::Start(a) => handle_start(a).await,
+        Command::Key(KeyCmd::Migrate(a)) => handle_key_migrate(a),
+        Command::Config(a) => handle_config(a),
+        Command::Snapshot(SnapshotCmd::Export(a)) => handle_snapshot_export(a),
+        Command::Snapshot(SnapshotCmd::Import(a)) => handle_snapshot_import(a),
+        Command::Reconfig(ReconfigCmd::AddValidator(a)) => handle_reconfig_add(a),
+        Command::Reconfig(ReconfigCmd::RemoveValidator(a)) => handle_reconfig_remove(a),
+        Command::Reconfig(ReconfigCmd::ChangeWeight(a)) => handle_reconfig_change_weight(a),
+        Command::Rotation(RotationCmd::Propose(a)) => handle_rotation_propose(a),
     }
 }
 
-fn print_usage() {
-    println!("Usage: boule <subcommand> [options]");
-    println!();
-    println!("Subcommands:");
-    println!("  init [--config <path>]");
-    println!("      Bootstrap a node: write a starter config if missing,");
-    println!("      provision the node key (file/encrypted-file backends),");
-    println!("      ensure storage_dir exists, and print the resulting NodeId.");
-    println!();
-    println!("  start [--config <path>] [--production] [--allow-insecure-key-perms]");
-    println!("      Run the node. Refuses to start if no key has been provisioned.");
-    println!();
-    println!("  key migrate --to <backend> [backend flags]");
-    println!("      Migrate the node key between identity backends. Backends:");
-    println!("        --to file             --path <path>");
-    println!("        --to encrypted-file   --path <path> [--passphrase-env <var>]");
-    println!("        --to keyring          [--service <name>] [--account <name>]");
-    println!("      Reads the current [node.identity] from --config; pass");
-    println!("      --delete-source to zeroize and remove a file-backed source.");
-    println!();
-    println!("  snapshot export [--config <path>] [--height <H>] --out <dir>");
-    println!("      Dump a snapshot from the consensus storage_dir into a");
-    println!("      portable directory layout (manifest.bin + chunk-N.bin).");
-    println!("      `--height` selects an exact snapshot; omit for the latest.");
-    println!();
-    println!("  snapshot import [--config <path>] --in <dir>");
-    println!("      Read a directory layout produced by `snapshot export` and");
-    println!("      write it back into the local consensus storage_dir's");
-    println!("      snapshot store. Verifies chunk hashes against the manifest.");
-    println!();
-    println!("  reconfig add-validator --pubkey <base58> --addr <socketaddr> --v-eff <view>");
-    println!("                         [--bls-pop-file <path> | --bls-key-file <path>]");
-    println!("                         [--config <path>]");
-    println!("      Build a tagged ReconfigCommand payload that adds a validator");
-    println!("      to the active committee at view `v_eff` and print it as hex");
-    println!("      on stdout. Operators inject the resulting bytes into a");
-    println!("      cluster member's mempool to propose the reconfig.");
-    println!("      On BLS chains pass --bls-pop-file (hex `<pubkey>:<sig>`) or");
-    println!("      --bls-key-file (a BlsKeyFile to derive PoP from). When --config");
-    println!("      is supplied, the chain's signature_scheme is cross-checked.");
-    println!(
-        "      The consensus floor is {} validators after applying;",
-        boule::consensus::reconfig::MIN_VALIDATOR_FLOOR,
-    );
-    println!(
-        "      `v_eff` must be at least `current_view + {}`.",
-        boule::consensus::reconfig::MIN_V_EFF_DELAY,
-    );
-    println!();
-    println!("  reconfig remove-validator --pubkey <base58> --v-eff <view>");
-    println!("      Build a tagged ReconfigCommand payload that removes a");
-    println!("      validator at view `v_eff` and print it as hex on stdout.");
-    println!("      Same rules as add-validator (floor, v_eff delay).");
-    println!();
-    println!("  rotation propose --new-key-backend <file|encrypted-file>");
-    println!("                   --new-key-path <path> [--new-key-passphrase-env <var>]");
-    println!("                   [--new-bls-key-backend file --new-bls-key-path <path>]");
-    println!("                   --v-eff <view> [--config <path>]");
-    println!("      Build a tagged DualSignedRotation payload that rotates the");
-    println!("      validator's consensus signing key at view `v_eff` and print");
-    println!("      it as hex on stdout. The current signer is read from");
-    println!("      `[node.validator_identity]` (or, when absent, the network");
-    println!("      identity). The new key is minted under the chosen backend if");
-    println!("      the path doesn't already exist. On `bls_aggregated` chains,");
-    println!("      the BLS half is also minted (or reloaded) and bundled into the");
-    println!("      payload along with a chain-bound proof-of-possession.");
-    println!(
-        "      `v_eff` must be at least `current_view + {}`.",
-        boule::consensus::validator_rotation::V_EFF_MIN_DELAY,
-    );
-    println!();
-    println!("  config [--config <path>] [--format human|json|toml] [--raw|--edit|--path]");
-    println!("      Print or edit the node's effective configuration. Default");
-    println!("      prints the fully-resolved config (file contents + filled-in");
-    println!("      defaults). `--format` overrides the per-config default set by");
-    println!("      `[ui] output_format`; for `config`, both `human` (the global");
-    println!("      default) and `toml` render TOML, while `json` emits JSON");
-    println!(
-        "      suitable for piping (e.g. `boule config --format json | jq '.consensus.timeout_base_ms'`)."
-    );
-    println!("      `--raw` prints the file as-written. `--edit` opens the file");
-    println!("      in $EDITOR / $VISUAL and validates the result. `--path` prints");
-    println!("      the resolved config file path and exits.");
-    println!();
-    println!("If --config is omitted, the platform-specific default is used:");
-    if let Some(p) = paths::default_config_path() {
-        println!("  default: {}", p.display());
-    } else {
-        println!("  default: <unavailable on this host; pass --config explicitly>");
-    }
+/// A peer-to-peer runtime hosting a HotStuff-style BFT consensus node.
+#[derive(Parser)]
+#[command(name = "boule", version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
 }
 
-// ── Shared CLI parsing ──────────────────────────────────────────────────────
+#[derive(Subcommand)]
+enum Command {
+    /// Bootstrap a node: write a starter config if missing, provision the
+    /// node key, ensure storage_dir exists, and print the resulting NodeId.
+    Init(InitArgs),
+    /// Run the node. Refuses to start if no key has been provisioned.
+    Start(StartArgs),
+    /// Manage the node's identity key.
+    #[command(subcommand)]
+    Key(KeyCmd),
+    /// Print or edit the node's effective configuration.
+    Config(ConfigArgs),
+    /// Export or import consensus snapshots.
+    #[command(subcommand)]
+    Snapshot(SnapshotCmd),
+    /// Build validator-set reconfiguration payloads (printed as hex).
+    #[command(subcommand)]
+    Reconfig(ReconfigCmd),
+    /// Build validator key-rotation payloads (printed as hex).
+    #[command(subcommand)]
+    Rotation(RotationCmd),
+}
 
-#[derive(Debug, Default)]
+/// Shared `--config/-c` flag: path to the node config, defaulting to the
+/// platform-specific location when omitted.
+#[derive(Args)]
 struct InitArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
 }
 
-fn parse_init_args(args: &[String]) -> anyhow::Result<InitArgs> {
-    let mut out = InitArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" | "-c" => {
-                i += 1;
-                let p = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
-                out.config_path = Some(PathBuf::from(p));
-            }
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            other => anyhow::bail!("unknown init flag: {other}"),
-        }
-        i += 1;
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Default)]
+#[derive(Args)]
 struct StartArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
+    /// Fail closed on insecure defaults (also set by BOULE_ENV=production).
+    #[arg(long)]
     production: bool,
+    /// Permit a key file with group/other-readable permissions.
+    #[arg(long = "allow-insecure-key-perms")]
     allow_insecure_perms: bool,
 }
 
-fn parse_start_args(args: &[String]) -> anyhow::Result<StartArgs> {
-    let mut out = StartArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" | "-c" => {
-                i += 1;
-                let p = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
-                out.config_path = Some(PathBuf::from(p));
-            }
-            "--production" => out.production = true,
-            "--allow-insecure-key-perms" => out.allow_insecure_perms = true,
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            other => anyhow::bail!("unknown start flag: {other}"),
-        }
-        i += 1;
-    }
-    Ok(out)
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Migrate the node key between identity backends. Reads the current
+    /// `[node.identity]` from the config and provisions the destination.
+    Migrate(MigrateArgs),
+}
+
+#[derive(Args)]
+struct MigrateArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
+    config_path: Option<PathBuf>,
+    /// Destination backend: file, encrypted-file, or keyring.
+    #[arg(long)]
+    to: String,
+    /// Destination path (file / encrypted-file backends).
+    #[arg(long)]
+    path: Option<PathBuf>,
+    /// Env var holding the passphrase (encrypted-file backend).
+    #[arg(long)]
+    passphrase_env: Option<String>,
+    /// Keyring service name (keyring backend; default "boule").
+    #[arg(long)]
+    service: Option<String>,
+    /// Keyring account name (keyring backend).
+    #[arg(long)]
+    account: Option<String>,
+    /// Zeroize and remove a file-backed source key after migrating.
+    #[arg(long)]
+    delete_source: bool,
+}
+
+#[derive(Args)]
+struct ConfigArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
+    config_path: Option<PathBuf>,
+    /// Output format: human, json, or toml. Overrides `[ui] output_format`.
+    #[arg(
+        short = 'f',
+        long,
+        value_parser = parse_output_format,
+        conflicts_with_all = ["raw", "edit", "print_path"],
+    )]
+    format: Option<OutputFormat>,
+    /// Print the config file as-written, without filling in defaults.
+    #[arg(long, group = "config_mode")]
+    raw: bool,
+    /// Open the config in $EDITOR / $VISUAL and validate the result.
+    #[arg(long, group = "config_mode")]
+    edit: bool,
+    /// Print the resolved config file path and exit.
+    #[arg(long = "path", group = "config_mode")]
+    print_path: bool,
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Dump a snapshot into a portable directory (manifest.bin + chunks).
+    Export(SnapshotExportArgs),
+    /// Load a directory produced by `snapshot export` into local storage.
+    Import(SnapshotImportArgs),
+}
+
+#[derive(Args)]
+struct SnapshotExportArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
+    config_path: Option<PathBuf>,
+    /// Snapshot height to export (default: the latest).
+    #[arg(long)]
+    height: Option<u64>,
+    /// Output directory.
+    #[arg(short = 'o', long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct SnapshotImportArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
+    config_path: Option<PathBuf>,
+    /// Input directory, as produced by `snapshot export`.
+    #[arg(short = 'i', long = "in")]
+    in_dir: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum ReconfigCmd {
+    /// Add a validator to the committee at view `v_eff`.
+    AddValidator(ReconfigAddArgs),
+    /// Remove a validator from the committee at view `v_eff`.
+    RemoveValidator(ReconfigRemoveArgs),
+    /// Change a seated validator's voting weight at view `v_eff`.
+    ChangeWeight(ReconfigChangeWeightArgs),
+}
+
+#[derive(Args)]
+struct ReconfigAddArgs {
+    /// New validator NodeId (base58).
+    #[arg(long)]
+    pubkey: String,
+    /// New validator socket address.
+    #[arg(long)]
+    addr: String,
+    /// View at and after which the change takes effect.
+    #[arg(long = "v-eff")]
+    v_eff: u64,
+    /// Voting weight (>= 1; use 1 for an unweighted committee).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    weight: u64,
+    /// Hex `<pubkey>:<pop>` proof-of-possession file (BLS chains).
+    #[arg(long, conflicts_with = "bls_key_file")]
+    bls_pop_file: Option<PathBuf>,
+    /// BlsKeyFile to derive the PoP from locally (BLS chains).
+    #[arg(long)]
+    bls_key_file: Option<PathBuf>,
+    /// Config path; enables the chain `signature_scheme` cross-check.
+    #[arg(short = 'c', long = "config")]
+    config_path: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ReconfigRemoveArgs {
+    /// Validator NodeId to remove (base58).
+    #[arg(long)]
+    pubkey: String,
+    /// View at and after which the removal takes effect.
+    #[arg(long = "v-eff")]
+    v_eff: u64,
+}
+
+#[derive(Args)]
+struct ReconfigChangeWeightArgs {
+    /// Validator NodeId to reweight (base58).
+    #[arg(long)]
+    pubkey: String,
+    /// New voting weight (>= 1).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    weight: u64,
+    /// View at and after which the new weight takes effect.
+    #[arg(long = "v-eff")]
+    v_eff: u64,
+}
+
+#[derive(Subcommand)]
+enum RotationCmd {
+    /// Build a validator key-rotation payload, minting the new key(s).
+    Propose(RotationProposeArgs),
+}
+
+#[derive(Args)]
+struct RotationProposeArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
+    config_path: Option<PathBuf>,
+    /// New consensus key backend: file or encrypted-file.
+    #[arg(long)]
+    new_key_backend: String,
+    /// Path for the new consensus key.
+    #[arg(long)]
+    new_key_path: Option<PathBuf>,
+    /// Env var holding the new key's passphrase (encrypted-file).
+    #[arg(long)]
+    new_key_passphrase_env: Option<String>,
+    /// New BLS key backend (BLS chains; only `file` today).
+    #[arg(long)]
+    new_bls_key_backend: Option<String>,
+    /// Path for the new BLS key (BLS chains).
+    #[arg(long)]
+    new_bls_key_path: Option<PathBuf>,
+    /// View at and after which the rotation takes effect.
+    #[arg(long = "v-eff")]
+    v_eff: u64,
+}
+
+/// Parse a `--format` value into the shared [`OutputFormat`].
+fn parse_output_format(s: &str) -> anyhow::Result<OutputFormat> {
+    OutputFormat::parse(s)
 }
 
 fn resolve_config_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -258,11 +322,9 @@ fn is_production(cli_flag: bool) -> bool {
 
 // ── `init` subcommand ───────────────────────────────────────────────────────
 
-fn handle_init(args: &[String]) -> anyhow::Result<()> {
-    let args = parse_init_args(args)?;
+fn handle_init(args: InitArgs) -> anyhow::Result<()> {
     let config_path = resolve_config_path(args.config_path)?;
 
-    // Step 1: write the starter template if the config doesn't exist.
     if !config_path.exists() {
         config::write_starter_config(&config_path)?;
         println!("wrote starter config to {}", config_path.display());
@@ -270,41 +332,31 @@ fn handle_init(args: &[String]) -> anyhow::Result<()> {
         println!("config already exists at {}", config_path.display());
     }
 
-    // Step 2: load + validate.
     let config = config::load(&config_path)?;
     info!("loaded config from {}", config_path.display());
 
-    // Step 3: resolve the identity backend. `init` does not need
-    // production semantics — operators run it interactively to bootstrap.
+    // `init` runs interactively to bootstrap, so production semantics are off.
     let identity_cfg = config::resolve_and_validate_identity(&config.node, false, false)?;
     println!("network identity backend: {}", identity_cfg.backend_name());
 
-    // Step 4: provision the network key (or report externally-managed).
     let provider = config::build_provider(&identity_cfg)?;
     provision_or_report(&*provider, identity_cfg.backend_name(), "network")?;
 
-    // Step 4a: cross-validate `[[peers]]` against the local NodeId now
-    // that the network key has been loaded. Catches a self-id in the
-    // static peers list at `init` time so operators don't ship a config
-    // that only fails at `start`.
+    // Cross-validate `[[peers]]` against the local NodeId now so a self-id is
+    // caught at `init` rather than only surfacing at `start`.
     if let Some(net_id) = provider.try_load()? {
         let tls = boule::p2p::tls::TlsIdentity::from_identity(&net_id)?;
         config.validate(&tls.node_id)?;
     }
 
-    // Step 4b: same flow for `[node.validator_identity]` if configured.
-    // When the table is absent, the network key is reused for consensus
-    // signing at start time (with a deprecation warning), so `init` has
-    // nothing extra to do here.
     if let Some(val_cfg) = config::resolve_validator_identity(&config.node) {
         println!("validator identity backend: {}", val_cfg.backend_name());
         let val_provider = config::build_provider(&val_cfg)?;
         provision_or_report(&*val_provider, val_cfg.backend_name(), "validator")?;
     }
 
-    // Step 5: ensure consensus storage_dir exists. Doing this in init
-    // (rather than lazily on first start) lets operators verify the
-    // path is writable before going live.
+    // Create storage_dir during `init` so operators learn it's writable
+    // before going live, rather than lazily on first `start`.
     if let Some(cons) = config.consensus.as_ref() {
         if let Some(dir) = cons.storage_dir.as_ref() {
             std::fs::create_dir_all(dir).map_err(|e| {
@@ -314,9 +366,6 @@ fn handle_init(args: &[String]) -> anyhow::Result<()> {
         }
     }
 
-    // Step 6: pre-flight validation of the rest of the config so init
-    // is the natural moment to surface typos in peer addresses or
-    // validator IDs.
     config.preflight_validate()?;
 
     println!(
@@ -364,8 +413,7 @@ fn provision_or_report(
 
 // ── `start` subcommand ──────────────────────────────────────────────────────
 
-async fn handle_start(args: &[String]) -> anyhow::Result<()> {
-    let args = parse_start_args(args)?;
+async fn handle_start(args: StartArgs) -> anyhow::Result<()> {
     let config_path = resolve_config_path(args.config_path)?;
 
     let config = config::load(&config_path)?;
@@ -409,100 +457,11 @@ async fn handle_start(args: &[String]) -> anyhow::Result<()> {
     node::run(config, network_identity, validator_identity).await
 }
 
-// ── `key` subcommand (existing migrate flow) ────────────────────────────────
-
-fn handle_key_subcommand(args: &[String]) -> anyhow::Result<()> {
-    let sub = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("missing key subcommand (try: migrate)"))?;
-    match sub.as_str() {
-        "migrate" => handle_key_migrate(&args[1..]),
-        other => anyhow::bail!("unknown `key` subcommand: {other}"),
-    }
-}
-
-#[derive(Debug, Default)]
-struct MigrateArgs {
-    config_path: Option<PathBuf>,
-    to: Option<String>,
-    path: Option<PathBuf>,
-    passphrase_env: Option<String>,
-    service: Option<String>,
-    account: Option<String>,
-    delete_source: bool,
-}
-
-fn parse_migrate_args(args: &[String]) -> anyhow::Result<MigrateArgs> {
-    let mut out = MigrateArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" | "-c" => {
-                i += 1;
-                out.config_path = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--config needs a value"))?
-                        .into(),
-                );
-            }
-            "--to" => {
-                i += 1;
-                out.to = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--to needs a value"))?
-                        .clone(),
-                );
-            }
-            "--path" => {
-                i += 1;
-                out.path = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--path needs a value"))?
-                        .into(),
-                );
-            }
-            "--passphrase-env" => {
-                i += 1;
-                out.passphrase_env = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--passphrase-env needs a value"))?
-                        .clone(),
-                );
-            }
-            "--service" => {
-                i += 1;
-                out.service = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--service needs a value"))?
-                        .clone(),
-                );
-            }
-            "--account" => {
-                i += 1;
-                out.account = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--account needs a value"))?
-                        .clone(),
-                );
-            }
-            "--delete-source" => out.delete_source = true,
-            other => anyhow::bail!("unknown migrate flag: {other}"),
-        }
-        i += 1;
-    }
-    Ok(out)
-}
-
-fn handle_key_migrate(args: &[String]) -> anyhow::Result<()> {
-    let args = parse_migrate_args(args)?;
-    let to = args
-        .to
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("key migrate requires --to <backend>"))?;
-    let config_path = resolve_config_path(args.config_path.clone())?;
+fn handle_key_migrate(args: MigrateArgs) -> anyhow::Result<()> {
+    let config_path = resolve_config_path(args.config_path)?;
     config::migrate_key(
         &config_path,
-        to,
+        &args.to,
         args.path,
         args.passphrase_env,
         args.service,
@@ -511,66 +470,7 @@ fn handle_key_migrate(args: &[String]) -> anyhow::Result<()> {
     )
 }
 
-// ── `config` subcommand ─────────────────────────────────────────────────────
-
-#[derive(Debug, Default)]
-struct ConfigArgs {
-    config_path: Option<PathBuf>,
-    format: Option<OutputFormat>,
-    raw: bool,
-    edit: bool,
-    print_path: bool,
-}
-
-fn parse_config_args(args: &[String]) -> anyhow::Result<ConfigArgs> {
-    let mut out = ConfigArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" | "-c" => {
-                i += 1;
-                let p = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?;
-                out.config_path = Some(PathBuf::from(p));
-            }
-            "--format" | "-f" => {
-                i += 1;
-                let v = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--format requires a value"))?;
-                out.format = Some(OutputFormat::parse(v)?);
-            }
-            "--raw" => out.raw = true,
-            "--edit" => out.edit = true,
-            "--path" => out.print_path = true,
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            other => anyhow::bail!("unknown config flag: {other}"),
-        }
-        i += 1;
-    }
-    Ok(out)
-}
-
-fn handle_config(args: &[String]) -> anyhow::Result<()> {
-    let args = parse_config_args(args)?;
-
-    // Mode flags are mutually exclusive — pick exactly one of
-    // print/raw/edit/path. Default (no mode flag) is "print resolved".
-    let mode_count = [args.print_path, args.edit, args.raw]
-        .iter()
-        .filter(|b| **b)
-        .count();
-    if mode_count > 1 {
-        anyhow::bail!("--path, --edit, and --raw are mutually exclusive");
-    }
-    if args.format.is_some() && (args.print_path || args.edit || args.raw) {
-        anyhow::bail!("--format only applies to the default (resolved-output) mode");
-    }
-
+fn handle_config(args: ConfigArgs) -> anyhow::Result<()> {
     let config_path = resolve_config_path(args.config_path)?;
 
     if args.print_path {
@@ -678,70 +578,8 @@ fn split_editor_command(cmd: &str) -> (std::ffi::OsString, Vec<std::ffi::OsStrin
     (program, argv)
 }
 
-// ── `snapshot` subcommand ───────────────────────────────────────────────────
-
-fn handle_snapshot_subcommand(args: &[String]) -> anyhow::Result<()> {
-    let sub = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("missing snapshot subcommand (try: export, import)"))?;
-    match sub.as_str() {
-        "export" => handle_snapshot_export(&args[1..]),
-        "import" => handle_snapshot_import(&args[1..]),
-        other => anyhow::bail!("unknown `snapshot` subcommand: {other}"),
-    }
-}
-
-#[derive(Debug, Default)]
-struct SnapshotExportArgs {
-    config_path: Option<PathBuf>,
-    height: Option<u64>,
-    out: Option<PathBuf>,
-}
-
-fn parse_snapshot_export_args(args: &[String]) -> anyhow::Result<SnapshotExportArgs> {
-    let mut out = SnapshotExportArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" | "-c" => {
-                i += 1;
-                out.config_path = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?
-                        .into(),
-                );
-            }
-            "--height" => {
-                i += 1;
-                let raw = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--height requires a value"))?;
-                out.height = Some(
-                    raw.parse::<u64>()
-                        .map_err(|e| anyhow::anyhow!("invalid --height {raw:?}: {e}"))?,
-                );
-            }
-            "--out" | "-o" => {
-                i += 1;
-                out.out = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--out requires a path"))?
-                        .into(),
-                );
-            }
-            other => anyhow::bail!("unknown snapshot export flag: {other}"),
-        }
-        i += 1;
-    }
-    Ok(out)
-}
-
-fn handle_snapshot_export(args: &[String]) -> anyhow::Result<()> {
-    let args = parse_snapshot_export_args(args)?;
-    let out_dir = args
-        .out
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("snapshot export requires --out <dir>"))?;
+fn handle_snapshot_export(args: SnapshotExportArgs) -> anyhow::Result<()> {
+    let out_dir = args.out;
     let config_path = resolve_config_path(args.config_path)?;
     let config = config::load(&config_path)?;
     let store = boule::replication::snapshot::open_snapshot_store(&config)?;
@@ -756,46 +594,8 @@ fn handle_snapshot_export(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct SnapshotImportArgs {
-    config_path: Option<PathBuf>,
-    in_dir: Option<PathBuf>,
-}
-
-fn parse_snapshot_import_args(args: &[String]) -> anyhow::Result<SnapshotImportArgs> {
-    let mut out = SnapshotImportArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" | "-c" => {
-                i += 1;
-                out.config_path = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?
-                        .into(),
-                );
-            }
-            "--in" | "-i" => {
-                i += 1;
-                out.in_dir = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--in requires a path"))?
-                        .into(),
-                );
-            }
-            other => anyhow::bail!("unknown snapshot import flag: {other}"),
-        }
-        i += 1;
-    }
-    Ok(out)
-}
-
-fn handle_snapshot_import(args: &[String]) -> anyhow::Result<()> {
-    let args = parse_snapshot_import_args(args)?;
-    let in_dir = args
-        .in_dir
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("snapshot import requires --in <dir>"))?;
+fn handle_snapshot_import(args: SnapshotImportArgs) -> anyhow::Result<()> {
+    let in_dir = args.in_dir;
     let config_path = resolve_config_path(args.config_path)?;
     let config = config::load(&config_path)?;
     let store = boule::replication::snapshot::open_snapshot_store(&config)?;
@@ -807,152 +607,18 @@ fn handle_snapshot_import(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── `reconfig` subcommand (#251) ───────────────────────────────────────────
-
-fn handle_reconfig_subcommand(args: &[String]) -> anyhow::Result<()> {
-    let sub = args.first().ok_or_else(|| {
-        anyhow::anyhow!(
-            "missing reconfig subcommand (try: add-validator, remove-validator, change-weight)"
-        )
-    })?;
-    match sub.as_str() {
-        "add-validator" => handle_reconfig_add(&args[1..]),
-        "remove-validator" => handle_reconfig_remove(&args[1..]),
-        "change-weight" => handle_reconfig_change_weight(&args[1..]),
-        other => anyhow::bail!("unknown `reconfig` subcommand: {other}"),
-    }
-}
-
-#[derive(Debug, Default)]
-struct ReconfigArgs {
-    pubkey: Option<String>,
-    addr: Option<String>,
-    v_eff: Option<u64>,
-    /// Voting weight for the validator at and after `v_eff` (#462).
-    /// Required for `add-validator`; optional and ignored for
-    /// `remove-validator`. Required for `change-weight`. Must be `>= 1`.
-    weight: Option<u64>,
-    /// Path to a hex-encoded `<pubkey_hex>:<pop_hex>` file (48-byte
-    /// BLS pubkey + 96-byte PoP signature) for the new validator.
-    /// Mutually exclusive with `--bls-key-file`.
-    bls_pop_file: Option<PathBuf>,
-    /// Path to a `BlsKeyFile` (33-byte format-versioned secret key) on
-    /// disk. The CLI derives the pubkey + PoP locally before printing
-    /// the payload. Mutually exclusive with `--bls-pop-file`.
-    bls_key_file: Option<PathBuf>,
-    /// Optional config path; when set the CLI cross-checks the chain's
-    /// `signature_scheme` against the BLS-flag presence and refuses to
-    /// build a payload that would be rejected at commit time (#334).
-    config_path: Option<PathBuf>,
-}
-
-fn parse_reconfig_args(args: &[String]) -> anyhow::Result<ReconfigArgs> {
-    let mut out = ReconfigArgs::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--pubkey" => {
-                i += 1;
-                out.pubkey = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--pubkey requires a base58 NodeId"))?
-                        .clone(),
-                );
-            }
-            "--addr" => {
-                i += 1;
-                out.addr = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--addr requires a socket address"))?
-                        .clone(),
-                );
-            }
-            "--v-eff" => {
-                i += 1;
-                let raw = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--v-eff requires a view number"))?;
-                out.v_eff = Some(
-                    raw.parse::<u64>()
-                        .map_err(|e| anyhow::anyhow!("invalid --v-eff {raw:?}: {e}"))?,
-                );
-            }
-            "--weight" => {
-                i += 1;
-                let raw = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--weight requires a u64 weight"))?;
-                let w = raw
-                    .parse::<u64>()
-                    .map_err(|e| anyhow::anyhow!("invalid --weight {raw:?}: {e}"))?;
-                if w == 0 {
-                    anyhow::bail!(
-                        "--weight 0 is reserved; use `remove-validator` to drop a validator."
-                    );
-                }
-                out.weight = Some(w);
-            }
-            "--bls-pop-file" => {
-                i += 1;
-                out.bls_pop_file =
-                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
-                        anyhow::anyhow!("--bls-pop-file requires a path")
-                    })?));
-            }
-            "--bls-key-file" => {
-                i += 1;
-                out.bls_key_file =
-                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
-                        anyhow::anyhow!("--bls-key-file requires a path")
-                    })?));
-            }
-            "--config" | "-c" => {
-                i += 1;
-                out.config_path =
-                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
-                        anyhow::anyhow!("--config requires a path")
-                    })?));
-            }
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            other => anyhow::bail!("unknown reconfig flag: {other}"),
-        }
-        i += 1;
-    }
-    Ok(out)
-}
-
-fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
+fn handle_reconfig_add(args: ReconfigAddArgs) -> anyhow::Result<()> {
     use boule::consensus::reconfig;
     use boule::p2p::tls::base58_to_node_id;
 
-    let a = parse_reconfig_args(args)?;
-    let pubkey_b58 = a
-        .pubkey
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --pubkey <base58>"))?;
-    let addr_str = a
-        .addr
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --addr <socketaddr>"))?;
-    let v_eff = boule::consensus::View(
-        a.v_eff
-            .ok_or_else(|| anyhow::anyhow!("reconfig add-validator requires --v-eff <view>"))?,
-    );
-    let weight = a.weight.ok_or_else(|| {
-        anyhow::anyhow!(
-            "reconfig add-validator requires --weight <u64>; use 1 for an unweighted committee."
-        )
+    let node_id = base58_to_node_id(&args.pubkey)
+        .map_err(|e| anyhow::anyhow!("--pubkey {:?} is not a valid NodeId: {e}", args.pubkey))?;
+    let addr: std::net::SocketAddr = args.addr.parse().map_err(|e| {
+        anyhow::anyhow!("--addr {:?} is not a valid socket address: {e}", args.addr)
     })?;
-    let node_id = base58_to_node_id(pubkey_b58)
-        .map_err(|e| anyhow::anyhow!("--pubkey {pubkey_b58:?} is not a valid NodeId: {e}"))?;
-    let addr: std::net::SocketAddr = addr_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("--addr {addr_str:?} is not a valid socket address: {e}"))?;
+    let v_eff = boule::consensus::View(args.v_eff);
 
-    let config = a
+    let config = args
         .config_path
         .as_ref()
         .map(|p| config::load(p))
@@ -962,163 +628,51 @@ fn handle_reconfig_add(args: &[String]) -> anyhow::Result<()> {
         node_id,
         addr,
         v_eff,
-        weight,
-        a.bls_pop_file.as_deref(),
-        a.bls_key_file.as_deref(),
+        args.weight,
+        args.bls_pop_file.as_deref(),
+        args.bls_key_file.as_deref(),
     )?;
     println!("{}", hex::encode(&payload));
     Ok(())
 }
 
-fn handle_reconfig_remove(args: &[String]) -> anyhow::Result<()> {
+fn handle_reconfig_remove(args: ReconfigRemoveArgs) -> anyhow::Result<()> {
     use boule::consensus::reconfig::ReconfigCommand;
     use boule::p2p::tls::base58_to_node_id;
 
-    let a = parse_reconfig_args(args)?;
-    let pubkey_b58 = a
-        .pubkey
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --pubkey <base58>"))?;
-    let v_eff = boule::consensus::View(
-        a.v_eff
-            .ok_or_else(|| anyhow::anyhow!("reconfig remove-validator requires --v-eff <view>"))?,
-    );
-    if a.addr.is_some() {
-        anyhow::bail!("reconfig remove-validator does not take --addr");
-    }
-
-    let node_id = base58_to_node_id(pubkey_b58)
-        .map_err(|e| anyhow::anyhow!("--pubkey {pubkey_b58:?} is not a valid NodeId: {e}"))?;
-
+    let node_id = base58_to_node_id(&args.pubkey)
+        .map_err(|e| anyhow::anyhow!("--pubkey {:?} is not a valid NodeId: {e}", args.pubkey))?;
+    let v_eff = boule::consensus::View(args.v_eff);
     let payload = ReconfigCommand::build_remove_validator_payload(node_id, v_eff);
     println!("{}", hex::encode(&payload));
     Ok(())
 }
 
-/// `reconfig change-weight` (#462): change a currently-seated
-/// validator's voting weight at and after `v_eff`. Membership is
-/// unchanged.
-fn handle_reconfig_change_weight(args: &[String]) -> anyhow::Result<()> {
+fn handle_reconfig_change_weight(args: ReconfigChangeWeightArgs) -> anyhow::Result<()> {
     use boule::consensus::reconfig::ReconfigCommand;
     use boule::p2p::tls::base58_to_node_id;
 
-    let a = parse_reconfig_args(args)?;
-    let pubkey_b58 = a
-        .pubkey
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("reconfig change-weight requires --pubkey <base58>"))?;
-    let v_eff = boule::consensus::View(
-        a.v_eff
-            .ok_or_else(|| anyhow::anyhow!("reconfig change-weight requires --v-eff <view>"))?,
-    );
-    let weight = a
-        .weight
-        .ok_or_else(|| anyhow::anyhow!("reconfig change-weight requires --weight <u64>"))?;
-    if a.addr.is_some() {
-        anyhow::bail!("reconfig change-weight does not take --addr");
-    }
-
-    let node_id = base58_to_node_id(pubkey_b58)
-        .map_err(|e| anyhow::anyhow!("--pubkey {pubkey_b58:?} is not a valid NodeId: {e}"))?;
-
-    let payload = ReconfigCommand::build_change_weight_payload(node_id, weight, v_eff);
+    let node_id = base58_to_node_id(&args.pubkey)
+        .map_err(|e| anyhow::anyhow!("--pubkey {:?} is not a valid NodeId: {e}", args.pubkey))?;
+    let v_eff = boule::consensus::View(args.v_eff);
+    let payload = ReconfigCommand::build_change_weight_payload(node_id, args.weight, v_eff);
     println!("{}", hex::encode(&payload));
     Ok(())
 }
 
-// ── `rotation` subcommand (#313) ───────────────────────────────────────────
-
-fn handle_rotation_subcommand(args: &[String]) -> anyhow::Result<()> {
-    let sub = args
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("missing rotation subcommand (try: propose)"))?;
-    match sub.as_str() {
-        "propose" => handle_rotation_propose(&args[1..]),
-        other => anyhow::bail!("unknown `rotation` subcommand: {other}"),
-    }
-}
-
-fn parse_rotation_propose_args(args: &[String]) -> anyhow::Result<RotationProposeRequest> {
-    let mut out = RotationProposeRequest::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" | "-c" => {
-                i += 1;
-                out.config_path =
-                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
-                        anyhow::anyhow!("--config requires a path")
-                    })?));
-            }
-            "--new-key-backend" => {
-                i += 1;
-                out.new_key_backend = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--new-key-backend requires a value"))?
-                        .clone(),
-                );
-            }
-            "--new-key-path" => {
-                i += 1;
-                out.new_key_path =
-                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
-                        anyhow::anyhow!("--new-key-path requires a path")
-                    })?));
-            }
-            "--new-key-passphrase-env" => {
-                i += 1;
-                out.new_key_passphrase_env = Some(
-                    args.get(i)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("--new-key-passphrase-env requires a variable name")
-                        })?
-                        .clone(),
-                );
-            }
-            "--new-bls-key-backend" => {
-                i += 1;
-                out.new_bls_key_backend = Some(
-                    args.get(i)
-                        .ok_or_else(|| anyhow::anyhow!("--new-bls-key-backend requires a value"))?
-                        .clone(),
-                );
-            }
-            "--new-bls-key-path" => {
-                i += 1;
-                out.new_bls_key_path =
-                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
-                        anyhow::anyhow!("--new-bls-key-path requires a path")
-                    })?));
-            }
-            "--v-eff" => {
-                i += 1;
-                let raw = args
-                    .get(i)
-                    .ok_or_else(|| anyhow::anyhow!("--v-eff requires a view number"))?;
-                out.v_eff = Some(
-                    raw.parse::<u64>()
-                        .map_err(|e| anyhow::anyhow!("invalid --v-eff {raw:?}: {e}"))?,
-                );
-            }
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            other => anyhow::bail!("unknown rotation propose flag: {other}"),
-        }
-        i += 1;
-    }
-    Ok(out)
-}
-
-fn handle_rotation_propose(args: &[String]) -> anyhow::Result<()> {
+fn handle_rotation_propose(args: RotationProposeArgs) -> anyhow::Result<()> {
     use boule::consensus::validator_rotation::build_rotation_envelope;
     use boule::p2p::tls::node_id_to_base58;
 
-    let mut req = parse_rotation_propose_args(args)?;
-    // Resolve the default config path here (a binary concern) so the lib
-    // can load it directly.
-    req.config_path = Some(resolve_config_path(req.config_path.take())?);
+    let req = RotationProposeRequest {
+        config_path: Some(resolve_config_path(args.config_path)?),
+        new_key_backend: Some(args.new_key_backend),
+        new_key_path: args.new_key_path,
+        new_key_passphrase_env: args.new_key_passphrase_env,
+        new_bls_key_backend: args.new_bls_key_backend,
+        new_bls_key_path: args.new_bls_key_path,
+        v_eff: Some(args.v_eff),
+    };
     let outcome = build_rotation_envelope(&req)?;
     let bytes = outcome.envelope.encode_command();
     println!("{}", hex::encode(&bytes));
@@ -1521,49 +1075,6 @@ mod tests {
         };
         // current_view=10, v_eff=11 → < current+2; must be rejected.
         assert!(payload.validate_structural(10).is_err());
-    }
-
-    #[test]
-    fn parse_rotation_propose_args_round_trips() {
-        let args: Vec<String> = [
-            "--config",
-            "/tmp/c.toml",
-            "--new-key-backend",
-            "file",
-            "--new-key-path",
-            "/tmp/n.key",
-            "--v-eff",
-            "100",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let parsed = parse_rotation_propose_args(&args).unwrap();
-        assert_eq!(parsed.config_path.unwrap(), PathBuf::from("/tmp/c.toml"));
-        assert_eq!(parsed.new_key_backend.as_deref(), Some("file"));
-        assert_eq!(parsed.new_key_path.unwrap(), PathBuf::from("/tmp/n.key"));
-        assert_eq!(parsed.v_eff, Some(100));
-        assert!(parsed.new_bls_key_backend.is_none());
-    }
-
-    #[test]
-    fn parse_rotation_propose_args_rejects_unknown_flag() {
-        let args = ["--no-such-flag"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-        let err = parse_rotation_propose_args(&args).unwrap_err();
-        assert!(err.to_string().contains("--no-such-flag"));
-    }
-
-    #[test]
-    fn parse_rotation_propose_args_rejects_invalid_v_eff() {
-        let args = ["--v-eff", "not-a-number"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>();
-        let err = parse_rotation_propose_args(&args).unwrap_err();
-        assert!(err.to_string().contains("--v-eff"));
     }
 
     #[test]
