@@ -19,6 +19,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Build the fuzz target for the GNU host explicitly. `taiki-e/install-action`
+  # ships a *musl*-built cargo-fuzz, and cargo-fuzz defaults the fuzzing target
+  # to its own build triple — which would target musl, where ASan can't link
+  # (static libc) and whose std isn't installed on the nightly toolchain.
+  FUZZ_TARGET: x86_64-unknown-linux-gnu
 
 jobs:
   fuzz:
@@ -45,7 +50,7 @@ jobs:
       # which `cargo fuzz build` does not touch.
       - name: Build fuzz target
         working-directory: fuzz
-        run: cargo +nightly fuzz build dispatch_ingress_skip
+        run: cargo +nightly fuzz build dispatch_ingress_skip --target "$FUZZ_TARGET"
       - name: Build corpus seeder
         working-directory: fuzz
         run: cargo +nightly build --bin seed_corpus
@@ -54,4 +59,4 @@ jobs:
       # fuzz/README.md. Nightly gets a slightly longer smoke than PR/manual.
       - name: Smoke run
         working-directory: fuzz
-        run: cargo +nightly fuzz run dispatch_ingress_skip -- -max_total_time=${{ github.event_name == 'schedule' && '300' || '60' }}
+        run: cargo +nightly fuzz run dispatch_ingress_skip --target "$FUZZ_TARGET" -- -max_total_time=${{ github.event_name == 'schedule' && '300' || '60' }}
