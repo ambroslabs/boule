@@ -68,6 +68,19 @@ The leading comment in `.config/nextest.toml` documents the convention. New
 tests that match an existing pattern (for example, anything in
 `crypto::bls_key::tests`) are picked up automatically.
 
+### Fuzzing
+
+The consensus wire/ingress path has a nightly-only [`cargo-fuzz`] harness in
+[`fuzz/`](fuzz/README.md). It is intentionally **not** a workspace member and
+is not built by the per-PR stable gate, so it has its own opt-in CI workflow
+([`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml)): add the `fuzz`
+label to a PR to build + smoke-run the target, trigger it manually from the
+Actions tab, or rely on the nightly schedule. See
+[`fuzz/README.md`](fuzz/README.md) for what the target covers and the
+recommended local soak budgets.
+
+[`cargo-fuzz`]: https://rust-fuzz.github.io/book/cargo-fuzz.html
+
 ## Code Style
 
 Formatting and linting are enforced in CI. Before pushing, run:
