@@ -389,7 +389,7 @@ timeline), and `src/consensus/node.rs::apply_committed_rotations`
   the removal path under [validator-set reconfiguration](testnet-local.md).
 - Migration to a stronger backend (`file` → `keyring` → HSM).
 
-[142-issue]: https://github.com/zrbecker/ambros-p2p/issues/142
+[142-issue]: https://github.com/ambroslabs/ambros-p2p/issues/142
 
 The rotation transaction is **self-attested**: it carries two
 Ed25519 signatures over the same canonical pre-image, one under the

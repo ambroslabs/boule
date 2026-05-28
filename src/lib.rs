@@ -63,7 +63,7 @@
 //!
 //! # Running a node
 //!
-//! See the top-level [`README.md`](https://github.com/zrbecker/ambros-p2p/blob/main/README.md)
+//! See the top-level [`README.md`](https://github.com/ambroslabs/ambros-p2p/blob/main/README.md)
 //! for build / run / test instructions and the configuration reference,
 //! and `docs/testnet-local.md` for a walkthrough of the
 //! `ambros-p2p init` → `ambros-p2p start` flow.

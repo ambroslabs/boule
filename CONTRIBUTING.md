@@ -32,7 +32,7 @@ is required.
 file ensures the correct toolchain is selected automatically.
 
 ```sh
-git clone https://github.com/zrbecker/ambros-p2p.git
+git clone https://github.com/ambroslabs/ambros-p2p.git
 cd ambros-p2p
 cargo build
 ```

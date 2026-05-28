@@ -362,7 +362,7 @@ Same general procedure as ENOSPC: the node is fail-stop on any
 the error in the logs to identify the underlying cause (filesystem
 unmounted, permissions changed, hardware fault), fix it, and restart.
 
-[issue-136]: https://github.com/zrbecker/ambros-p2p/issues/136
-[issue-197]: https://github.com/zrbecker/ambros-p2p/issues/197
-[issue-325]: https://github.com/zrbecker/ambros-p2p/issues/325
-[issue-504]: https://github.com/zrbecker/ambros-p2p/issues/504
+[issue-136]: https://github.com/ambroslabs/ambros-p2p/issues/136
+[issue-197]: https://github.com/ambroslabs/ambros-p2p/issues/197
+[issue-325]: https://github.com/ambroslabs/ambros-p2p/issues/325
+[issue-504]: https://github.com/ambroslabs/ambros-p2p/issues/504
