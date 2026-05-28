@@ -12,7 +12,7 @@ use crate::consensus::validator_history::ValidatorSetHistory;
 use crate::consensus::validator_key_history::ValidatorKeyHistory;
 use crate::consensus::validator_set::ValidatorSet;
 use crate::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
-use crate::p2p::identity::NodeIdentity;
+use crate::identity::NodeIdentity;
 use crate::replication::block::Block;
 
 fn fresh_signer() -> NodeSigner {

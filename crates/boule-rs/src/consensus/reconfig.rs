@@ -574,7 +574,7 @@ pub fn build_add_validator_payload(
             }
             _ => {}
         }
-        Some(crate::node::derive_chain_id(cons)?)
+        Some(crate::consensus::genesis::derive_chain_id(cons)?)
     } else {
         None
     };

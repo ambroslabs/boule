@@ -524,7 +524,7 @@ pub fn build_rotation_envelope(
             config_path.display(),
         )
     })?;
-    let chain_id = crate::node::derive_chain_id(cons)?;
+    let chain_id = crate::consensus::genesis::derive_chain_id(cons)?;
 
     // Reject scheme/flag mismatches *before* minting any new keys so a
     // misconfigured invocation leaves no half-provisioned files behind.
@@ -649,7 +649,7 @@ mod tests {
     use super::*;
 
     use crate::crypto::signed::NodeSigner;
-    use crate::p2p::identity::NodeIdentity;
+    use crate::identity::NodeIdentity;
     use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
     use zeroize::Zeroizing;
 

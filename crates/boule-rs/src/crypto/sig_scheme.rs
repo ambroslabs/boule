@@ -43,9 +43,109 @@ use std::fmt::{self, Debug};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
-use crate::consensus::hotstuff::qc::SignerBitmap;
 use crate::crypto::signed::ChainId;
-use crate::p2p::NodeId;
+use crate::identity::NodeId;
+
+/// Compact signer set, indexed over a validator set's sorted order.
+///
+/// Internally: little-endian-packed bits in a `Vec<u8>`, with the bit
+/// length stored as a `u32` so the postcard encoding is
+/// platform-independent (the `usize` from a validator set's `len` would
+/// be varint-encoded but we keep the on-wire width fixed to protect
+/// future protocol changes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignerBitmap {
+    bits: Vec<u8>,
+    len: u32,
+}
+
+impl SignerBitmap {
+    /// Build an all-zero bitmap of exactly `len` bits.
+    pub fn new(len: usize) -> Self {
+        let len_u32 =
+            u32::try_from(len).expect("validator set larger than u32::MAX is nonsensical");
+        let byte_len = len.div_ceil(8);
+        Self {
+            bits: vec![0u8; byte_len],
+            len: len_u32,
+        }
+    }
+
+    /// Number of bit positions this map indexes (typically
+    /// `validator_set.len()`).
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Set bit `idx`. Panics if `idx >= self.len()`.
+    pub fn set(&mut self, idx: usize) {
+        assert!(
+            idx < self.len(),
+            "SignerBitmap::set index {idx} out of bounds (len {})",
+            self.len()
+        );
+        self.bits[idx / 8] |= 1 << (idx % 8);
+    }
+
+    /// Returns whether bit `idx` is set. Out-of-range indices return
+    /// `false` (callers shouldn't rely on it, but this keeps iteration
+    /// code simple).
+    pub fn get(&self, idx: usize) -> bool {
+        if idx >= self.len() {
+            return false;
+        }
+        (self.bits[idx / 8] >> (idx % 8)) & 1 == 1
+    }
+
+    /// Count the set bits.
+    pub fn count(&self) -> usize {
+        self.bits.iter().map(|b| b.count_ones() as usize).sum()
+    }
+
+    /// Iterate over the set-bit indices in ascending order.
+    pub fn iter_set(&self) -> impl Iterator<Item = usize> + '_ {
+        let len = self.len();
+        self.bits
+            .iter()
+            .enumerate()
+            .flat_map(move |(byte_idx, byte)| {
+                (0..8).filter_map(move |bit| {
+                    let idx = byte_idx * 8 + bit;
+                    if idx < len && (byte >> bit) & 1 == 1 {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+            })
+    }
+
+    /// Well-formedness check: no bits are set beyond `self.len()` and
+    /// the backing byte length matches what `new(self.len())` would
+    /// produce. Constructors maintain this; call it when accepting a
+    /// bitmap from untrusted input.
+    pub fn is_well_formed(&self) -> bool {
+        let expected_bytes = self.len().div_ceil(8);
+        if self.bits.len() != expected_bytes {
+            return false;
+        }
+        // Check for stray bits past `self.len` inside the last byte.
+        let len = self.len();
+        if len % 8 != 0 {
+            let last = *self.bits.last().unwrap_or(&0);
+            let valid_bits_in_last = len % 8;
+            let mask: u8 = (1u16 << valid_bits_in_last).wrapping_sub(1) as u8;
+            if last & !mask != 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 /// A pluggable signature scheme for HotStuff QC aggregation.
 ///
@@ -604,7 +704,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use crate::crypto::signed::{NodeSigner, Signer};
-    use crate::p2p::identity::NodeIdentity;
+    use crate::identity::NodeIdentity;
 
     fn fresh_signer() -> NodeSigner {
         let kp = RcgenKeyPair::generate_for(&PKCS_ED25519).unwrap();

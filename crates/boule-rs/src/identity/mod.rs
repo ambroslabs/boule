@@ -31,6 +31,22 @@ use base64::Engine as _;
 use rcgen::{KeyPair, PKCS_ED25519};
 use zeroize::Zeroizing;
 
+/// A node's overlay address: the 32-byte Ed25519 public key.
+pub type NodeId = [u8; 32];
+
+/// Render a [`NodeId`] as base58 (the operator-facing form).
+pub fn node_id_to_base58(id: &NodeId) -> String {
+    bs58::encode(id).into_string()
+}
+
+/// Parse a base58 string back into a [`NodeId`].
+pub fn base58_to_node_id(s: &str) -> anyhow::Result<NodeId> {
+    let bytes = bs58::decode(s).into_vec().context("invalid base58")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("node ID must be 32 bytes"))
+}
+
 /// Loaded node identity: the PKCS#8 DER bytes of the Ed25519 key.
 ///
 /// The DER buffer is zeroized when dropped. Callers should keep this

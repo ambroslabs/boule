@@ -7,11 +7,11 @@ use tracing::{info, warn};
 use crate::cli::OutputFormat;
 use crate::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
 use crate::crypto::signed::ChainId;
-use crate::p2p::identity::KeyProvider;
-use crate::p2p::identity::encrypted_file::EncryptedFileKeyProvider;
-use crate::p2p::identity::env::EnvKeyProvider;
-use crate::p2p::identity::exec::ExecKeyProvider;
-use crate::p2p::identity::file::FileKeyProvider;
+use crate::identity::KeyProvider;
+use crate::identity::encrypted_file::EncryptedFileKeyProvider;
+use crate::identity::env::EnvKeyProvider;
+use crate::identity::exec::ExecKeyProvider;
+use crate::identity::file::FileKeyProvider;
 use crate::p2p::tls::{NodeId, base58_to_node_id, node_id_to_base58};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -1418,7 +1418,7 @@ pub fn build_provider(cfg: &IdentityConfig) -> anyhow::Result<Arc<dyn KeyProvide
         IdentityConfig::Keyring { service, account } => {
             let acct = account.clone().unwrap_or_else(default_keyring_account);
             Ok(Arc::new(
-                crate::p2p::identity::keyring::KeyringKeyProvider::new(service.clone(), acct),
+                crate::identity::keyring::KeyringKeyProvider::new(service.clone(), acct),
             ))
         }
         #[cfg(not(feature = "keyring-backend"))]

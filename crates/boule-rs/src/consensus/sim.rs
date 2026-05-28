@@ -72,7 +72,7 @@ use crate::consensus::node::{ConsensusNode, NodeConfigForConsensus};
 use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::{Height, View};
 use crate::crypto::signed::{NodeSigner, Signer};
-use crate::p2p::identity::NodeIdentity;
+use crate::identity::NodeIdentity;
 use crate::p2p::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
 use crate::p2p::overlay::gossip::overlay::{
     GossipOverlay, GossipOverlayConfig, GossipOverlayHandles, SpawnArgs,

@@ -2960,7 +2960,7 @@ mod tests {
     // ── D/E-series: event loop ────────────────────────────────────────────────
 
     use crate::crypto::signed::NodeSigner;
-    use crate::p2p::identity::NodeIdentity;
+    use crate::identity::NodeIdentity;
     use crate::p2p::{ProtocolEvent, ProtocolOutbound};
     use rcgen::KeyPair as RcgenKeyPair;
     use rcgen::PKCS_ED25519;

@@ -38,8 +38,8 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::sig_scheme::SignatureScheme;
-use crate::p2p::NodeId;
-use crate::p2p::identity::NodeIdentity;
+use crate::identity::NodeId;
+use crate::identity::NodeIdentity;
 
 /// A key that can produce Ed25519 signatures over arbitrary byte strings.
 ///
@@ -202,7 +202,7 @@ where
     ///
     /// ```
     /// use boule::crypto::signed::{ChainId, NodeSigner, Signed, SignedMessage, Signer};
-    /// use boule::p2p::identity::NodeIdentity;
+    /// use boule::identity::NodeIdentity;
     /// use rcgen::{KeyPair, PKCS_ED25519};
     /// use serde::{Deserialize, Serialize};
     /// use zeroize::Zeroizing;

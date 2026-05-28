@@ -56,7 +56,7 @@ use crate::consensus::validator_set::ValidatorSet;
 use crate::consensus::{Height, View};
 use crate::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
 use crate::p2p::NodeId;
-use crate::p2p::identity::NodeIdentity;
+use crate::identity::NodeIdentity;
 use crate::replication::block::{Block, BlockHash, BlockHeader};
 
 // ── Shared signer pool ──────────────────────────────────────────────

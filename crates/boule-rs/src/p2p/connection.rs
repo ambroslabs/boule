@@ -487,7 +487,7 @@ mod tests {
         use tokio_rustls::{TlsConnector, rustls};
         use zeroize::Zeroizing;
 
-        use crate::p2p::identity::NodeIdentity;
+        use crate::identity::NodeIdentity;
         use crate::p2p::tls::TlsIdentity;
 
         fn fresh_tls() -> Arc<TlsIdentity> {

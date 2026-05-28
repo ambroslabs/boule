@@ -13,20 +13,8 @@ use rustls::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 
-use super::identity::NodeIdentity;
-
-pub type NodeId = [u8; 32];
-
-pub fn node_id_to_base58(id: &NodeId) -> String {
-    bs58::encode(id).into_string()
-}
-
-pub fn base58_to_node_id(s: &str) -> anyhow::Result<NodeId> {
-    let bytes = bs58::decode(s).into_vec().context("invalid base58")?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("node ID must be 32 bytes"))
-}
+use crate::identity::NodeIdentity;
+pub use crate::identity::{NodeId, base58_to_node_id, node_id_to_base58};
 
 /// Unified stream type covering both inbound and outbound TLS connections.
 pub enum TlsStream {
@@ -289,7 +277,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::p2p::identity::NodeIdentity;
+    use crate::identity::NodeIdentity;
 
     fn fresh_identity() -> NodeIdentity {
         let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();

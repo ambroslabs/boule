@@ -43,6 +43,7 @@ pub mod block_sync_retry_timer;
 pub mod bls_key_history;
 pub(crate) mod crashpoint;
 pub mod dispatch;
+pub mod genesis;
 pub mod history_commitment;
 pub mod hotstuff;
 pub mod limits;

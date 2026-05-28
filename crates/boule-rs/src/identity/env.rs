@@ -63,7 +63,7 @@ impl KeyProvider for EnvKeyProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::identity::{der_to_pem, generate_pkcs8_der};
+    use crate::identity::{der_to_pem, generate_pkcs8_der};
 
     // Env vars are process-global; pick names unique to each test.
 

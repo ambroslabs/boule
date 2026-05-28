@@ -69,7 +69,7 @@ impl KeyProvider for ExecKeyProvider {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::p2p::identity::{der_to_pem, generate_pkcs8_der};
+    use crate::identity::{der_to_pem, generate_pkcs8_der};
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
 

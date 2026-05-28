@@ -47,7 +47,7 @@
 //!   unmodified under both real time and the deterministic simulator.
 //! - [`p2p`] — TLS-authenticated transport, a protocol multiplexer, a peer
 //!   manager, and a request/response [`p2p::rpc`] layer on top of it. The
-//!   node's [`p2p::identity`] (Ed25519) IS its overlay address.
+//!   node's [`identity`] (Ed25519) IS its overlay address.
 //! - [`crypto`] — application-level signed envelopes that survive being
 //!   forwarded through intermediaries or reconstructed from storage.
 //! - [`clock`] — object-safe time abstraction; real [`clock::TokioClock`]
@@ -72,6 +72,7 @@ pub mod clock;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
+pub mod identity;
 pub mod node;
 pub mod p2p;
 pub mod paths;
