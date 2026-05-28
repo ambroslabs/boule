@@ -37,5 +37,4 @@ cargo deny check
 ## PRs & issues
 
 - Close the issue from the PR body: `Closes #N` / `Fixes #N`.
-- Land a single PR with `gh pr merge <N> --squash --delete-branch`; rebase first if behind `main`.
 - New issues need exactly one `priority:` and one `size:` label — no other labels unless asked.
