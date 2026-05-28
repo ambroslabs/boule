@@ -3,6 +3,22 @@
 Rust P2P consensus node. Read [README.md](README.md) (what it is) and
 [CONTRIBUTING.md](CONTRIBUTING.md) (setup, test shards, PR flow) first.
 
+## Module map (`src/`)
+
+Layered top-to-bottom; `src/lib.rs` has the full layer diagram.
+
+- `consensus/` — HotStuff-style BFT replica: safety core, `pacemaker/`, `hotstuff/`, validator set + rotation, block/snapshot sync.
+- `replication/` — block, mempool, and snapshot replication plus the state machine.
+- `p2p/` — TLS transport, peer `manager`, `rpc` request/response, `overlay/` (gossip), `identity/` (Ed25519 key = node address).
+- `crypto/` — signing schemes (Ed25519, BLS) and `Signed` envelopes.
+- `storage/` — `Storage` (KV) + `Wal` traits; in-memory (sim) and `redb` (durable) backends.
+- `clock/` — object-safe time: real `TokioClock`, virtual `SimClock` for tests.
+- `node.rs` — top-level runtime that wires it all together (`node::run`).
+- `cli.rs`, `config.rs`, `paths.rs` — CLI subcommands, config parsing, default file locations.
+- `testnet/` — local multi-node testnet driver (the `testnet` bin).
+
+Binaries: `src/main.rs` (the `ambros-p2p` node), `src/bin/testnet.rs` (testnet driver).
+
 ## Before pushing — all four gate CI
 
 ```sh
