@@ -704,6 +704,71 @@ mod tests {
     use zeroize::Zeroizing;
 
     use crate::crypto::signed::{NodeSigner, Signer};
+
+    // ── SignerBitmap ─────────────────────────────────────────────
+
+    #[test]
+    fn signer_bitmap_basic_set_get_count() {
+        let mut bm = SignerBitmap::new(10);
+        assert_eq!(bm.len(), 10);
+        assert_eq!(bm.count(), 0);
+
+        bm.set(0);
+        bm.set(3);
+        bm.set(9);
+
+        assert!(bm.get(0));
+        assert!(!bm.get(1));
+        assert!(bm.get(3));
+        assert!(bm.get(9));
+        assert!(!bm.get(10), "out-of-range read returns false, not panic");
+        assert_eq!(bm.count(), 3);
+
+        let set: Vec<usize> = bm.iter_set().collect();
+        assert_eq!(set, vec![0, 3, 9]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn signer_bitmap_set_oob_panics() {
+        let mut bm = SignerBitmap::new(4);
+        bm.set(4);
+    }
+
+    #[test]
+    fn signer_bitmap_is_well_formed_after_normal_construction() {
+        let mut bm = SignerBitmap::new(13);
+        for i in [1, 5, 12] {
+            bm.set(i);
+        }
+        assert!(bm.is_well_formed());
+    }
+
+    #[test]
+    fn signer_bitmap_rejects_stray_bits_past_len() {
+        let mut bm = SignerBitmap::new(5);
+        // Poke a stray bit 7 (inside byte 0 but past len=5).
+        bm.bits[0] |= 0b1000_0000;
+        assert!(!bm.is_well_formed());
+    }
+
+    #[test]
+    fn signer_bitmap_rejects_wrong_byte_length() {
+        let mut bm = SignerBitmap::new(5);
+        bm.bits.push(0);
+        assert!(!bm.is_well_formed());
+    }
+
+    #[test]
+    fn signer_bitmap_postcard_roundtrip() {
+        let mut bm = SignerBitmap::new(17);
+        for i in [0, 7, 8, 16] {
+            bm.set(i);
+        }
+        let wire = postcard::to_stdvec(&bm).unwrap();
+        let back: SignerBitmap = postcard::from_bytes(&wire).unwrap();
+        assert_eq!(back, bm);
+    }
     use crate::identity::NodeIdentity;
 
     fn fresh_signer() -> NodeSigner {

@@ -129,53 +129,33 @@ impl CacheLimits {
     /// drift.
     pub fn production_defaults() -> Self {
         Self {
-            vote_bucket_capacity: DEFAULT_VOTE_BUCKET_CAPACITY,
-            parked_proposals_capacity: DEFAULT_PARKED_PROPOSALS_CAPACITY,
-            pending_blocks_capacity: DEFAULT_PENDING_BLOCKS_CAPACITY,
-            timeout_buckets_capacity: DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
-            block_sync_initial_backoff_views: DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
-            block_sync_max_backoff_views: DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
-            block_sync_per_peer_attempts: DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
-            block_sync_max_attempts: DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
+            vote_bucket_capacity: crate::config::DEFAULT_VOTE_BUCKET_CAPACITY,
+            parked_proposals_capacity: crate::config::DEFAULT_PARKED_PROPOSALS_CAPACITY,
+            pending_blocks_capacity: crate::config::DEFAULT_PENDING_BLOCKS_CAPACITY,
+            timeout_buckets_capacity: crate::config::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
+            block_sync_initial_backoff_views: crate::config::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
+            block_sync_max_backoff_views: crate::config::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
+            block_sync_per_peer_attempts: crate::config::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
+            block_sync_max_attempts: crate::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
+        }
+    }
+
+    /// Project the parsed `[consensus.limits]` config into the runtime
+    /// cap shape. `mempool_capacity` is consumed separately by the node
+    /// wiring and does not appear here.
+    pub fn from_config(c: &crate::config::ConsensusLimits) -> Self {
+        Self {
+            vote_bucket_capacity: c.vote_bucket_capacity,
+            parked_proposals_capacity: c.parked_proposals_capacity,
+            pending_blocks_capacity: c.pending_blocks_capacity,
+            timeout_buckets_capacity: c.timeout_buckets_capacity,
+            block_sync_initial_backoff_views: c.block_sync_initial_backoff_views,
+            block_sync_max_backoff_views: c.block_sync_max_backoff_views,
+            block_sync_per_peer_attempts: c.block_sync_per_peer_attempts,
+            block_sync_max_attempts: c.block_sync_max_attempts,
         }
     }
 }
-
-/// Default cap on the `vote_bucket` map. Sized for four to a few dozen
-/// validators across a Byzantine-flood window of a few hundred views.
-pub const DEFAULT_VOTE_BUCKET_CAPACITY: usize = 1024;
-/// Default cap on `parked_proposals`. Each parked proposal is at most
-/// one in-flight `RequestBlock` retry per pacemaker tick, so this also
-/// caps the per-tick block-sync request rate.
-pub const DEFAULT_PARKED_PROPOSALS_CAPACITY: usize = 256;
-/// Default cap on `pending_blocks`. Generous for a steady-state node
-/// (which only needs a handful of blocks above the commit frontier),
-/// tight enough that a flood of distinct future-height blocks gets
-/// pruned before consuming meaningful memory.
-pub const DEFAULT_PENDING_BLOCKS_CAPACITY: usize = 1024;
-/// Default cap on the integration layer's timeout-vote buckets.
-pub const DEFAULT_TIMEOUT_BUCKETS_CAPACITY: usize = 1024;
-/// Default initial views between successive `RequestBlock` retries on
-/// the same parent hash. The first retry is eligible after one
-/// `PacemakerAdvance`; subsequent retries double the gap up to
-/// [`DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS`].
-pub const DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS: u64 = 1;
-/// Default ceiling on the per-parent-hash retry gap in views. With the
-/// default initial of `1` and the doubling schedule, the gap saturates
-/// here after roughly four attempts.
-pub const DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS: u64 = 8;
-/// Default attempts at the same peer before rotating to the next
-/// validator in the ring. Two gives the original sender a brief retry
-/// window (one redelivery in case the first probe was lost in flight)
-/// before fanning out.
-pub const DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS: u32 = 2;
-/// Default total `RequestBlock` budget per parent hash. With the
-/// default `per_peer = 2`, eight attempts cover the original sender
-/// plus three rotation rounds, which exhausts the four-validator
-/// ring twice. After this, the parked proposals depending on the
-/// missing parent are dropped and the
-/// [`CacheEvictionCounters::block_sync_dropped`] counter ticks.
-pub const DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS: u32 = 8;
 
 /// Atomic counters tracking forced evictions across the consensus
 /// caches. Cheap to clone (each inner counter is an `Arc<AtomicU64>`)
@@ -265,6 +245,30 @@ impl CacheEvictionCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_config_maps_every_field() {
+        let cfg = crate::config::ConsensusLimits {
+            vote_bucket_capacity: 11,
+            parked_proposals_capacity: 22,
+            pending_blocks_capacity: 33,
+            timeout_buckets_capacity: 44,
+            block_sync_initial_backoff_views: 5,
+            block_sync_max_backoff_views: 6,
+            block_sync_per_peer_attempts: 7,
+            block_sync_max_attempts: 8,
+            mempool_capacity: 99,
+        };
+        let runtime = CacheLimits::from_config(&cfg);
+        assert_eq!(runtime.vote_bucket_capacity, 11);
+        assert_eq!(runtime.parked_proposals_capacity, 22);
+        assert_eq!(runtime.pending_blocks_capacity, 33);
+        assert_eq!(runtime.timeout_buckets_capacity, 44);
+        assert_eq!(runtime.block_sync_initial_backoff_views, 5);
+        assert_eq!(runtime.block_sync_max_backoff_views, 6);
+        assert_eq!(runtime.block_sync_per_peer_attempts, 7);
+        assert_eq!(runtime.block_sync_max_attempts, 8);
+    }
 
     #[test]
     fn defaults_are_sane() {

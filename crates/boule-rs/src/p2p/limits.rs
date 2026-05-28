@@ -309,6 +309,30 @@ pub struct RateLimitsConfig {
 }
 
 impl RateLimitsConfig {
+    /// Project the parsed `[p2p.limits]` rate + violation fields into
+    /// the runtime rate-limit shape.
+    pub fn from_config(c: &crate::config::P2pLimitsConfig) -> Self {
+        Self {
+            proposal_per_sec: c.rate.proposal_per_sec,
+            vote_per_sec: c.rate.vote_per_sec,
+            timeout_vote_per_sec: c.rate.timeout_vote_per_sec,
+            new_view_per_sec: c.rate.new_view_per_sec,
+            request_block_per_sec: c.rate.request_block_per_sec,
+            receive_block_per_sec: c.rate.receive_block_per_sec,
+            snapshot_manifest_request_per_sec: c.rate.snapshot_manifest_request_per_sec,
+            snapshot_manifest_response_per_sec: c.rate.snapshot_manifest_response_per_sec,
+            snapshot_chunk_request_per_sec: c.rate.snapshot_chunk_request_per_sec,
+            snapshot_chunk_response_per_sec: c.rate.snapshot_chunk_response_per_sec,
+            block_range_request_per_sec: c.rate.block_range_request_per_sec,
+            block_range_response_per_sec: c.rate.block_range_response_per_sec,
+            bytes_per_sec: c.rate.bytes_per_sec,
+            outbound_bytes_per_sec: c.rate.outbound_bytes_per_sec,
+            burst_seconds: c.rate.burst_seconds,
+            violation_window: std::time::Duration::from_secs(c.violations.window_secs),
+            max_violations: c.violations.max_violations,
+        }
+    }
+
     /// Permissive defaults that effectively disable rate limiting.
     /// Used by the consensus property tests and the simulator's
     /// happy-path harness so an unrelated rate spike never perturbs
@@ -737,6 +761,20 @@ pub struct ConnectionLimitsConfig {
 }
 
 impl ConnectionLimitsConfig {
+    /// Project the parsed `[p2p.limits]` connection-cap fields into the
+    /// runtime shape. The overlay-layer `max_total` cap (#187) is not
+    /// sourced from `[p2p.limits]`; callers that want the merged view
+    /// (combining `[overlay].total_max`) build the runtime config in
+    /// the node wiring's `build_connection_limiter`.
+    pub fn from_config(c: &crate::config::P2pLimitsConfig) -> Self {
+        Self {
+            max_inbound: c.max_inbound_connections,
+            max_outbound: c.max_outbound_connections,
+            max_per_ip: c.max_connections_per_ip,
+            max_total: usize::MAX,
+        }
+    }
+
     /// Defaults baked into the binary when the operator omits
     /// `[p2p.limits]` connection caps. Loose enough for a 4–dozen-
     /// validator cluster.
@@ -924,6 +962,24 @@ mod tests {
 
     fn nid(b: u8) -> NodeId {
         [b; 32]
+    }
+
+    #[test]
+    fn from_config_projects_p2p_limits() {
+        let cfg = crate::config::P2pLimitsConfig::default();
+        let rate = RateLimitsConfig::from_config(&cfg);
+        assert_eq!(rate.vote_per_sec, cfg.rate.vote_per_sec);
+        assert_eq!(rate.bytes_per_sec, cfg.rate.bytes_per_sec);
+        assert_eq!(
+            rate.violation_window,
+            std::time::Duration::from_secs(cfg.violations.window_secs)
+        );
+        assert_eq!(rate.max_violations, cfg.violations.max_violations);
+        let conn = ConnectionLimitsConfig::from_config(&cfg);
+        assert_eq!(conn.max_inbound, cfg.max_inbound_connections);
+        assert_eq!(conn.max_outbound, cfg.max_outbound_connections);
+        assert_eq!(conn.max_per_ip, cfg.max_connections_per_ip);
+        assert_eq!(conn.max_total, usize::MAX);
     }
 
     /// A clock that returns whatever `set` was last called with.

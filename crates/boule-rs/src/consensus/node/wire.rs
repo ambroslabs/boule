@@ -20,7 +20,9 @@ pub const PROTOCOL_ID: u8 = 0x03;
 /// Maximum encoded frame size accepted from the wire for this protocol.
 /// Sized to accommodate a full block with up to ~1000 moderate-sized
 /// commands; production tuning can raise this without protocol changes.
-pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+/// Defined in the shared config layer so config validation can bound
+/// `snapshot_chunk_size_bytes` against it.
+pub use crate::config::MAX_FRAME_BYTES;
 
 /// Signed payload of a [`WireMessage::BlockResponse`].
 ///

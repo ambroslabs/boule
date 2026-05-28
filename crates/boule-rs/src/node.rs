@@ -184,7 +184,7 @@ pub async fn run(
         // `dispatch::ingress` ever runs.
         let rate_limiter = config.p2p.limits.as_ref().map(|l| {
             Arc::new(p2p::limits::RateLimiter::new(
-                l.rate_limits(),
+                crate::p2p::limits::RateLimitsConfig::from_config(l),
                 Arc::clone(&clock),
             ))
         });
@@ -385,7 +385,7 @@ async fn start_consensus(
         propose_limit: cons_cfg.propose_limit,
         timeout_base: Duration::from_millis(cons_cfg.timeout_base_ms),
         timeout_max: Duration::from_millis(cons_cfg.timeout_max_ms),
-        limits: cons_cfg.limits.to_cache_limits(),
+        limits: crate::consensus::limits::CacheLimits::from_config(&cons_cfg.limits),
         snapshot_policy: crate::replication::snapshot::SnapshotPolicy {
             interval_blocks: cons_cfg.snapshot_interval_blocks,
             retention_count: cons_cfg.snapshot_retention_count,
@@ -510,7 +510,7 @@ async fn start_consensus(
 fn build_connection_limiter(config: &Config) -> Option<Arc<p2p::limits::ConnectionLimiter>> {
     use p2p::limits::ConnectionLimitsConfig;
 
-    let limits = config.p2p.limits.as_ref().map(|l| l.connection_limits());
+    let limits = config.p2p.limits.as_ref().map(|l| crate::p2p::limits::ConnectionLimitsConfig::from_config(l));
     let overlay_caps_active = config.overlay.mode == OverlayMode::Gossip;
 
     let merged = match (limits, overlay_caps_active) {
@@ -831,7 +831,7 @@ fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Resul
 mod tests {
     use super::*;
     use crate::config::ConsensusLimits;
-    use crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY;
+    use crate::config::DEFAULT_VOTE_BUCKET_CAPACITY;
     use crate::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
     use crate::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
     use crate::storage::MemoryStorage;
