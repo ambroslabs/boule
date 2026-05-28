@@ -32,7 +32,7 @@ is required.
 file ensures the correct toolchain is selected automatically.
 
 ```sh
-git clone https://github.com/ambroslabs/boule-rs.git
+git clone https://github.com/ambroslabs/boule.git
 cd boule
 cargo build
 ```

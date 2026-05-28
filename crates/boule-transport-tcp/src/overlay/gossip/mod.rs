@@ -20,7 +20,7 @@
 //!    relying on receivers to forward on (with deduplication).
 //!
 //! See issue #137 for the full design and the [breakdown
-//! comment](https://github.com/ambroslabs/boule-rs/issues/137#issuecomment-4319359359)
+//! comment](https://github.com/ambroslabs/boule/issues/137#issuecomment-4319359359)
 //! for the per-PR plan.
 //!
 //! # Protocol ID

@@ -3,9 +3,9 @@ name = "boule-consensus"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "HotStuff-style BFT consensus core and block/snapshot replication for boule. Transport-agnostic: depends only on boule-rs primitives."
-repository = "https://github.com/ambroslabs/boule-rs"
-homepage = "https://github.com/ambroslabs/boule-rs"
+description = "HotStuff-style BFT consensus core and block/snapshot replication for boule. Transport-agnostic: depends only on boule primitives."
+repository = "https://github.com/ambroslabs/boule"
+homepage = "https://github.com/ambroslabs/boule"
 
 [features]
 # Crash-injection seam (issue #420): compiles the `crashpoint!` firing
@@ -19,7 +19,7 @@ crashpoints = []
 testing = []
 
 [dependencies]
-boule-rs    = { path = "../boule-rs", version = "0.1.0" }
+boule-core  = { path = "../boule-core", version = "0.1.0" }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 postcard    = { version = "1", default-features = false, features = ["use-std"] }
@@ -36,7 +36,7 @@ tokio       = { version = "1", features = ["full"] }
 axum        = "0.8"
 
 [dev-dependencies]
-boule-rs    = { path = "../boule-rs", version = "0.1.0", features = ["testing"] }
+boule-core  = { path = "../boule-core", version = "0.1.0", features = ["testing"] }
 tokio       = { version = "1", features = ["full", "test-util"] }
 proptest    = { version = "1", default-features = false, features = ["std", "bit-set"] }
 rcgen       = { version = "0.13", default-features = false, features = ["ring", "pem"] }

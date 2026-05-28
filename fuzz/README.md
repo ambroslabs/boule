@@ -1,4 +1,4 @@
-# `boule-rs-fuzz`
+# `boule-fuzz`
 
 [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets for
 the consensus layer.

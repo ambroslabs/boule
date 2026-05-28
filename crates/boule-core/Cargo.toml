@@ -1,11 +1,11 @@
 [package]
-name = "boule-rs"
+name = "boule-core"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "A peer-to-peer runtime hosting a HotStuff-style BFT consensus layer (library)."
-repository = "https://github.com/ambroslabs/boule-rs"
-homepage = "https://github.com/ambroslabs/boule-rs"
+description = "Bottom-layer primitives for boule: crypto, identity, storage, clock, config (library)."
+repository = "https://github.com/ambroslabs/boule"
+homepage = "https://github.com/ambroslabs/boule"
 
 [lib]
 name = "boule"

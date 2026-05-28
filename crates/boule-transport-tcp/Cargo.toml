@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "TCP/TLS transport implementation for boule: authenticated transport, peer manager, RPC, and the gossip overlay implementing boule-transport."
-repository = "https://github.com/ambroslabs/boule-rs"
-homepage = "https://github.com/ambroslabs/boule-rs"
+repository = "https://github.com/ambroslabs/boule"
+homepage = "https://github.com/ambroslabs/boule"
 
 [dependencies]
-boule-rs        = { path = "../boule-rs", version = "0.1.0" }
+boule-core      = { path = "../boule-core", version = "0.1.0" }
 boule-transport = { path = "../boule-transport", version = "0.1.0" }
 tokio           = { version = "1", features = ["full"] }
 tokio-util      = { version = "0.7", features = ["codec"] }
