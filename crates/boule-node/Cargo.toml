@@ -1,0 +1,34 @@
+[package]
+name = "boule-node"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A peer-to-peer runtime hosting a HotStuff-style BFT consensus layer (node binary)."
+repository = "https://github.com/ambroslabs/boule-rs"
+homepage = "https://github.com/ambroslabs/boule-rs"
+
+# The node binary. `boule-rs` exposes its library as `boule`, so both the
+# binary and the testnet driver import it as `use boule::...`.
+[[bin]]
+name = "boule"
+path = "src/main.rs"
+
+# The `testnet` driver binary is auto-discovered from src/bin/testnet.rs.
+
+[dependencies]
+boule-rs           = { path = "../boule-rs", version = "0.1.0" }
+tokio              = { version = "1", features = ["full"] }
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+hex                = "0.4"
+bytes              = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+tokio              = { version = "1", features = ["full", "test-util"] }
+tempfile           = "3"
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+libc               = "0.2"
+futures-util       = { version = "0.3", features = ["sink"] }

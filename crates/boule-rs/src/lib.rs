@@ -1,11 +1,12 @@
 //! `boule` — a peer-to-peer runtime hosting a HotStuff-style BFT
 //! consensus layer.
 //!
-//! The crate ships both a library target (these modules) and a binary target
-//! (`src/main.rs`) that wires them into a running node. Keeping the layering
-//! in a library lets `cargo test --doc` compile the examples here and lets
-//! integration tests + the `start` subcommand share one definition of "what
-//! a running node looks like" via [`node::run`].
+//! This is the `boule-rs` library crate (these modules). The companion
+//! `boule-node` crate provides the `boule` binary that wires them into a
+//! running node. Keeping the layering in a library lets `cargo test --doc`
+//! compile the examples here and lets integration tests + the `start`
+//! subcommand share one definition of "what a running node looks like" via
+//! [`node::run`].
 //!
 //! # Layer map
 //!
