@@ -1,4 +1,4 @@
-# Testnet smoke sweep — `zrbecker/ambros-p2p`
+# Testnet smoke sweep — `ambroslabs/ambros-p2p`
 
 ## Goal
 
@@ -29,7 +29,7 @@ starting any work. If the user doesn't answer, default to **30 min**.
 
 ## Setup (all tiers)
 
-In a clean checkout of `zrbecker/ambros-p2p` at `origin/main` HEAD, from the
+In a clean checkout of `ambroslabs/ambros-p2p` at `origin/main` HEAD, from the
 repo root:
 
 ```sh

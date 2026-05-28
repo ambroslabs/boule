@@ -299,9 +299,9 @@ Prefer linking the section rather than re-deriving the tradeoff in a code
 comment. Keep the notes in sync with the code; if the code deviates from
 what's described here, update both.
 
-[issue-23]: https://github.com/zrbecker/ambros-p2p/issues/23
-[#93]: https://github.com/zrbecker/ambros-p2p/issues/93
-[#94]: https://github.com/zrbecker/ambros-p2p/pull/94
-[#95]: https://github.com/zrbecker/ambros-p2p/pull/95
-[#96]: https://github.com/zrbecker/ambros-p2p/pull/96
-[#24]: https://github.com/zrbecker/ambros-p2p/issues/24
+[issue-23]: https://github.com/ambroslabs/ambros-p2p/issues/23
+[#93]: https://github.com/ambroslabs/ambros-p2p/issues/93
+[#94]: https://github.com/ambroslabs/ambros-p2p/pull/94
+[#95]: https://github.com/ambroslabs/ambros-p2p/pull/95
+[#96]: https://github.com/ambroslabs/ambros-p2p/pull/96
+[#24]: https://github.com/ambroslabs/ambros-p2p/issues/24

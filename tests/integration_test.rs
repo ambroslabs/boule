@@ -789,7 +789,7 @@ async fn test_consensus_status_endpoint_reports_live_progress() {
 /// Spawn a consensus-running node with `[overlay] mode = "gossip"`.
 /// `[[peers]]` is left empty; reachability is driven by
 /// `bootstrap_addrs` which the gossip overlay's
-/// [`Discovery::add_bootstrap`](https://github.com/zrbecker/ambros-p2p/issues/137)
+/// [`Discovery::add_bootstrap`](https://github.com/ambroslabs/ambros-p2p/issues/137)
 /// dials as TOFU.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_consensus_node_gossip(

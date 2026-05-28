@@ -26,7 +26,7 @@ scenario that exercises crash recovery and dynamic membership tolerance.
 Clone and build once:
 
 ```sh
-git clone https://github.com/zrbecker/ambros-p2p.git
+git clone https://github.com/ambroslabs/ambros-p2p.git
 cd ambros-p2p
 cargo build --release
 ```
@@ -1020,7 +1020,7 @@ re-adding it) uses a separate, dedicated mechanism — the dual-signed
 ["Rotating a validator's consensus signing key" section in
 operations.md][rotation-runbook] for the runbook.
 
-[rotation-tx]: https://github.com/zrbecker/ambros-p2p/blob/main/src/consensus/validator_rotation.rs
+[rotation-tx]: https://github.com/ambroslabs/ambros-p2p/blob/main/src/consensus/validator_rotation.rs
 [rotation-runbook]: operations.md#rotating-a-validators-consensus-signing-key-issue-142
 
 Also note the older note in §2 above (under "Network identity vs.
