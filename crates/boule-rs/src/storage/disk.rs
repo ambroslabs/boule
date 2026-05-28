@@ -1290,18 +1290,30 @@ mod tests {
 
         // Seed so the parent always finds the marker file even if SIGKILL
         // hits before the first flush.
-        std::fs::write(&marker_path, "0").unwrap();
+        write_marker_atomically(&marker_path, "0").unwrap();
 
         let w = DiskWal::open(&path).unwrap();
         for i in 1u64.. {
             w.append(format!("entry-{i}").as_bytes()).unwrap();
             w.flush().unwrap();
-            // Best-effort marker; an intervening SIGKILL is the whole
-            // point. `_ = ` instead of `.unwrap()` because the parent may
-            // have torn down the temp dir between the write and us
-            // re-checking errno.
-            let _ = std::fs::write(&marker_path, i.to_string());
+            // Best-effort marker; an intervening SIGKILL is the whole point,
+            // so `_ =` rather than `.unwrap()`. The write is atomic (temp +
+            // rename) so a SIGKILL mid-write can never leave the parent a
+            // torn value to parse.
+            let _ = write_marker_atomically(&marker_path, &i.to_string());
         }
+    }
+
+    /// Write `value` to `marker_path` atomically: stage it in a sibling temp
+    /// file, then `rename()` it into place. rename is atomic on a single
+    /// filesystem, so a reader (the parent) only ever observes the previous
+    /// complete value or the new complete value — never a partial write left
+    /// behind by a SIGKILL that lands mid-`write`.
+    #[cfg(unix)]
+    fn write_marker_atomically(marker_path: &str, value: &str) -> std::io::Result<()> {
+        let tmp = format!("{marker_path}.tmp");
+        std::fs::write(&tmp, value)?;
+        std::fs::rename(&tmp, marker_path)
     }
 
     #[test]
