@@ -60,8 +60,8 @@ use crate::replication::block::Block;
 /// use std::sync::Arc;
 /// use tokio::sync::mpsc;
 ///
-/// use ambros_p2p::consensus::api::{CommitNotifier, MpscCommitNotifier};
-/// use ambros_p2p::consensus::node::ConsensusNode;
+/// use boule::consensus::api::{CommitNotifier, MpscCommitNotifier};
+/// use boule::consensus::node::ConsensusNode;
 ///
 /// # fn build(node: ConsensusNode) -> ConsensusNode {
 /// let (tx, mut rx) = mpsc::channel(4096);
@@ -147,7 +147,7 @@ impl CommitNotifier for MpscCommitNotifier {
                 // test surfaces the cause instead of OOMing.
                 self.overflows.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
-                    target: "ambros_p2p::consensus::api",
+                    target: "boule::consensus::api",
                     "MpscCommitNotifier dropped commit on full channel"
                 );
             }

@@ -1,7 +1,7 @@
 # Back-pressure policy
 
 System-wide reference for every queue, channel, and buffer in
-`ambros-p2p`. Each entry records what the path carries, the chosen
+`boule`. Each entry records what the path carries, the chosen
 overflow policy, and *why* — so a future contributor can adjust a
 capacity or convert a `try_send` to a `send().await` (or the other way
 round) without rediscovering the trade-offs.

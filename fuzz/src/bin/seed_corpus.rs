@@ -35,20 +35,20 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use ambros_p2p::consensus::hotstuff::qc::{
+use boule::consensus::hotstuff::qc::{
     NewView, Proposal, QuorumCertificate, TimeoutVote, Vote,
 };
-use ambros_p2p::consensus::node::{BlockResponsePayload, WireMessage};
-use ambros_p2p::crypto::signed::Signed;
-use ambros_p2p::p2p::NodeId;
-use ambros_p2p::replication::block::{Block, BlockHeader};
+use boule::consensus::node::{BlockResponsePayload, WireMessage};
+use boule::crypto::signed::Signed;
+use boule::p2p::NodeId;
+use boule::replication::block::{Block, BlockHeader};
 use bytes::Bytes;
 
 const N_VALIDATORS: usize = 4;
 
 /// Same NodeId space as the fuzz target's validator set: `[1; 32]
 /// .. [4; 32]`. Using a real validator NodeId here lets the
-/// signer-membership check in [`ambros_p2p::consensus::dispatch::ingress_wire`]
+/// signer-membership check in [`boule::consensus::dispatch::ingress_wire`]
 /// pass, so the seed exercises the path into envelope-sig verification.
 fn validator_node_id(idx: u8) -> NodeId {
     [idx; 32]
@@ -80,7 +80,7 @@ fn signed<T>(payload: T, signer_idx: u8) -> Signed<T> {
 /// well-formed under [`is_well_formed`] — libFuzzer mutates from there
 /// to explore stray-bit and length-mismatch territory.
 ///
-/// [`is_well_formed`]: ambros_p2p::consensus::hotstuff::qc::SignerBitmap::is_well_formed
+/// [`is_well_formed`]: boule::consensus::hotstuff::qc::SignerBitmap::is_well_formed
 fn placeholder_qc(view: u64, block_hash: [u8; 32]) -> QuorumCertificate {
     let mut qc = QuorumCertificate::new(view, block_hash, N_VALIDATORS);
     for i in 0..N_VALIDATORS {

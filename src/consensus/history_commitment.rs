@@ -21,7 +21,7 @@
 //!
 //! # Domain separation
 //!
-//! The hash starts with the byte string `b"ambros.history_commitment.v1"`
+//! The hash starts with the byte string `b"boule.history_commitment.v1"`
 //! followed by a versioning byte. Versioning lets a future v2 — for
 //! instance, one that adds a fourth history table — be computed
 //! distinguishably even on inputs the v1 code would also accept.
@@ -50,7 +50,7 @@ use crate::replication::block::Block;
 
 /// Domain tag mixed into the leading bytes of the v1 commitment. Bumped
 /// alongside the function name on any future shape change.
-const DOMAIN_V1: &[u8] = b"ambros.history_commitment.v1";
+const DOMAIN_V1: &[u8] = b"boule.history_commitment.v1";
 
 /// Compute the v1 commitment over a `(set_history, key_history,
 /// bls_key_history?)` triple. See the module-level docs for framing.

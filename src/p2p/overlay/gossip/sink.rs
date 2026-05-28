@@ -111,7 +111,7 @@ impl OverlayUnicast for OverlaySink {
                 // peer's connection task has stalled.
                 self.overflows.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    target: "ambros_p2p::p2p::overlay::gossip",
+                    target: "boule::p2p::overlay::gossip",
                     target_peer = %node_id_to_base58(&target),
                     payload_bytes,
                     channel_capacity = self.send_tx.capacity(),
@@ -123,7 +123,7 @@ impl OverlayUnicast for OverlaySink {
                 // shortly after via its own shutdown path; nothing to
                 // do here.
                 warn!(
-                    target: "ambros_p2p::p2p::overlay::gossip",
+                    target: "boule::p2p::overlay::gossip",
                     target_peer = %node_id_to_base58(&target),
                     "overlay_sink_drop_closed",
                 );

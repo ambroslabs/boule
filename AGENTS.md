@@ -17,7 +17,7 @@ Layered top-to-bottom; `src/lib.rs` has the full layer diagram.
 - `cli.rs`, `config.rs`, `paths.rs` — CLI subcommands, config parsing, default file locations.
 - `testnet/` — local multi-node testnet driver (the `testnet` bin).
 
-Binaries: `src/main.rs` (the `ambros-p2p` node), `src/bin/testnet.rs` (testnet driver).
+Binaries: `src/main.rs` (the `boule` node), `src/bin/testnet.rs` (testnet driver).
 
 ## Before pushing — all four gate CI
 

@@ -23,9 +23,9 @@
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! use ambros_p2p::clock::{Clock, TokioClock};
-//! use ambros_p2p::p2p::{self, PeerCommand};
-//! use ambros_p2p::p2p::rpc::RpcBuilder;
+//! use boule::clock::{Clock, TokioClock};
+//! use boule::p2p::{self, PeerCommand};
+//! use boule::p2p::rpc::RpcBuilder;
 //! use bytes::Bytes;
 //! use tokio::sync::{mpsc, oneshot};
 //! use tokio_util::sync::CancellationToken;
@@ -448,9 +448,9 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Bytes, Bytes>> + Sen
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use ambros_p2p::clock::{Clock, TokioClock};
-/// use ambros_p2p::p2p::{NodeId, ProtocolHandle};
-/// use ambros_p2p::p2p::rpc::RpcBuilder;
+/// use boule::clock::{Clock, TokioClock};
+/// use boule::p2p::{NodeId, ProtocolHandle};
+/// use boule::p2p::rpc::RpcBuilder;
 /// use bytes::Bytes;
 /// use tokio_util::sync::CancellationToken;
 ///
@@ -516,9 +516,9 @@ where
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use ambros_p2p::clock::{Clock, TokioClock};
-/// use ambros_p2p::p2p::{NodeId, ProtocolHandle};
-/// use ambros_p2p::p2p::rpc::RpcBuilder;
+/// use boule::clock::{Clock, TokioClock};
+/// use boule::p2p::{NodeId, ProtocolHandle};
+/// use boule::p2p::rpc::RpcBuilder;
 /// use bytes::Bytes;
 /// use tokio_util::sync::CancellationToken;
 ///

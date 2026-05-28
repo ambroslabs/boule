@@ -31,7 +31,7 @@
 //! [`ProtocolHandle`] you can drive a protocol task from:
 //!
 //! ```no_run
-//! use ambros_p2p::p2p::{PeerCommand, ProtocolHandle};
+//! use boule::p2p::{PeerCommand, ProtocolHandle};
 //! use tokio::sync::{mpsc, oneshot};
 //!
 //! # async fn wiring(p2p_cmd_tx: mpsc::Sender<PeerCommand>) -> anyhow::Result<()> {
@@ -132,11 +132,11 @@ pub use tls::NodeId;
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use ambros_p2p::clock::{Clock, TokioClock};
-/// use ambros_p2p::p2p::{ConnectionProtocol, NodeId};
-/// use ambros_p2p::p2p::manager::ManagerMsg;
-/// use ambros_p2p::p2p::tls::TlsIdentity;
-/// use ambros_p2p::p2p::tls_protocol::TlsConnectionProtocol;
+/// use boule::clock::{Clock, TokioClock};
+/// use boule::p2p::{ConnectionProtocol, NodeId};
+/// use boule::p2p::manager::ManagerMsg;
+/// use boule::p2p::tls::TlsIdentity;
+/// use boule::p2p::tls_protocol::TlsConnectionProtocol;
 /// use tokio::net::TcpListener;
 /// use tokio::sync::{broadcast, mpsc};
 ///
@@ -304,7 +304,7 @@ pub enum ProtocolEvent {
 /// The typical shape is:
 ///
 /// ```no_run
-/// use ambros_p2p::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
+/// use boule::p2p::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
 /// use bytes::Bytes;
 ///
 /// # async fn wiring(handle: ProtocolHandle) {

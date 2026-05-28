@@ -47,7 +47,7 @@ pub struct NewArgs {
 }
 
 /// `testnet new`: lay out the workdir, generate the topology, mint
-/// every node's identity via `ambros-p2p init`, harvest each node's
+/// every node's identity via `boule init`, harvest each node's
 /// `node_id`, and write the final per-node configs with the full
 /// `[consensus].validators` list and the bootstrap `[[peers]]` block.
 pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
@@ -450,7 +450,7 @@ fn run_init(binary: &Path, config: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("spawning {:?} init", binary))?;
     if !output.status.success() {
         anyhow::bail!(
-            "ambros-p2p init exited {}: stderr={}",
+            "boule init exited {}: stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
@@ -480,7 +480,7 @@ async fn launch_once_for_discovery(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .context("spawning ambros-p2p start for discovery")?;
+        .context("spawning boule start for discovery")?;
 
     let deadline = Instant::now() + ADDR_FILE_TIMEOUT;
     let info = loop {
@@ -552,7 +552,7 @@ pub async fn up_one(workdir: &Path, binary: &Path, layout: &NodeLayout) -> anyho
         .stdout(log)
         .stderr(log_err)
         .spawn()
-        .with_context(|| format!("spawning ambros-p2p start for {}", layout.display_name()))?;
+        .with_context(|| format!("spawning boule start for {}", layout.display_name()))?;
 
     let pid = child.id();
     std::fs::write(&layout.pid_path, pid.to_string())

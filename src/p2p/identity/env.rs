@@ -71,7 +71,7 @@ mod tests {
     fn loads_base64_der() {
         let der = generate_pkcs8_der().unwrap();
         let b64 = base64::engine::general_purpose::STANDARD.encode(&der[..]);
-        let var = "AMBROS_TEST_KEY_B64";
+        let var = "BOULE_TEST_KEY_B64";
         // SAFETY: test-only, no other thread reads this var
         unsafe { std::env::set_var(var, b64) };
 
@@ -85,7 +85,7 @@ mod tests {
     fn loads_pem() {
         let der = generate_pkcs8_der().unwrap();
         let pem = der_to_pem(&der);
-        let var = "AMBROS_TEST_KEY_PEM";
+        let var = "BOULE_TEST_KEY_PEM";
         unsafe { std::env::set_var(var, pem) };
 
         let id = EnvKeyProvider::new(var).load_or_init().unwrap();
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn missing_env_errors() {
-        let err = EnvKeyProvider::new("AMBROS_DEFINITELY_NOT_SET_KEY_XZ42")
+        let err = EnvKeyProvider::new("BOULE_DEFINITELY_NOT_SET_KEY_XZ42")
             .load_or_init()
             .unwrap_err();
         assert!(format!("{err}").contains("reading env var"));
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn bad_base64_errors() {
-        let var = "AMBROS_TEST_KEY_BAD";
+        let var = "BOULE_TEST_KEY_BAD";
         unsafe { std::env::set_var(var, "$$$not-base64$$$") };
         let err = EnvKeyProvider::new(var).load_or_init().unwrap_err();
         assert!(format!("{err}").contains("base64"));
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn malformed_key_rejected() {
-        let var = "AMBROS_TEST_KEY_MALFORMED";
+        let var = "BOULE_TEST_KEY_MALFORMED";
         // valid base64 but not a valid PKCS#8 key
         let b64 = base64::engine::general_purpose::STANDARD.encode([0x30u8, 0x02, 0x05, 0x00]);
         unsafe { std::env::set_var(var, b64) };

@@ -47,7 +47,7 @@ pub struct BlockResponsePayload {
 }
 
 impl SignedMessage for BlockResponsePayload {
-    const DOMAIN: &'static str = "ambros.consensus.block_response.v1";
+    const DOMAIN: &'static str = "boule.consensus.block_response.v1";
 }
 
 /// Maximum number of blocks a single
@@ -101,7 +101,7 @@ pub struct BlockRangeResponsePayload {
 }
 
 impl SignedMessage for BlockRangeResponsePayload {
-    const DOMAIN: &'static str = "ambros.consensus.block_range_response.v1";
+    const DOMAIN: &'static str = "boule.consensus.block_range_response.v1";
 }
 
 /// Every message sent over the `PROTOCOL_ID` channel is one of these

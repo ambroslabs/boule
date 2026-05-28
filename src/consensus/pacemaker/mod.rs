@@ -61,7 +61,7 @@ mod tests;
 /// private, so this is the sole construction path.
 ///
 /// ```compile_fail
-/// use ambros_p2p::consensus::pacemaker::HonestyThresholdEvidence;
+/// use boule::consensus::pacemaker::HonestyThresholdEvidence;
 /// // Direct construction is rejected — the inner field is private,
 /// // forcing callers through `from_bucket` and the threshold check.
 /// let _ = HonestyThresholdEvidence(());

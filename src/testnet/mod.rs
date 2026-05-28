@@ -1,4 +1,4 @@
-//! Parameterized testnet driver: spawn a multi-process ambros-p2p
+//! Parameterized testnet driver: spawn a multi-process boule
 //! cluster on a single host, drive scenarios against it, and verify
 //! safety invariants from the outside.
 //!

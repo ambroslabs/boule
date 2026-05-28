@@ -1,4 +1,4 @@
-//! `ambros-p2p` — a peer-to-peer runtime hosting a HotStuff-style BFT
+//! `boule` — a peer-to-peer runtime hosting a HotStuff-style BFT
 //! consensus layer.
 //!
 //! The crate ships both a library target (these modules) and a binary target
@@ -63,10 +63,10 @@
 //!
 //! # Running a node
 //!
-//! See the top-level [`README.md`](https://github.com/ambroslabs/ambros-p2p/blob/main/README.md)
+//! See the top-level [`README.md`](https://github.com/ambroslabs/boule-rs/blob/main/README.md)
 //! for build / run / test instructions and the configuration reference,
 //! and `docs/testnet-local.md` for a walkthrough of the
-//! `ambros-p2p init` → `ambros-p2p start` flow.
+//! `boule init` → `boule start` flow.
 
 pub mod cli;
 pub mod clock;

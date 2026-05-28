@@ -1,7 +1,7 @@
 # HotStuff: notes for this codebase
 
 Working notes on HotStuff as implemented (and planned to be implemented) in
-`ambros-p2p`. Written while working on [#23][issue-23] (the milestone-7 parent)
+`boule`. Written while working on [#23][issue-23] (the milestone-7 parent)
 and its sub-issues; referenced from code comments that would otherwise need
 to re-derive the same tradeoffs.
 
@@ -299,9 +299,9 @@ Prefer linking the section rather than re-deriving the tradeoff in a code
 comment. Keep the notes in sync with the code; if the code deviates from
 what's described here, update both.
 
-[issue-23]: https://github.com/ambroslabs/ambros-p2p/issues/23
-[#93]: https://github.com/ambroslabs/ambros-p2p/issues/93
-[#94]: https://github.com/ambroslabs/ambros-p2p/pull/94
-[#95]: https://github.com/ambroslabs/ambros-p2p/pull/95
-[#96]: https://github.com/ambroslabs/ambros-p2p/pull/96
-[#24]: https://github.com/ambroslabs/ambros-p2p/issues/24
+[issue-23]: https://github.com/ambroslabs/boule-rs/issues/23
+[#93]: https://github.com/ambroslabs/boule-rs/issues/93
+[#94]: https://github.com/ambroslabs/boule-rs/pull/94
+[#95]: https://github.com/ambroslabs/boule-rs/pull/95
+[#96]: https://github.com/ambroslabs/boule-rs/pull/96
+[#24]: https://github.com/ambroslabs/boule-rs/issues/24

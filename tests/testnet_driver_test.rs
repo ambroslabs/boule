@@ -1,7 +1,7 @@
-//! End-to-end exercise of the testnet driver lib (`ambros_p2p::testnet`):
+//! End-to-end exercise of the testnet driver lib (`boule::testnet`):
 //! 4-node cluster, drive it through `new` → `up` → wait → kill → wait →
-//! verify-safety → `down`. Uses the `ambros-p2p` binary built by cargo
-//! (`CARGO_BIN_EXE_ambros-p2p`) so we exercise the same spawn path the
+//! verify-safety → `down`. Uses the `boule` binary built by cargo
+//! (`CARGO_BIN_EXE_boule`) so we exercise the same spawn path the
 //! `testnet` CLI does.
 //!
 //! Budgeted for the 15s/test ceiling in CLAUDE.md: the cluster runs at
@@ -10,11 +10,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ambros_p2p::testnet::{lifecycle, safety, scenario, topology, wait, workdir};
+use boule::testnet::{lifecycle, safety, scenario, topology, wait, workdir};
 use tokio::sync::Mutex;
 
 /// Serializes every test in this file. Each test spawns a 4-node
-/// `ambros-p2p` cluster (process-level spawn + addr-file discovery +
+/// `boule` cluster (process-level spawn + addr-file discovery +
 /// consensus warm-up); running multiple in parallel on a hosted
 /// runner times out under CPU contention. Held across awaits, so it
 /// must be a tokio (async) mutex — `std::sync::Mutex` would trip the
@@ -24,7 +24,7 @@ static TEST_SERIAL: Mutex<()> = Mutex::const_new(());
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn driver_lifecycle_4_nodes() {
     let _serial = TEST_SERIAL.lock().await;
-    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ambros-p2p"));
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_boule"));
     let tmp = tempfile::tempdir().expect("tempdir");
     let wd = tmp.path().to_path_buf();
 
@@ -41,7 +41,7 @@ async fn driver_lifecycle_4_nodes() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: ambros_p2p::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster");
@@ -123,7 +123,7 @@ async fn driver_lifecycle_4_nodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
     let _serial = TEST_SERIAL.lock().await;
-    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ambros-p2p"));
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_boule"));
     let tmp = tempfile::tempdir().expect("tempdir");
     let wd = tmp.path().to_path_buf();
 
@@ -139,7 +139,7 @@ async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: ambros_p2p::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster");
@@ -208,7 +208,7 @@ async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn new_cluster_canonicalizes_relative_workdir() {
     let _serial = TEST_SERIAL.lock().await;
-    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ambros-p2p"));
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_boule"));
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let prev = std::env::current_dir().expect("current_dir");
@@ -227,7 +227,7 @@ async fn new_cluster_canonicalizes_relative_workdir() {
         binary: bin,
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: ambros_p2p::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster with relative workdir");

@@ -1,8 +1,15 @@
 [package]
-name = "ambros-p2p"
+name = "boule-rs"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+
+[lib]
+name = "boule"
+
+[[bin]]
+name = "boule"
+path = "src/main.rs"
 
 [features]
 # Default builds exclude the OS keyring backend because its Linux

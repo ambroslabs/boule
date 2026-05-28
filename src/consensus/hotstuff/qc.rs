@@ -672,7 +672,7 @@ pub struct Proposal {
 }
 
 impl SignedMessage for Proposal {
-    const DOMAIN: &'static str = "ambros.hotstuff.proposal.v1";
+    const DOMAIN: &'static str = "boule.hotstuff.proposal.v1";
 }
 
 /// A replica's vote for a block it considers safe.
@@ -683,7 +683,7 @@ pub struct Vote {
 }
 
 impl SignedMessage for Vote {
-    const DOMAIN: &'static str = "ambros.hotstuff.vote.v1";
+    const DOMAIN: &'static str = "boule.hotstuff.vote.v1";
 }
 
 /// A replica entering a new view and announcing the highest QC it
@@ -696,7 +696,7 @@ pub struct NewView {
 }
 
 impl SignedMessage for NewView {
-    const DOMAIN: &'static str = "ambros.hotstuff.newview.v1";
+    const DOMAIN: &'static str = "boule.hotstuff.newview.v1";
 }
 
 /// A replica's signed "I am giving up on `view`" notice. Quoted across
@@ -717,7 +717,7 @@ pub struct TimeoutVote {
 }
 
 impl SignedMessage for TimeoutVote {
-    const DOMAIN: &'static str = "ambros.hotstuff.timeout.v1";
+    const DOMAIN: &'static str = "boule.hotstuff.timeout.v1";
 }
 
 /// Logical consensus message emitted by the safety core via

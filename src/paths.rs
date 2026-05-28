@@ -12,14 +12,14 @@
 //!
 //! | Resource | Linux | macOS | Windows |
 //! | --- | --- | --- | --- |
-//! | Config | `$XDG_CONFIG_HOME/ambros-p2p/config.toml` | `~/Library/Application Support/ambros-p2p/config.toml` | `%APPDATA%\ambros-p2p\config.toml` |
-//! | State / WAL / storage | `$XDG_DATA_HOME/ambros-p2p/` | `~/Library/Application Support/ambros-p2p/` | `%LOCALAPPDATA%\ambros-p2p\` |
+//! | Config | `$XDG_CONFIG_HOME/boule/config.toml` | `~/Library/Application Support/boule/config.toml` | `%APPDATA%\boule\config.toml` |
+//! | State / WAL / storage | `$XDG_DATA_HOME/boule/` | `~/Library/Application Support/boule/` | `%LOCALAPPDATA%\boule\` |
 
 use std::path::PathBuf;
 
 /// Application name used as the leaf directory under each platform's
 /// well-known location.
-pub const APP_NAME: &str = "ambros-p2p";
+pub const APP_NAME: &str = "boule";
 
 /// Filename of the TOML config inside the platform-specific config dir.
 pub const CONFIG_FILE_NAME: &str = "config.toml";

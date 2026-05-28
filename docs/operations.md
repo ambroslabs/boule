@@ -1,6 +1,6 @@
 # Operations
 
-Operational guidance for running an `ambros-p2p` validator. The
+Operational guidance for running an `boule` validator. The
 [testnet walkthrough](testnet-local.md) covers the local-cluster
 driver; this document focuses on production-deployment concerns.
 For the system-wide queue / channel inventory and the chosen overflow
@@ -11,7 +11,7 @@ policy on each path, see [`backpressure.md`](backpressure.md).
 Some operators can dial out but cannot accept new inbound TCP
 connections — typically because they sit behind a corporate NAT, an
 asymmetric firewall, or a cloud network with a single public load
-balancer. `ambros-p2p` supports those operators through **outbound-only
+balancer. `boule` supports those operators through **outbound-only
 mode**.
 
 ### When to use it
@@ -69,7 +69,7 @@ listen_addr = "127.0.0.1:0"   # required by the parser; no listener is bound
 
 [node.identity]
 backend = "file"
-path    = "/var/lib/ambros-p2p/node.key"
+path    = "/var/lib/boule/node.key"
 
 [api]
 listen_addr = "127.0.0.1:8000"
@@ -88,7 +88,7 @@ validators       = [
     "<peer-2-id>",
     "<peer-3-id>",
 ]
-storage_dir      = "/var/lib/ambros-p2p/consensus"
+storage_dir      = "/var/lib/boule/consensus"
 ```
 
 `bootstrap_addrs` may list any reachable validator(s); the gossip
@@ -258,15 +258,15 @@ becomes operator-relevant once the application layer lands.
 
 ### Manual export and import
 
-`ambros-p2p` ships a CLI for hand-moving a snapshot between nodes
+`boule` ships a CLI for hand-moving a snapshot between nodes
 without running consensus. Both subcommands operate against the
 `[consensus] storage_dir` configured in the node's `config.toml`
 and require a `redb`-backed store at `kv.redb` (the in-memory
 fallback is rejected — there's nothing to export from).
 
 ```text
-ambros-p2p snapshot export [--config <path>] [--height <H>] --out <dir>
-ambros-p2p snapshot import [--config <path>] --in <dir>
+boule snapshot export [--config <path>] [--height <H>] --out <dir>
+boule snapshot import [--config <path>] --in <dir>
 ```
 
 Flags:
@@ -304,11 +304,11 @@ On A (the source):
 
 ```sh
 # 1. Stop the node so the storage_dir's redb file isn't held open.
-sudo systemctl stop ambros-p2p   # or whatever supervisor you use
+sudo systemctl stop boule   # or whatever supervisor you use
 
 # 2. Export the latest snapshot to a portable directory.
-ambros-p2p snapshot export \
-    --config /etc/ambros-p2p/config.toml \
+boule snapshot export \
+    --config /etc/boule/config.toml \
     --out   /tmp/snapshot-bundle
 
 # Output:
@@ -319,19 +319,19 @@ tar -czf /tmp/snapshot-bundle.tgz -C /tmp snapshot-bundle
 scp /tmp/snapshot-bundle.tgz operator-b@validator-b:/tmp/
 
 # 4. Restart A.
-sudo systemctl start ambros-p2p
+sudo systemctl start boule
 ```
 
 On B (the destination):
 
 ```sh
 # 1. Stop B's node (if running) and unpack the bundle.
-sudo systemctl stop ambros-p2p
+sudo systemctl stop boule
 tar -xzf /tmp/snapshot-bundle.tgz -C /tmp
 
 # 2. Import into B's local snapshot store.
-ambros-p2p snapshot import \
-    --config /etc/ambros-p2p/config.toml \
+boule snapshot import \
+    --config /etc/boule/config.toml \
     --in    /tmp/snapshot-bundle
 
 # Output:
@@ -340,7 +340,7 @@ ambros-p2p snapshot import \
 # 3. Restart. The joiner-side fetch path will detect that the
 #    locally-stored snapshot already covers the cluster's height and
 #    fall straight through to tail-sync for blocks above 10000.
-sudo systemctl start ambros-p2p
+sudo systemctl start boule
 ```
 
 Importing into a node that already has a newer snapshot at the
@@ -389,7 +389,7 @@ timeline), and `src/consensus/node.rs::apply_committed_rotations`
   the removal path under [validator-set reconfiguration](testnet-local.md).
 - Migration to a stronger backend (`file` → `keyring` → HSM).
 
-[142-issue]: https://github.com/ambroslabs/ambros-p2p/issues/142
+[142-issue]: https://github.com/ambroslabs/boule-rs/issues/142
 
 The rotation transaction is **self-attested**: it carries two
 Ed25519 signatures over the same canonical pre-image, one under the
@@ -409,10 +409,10 @@ hex into any validator's mempool to propose the rotation.
 
 ```sh
 # Ed25519 chain — mint new.key on the spot, sign, print payload.
-ambros-p2p rotation propose \
-    --config /etc/ambros-p2p/config.toml \
+boule rotation propose \
+    --config /etc/boule/config.toml \
     --new-key-backend file \
-    --new-key-path /etc/ambros-p2p/new.key \
+    --new-key-path /etc/boule/new.key \
     --v-eff 5000
 ```
 
@@ -423,12 +423,12 @@ BLS proof-of-possession into the payload:
 
 ```sh
 # BLS chain — mint both halves, sign, bundle PoP, print payload.
-ambros-p2p rotation propose \
-    --config /etc/ambros-p2p/config.toml \
+boule rotation propose \
+    --config /etc/boule/config.toml \
     --new-key-backend file \
-    --new-key-path /etc/ambros-p2p/new.key \
+    --new-key-path /etc/boule/new.key \
     --new-bls-key-backend file \
-    --new-bls-key-path /etc/ambros-p2p/new-bls.key \
+    --new-bls-key-path /etc/boule/new-bls.key \
     --v-eff 5000
 ```
 
@@ -483,7 +483,7 @@ the following two paths produces those bytes:
 2. **Programmatic.** For backends `rotation propose` doesn't yet
    support (`env` / `exec` / `keyring`), or for one-off scripts:
    ```rust
-   use ambros_p2p::consensus::validator_rotation::{
+   use boule::consensus::validator_rotation::{
        DualSignedRotation, ValidatorKeyRotation,
    };
    let payload = ValidatorKeyRotation {
@@ -662,7 +662,7 @@ weight-quorum threshold is in reach. Until #473 lands the
 authoritative weighted view is in the trace logs:
 
 ```
-DEBUG ambros_p2p::consensus: timeout_vote view=42 signer=… \
+DEBUG boule::consensus: timeout_vote view=42 signer=… \
   bucket_signers=2 bucket_weight=8 quorum_weight=11
 ```
 
@@ -708,7 +708,7 @@ submit a counter-reconfig.
 Every committed reconfig writes a structured log line:
 
 ```
-INFO ambros_p2p::consensus: reconfig_applied height=… view=… v_eff=… next_size=…
+INFO boule::consensus: reconfig_applied height=… view=… v_eff=… next_size=…
 ```
 
 The actual weights at each boundary live in

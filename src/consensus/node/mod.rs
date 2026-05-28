@@ -122,9 +122,9 @@ use timeout_bucket::TimeoutBucket;
 
 /// Tracing target used by every structured trace emitted from the
 /// consensus integration layer. Filter it with
-/// `RUST_LOG=info,ambros_p2p::consensus=debug` to see just the event
+/// `RUST_LOG=info,boule::consensus=debug` to see just the event
 /// boundaries without drowning in p2p / gossip traffic.
-pub const TRACE_TARGET: &str = "ambros_p2p::consensus";
+pub const TRACE_TARGET: &str = "boule::consensus";
 
 /// Short, stable tag for a [`ConsensusMsg`] variant — suitable as a
 /// structured-log field value.

@@ -1,4 +1,4 @@
-# `ambros-p2p-fuzz`
+# `boule-rs-fuzz`
 
 [`cargo-fuzz`](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets for
 the consensus layer.
