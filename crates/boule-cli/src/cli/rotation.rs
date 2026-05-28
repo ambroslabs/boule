@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-use boule::consensus::validator_rotation::{RotationProposeRequest, build_rotation_envelope};
-use boule::p2p::tls::node_id_to_base58;
+use boule::identity::node_id_to_base58;
+use boule_consensus::validator_rotation::{RotationProposeRequest, build_rotation_envelope};
 
 use super::shared::resolve_config_path;
 
@@ -69,11 +69,11 @@ pub(crate) fn handle_propose(args: RotationProposeArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use boule::consensus::validator_rotation::{
-        RotationProposeRequest, build_new_identity_config_for_rotation, build_rotation_envelope,
-    };
     use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
     use boule::crypto::sig_scheme::BlsAggregated;
+    use boule_consensus::validator_rotation::{
+        RotationProposeRequest, build_new_identity_config_for_rotation, build_rotation_envelope,
+    };
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -89,7 +89,7 @@ mod tests {
         let provider = boule::config::build_provider(&cfg).unwrap();
         let id = provider.load_or_init().unwrap();
         let signer = NodeSigner::from_identity(&id).unwrap();
-        boule::p2p::tls::node_id_to_base58(&signer.node_id())
+        boule::identity::node_id_to_base58(&signer.node_id())
     }
 
     fn write_ed25519_chain_config(
@@ -207,7 +207,8 @@ mod tests {
         assert_eq!(outcome.envelope.payload.new_pubkey, new_signer.node_id());
 
         let cfg = boule::config::load(&config_path).unwrap();
-        let chain_id = boule::node::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        let chain_id =
+            boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
         outcome
             .envelope
             .verify(&current_signer.node_id(), &chain_id)
@@ -215,7 +216,7 @@ mod tests {
 
         let bytes = outcome.envelope.encode_command();
         assert!(
-            boule::consensus::validator_rotation::DualSignedRotation::is_rotation_payload(&bytes,),
+            boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(&bytes,),
         );
     }
 
@@ -343,7 +344,8 @@ mod tests {
         assert_eq!(env_pk, bls_id.public);
 
         let cfg = boule::config::load(&config_path).unwrap();
-        let chain_id = boule::node::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        let chain_id =
+            boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
         BlsAggregated::verify_pop(env_pop, &env_pk, &chain_id)
             .expect("BLS PoP must verify under the chain's chain_id");
 
@@ -411,10 +413,10 @@ mod tests {
         // build_rotation_envelope doesn't know "current_view"; the engine
         // enforces V_EFF_MIN_DELAY at commit time. Exercise the constant
         // here so a floor change surfaces in a CLI test too.
-        let payload = boule::consensus::validator_rotation::ValidatorKeyRotation {
+        let payload = boule_consensus::validator_rotation::ValidatorKeyRotation {
             validator: [1u8; 32],
             new_pubkey: [2u8; 32],
-            v_eff: boule::consensus::View(11),
+            v_eff: boule_consensus::View(11),
             new_bls_pubkey: None,
             new_bls_pop: None,
         };

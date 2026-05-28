@@ -1,13 +1,13 @@
 //! `testnet` — driver binary for the parameterized testnet. The library half
-//! ([`boule::testnet`]) is also usable directly from integration
+//! ([`boule_node::testnet`]) is also usable directly from integration
 //! tests; this binary is just the CLI shell that wires argv through to
 //! it. See `testnet --help`.
 
-use boule::testnet::cli;
+use boule_node::testnet::cli;
 
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "warn,boule::testnet=info".into());
+        .unwrap_or_else(|_| "warn,boule_node::testnet=info".into());
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 

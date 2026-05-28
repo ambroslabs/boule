@@ -1,0 +1,18 @@
+[package]
+name = "boule-transport"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Transport interface for boule: object-safe broadcast/discovery traits and rate-limit policy, independent of any concrete transport."
+repository = "https://github.com/ambroslabs/boule-rs"
+homepage = "https://github.com/ambroslabs/boule-rs"
+
+[dependencies]
+boule-rs    = { path = "../boule-rs", version = "0.1.0" }
+bytes       = { version = "1", features = ["serde"] }
+tokio       = { version = "1", features = ["full"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio       = { version = "1", features = ["full", "test-util"] }
+chrono      = { version = "0.4", features = ["serde"] }

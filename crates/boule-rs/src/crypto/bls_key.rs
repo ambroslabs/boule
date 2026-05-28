@@ -15,7 +15,7 @@
 //! the wire-format invariants.
 //!
 //! Permissions are tightened to `0o600` on write (matching the Ed25519
-//! file backend in [`crate::p2p::identity::file`]).
+//! file backend in [`crate::identity::file`]).
 //!
 //! # Cross-scheme mismatch
 //!
@@ -56,7 +56,7 @@ pub struct BlsKeyFile {
 }
 
 /// Trait surface for sourcing a validator's BLS signing key. Mirrors
-/// the existing [`crate::p2p::identity::KeyProvider`] design but stays
+/// the existing [`crate::identity::KeyProvider`] design but stays
 /// scoped to BLS — TLS / network identity remains Ed25519 (parent
 /// issue non-goal).
 pub trait BlsKeyProvider: Send + Sync {

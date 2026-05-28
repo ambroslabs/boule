@@ -17,6 +17,9 @@ name = "boule"
 # have a secret service available.
 default = []
 keyring-backend = ["dep:keyring"]
+# Exposes test-only fixtures (e.g. `ChainId::TEST`) to downstream crates'
+# tests without making them available in production builds.
+testing = []
 
 [dependencies]
 tokio             = { version = "1", features = ["full"] }

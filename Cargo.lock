@@ -405,7 +405,10 @@ name = "boule-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boule-consensus",
+ "boule-node",
  "boule-rs",
+ "boule-transport-tcp",
  "bytes",
  "clap",
  "futures-util",
@@ -418,6 +421,66 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "boule-consensus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "blst",
+ "boule-rs",
+ "bytes",
+ "chrono",
+ "hex",
+ "parking_lot",
+ "postcard",
+ "proptest",
+ "rcgen",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "boule-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "boule-consensus",
+ "boule-rs",
+ "boule-transport",
+ "boule-transport-tcp",
+ "bs58",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "libc",
+ "parking_lot",
+ "postcard",
+ "proptest",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rcgen",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -459,6 +522,47 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "boule-transport"
+version = "0.1.0"
+dependencies = [
+ "boule-rs",
+ "bytes",
+ "chrono",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "boule-transport-tcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "boule-rs",
+ "boule-transport",
+ "bs58",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "parking_lot",
+ "postcard",
+ "proptest",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rcgen",
+ "ring",
+ "rustls",
+ "serde",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
  "zeroize",
 ]
 

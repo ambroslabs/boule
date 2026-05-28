@@ -7,12 +7,12 @@ use tracing::{info, warn};
 use crate::cli::OutputFormat;
 use crate::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
 use crate::crypto::signed::ChainId;
-use crate::p2p::identity::KeyProvider;
-use crate::p2p::identity::encrypted_file::EncryptedFileKeyProvider;
-use crate::p2p::identity::env::EnvKeyProvider;
-use crate::p2p::identity::exec::ExecKeyProvider;
-use crate::p2p::identity::file::FileKeyProvider;
-use crate::p2p::tls::{NodeId, base58_to_node_id, node_id_to_base58};
+use crate::identity::KeyProvider;
+use crate::identity::encrypted_file::EncryptedFileKeyProvider;
+use crate::identity::env::EnvKeyProvider;
+use crate::identity::exec::ExecKeyProvider;
+use crate::identity::file::FileKeyProvider;
+use crate::identity::{NodeId, base58_to_node_id, node_id_to_base58};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
@@ -441,15 +441,14 @@ impl ConsensusConfig {
         // who deliberately push the chunk size to the wire-frame
         // ceiling still leave room for protocol evolution.
         const FRAME_OVERHEAD_RESERVED: usize = 64 * 1024;
-        let max_chunk_size =
-            crate::consensus::node::MAX_FRAME_BYTES.saturating_sub(FRAME_OVERHEAD_RESERVED);
+        let max_chunk_size = crate::config::MAX_FRAME_BYTES.saturating_sub(FRAME_OVERHEAD_RESERVED);
         if (self.snapshot_chunk_size_bytes as usize) > max_chunk_size {
             anyhow::bail!(
                 "consensus.snapshot_chunk_size_bytes={} exceeds wire-frame budget {} \
                  (MAX_FRAME_BYTES {} − {} reserved for envelope)",
                 self.snapshot_chunk_size_bytes,
                 max_chunk_size,
-                crate::consensus::node::MAX_FRAME_BYTES,
+                crate::config::MAX_FRAME_BYTES,
                 FRAME_OVERHEAD_RESERVED,
             );
         }
@@ -468,19 +467,19 @@ impl ConsensusConfig {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ConsensusLimits {
     /// Cap on the safety core's `vote_bucket` map. Defaults to
-    /// [`crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY`].
+    /// [`crate::config::DEFAULT_VOTE_BUCKET_CAPACITY`].
     #[serde(default = "default_vote_bucket_capacity")]
     pub vote_bucket_capacity: usize,
     /// Cap on the safety core's `parked_proposals` map. Defaults to
-    /// [`crate::consensus::limits::DEFAULT_PARKED_PROPOSALS_CAPACITY`].
+    /// [`crate::config::DEFAULT_PARKED_PROPOSALS_CAPACITY`].
     #[serde(default = "default_parked_proposals_capacity")]
     pub parked_proposals_capacity: usize,
     /// Cap on the safety core's `pending_blocks` map. Defaults to
-    /// [`crate::consensus::limits::DEFAULT_PENDING_BLOCKS_CAPACITY`].
+    /// [`crate::config::DEFAULT_PENDING_BLOCKS_CAPACITY`].
     #[serde(default = "default_pending_blocks_capacity")]
     pub pending_blocks_capacity: usize,
     /// Cap on the integration layer's `timeout_buckets` map. Defaults
-    /// to [`crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY`].
+    /// to [`crate::config::DEFAULT_TIMEOUT_BUCKETS_CAPACITY`].
     #[serde(default = "default_timeout_buckets_capacity")]
     pub timeout_buckets_capacity: usize,
     /// Initial views to wait between successive `RequestBlock` retries
@@ -529,26 +528,6 @@ impl Default for ConsensusLimits {
     }
 }
 
-impl ConsensusLimits {
-    /// Project the safety-core / integration-layer caps into the
-    /// runtime [`crate::consensus::limits::CacheLimits`] shape. The
-    /// `mempool_capacity` field is consumed independently by the
-    /// startup wiring in `src/node.rs` and does not appear in
-    /// `CacheLimits`.
-    pub fn to_cache_limits(&self) -> crate::consensus::limits::CacheLimits {
-        crate::consensus::limits::CacheLimits {
-            vote_bucket_capacity: self.vote_bucket_capacity,
-            parked_proposals_capacity: self.parked_proposals_capacity,
-            pending_blocks_capacity: self.pending_blocks_capacity,
-            timeout_buckets_capacity: self.timeout_buckets_capacity,
-            block_sync_initial_backoff_views: self.block_sync_initial_backoff_views,
-            block_sync_max_backoff_views: self.block_sync_max_backoff_views,
-            block_sync_per_peer_attempts: self.block_sync_per_peer_attempts,
-            block_sync_max_attempts: self.block_sync_max_attempts,
-        }
-    }
-}
-
 fn default_propose_limit() -> usize {
     64
 }
@@ -562,40 +541,80 @@ fn default_timeout_max_ms() -> u64 {
 }
 
 fn default_vote_bucket_capacity() -> usize {
-    crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY
+    crate::config::DEFAULT_VOTE_BUCKET_CAPACITY
 }
 
 fn default_parked_proposals_capacity() -> usize {
-    crate::consensus::limits::DEFAULT_PARKED_PROPOSALS_CAPACITY
+    crate::config::DEFAULT_PARKED_PROPOSALS_CAPACITY
 }
 
 fn default_pending_blocks_capacity() -> usize {
-    crate::consensus::limits::DEFAULT_PENDING_BLOCKS_CAPACITY
+    crate::config::DEFAULT_PENDING_BLOCKS_CAPACITY
 }
 
 fn default_timeout_buckets_capacity() -> usize {
-    crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY
+    crate::config::DEFAULT_TIMEOUT_BUCKETS_CAPACITY
 }
 
 fn default_block_sync_initial_backoff_views() -> u64 {
-    crate::consensus::limits::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS
+    crate::config::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS
 }
 
 fn default_block_sync_max_backoff_views() -> u64 {
-    crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS
+    crate::config::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS
 }
 
 fn default_block_sync_per_peer_attempts() -> u32 {
-    crate::consensus::limits::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS
+    crate::config::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS
 }
 
 fn default_block_sync_max_attempts() -> u32 {
-    crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS
+    crate::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS
 }
 
 fn default_mempool_capacity() -> usize {
     1024
 }
+
+/// Caps a single postcard frame on the consensus wire protocol (4 MiB).
+/// The runtime wire codec (`consensus::node::wire`) enforces it; config
+/// validation uses it to bound `snapshot_chunk_size_bytes`.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Default cap on the `vote_bucket` map. Sized for four to a few dozen
+/// validators across a Byzantine-flood window of a few hundred views.
+pub const DEFAULT_VOTE_BUCKET_CAPACITY: usize = 1024;
+/// Default cap on `parked_proposals`. Each parked proposal is at most
+/// one in-flight `RequestBlock` retry per pacemaker tick, so this also
+/// caps the per-tick block-sync request rate.
+pub const DEFAULT_PARKED_PROPOSALS_CAPACITY: usize = 256;
+/// Default cap on `pending_blocks`. Generous for a steady-state node
+/// (which only needs a handful of blocks above the commit frontier),
+/// tight enough that a flood of distinct future-height blocks gets
+/// pruned before consuming meaningful memory.
+pub const DEFAULT_PENDING_BLOCKS_CAPACITY: usize = 1024;
+/// Default cap on the integration layer's timeout-vote buckets.
+pub const DEFAULT_TIMEOUT_BUCKETS_CAPACITY: usize = 1024;
+/// Default initial views between successive `RequestBlock` retries on
+/// the same parent hash. The first retry is eligible after one
+/// `PacemakerAdvance`; subsequent retries double the gap up to
+/// [`DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS`].
+pub const DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS: u64 = 1;
+/// Default ceiling on the per-parent-hash retry gap in views. With the
+/// default initial of `1` and the doubling schedule, the gap saturates
+/// here after roughly four attempts.
+pub const DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS: u64 = 8;
+/// Default attempts at the same peer before rotating to the next
+/// validator in the ring. Two gives the original sender a brief retry
+/// window (one redelivery in case the first probe was lost in flight)
+/// before fanning out.
+pub const DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS: u32 = 2;
+/// Default total `RequestBlock` budget per parent hash. With the
+/// default `per_peer = 2`, eight attempts cover the original sender
+/// plus three rotation rounds, which exhausts the four-validator
+/// ring twice. After this, the parked proposals depending on the
+/// missing parent are dropped and the cache-eviction counter ticks.
+pub const DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS: u32 = 8;
 
 fn default_snapshot_interval_blocks() -> u64 {
     10_000
@@ -687,45 +706,6 @@ impl P2pLimitsConfig {
             max_connections_per_ip: default_max_connections_per_ip(),
             rate: P2pRateLimitsConfig::default(),
             violations: P2pViolationsConfig::default(),
-        }
-    }
-
-    /// Project the connection-cap fields into the runtime
-    /// [`crate::p2p::limits::ConnectionLimitsConfig`] shape. The
-    /// overlay-layer `max_total` cap (#187) is not sourced from
-    /// `[p2p.limits]`; callers that want the merged view (combining
-    /// `[overlay].total_max`) build the runtime config in
-    /// `crate::node::build_connection_limiter`.
-    pub fn connection_limits(&self) -> crate::p2p::limits::ConnectionLimitsConfig {
-        crate::p2p::limits::ConnectionLimitsConfig {
-            max_inbound: self.max_inbound_connections,
-            max_outbound: self.max_outbound_connections,
-            max_per_ip: self.max_connections_per_ip,
-            max_total: usize::MAX,
-        }
-    }
-
-    /// Project the rate + violation fields into the runtime
-    /// [`crate::p2p::limits::RateLimitsConfig`] shape.
-    pub fn rate_limits(&self) -> crate::p2p::limits::RateLimitsConfig {
-        crate::p2p::limits::RateLimitsConfig {
-            proposal_per_sec: self.rate.proposal_per_sec,
-            vote_per_sec: self.rate.vote_per_sec,
-            timeout_vote_per_sec: self.rate.timeout_vote_per_sec,
-            new_view_per_sec: self.rate.new_view_per_sec,
-            request_block_per_sec: self.rate.request_block_per_sec,
-            receive_block_per_sec: self.rate.receive_block_per_sec,
-            snapshot_manifest_request_per_sec: self.rate.snapshot_manifest_request_per_sec,
-            snapshot_manifest_response_per_sec: self.rate.snapshot_manifest_response_per_sec,
-            snapshot_chunk_request_per_sec: self.rate.snapshot_chunk_request_per_sec,
-            snapshot_chunk_response_per_sec: self.rate.snapshot_chunk_response_per_sec,
-            block_range_request_per_sec: self.rate.block_range_request_per_sec,
-            block_range_response_per_sec: self.rate.block_range_response_per_sec,
-            bytes_per_sec: self.rate.bytes_per_sec,
-            outbound_bytes_per_sec: self.rate.outbound_bytes_per_sec,
-            burst_seconds: self.rate.burst_seconds,
-            violation_window: std::time::Duration::from_secs(self.violations.window_secs),
-            max_violations: self.violations.max_violations,
         }
     }
 }
@@ -1417,9 +1397,10 @@ pub fn build_provider(cfg: &IdentityConfig) -> anyhow::Result<Arc<dyn KeyProvide
         #[cfg(feature = "keyring-backend")]
         IdentityConfig::Keyring { service, account } => {
             let acct = account.clone().unwrap_or_else(default_keyring_account);
-            Ok(Arc::new(
-                crate::p2p::identity::keyring::KeyringKeyProvider::new(service.clone(), acct),
-            ))
+            Ok(Arc::new(crate::identity::keyring::KeyringKeyProvider::new(
+                service.clone(),
+                acct,
+            )))
         }
         #[cfg(not(feature = "keyring-backend"))]
         IdentityConfig::Keyring { .. } => {
@@ -1621,38 +1602,37 @@ validators = ["a"]
         assert!(cons.storage_dir.is_none());
         assert!(cons.genesis_seed_hex.is_none());
         // Limits sub-table default — see ConsensusLimits::default().
-        let runtime = cons.limits.to_cache_limits();
         assert_eq!(
-            runtime.vote_bucket_capacity,
-            crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY,
+            cons.limits.vote_bucket_capacity,
+            crate::config::DEFAULT_VOTE_BUCKET_CAPACITY,
         );
         assert_eq!(
-            runtime.parked_proposals_capacity,
-            crate::consensus::limits::DEFAULT_PARKED_PROPOSALS_CAPACITY,
+            cons.limits.parked_proposals_capacity,
+            crate::config::DEFAULT_PARKED_PROPOSALS_CAPACITY,
         );
         assert_eq!(
-            runtime.pending_blocks_capacity,
-            crate::consensus::limits::DEFAULT_PENDING_BLOCKS_CAPACITY,
+            cons.limits.pending_blocks_capacity,
+            crate::config::DEFAULT_PENDING_BLOCKS_CAPACITY,
         );
         assert_eq!(
-            runtime.timeout_buckets_capacity,
-            crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
+            cons.limits.timeout_buckets_capacity,
+            crate::config::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
         );
         assert_eq!(
-            runtime.block_sync_initial_backoff_views,
-            crate::consensus::limits::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
+            cons.limits.block_sync_initial_backoff_views,
+            crate::config::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
         );
         assert_eq!(
-            runtime.block_sync_max_backoff_views,
-            crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
+            cons.limits.block_sync_max_backoff_views,
+            crate::config::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
         );
         assert_eq!(
-            runtime.block_sync_per_peer_attempts,
-            crate::consensus::limits::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
+            cons.limits.block_sync_per_peer_attempts,
+            crate::config::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
         );
         assert_eq!(
-            runtime.block_sync_max_attempts,
-            crate::consensus::limits::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
+            cons.limits.block_sync_max_attempts,
+            crate::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
         );
         assert_eq!(cons.limits.mempool_capacity, 1024);
         // Default scheme: collected Ed25519. BLS lands at #289.
@@ -1732,15 +1712,14 @@ mempool_capacity = 2048
 "#,
         );
         let cons = c.consensus.expect("consensus section");
-        let runtime = cons.limits.to_cache_limits();
-        assert_eq!(runtime.vote_bucket_capacity, 32);
-        assert_eq!(runtime.parked_proposals_capacity, 16);
-        assert_eq!(runtime.pending_blocks_capacity, 64);
-        assert_eq!(runtime.timeout_buckets_capacity, 8);
-        assert_eq!(runtime.block_sync_initial_backoff_views, 4);
-        assert_eq!(runtime.block_sync_max_backoff_views, 32);
-        assert_eq!(runtime.block_sync_per_peer_attempts, 5);
-        assert_eq!(runtime.block_sync_max_attempts, 25);
+        assert_eq!(cons.limits.vote_bucket_capacity, 32);
+        assert_eq!(cons.limits.parked_proposals_capacity, 16);
+        assert_eq!(cons.limits.pending_blocks_capacity, 64);
+        assert_eq!(cons.limits.timeout_buckets_capacity, 8);
+        assert_eq!(cons.limits.block_sync_initial_backoff_views, 4);
+        assert_eq!(cons.limits.block_sync_max_backoff_views, 32);
+        assert_eq!(cons.limits.block_sync_per_peer_attempts, 5);
+        assert_eq!(cons.limits.block_sync_max_attempts, 25);
         assert_eq!(cons.limits.mempool_capacity, 2048);
     }
 
@@ -1858,15 +1837,14 @@ mempool_capacity = 64
 "#,
         );
         let cons = c.consensus.expect("consensus section");
-        let runtime = cons.limits.to_cache_limits();
         assert_eq!(cons.limits.mempool_capacity, 64);
         assert_eq!(
-            runtime.vote_bucket_capacity,
-            crate::consensus::limits::DEFAULT_VOTE_BUCKET_CAPACITY,
+            cons.limits.vote_bucket_capacity,
+            crate::config::DEFAULT_VOTE_BUCKET_CAPACITY,
         );
         assert_eq!(
-            runtime.timeout_buckets_capacity,
-            crate::consensus::limits::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
+            cons.limits.timeout_buckets_capacity,
+            crate::config::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
         );
     }
 
@@ -2241,15 +2219,10 @@ vote_per_sec = 1024.0
         assert_eq!(limits.max_inbound_connections, 64); // default kept
         assert_eq!(limits.rate.vote_per_sec, 1024.0);
         assert_eq!(limits.rate.proposal_per_sec, 16.0); // default kept
-        // Round-trip into the runtime shapes consensus consumes.
-        let conn = limits.connection_limits();
-        assert_eq!(conn.max_per_ip, 1);
-        assert_eq!(conn.max_inbound, 64);
-        let rate = limits.rate_limits();
-        assert_eq!(rate.vote_per_sec, 1024.0);
-        assert_eq!(rate.proposal_per_sec, 16.0);
-        assert_eq!(rate.violation_window, std::time::Duration::from_secs(10));
-        assert_eq!(rate.max_violations, 100);
+        // Violation window/count defaults are preserved. The projection
+        // into the runtime RateLimitsConfig is covered in p2p::limits.
+        assert_eq!(limits.violations.window_secs, 10);
+        assert_eq!(limits.violations.max_violations, 100);
     }
 
     #[test]
@@ -2270,9 +2243,6 @@ max_violations = 20
         let limits = c.p2p.limits.expect("limits section");
         assert_eq!(limits.violations.window_secs, 5);
         assert_eq!(limits.violations.max_violations, 20);
-        let rate = limits.rate_limits();
-        assert_eq!(rate.violation_window, std::time::Duration::from_secs(5));
-        assert_eq!(rate.max_violations, 20);
     }
 
     #[test]
@@ -2339,7 +2309,7 @@ node_id = "{}"
         // validation time — the peer's identity is whatever it
         // presents on the handshake. validate() lets these through;
         // the dialer and listener handshake guards catch the self
-        // case at runtime.
+        // case at cons.limits.
         let self_id: NodeId = [3u8; 32];
         let cfg: Config = toml::from_str(
             r#"

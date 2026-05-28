@@ -6,7 +6,7 @@ use clap::Args;
 use tracing::info;
 
 use boule::config;
-use boule::node;
+use boule_node as node;
 
 use super::shared::{is_production, resolve_config_path};
 

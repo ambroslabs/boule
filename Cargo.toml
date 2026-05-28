@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/boule-rs", "crates/boule-cli"]
+members = [
+    "crates/boule-rs",
+    "crates/boule-transport",
+    "crates/boule-transport-tcp",
+    "crates/boule-consensus",
+    "crates/boule-node",
+    "crates/boule-cli",
+]
 # `fuzz` is intentionally excluded: it hosts nightly-only `cargo-fuzz`
 # targets and must not be pulled into the stable workspace build.
 exclude = ["fuzz"]

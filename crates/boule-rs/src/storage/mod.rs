@@ -201,7 +201,7 @@ pub struct WriteBatch {
 }
 
 #[derive(Debug)]
-pub(crate) enum WriteOp {
+pub enum WriteOp {
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
 }
@@ -213,6 +213,12 @@ impl WriteBatch {
 
     pub fn delete(&mut self, key: &[u8]) {
         self.ops.push(WriteOp::Delete(key.to_vec()));
+    }
+
+    /// Read-only view of the queued operations. Used by storage backends
+    /// and by tests that assert which writes a batch carries.
+    pub fn ops(&self) -> &[WriteOp] {
+        &self.ops
     }
 
     pub fn len(&self) -> usize {

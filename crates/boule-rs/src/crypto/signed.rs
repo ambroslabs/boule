@@ -38,8 +38,8 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::sig_scheme::SignatureScheme;
-use crate::p2p::NodeId;
-use crate::p2p::identity::NodeIdentity;
+use crate::identity::NodeId;
+use crate::identity::NodeIdentity;
 
 /// A key that can produce Ed25519 signatures over arbitrary byte strings.
 ///
@@ -151,13 +151,15 @@ impl ChainId {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl ChainId {
-    /// Test sentinel: an all-zero `ChainId`. Gated to `cfg(test)` so a
-    /// production deployment cannot accidentally select the all-zero
-    /// chain id (which would be replay-compatible with every other
-    /// deployment that did the same). Production callers must derive
-    /// their `ChainId` from the genesis block via [`from_genesis_hash`].
+    /// Test sentinel: an all-zero `ChainId`. Gated behind `cfg(test)` /
+    /// the `testing` feature so a production deployment cannot
+    /// accidentally select the all-zero chain id (which would be
+    /// replay-compatible with every other deployment that did the same).
+    /// Production callers must derive their `ChainId` from the genesis
+    /// block via [`from_genesis_hash`]. Downstream crates enable
+    /// `boule-rs/testing` in their dev-dependencies to use it in tests.
     pub const TEST: Self = Self([0u8; 32]);
 }
 
@@ -202,7 +204,7 @@ where
     ///
     /// ```
     /// use boule::crypto::signed::{ChainId, NodeSigner, Signed, SignedMessage, Signer};
-    /// use boule::p2p::identity::NodeIdentity;
+    /// use boule::identity::NodeIdentity;
     /// use rcgen::{KeyPair, PKCS_ED25519};
     /// use serde::{Deserialize, Serialize};
     /// use zeroize::Zeroizing;
@@ -269,10 +271,7 @@ where
 ///
 /// The `chain_id` is the 32-byte deployment-scoped tag from #324; see
 /// the module-level docs.
-pub(crate) fn preimage<T: Serialize + SignedMessage>(
-    payload: &T,
-    chain_id: &ChainId,
-) -> Result<Vec<u8>> {
+pub fn preimage<T: Serialize + SignedMessage>(payload: &T, chain_id: &ChainId) -> Result<Vec<u8>> {
     let domain = T::DOMAIN.as_bytes();
     if domain.len() > u32::MAX as usize {
         bail!("domain tag too long");

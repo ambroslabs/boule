@@ -1,0 +1,44 @@
+[package]
+name = "boule-consensus"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "HotStuff-style BFT consensus core and block/snapshot replication for boule. Transport-agnostic: depends only on boule-rs primitives."
+repository = "https://github.com/ambroslabs/boule-rs"
+homepage = "https://github.com/ambroslabs/boule-rs"
+
+[features]
+# Crash-injection seam (issue #420): compiles the `crashpoint!` firing
+# path and the `CrashSlot` arming API. Off in production (the macro
+# becomes a no-op); enabled by `boule-node`'s dev-dependency so the
+# crash-recovery sim can arm and observe crashpoints.
+crashpoints = []
+# Exposes test-only fixtures (test ingress entry points, manifest/
+# block-sync test constructors) to downstream crates' tests without
+# making them part of the production API.
+testing = []
+
+[dependencies]
+boule-rs    = { path = "../boule-rs", version = "0.1.0" }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+postcard    = { version = "1", default-features = false, features = ["use-std"] }
+sha2        = "0.10"
+bytes       = { version = "1", features = ["serde"] }
+anyhow      = "1"
+tracing     = "0.1"
+parking_lot = "0.12"
+hex         = "0.4"
+chrono      = { version = "0.4", features = ["serde"] }
+blst        = "0.3"
+ring        = "0.17"
+tokio       = { version = "1", features = ["full"] }
+axum        = "0.8"
+
+[dev-dependencies]
+boule-rs    = { path = "../boule-rs", version = "0.1.0", features = ["testing"] }
+tokio       = { version = "1", features = ["full", "test-util"] }
+proptest    = { version = "1", default-features = false, features = ["std", "bit-set"] }
+rcgen       = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+zeroize     = { version = "1", features = ["derive"] }
+tempfile    = "3"

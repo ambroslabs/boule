@@ -6,8 +6,8 @@ use clap::Args;
 use tracing::info;
 
 use boule::config;
-use boule::p2p::identity::KeyProvider;
-use boule::p2p::tls::node_id_to_base58;
+use boule::identity::KeyProvider;
+use boule::identity::node_id_to_base58;
 
 use super::shared::resolve_config_path;
 
@@ -41,7 +41,7 @@ pub(crate) fn handle(args: InitArgs) -> anyhow::Result<()> {
     // Cross-validate `[[peers]]` against the local NodeId now so a self-id is
     // caught at `init` rather than only surfacing at `start`.
     if let Some(net_id) = provider.try_load()? {
-        let tls = boule::p2p::tls::TlsIdentity::from_identity(&net_id)?;
+        let tls = boule_transport_tcp::tls::TlsIdentity::from_identity(&net_id)?;
         config.validate(&tls.node_id)?;
     }
 
@@ -82,7 +82,7 @@ fn provision_or_report(
 ) -> anyhow::Result<()> {
     match provider.try_load()? {
         Some(id) => {
-            let tls = boule::p2p::tls::TlsIdentity::from_identity(&id)?;
+            let tls = boule_transport_tcp::tls::TlsIdentity::from_identity(&id)?;
             println!(
                 "{slot} key already provisioned: NodeId = {}",
                 node_id_to_base58(&tls.node_id)
@@ -91,7 +91,7 @@ fn provision_or_report(
         None => {
             if provider.is_provisioning_capable() {
                 let new_id = provider.load_or_init()?;
-                let tls = boule::p2p::tls::TlsIdentity::from_identity(&new_id)?;
+                let tls = boule_transport_tcp::tls::TlsIdentity::from_identity(&new_id)?;
                 println!(
                     "provisioned new {slot} key: NodeId = {}",
                     node_id_to_base58(&tls.node_id)
