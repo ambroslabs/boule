@@ -20,8 +20,6 @@
 //!    bypassed the synchronous gate).
 //! 3. Bound the worst case if a future caller batches multiple
 //!    `Dispatch::ServeBlock` actions from a single ingress event.
-//!
-//! See `docs/backpressure.md` for the full policy table.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -340,7 +340,6 @@ pub struct ProtocolHandle {
     /// [`crate::consensus::status::BackpressureStatus::peer_outbound_overflow_total`]
     /// metric counts. Wired through to consensus so a single counter
     /// covers `SendTo` + `Broadcast` outbound drops on every protocol.
-    /// Closed-channel failures are intentionally not counted (see
-    /// `docs/backpressure.md`).
+    /// Closed-channel failures are intentionally not counted.
     pub peer_outbound_overflows: Arc<AtomicU64>,
 }

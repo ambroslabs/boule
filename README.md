@@ -16,7 +16,7 @@ in the repo root pins the toolchain; `rustup` will pick it up automatically.
 cargo build
 
 # Bootstrap a single node (writes a starter config at the platform
-# default location if --config is omitted; see docs/testnet-local.md)
+# default location if --config is omitted)
 cargo run -- init --config config.toml
 
 # Run that node
@@ -93,8 +93,7 @@ Module crib sheet (see `cargo doc` for the authoritative version):
 | `crypto`  | Application-level `Signed<T>` envelopes for consensus votes, proposals, etc.      |
 | `clock`   | Object-safe time abstraction; `TokioClock` in prod, `SimClock` in tests.          |
 | `sim`     | `#[cfg(test)]`-only deterministic simulator: in-memory pipes, virtual time, seeded RNG. |
-| `storage` | `Storage` (KV) and `Wal` (append-only) traits with in-memory and `redb` backends. Durability audit and operator runbook in [docs/storage-durability.md](docs/storage-durability.md). |
-| ops       | Production-deployment guidance: outbound-only / NAT mode, state snapshots and disk-usage expectations, manual export/import. See [docs/operations.md](docs/operations.md). |
+| `storage` | `Storage` (KV) and `Wal` (append-only) traits with in-memory and `redb` backends. |
 | `config`  | TOML config loading and identity-backend resolution.                              |
 
 ## Configuration

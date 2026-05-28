@@ -164,8 +164,8 @@ pub async fn run(
     // peer accumulates [`SLOW_PEER_OVERFLOW_THRESHOLD`] overflows
     // within [`SLOW_PEER_OVERFLOW_WINDOW`], the manager kicks the
     // peer with the same cleanup path `PeerCommand::Disconnect`
-    // takes — the back-pressure policy in `docs/backpressure.md`
-    // calls this the "must-deliver-or-disconnect" escape valve.
+    // takes — the back-pressure policy calls this the
+    // "must-deliver-or-disconnect" escape valve.
     let mut slow_peer_trackers: HashMap<NodeId, SlowPeerTracker> = HashMap::new();
 
     loop {
@@ -586,8 +586,7 @@ fn broadcast_msg(
 /// Tear down `node_id`'s peer slot and notify the rest of the system,
 /// matching the cleanup `PeerCommand::Disconnect` performs. Used by
 /// the slow-peer disconnect heuristic (#490) so the
-/// must-deliver-or-disconnect contract from `docs/backpressure.md`
-/// has a real escape valve.
+/// must-deliver-or-disconnect contract has a real escape valve.
 fn disconnect_peer_for_overflow(
     node_id: NodeId,
     peers: &mut BTreeMap<NodeId, PeerSlot>,

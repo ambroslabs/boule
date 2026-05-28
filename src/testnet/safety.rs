@@ -1,7 +1,7 @@
 //! `testnet verify-safety`: extract every `(height, view)` pair from
 //! every node's log and confirm that no two nodes ever committed
-//! different views at the same height. Mirrors the §8 verifier in
-//! `docs/testnet-local.md` but immune to ANSI escape codes (the regex
+//! different views at the same height. Mirrors the shell-based verifier,
+//! but immune to ANSI escape codes (the regex
 //! matches the `height=N view=N` substring even when surrounded by
 //! tracing color codes).
 

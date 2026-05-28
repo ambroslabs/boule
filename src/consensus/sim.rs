@@ -103,7 +103,6 @@ type LinkCut = (NodeId, NodeId);
 /// generously above the worst-case burst we've observed in long-run
 /// tests so that under normal use the bound never trips; on overflow
 /// the [`MpscCommitNotifier`] bumps a counter the harness can poll.
-/// See `docs/backpressure.md`.
 pub const SIM_COMMIT_CHANNEL_CAP: usize = 4096;
 
 // ── Per-replica vote-uniqueness observer (issue #422) ────────────────────────
@@ -5711,8 +5710,8 @@ mod tests {
     /// must catch up via block-sync rather than wedging at its old
     /// height.
     ///
-    /// This is the in-sim analogue of `docs/testnet-local.md` §9b's
-    /// rotating-failure scenario: a partitioned node mirrors the
+    /// This is the in-sim analogue of a rotating-failure scenario: a
+    /// partitioned node mirrors the
     /// "behind the cluster" state of a freshly-restarted node, since
     /// in both cases the lagger sees fresh proposals whose parents
     /// it has never processed.

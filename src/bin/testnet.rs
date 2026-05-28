@@ -1,5 +1,4 @@
-//! `testnet` — driver binary for the parameterized testnet replacing the
-//! §9b shell harness in `docs/testnet-local.md`. The library half
+//! `testnet` — driver binary for the parameterized testnet. The library half
 //! ([`boule::testnet`]) is also usable directly from integration
 //! tests; this binary is just the CLI shell that wires argv through to
 //! it. See `testnet --help`.
