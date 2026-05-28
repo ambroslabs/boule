@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Command-line interface and node binary for boule, a HotStuff-style BFT consensus layer."
-repository = "https://github.com/ambroslabs/boule-rs"
-homepage = "https://github.com/ambroslabs/boule-rs"
+repository = "https://github.com/ambroslabs/boule"
+homepage = "https://github.com/ambroslabs/boule"
 
-# The node binary. `boule-rs` exposes its library as `boule`, so both the
+# The node binary. `boule-core` exposes its library as `boule`, so both the
 # binary and the testnet driver import it as `use boule::...`.
 [[bin]]
 name = "boule"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 # The `testnet` driver binary is auto-discovered from src/bin/testnet.rs.
 
 [dependencies]
-boule-rs            = { path = "../boule-rs", version = "0.1.0" }
+boule-core          = { path = "../boule-core", version = "0.1.0" }
 boule-consensus     = { path = "../boule-consensus", version = "0.1.0" }
 boule-transport-tcp = { path = "../boule-transport-tcp", version = "0.1.0" }
 boule-node          = { path = "../boule-node", version = "0.1.0" }

@@ -1,5 +1,10 @@
 # boule
 
+> **boule** — from the ancient Greek *βουλή* (boulē, /buːˈleɪ/, "boo-LAY"),
+> the citizen council of classical Athens that deliberated to reach
+> collective decisions. A fitting namesake for a Byzantine-fault-tolerant
+> consensus system.
+
 A peer-to-peer runtime written in Rust, hosting a HotStuff-style BFT
 consensus layer. Every subsystem below consensus — TLS transport, gossip,
 signed envelopes, clock, durable storage — lives behind an object-safe
@@ -38,7 +43,7 @@ cargo test --doc
 # default (256 cases) runs in about a second; deeper runs catch
 # rarer Byzantine interleavings. A failing case is saved to
 # `proptest-regressions/` so the exact seed persists across runs.
-PROPTEST_CASES=4096 cargo test -p boule-rs --lib consensus::hotstuff::step::tests::property
+PROPTEST_CASES=4096 cargo test -p boule-consensus --lib hotstuff::step::tests::property
 ```
 
 Format and lint before pushing:

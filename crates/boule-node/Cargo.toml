@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Top-level node runtime for boule: wires consensus + replication over the TCP transport, plus the consensus driver, testnet driver, and simulator."
-repository = "https://github.com/ambroslabs/boule-rs"
-homepage = "https://github.com/ambroslabs/boule-rs"
+repository = "https://github.com/ambroslabs/boule"
+homepage = "https://github.com/ambroslabs/boule"
 
 [dependencies]
-boule-rs            = { path = "../boule-rs", version = "0.1.0" }
+boule-core          = { path = "../boule-core", version = "0.1.0" }
 boule-transport     = { path = "../boule-transport", version = "0.1.0" }
 boule-transport-tcp = { path = "../boule-transport-tcp", version = "0.1.0" }
 boule-consensus     = { path = "../boule-consensus", version = "0.1.0" }
@@ -39,7 +39,7 @@ zeroize             = { version = "1", features = ["derive"] }
 [dev-dependencies]
 # Enable the crash-injection seam in consensus for the crash-recovery sim.
 boule-consensus     = { path = "../boule-consensus", version = "0.1.0", features = ["crashpoints", "testing"] }
-boule-rs            = { path = "../boule-rs", version = "0.1.0", features = ["testing"] }
+boule-core          = { path = "../boule-core", version = "0.1.0", features = ["testing"] }
 tokio               = { version = "1", features = ["full", "test-util"] }
 proptest            = { version = "1", default-features = false, features = ["std", "bit-set"] }
 tempfile            = "3"

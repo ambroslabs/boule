@@ -159,7 +159,7 @@ impl ChainId {
     /// replay-compatible with every other deployment that did the same).
     /// Production callers must derive their `ChainId` from the genesis
     /// block via [`from_genesis_hash`]. Downstream crates enable
-    /// `boule-rs/testing` in their dev-dependencies to use it in tests.
+    /// `boule-core/testing` in their dev-dependencies to use it in tests.
     pub const TEST: Self = Self([0u8; 32]);
 }
 
