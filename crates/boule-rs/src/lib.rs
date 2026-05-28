@@ -70,12 +70,7 @@
 pub mod cli;
 pub mod clock;
 pub mod config;
-pub mod consensus;
 pub mod crypto;
 pub mod identity;
-pub mod node;
-pub mod p2p;
 pub mod paths;
-pub mod replication;
 pub mod storage;
-pub mod testnet;

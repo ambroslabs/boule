@@ -269,7 +269,7 @@ where
 ///
 /// The `chain_id` is the 32-byte deployment-scoped tag from #324; see
 /// the module-level docs.
-pub(crate) fn preimage<T: Serialize + SignedMessage>(
+pub fn preimage<T: Serialize + SignedMessage>(
     payload: &T,
     chain_id: &ChainId,
 ) -> Result<Vec<u8>> {

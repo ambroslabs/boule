@@ -16,7 +16,10 @@ path = "src/main.rs"
 # The `testnet` driver binary is auto-discovered from src/bin/testnet.rs.
 
 [dependencies]
-boule-rs           = { path = "../boule-rs", version = "0.1.0" }
+boule-rs            = { path = "../boule-rs", version = "0.1.0" }
+boule-consensus     = { path = "../boule-consensus", version = "0.1.0" }
+boule-transport-tcp = { path = "../boule-transport-tcp", version = "0.1.0" }
+boule-node          = { path = "../boule-node", version = "0.1.0" }
 tokio              = { version = "1", features = ["full"] }
 anyhow             = "1"
 tracing            = "0.1"

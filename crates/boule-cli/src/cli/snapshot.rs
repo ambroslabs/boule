@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use boule::config;
-use boule::replication::snapshot;
+use boule_consensus::replication::snapshot;
 
 use super::shared::resolve_config_path;
 
