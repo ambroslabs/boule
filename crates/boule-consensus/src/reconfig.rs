@@ -57,7 +57,7 @@ pub const MIN_V_EFF_DELAY: View = View::new(2);
 
 /// A pubkey + network address pair describing a validator to admit.
 ///
-/// `node_id` is the Ed25519 pubkey used by [`crate::p2p::tls`]; `addr` is
+/// `node_id` is the Ed25519 pubkey used by `boule_transport_tcp::tls`; `addr` is
 /// the routable socket peers should use to reach this validator. On BLS
 /// chains (#143 / #289) `bls_pop` carries the new validator's BLS
 /// pubkey paired with a proof-of-possession signature over that pubkey;
@@ -107,7 +107,7 @@ pub struct WeightChange {
 ///
 /// `adds`, `removes`, and `changes` describe the diff against the
 /// active set. `v_eff` is the view at which the resulting set becomes
-/// authoritative. See [`Self::validate_against`] for the exact
+/// authoritative. See [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_scheme`] for the exact
 /// pre-commit checks.
 ///
 /// **Wire-format note (#462):** `ValidatorEntry` gains a `weight`
@@ -226,7 +226,7 @@ impl ReconfigCommand {
         self.validate_against_with_delay(current_set, current_view.into(), MIN_V_EFF_DELAY)
     }
 
-    /// Same as [`Self::validate_against`] but uses an operator-supplied
+    /// Same as [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_scheme`] but uses an operator-supplied
     /// minimum delay floor, which must be at least [`MIN_V_EFF_DELAY`].
     /// Wired through [`crate::wire::NodeConfigForConsensus::min_v_eff_delay`]
     /// (#272) so deployments can require a longer "give the new
@@ -256,7 +256,7 @@ impl ReconfigCommand {
         )
     }
 
-    /// Scheme-aware variant of [`Self::validate_against_with_delay`].
+    /// Scheme-aware variant of [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_scheme`].
     /// Adds two checks driven by the chain's signature scheme (#334):
     ///
     /// - BLS chain: every `adds` entry must carry a `bls_pop` whose

@@ -482,7 +482,7 @@ pub struct PersistedValidator {
 
 /// Serializable snapshot of a [`ValidatorKeyHistory`] (#260). Encoded
 /// via postcard at storage write time, written under
-/// [`crate::wire::STORAGE_KEY_VALIDATOR_KEY_HISTORY`].
+/// `boule_node::consensus_node::persistence::STORAGE_KEY_VALIDATOR_KEY_HISTORY`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedValidatorKeyHistory {
     pub validators: Vec<PersistedValidator>,

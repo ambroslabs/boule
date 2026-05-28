@@ -16,7 +16,7 @@
 //!
 //! # Quick start
 //!
-//! Register a protocol ID, build an [`Rpc`] with handlers for each method
+//! Register a protocol ID, build an [`crate::rpc::Rpc`] with handlers for each method
 //! you want to serve, then issue calls:
 //!
 //! ```no_run

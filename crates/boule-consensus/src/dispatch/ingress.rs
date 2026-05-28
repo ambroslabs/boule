@@ -3,7 +3,7 @@
 //! [`ingress_wire_with_qc_verification`] dispatches to one
 //! `ingress_<variant>` function per [`WireMessage`] variant rather
 //! than nesting verifier calls inside a single match. The split makes
-//! the call sites in [`crate::node`]'s event loop testable
+//! the call sites in `boule_node`'s event loop testable
 //! in isolation — each variant function takes the already-decoded
 //! payload plus chain context and returns the [`Dispatch`] items
 //! that variant produces.
@@ -118,7 +118,7 @@ pub fn ingress_wire(
     )
 }
 
-/// QC-verifying counterpart to [`ingress_wire`]. See [`QcVerification`]
+/// QC-verifying counterpart to `ingress_wire`. See [`QcVerification`]
 /// for the scheme-aware verification policy.
 pub fn ingress_wire_with_qc_verification(
     from: NodeId,
@@ -366,7 +366,7 @@ pub fn ingress_block_request(hash: BlockHash, from: NodeId) -> Vec<Dispatch> {
 /// later slashable. Hash verification (`block.hash() == requested_hash`
 /// and `requested_hash` matches an outstanding `block_sync_inflight`
 /// entry) lives in the [`Dispatch::ReceiveBlock`] handler in
-/// [`crate::wire::Node::apply_dispatch`] because the inflight
+/// `boule_node::consensus_node::action_interpreter::apply_dispatch` because the inflight
 /// tracker lives on the integration layer, not in ingress.
 pub fn ingress_block_response(
     signed: Signed<crate::wire::BlockResponsePayload>,

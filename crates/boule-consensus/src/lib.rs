@@ -1,8 +1,8 @@
 //! HotStuff-style BFT consensus layer.
 //!
 //! Consensus sits above [`crate::replication`] (state machine, mempool,
-//! block format) and [`crate::storage`] (durable state), and ships its
-//! messages through [`crate::p2p`]. The design discipline of this crate —
+//! block format) and [`boule::storage`] (durable state), and ships its
+//! messages through `boule_transport_tcp`. The design discipline of this crate —
 //! small object-safe traits, `Arc<dyn Trait>` at the edges, pure state
 //! machines in the core — applies here especially hard: HotStuff
 //! implementations are historically buggy when safety, liveness, and I/O

@@ -1,7 +1,7 @@
 //! Joiner-side snapshot-fetch state machine.
 //!
 //! Pure state machine with no I/O — the integration layer in
-//! [`crate::wire::ConsensusNode`] feeds it observations
+//! `boule_node::consensus_node::ConsensusNode` feeds it observations
 //! (inbound proposals, manifest/chunk responses, peer disconnects)
 //! and executes the [`SnapshotSyncAction`]s it returns (send wire
 //! messages, restore state, log abort).

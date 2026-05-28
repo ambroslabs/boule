@@ -598,7 +598,7 @@ impl ConsensusNode {
     /// Bulk-range gap detection (#515): when a proposal arrives
     /// whose parent is not in `pending_blocks` and whose height sits
     /// more than two blocks above the commit frontier, fire a
-    /// [`WireMessage::BlockRangeRequest`] to the proposer in addition
+    /// [`boule_consensus::wire::WireMessage::BlockRangeRequest`] to the proposer in addition
     /// to the safety core's single-block `RequestBlock` for the
     /// immediate parent. The single-block path keeps working as a
     /// fallback for the unknown-parent-but-only-one-block-away case

@@ -262,7 +262,7 @@ pub struct ConsensusNode {
     /// non-validator BLS-chain participants. Wrapped in `Arc` so the
     /// dispatch layer can cheaply hold a borrow across `await`
     /// suspension points alongside the existing Ed25519 `signer`.
-    /// Consumed by [`boule_consensus::dispatch::sign_consensus_msg`]
+    /// Consumed by `boule_consensus::dispatch::sign_consensus_msg`
     /// when signing a `Vote` on a BLS chain — the produced
     /// `BlsPartialSig` rides on the wire alongside the Ed25519
     /// envelope.
@@ -324,7 +324,7 @@ pub struct ConsensusNode {
     /// `(from_height, to_height)` (#515). Inserted on emission so a
     /// fresh proposal arriving while the previous range is still
     /// in-flight does not double-emit. Cleared on
-    /// [`Dispatch::ReceiveBlockRange`]. Decoupled from
+    /// [`boule_consensus::dispatch::Dispatch::ReceiveBlockRange`]. Decoupled from
     /// [`HotStuffCore::block_sync_inflight`] (which keys by
     /// content-hash for the single-block fallback path) — the two
     /// trackers compose: a recovering node typically holds one or
@@ -456,7 +456,7 @@ pub(super) struct BlockSyncRangeInflight {
     /// `last_asked_at` is below the configured retry threshold —
     /// guards against an immediate re-emission when the timer ticks
     /// shortly after a fresh insert from
-    /// [`super::action_interpreter`]'s `maybe_emit_block_range_request`.
+    /// [`crate::consensus_node::action_interpreter`]'s `maybe_emit_block_range_request`.
     pub(super) last_asked_at: tokio::time::Instant,
 }
 
@@ -734,7 +734,7 @@ impl ConsensusNode {
     /// L5-1). The same `Arc` the integration layer increments on every
     /// `Action::ProposalEquivocationEvidence` it observes; sibling of
     /// [`Self::equivocations_counter`] used by
-    /// [`crate::sim::SimCluster::peek_proposal_equivocations_detected`]
+    /// `SimCluster::peek_proposal_equivocations_detected`
     /// to verify the proposer-side detection path end-to-end.
     pub fn proposal_equivocations_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.proposal_equivocations_detected)

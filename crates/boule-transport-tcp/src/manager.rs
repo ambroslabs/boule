@@ -155,7 +155,7 @@ pub async fn run(
     // it. Cloned into every [`ProtocolHandle`] returned by
     // [`PeerCommand::RegisterProtocol`] so a consumer (consensus) can
     // surface the running drop count via
-    // [`crate::consensus::status::BackpressureStatus`]. `Closed`
+    // `boule_consensus::status::BackpressureStatus`. `Closed`
     // failures are intentionally not counted: they fire when a peer
     // disconnects mid-send and would mask real back-pressure events.
     // (#163 / #486 follow-up.)

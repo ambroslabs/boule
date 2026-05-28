@@ -14,21 +14,21 @@
 //!
 //! Two seams suffice to keep consensus topology-agnostic:
 //!
-//! - [`Broadcaster`] hides the *outbound* dispatch decision behind two
+//! - [`boule_transport::overlay::Broadcaster`] hides the *outbound* dispatch decision behind two
 //!   methods: `broadcast` (fan out to every "currently reachable" peer)
 //!   and `send_to` (a single named peer). The mesh implementation
-//!   ([`MeshBroadcaster`]) routes both through the existing peer-manager
+//!   ([`crate::overlay::MeshBroadcaster`]) routes both through the existing peer-manager
 //!   channel; a future gossip implementation will pick a fanout subset
 //!   and rely on the receiver to forward.
-//! - [`Discovery`] hides the *peer-membership* surface behind
+//! - [`boule_transport::overlay::Discovery`] hides the *peer-membership* surface behind
 //!   `known_peers` (snapshot), `add_bootstrap` (request a dial to a
 //!   freshly learned address), and `subscribe` (event stream of
-//!   add/remove deltas). The mesh implementation ([`MeshDiscovery`])
+//!   add/remove deltas). The mesh implementation ([`crate::overlay::MeshDiscovery`])
 //!   maintains a local cache fed by the manager's add/remove broadcast.
 //!
 //! # Delivery contract
 //!
-//! Implementations of [`Broadcaster`] guarantee **at-least-once**
+//! Implementations of [`boule_transport::overlay::Broadcaster`] guarantee **at-least-once**
 //! delivery on a best-effort basis: a frame may be delivered more than
 //! once under retries (e.g. when gossip lands and a frame is forwarded
 //! by two neighbours), and there is **no ordering guarantee** across
@@ -36,7 +36,7 @@
 //! send_to-ing concurrently can interleave on receivers in any order.
 //! Receivers are responsible for deduplication; consensus already does
 //! this via the per-view vote/proposal buckets in
-//! [`crate::consensus::hotstuff`].
+//! `boule_consensus::hotstuff`.
 //!
 //! Both `broadcast` and `send_to` return a future so the caller can
 //! preserve the existing `await`-on-send backpressure. A successfully
@@ -51,9 +51,9 @@
 //!
 //! # Implementations
 //!
-//! - [`mesh`] — the legacy full-mesh impl that ships today. Still the
+//! - `mesh` — the legacy full-mesh impl that ships today. Still the
 //!   default until the gossip overlay is ready to take over.
-//! - [`gossip`] — partial-mesh gossip overlay (issue #137). Currently
+//! - [`crate::overlay::gossip`] — partial-mesh gossip overlay (issue #137). Currently
 //!   under construction; types live here but nothing wires them up
 //!   yet.
 //!

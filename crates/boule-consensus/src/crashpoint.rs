@@ -8,7 +8,7 @@
 //! `cfg(test)` so a release binary takes no extra branch.
 //!
 //! In test builds the macro consults a tokio-task-local, fire-once
-//! [`CrashSlot`]. If a test has *armed* the slot with a matching name,
+//! `CrashSlot`. If a test has *armed* the slot with a matching name,
 //! the macro panics with a tagged `CrashPoint(name)` payload — modelling
 //! the consensus task being yanked out from under the integration
 //! layer between "I just persisted X" and "I just sent the network
@@ -32,7 +32,7 @@
 //! # Production no-op contract
 //!
 //! `crashpoint!("name")` expands to `()` outside `cfg(test)`. Tests
-//! enforce this via [`crashpoint_macro_is_noop_outside_cfg_test`] (a
+//! enforce this via `crashpoint_macro_is_noop_outside_cfg_test` (a
 //! tautology under `cfg(test)` but kept as a documented anchor: any
 //! future macro change that would smuggle a runtime branch into
 //! release builds breaks compilation of that anchor).
@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "crashpoints")]
 tokio::task_local! {
-    /// Per-task fire-once crash slot. Cloned [`CrashSlot`]s share the
+    /// Per-task fire-once crash slot. Cloned `CrashSlot`s share the
     /// same inner state via [`Arc`], so the sim can hold an external
     /// handle, hand another clone into the consensus task via
     /// [`tokio::task_local::LocalKey::scope`], and arm the slot from
@@ -58,7 +58,7 @@ tokio::task_local! {
 
 /// Test-side handle for arming a [`CRASH_SLOT`]. Constructed by the
 /// sim when it spawns a node, handed to the test via
-/// [`crate::sim::SimCluster::arm_crashpoint`], and consulted
+/// `boule_node::sim::SimCluster::arm_crashpoint`, and consulted
 /// by [`fire`] when the consensus task hits a `crashpoint!()`.
 ///
 /// The slot is fire-once: the first matching name consumes the entry.
@@ -149,7 +149,7 @@ pub fn fire(_name: &'static str) {}
 /// Inject `crashpoint!("name")` between a safety-state mutation and
 /// its dependent network send. Compiles to a no-op outside `cfg(test)`
 /// so production binaries take no extra branch. Inside `cfg(test)`
-/// expands to a [`fire`] call against the per-task [`CrashSlot`].
+/// expands to a [`fire`] call against the per-task `CrashSlot`.
 ///
 /// Names are short kebab-case strings naming the durability boundary,
 /// matching the audit's vocabulary: `after_persist_voted_view`,

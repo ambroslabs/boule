@@ -25,7 +25,7 @@
 //!
 //! # Publication model
 //!
-//! [`ConsensusNode`](crate::wire::ConsensusNode) builds a
+//! `ConsensusNode` builds a
 //! fresh [`ConsensusStatus`] at the end of each event-loop iteration
 //! and publishes it through a [`tokio::sync::watch`] channel. The HTTP
 //! handler holds the receiver and returns the latest value; this is a
@@ -138,7 +138,7 @@ pub struct CacheEvictionStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BackpressureStatus {
     /// Drops from
-    /// [`crate::p2p::overlay::gossip::sink::OverlaySink::send_to`]'s
+    /// `boule_transport_tcp::overlay::gossip::sink::OverlaySink::send_to`'s
     /// `try_send` falling back on `Full`. Used by the gossip overlay's
     /// peer-list publisher and the overlay run loop's per-peer
     /// unicasts. Always zero on a node configured for mesh-mode
@@ -260,7 +260,7 @@ pub struct ConsensusStatus {
     #[serde(default)]
     pub cache_evictions: CacheEvictionStatus,
     /// Cumulative count of commands the local
-    /// [`crate::wire::MempoolBlockBuilder`] dropped
+    /// `boule_node::consensus_node::block_builder::MempoolBlockBuilder` dropped
     /// because `StateMachine::apply` returned `Err` (decode error,
     /// bad command kind, or app-level rejection — issue #376). The
     /// commands themselves still ride the proposed block; replicas

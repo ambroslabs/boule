@@ -115,3 +115,21 @@ jobs:
       - uses: actions/checkout@v4
       - if: needs.changes.outputs.rust == 'true'
         uses: EmbarkStudios/cargo-deny-action@v2
+
+  docs:
+    name: Docs (intra-doc links)
+    needs: changes
+    runs-on: ubuntu-latest
+    # Fail on broken intra-doc links so doc references can't silently rot
+    # when items move between modules/crates (e.g. a refactor). Scoped to
+    # the broken-links lint; `private_intra_doc_links` stays a warning.
+    env:
+      RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
+    steps:
+      - uses: actions/checkout@v4
+      - if: needs.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - if: needs.changes.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@v2
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo doc --workspace --no-deps --document-private-items

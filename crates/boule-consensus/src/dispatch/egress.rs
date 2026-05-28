@@ -264,10 +264,10 @@ pub(in crate::dispatch) fn sign_consensus_msg(
 /// the envelope was just produced by `signer`, so re-verifying is
 /// redundant work. `key_history` is still consulted to resolve the
 /// signer pubkey to its stable [`ValidatorId`] (#394), which is
-/// stamped on the [`Verified`] envelope so the safety core's bitmap
+/// stamped on the [`crate::dispatch::Verified`] envelope so the safety core's bitmap
 /// lookup matches the wire path's resolution after a rotation. The
 /// returned `Dispatch` items otherwise match the output of
-/// [`super::ingress_wire`] for this frame arriving from `signer.node_id()`.
+/// `ingress_wire` for this frame arriving from `signer.node_id()`.
 pub fn egress_consensus_msg_with_loopback(
     msg: &ConsensusMsg,
     signer: &dyn Signer,

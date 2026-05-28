@@ -263,9 +263,9 @@ where
 ///
 /// Exposed at crate visibility so envelopes that carry more than one
 /// signature over the same payload (e.g. the dual-signed validator-key
-/// rotation tx in [`crate::consensus::validator_rotation`]) and
+/// rotation tx in `boule_consensus::validator_rotation`) and
 /// off-envelope signatures over the same payload (the per-signer
-/// partial signatures aggregated into a [`crate::consensus::hotstuff::qc::QuorumCertificate`])
+/// partial signatures aggregated into a `boule_consensus::hotstuff::qc::QuorumCertificate`)
 /// reuse this exact framing instead of duplicating it. Reusing the
 /// helper keeps a single source of truth for "what bytes are signed".
 ///

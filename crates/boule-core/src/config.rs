@@ -21,7 +21,7 @@ pub struct Config {
     pub peers: Vec<PeerConfig>,
     pub api: ApiConfig,
     /// Optional HotStuff consensus configuration. When absent the node
-    /// runs gossip-only; when present a [`crate::consensus::node::ConsensusNode`]
+    /// runs gossip-only; when present a `boule_node::consensus_node::ConsensusNode`
     /// is started alongside the gossip and ping protocols.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consensus: Option<ConsensusConfig>,
@@ -46,7 +46,7 @@ pub struct Config {
 pub struct NodeConfig {
     pub listen_addr: SocketAddr,
     /// Network (TLS) identity backend. The Ed25519 public key loaded here
-    /// becomes the node's overlay [`crate::p2p::tls::NodeId`] and the
+    /// becomes the node's overlay [`crate::identity::NodeId`] and the
     /// certificate the TLS handshake presents. If absent, falls back to
     /// the deprecated `key_file` field or, failing that, a file backend
     /// at `./node.key`.
@@ -209,12 +209,12 @@ pub struct ConsensusConfig {
     /// Bounded-cache caps for the safety core and the integration
     /// layer's timeout-vote handler. See [`ConsensusLimits`] for the
     /// per-cache documentation; defaults match
-    /// [`crate::consensus::limits::CacheLimits::production_defaults`].
+    /// `boule_consensus::limits::CacheLimits::production_defaults`.
     #[serde(default)]
     pub limits: ConsensusLimits,
     /// Take a state-machine snapshot every `snapshot_interval_blocks`
     /// committed blocks. `0` disables snapshot creation entirely. See
-    /// [`crate::replication::snapshot`] for the on-disk layout.
+    /// `boule_consensus::replication::snapshot` for the on-disk layout.
     #[serde(default = "default_snapshot_interval_blocks")]
     pub snapshot_interval_blocks: u64,
     /// Number of most-recent snapshots to keep on disk. Older snapshots
@@ -283,7 +283,7 @@ impl ConsensusConfig {
     /// for two consumers:
     ///
     /// 1. A `(NodeId, BlsPublicKey)` projection seeds the genesis
-    ///    [`crate::consensus::bls_key_history::BlsKeyHistory`] and
+    ///    `boule_consensus::bls_key_history::BlsKeyHistory` and
     ///    feeds the genesis-block `validator_history_commitment`.
     /// 2. The `BlsPop` is verified cryptographically by
     ///    [`Self::verify_genesis_bls_pops`] *after* the genesis hash
@@ -461,7 +461,7 @@ impl ConsensusConfig {
 /// table — or any individual field — is omitted.
 ///
 /// Eviction policy and rationale are documented on
-/// [`crate::consensus::limits::CacheLimits`]; this struct is the
+/// `boule_consensus::limits::CacheLimits`; this struct is the
 /// configuration shape, the runtime shape lives in that module so the
 /// safety core can stay free of `serde` dependencies.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -484,26 +484,26 @@ pub struct ConsensusLimits {
     pub timeout_buckets_capacity: usize,
     /// Initial views to wait between successive `RequestBlock` retries
     /// for the same parent hash. See
-    /// [`crate::consensus::limits::CacheLimits::block_sync_initial_backoff_views`].
+    /// `boule_consensus::limits::CacheLimits::block_sync_initial_backoff_views`.
     #[serde(default = "default_block_sync_initial_backoff_views")]
     pub block_sync_initial_backoff_views: u64,
     /// Cap on the per-parent-hash retry gap. See
-    /// [`crate::consensus::limits::CacheLimits::block_sync_max_backoff_views`].
+    /// `boule_consensus::limits::CacheLimits::block_sync_max_backoff_views`.
     #[serde(default = "default_block_sync_max_backoff_views")]
     pub block_sync_max_backoff_views: u64,
     /// Same-peer attempts before the safety core rotates to the next
     /// validator on `RequestBlock` retries. See
-    /// [`crate::consensus::limits::CacheLimits::block_sync_per_peer_attempts`].
+    /// `boule_consensus::limits::CacheLimits::block_sync_per_peer_attempts`.
     #[serde(default = "default_block_sync_per_peer_attempts")]
     pub block_sync_per_peer_attempts: u32,
     /// Total `RequestBlock` budget per parent hash before parked
     /// proposals are dropped. See
-    /// [`crate::consensus::limits::CacheLimits::block_sync_max_attempts`].
+    /// `boule_consensus::limits::CacheLimits::block_sync_max_attempts`.
     #[serde(default = "default_block_sync_max_attempts")]
     pub block_sync_max_attempts: u32,
     /// Maximum entries the bundled in-memory mempool will accept.
     /// Inserts past the cap surface as `Err` to the caller (see
-    /// [`crate::replication::impls::mem_mempool::InMemoryMempool`]),
+    /// `boule_consensus::replication::impls::mem_mempool::InMemoryMempool`),
     /// rather than silently dropping. The application layer that
     /// will eventually replace this implementation is free to ignore
     /// the field; consensus only consults it when constructing the
@@ -727,7 +727,7 @@ pub struct P2pRateLimitsConfig {
     #[serde(default = "default_receive_block_per_sec")]
     pub receive_block_per_sec: f64,
     /// Steady-state inbound rate of `SnapshotManifestRequest` frames.
-    /// See [`crate::p2p::limits::RateLimitsConfig::snapshot_manifest_request_per_sec`].
+    /// See `boule_transport::limits::RateLimitsConfig::snapshot_manifest_request_per_sec`.
     #[serde(default = "default_snapshot_manifest_request_per_sec")]
     pub snapshot_manifest_request_per_sec: f64,
     /// Steady-state inbound rate of `SnapshotManifestResponse` frames.
@@ -871,9 +871,9 @@ fn default_max_violations() -> u32 {
 /// and for tests that want N–1 connectivity guarantees).
 ///
 /// Defaults are tuned to match the per-module `Default` impls in the
-/// gossip building blocks ([`crate::p2p::overlay::gossip::peer_list_task::PeerListGossipConfig`],
-/// [`crate::p2p::overlay::gossip::maintenance::MeshMaintenanceConfig`],
-/// [`crate::p2p::overlay::gossip::overlay::GossipOverlayConfig`]), so a
+/// gossip building blocks (`boule_transport_tcp::overlay::gossip::peer_list_task::PeerListGossipConfig`,
+/// `boule_transport_tcp::overlay::gossip::maintenance::MeshMaintenanceConfig`,
+/// `boule_transport_tcp::overlay::gossip::overlay::GossipOverlayConfig`), so a
 /// node that omits `[overlay]` entirely gets the breakdown-comment
 /// defaults from issue #137.
 ///
