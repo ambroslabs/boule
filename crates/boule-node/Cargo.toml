@@ -23,6 +23,7 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 hex                = "0.4"
 bytes              = { version = "1", features = ["serde"] }
+clap               = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tokio              = { version = "1", features = ["full", "test-util"] }
