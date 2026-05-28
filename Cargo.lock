@@ -351,6 +351,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "boule-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boule-rs",
+ "bytes",
+ "futures-util",
+ "hex",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "boule-rs"
 version = "0.1.0"
 dependencies = [

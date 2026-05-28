@@ -21,7 +21,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-boule-rs      = { path = ".." }
+boule-rs      = { path = "../crates/boule-rs" }
 postcard      = { version = "1", default-features = false, features = ["use-std"] }
 bytes         = { version = "1", features = ["serde"] }
 
