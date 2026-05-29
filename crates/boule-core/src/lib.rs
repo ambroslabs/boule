@@ -4,9 +4,9 @@
 //! This crate is published as `boule-core` but imported as `boule` (its
 //! library name). It holds the leaf abstractions the rest of the
 //! workspace builds on and depends on nothing else in it: the consensus
-//! core (`boule-consensus`), the transport interface and its TCP
-//! implementation (`boule-transport` / `boule-transport-tcp`), the node
-//! runtime (`boule-node`), and the CLI (`boule-cli`) all sit above it.
+//! core (`boule-consensus`), the TCP transport implementation
+//! (`boule-transport-tcp`), the node runtime (`boule-node`), and the CLI
+//! (`boule-cli`) all sit above it.
 //!
 //! # Modules
 //!
@@ -25,6 +25,10 @@
 //! - [`paths`] — cross-platform default locations for config and durable
 //!   state.
 //! - [`cli`] — output-format helpers shared with `boule-cli`.
+//! - [`transport`] — object-safe [`transport::overlay::Broadcaster`] /
+//!   [`transport::overlay::Discovery`] traits and the [`transport::limits`]
+//!   rate-limit policy; concrete transports (`boule-transport-tcp`)
+//!   implement them.
 //!
 //! # Running a node
 //!
@@ -38,3 +42,4 @@ pub mod crypto;
 pub mod identity;
 pub mod paths;
 pub mod storage;
+pub mod transport;

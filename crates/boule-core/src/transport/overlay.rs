@@ -7,9 +7,9 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use boule::clock::BoxFuture;
+use crate::clock::BoxFuture;
 
-use boule::identity::NodeId;
+use crate::identity::NodeId;
 
 // ── Broadcaster trait ────────────────────────────────────────────────────────
 

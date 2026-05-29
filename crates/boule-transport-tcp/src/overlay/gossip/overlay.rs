@@ -43,9 +43,9 @@
 //!    is overlay control traffic.
 //! 2. `ProtocolEvent::PeerConnected` / `PeerDisconnected` are recorded
 //!    in the direct-peer set and republished as
-//!    [`boule_transport::overlay::DiscoveryEvent`]s, but **not** surfaced
+//!    [`boule::transport::overlay::DiscoveryEvent`]s, but **not** surfaced
 //!    upstream. The consensus layer reads peer membership through
-//!    [`boule_transport::overlay::Discovery::subscribe`]; routing the same
+//!    [`boule::transport::overlay::Discovery::subscribe`]; routing the same
 //!    deltas through the upstream `event_rx` would be a duplicate.
 //!    (Today the consensus event loop in
 //!    `boule_node::consensus_node` explicitly ignores
@@ -60,7 +60,7 @@
 //!
 //! # `SendTo` semantics
 //!
-//! [`boule_transport::overlay::Broadcaster::send_to`] is implemented as a
+//! [`boule::transport::overlay::Broadcaster::send_to`] is implemented as a
 //! broadcast — a unicast `Forward` frame goes out to every direct
 //! neighbour and every receiver surfaces it to consensus dispatch.
 //! The consensus dispatch is idempotent under duplicate `BlockRequest`
@@ -104,7 +104,7 @@ use super::peer_list_task::{
 };
 use super::peer_table::PeerTable;
 use super::wire::{MsgId, OverlayFrame};
-use boule_transport::overlay::DiscoveryEvent;
+use boule::transport::overlay::DiscoveryEvent;
 
 /// Knobs for [`GossipOverlay::spawn`].
 ///

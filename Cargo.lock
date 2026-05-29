@@ -498,7 +498,6 @@ dependencies = [
  "axum",
  "boule-consensus",
  "boule-core",
- "boule-transport",
  "boule-transport-tcp",
  "bs58",
  "bytes",
@@ -526,24 +525,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "boule-transport"
-version = "0.1.0"
-dependencies = [
- "boule-core",
- "bytes",
- "chrono",
- "parking_lot",
- "tokio",
-]
-
-[[package]]
 name = "boule-transport-tcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "boule-core",
- "boule-transport",
  "bs58",
  "bytes",
  "chrono",

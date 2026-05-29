@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 use boule::clock::BoxFuture;
 
 use super::super::super::tls::NodeId;
-use boule_transport::overlay::Broadcaster;
+use boule::transport::overlay::Broadcaster;
 
 /// Typed command from a [`GossipBroadcaster`] to the gossip overlay's
 /// run loop.

@@ -727,7 +727,7 @@ pub struct P2pRateLimitsConfig {
     #[serde(default = "default_receive_block_per_sec")]
     pub receive_block_per_sec: f64,
     /// Steady-state inbound rate of `SnapshotManifestRequest` frames.
-    /// See `boule_transport::limits::RateLimitsConfig::snapshot_manifest_request_per_sec`.
+    /// See `crate::transport::limits::RateLimitsConfig::snapshot_manifest_request_per_sec`.
     #[serde(default = "default_snapshot_manifest_request_per_sec")]
     pub snapshot_manifest_request_per_sec: f64,
     /// Steady-state inbound rate of `SnapshotManifestResponse` frames.

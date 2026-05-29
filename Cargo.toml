@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/boule-core",
-    "crates/boule-transport",
     "crates/boule-transport-tcp",
     "crates/boule-consensus",
     "crates/boule-node",

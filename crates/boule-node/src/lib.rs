@@ -197,8 +197,8 @@ pub async fn run(
         // ConsensusNode below so ingress is gated before
         // `dispatch::ingress` ever runs.
         let rate_limiter = config.p2p.limits.as_ref().map(|l| {
-            Arc::new(boule_transport::limits::RateLimiter::new(
-                boule_transport::limits::RateLimitsConfig::from_config(l),
+            Arc::new(boule::transport::limits::RateLimiter::new(
+                boule::transport::limits::RateLimitsConfig::from_config(l),
                 Arc::clone(&clock),
             ))
         });
@@ -331,7 +331,7 @@ async fn start_consensus(
     clock: Arc<dyn Clock>,
     self_listen_addr: std::net::SocketAddr,
     inbound_disabled: bool,
-    rate_limiter: Option<Arc<boule_transport::limits::RateLimiter>>,
+    rate_limiter: Option<Arc<boule::transport::limits::RateLimiter>>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     info!(
@@ -504,7 +504,7 @@ async fn start_consensus(
 
 /// Merge `[p2p.limits]` (issue #134, abuse-protection caps) and
 /// `[overlay]` (#187, overlay-degree-aware caps) into a single
-/// [`boule_transport::limits::ConnectionLimitsConfig`] for the manager's
+/// [`boule::transport::limits::ConnectionLimitsConfig`] for the manager's
 /// admission gate. Returns `None` only when neither source
 /// contributes a binding limit, in which case the manager runs
 /// without a connection limiter (the simulator and gossip-only test
@@ -523,14 +523,14 @@ async fn start_consensus(
 ///   explicitly opted into N–1 connectivity.
 fn build_connection_limiter(
     config: &Config,
-) -> Option<Arc<boule_transport::limits::ConnectionLimiter>> {
-    use boule_transport::limits::ConnectionLimitsConfig;
+) -> Option<Arc<boule::transport::limits::ConnectionLimiter>> {
+    use boule::transport::limits::ConnectionLimitsConfig;
 
     let limits = config
         .p2p
         .limits
         .as_ref()
-        .map(boule_transport::limits::ConnectionLimitsConfig::from_config);
+        .map(boule::transport::limits::ConnectionLimitsConfig::from_config);
     let overlay_caps_active = config.overlay.mode == OverlayMode::Gossip;
 
     let merged = match (limits, overlay_caps_active) {
@@ -549,7 +549,7 @@ fn build_connection_limiter(
             max_total: l.max_total.min(config.overlay.total_max),
         },
     };
-    Some(Arc::new(boule_transport::limits::ConnectionLimiter::new(
+    Some(Arc::new(boule::transport::limits::ConnectionLimiter::new(
         merged,
     )))
 }
