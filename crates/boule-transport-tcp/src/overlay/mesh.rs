@@ -18,7 +18,7 @@ use boule::clock::BoxFuture;
 
 use super::super::ProtocolOutbound;
 use super::super::tls::NodeId;
-use boule_transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
+use boule::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 
 // ── MeshBroadcaster ──────────────────────────────────────────────────────────
 

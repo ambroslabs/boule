@@ -14,13 +14,13 @@
 //!
 //! Two seams suffice to keep consensus topology-agnostic:
 //!
-//! - [`boule_transport::overlay::Broadcaster`] hides the *outbound* dispatch decision behind two
+//! - [`boule::transport::overlay::Broadcaster`] hides the *outbound* dispatch decision behind two
 //!   methods: `broadcast` (fan out to every "currently reachable" peer)
 //!   and `send_to` (a single named peer). The mesh implementation
 //!   ([`crate::overlay::MeshBroadcaster`]) routes both through the existing peer-manager
 //!   channel; a future gossip implementation will pick a fanout subset
 //!   and rely on the receiver to forward.
-//! - [`boule_transport::overlay::Discovery`] hides the *peer-membership* surface behind
+//! - [`boule::transport::overlay::Discovery`] hides the *peer-membership* surface behind
 //!   `known_peers` (snapshot), `add_bootstrap` (request a dial to a
 //!   freshly learned address), and `subscribe` (event stream of
 //!   add/remove deltas). The mesh implementation ([`crate::overlay::MeshDiscovery`])
@@ -28,7 +28,7 @@
 //!
 //! # Delivery contract
 //!
-//! Implementations of [`boule_transport::overlay::Broadcaster`] guarantee **at-least-once**
+//! Implementations of [`boule::transport::overlay::Broadcaster`] guarantee **at-least-once**
 //! delivery on a best-effort basis: a frame may be delivered more than
 //! once under retries (e.g. when gossip lands and a frame is forwarded
 //! by two neighbours), and there is **no ordering guarantee** across
@@ -66,5 +66,5 @@ mod mesh;
 
 pub mod gossip;
 
-pub use boule_transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
+pub use boule::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 pub use mesh::{MeshBroadcaster, MeshDiscovery};

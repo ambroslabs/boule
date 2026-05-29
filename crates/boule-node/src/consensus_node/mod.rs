@@ -59,6 +59,7 @@ use std::time::Duration;
 
 use boule::crypto::signed::{ChainId, Signer};
 use boule::storage::{Storage, Wal};
+use boule::transport::limits::RateLimiter;
 use boule_consensus::api::CommitNotifier;
 use boule_consensus::block_sync_retry_timer::{
     BlockSyncRetryTimer, DEFAULT_INITIAL_DELAY as BLOCK_SYNC_RETRY_INITIAL_DELAY,
@@ -81,7 +82,6 @@ use boule_consensus::validator_key_history::ValidatorKeyHistory;
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
-use boule_transport::limits::RateLimiter;
 use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use boule_transport_tcp::tls::node_id_to_base58;
 use boule_transport_tcp::{NodeId, ProtocolEvent};
@@ -192,7 +192,7 @@ pub(super) async fn send_outbound(
             if let Some(limiter) = rate_limiter
                 && matches!(
                     limiter.admit_outbound(to, payload.len()),
-                    boule_transport::limits::Decision::Drop
+                    boule::transport::limits::Decision::Drop
                 )
             {
                 tracing::warn!(
@@ -388,7 +388,7 @@ pub struct ConsensusNode {
     /// happy-path tests.
     rate_limiter: Option<Arc<RateLimiter>>,
     /// Channel into the peer manager. When set together with
-    /// `rate_limiter`, a [`boule_transport::limits::Decision::Disconnect`]
+    /// `rate_limiter`, a [`boule::transport::limits::Decision::Disconnect`]
     /// from the limiter drives a [`boule_transport_tcp::PeerCommand::Disconnect`]
     /// so the offending peer's TCP/TLS connection is torn down. `None`
     /// in the simulator (which has no real manager); the limiter still
@@ -689,7 +689,7 @@ impl ConsensusNode {
     /// Attach a per-peer rate limiter (issue #134) and the optional
     /// peer-command channel used to issue
     /// [`boule_transport_tcp::PeerCommand::Disconnect`] when the limiter
-    /// returns [`boule_transport::limits::Decision::Disconnect`] for a peer.
+    /// returns [`boule::transport::limits::Decision::Disconnect`] for a peer.
     /// Pass `peer_cmd_tx = None` in the simulator: the limiter will
     /// still classify and drop, and tests can observe the disconnect
     /// decision via [`RateLimiter::counters`].
@@ -1355,6 +1355,7 @@ mod tests {
     // longer brought into scope by this file's top-level `use` block).
     use boule::crypto::signed::Signed;
     use boule::storage::{MemoryStorage, MemoryWal};
+    use boule::transport::limits::MessageKind;
     use boule_consensus::dispatch::Dispatch;
     use boule_consensus::hotstuff::Locked;
     use boule_consensus::hotstuff::qc::TimeoutVote;
@@ -1363,7 +1364,6 @@ mod tests {
     use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
     use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
     use boule_consensus::validator_set::ValidatorSet;
-    use boule_transport::limits::MessageKind;
     use boule_transport_tcp::NodeId;
 
     fn nid(b: u8) -> NodeId {
@@ -8006,7 +8006,7 @@ mod tests {
     // ── RateLimiter integration (issue #134) ────────────────────────────────
 
     use boule::clock::{Clock, TokioClock};
-    use boule_transport::limits::{RateLimiter, RateLimitsConfig};
+    use boule::transport::limits::{RateLimiter, RateLimitsConfig};
     use boule_transport_tcp::PeerCommand;
 
     /// Build a `WireMessage::BlockRequest([0; 32])` postcard frame.
@@ -8227,7 +8227,7 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(
                 limiter.admit(peer_b, MessageKind::Vote, 64),
-                boule_transport::limits::Decision::Allow
+                boule::transport::limits::Decision::Allow
             );
         }
         // And Peer A's Vote bucket is unaffected too — distinct
@@ -8235,7 +8235,7 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(
                 limiter.admit(peer_a, MessageKind::Vote, 64),
-                boule_transport::limits::Decision::Allow
+                boule::transport::limits::Decision::Allow
             );
         }
     }

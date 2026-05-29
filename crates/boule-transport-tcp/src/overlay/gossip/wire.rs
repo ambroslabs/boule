@@ -47,8 +47,8 @@ pub enum OverlayFrame {
     /// An application-level payload being broadcast through the gossip
     /// overlay. The `msg_id` is the dedup key.
     ///
-    /// Both [`boule_transport::overlay::Broadcaster::broadcast`] and
-    /// [`boule_transport::overlay::Broadcaster::send_to`] produce this
+    /// Both [`boule::transport::overlay::Broadcaster::broadcast`] and
+    /// [`boule::transport::overlay::Broadcaster::send_to`] produce this
     /// frame variant: in the gossip overlay, point-to-point sends are
     /// implemented as broadcasts (fanned out across the partial mesh,
     /// dedup-bounded, every receiver surfaces upstream). Issue #182

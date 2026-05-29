@@ -48,8 +48,8 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use boule::clock::Clock;
-use boule::identity::NodeId;
+use crate::clock::Clock;
+use crate::identity::NodeId;
 
 // ── MessageKind ──────────────────────────────────────────────────────────────
 
@@ -311,7 +311,7 @@ pub struct RateLimitsConfig {
 impl RateLimitsConfig {
     /// Project the parsed `[p2p.limits]` rate + violation fields into
     /// the runtime rate-limit shape.
-    pub fn from_config(c: &boule::config::P2pLimitsConfig) -> Self {
+    pub fn from_config(c: &crate::config::P2pLimitsConfig) -> Self {
         Self {
             proposal_per_sec: c.rate.proposal_per_sec,
             vote_per_sec: c.rate.vote_per_sec,
@@ -766,7 +766,7 @@ impl ConnectionLimitsConfig {
     /// sourced from `[p2p.limits]`; callers that want the merged view
     /// (combining `[overlay].total_max`) build the runtime config in
     /// the node wiring's `build_connection_limiter`.
-    pub fn from_config(c: &boule::config::P2pLimitsConfig) -> Self {
+    pub fn from_config(c: &crate::config::P2pLimitsConfig) -> Self {
         Self {
             max_inbound: c.max_inbound_connections,
             max_outbound: c.max_outbound_connections,
@@ -956,7 +956,7 @@ impl ConnectionLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boule::clock::TokioClock;
+    use crate::clock::TokioClock;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
 
@@ -966,7 +966,7 @@ mod tests {
 
     #[test]
     fn from_config_projects_p2p_limits() {
-        let cfg = boule::config::P2pLimitsConfig::default();
+        let cfg = crate::config::P2pLimitsConfig::default();
         let rate = RateLimitsConfig::from_config(&cfg);
         assert_eq!(rate.vote_per_sec, cfg.rate.vote_per_sec);
         assert_eq!(rate.bytes_per_sec, cfg.rate.bytes_per_sec);
@@ -996,17 +996,17 @@ mod tests {
         }
     }
 
-    impl boule::clock::Clock for ManualClock {
+    impl crate::clock::Clock for ManualClock {
         fn now_wall(&self) -> chrono::DateTime<chrono::Utc> {
             chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
         }
         fn now_monotonic(&self) -> Duration {
             *self.0.lock()
         }
-        fn sleep(&self, _dur: Duration) -> boule::clock::BoxFuture<'static, ()> {
+        fn sleep(&self, _dur: Duration) -> crate::clock::BoxFuture<'static, ()> {
             Box::pin(async {})
         }
-        fn interval(&self, _period: Duration) -> Box<dyn boule::clock::ClockInterval> {
+        fn interval(&self, _period: Duration) -> Box<dyn crate::clock::ClockInterval> {
             unimplemented!("ManualClock::interval is not used by RateLimiter")
         }
     }
