@@ -1,11 +1,16 @@
 [package]
 name = "boule-consensus"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "HotStuff-style BFT consensus core and block/snapshot replication for boule. Transport-agnostic: depends only on boule primitives."
-repository = "https://github.com/ambroslabs/boule"
-homepage = "https://github.com/ambroslabs/boule"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/boule-consensus"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 # Crash-injection seam (issue #420): compiles the `crashpoint!` firing
