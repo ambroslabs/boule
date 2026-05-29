@@ -1,6 +1,6 @@
 //! Regenerate the committed initial corpus for `dispatch_ingress_skip`.
 //!
-//! Mirrors the wire-shape coverage of `src/consensus/wire_fuzz.rs`:
+//! Mirrors the wire-shape coverage of `crates/boule-node/src/wire_fuzz.rs`:
 //! one decodable sample per [`WireMessage`] variant, plus a handful of
 //! edge cases (empty payloads, max-view, non-genesis parent) that the
 //! proptest generators in `wire_fuzz.rs` already cover. libFuzzer's
@@ -35,20 +35,19 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use boule::consensus::hotstuff::qc::{
-    NewView, Proposal, QuorumCertificate, TimeoutVote, Vote,
-};
-use boule::consensus::node::{BlockResponsePayload, WireMessage};
 use boule::crypto::signed::Signed;
-use boule::p2p::NodeId;
-use boule::replication::block::{Block, BlockHeader};
+use boule::identity::NodeId;
+use boule_consensus::hotstuff::qc::{NewView, Proposal, QuorumCertificate, TimeoutVote, Vote};
+use boule_consensus::replication::block::{Block, BlockHeader};
+use boule_consensus::wire::{BlockResponsePayload, WireMessage};
+use boule_consensus::{Height, View};
 use bytes::Bytes;
 
 const N_VALIDATORS: usize = 4;
 
 /// Same NodeId space as the fuzz target's validator set: `[1; 32]
 /// .. [4; 32]`. Using a real validator NodeId here lets the
-/// signer-membership check in [`boule::consensus::dispatch::ingress_wire`]
+/// signer-membership check in [`boule_consensus::dispatch::ingress_wire`]
 /// pass, so the seed exercises the path into envelope-sig verification.
 fn validator_node_id(idx: u8) -> NodeId {
     [idx; 32]
@@ -80,7 +79,7 @@ fn signed<T>(payload: T, signer_idx: u8) -> Signed<T> {
 /// well-formed under [`is_well_formed`] — libFuzzer mutates from there
 /// to explore stray-bit and length-mismatch territory.
 ///
-/// [`is_well_formed`]: boule::consensus::hotstuff::qc::SignerBitmap::is_well_formed
+/// [`is_well_formed`]: boule::crypto::sig_scheme::SignerBitmap::is_well_formed
 fn placeholder_qc(view: u64, block_hash: [u8; 32]) -> QuorumCertificate {
     let mut qc = QuorumCertificate::new(view, block_hash, N_VALIDATORS);
     for i in 0..N_VALIDATORS {
@@ -92,8 +91,8 @@ fn placeholder_qc(view: u64, block_hash: [u8; 32]) -> QuorumCertificate {
 fn placeholder_block(parent_hash: [u8; 32], height: u64, view: u64, proposer: NodeId) -> Block {
     let header = BlockHeader {
         parent_hash,
-        height,
-        view,
+        height: Height(height),
+        view: View(view),
         proposer,
         state_commitment: [view as u8; 32],
         commands_commitment: Block::commands_commitment(&[]),
@@ -199,7 +198,7 @@ fn main() {
     );
 
     let vote = Vote {
-        view: 1,
+        view: View(1),
         block_hash: genesis_hash,
     };
     write_sample(
@@ -226,7 +225,7 @@ fn main() {
     );
 
     let timeout_no_qc = TimeoutVote {
-        view: 7,
+        view: View(7),
         high_qc: None,
     };
     write_sample(
@@ -236,7 +235,7 @@ fn main() {
     );
 
     let timeout_with_qc = TimeoutVote {
-        view: 7,
+        view: View(7),
         high_qc: Some(placeholder_qc(6, [0x22; 32])),
     };
     write_sample(

@@ -6,7 +6,7 @@
 //! point — the exact path the production node and most tests take when
 //! `QcVerification::Skip` is in effect.
 //!
-//! `src/consensus/wire_fuzz.rs` already covers the decode-side shape
+//! `crates/boule-node/src/wire_fuzz.rs` already covers the decode-side shape
 //! coverage with a proptest-driven harness, but proptest's per-iteration
 //! cost (real Ed25519 signing) caps the number of cases it can run in a
 //! reasonable wall-clock. libFuzzer trades that cost for raw bytes plus
@@ -39,12 +39,12 @@
 
 use std::sync::LazyLock;
 
-use boule::consensus::dispatch::ingress_wire;
-use boule::consensus::node::WireMessage;
-use boule::consensus::validator_history::ValidatorSetHistory;
-use boule::consensus::validator_key_history::ValidatorKeyHistory;
-use boule::consensus::validator_set::{ValidatorId, ValidatorSet};
 use boule::crypto::signed::ChainId;
+use boule_consensus::dispatch::ingress_wire;
+use boule_consensus::validator_history::ValidatorSetHistory;
+use boule_consensus::validator_key_history::ValidatorKeyHistory;
+use boule_consensus::validator_set::{ValidatorId, ValidatorSet};
+use boule_consensus::wire::WireMessage;
 use libfuzzer_sys::fuzz_target;
 
 /// Tiny fixed validator set. Four validators is the smallest size that

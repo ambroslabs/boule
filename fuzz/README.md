@@ -6,19 +6,20 @@ the consensus layer.
 This crate is intentionally **not** part of the parent workspace. It is
 nightly-only (libFuzzer needs `-Z sanitizer`), and its `libfuzzer-sys`
 dependency would be a runtime cost on every `cargo test` / `cargo clippy`
-run otherwise. CI does not build or run anything in this directory; the
-targets are intended for manual / scheduled invocations.
+run otherwise. It is therefore kept off the per-PR stable gate
+(`fmt`/`clippy`/`test`/`deny`); a dedicated opt-in workflow builds and
+smoke-runs it instead — see [Continuous integration](#continuous-integration).
 
 ## Targets
 
 ### `dispatch_ingress_skip`
 
 Decodes arbitrary bytes as
-[`WireMessage`](../src/consensus/node.rs) and feeds them into
-[`ingress_wire`](../src/consensus/dispatch/ingress.rs) under
+[`WireMessage`](../crates/boule-consensus/src/wire.rs) and feeds them into
+[`ingress_wire`](../crates/boule-consensus/src/dispatch/ingress.rs) under
 `QcVerification::Skip` against a fixed 4-validator history.
 
-[`src/consensus/wire_fuzz.rs`](../src/consensus/wire_fuzz.rs) already covers
+[`wire_fuzz.rs`](../crates/boule-node/src/wire_fuzz.rs) already covers
 the decode-side panic surface with a proptest harness. This target trades
 proptest's per-iteration signing cost for raw libFuzzer bytes plus
 coverage-guided mutation, so it can run for hours rather than seconds and
@@ -61,9 +62,29 @@ reuse the cached artifact.
 | Nightly soak               | 6 h            | `-- -max_total_time=21600`            |
 | Triage after a crash       | until quiesced | `-- -runs=0` against the artifact dir |
 
-CI does **not** run this target on every PR. The proptest harness in
-[`src/consensus/wire_fuzz.rs`](../src/consensus/wire_fuzz.rs) gives the
-day-to-day shape coverage; this target is the long-tail watchdog.
+This target does **not** run on the per-PR stable gate. The proptest harness in
+[`wire_fuzz.rs`](../crates/boule-node/src/wire_fuzz.rs) gives the day-to-day
+shape coverage; this target is the long-tail watchdog. See
+[Continuous integration](#continuous-integration) for when it *does* run.
+
+## Continuous integration
+
+The 4-gate CI (`fmt`/`clippy`/`test`/`deny`) never touches this crate, so a
+crate-split or refactor could silently break it from compiling. A separate
+[`fuzz.yml`](../.github/workflows/fuzz.yml) workflow guards against that. It
+`cargo +nightly fuzz build`s the target, builds the `seed_corpus` helper, and
+runs a short smoke (`-max_total_time`) so both "does it build" and "does it
+run" are covered. It fires on three triggers, and never on the default per-PR
+gate:
+
+| Trigger | When | Smoke budget |
+| --- | --- | --- |
+| PR label `fuzz` | Add the `fuzz` label to a PR (re-runs on each push while labeled) | 60 s |
+| `workflow_dispatch` | Manual run from the Actions tab | 60 s |
+| `schedule` (nightly) | Daily cron | 5 min |
+
+For a real soak, run it locally with a longer budget (see the table above) —
+CI only proves the harness is healthy, it is not the soak.
 
 ## Initial corpus
 
@@ -95,5 +116,5 @@ Useful follow-ups after a fix lands:
 - Add the artifact to the seed corpus so the regression is caught on
   every future run.
 - Or, if it's a wire-shape concern, encode the same shape into the
-  proptest generator in `src/consensus/wire_fuzz.rs` so CI catches it
+  proptest generator in `crates/boule-node/src/wire_fuzz.rs` so CI catches it
   without nightly.

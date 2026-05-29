@@ -20,10 +20,11 @@ license = "MIT OR Apache-2.0"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
-boule-core    = { path = "../crates/boule-core" }
-postcard      = { version = "1", default-features = false, features = ["use-std"] }
-bytes         = { version = "1", features = ["serde"] }
+libfuzzer-sys   = "0.4"
+boule-core      = { path = "../crates/boule-core" }
+boule-consensus = { path = "../crates/boule-consensus", features = ["testing"] }
+postcard        = { version = "1", default-features = false, features = ["use-std"] }
+bytes           = { version = "1", features = ["serde"] }
 
 [[bin]]
 name = "dispatch_ingress_skip"

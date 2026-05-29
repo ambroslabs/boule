@@ -1,0 +1,62 @@
+name: Fuzz
+
+# The `fuzz/` crate is nightly-only (libFuzzer needs `-Z sanitizer`) and is
+# intentionally NOT a workspace member, so the per-PR stable gate
+# (fmt/clippy/test/deny in ci.yml) never compiles it. That is exactly how it
+# silently rotted during the crate split (#572/#574). This workflow is the
+# guard: it builds + smoke-runs the fuzz target so a future refactor can't
+# break it unnoticed — without ever blocking the per-PR gate.
+on:
+  schedule:
+    # Nightly soak guard (07:13 UTC, off the hour to dodge cron congestion).
+    - cron: '13 7 * * *'
+  workflow_dispatch:
+  pull_request:
+    # `labeled` lets adding the `fuzz` label kick off a run; the others let it
+    # re-run on new pushes while the label is still applied.
+    types: [opened, synchronize, reopened, labeled]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Build the fuzz target for the GNU host explicitly. `taiki-e/install-action`
+  # ships a *musl*-built cargo-fuzz, and cargo-fuzz defaults the fuzzing target
+  # to its own build triple — which would target musl, where ASan can't link
+  # (static libc) and whose std isn't installed on the nightly toolchain.
+  FUZZ_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  fuzz:
+    name: Build + smoke (dispatch_ingress_skip)
+    # Opt-in on PRs via the `fuzz` label; always on nightly schedule and
+    # manual dispatch.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.labels.*.name, 'fuzz'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # `cargo fuzz build` proves the target links with libFuzzer + sanitizer
+      # instrumentation; the plain build covers the `seed_corpus` helper bin,
+      # which `cargo fuzz build` does not touch.
+      - name: Build fuzz target
+        working-directory: fuzz
+        run: cargo +nightly fuzz build dispatch_ingress_skip --target "$FUZZ_TARGET"
+      - name: Build corpus seeder
+        working-directory: fuzz
+        run: cargo +nightly build --bin seed_corpus
+      # Short smoke proves the target actually runs (not just builds). A real
+      # soak is a manual/local activity with a much larger budget — see
+      # fuzz/README.md. Nightly gets a slightly longer smoke than PR/manual.
+      - name: Smoke run
+        working-directory: fuzz
+        run: cargo +nightly fuzz run dispatch_ingress_skip --target "$FUZZ_TARGET" -- -max_total_time=${{ github.event_name == 'schedule' && '300' || '60' }}
