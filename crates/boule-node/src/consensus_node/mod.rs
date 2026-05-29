@@ -7248,10 +7248,14 @@ mod tests {
     #[tokio::test]
     async fn send_to_peer_vote_goes_on_the_wire_unchanged() {
         let ns = fresh_signer();
-        let (mut node, vs) = make_node_with_signer(&ns, 0);
+        let (mut node, _vs) = make_node_with_signer(&ns, 0);
         let signer: Arc<dyn Signer> = Arc::new(ns);
-        // A placeholder peer that is *not* self.
-        let peer = vs.get(1).unwrap().into_node_id();
+        // A placeholder peer that is deterministically *not* self.
+        // Don't pick by post-sort index: `ValidatorSet::new` sorts its
+        // members, so `vs.get(1)` can be the random `self_id` whenever it
+        // sorts into slot 1 (#580). A literal placeholder id is in the set
+        // regardless of sort order and can never equal a real Ed25519 key.
+        let peer = nid(0xA1);
         assert_ne!(peer, node.self_id);
 
         let (broadcaster, mut send_rx) = make_test_broadcaster();
@@ -7341,7 +7345,7 @@ mod tests {
     async fn timeout_buckets_inserting_twice_the_cap_evicts_to_cap() {
         let cap = 4usize;
         let ns = fresh_signer();
-        let (mut node, vs) = make_node_with_timeout_cap(&ns, 0, cap);
+        let (mut node, _vs) = make_node_with_timeout_cap(&ns, 0, cap);
         let signer: Arc<dyn Signer> = Arc::new(ns);
 
         let (broadcaster, _send_rx) = make_test_broadcaster();
@@ -7352,7 +7356,10 @@ mod tests {
         // exercise the foreign-vote ingress path and never trip the
         // self-loopback shortcut. View 0 must be skipped — `view <
         // current_view` would short-circuit before the bucket insert.
-        let voter = vs.get(1).unwrap().into_node_id();
+        // A literal placeholder id (not `vs.get(1)`) sidesteps the
+        // sorted-vs-construction-order trap that flaked #580: the sort in
+        // `ValidatorSet::new` can land the random self_id in slot 1.
+        let voter = nid(0xA1);
         let n = (2 * cap) as u64;
         for view in 1..=n {
             let payload = TimeoutVote {
