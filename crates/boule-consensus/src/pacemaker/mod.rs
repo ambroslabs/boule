@@ -10,7 +10,7 @@
 //! # Purity
 //!
 //! Everything here is deliberately I/O-free: no `tokio`, no
-//! [`boule::clock::Clock`], no network. Inputs are [`Event`]s; outputs
+//! [`boule_core::clock::Clock`], no network. Inputs are [`Event`]s; outputs
 //! are [`Action`]s. The milestone 8 integration layer (#24) translates
 //! the returned actions into real effects (arming timers, sending
 //! messages). This is what lets the pacemaker run unmodified in the
@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::View;
-use boule::identity::NodeId;
+use boule_core::identity::NodeId;
 
 use self::leader::LeaderSelector;
 use self::timeout::TimeoutPolicy;
@@ -61,7 +61,7 @@ mod tests;
 /// private, so this is the sole construction path.
 ///
 /// ```compile_fail
-/// use boule::consensus::pacemaker::HonestyThresholdEvidence;
+/// use boule_core::consensus::pacemaker::HonestyThresholdEvidence;
 /// // Direct construction is rejected — the inner field is private,
 /// // forcing callers through `from_bucket` and the threshold check.
 /// let _ = HonestyThresholdEvidence(());

@@ -16,7 +16,7 @@ use crate::pacemaker::leader::{LeaderSelector, RoundRobinSelector};
 use crate::pacemaker::timeout::{ExponentialBackoff, TimeoutPolicy};
 use crate::pacemaker::{Action, AdvanceCause, Event, HonestyThresholdEvidence, Pacemaker};
 use crate::validator_set::ValidatorSet;
-use boule::identity::NodeId;
+use boule_core::identity::NodeId;
 
 // ---------------------------------------------------------------------
 // Fixtures

@@ -57,9 +57,6 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use std::time::Duration;
 
-use boule::crypto::signed::{ChainId, Signer};
-use boule::storage::{Storage, Wal};
-use boule::transport::limits::RateLimiter;
 use boule_consensus::api::CommitNotifier;
 use boule_consensus::block_sync_retry_timer::{
     BlockSyncRetryTimer, DEFAULT_INITIAL_DELAY as BLOCK_SYNC_RETRY_INITIAL_DELAY,
@@ -82,6 +79,9 @@ use boule_consensus::validator_key_history::ValidatorKeyHistory;
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
+use boule_core::crypto::signed::{ChainId, Signer};
+use boule_core::storage::{Storage, Wal};
+use boule_core::transport::limits::RateLimiter;
 use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use boule_transport_tcp::tls::node_id_to_base58;
 use boule_transport_tcp::{NodeId, ProtocolEvent};
@@ -121,9 +121,9 @@ use timeout_bucket::TimeoutBucket;
 
 /// Tracing target used by every structured trace emitted from the
 /// consensus integration layer. Filter it with
-/// `RUST_LOG=info,boule::consensus=debug` to see just the event
+/// `RUST_LOG=info,boule_core::consensus=debug` to see just the event
 /// boundaries without drowning in p2p / gossip traffic.
-pub const TRACE_TARGET: &str = "boule::consensus";
+pub const TRACE_TARGET: &str = "boule_core::consensus";
 
 /// Short, stable tag for a [`ConsensusMsg`] variant — suitable as a
 /// structured-log field value.
@@ -192,7 +192,7 @@ pub(super) async fn send_outbound(
             if let Some(limiter) = rate_limiter
                 && matches!(
                     limiter.admit_outbound(to, payload.len()),
-                    boule::transport::limits::Decision::Drop
+                    boule_core::transport::limits::Decision::Drop
                 )
             {
                 tracing::warn!(
@@ -267,13 +267,17 @@ pub struct ConsensusNode {
     /// `BlsPartialSig` rides on the wire alongside the Ed25519
     /// envelope.
     pub bls_signer: Option<
-        Arc<dyn boule::crypto::signed::PartialSigner<boule::crypto::sig_scheme::BlsAggregated>>,
+        Arc<
+            dyn boule_core::crypto::signed::PartialSigner<
+                    boule_core::crypto::sig_scheme::BlsAggregated,
+                >,
+        >,
     >,
     /// Chain-level signature scheme (#288). Fixed for the lifetime of
     /// the chain; consulted at ingress time to dispatch QC aggregate
     /// verification through the right `verify_aggregate` /
     /// `verify_aggregate_bls` arm.
-    pub signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice,
+    pub signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     /// Configured view-timer behaviour; consulted by the timer helper
     /// in Phase D when arming/re-arming the view timer.
     pub timeout_policy: Arc<ExponentialBackoff>,
@@ -388,7 +392,7 @@ pub struct ConsensusNode {
     /// happy-path tests.
     rate_limiter: Option<Arc<RateLimiter>>,
     /// Channel into the peer manager. When set together with
-    /// `rate_limiter`, a [`boule::transport::limits::Decision::Disconnect`]
+    /// `rate_limiter`, a [`boule_core::transport::limits::Decision::Disconnect`]
     /// from the limiter drives a [`boule_transport_tcp::PeerCommand::Disconnect`]
     /// so the offending peer's TCP/TLS connection is torn down. `None`
     /// in the simulator (which has no real manager); the limiter still
@@ -522,10 +526,10 @@ impl ConsensusNode {
         // empty-bitmap, empty-aggregate QC that the dispatch verifier
         // accepts via its `signer_count == 0` genesis-skip path.
         let boot_qc = match config.signature_scheme {
-            boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => {
+            boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => {
                 genesis_qc(&config.genesis, &config.validator_set)
             }
-            boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => {
+            boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => {
                 genesis_qc_bls(&config.genesis, validator_set_len)
             }
         };
@@ -611,7 +615,7 @@ impl ConsensusNode {
     ///
     /// Used at boot on `bls_aggregated` chains, when the operator has
     /// loaded a `BlsValidatorIdentity` for this node — see
-    /// [`boule::crypto::bls_key::BlsPartialSignerImpl::from_identity`].
+    /// [`boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity`].
     /// The dispatch layer consults this signer when this node emits a
     /// `Vote`, producing the 96-byte BLS partial that rides on the
     /// wire alongside the Ed25519 envelope. On Ed25519 chains this
@@ -621,7 +625,9 @@ impl ConsensusNode {
     pub fn with_bls_signer(
         mut self,
         bls_signer: Arc<
-            dyn boule::crypto::signed::PartialSigner<boule::crypto::sig_scheme::BlsAggregated>,
+            dyn boule_core::crypto::signed::PartialSigner<
+                    boule_core::crypto::sig_scheme::BlsAggregated,
+                >,
         >,
     ) -> Self {
         self.bls_signer = Some(bls_signer);
@@ -689,7 +695,7 @@ impl ConsensusNode {
     /// Attach a per-peer rate limiter (issue #134) and the optional
     /// peer-command channel used to issue
     /// [`boule_transport_tcp::PeerCommand::Disconnect`] when the limiter
-    /// returns [`boule::transport::limits::Decision::Disconnect`] for a peer.
+    /// returns [`boule_core::transport::limits::Decision::Disconnect`] for a peer.
     /// Pass `peer_cmd_tx = None` in the simulator: the limiter will
     /// still classify and drop, and tests can observe the disconnect
     /// decision via [`RateLimiter::counters`].
@@ -1353,9 +1359,6 @@ mod tests {
     // Re-imports for short-name access in tests (the production code
     // moved to topical submodules under `node/`, so the symbols are no
     // longer brought into scope by this file's top-level `use` block).
-    use boule::crypto::signed::Signed;
-    use boule::storage::{MemoryStorage, MemoryWal};
-    use boule::transport::limits::MessageKind;
     use boule_consensus::dispatch::Dispatch;
     use boule_consensus::hotstuff::Locked;
     use boule_consensus::hotstuff::qc::TimeoutVote;
@@ -1364,6 +1367,9 @@ mod tests {
     use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
     use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
     use boule_consensus::validator_set::ValidatorSet;
+    use boule_core::crypto::signed::Signed;
+    use boule_core::storage::{MemoryStorage, MemoryWal};
+    use boule_core::transport::limits::MessageKind;
     use boule_transport_tcp::NodeId;
 
     fn nid(b: u8) -> NodeId {
@@ -2958,8 +2964,8 @@ mod tests {
 
     // ── D/E-series: event loop ────────────────────────────────────────────────
 
-    use boule::crypto::signed::NodeSigner;
-    use boule::identity::NodeIdentity;
+    use boule_core::crypto::signed::NodeSigner;
+    use boule_core::identity::NodeIdentity;
     use boule_transport_tcp::{ProtocolEvent, ProtocolOutbound};
     use rcgen::KeyPair as RcgenKeyPair;
     use rcgen::PKCS_ED25519;
@@ -3496,9 +3502,9 @@ mod tests {
 
         use bytes::Bytes;
 
-        use boule::storage::WriteBatch;
         use boule_consensus::api::CommitNotifier;
         use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+        use boule_core::storage::WriteBatch;
 
         // Storage wrapper: reads/single-key writes pass through to an
         // inner `MemoryStorage`, but every `apply_batch` returns an
@@ -4889,7 +4895,7 @@ mod tests {
             &req_bytes,
             &ValidatorSetHistory::from_genesis(four_validators()),
             &ValidatorKeyHistory::new(four_validators().iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .unwrap();
         assert_eq!(dispatches.len(), 1);
@@ -4919,7 +4925,7 @@ mod tests {
                 &req_bytes,
                 &ValidatorSetHistory::from_genesis(four_validators()),
                 &ValidatorKeyHistory::new(four_validators().iter().copied()),
-                &boule::crypto::signed::ChainId::TEST,
+                &boule_core::crypto::signed::ChainId::TEST,
             )
             .unwrap();
             for d in dispatches {
@@ -5242,7 +5248,7 @@ mod tests {
             &req_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("ingress manifest request");
         for d in dispatches {
@@ -5273,7 +5279,7 @@ mod tests {
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -5305,7 +5311,7 @@ mod tests {
                 &chunk_req_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
-                &boule::crypto::signed::ChainId::TEST,
+                &boule_core::crypto::signed::ChainId::TEST,
             )
             .expect("ingress chunk request");
             for d in dispatches {
@@ -5329,7 +5335,7 @@ mod tests {
                 &chunk_resp_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
-                &boule::crypto::signed::ChainId::TEST,
+                &boule_core::crypto::signed::ChainId::TEST,
             )
             .expect("ingress chunk response");
             for d in dispatches {
@@ -5499,7 +5505,7 @@ mod tests {
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("ingress tampered manifest");
         for d in dispatches {
@@ -6058,7 +6064,7 @@ mod tests {
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -6106,7 +6112,7 @@ mod tests {
                 &resp_payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
-                &boule::crypto::signed::ChainId::TEST,
+                &boule_core::crypto::signed::ChainId::TEST,
             )
             .expect("ingress chunk response");
             for d in dispatches {
@@ -6253,7 +6259,7 @@ mod tests {
             &resp_payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("ingress manifest response");
         for d in dispatches {
@@ -6291,7 +6297,7 @@ mod tests {
             &resp_bytes,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .unwrap();
         for d in dispatches {
@@ -6364,7 +6370,7 @@ mod tests {
                 &resp_bytes,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
-                &boule::crypto::signed::ChainId::TEST,
+                &boule_core::crypto::signed::ChainId::TEST,
             )
             .unwrap();
             for d in dispatches {
@@ -6504,10 +6510,10 @@ mod tests {
             view: View(42),
             high_qc: None,
         };
-        let signed = boule::crypto::signed::Signed::sign(
+        let signed = boule_core::crypto::signed::Signed::sign(
             tv,
             &peer_signer,
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("sign TimeoutVote");
         let wire = WireMessage::TimeoutVote(signed);
@@ -6518,7 +6524,7 @@ mod tests {
             &payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("ingress");
         let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
@@ -6591,10 +6597,10 @@ mod tests {
                 view: View(42),
                 high_qc: None,
             };
-            let signed = boule::crypto::signed::Signed::sign(
+            let signed = boule_core::crypto::signed::Signed::sign(
                 tv,
                 peer,
-                &boule::crypto::signed::ChainId::TEST,
+                &boule_core::crypto::signed::ChainId::TEST,
             )
             .expect("sign TimeoutVote");
             let wire = WireMessage::TimeoutVote(signed);
@@ -6604,7 +6610,7 @@ mod tests {
                 &payload,
                 &ValidatorSetHistory::from_genesis(vs.clone()),
                 &ValidatorKeyHistory::new(vs.iter().copied()),
-                &boule::crypto::signed::ChainId::TEST,
+                &boule_core::crypto::signed::ChainId::TEST,
             )
             .expect("ingress");
             for d in dispatches {
@@ -6691,10 +6697,10 @@ mod tests {
             view: attack_view,
             high_qc: Some(forged),
         };
-        let signed = boule::crypto::signed::Signed::sign(
+        let signed = boule_core::crypto::signed::Signed::sign(
             tv,
             &byzantine,
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("sign TimeoutVote");
         let wire = WireMessage::TimeoutVote(signed);
@@ -6703,7 +6709,7 @@ mod tests {
         // Run through the production verify path — this is the same
         // policy the live event loop wires (node.rs apply_dispatch).
         let qc_verification = boule_consensus::dispatch::QcVerification::Verify {
-            scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+            scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
             genesis_hash: node.core.state().genesis_hash,
@@ -6714,7 +6720,7 @@ mod tests {
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
             &qc_verification,
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("envelope is honest; ingress must accept and emit Dispatch::TimeoutVote");
 
@@ -6848,10 +6854,10 @@ mod tests {
             view: View(5),
             high_qc: None,
         };
-        let signed = boule::crypto::signed::Signed::sign(
+        let signed = boule_core::crypto::signed::Signed::sign(
             tv,
             &wedged_peer,
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("sign TimeoutVote");
         let wire = WireMessage::TimeoutVote(signed);
@@ -6862,7 +6868,7 @@ mod tests {
             &payload,
             &ValidatorSetHistory::from_genesis(vs.clone()),
             &ValidatorKeyHistory::new(vs.iter().copied()),
-            &boule::crypto::signed::ChainId::TEST,
+            &boule_core::crypto::signed::ChainId::TEST,
         )
         .expect("ingress");
         for d in dispatches {
@@ -7420,10 +7426,10 @@ mod tests {
         use bytes::Bytes;
         use parking_lot::Mutex as PlMutex;
 
-        use boule::clock::BoxFuture;
-        use boule::storage::{Storage, WriteBatch};
         use boule_consensus::dispatch::ingress_with_qc_verification;
         use boule_consensus::hotstuff::Proposal;
+        use boule_core::clock::BoxFuture;
+        use boule_core::storage::{Storage, WriteBatch};
         use boule_transport_tcp::overlay::Broadcaster;
 
         #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7460,7 +7466,7 @@ mod tests {
                 // batch; record only after the inner write succeeds.
                 let mut written_view: Option<View> = None;
                 for op in batch.ops() {
-                    if let boule::storage::WriteOp::Put(key, value) = op {
+                    if let boule_core::storage::WriteOp::Put(key, value) = op {
                         if key.as_slice() == STORAGE_KEY_LAST_VOTED_VIEW {
                             if let Ok(v) = decode_voted_view(value) {
                                 written_view = Some(v);
@@ -7590,7 +7596,7 @@ mod tests {
         let wire = WireMessage::Proposal(signed_proposal);
         let payload = postcard::to_stdvec(&wire).expect("encode wire");
         let qc_verification = boule_consensus::dispatch::QcVerification::Verify {
-            scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+            scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
             genesis_hash: node.core.state().genesis_hash,
@@ -7661,10 +7667,10 @@ mod tests {
         use bytes::Bytes;
         use parking_lot::Mutex as PlMutex;
 
-        use boule::clock::BoxFuture;
-        use boule::storage::{Storage, WriteBatch};
         use boule_consensus::hotstuff::Proposal;
         use boule_consensus::hotstuff::qc::QuorumCertificate;
+        use boule_core::clock::BoxFuture;
+        use boule_core::storage::{Storage, WriteBatch};
         use boule_transport_tcp::overlay::Broadcaster;
 
         #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7693,7 +7699,7 @@ mod tests {
             fn apply_batch(&self, batch: WriteBatch) -> anyhow::Result<()> {
                 let mut written_lock_view: Option<View> = None;
                 for op in batch.ops() {
-                    if let boule::storage::WriteOp::Put(key, value) = op {
+                    if let boule_core::storage::WriteOp::Put(key, value) = op {
                         if key.as_slice() == STORAGE_KEY_LOCKED {
                             if let Ok(l) = decode_locked(value) {
                                 written_lock_view = Some(l.view);
@@ -8012,8 +8018,8 @@ mod tests {
 
     // ── RateLimiter integration (issue #134) ────────────────────────────────
 
-    use boule::clock::{Clock, TokioClock};
-    use boule::transport::limits::{RateLimiter, RateLimitsConfig};
+    use boule_core::clock::{Clock, TokioClock};
+    use boule_core::transport::limits::{RateLimiter, RateLimitsConfig};
     use boule_transport_tcp::PeerCommand;
 
     /// Build a `WireMessage::BlockRequest([0; 32])` postcard frame.
@@ -8234,7 +8240,7 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(
                 limiter.admit(peer_b, MessageKind::Vote, 64),
-                boule::transport::limits::Decision::Allow
+                boule_core::transport::limits::Decision::Allow
             );
         }
         // And Peer A's Vote bucket is unaffected too — distinct
@@ -8242,7 +8248,7 @@ mod tests {
         for _ in 0..4 {
             assert_eq!(
                 limiter.admit(peer_a, MessageKind::Vote, 64),
-                boule::transport::limits::Decision::Allow
+                boule_core::transport::limits::Decision::Allow
             );
         }
     }
@@ -8889,8 +8895,8 @@ mod tests {
     /// silently rot.
     #[test]
     fn verify_persisted_history_consistency_bls_happy_path() {
-        use boule::crypto::sig_scheme::{BlsPublicKey, SignatureSchemeChoice};
         use boule_consensus::bls_key_history::BlsKeyHistory;
+        use boule_core::crypto::sig_scheme::{BlsPublicKey, SignatureSchemeChoice};
 
         // Synthesize 4 BLS pubkeys (deterministic, since the test
         // only exercises the bookkeeping path; PoP verification is

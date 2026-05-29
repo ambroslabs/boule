@@ -6,11 +6,11 @@ behind in `boule-core`**.
 
 > [!NOTE]
 > **Partly superseded (2026-05):** the `boule-transport` interface crate was
-> later folded back into `boule-core` as the `boule::transport` module
+> later folded back into `boule-core` as the `boule_core::transport` module
 > (`transport::overlay` + `transport::limits`). The layering below is the
 > historical split plan; today those traits and the rate-limit policy live in
 > `boule-core`, and `boule-transport-tcp` / `boule-node` reach them via
-> `boule::transport::…`.
+> `boule_core::transport::…`.
 
 ## Target crates (depend strictly downward)
 

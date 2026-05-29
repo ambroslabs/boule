@@ -23,7 +23,7 @@
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!
-//! use boule::clock::{Clock, TokioClock};
+//! use boule_core::clock::{Clock, TokioClock};
 //! use boule_transport_tcp::{self as p2p, PeerCommand};
 //! use boule_transport_tcp::rpc::RpcBuilder;
 //! use bytes::Bytes;
@@ -89,7 +89,7 @@ use tracing::warn;
 
 use crate::tls::{NodeId, node_id_to_base58};
 use crate::{ProtocolEvent, ProtocolHandle, ProtocolOutbound};
-use boule::clock::{self, Clock};
+use boule_core::clock::{self, Clock};
 
 /// Frame kind: an outbound request from a client. The server looks up
 /// `method_id` in its handler table and dispatches.
@@ -448,7 +448,7 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<Bytes, Bytes>> + Sen
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use boule::clock::{Clock, TokioClock};
+/// use boule_core::clock::{Clock, TokioClock};
 /// use boule_transport_tcp::{NodeId, ProtocolHandle};
 /// use boule_transport_tcp::rpc::RpcBuilder;
 /// use bytes::Bytes;
@@ -516,7 +516,7 @@ where
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use boule::clock::{Clock, TokioClock};
+/// use boule_core::clock::{Clock, TokioClock};
 /// use boule_transport_tcp::{NodeId, ProtocolHandle};
 /// use boule_transport_tcp::rpc::RpcBuilder;
 /// use bytes::Bytes;
@@ -593,7 +593,7 @@ impl RpcBuilder {
     /// return a cloneable [`Rpc`] handle.
     ///
     /// `clock` is used for the per-call timeout in [`Rpc::call`] — pass
-    /// [`TokioClock`](boule::clock::TokioClock) in production; the sim
+    /// [`TokioClock`](boule_core::clock::TokioClock) in production; the sim
     /// harness injects a virtual clock.
     ///
     /// The RPC task runs until the [`ProtocolHandle`]'s event channel
@@ -1144,7 +1144,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use boule::clock::TokioClock;
+    use boule_core::clock::TokioClock;
 
     fn test_clock() -> Arc<dyn Clock> {
         Arc::new(TokioClock::new())

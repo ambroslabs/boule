@@ -31,9 +31,9 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::View;
-use boule::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
-use boule::crypto::signed::{ChainId, SignedMessage, Signer, preimage};
-use boule::identity::NodeId;
+use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
+use boule_core::crypto::signed::{ChainId, SignedMessage, Signer, preimage};
+use boule_core::identity::NodeId;
 
 /// Magic prefix that tags a `Block.commands` entry as a tagged
 /// [`DualSignedRotation`] payload. Mirrors the [`RECONFIG_TAG`] convention
@@ -97,7 +97,7 @@ impl SignedMessage for ValidatorKeyRotation {
 /// verifies under whatever key the validator is currently using — looked
 /// up by the consumer against the active validator set, not carried on
 /// the envelope. That's deliberate: an attacker who rewrites a `signer`
-/// claim can already be defeated by [`boule::crypto::signed::Signed`],
+/// claim can already be defeated by [`boule_core::crypto::signed::Signed`],
 /// but for a self-attestation envelope the trusted answer to "who is the
 /// old signer?" comes from the validator set, not from the message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -329,7 +329,7 @@ impl DualSignedRotation {
     /// `sig_new` would never verify).
     ///
     /// Both signatures are over the same canonical pre-image as
-    /// [`boule::crypto::signed::Signed`] for `ValidatorKeyRotation` — the
+    /// [`boule_core::crypto::signed::Signed`] for `ValidatorKeyRotation` — the
     /// shared helper guarantees the bytes signed match the bytes
     /// [`Self::verify`] reconstructs.
     pub fn sign(
@@ -395,7 +395,7 @@ impl DualSignedRotation {
 mod serde_optional_bls_pubkey {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
-    use boule::crypto::sig_scheme::BlsPublicKey;
+    use boule_core::crypto::sig_scheme::BlsPublicKey;
 
     pub fn serialize<S: Serializer>(opt: &Option<BlsPublicKey>, s: S) -> Result<S::Ok, S::Error> {
         match opt {
@@ -460,7 +460,7 @@ pub struct RotationProposeOutcome {
 }
 
 /// Translate the `--new-key-backend` + path/passphrase flags into an
-/// [`boule::config::IdentityConfig`]. Accepts only the path-bearing
+/// [`boule_core::config::IdentityConfig`]. Accepts only the path-bearing
 /// backends — `file` and `encrypted-file` — because they can
 /// self-provision a fresh key when the path doesn't yet exist (the common
 /// rotation path). Read-only backends (env, exec, keyring) need bespoke
@@ -469,8 +469,8 @@ pub fn build_new_identity_config_for_rotation(
     backend: &str,
     path: Option<PathBuf>,
     passphrase_env: Option<String>,
-) -> anyhow::Result<boule::config::IdentityConfig> {
-    use boule::config::IdentityConfig;
+) -> anyhow::Result<boule_core::config::IdentityConfig> {
+    use boule_core::config::IdentityConfig;
     match backend {
         "file" => Ok(IdentityConfig::File {
             path: path
@@ -502,8 +502,8 @@ pub fn build_new_identity_config_for_rotation(
 pub fn build_rotation_envelope(
     req: &RotationProposeRequest,
 ) -> anyhow::Result<RotationProposeOutcome> {
-    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
-    use boule::crypto::signed::NodeSigner;
+    use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule_core::crypto::signed::NodeSigner;
 
     let v_eff = View(
         req.v_eff
@@ -516,7 +516,7 @@ pub fn build_rotation_envelope(
         .config_path
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("rotation propose requires --config"))?;
-    let config = boule::config::load(config_path)?;
+    let config = boule_core::config::load(config_path)?;
     let cons = config.consensus.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "--config {} has no [consensus] section; rotation requires the \
@@ -553,9 +553,9 @@ pub fn build_rotation_envelope(
     // precedence: prefer `[node.validator_identity]`, else fall back to
     // the network identity. The key must already exist on disk.
     let (current_id_cfg, current_slot) =
-        match boule::config::resolve_validator_identity(&config.node) {
+        match boule_core::config::resolve_validator_identity(&config.node) {
             Some(cfg) => (cfg, "validator"),
-            None => match boule::config::resolve_identity(&config.node) {
+            None => match boule_core::config::resolve_identity(&config.node) {
                 Some(cfg) => (cfg, "network (legacy single-key)"),
                 None => anyhow::bail!(
                     "--config {} has no [node.validator_identity] or [node.identity]; \
@@ -564,7 +564,7 @@ pub fn build_rotation_envelope(
                 ),
             },
         };
-    let current_provider = boule::config::build_provider(&current_id_cfg)?;
+    let current_provider = boule_core::config::build_provider(&current_id_cfg)?;
     let current_identity = current_provider.try_load()?.ok_or_else(|| {
         anyhow::anyhow!(
             "no current consensus key found via the {} `{}` backend; provision it via \
@@ -581,7 +581,7 @@ pub fn build_rotation_envelope(
         req.new_key_path.clone(),
         req.new_key_passphrase_env.clone(),
     )?;
-    let new_provider = boule::config::build_provider(&new_id_cfg)?;
+    let new_provider = boule_core::config::build_provider(&new_id_cfg)?;
     let new_identity = if new_provider.is_provisioning_capable() {
         new_provider.load_or_init()?
     } else {
@@ -648,8 +648,8 @@ pub fn build_rotation_envelope(
 mod tests {
     use super::*;
 
-    use boule::crypto::signed::NodeSigner;
-    use boule::identity::NodeIdentity;
+    use boule_core::crypto::signed::NodeSigner;
+    use boule_core::identity::NodeIdentity;
     use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
     use zeroize::Zeroizing;
 
@@ -1140,8 +1140,8 @@ mod tests {
     fn bls_keypair(
         seed: u8,
     ) -> (
-        boule::crypto::sig_scheme::BlsSecretKey,
-        boule::crypto::sig_scheme::BlsPublicKey,
+        boule_core::crypto::sig_scheme::BlsSecretKey,
+        boule_core::crypto::sig_scheme::BlsPublicKey,
     ) {
         let mut ikm = [0u8; 32];
         ikm[0] = seed;

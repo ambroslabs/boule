@@ -9,7 +9,7 @@
 //! # Purity
 //!
 //! Everything in this module is deliberately I/O-free: no `tokio`, no
-//! [`boule::clock::Clock`], no network, no [`boule::storage`]. Inputs
+//! [`boule_core::clock::Clock`], no network, no [`boule_core::storage`]. Inputs
 //! are [`Event`]s; outputs are [`Action`]s. The milestone 8 integration
 //! layer (#24) translates returned actions into real effects (syncing
 //! WAL, sending messages, advancing views). This is what lets the core

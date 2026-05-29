@@ -85,26 +85,26 @@ impl CacheLimits {
     }
 
     /// Production defaults, taken from the `DEFAULT_*` constants in
-    /// [`boule::config`] so they stay in sync with the defaults of
-    /// [`boule::config::ConsensusLimits`].
+    /// [`boule_core::config`] so they stay in sync with the defaults of
+    /// [`boule_core::config::ConsensusLimits`].
     pub fn production_defaults() -> Self {
         Self {
-            vote_bucket_capacity: boule::config::DEFAULT_VOTE_BUCKET_CAPACITY,
-            parked_proposals_capacity: boule::config::DEFAULT_PARKED_PROPOSALS_CAPACITY,
-            pending_blocks_capacity: boule::config::DEFAULT_PENDING_BLOCKS_CAPACITY,
-            timeout_buckets_capacity: boule::config::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
+            vote_bucket_capacity: boule_core::config::DEFAULT_VOTE_BUCKET_CAPACITY,
+            parked_proposals_capacity: boule_core::config::DEFAULT_PARKED_PROPOSALS_CAPACITY,
+            pending_blocks_capacity: boule_core::config::DEFAULT_PENDING_BLOCKS_CAPACITY,
+            timeout_buckets_capacity: boule_core::config::DEFAULT_TIMEOUT_BUCKETS_CAPACITY,
             block_sync_initial_backoff_views:
-                boule::config::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
-            block_sync_max_backoff_views: boule::config::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
-            block_sync_per_peer_attempts: boule::config::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
-            block_sync_max_attempts: boule::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
+                boule_core::config::DEFAULT_BLOCK_SYNC_INITIAL_BACKOFF_VIEWS,
+            block_sync_max_backoff_views: boule_core::config::DEFAULT_BLOCK_SYNC_MAX_BACKOFF_VIEWS,
+            block_sync_per_peer_attempts: boule_core::config::DEFAULT_BLOCK_SYNC_PER_PEER_ATTEMPTS,
+            block_sync_max_attempts: boule_core::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
         }
     }
 
-    /// Build these caps from [`boule::config::ConsensusLimits`], field
+    /// Build these caps from [`boule_core::config::ConsensusLimits`], field
     /// for field. (The mempool cap lives on
-    /// `boule::config::ConsensusConfig`, not here.)
-    pub fn from_config(c: &boule::config::ConsensusLimits) -> Self {
+    /// `boule_core::config::ConsensusConfig`, not here.)
+    pub fn from_config(c: &boule_core::config::ConsensusLimits) -> Self {
         Self {
             vote_bucket_capacity: c.vote_bucket_capacity,
             parked_proposals_capacity: c.parked_proposals_capacity,
@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn from_config_maps_every_field() {
-        let cfg = boule::config::ConsensusLimits {
+        let cfg = boule_core::config::ConsensusLimits {
             vote_bucket_capacity: 11,
             parked_proposals_capacity: 22,
             pending_blocks_capacity: 33,

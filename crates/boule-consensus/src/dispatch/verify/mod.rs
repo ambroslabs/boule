@@ -14,7 +14,7 @@
 //! - [`bls_partial`]: required BLS partial-signature gate on Vote
 //!   frames over a `bls_aggregated` chain.
 //! - [`domain`]: chain-id pre-image binding (#324) — wraps
-//!   [`boule::crypto::signed::preimage`] for the call sites here.
+//!   [`boule_core::crypto::signed::preimage`] for the call sites here.
 //! - [`proposal_history`]: validator-history commitment check on
 //!   inbound Proposals (#325 PR C).
 

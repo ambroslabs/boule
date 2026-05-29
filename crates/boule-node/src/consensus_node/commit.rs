@@ -5,10 +5,10 @@
 
 use std::sync::atomic::Ordering;
 
-use boule::storage::{Storage, StorageExt};
 use boule_consensus::Height;
 use boule_consensus::crashpoint::crashpoint;
 use boule_consensus::replication::block::{Block, BlockHash};
+use boule_core::storage::{Storage, StorageExt};
 
 use super::{
     ConsensusNode, LastCommitted, STORAGE_KEY_HEIGHT_PREFIX, STORAGE_KEY_LAST_COMMITTED,

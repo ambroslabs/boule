@@ -19,7 +19,6 @@ use std::collections::VecDeque;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use boule::storage::{Storage, StorageExt};
 use boule_consensus::hotstuff::Locked;
 use boule_consensus::hotstuff::qc::{TimeoutVote, VerifiedQc};
 use boule_consensus::hotstuff::step::StateUpdate;
@@ -27,6 +26,7 @@ use boule_consensus::hotstuff::{HotStuffState, QuorumCertificate, genesis_qc};
 use boule_consensus::replication::block::{Block, BlockHash};
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::{Height, View};
+use boule_core::storage::{Storage, StorageExt};
 
 use super::{ConsensusNode, TRACE_TARGET};
 

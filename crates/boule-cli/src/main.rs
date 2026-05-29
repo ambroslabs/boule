@@ -7,7 +7,7 @@ use clap::Parser;
 /// Honors two environment variables:
 ///
 /// - `RUST_LOG`: standard `tracing-subscriber` env filter. Defaults to
-///   `boule=info`. Set to `info,boule::consensus=debug` to get the
+///   `boule=info`. Set to `info,boule_core::consensus=debug` to get the
 ///   structured event-boundary logs the consensus layer emits.
 /// - `RUST_LOG_FORMAT`: `pretty` (default) or `json`. JSON emits one
 ///   structured event per line, which operators can pipe through `jq`.

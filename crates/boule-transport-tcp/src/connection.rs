@@ -488,7 +488,7 @@ mod tests {
         use zeroize::Zeroizing;
 
         use crate::tls::TlsIdentity;
-        use boule::identity::NodeIdentity;
+        use boule_core::identity::NodeIdentity;
 
         fn fresh_tls() -> Arc<TlsIdentity> {
             let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();

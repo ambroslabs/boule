@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::View;
 use crate::validator_set::{ValidatorId, ValidatorSet};
-use boule::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop, SignatureSchemeChoice};
-use boule::crypto::signed::ChainId;
-use boule::identity::NodeId;
+use boule_core::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop, SignatureSchemeChoice};
+use boule_core::crypto::signed::ChainId;
+use boule_core::identity::NodeId;
 
 /// Magic prefix that tags a `Block.commands` entry as a reconfig payload.
 pub const RECONFIG_TAG: &[u8; 6] = b"RECFG\0";
@@ -505,13 +505,13 @@ pub fn read_bls_pop_file(path: &Path) -> anyhow::Result<BlsPop> {
     Ok(BlsPop { pubkey, sig })
 }
 
-/// Load a [`boule::crypto::bls_key::BlsKeyFile`] and derive a
+/// Load a [`boule_core::crypto::bls_key::BlsKeyFile`] and derive a
 /// chain-id-bound PoP (#410) on the fly, letting an operator generate an
 /// add-validator payload from a freshly-provisioned BLS key file in one
 /// step. The PoP pre-image binds to `chain_id` so the same key produces a
 /// different PoP per deployment, blocking cross-chain replay.
 pub fn derive_bls_pop_from_key_file(path: &Path, chain_id: &ChainId) -> anyhow::Result<BlsPop> {
-    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
     let provider = BlsKeyFile::new(path.to_path_buf());
     let id = provider
         .load_or_init()
@@ -527,7 +527,7 @@ pub fn derive_bls_pop_from_key_file(path: &Path, chain_id: &ChainId) -> anyhow::
 /// are mutually exclusive. Backs `reconfig add-validator`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_add_validator_payload(
-    config: Option<&boule::config::Config>,
+    config: Option<&boule_core::config::Config>,
     node_id: NodeId,
     addr: SocketAddr,
     v_eff: View,
@@ -624,7 +624,7 @@ pub fn build_add_validator_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
     use tempfile::TempDir;
 
     fn nid(b: u8) -> NodeId {

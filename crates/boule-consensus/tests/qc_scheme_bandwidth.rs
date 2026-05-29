@@ -35,11 +35,11 @@
 
 use std::time::{Duration, Instant};
 
-use boule::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
-use boule::crypto::signed::{NodeSigner, Signer};
-use boule::identity::NodeId;
-use boule::identity::NodeIdentity;
 use boule_consensus::hotstuff::qc::{QuorumCertificate, Vote as ConsensusVote, quorum_size};
+use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
+use boule_core::crypto::signed::{NodeSigner, Signer};
+use boule_core::identity::NodeId;
+use boule_core::identity::NodeIdentity;
 use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
 use zeroize::Zeroizing;
 

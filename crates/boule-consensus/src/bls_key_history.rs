@@ -48,8 +48,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::View;
 use crate::validator_set::ValidatorSet;
-use boule::crypto::sig_scheme::BlsPublicKey;
-use boule::identity::NodeId;
+use boule_core::crypto::sig_scheme::BlsPublicKey;
+use boule_core::identity::NodeId;
 
 /// One entry in a validator's BLS key timeline: at view `v_eff` the
 /// validator began signing QCs with `bls_pubkey`. Per-validator entries

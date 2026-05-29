@@ -43,7 +43,7 @@ use crate::View;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_rotation::{RotationStructuralError, ValidatorKeyRotation};
 use crate::validator_set::{Pubkey, ValidatorId};
-use boule::identity::NodeId;
+use boule_core::identity::NodeId;
 
 /// One entry in a validator's key history: at view `v_eff` the validator
 /// began signing with `pubkey`. The list of entries for a single

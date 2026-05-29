@@ -19,7 +19,7 @@
 //! core emits passes through the per-node routing task in
 //! [`crate::sim::SimCluster`]'s spawn path, and the
 //! [`Adversary`] hook taps into that exact stream. Adversaries get the
-//! node's own [`boule::crypto::signed::Signer`] so any envelope they
+//! node's own [`boule_core::crypto::signed::Signer`] so any envelope they
 //! craft passes recipient-side signature verification — testing
 //! protocol-level rejection rather than crypto-level rejection.
 //!
@@ -48,12 +48,12 @@ use parking_lot::Mutex;
 use proptest::prelude::*;
 
 use super::sim::{Adversary, AdversaryCtx, SimCluster, assert_no_conflicts};
-use boule::crypto::signed::{ChainId, Signed};
 use boule_consensus::View;
 use boule_consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote, Vote};
 use boule_consensus::hotstuff::{NewView, Proposal};
 use boule_consensus::replication::block::Block;
 use boule_consensus::wire::WireMessage;
+use boule_core::crypto::signed::{ChainId, Signed};
 use boule_transport_tcp::{NodeId, ProtocolOutbound};
 
 // ── Wire helpers ─────────────────────────────────────────────────────────────

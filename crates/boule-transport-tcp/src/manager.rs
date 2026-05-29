@@ -70,7 +70,7 @@ use super::connection::ProtocolCaps;
 use super::overlay::DiscoveryEvent;
 use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
-use boule::transport::limits::{ConnectionLimiter, Direction};
+use boule_core::transport::limits::{ConnectionLimiter, Direction};
 
 /// Monotonic per-connection identity assigned by the manager. Used to
 /// distinguish connections to the same peer so a tie-breaker replacement
@@ -1273,7 +1273,7 @@ mod tests {
 
     // ── ConnectionLimiter integration ──────────────────────────────────────
 
-    use boule::transport::limits::ConnectionLimitsConfig;
+    use boule_core::transport::limits::ConnectionLimitsConfig;
 
     fn sa(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
         SocketAddr::from(([a, b, c, d], port))

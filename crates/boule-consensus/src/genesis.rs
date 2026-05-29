@@ -7,14 +7,14 @@
 //! `rotation`) and the `testnet` driver can derive a chain ID without
 //! booting a node.
 //!
-//! [`ChainId`]: boule::crypto::signed::ChainId
+//! [`ChainId`]: boule_core::crypto::signed::ChainId
 
 use anyhow::Context as _;
 
 use crate::replication::block::Block;
 use crate::validator_set::ValidatorSet;
-use boule::config::ConsensusConfig;
-use boule::identity::{NodeId, base58_to_node_id};
+use boule_core::config::ConsensusConfig;
+use boule_core::identity::{NodeId, base58_to_node_id};
 
 /// Derive the deployment's [`ChainId`] from a [`ConsensusConfig`]
 /// without booting a full consensus node. Used by CLI tooling
@@ -27,8 +27,10 @@ use boule::identity::{NodeId, base58_to_node_id};
 /// PoP check is exactly what the caller is preparing to perform, so
 /// it would be redundant here.
 ///
-/// [`ChainId`]: boule::crypto::signed::ChainId
-pub fn derive_chain_id(cfg: &ConsensusConfig) -> anyhow::Result<boule::crypto::signed::ChainId> {
+/// [`ChainId`]: boule_core::crypto::signed::ChainId
+pub fn derive_chain_id(
+    cfg: &ConsensusConfig,
+) -> anyhow::Result<boule_core::crypto::signed::ChainId> {
     if cfg.validators.is_empty() {
         anyhow::bail!("[consensus.validators] must list at least one node");
     }
@@ -41,7 +43,7 @@ pub fn derive_chain_id(cfg: &ConsensusConfig) -> anyhow::Result<boule::crypto::s
     let bls_full = cfg
         .resolve_genesis_bls_keys()
         .context("decoding genesis BLS validator table")?;
-    let bls_pubkeys: Vec<(NodeId, boule::crypto::sig_scheme::BlsPublicKey)> = bls_full
+    let bls_pubkeys: Vec<(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)> = bls_full
         .into_iter()
         .map(|(nid, pk, _pop)| (nid, pk))
         .collect();
@@ -69,13 +71,13 @@ pub fn derive_chain_id(cfg: &ConsensusConfig) -> anyhow::Result<boule::crypto::s
 /// the same way `[consensus.validators]` parsing does, so the input
 /// order doesn't matter as long as it's the same set on every node.
 ///
-/// [`ChainId`]: boule::crypto::signed::ChainId
+/// [`ChainId`]: boule_core::crypto::signed::ChainId
 pub fn derive_chain_id_from_parts(
     validator_node_ids: &[NodeId],
-    signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice,
-    genesis_bls: &[(NodeId, boule::crypto::sig_scheme::BlsPublicKey)],
+    signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
+    genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
     genesis_seed: [u8; 32],
-) -> boule::crypto::signed::ChainId {
+) -> boule_core::crypto::signed::ChainId {
     let validator_ids: Vec<crate::validator_set::ValidatorId> = validator_node_ids
         .iter()
         .copied()
@@ -85,7 +87,7 @@ pub fn derive_chain_id_from_parts(
     let commitment =
         compute_genesis_validator_history_commitment(&validator_set, signature_scheme, genesis_bls);
     let genesis = Block::genesis(genesis_seed, commitment);
-    boule::crypto::signed::ChainId::from_genesis_hash(genesis.hash())
+    boule_core::crypto::signed::ChainId::from_genesis_hash(genesis.hash())
 }
 
 /// Build the genesis block from the optional `genesis_seed_hex` config
@@ -99,7 +101,7 @@ pub fn derive_chain_id_from_parts(
 pub fn build_genesis(
     cfg: &ConsensusConfig,
     validator_set: &ValidatorSet,
-    genesis_bls: &[(NodeId, boule::crypto::sig_scheme::BlsPublicKey)],
+    genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
 ) -> anyhow::Result<Block> {
     let mut seed = [0u8; 32];
     if let Some(hex) = &cfg.genesis_seed_hex {
@@ -121,18 +123,18 @@ pub fn build_genesis(
 /// so both produce byte-identical hashes from the same inputs.
 fn compute_genesis_validator_history_commitment(
     validator_set: &ValidatorSet,
-    scheme: boule::crypto::sig_scheme::SignatureSchemeChoice,
-    genesis_bls: &[(NodeId, boule::crypto::sig_scheme::BlsPublicKey)],
+    scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
+    genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
 ) -> [u8; 32] {
     let set_hist =
         crate::validator_history::ValidatorSetHistory::from_genesis(validator_set.clone());
     let key_hist =
         crate::validator_key_history::ValidatorKeyHistory::new(validator_set.iter().copied());
     let bls_hist = match scheme {
-        boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => Some(
+        boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => Some(
             crate::bls_key_history::BlsKeyHistory::with_genesis(genesis_bls.iter().copied()),
         ),
-        boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => None,
+        boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => None,
     };
     crate::history_commitment::validator_history_commitment_v1(
         &set_hist,

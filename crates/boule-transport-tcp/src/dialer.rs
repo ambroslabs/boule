@@ -7,8 +7,8 @@ use tracing::{info, warn};
 use super::PeerCommand;
 use super::manager::{AnyStream, ManagerMsg};
 use super::tls::{NodeId, TlsIdentity, TlsStream, extract_node_id, node_id_to_base58};
-use boule::clock::Clock;
-use boule::transport::limits::Direction;
+use boule_core::clock::Clock;
+use boule_core::transport::limits::Direction;
 
 /// Bundle of per-node dialer dependencies — the parameters every
 /// invocation of [`reconnect_loop`] needs that are constant across the

@@ -44,8 +44,6 @@ use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
 use serde::Serialize;
 use zeroize::Zeroizing;
 
-use boule::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
-use boule::identity::NodeIdentity;
 use boule_consensus::dispatch::ingress;
 use boule_consensus::hotstuff::qc::{
     ConsensusMsg, NewView, Proposal, QuorumCertificate, SignerBitmap, TimeoutVote, Vote,
@@ -57,6 +55,8 @@ use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::wire::WireMessage;
 use boule_consensus::{Height, View};
+use boule_core::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
+use boule_core::identity::NodeIdentity;
 use boule_transport_tcp::NodeId;
 
 // ── Shared signer pool ──────────────────────────────────────────────

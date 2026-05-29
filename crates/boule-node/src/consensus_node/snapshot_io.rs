@@ -19,8 +19,6 @@ use std::sync::atomic::Ordering;
 use anyhow::Context;
 use bytes::Bytes;
 
-use boule::crypto::signed::Signer;
-use boule::storage::StorageExt;
 use boule_consensus::Height;
 use boule_consensus::View;
 use boule_consensus::crashpoint::crashpoint;
@@ -29,6 +27,8 @@ use boule_consensus::hotstuff::qc::VerifiedQc;
 use boule_consensus::hotstuff::step::{Action as SafetyAction, Event as SafetyEvent, StateUpdate};
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::view_timer::ViewTimer;
+use boule_core::crypto::signed::Signer;
+use boule_core::storage::StorageExt;
 use boule_transport_tcp::NodeId;
 use boule_transport_tcp::overlay::Broadcaster;
 use boule_transport_tcp::tls::node_id_to_base58;

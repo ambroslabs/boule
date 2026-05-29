@@ -9,7 +9,7 @@
 
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
-use boule::crypto::signed::ChainId;
+use boule_core::crypto::signed::ChainId;
 
 use super::super::{IngressError, QcVerification};
 

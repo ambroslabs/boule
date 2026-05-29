@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-use boule::identity::node_id_to_base58;
 use boule_consensus::validator_rotation::{RotationProposeRequest, build_rotation_envelope};
+use boule_core::identity::node_id_to_base58;
 
 use super::shared::resolve_config_path;
 
@@ -69,11 +69,11 @@ pub(crate) fn handle_propose(args: RotationProposeArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
-    use boule::crypto::sig_scheme::BlsAggregated;
     use boule_consensus::validator_rotation::{
         RotationProposeRequest, build_new_identity_config_for_rotation, build_rotation_envelope,
     };
+    use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule_core::crypto::sig_scheme::BlsAggregated;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -81,15 +81,15 @@ mod tests {
     /// base58-encoded NodeId. Both halves are what the rotation tests
     /// need to write a usable config TOML.
     fn mint_validator_key(path: &Path) -> String {
-        use boule::crypto::signed::{NodeSigner, Signer as _};
-        let cfg = boule::config::IdentityConfig::File {
+        use boule_core::crypto::signed::{NodeSigner, Signer as _};
+        let cfg = boule_core::config::IdentityConfig::File {
             path: path.to_path_buf(),
             allow_insecure_perms: false,
         };
-        let provider = boule::config::build_provider(&cfg).unwrap();
+        let provider = boule_core::config::build_provider(&cfg).unwrap();
         let id = provider.load_or_init().unwrap();
         let signer = NodeSigner::from_identity(&id).unwrap();
-        boule::identity::node_id_to_base58(&signer.node_id())
+        boule_core::identity::node_id_to_base58(&signer.node_id())
     }
 
     fn write_ed25519_chain_config(
@@ -155,7 +155,7 @@ mod tests {
         // End-to-end: real config + existing validator key on disk → minted
         // new key → signed envelope that verifies under the validator's
         // current pubkey and the chain's chain_id.
-        use boule::crypto::signed::{NodeSigner, Signer as _};
+        use boule_core::crypto::signed::{NodeSigner, Signer as _};
 
         let dir = TempDir::new().unwrap();
         let current_key = dir.path().join("current.key");
@@ -185,28 +185,30 @@ mod tests {
         assert!(outcome.envelope.payload.new_bls_pop.is_none());
         assert_eq!(outcome.envelope.payload.v_eff.0, 500);
 
-        let current_id = boule::config::build_provider(&boule::config::IdentityConfig::File {
-            path: current_key.clone(),
-            allow_insecure_perms: false,
-        })
-        .unwrap()
-        .try_load()
-        .unwrap()
-        .unwrap();
+        let current_id =
+            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
+                path: current_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
         let current_signer = NodeSigner::from_identity(&current_id).unwrap();
-        let new_id = boule::config::build_provider(&boule::config::IdentityConfig::File {
-            path: new_key.clone(),
-            allow_insecure_perms: false,
-        })
-        .unwrap()
-        .try_load()
-        .unwrap()
-        .unwrap();
+        let new_id =
+            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
+                path: new_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
         let new_signer = NodeSigner::from_identity(&new_id).unwrap();
         assert_eq!(outcome.envelope.payload.validator, current_signer.node_id());
         assert_eq!(outcome.envelope.payload.new_pubkey, new_signer.node_id());
 
-        let cfg = boule::config::load(&config_path).unwrap();
+        let cfg = boule_core::config::load(&config_path).unwrap();
         let chain_id =
             boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
         outcome
@@ -224,7 +226,7 @@ mod tests {
     fn rotation_propose_idempotent_when_new_key_already_exists() {
         // Re-running with a pre-minted `new_key_path` must reload it (not
         // overwrite) and produce a payload pointing at the same pubkey.
-        use boule::crypto::signed::{NodeSigner, Signer as _};
+        use boule_core::crypto::signed::{NodeSigner, Signer as _};
 
         let dir = TempDir::new().unwrap();
         let current_key = dir.path().join("current.key");
@@ -245,14 +247,15 @@ mod tests {
         let first = build_rotation_envelope(&args).unwrap();
         let second = build_rotation_envelope(&args).unwrap();
 
-        let new_id = boule::config::build_provider(&boule::config::IdentityConfig::File {
-            path: new_key.clone(),
-            allow_insecure_perms: false,
-        })
-        .unwrap()
-        .try_load()
-        .unwrap()
-        .unwrap();
+        let new_id =
+            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
+                path: new_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
         let new_signer = NodeSigner::from_identity(&new_id).unwrap();
         assert_eq!(first.envelope.payload.new_pubkey, new_signer.node_id());
         assert_eq!(second.envelope.payload.new_pubkey, new_signer.node_id());
@@ -290,7 +293,7 @@ mod tests {
     fn rotation_propose_bls_chain_bundles_bls_key_and_pop() {
         // BLS-chain happy path: both halves minted, the envelope carries a
         // chain-bound PoP, and the payload passes scheme-consistency.
-        use boule::crypto::signed::{NodeSigner, Signer as _};
+        use boule_core::crypto::signed::{NodeSigner, Signer as _};
 
         let dir = TempDir::new().unwrap();
         let current_key = dir.path().join("current.key");
@@ -343,7 +346,7 @@ mod tests {
         let bls_id = BlsKeyFile::new(new_bls.clone()).load_or_init().unwrap();
         assert_eq!(env_pk, bls_id.public);
 
-        let cfg = boule::config::load(&config_path).unwrap();
+        let cfg = boule_core::config::load(&config_path).unwrap();
         let chain_id =
             boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
         BlsAggregated::verify_pop(env_pop, &env_pk, &chain_id)
@@ -353,19 +356,20 @@ mod tests {
             .envelope
             .payload
             .validate_scheme_consistency(
-                boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
+                boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
                 &chain_id,
             )
             .expect("must pass scheme-consistency under the BLS scheme");
 
-        let current_id = boule::config::build_provider(&boule::config::IdentityConfig::File {
-            path: current_key.clone(),
-            allow_insecure_perms: false,
-        })
-        .unwrap()
-        .try_load()
-        .unwrap()
-        .unwrap();
+        let current_id =
+            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
+                path: current_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
         let current_signer = NodeSigner::from_identity(&current_id).unwrap();
         outcome
             .envelope
@@ -429,7 +433,10 @@ mod tests {
         let cfg =
             build_new_identity_config_for_rotation("file", Some(PathBuf::from("/tmp/k")), None)
                 .unwrap();
-        assert!(matches!(cfg, boule::config::IdentityConfig::File { .. }));
+        assert!(matches!(
+            cfg,
+            boule_core::config::IdentityConfig::File { .. }
+        ));
         assert_eq!(cfg.backend_name(), "file");
 
         let cfg = build_new_identity_config_for_rotation(

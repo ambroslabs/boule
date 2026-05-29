@@ -13,8 +13,8 @@ use rustls::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 
-use boule::identity::NodeIdentity;
-pub use boule::identity::{NodeId, base58_to_node_id, node_id_to_base58};
+use boule_core::identity::NodeIdentity;
+pub use boule_core::identity::{NodeId, base58_to_node_id, node_id_to_base58};
 
 /// Unified stream type covering both inbound and outbound TLS connections.
 pub enum TlsStream {
@@ -277,7 +277,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
-    use boule::identity::NodeIdentity;
+    use boule_core::identity::NodeIdentity;
 
     fn fresh_identity() -> NodeIdentity {
         let kp = KeyPair::generate_for(&PKCS_ED25519).unwrap();

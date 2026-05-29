@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{Height, View};
-use boule::identity::NodeId;
+use boule_core::identity::NodeId;
 
 /// Content-address of a block, computed over its header.
 pub type BlockHash = [u8; 32];

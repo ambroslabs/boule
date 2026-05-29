@@ -8,8 +8,8 @@ use super::listener;
 use super::manager::ManagerMsg;
 use super::tls::{TlsIdentity, base58_to_node_id};
 use super::{ConnectionProtocol, NodeId, PeerCommand};
-use boule::clock::Clock;
-use boule::config::PeerConfig;
+use boule_core::clock::Clock;
+use boule_core::config::PeerConfig;
 
 pub struct TlsConnectionProtocol {
     pub identity: Arc<TlsIdentity>,

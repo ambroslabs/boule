@@ -43,7 +43,7 @@ pub struct NewArgs {
     /// a BLS keypair per node, computes per-validator PoPs, and writes
     /// a `[consensus.validators_bls]` genesis table + a
     /// `[node.bls_validator_identity]` reference per node config.
-    pub signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice,
+    pub signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
 }
 
 /// `testnet new`: lay out the workdir, generate the topology, mint
@@ -220,11 +220,11 @@ struct BlsGenesisEntry {
 /// binding a PoP minted here would replay across any deployment that
 /// happened to reuse the same validator BLS key.
 fn mint_bls_keys_if_needed(
-    scheme: boule::crypto::sig_scheme::SignatureSchemeChoice,
+    scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     nodes: &mut [NodeLayout],
 ) -> anyhow::Result<Option<Vec<BlsGenesisEntry>>> {
-    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
-    use boule::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
+    use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
+    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
     use boule_transport_tcp::tls::base58_to_node_id;
     if scheme == SignatureSchemeChoice::Ed25519Collected {
         return Ok(None);
@@ -236,7 +236,7 @@ fn mint_bls_keys_if_needed(
     struct PendingEntry {
         node_id: String,
         node_id_bytes: boule_transport_tcp::tls::NodeId,
-        secret: zeroize::Zeroizing<boule::crypto::sig_scheme::BlsSecretKey>,
+        secret: zeroize::Zeroizing<boule_core::crypto::sig_scheme::BlsSecretKey>,
         public: BlsPublicKey,
     }
     let mut pending: Vec<PendingEntry> = Vec::with_capacity(nodes.len());
@@ -332,10 +332,10 @@ fn write_final_config(
     target_degree: usize,
     timeout_base_ms: u64,
     timeout_max_ms: u64,
-    signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice,
+    signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     bls_genesis: Option<&[BlsGenesisEntry]>,
 ) -> anyhow::Result<()> {
-    use boule::crypto::sig_scheme::SignatureSchemeChoice;
+    use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
     use std::fmt::Write as _;
     let p2p = n
         .p2p_addr

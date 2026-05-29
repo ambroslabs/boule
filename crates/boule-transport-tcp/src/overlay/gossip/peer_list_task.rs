@@ -33,7 +33,7 @@ use rand_chacha::ChaCha20Rng;
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use boule::clock::Clock;
+use boule_core::clock::Clock;
 
 use super::super::super::tls::NodeId;
 use super::peer_table::PeerTable;
@@ -308,7 +308,7 @@ mod tests {
     use bytes::Bytes;
     use parking_lot::Mutex;
 
-    use boule::clock::TokioClock;
+    use boule_core::clock::TokioClock;
 
     use super::super::wire::{MsgId, OverlayFrame, PeerEntry};
     use super::*;

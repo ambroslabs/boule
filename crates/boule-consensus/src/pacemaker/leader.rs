@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use crate::View;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_set::ValidatorSet;
-use boule::identity::NodeId;
+use boule_core::identity::NodeId;
 
 /// Maps a [`View`] to the proposer for that view.
 ///

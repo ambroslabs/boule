@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::View;
 use crate::validator_set::{ValidatorId, ValidatorSet};
-use boule::identity::NodeId;
+use boule_core::identity::NodeId;
 
 /// One boundary in the history: the view at which `set` becomes
 /// authoritative, and the set itself.
@@ -302,7 +302,7 @@ pub struct PersistedValidatorHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boule::identity::NodeId;
+    use boule_core::identity::NodeId;
 
     fn nid(b: u8) -> NodeId {
         [b; 32]

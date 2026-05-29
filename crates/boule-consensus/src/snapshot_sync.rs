@@ -59,7 +59,7 @@ use bytes::Bytes;
 
 use crate::replication::snapshot::{ManifestError, SnapshotManifest, SnapshotPolicy, verify_chunk};
 use crate::validator_set::ValidatorSet;
-use boule::identity::NodeId;
+use boule_core::identity::NodeId;
 
 /// Cap on the number of chunk requests in flight at any moment
 /// across the workpool. Picked to balance bandwidth utilization

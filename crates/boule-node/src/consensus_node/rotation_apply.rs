@@ -147,7 +147,7 @@ impl ConsensusNode {
             // Ed25519 path already covers, but in the parallel BLS
             // history. Log + roll back if it does.
             if self.signature_scheme
-                == boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated
+                == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated
             {
                 let new_bls_pk = envelope.payload.new_bls_pubkey.expect(
                     "BLS chain rotation passed scheme consistency must carry new_bls_pubkey",

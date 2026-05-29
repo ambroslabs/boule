@@ -12,8 +12,8 @@ use crate::replication::block::Block;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
 use crate::validator_set::ValidatorSet;
-use boule::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
-use boule::identity::NodeIdentity;
+use boule_core::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
+use boule_core::identity::NodeIdentity;
 
 fn fresh_signer() -> NodeSigner {
     let kp = RcgenKeyPair::generate_for(&PKCS_ED25519).unwrap();
@@ -2087,8 +2087,9 @@ fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
     // a BLS QC) is what we're exercising, not bytes-level forgery.
     let mut ikm = [0u8; 32];
     ikm[0] = 0xAB;
-    let (sk, _pk) = boule::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
-    let real_partial = boule::crypto::sig_scheme::BlsAggregated::sign_partial(&sk, b"x").unwrap();
+    let (sk, _pk) = boule_core::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
+    let real_partial =
+        boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(&sk, b"x").unwrap();
     let mut bls_qc = QuorumCertificate::new_bls(view, block_hash, vs.len());
     bls_qc.add_bls_partial(0, real_partial);
 
@@ -2147,13 +2148,13 @@ fn fresh_bls_signer(
     seed: u8,
 ) -> (
     NodeSigner,
-    boule::crypto::sig_scheme::BlsSecretKey,
-    boule::crypto::sig_scheme::BlsPublicKey,
+    boule_core::crypto::sig_scheme::BlsSecretKey,
+    boule_core::crypto::sig_scheme::BlsPublicKey,
 ) {
     let signer = fresh_signer();
     let mut ikm = [0u8; 32];
     ikm.fill(seed);
-    let (sk, pk) = boule::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
+    let (sk, pk) = boule_core::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
     (signer, sk, pk)
 }
 
@@ -2161,14 +2162,16 @@ fn fresh_bls_signer(
 /// Vote pre-image.
 fn make_signed_vote_with_bls_partial(
     signer: &NodeSigner,
-    bls_sk: &boule::crypto::sig_scheme::BlsSecretKey,
+    bls_sk: &boule_core::crypto::sig_scheme::BlsSecretKey,
     view: View,
     block_hash: BlockHash,
-) -> (Signed<Vote>, boule::crypto::sig_scheme::BlsPartialSig) {
+) -> (Signed<Vote>, boule_core::crypto::sig_scheme::BlsPartialSig) {
     let vote = Vote { view, block_hash };
-    let preimage_bytes = boule::crypto::signed::preimage::<Vote>(&vote, &ChainId::TEST).unwrap();
+    let preimage_bytes =
+        boule_core::crypto::signed::preimage::<Vote>(&vote, &ChainId::TEST).unwrap();
     let partial =
-        boule::crypto::sig_scheme::BlsAggregated::sign_partial(bls_sk, &preimage_bytes).unwrap();
+        boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(bls_sk, &preimage_bytes)
+            .unwrap();
     let signed = Signed::sign(vote, signer, &ChainId::TEST).unwrap();
     (signed, partial)
 }
@@ -2301,9 +2304,10 @@ fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
 
     let (signed, _) = make_signed_vote_with_bls_partial(&signer, &bls_sk_b, view, block_hash);
     let preimage_bytes =
-        boule::crypto::signed::preimage::<Vote>(&signed.payload, &ChainId::TEST).unwrap();
+        boule_core::crypto::signed::preimage::<Vote>(&signed.payload, &ChainId::TEST).unwrap();
     let partial =
-        boule::crypto::sig_scheme::BlsAggregated::sign_partial(&bls_sk_b, &preimage_bytes).unwrap();
+        boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(&bls_sk_b, &preimage_bytes)
+            .unwrap();
     let wire = WireMessage::Vote(signed, Some(partial));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 

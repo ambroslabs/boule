@@ -20,7 +20,7 @@
 //! block header. Snapshots let a replica trim its log without losing the
 //! ability to serve a newly joining peer.
 //!
-//! Like [`boule::storage`] and [`boule::clock`], traits here are consumed
+//! Like [`boule_core::storage`] and [`boule_core::clock`], traits here are consumed
 //! as `Arc<dyn Trait>` — backends are swapped at the edges, not plumbed
 //! through generics.
 

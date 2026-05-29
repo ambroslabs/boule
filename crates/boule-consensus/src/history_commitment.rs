@@ -45,8 +45,8 @@ use crate::replication::block::Block;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
 use crate::validator_set::ValidatorSet;
-use boule::crypto::sig_scheme::SignatureSchemeChoice;
-use boule::crypto::signed::ChainId;
+use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
+use boule_core::crypto::signed::ChainId;
 
 /// Domain tag mixed into the leading bytes of the v1 commitment. Bumped
 /// alongside the function name on any future shape change.
@@ -378,7 +378,7 @@ pub fn compute_post_block_commitment(
 mod tests {
     use super::*;
     use crate::validator_set::ValidatorSet;
-    use boule::identity::NodeId;
+    use boule_core::identity::NodeId;
 
     fn nid(b: u8) -> NodeId {
         [b; 32]
