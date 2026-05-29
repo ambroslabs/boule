@@ -142,8 +142,11 @@ impl CacheLimits {
     }
 
     /// Project the parsed `[consensus.limits]` config into the runtime
-    /// cap shape. `mempool_capacity` is consumed separately by the node
-    /// wiring and does not appear here.
+    /// cap shape. The two structs are field-identical; the split exists
+    /// only so this `Copy`, serde-free runtime shape can be threaded
+    /// through the safety core without dragging in `serde`. (The mempool
+    /// cap is a node-wiring concern and lives on
+    /// `boule::config::ConsensusConfig`, not in either struct here.)
     pub fn from_config(c: &boule::config::ConsensusLimits) -> Self {
         Self {
             vote_bucket_capacity: c.vote_bucket_capacity,
@@ -258,17 +261,29 @@ mod tests {
             block_sync_max_backoff_views: 6,
             block_sync_per_peer_attempts: 7,
             block_sync_max_attempts: 8,
-            mempool_capacity: 99,
         };
-        let runtime = CacheLimits::from_config(&cfg);
-        assert_eq!(runtime.vote_bucket_capacity, 11);
-        assert_eq!(runtime.parked_proposals_capacity, 22);
-        assert_eq!(runtime.pending_blocks_capacity, 33);
-        assert_eq!(runtime.timeout_buckets_capacity, 44);
-        assert_eq!(runtime.block_sync_initial_backoff_views, 5);
-        assert_eq!(runtime.block_sync_max_backoff_views, 6);
-        assert_eq!(runtime.block_sync_per_peer_attempts, 7);
-        assert_eq!(runtime.block_sync_max_attempts, 8);
+        // Destructure the result so a newly added `CacheLimits` field
+        // that `from_config` forgets to populate is a *compile* error
+        // here, not a silently-unchecked field. This is what makes the
+        // "maps every field" name a real guarantee.
+        let CacheLimits {
+            vote_bucket_capacity,
+            parked_proposals_capacity,
+            pending_blocks_capacity,
+            timeout_buckets_capacity,
+            block_sync_initial_backoff_views,
+            block_sync_max_backoff_views,
+            block_sync_per_peer_attempts,
+            block_sync_max_attempts,
+        } = CacheLimits::from_config(&cfg);
+        assert_eq!(vote_bucket_capacity, 11);
+        assert_eq!(parked_proposals_capacity, 22);
+        assert_eq!(pending_blocks_capacity, 33);
+        assert_eq!(timeout_buckets_capacity, 44);
+        assert_eq!(block_sync_initial_backoff_views, 5);
+        assert_eq!(block_sync_max_backoff_views, 6);
+        assert_eq!(block_sync_per_peer_attempts, 7);
+        assert_eq!(block_sync_max_attempts, 8);
     }
 
     #[test]

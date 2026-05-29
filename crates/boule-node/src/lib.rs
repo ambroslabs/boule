@@ -412,7 +412,7 @@ async fn start_consensus(
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
         Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
-    let mempool = Arc::new(InMemoryMempool::new(cons_cfg.limits.mempool_capacity));
+    let mempool = Arc::new(InMemoryMempool::new(cons_cfg.mempool_capacity));
 
     // Wire the broadcaster + discovery + upstream event channel
     // according to the configured overlay mode.
@@ -873,6 +873,7 @@ mod tests {
             validators: vec![],
             genesis_seed_hex: None,
             propose_limit: 64,
+            mempool_capacity: 1024,
             timeout_base_ms: 200,
             timeout_max_ms: 10_000,
             storage_dir: None,

@@ -196,6 +196,18 @@ pub struct ConsensusConfig {
     /// Maximum commands the leader pulls from the mempool per proposal.
     #[serde(default = "default_propose_limit")]
     pub propose_limit: usize,
+    /// Maximum entries the bundled in-memory mempool will accept.
+    /// Inserts past the cap surface as `Err` to the caller (see
+    /// `boule_consensus::replication::impls::mem_mempool::InMemoryMempool`),
+    /// rather than silently dropping. The application layer that will
+    /// eventually replace this implementation is free to ignore the
+    /// field; consensus only consults it when constructing the default
+    /// `InMemoryMempool` at startup. Lives here beside [`Self::propose_limit`]
+    /// (the other mempool-facing knob) rather than under
+    /// `[consensus.limits]`, which holds only the safety-core cache caps
+    /// that project into `boule_consensus::limits::CacheLimits`.
+    #[serde(default = "default_mempool_capacity")]
+    pub mempool_capacity: usize,
     /// View-timer base duration in milliseconds.
     #[serde(default = "default_timeout_base_ms")]
     pub timeout_base_ms: u64,
@@ -456,9 +468,13 @@ impl ConsensusConfig {
     }
 }
 
-/// Per-cache capacity caps and an in-memory mempool cap. Parsed from
-/// the `[consensus.limits]` TOML sub-table; defaults apply when the
-/// table — or any individual field — is omitted.
+/// Per-cache capacity caps for the safety core and integration layer.
+/// Parsed from the `[consensus.limits]` TOML sub-table; defaults apply
+/// when the table — or any individual field — is omitted. Every field
+/// here projects 1:1 into `boule_consensus::limits::CacheLimits`; the
+/// mempool cap is *not* here — it lives on [`ConsensusConfig`] beside
+/// `propose_limit`, since it is consumed by node wiring, not the
+/// safety core.
 ///
 /// Eviction policy and rationale are documented on
 /// `boule_consensus::limits::CacheLimits`; this struct is the
@@ -501,15 +517,6 @@ pub struct ConsensusLimits {
     /// `boule_consensus::limits::CacheLimits::block_sync_max_attempts`.
     #[serde(default = "default_block_sync_max_attempts")]
     pub block_sync_max_attempts: u32,
-    /// Maximum entries the bundled in-memory mempool will accept.
-    /// Inserts past the cap surface as `Err` to the caller (see
-    /// `boule_consensus::replication::impls::mem_mempool::InMemoryMempool`),
-    /// rather than silently dropping. The application layer that
-    /// will eventually replace this implementation is free to ignore
-    /// the field; consensus only consults it when constructing the
-    /// default `InMemoryMempool` at startup.
-    #[serde(default = "default_mempool_capacity")]
-    pub mempool_capacity: usize,
 }
 
 impl Default for ConsensusLimits {
@@ -523,7 +530,6 @@ impl Default for ConsensusLimits {
             block_sync_max_backoff_views: default_block_sync_max_backoff_views(),
             block_sync_per_peer_attempts: default_block_sync_per_peer_attempts(),
             block_sync_max_attempts: default_block_sync_max_attempts(),
-            mempool_capacity: default_mempool_capacity(),
         }
     }
 }
@@ -1634,7 +1640,7 @@ validators = ["a"]
             cons.limits.block_sync_max_attempts,
             crate::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
         );
-        assert_eq!(cons.limits.mempool_capacity, 1024);
+        assert_eq!(cons.mempool_capacity, 1024);
         // Default scheme: collected Ed25519. BLS lands at #289.
         assert_eq!(
             cons.signature_scheme,
@@ -1698,6 +1704,7 @@ listen_addr = "127.0.0.1:8080"
 
 [consensus]
 validators = ["a"]
+mempool_capacity = 2048
 
 [consensus.limits]
 vote_bucket_capacity = 32
@@ -1708,7 +1715,6 @@ block_sync_initial_backoff_views = 4
 block_sync_max_backoff_views = 32
 block_sync_per_peer_attempts = 5
 block_sync_max_attempts = 25
-mempool_capacity = 2048
 "#,
         );
         let cons = c.consensus.expect("consensus section");
@@ -1720,7 +1726,7 @@ mempool_capacity = 2048
         assert_eq!(cons.limits.block_sync_max_backoff_views, 32);
         assert_eq!(cons.limits.block_sync_per_peer_attempts, 5);
         assert_eq!(cons.limits.block_sync_max_attempts, 25);
-        assert_eq!(cons.limits.mempool_capacity, 2048);
+        assert_eq!(cons.mempool_capacity, 2048);
     }
 
     #[test]
@@ -1818,7 +1824,7 @@ snapshot_chunk_size_bytes = 0
 
     #[test]
     fn consensus_limits_partial_override_keeps_other_defaults() {
-        // Operators commonly override one knob (a tighter mempool
+        // Operators commonly override one knob (a tighter vote bucket
         // for a memory-constrained host, say) and expect the rest to
         // fall back to safe defaults.
         let c = parse(
@@ -1833,14 +1839,14 @@ listen_addr = "127.0.0.1:8080"
 validators = ["a"]
 
 [consensus.limits]
-mempool_capacity = 64
+vote_bucket_capacity = 64
 "#,
         );
         let cons = c.consensus.expect("consensus section");
-        assert_eq!(cons.limits.mempool_capacity, 64);
+        assert_eq!(cons.limits.vote_bucket_capacity, 64);
         assert_eq!(
-            cons.limits.vote_bucket_capacity,
-            crate::config::DEFAULT_VOTE_BUCKET_CAPACITY,
+            cons.limits.parked_proposals_capacity,
+            crate::config::DEFAULT_PARKED_PROPOSALS_CAPACITY,
         );
         assert_eq!(
             cons.limits.timeout_buckets_capacity,
