@@ -1,11 +1,16 @@
 [package]
 name = "boule-node"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 description = "Top-level node runtime for boule: wires consensus + replication over the TCP transport, plus the consensus driver, testnet driver, and simulator."
-repository = "https://github.com/ambroslabs/boule"
-homepage = "https://github.com/ambroslabs/boule"
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/boule-node"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 boule-core          = { path = "../boule-core", version = "0.1.0" }

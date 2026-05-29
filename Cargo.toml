@@ -11,3 +11,14 @@ members = [
 # `fuzz` is intentionally excluded: it hosts nightly-only `cargo-fuzz`
 # targets and must not be pulled into the stable workspace build.
 exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ambroslabs/boule"
+homepage = "https://github.com/ambroslabs/boule"
+readme = "README.md"
+keywords = ["consensus", "bft", "hotstuff", "p2p", "distributed-systems"]
+categories = ["network-programming", "cryptography"]
