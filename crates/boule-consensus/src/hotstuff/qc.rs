@@ -44,20 +44,20 @@
 //! that inbound [`Signed`] values have already been verified.
 //!
 //! [`ValidatorSet`]: crate::validator_set::ValidatorSet
-//! [`SignedMessage`]: boule::crypto::signed::SignedMessage
-//! [`Signed`]: boule::crypto::signed::Signed
+//! [`SignedMessage`]: boule_core::crypto::signed::SignedMessage
+//! [`Signed`]: boule_core::crypto::signed::Signed
 
 use serde::{Deserialize, Serialize};
 
 use crate::View;
 use crate::replication::block::{Block, BlockHash};
 use crate::validator_set::ValidatorSet;
-use boule::crypto::sig_scheme::{
+use boule_core::crypto::sig_scheme::{
     AggregateVerifyError, BlsAggregate, BlsAggregated, BlsPublicKey, Ed25519Collected,
     SignatureScheme,
 };
-use boule::crypto::signed::SignedMessage;
-use boule::identity::NodeId;
+use boule_core::crypto::signed::SignedMessage;
+use boule_core::identity::NodeId;
 
 /// HotStuff quorum threshold over a flat (count-based) committee:
 /// `2n/3 + 1`.
@@ -143,7 +143,7 @@ pub fn honesty_weight_threshold(vs: &ValidatorSet) -> u128 {
 ///
 /// Defined in the crypto layer (it is the signature-aggregation bitmap)
 /// and surfaced here as part of the QC API.
-pub use boule::crypto::sig_scheme::SignerBitmap;
+pub use boule_core::crypto::sig_scheme::SignerBitmap;
 
 /// A proof that a quorum of validators signed off on
 /// `(view, block_hash)`.
@@ -188,7 +188,7 @@ pub enum QcSignatures {
 
 impl QcSignatures {
     /// Variant name for diagnostics. Matches
-    /// [`boule::crypto::sig_scheme::SignatureScheme::NAME`] so logs
+    /// [`boule_core::crypto::sig_scheme::SignatureScheme::NAME`] so logs
     /// stay consistent.
     pub fn scheme_name(&self) -> &'static str {
         match self {
@@ -338,13 +338,13 @@ impl QuorumCertificate {
     /// **Panics** if this QC was constructed for a non-BLS scheme.
     /// The caller MUST have validated `partial` against the signer's
     /// pubkey via
-    /// [`BlsAggregated::verify_partial`](boule::crypto::sig_scheme::BlsAggregated::verify_partial)
+    /// [`BlsAggregated::verify_partial`](boule_core::crypto::sig_scheme::BlsAggregated::verify_partial)
     /// before calling this — folding a malformed partial into the
     /// aggregate corrupts it for everyone.
     pub fn add_bls_partial(
         &mut self,
         validator_idx: usize,
-        partial: boule::crypto::sig_scheme::BlsPartialSig,
+        partial: boule_core::crypto::sig_scheme::BlsPartialSig,
     ) {
         let QcSignatures::BlsAggregated(agg) = &mut self.signatures else {
             panic!(
@@ -652,7 +652,7 @@ impl SignedMessage for TimeoutVote {
 ///
 /// [`Action::Broadcast`]: super::step::Action::Broadcast
 /// [`Action::SendTo`]: super::step::Action::SendTo
-/// [`Signed`]: boule::crypto::signed::Signed
+/// [`Signed`]: boule_core::crypto::signed::Signed
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusMsg {
     Proposal(Proposal),
@@ -725,9 +725,9 @@ pub fn genesis_qc_bls(genesis: &Block, validator_set_len: usize) -> QuorumCertif
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boule::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
-    use boule::identity::NodeId;
-    use boule::identity::NodeIdentity;
+    use boule_core::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
+    use boule_core::identity::NodeId;
+    use boule_core::identity::NodeIdentity;
     use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
     use zeroize::Zeroizing;
 
@@ -953,7 +953,7 @@ mod tests {
 
     // ── BLS-flavored QCs (#293) ──────────────────────────────────
 
-    use boule::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
+    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
 
     fn bls_keypair(seed: u8) -> (BlsSecretKey, BlsPublicKey) {
         let mut ikm = [0u8; 32];

@@ -20,9 +20,9 @@ use super::qc::VerifiedQc;
 
 /// Tracing target for eviction logs. Same string as
 /// [`TRACE_TARGET`] so a single
-/// `RUST_LOG=boule::consensus=info` filter catches every cache
+/// `RUST_LOG=boule_core::consensus=info` filter catches every cache
 /// drop the consensus layer emits.
-const TRACE_TARGET: &str = "boule::consensus";
+const TRACE_TARGET: &str = "boule_core::consensus";
 
 /// How many parent links above `high_qc.block_hash` to protect from
 /// cap-based eviction. The two-chain lock-promotion walk reaches one
@@ -272,7 +272,7 @@ impl HotStuffState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boule::identity::NodeId;
+    use boule_core::identity::NodeId;
 
     fn nid(b: u8) -> NodeId {
         [b; 32]

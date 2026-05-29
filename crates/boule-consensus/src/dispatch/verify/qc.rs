@@ -14,9 +14,9 @@ use crate::View;
 use crate::hotstuff::qc::QuorumCertificate;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
-use boule::crypto::sig_scheme::SignatureSchemeChoice;
-use boule::crypto::signed::ChainId;
-use boule::identity::NodeId;
+use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
+use boule_core::crypto::signed::ChainId;
+use boule_core::identity::NodeId;
 
 use super::super::{IngressError, QcVerification};
 use super::domain::vote_preimage;

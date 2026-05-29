@@ -129,7 +129,7 @@ pub use tls::NodeId;
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use boule::clock::{Clock, TokioClock};
+/// use boule_core::clock::{Clock, TokioClock};
 /// use boule_transport_tcp::{ConnectionProtocol, NodeId};
 /// use boule_transport_tcp::manager::ManagerMsg;
 /// use boule_transport_tcp::tls::TlsIdentity;

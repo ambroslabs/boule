@@ -1,13 +1,13 @@
 //! Cross-layer invariant: the `WireMessage` postcard variant indices
 //! (defined in `boule-consensus`) must stay in lockstep with
-//! `MessageKind::from_wire_tag` (defined in `boule::transport::limits`). The
+//! `MessageKind::from_wire_tag` (defined in `boule_core::transport::limits`). The
 //! two live in different crates, so the check lives here in `boule-node`
-//! where both are visible. Moved out of `boule::transport::limits` when
+//! where both are visible. Moved out of `boule_core::transport::limits` when
 //! the crate split landed.
 
-use boule::crypto::signed::Signed;
-use boule::transport::limits::MessageKind;
 use boule_consensus::wire::{BlockResponsePayload, WireMessage};
+use boule_core::crypto::signed::Signed;
+use boule_core::transport::limits::MessageKind;
 
 #[test]
 fn wire_tag_layout_locked() {

@@ -12,9 +12,6 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[lib]
-name = "boule"
-
 [features]
 # Default builds exclude the OS keyring backend because its Linux
 # implementation needs a running D-Bus / Secret Service. Enable explicitly

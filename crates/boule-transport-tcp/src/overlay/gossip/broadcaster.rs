@@ -39,10 +39,10 @@
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use boule::clock::BoxFuture;
+use boule_core::clock::BoxFuture;
 
 use super::super::super::tls::NodeId;
-use boule::transport::overlay::Broadcaster;
+use boule_core::transport::overlay::Broadcaster;
 
 /// Typed command from a [`GossipBroadcaster`] to the gossip overlay's
 /// run loop.

@@ -37,7 +37,7 @@ pub struct NodeConfigForConsensus {
     /// produced) so tests that don't opt in see zero behavioural
     /// change; production wiring in `src/node.rs` substitutes the
     /// operator-configured policy from
-    /// [`boule::config::ConsensusConfig`].
+    /// [`boule_core::config::ConsensusConfig`].
     pub snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy,
 
     /// Operator-supplied floor on the gap between a reconfig's commit
@@ -53,7 +53,7 @@ pub struct NodeConfigForConsensus {
     /// `Ed25519Collected` is implemented; the BLS variant lands in #289
     /// and the "node built for the wrong scheme" mismatch check lands
     /// in #292.
-    pub signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice,
+    pub signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
 
     /// Number of committed blocks to retain in the durable block store
     /// (`consensus/block/<hash>`) below `last_committed`. Older
@@ -83,7 +83,7 @@ impl NodeConfigForConsensus {
             // policy. The default keeps the snapshot store untouched.
             snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-            signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::default(),
+            signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
             // Tests build short chains — keep everything by default so
             // an integration test that walks the committed chain by
             // hand never trips over a pruned block. Tests that exercise

@@ -39,7 +39,7 @@
 
 use std::sync::LazyLock;
 
-use boule::crypto::signed::ChainId;
+use boule_core::crypto::signed::ChainId;
 use boule_consensus::dispatch::ingress_wire;
 use boule_consensus::validator_history::ValidatorSetHistory;
 use boule_consensus::validator_key_history::ValidatorKeyHistory;

@@ -43,9 +43,9 @@
 //!    is overlay control traffic.
 //! 2. `ProtocolEvent::PeerConnected` / `PeerDisconnected` are recorded
 //!    in the direct-peer set and republished as
-//!    [`boule::transport::overlay::DiscoveryEvent`]s, but **not** surfaced
+//!    [`boule_core::transport::overlay::DiscoveryEvent`]s, but **not** surfaced
 //!    upstream. The consensus layer reads peer membership through
-//!    [`boule::transport::overlay::Discovery::subscribe`]; routing the same
+//!    [`boule_core::transport::overlay::Discovery::subscribe`]; routing the same
 //!    deltas through the upstream `event_rx` would be a duplicate.
 //!    (Today the consensus event loop in
 //!    `boule_node::consensus_node` explicitly ignores
@@ -60,7 +60,7 @@
 //!
 //! # `SendTo` semantics
 //!
-//! [`boule::transport::overlay::Broadcaster::send_to`] is implemented as a
+//! [`boule_core::transport::overlay::Broadcaster::send_to`] is implemented as a
 //! broadcast — a unicast `Forward` frame goes out to every direct
 //! neighbour and every receiver surfaces it to consensus dispatch.
 //! The consensus dispatch is idempotent under duplicate `BlockRequest`
@@ -92,7 +92,7 @@ use tracing::{debug, info};
 use crate::ProtocolEvent;
 use crate::dialer::DialerCtx;
 use crate::tls::NodeId;
-use boule::clock::Clock;
+use boule_core::clock::Clock;
 
 use super::broadcaster::{GossipBroadcaster, OverlayCmd};
 use super::dedup::{InsertOutcome, MsgIdRing};
@@ -104,7 +104,7 @@ use super::peer_list_task::{
 };
 use super::peer_table::PeerTable;
 use super::wire::{MsgId, OverlayFrame};
-use boule::transport::overlay::DiscoveryEvent;
+use boule_core::transport::overlay::DiscoveryEvent;
 
 /// Knobs for [`GossipOverlay::spawn`].
 ///
@@ -157,7 +157,7 @@ impl Default for GossipOverlayConfig {
 
 impl GossipOverlayConfig {
     /// Build a [`GossipOverlayConfig`] from the operator-facing
-    /// [`boule::config::OverlayConfig`]. The two structs have separate
+    /// [`boule_core::config::OverlayConfig`]. The two structs have separate
     /// vocabularies — config-side knobs are flat `_ms` durations for
     /// TOML readability; the runtime-side struct uses real
     /// `Duration`s and bundles per-task knobs into their owners
@@ -166,7 +166,7 @@ impl GossipOverlayConfig {
     /// `rng_seed` is taken as a parameter so the binary can derive it
     /// from a per-node source (e.g. the node id) rather than baking
     /// it into `[overlay]`. Sim tests pass an explicit seed.
-    pub fn from_config(cfg: &boule::config::OverlayConfig, rng_seed: u64) -> Self {
+    pub fn from_config(cfg: &boule_core::config::OverlayConfig, rng_seed: u64) -> Self {
         Self {
             peer_list: PeerListGossipConfig {
                 interval: Duration::from_millis(cfg.peer_gossip_interval_ms),
@@ -673,7 +673,7 @@ mod tests {
     use parking_lot::Mutex;
 
     use crate::overlay::{Broadcaster, Discovery};
-    use boule::clock::TokioClock;
+    use boule_core::clock::TokioClock;
 
     use super::super::wire::PeerEntry;
     use super::*;

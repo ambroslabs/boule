@@ -11,8 +11,8 @@ use crate::View;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
 use crate::validator_set::{Pubkey, ValidatorId};
-use boule::crypto::signed::{ChainId, Signed, SignedMessage};
-use boule::identity::NodeId;
+use boule_core::crypto::signed::{ChainId, Signed, SignedMessage};
+use boule_core::identity::NodeId;
 
 use super::super::IngressError;
 

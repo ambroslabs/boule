@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use boule::cli::{self, OutputFormat};
-use boule::config;
+use boule_core::cli::{self, OutputFormat};
+use boule_core::config;
 
 use super::shared::{parse_output_format, resolve_config_path};
 

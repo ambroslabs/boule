@@ -1465,7 +1465,7 @@ fn test_config_edit_errors_when_file_missing() {
 // default for subcommands with structured output, and the per-invocation
 // `--format` flag overrides it. Today only `config` honours it; future
 // subcommands (`status`, `peers list`, ...) will inherit the convention via
-// the `boule::cli` helpers.
+// the `boule_core::cli` helpers.
 
 const CONFIG_WITH_UI_JSON: &str = r#"
 [node]

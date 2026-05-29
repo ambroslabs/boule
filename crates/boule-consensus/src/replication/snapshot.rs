@@ -48,8 +48,8 @@ use crate::hotstuff::QuorumCertificate;
 use crate::replication::block::{Block, BlockHash};
 use crate::validator_set::ValidatorSet;
 use crate::{Height, View};
-use boule::identity::NodeId;
-use boule::storage::{Storage, StorageExt};
+use boule_core::identity::NodeId;
+use boule_core::storage::{Storage, StorageExt};
 
 /// Storage-key prefix under which [`SnapshotManifest`] values are
 /// persisted, keyed by height (big-endian `u64`).
@@ -561,7 +561,7 @@ impl std::error::Error for ChunkError {}
 ///
 /// Panics if `chunk_size == 0` — callers must validate the policy
 /// before reaching this helper (see
-/// [`boule::config::ConsensusConfig::validate_snapshot_policy`]).
+/// [`boule_core::config::ConsensusConfig::validate_snapshot_policy`]).
 pub fn chunk_snapshot(payload: &[u8], chunk_size: u32) -> Vec<(Bytes, [u8; 32])> {
     assert!(chunk_size > 0, "chunk_size must be > 0");
     if payload.is_empty() {
@@ -911,7 +911,7 @@ pub fn import_from_directory(
 /// `storage_dir`. Errors if consensus or the storage dir is unset, since
 /// in-memory storage has nothing to export from / import into. Backs the
 /// `snapshot export` / `snapshot import` CLI subcommands.
-pub fn open_snapshot_store(config: &boule::config::Config) -> anyhow::Result<SnapshotStore> {
+pub fn open_snapshot_store(config: &boule_core::config::Config) -> anyhow::Result<SnapshotStore> {
     let cons_cfg = config
         .consensus
         .as_ref()
@@ -925,7 +925,7 @@ pub fn open_snapshot_store(config: &boule::config::Config) -> anyhow::Result<Sna
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow::anyhow!("creating consensus storage_dir {}: {e}", dir.display()))?;
     let storage: Arc<dyn Storage> =
-        Arc::new(boule::storage::DiskStorage::open(dir.join("kv.redb"))?);
+        Arc::new(boule_core::storage::DiskStorage::open(dir.join("kv.redb"))?);
     Ok(SnapshotStore::new(storage))
 }
 
@@ -1024,7 +1024,7 @@ mod tests {
     use super::*;
     use crate::hotstuff::qc::quorum_size;
     use crate::replication::block::{Block, BlockHeader};
-    use boule::storage::MemoryStorage;
+    use boule_core::storage::MemoryStorage;
 
     fn vs(n: u8) -> ValidatorSet {
         ValidatorSet::new(
@@ -1259,7 +1259,7 @@ mod tests {
         // than `MemoryStorage`; this test pins that the snapshot
         // store layout works against the real (redb) backend the
         // production binary uses. Single chunk for speed.
-        use boule::storage::DiskStorage;
+        use boule_core::storage::DiskStorage;
         let tmp = tempfile::tempdir().unwrap();
         let storage: Arc<dyn Storage> =
             Arc::new(DiskStorage::open(tmp.path().join("kv.redb")).unwrap());

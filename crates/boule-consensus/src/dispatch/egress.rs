@@ -24,8 +24,8 @@ use crate::replication::snapshot::SnapshotManifest;
 use crate::validator_key_history::ValidatorKeyHistory;
 use crate::validator_set::{Pubkey, ValidatorId};
 use crate::wire::WireMessage;
-use boule::crypto::signed::{ChainId, Signed, Signer, preimage};
-use boule::identity::NodeId;
+use boule_core::crypto::signed::{ChainId, Signed, Signer, preimage};
+use boule_core::identity::NodeId;
 
 use super::codec;
 use super::{Dispatch, Outbound, Verified};
@@ -43,7 +43,9 @@ pub fn egress_safety(
     action: &SafetyAction,
     signer: &dyn Signer,
     bls_signer: Option<
-        &dyn boule::crypto::signed::PartialSigner<boule::crypto::sig_scheme::BlsAggregated>,
+        &dyn boule_core::crypto::signed::PartialSigner<
+            boule_core::crypto::sig_scheme::BlsAggregated,
+        >,
     >,
     chain_id: &ChainId,
 ) -> anyhow::Result<Option<Outbound>> {
@@ -221,7 +223,9 @@ pub(in crate::dispatch) fn sign_consensus_msg(
     msg: &ConsensusMsg,
     signer: &dyn Signer,
     bls_signer: Option<
-        &dyn boule::crypto::signed::PartialSigner<boule::crypto::sig_scheme::BlsAggregated>,
+        &dyn boule_core::crypto::signed::PartialSigner<
+            boule_core::crypto::sig_scheme::BlsAggregated,
+        >,
     >,
     chain_id: &ChainId,
 ) -> anyhow::Result<WireMessage> {
@@ -272,7 +276,9 @@ pub fn egress_consensus_msg_with_loopback(
     msg: &ConsensusMsg,
     signer: &dyn Signer,
     bls_signer: Option<
-        &dyn boule::crypto::signed::PartialSigner<boule::crypto::sig_scheme::BlsAggregated>,
+        &dyn boule_core::crypto::signed::PartialSigner<
+            boule_core::crypto::sig_scheme::BlsAggregated,
+        >,
     >,
     key_history: &ValidatorKeyHistory,
     chain_id: &ChainId,

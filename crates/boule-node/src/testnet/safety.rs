@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn parses_height_and_view_from_committed_block_line() {
-        let line = "2026-04-26T10:00:00Z INFO boule::consensus::node: consensus: committed block height=12 view=14";
+        let line = "2026-04-26T10:00:00Z INFO boule_core::consensus::node: consensus: committed block height=12 view=14";
         let r = parse_commit_line(line).unwrap();
         assert_eq!(r.height, 12);
         assert_eq!(r.view, 14);

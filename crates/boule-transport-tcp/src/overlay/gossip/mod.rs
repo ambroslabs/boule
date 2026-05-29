@@ -54,7 +54,7 @@ pub const PROTOCOL_ID: u8 = 0x04;
 /// Per-protocol frame-size cap. Sized to hold the largest forwarded
 /// consensus frame (proposals carry batched mempool transactions) plus
 /// a small wrapper margin for the [`wire::OverlayFrame`] envelope.
-/// Matches consensus's [`boule::config::MAX_FRAME_BYTES`] of
+/// Matches consensus's [`boule_core::config::MAX_FRAME_BYTES`] of
 /// 4 MiB today; grows in lockstep if a future consensus message gets
 /// bigger.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024 + 64 * 1024;

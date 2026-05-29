@@ -63,7 +63,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use boule::clock::{Clock, TokioClock};
+use boule_core::clock::{Clock, TokioClock};
 use boule_transport_tcp::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
 use boule_transport_tcp::overlay::gossip::overlay::{
     GossipOverlay, GossipOverlayConfig, GossipOverlayHandles, SpawnArgs,

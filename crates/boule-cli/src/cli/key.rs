@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-use boule::config;
+use boule_core::config;
 
 use super::shared::resolve_config_path;
 

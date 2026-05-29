@@ -18,9 +18,9 @@
 //! - **Block hashes** are hex-encoded (32 bytes → 64 hex chars). Block
 //!   hashes are content digests, not identities, so hex (a stable
 //!   byte-for-byte representation) is the right choice. Base58 is
-//!   reserved for [`NodeId`](boule::identity::NodeId).
+//!   reserved for [`NodeId`](boule_core::identity::NodeId).
 //! - **NodeIds** are base58, matching
-//!   [`boule::identity::node_id_to_base58`] — the convention used
+//!   [`boule_core::identity::node_id_to_base58`] — the convention used
 //!   everywhere else the node surfaces a NodeId (logs, `/peers`).
 //!
 //! # Publication model
@@ -187,7 +187,7 @@ pub struct BackpressureStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RotationEntry {
     pub v_eff: View,
-    /// base58-encoded [`NodeId`](boule::identity::NodeId).
+    /// base58-encoded [`NodeId`](boule_core::identity::NodeId).
     pub pubkey: String,
 }
 
@@ -222,7 +222,7 @@ pub struct ValidatorKeyStatus {
 /// public contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusStatus {
-    /// This node's base58-encoded [`NodeId`](boule::identity::NodeId).
+    /// This node's base58-encoded [`NodeId`](boule_core::identity::NodeId).
     pub node_id: String,
     /// `"leader(view=N)"` when this node is the round-robin leader for
     /// the current view; otherwise `"replica"`.
@@ -242,7 +242,7 @@ pub struct ConsensusStatus {
     pub parked_proposals: Vec<ParkedProposalStatus>,
     pub pending_blocks_count: usize,
     /// Consensus-layer view of connected peers (not the raw p2p
-    /// manager's peer map). Base58-encoded [`NodeId`](boule::identity::NodeId)s.
+    /// manager's peer map). Base58-encoded [`NodeId`](boule_core::identity::NodeId)s.
     pub peers_connected: Vec<String>,
     /// Every validator in the committee, base58-encoded and sorted in
     /// the order used for round-robin leader rotation.

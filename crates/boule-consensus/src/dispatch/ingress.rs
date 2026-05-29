@@ -17,8 +17,8 @@ use crate::replication::snapshot::SnapshotManifest;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
 use crate::wire::WireMessage;
-use boule::crypto::signed::{ChainId, Signed};
-use boule::identity::NodeId;
+use boule_core::crypto::signed::{ChainId, Signed};
+use boule_core::identity::NodeId;
 
 use super::codec;
 use super::verify::bls_partial::verify_bls_partial_if_required;
@@ -232,7 +232,7 @@ pub fn ingress_proposal(
 /// and emit the safety-core `VoteReceived` event.
 pub fn ingress_vote(
     signed: Signed<Vote>,
-    bls_partial: Option<boule::crypto::sig_scheme::BlsPartialSig>,
+    bls_partial: Option<boule_core::crypto::sig_scheme::BlsPartialSig>,
     history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
     qc_verification: &QcVerification<'_>,

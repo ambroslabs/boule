@@ -51,7 +51,7 @@ use tokio::sync::broadcast;
 use super::super::super::tls::NodeId;
 use super::maintenance::Dialer;
 use super::peer_list_task::{DirectPeers, LockedVec};
-use boule::transport::overlay::{Discovery, DiscoveryEvent};
+use boule_core::transport::overlay::{Discovery, DiscoveryEvent};
 
 /// Broadcast channel depth for re-published `DiscoveryEvent`s.
 ///

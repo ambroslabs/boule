@@ -135,7 +135,7 @@ mod tests {
     use crate::replication::block::{Block, BlockHeader};
     use crate::validator_set::ValidatorSet;
     use crate::{Height, View};
-    use boule::identity::NodeId;
+    use boule_core::identity::NodeId;
 
     fn nid(b: u8) -> NodeId {
         [b; 32]

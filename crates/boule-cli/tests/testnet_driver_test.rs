@@ -1,4 +1,4 @@
-//! End-to-end exercise of the testnet driver lib (`boule::testnet`):
+//! End-to-end exercise of the testnet driver lib (`boule_core::testnet`):
 //! 4-node cluster, drive it through `new` → `up` → wait → kill → wait →
 //! verify-safety → `down`. Uses the `boule` binary built by cargo
 //! (`CARGO_BIN_EXE_boule`) so we exercise the same spawn path the
@@ -41,7 +41,7 @@ async fn driver_lifecycle_4_nodes() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster");
@@ -139,7 +139,7 @@ async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster");
@@ -227,7 +227,7 @@ async fn new_cluster_canonicalizes_relative_workdir() {
         binary: bin,
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
     })
     .await
     .expect("new_cluster with relative workdir");

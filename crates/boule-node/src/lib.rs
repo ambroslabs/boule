@@ -28,15 +28,15 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
-use boule::clock::{Clock, TokioClock};
-use boule::config::{BlsIdentityConfig, Config, ConsensusConfig, OverlayConfig, OverlayMode};
-use boule::crypto::signed::{NodeSigner, Signer};
-use boule::identity::NodeIdentity;
-use boule::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
 use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_set::ValidatorSet;
+use boule_core::clock::{Clock, TokioClock};
+use boule_core::config::{BlsIdentityConfig, Config, ConsensusConfig, OverlayConfig, OverlayMode};
+use boule_core::crypto::signed::{NodeSigner, Signer};
+use boule_core::identity::NodeIdentity;
+use boule_core::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
 use boule_transport_tcp::dialer::DialerCtx;
 use boule_transport_tcp::manager::ManagerMsg;
 use boule_transport_tcp::overlay::gossip::overlay::{
@@ -197,8 +197,8 @@ pub async fn run(
         // ConsensusNode below so ingress is gated before
         // `dispatch::ingress` ever runs.
         let rate_limiter = config.p2p.limits.as_ref().map(|l| {
-            Arc::new(boule::transport::limits::RateLimiter::new(
-                boule::transport::limits::RateLimitsConfig::from_config(l),
+            Arc::new(boule_core::transport::limits::RateLimiter::new(
+                boule_core::transport::limits::RateLimitsConfig::from_config(l),
                 Arc::clone(&clock),
             ))
         });
@@ -331,7 +331,7 @@ async fn start_consensus(
     clock: Arc<dyn Clock>,
     self_listen_addr: std::net::SocketAddr,
     inbound_disabled: bool,
-    rate_limiter: Option<Arc<boule::transport::limits::RateLimiter>>,
+    rate_limiter: Option<Arc<boule_core::transport::limits::RateLimiter>>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     info!(
@@ -359,7 +359,7 @@ async fn start_consensus(
     // `reconcile_bls_identity`. PoPs are split off and verified
     // *after* the chain_id is known (#410), since the PoP pre-image
     // binds to chain_id.
-    let genesis_bls: Vec<(NodeId, boule::crypto::sig_scheme::BlsPublicKey)> = genesis_bls_full
+    let genesis_bls: Vec<(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)> = genesis_bls_full
         .iter()
         .map(|(nid, pk, _pop)| (*nid, *pk))
         .collect();
@@ -372,7 +372,7 @@ async fn start_consensus(
     // (#410, audit finding 7-2). Without this check, an attacker who
     // operates the same validator BLS key on two deployments could
     // cross-replay a genesis-time PoP across them.
-    let chain_id = boule::crypto::signed::ChainId::from_genesis_hash(genesis.hash());
+    let chain_id = boule_core::crypto::signed::ChainId::from_genesis_hash(genesis.hash());
     cons_cfg
         .verify_genesis_bls_pops(&genesis_bls_full, &chain_id)
         .context("verifying genesis BLS proof-of-possession against chain_id")?;
@@ -457,10 +457,10 @@ async fn start_consensus(
     if let Some(BlsBootstrap { history, identity }) = bls_setup {
         node = node.with_bls_key_history(history);
         let bls_signer: Arc<
-            dyn boule::crypto::signed::PartialSigner<boule::crypto::sig_scheme::BlsAggregated>,
-        > = Arc::new(boule::crypto::bls_key::BlsPartialSignerImpl::from_identity(
-            identity,
-        ));
+            dyn boule_core::crypto::signed::PartialSigner<
+                    boule_core::crypto::sig_scheme::BlsAggregated,
+                >,
+        > = Arc::new(boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity));
         node = node.with_bls_signer(bls_signer);
     }
 
@@ -487,7 +487,7 @@ async fn start_consensus(
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let signer = Arc::clone(signer) as Arc<dyn boule::crypto::signed::Signer>;
+    let signer = Arc::clone(signer) as Arc<dyn boule_core::crypto::signed::Signer>;
     let join = tokio::spawn(async move {
         node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
             .await
@@ -504,7 +504,7 @@ async fn start_consensus(
 
 /// Merge `[p2p.limits]` (issue #134, abuse-protection caps) and
 /// `[overlay]` (#187, overlay-degree-aware caps) into a single
-/// [`boule::transport::limits::ConnectionLimitsConfig`] for the manager's
+/// [`boule_core::transport::limits::ConnectionLimitsConfig`] for the manager's
 /// admission gate. Returns `None` only when neither source
 /// contributes a binding limit, in which case the manager runs
 /// without a connection limiter (the simulator and gossip-only test
@@ -523,14 +523,14 @@ async fn start_consensus(
 ///   explicitly opted into N–1 connectivity.
 fn build_connection_limiter(
     config: &Config,
-) -> Option<Arc<boule::transport::limits::ConnectionLimiter>> {
-    use boule::transport::limits::ConnectionLimitsConfig;
+) -> Option<Arc<boule_core::transport::limits::ConnectionLimiter>> {
+    use boule_core::transport::limits::ConnectionLimitsConfig;
 
     let limits = config
         .p2p
         .limits
         .as_ref()
-        .map(boule::transport::limits::ConnectionLimitsConfig::from_config);
+        .map(boule_core::transport::limits::ConnectionLimitsConfig::from_config);
     let overlay_caps_active = config.overlay.mode == OverlayMode::Gossip;
 
     let merged = match (limits, overlay_caps_active) {
@@ -549,9 +549,9 @@ fn build_connection_limiter(
             max_total: l.max_total.min(config.overlay.total_max),
         },
     };
-    Some(Arc::new(boule::transport::limits::ConnectionLimiter::new(
-        merged,
-    )))
+    Some(Arc::new(
+        boule_core::transport::limits::ConnectionLimiter::new(merged),
+    ))
 }
 
 /// Bundle returned by [`reconcile_bls_identity`] on `bls_aggregated`
@@ -562,7 +562,7 @@ fn build_connection_limiter(
 #[derive(Debug)]
 struct BlsBootstrap {
     history: boule_consensus::bls_key_history::BlsKeyHistory,
-    identity: boule::crypto::bls_key::BlsValidatorIdentity,
+    identity: boule_core::crypto::bls_key::BlsValidatorIdentity,
 }
 
 /// Reconcile the node's local BLS identity with the chain's signature
@@ -576,18 +576,18 @@ struct BlsBootstrap {
 /// carrying both the seeded
 /// [`boule_consensus::bls_key_history::BlsKeyHistory`] (for QC
 /// verification at ingress) and the loaded
-/// [`boule::crypto::bls_key::BlsValidatorIdentity`] (for partial
+/// [`boule_core::crypto::bls_key::BlsValidatorIdentity`] (for partial
 /// signing at egress). On an Ed25519 chain, returns `None`.
 fn reconcile_bls_identity(
     cons_cfg: &ConsensusConfig,
     bls_identity_config: Option<&BlsIdentityConfig>,
     self_id: &NodeId,
-    genesis_bls: &[(NodeId, boule::crypto::sig_scheme::BlsPublicKey)],
-    storage: &dyn boule::storage::Storage,
+    genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
+    storage: &dyn boule_core::storage::Storage,
 ) -> anyhow::Result<Option<BlsBootstrap>> {
     use crate::consensus_node::STORAGE_KEY_BLS_KEY_HISTORY;
-    use boule::crypto::sig_scheme::SignatureSchemeChoice;
     use boule_consensus::bls_key_history::PersistedBlsKeyHistory;
+    use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
 
     match cons_cfg.signature_scheme {
         SignatureSchemeChoice::Ed25519Collected => {
@@ -609,7 +609,7 @@ fn reconcile_bls_identity(
                      partials. Configure a BLS key path before booting against this chain.",
                 )
             })?;
-            let provider = boule::config::build_bls_provider(bls_cfg)
+            let provider = boule_core::config::build_bls_provider(bls_cfg)
                 .context("building BLS validator-key provider from config")?;
             let identity = provider
                 .load_or_init()
@@ -851,11 +851,11 @@ fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boule::config::ConsensusLimits;
-    use boule::config::DEFAULT_VOTE_BUCKET_CAPACITY;
-    use boule::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
-    use boule::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
-    use boule::storage::MemoryStorage;
+    use boule_core::config::ConsensusLimits;
+    use boule_core::config::DEFAULT_VOTE_BUCKET_CAPACITY;
+    use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
+    use boule_core::storage::MemoryStorage;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1008,8 +1008,8 @@ mod tests {
         // confirm reconcile_bls_identity reloads it instead of
         // re-seeding from genesis.
         use crate::consensus_node::STORAGE_KEY_BLS_KEY_HISTORY;
-        use boule::storage::Storage as _;
         use boule_consensus::bls_key_history::BlsKeyHistory;
+        use boule_core::storage::Storage as _;
 
         let dir = TempDir::new().unwrap();
         let self_id = nid(7);

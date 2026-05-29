@@ -191,7 +191,7 @@ fn resolve_boule_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 // ── `new` ───────────────────────────────────────────────────────────────────
 
 async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
-    use boule::crypto::sig_scheme::SignatureSchemeChoice;
+    use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
     let (workdir, rest) = parse_workdir(args)?;
     let (boule_bin, rest) = parse_boule_bin(&rest)?;
     let mut nodes: Option<usize> = None;

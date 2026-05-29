@@ -51,9 +51,9 @@ use crate::replication::block::{Block, BlockHash};
 use crate::replication::snapshot::SnapshotManifest;
 use crate::validator_set::ValidatorId;
 use crate::{Height, View};
-use boule::crypto::sig_scheme::SignatureSchemeChoice;
-use boule::crypto::signed::Signed;
-use boule::identity::NodeId;
+use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
+use boule_core::crypto::signed::Signed;
+use boule_core::identity::NodeId;
 
 pub mod codec;
 pub mod egress;
@@ -377,9 +377,9 @@ impl From<postcard::Error> for IngressError {
 /// makes this snippet compile as a regression of the typestate gate.
 ///
 /// ```compile_fail
-/// use boule::consensus::hotstuff::Proposal;
-/// use boule::consensus::hotstuff::step::Event;
-/// use boule::crypto::signed::Signed;
+/// use boule_core::consensus::hotstuff::Proposal;
+/// use boule_core::consensus::hotstuff::step::Event;
+/// use boule_core::crypto::signed::Signed;
 /// fn forbidden(signed: Signed<Proposal>) -> Event {
 ///     // expected `Verified<Signed<Proposal>>`, found `Signed<Proposal>`
 ///     Event::ProposalReceived(signed)

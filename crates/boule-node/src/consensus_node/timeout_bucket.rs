@@ -16,7 +16,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use bytes::Bytes;
 
-use boule::crypto::signed::{Signed, Signer};
 use boule_consensus::View;
 use boule_consensus::crashpoint::crashpoint;
 use boule_consensus::dispatch::{self, Outbound};
@@ -29,6 +28,7 @@ use boule_consensus::hotstuff::step::Event as SafetyEvent;
 use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::pacemaker::HonestyThresholdEvidence as PacemakerHonestyThresholdEvidence;
 use boule_consensus::view_timer::ViewTimer;
+use boule_core::crypto::signed::{Signed, Signer};
 use boule_transport_tcp::NodeId;
 use boule_transport_tcp::overlay::Broadcaster;
 use boule_transport_tcp::tls::node_id_to_base58;

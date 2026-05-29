@@ -1,6 +1,6 @@
 //! Chain-id pre-image binding (#324).
 //!
-//! Single helper that wraps [`boule::crypto::signed::preimage`] for
+//! Single helper that wraps [`boule_core::crypto::signed::preimage`] for
 //! the dispatch-layer call sites. Reconstructs the canonical
 //! signing pre-image for a [`Vote`] over `(view, block_hash)` so the
 //! QC aggregate verifier and the BLS partial verifier see the same
@@ -9,7 +9,7 @@
 use crate::View;
 use crate::hotstuff::qc::Vote;
 use crate::replication::block::BlockHash;
-use boule::crypto::signed::{ChainId, preimage};
+use boule_core::crypto::signed::{ChainId, preimage};
 
 /// Reconstruct the canonical Vote signing pre-image for `(view,
 /// block_hash)` under `chain_id`. Used by both the QC aggregate

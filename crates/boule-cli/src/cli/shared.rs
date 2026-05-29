@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use boule::cli::OutputFormat;
-use boule::paths;
+use boule_core::cli::OutputFormat;
+use boule_core::paths;
 
 /// Env var that enables fail-closed production semantics when set to
 /// "production" (equivalent to passing `--production`).

@@ -63,7 +63,7 @@ use rand_chacha::ChaCha20Rng;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
 
-use boule::clock::Clock;
+use boule_core::clock::Clock;
 
 use super::super::super::tls::NodeId;
 use super::peer_list_task::DirectPeers;
@@ -760,7 +760,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn run_mesh_maintenance_dials_at_least_once() {
-        use boule::clock::TokioClock;
+        use boule_core::clock::TokioClock;
 
         let table = PeerTable::new(nid(0), 32);
         for i in 1..=10u8 {

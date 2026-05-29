@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::Height;
 use crate::hotstuff::qc::TimeoutVote;
 use crate::replication::block::{Block, BlockHash};
-use boule::crypto::signed::{Signed, SignedMessage};
+use boule_core::crypto::signed::{Signed, SignedMessage};
 
 /// Protocol ID registered with the p2p multiplexer for consensus traffic.
 /// Gossip uses `0x01`, ping-RPC uses `0x02`.
@@ -22,7 +22,7 @@ pub const PROTOCOL_ID: u8 = 0x03;
 /// commands; production tuning can raise this without protocol changes.
 /// Defined in the shared config layer so config validation can bound
 /// `snapshot_chunk_size_bytes` against it.
-pub use boule::config::MAX_FRAME_BYTES;
+pub use boule_core::config::MAX_FRAME_BYTES;
 
 /// Signed payload of a [`WireMessage::BlockResponse`].
 ///
@@ -127,7 +127,7 @@ impl SignedMessage for BlockRangeResponsePayload {
 /// **Variant order is wire-stable.** Postcard encodes the discriminant
 /// as a varint at byte 0; reordering breaks every running peer.
 /// Adding new variants at the end is fine. The
-/// `boule::transport::limits::MessageKind` enum mirrors this order and is
+/// `boule_core::transport::limits::MessageKind` enum mirrors this order and is
 /// pinned by `wire_tag_layout_locked`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireMessage {
@@ -147,7 +147,7 @@ pub enum WireMessage {
     Vote(
         Signed<crate::hotstuff::qc::Vote>,
         #[serde(with = "serde_optional_bls_partial")]
-        Option<boule::crypto::sig_scheme::BlsPartialSig>,
+        Option<boule_core::crypto::sig_scheme::BlsPartialSig>,
     ),
     NewView(Signed<crate::hotstuff::NewView>),
     /// A replica's signed notice that it is giving up on a view. A
@@ -210,13 +210,13 @@ pub enum WireMessage {
 
 /// Serde adapter for `Option<BlsPartialSig>` — a 96-byte fixed array that
 /// serde does not auto-derive past N=32. Mirrors the byte-sequence
-/// shape used by [`boule::crypto::sig_scheme::BlsPop`] so the two BLS
+/// shape used by [`boule_core::crypto::sig_scheme::BlsPop`] so the two BLS
 /// wire fields encode the same way (length-prefixed byte sequence
 /// inside an `Option`).
 mod serde_optional_bls_partial {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
-    use boule::crypto::sig_scheme::BlsPartialSig;
+    use boule_core::crypto::sig_scheme::BlsPartialSig;
 
     pub fn serialize<S: Serializer>(opt: &Option<BlsPartialSig>, s: S) -> Result<S::Ok, S::Error> {
         match opt {

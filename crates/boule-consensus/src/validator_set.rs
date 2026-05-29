@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use boule::identity::NodeId;
+use boule_core::identity::NodeId;
 
 /// Stable, unchanging identifier for a validator. Equal to its genesis
 /// pubkey. The slashing-correct identity (#328 / audit finding 5-F1).
@@ -70,8 +70,8 @@ use boule::identity::NodeId;
 /// `NodeId`. Existing on-disk and on-the-wire shapes are unchanged.
 ///
 /// ```compile_fail
-/// # use boule::consensus::validator_set::{ValidatorId, Pubkey};
-/// # use boule::p2p::NodeId;
+/// # use boule_core::consensus::validator_set::{ValidatorId, Pubkey};
+/// # use boule_core::p2p::NodeId;
 /// // The compile_fail guard for #328: arbitrary bytes must not be
 /// // promotable to a stable validator id without going through a
 /// // lookup. If a future PR adds `From<Pubkey> for ValidatorId` (or

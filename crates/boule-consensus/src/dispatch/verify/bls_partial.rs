@@ -8,8 +8,8 @@
 //! [`IngressError::InvalidBlsPartial`] variant for log triage.
 
 use crate::hotstuff::qc::Vote;
-use boule::crypto::sig_scheme::SignatureSchemeChoice;
-use boule::crypto::signed::{ChainId, Signed};
+use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
+use boule_core::crypto::signed::{ChainId, Signed};
 
 use super::super::{IngressError, QcVerification};
 use super::domain::vote_preimage;
@@ -23,14 +23,14 @@ use super::domain::vote_preimage;
 /// The BLS partial signs the same canonical pre-image that the QC
 /// aggregate verifier reconstructs over `(view, block_hash)`: the
 /// domain-separated `postcard(Vote { view, block_hash })` bytes (see
-/// [`boule::crypto::signed::preimage`]). Folding a partial that doesn't
+/// [`boule_core::crypto::signed::preimage`]). Folding a partial that doesn't
 /// verify into the aggregate would later cause `verify_aggregate_bls`
 /// to fail on the formed QC, so we reject up-front at ingress with a
 /// dedicated [`IngressError::InvalidBlsPartial`] variant for log
 /// triage.
 pub(in crate::dispatch) fn verify_bls_partial_if_required(
     signed: &Signed<Vote>,
-    bls_partial: Option<&boule::crypto::sig_scheme::BlsPartialSig>,
+    bls_partial: Option<&boule_core::crypto::sig_scheme::BlsPartialSig>,
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
@@ -73,10 +73,14 @@ pub(in crate::dispatch) fn verify_bls_partial_if_required(
             signer: signed.signer,
         })?;
 
-    boule::crypto::sig_scheme::BlsAggregated::verify_partial(&bls_pubkey, &preimage_bytes, partial)
-        .map_err(|_| IngressError::InvalidBlsPartial {
-            view: signed.payload.view,
-            signer: signed.signer,
-        })?;
+    boule_core::crypto::sig_scheme::BlsAggregated::verify_partial(
+        &bls_pubkey,
+        &preimage_bytes,
+        partial,
+    )
+    .map_err(|_| IngressError::InvalidBlsPartial {
+        view: signed.payload.view,
+        signer: signed.signer,
+    })?;
     Ok(())
 }

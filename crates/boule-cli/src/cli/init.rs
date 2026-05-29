@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use clap::Args;
 use tracing::info;
 
-use boule::config;
-use boule::identity::KeyProvider;
-use boule::identity::node_id_to_base58;
+use boule_core::config;
+use boule_core::identity::KeyProvider;
+use boule_core::identity::node_id_to_base58;
 
 use super::shared::resolve_config_path;
 

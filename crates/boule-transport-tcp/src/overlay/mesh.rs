@@ -14,11 +14,11 @@ use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc};
 use tracing::debug;
 
-use boule::clock::BoxFuture;
+use boule_core::clock::BoxFuture;
 
 use super::super::ProtocolOutbound;
 use super::super::tls::NodeId;
-use boule::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
+use boule_core::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 
 // ── MeshBroadcaster ──────────────────────────────────────────────────────────
 

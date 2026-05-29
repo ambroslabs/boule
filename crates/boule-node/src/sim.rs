@@ -66,10 +66,6 @@ use rand_chacha::ChaCha20Rng;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
-use boule::clock::{Clock, TokioClock};
-use boule::crypto::signed::{NodeSigner, Signer};
-use boule::identity::NodeIdentity;
-use boule::storage::{MemoryStorage, MemoryWal, Storage, Wal};
 use boule_consensus::api::{CommitNotifier, MpscCommitNotifier};
 use boule_consensus::limits::CacheLimits;
 use boule_consensus::replication::block::{Block, BlockHash};
@@ -78,6 +74,10 @@ use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::{Height, View};
+use boule_core::clock::{Clock, TokioClock};
+use boule_core::crypto::signed::{NodeSigner, Signer};
+use boule_core::identity::NodeIdentity;
+use boule_core::storage::{MemoryStorage, MemoryWal, Storage, Wal};
 use boule_transport_tcp::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
 use boule_transport_tcp::overlay::gossip::overlay::{
     GossipOverlay, GossipOverlayConfig, GossipOverlayHandles, SpawnArgs,
@@ -136,7 +136,7 @@ enum PayloadFraming {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteViolation {
     /// Stable identity of the replica whose safety core emitted both
-    /// votes. Resolved from the [`boule::crypto::signed::Signed::signer`]
+    /// votes. Resolved from the [`boule_core::crypto::signed::Signed::signer`]
     /// field on the observed vote envelope, so the attribution survives
     /// gossip-mode forwarding (the originator's signer travels with the
     /// payload).
@@ -269,7 +269,7 @@ impl VoteObserver {
 /// Per-node context handed to an [`Adversary`] on every intercept call.
 ///
 /// The signer is the same `Arc<dyn Signer>` that the node's own
-/// `ConsensusNode::run` uses, so any [`boule::crypto::signed::Signed`]
+/// `ConsensusNode::run` uses, so any [`boule_core::crypto::signed::Signed`]
 /// envelope the adversary crafts will pass the cluster's signature
 /// checks (the point of issue #132 is to test that honest replicas
 /// reject *protocol-level* misbehaviour, not that they detect crypto
@@ -294,7 +294,7 @@ pub struct AdversaryCtx {
     /// chain_id off the local `ConsensusNode`, so a forgery signed
     /// under any other tag fails envelope verification at ingress and
     /// never reaches the safety core.
-    pub chain_id: boule::crypto::signed::ChainId,
+    pub chain_id: boule_core::crypto::signed::ChainId,
 }
 
 /// Hook installed on a single node's routing task that lets a Byzantine
@@ -320,7 +320,7 @@ pub trait Adversary: Send + Sync {
 /// so the public callers stay flat.
 #[derive(Default)]
 struct SpawnExtras {
-    rate_limits: Option<boule::transport::limits::RateLimitsConfig>,
+    rate_limits: Option<boule_core::transport::limits::RateLimitsConfig>,
     /// Per-node adversary hooks (issue #132). Indexed by sorted node
     /// order; `None` slots run the honest protocol unchanged.
     adversaries: Option<Vec<Option<Arc<dyn Adversary>>>>,
@@ -329,10 +329,10 @@ struct SpawnExtras {
     /// BLS keypair per validator, seeds each node's
     /// [`boule_consensus::bls_key_history::BlsKeyHistory`] from
     /// genesis, and plumbs the corresponding
-    /// [`boule::crypto::bls_key::BlsPartialSignerImpl`] onto each
+    /// [`boule_core::crypto::bls_key::BlsPartialSignerImpl`] onto each
     /// node so leaders can produce real BLS partials on Vote frames.
     /// `None` keeps the default Ed25519 cluster shape.
-    signature_scheme: Option<boule::crypto::sig_scheme::SignatureSchemeChoice>,
+    signature_scheme: Option<boule_core::crypto::sig_scheme::SignatureSchemeChoice>,
     /// Per-validator voting weights, indexed in *sorted* validator
     /// order (`spawn_inner` sorts the freshly-generated `NodeSigner`s
     /// by `NodeId` before assigning weights — the slot at index `i`
@@ -342,8 +342,8 @@ struct SpawnExtras {
     weights: Option<Vec<u64>>,
     /// Per-node slow-disk write delay (#496). When `Some(delays)`,
     /// each node's `Storage` and `Wal` are wrapped in
-    /// [`boule::storage::ThrottledStorage`] /
-    /// [`boule::storage::ThrottledWal`] using the per-index delay
+    /// [`boule_core::storage::ThrottledStorage`] /
+    /// [`boule_core::storage::ThrottledWal`] using the per-index delay
     /// (`Duration::ZERO` is allowed and means "no throttling for this
     /// slot"). Length must equal `n` if supplied. Used by the slow-disk
     /// back-pressure test to verify that consensus blocks (rather than
@@ -550,8 +550,8 @@ impl SimCluster {
 
     /// Spawn `n` honest nodes with per-node slow-disk write delays
     /// (#496). Each `slow_disk_delays[i]` wraps node `i`'s `Storage`
-    /// and `Wal` in a [`boule::storage::ThrottledStorage`] /
-    /// [`boule::storage::ThrottledWal`] adapter that adds a
+    /// and `Wal` in a [`boule_core::storage::ThrottledStorage`] /
+    /// [`boule_core::storage::ThrottledWal`] adapter that adds a
     /// `std::thread::sleep` of that duration to every write.
     /// `Duration::ZERO` slots run un-throttled. Used by the slow-disk
     /// back-pressure test to verify that consensus blocks (rather than
@@ -644,7 +644,7 @@ impl SimCluster {
     /// - A freshly-generated BLS keypair, registered into a shared
     ///   [`BlsKeyHistory`] at `v_eff = 0` against the validator's
     ///   `NodeId`.
-    /// - A [`boule::crypto::bls_key::BlsPartialSignerImpl`] plumbed
+    /// - A [`boule_core::crypto::bls_key::BlsPartialSignerImpl`] plumbed
     ///   via [`ConsensusNode::with_bls_signer`] so the leader-side
     ///   vote-emission path can sign real BLS partials.
     ///
@@ -666,7 +666,7 @@ impl SimCluster {
                 rate_limits: None,
                 adversaries: None,
                 signature_scheme: Some(
-                    boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
+                    boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
                 ),
                 weights: None,
                 slow_disk_delays: None,
@@ -727,8 +727,8 @@ impl SimCluster {
     pub async fn spawn_with_rate_limits(
         n: usize,
         timeout_base: Duration,
-        rate_limits: boule::transport::limits::RateLimitsConfig,
-    ) -> (Self, Vec<Arc<boule::transport::limits::RateLimiter>>) {
+        rate_limits: boule_core::transport::limits::RateLimitsConfig,
+    ) -> (Self, Vec<Arc<boule_core::transport::limits::RateLimiter>>) {
         Self::spawn_inner(
             n,
             timeout_base,
@@ -748,7 +748,7 @@ impl SimCluster {
         n: usize,
         timeout_base: Duration,
         extras: SpawnExtras,
-    ) -> (Self, Vec<Arc<boule::transport::limits::RateLimiter>>) {
+    ) -> (Self, Vec<Arc<boule_core::transport::limits::RateLimiter>>) {
         let SpawnExtras {
             rate_limits,
             adversaries,
@@ -807,9 +807,9 @@ impl SimCluster {
         // is consulted per-node when wiring the
         // `BlsPartialSignerImpl`.
         let (bls_pubkeys, bls_secret_for): (
-            HashMap<NodeId, boule::crypto::sig_scheme::BlsPublicKey>,
-            HashMap<NodeId, boule::crypto::sig_scheme::BlsSecretKey>,
-        ) = if scheme == boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
+            HashMap<NodeId, boule_core::crypto::sig_scheme::BlsPublicKey>,
+            HashMap<NodeId, boule_core::crypto::sig_scheme::BlsSecretKey>,
+        ) = if scheme == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
             let mut pubs = HashMap::new();
             let mut secs = HashMap::new();
             for (i, validator_id) in vs.iter().enumerate() {
@@ -825,7 +825,7 @@ impl SimCluster {
                 for (j, b) in idx_bytes.iter().enumerate() {
                     ikm[j] ^= *b;
                 }
-                let (sk, pk) = boule::crypto::sig_scheme::BlsAggregated::keygen(&ikm)
+                let (sk, pk) = boule_core::crypto::sig_scheme::BlsAggregated::keygen(&ikm)
                     .unwrap_or_else(|e| panic!("sim BLS keygen must not fail: {e:?}"));
                 pubs.insert(nid, pk);
                 secs.insert(nid, sk);
@@ -895,7 +895,7 @@ impl SimCluster {
         let mut commit_rxs: Vec<mpsc::Receiver<Block>> = Vec::new();
         let mut commit_overflow_counters: Vec<Arc<AtomicU64>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
-        let mut limiters: Vec<Arc<boule::transport::limits::RateLimiter>> = Vec::new();
+        let mut limiters: Vec<Arc<boule_core::transport::limits::RateLimiter>> = Vec::new();
         // Per-node fire-once crashpoint slots. One per node, in
         // `node_ids` order. The sim hands a clone of each into the
         // consensus task's `CRASH_SLOT.scope(...)`; the test's
@@ -953,11 +953,11 @@ impl SimCluster {
             let (storage, wal): (Arc<dyn Storage>, Arc<dyn Wal>) =
                 match slow_disk_delays.as_ref().and_then(|d| d.get(idx).copied()) {
                     Some(delay) if delay > Duration::ZERO => (
-                        Arc::new(boule::storage::ThrottledStorage::new(
+                        Arc::new(boule_core::storage::ThrottledStorage::new(
                             Arc::clone(&raw_storage),
                             delay,
                         )),
-                        Arc::new(boule::storage::ThrottledWal::new(
+                        Arc::new(boule_core::storage::ThrottledWal::new(
                             Arc::clone(&raw_wal),
                             delay,
                         )),
@@ -985,24 +985,24 @@ impl SimCluster {
             // (2) its own `BlsPartialSignerImpl` so the dispatch-layer
             //     vote signer can produce real BLS partials on Vote
             //     frames the leader emits or loops back through #118.
-            if scheme == boule::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
+            if scheme == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
                 let bls_history = boule_consensus::bls_key_history::BlsKeyHistory::with_genesis(
                     bls_pubkeys.iter().map(|(id, pk)| (*id, *pk)),
                 );
                 node = node.with_bls_key_history(bls_history);
                 let sk = bls_secret_for[&nid];
                 let pk = bls_pubkeys[&nid];
-                let identity = boule::crypto::bls_key::BlsValidatorIdentity {
+                let identity = boule_core::crypto::bls_key::BlsValidatorIdentity {
                     secret: zeroize::Zeroizing::new(sk),
                     public: pk,
                 };
                 let bls_signer: Arc<
-                    dyn boule::crypto::signed::PartialSigner<
-                            boule::crypto::sig_scheme::BlsAggregated,
+                    dyn boule_core::crypto::signed::PartialSigner<
+                            boule_core::crypto::sig_scheme::BlsAggregated,
                         >,
-                > = Arc::new(boule::crypto::bls_key::BlsPartialSignerImpl::from_identity(
-                    identity,
-                ));
+                > = Arc::new(
+                    boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity),
+                );
                 node = node.with_bls_signer(bls_signer);
             }
 
@@ -1015,7 +1015,7 @@ impl SimCluster {
             // defaults leave orders-of-magnitude of headroom.
             if let Some(rl_cfg) = rate_limits.as_ref() {
                 let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-                let limiter = Arc::new(boule::transport::limits::RateLimiter::new(
+                let limiter = Arc::new(boule_core::transport::limits::RateLimiter::new(
                     rl_cfg.clone(),
                     clock,
                 ));
@@ -1045,7 +1045,9 @@ impl SimCluster {
                     validators: Arc::clone(&node_ids_arc),
                     signer: Arc::clone(&signer),
                     genesis: genesis.clone(),
-                    chain_id: boule::crypto::signed::ChainId::from_genesis_hash(genesis.hash()),
+                    chain_id: boule_core::crypto::signed::ChainId::from_genesis_hash(
+                        genesis.hash(),
+                    ),
                 };
                 (adv, ctx)
             });
@@ -1615,7 +1617,7 @@ impl SimCluster {
                 limits: CacheLimits::unbounded_for_tests(),
                 snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-                signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::default(),
+                signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
                 block_retention_window: 0,
             };
             // Fresh state machine and mempool — the previous session's
@@ -1858,7 +1860,7 @@ impl SimCluster {
             limits: CacheLimits::unbounded_for_tests(),
             snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-            signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::default(),
+            signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
             block_retention_window: 0,
         };
         let sm: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -2399,7 +2401,7 @@ impl SimCluster {
                 limits: CacheLimits::unbounded_for_tests(),
                 snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-                signature_scheme: boule::crypto::sig_scheme::SignatureSchemeChoice::default(),
+                signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
                 block_retention_window: 0,
             };
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -2650,10 +2652,10 @@ mod tests {
     use super::{
         LinkCut, SimCluster, VoteObserver, assert_no_conflicts, fresh_signer, spawn_route_task,
     };
-    use boule::crypto::signed::{ChainId, Signer};
     use boule_consensus::View;
     use boule_consensus::replication::block::Block;
     use boule_consensus::validator_set::ValidatorSet;
+    use boule_core::crypto::signed::{ChainId, Signer};
     use boule_transport_tcp::{NodeId, ProtocolEvent, ProtocolOutbound};
 
     // ── VoteObserver unit tests (issue #422) ──────────────────────────────────
@@ -2982,7 +2984,7 @@ mod tests {
 
     // ── Slow-disk back-pressure (#496) ────────────────────────────────────────
 
-    /// Wrap one node's storage in [`boule::storage::ThrottledStorage`]
+    /// Wrap one node's storage in [`boule_core::storage::ThrottledStorage`]
     /// with a per-write delay; assert the cluster's persist-blocks-rather-
     /// than-drops invariant holds (every node still commits, the slow
     /// node lags but doesn't violate safety).
@@ -5857,7 +5859,7 @@ mod tests {
         let (mut cluster, limiters) = SimCluster::spawn_with_rate_limits(
             4,
             Duration::from_millis(50),
-            boule::transport::limits::RateLimitsConfig::production_defaults(),
+            boule_core::transport::limits::RateLimitsConfig::production_defaults(),
         )
         .await;
 
@@ -5888,12 +5890,12 @@ mod tests {
                 "node {idx} unexpectedly dropped frames; per-kind: \
                  Proposal={} Vote={} NewView={} TimeoutVote={} \
                  RequestBlock={} ReceiveBlock={} bytes={}",
-                counters.drops(boule::transport::limits::MessageKind::Proposal),
-                counters.drops(boule::transport::limits::MessageKind::Vote),
-                counters.drops(boule::transport::limits::MessageKind::NewView),
-                counters.drops(boule::transport::limits::MessageKind::TimeoutVote),
-                counters.drops(boule::transport::limits::MessageKind::RequestBlock),
-                counters.drops(boule::transport::limits::MessageKind::ReceiveBlock),
+                counters.drops(boule_core::transport::limits::MessageKind::Proposal),
+                counters.drops(boule_core::transport::limits::MessageKind::Vote),
+                counters.drops(boule_core::transport::limits::MessageKind::NewView),
+                counters.drops(boule_core::transport::limits::MessageKind::TimeoutVote),
+                counters.drops(boule_core::transport::limits::MessageKind::RequestBlock),
+                counters.drops(boule_core::transport::limits::MessageKind::ReceiveBlock),
                 counters.bytes_drops(),
             );
             assert_eq!(
@@ -5930,7 +5932,7 @@ mod tests {
         // sufficient to trip the limiter without flooding for several
         // wall-seconds. The default is 8.0/sec — at 4.0/sec a 64-frame
         // flood lands well above the bucket capacity.
-        let mut config = boule::transport::limits::RateLimitsConfig::production_defaults();
+        let mut config = boule_core::transport::limits::RateLimitsConfig::production_defaults();
         config.request_block_per_sec = 4.0;
         let (mut cluster, limiters) =
             SimCluster::spawn_with_rate_limits(4, Duration::from_millis(50), config).await;
@@ -5990,7 +5992,7 @@ mod tests {
             yield_now().await;
             let drops = limiters[target_idx]
                 .counters()
-                .drops(boule::transport::limits::MessageKind::RequestBlock);
+                .drops(boule_core::transport::limits::MessageKind::RequestBlock);
             if drops > (FLOOD_COUNT as u64) / 2 {
                 break;
             }
@@ -6003,7 +6005,7 @@ mod tests {
         // than half the flood was dropped at the limiter boundary.
         let drops = limiters[target_idx]
             .counters()
-            .drops(boule::transport::limits::MessageKind::RequestBlock);
+            .drops(boule_core::transport::limits::MessageKind::RequestBlock);
         assert!(
             drops > (FLOOD_COUNT as u64) / 2,
             "expected > {} RequestBlock drops on node {target_idx}; got {drops}",
@@ -6048,7 +6050,7 @@ mod tests {
     /// `BlockRangeRequest` frames cannot pull more than
     /// `outbound_bytes_per_sec` of responses out of the responder.
     /// The per-peer outbound bytes bucket on
-    /// [`boule::transport::limits::RateLimiter`] caps egress regardless of
+    /// [`boule_core::transport::limits::RateLimiter`] caps egress regardless of
     /// how cheap the inbound requests are — the asymmetric
     /// request/response cost the issue documents (16 B request,
     /// hundreds of KB response) is bounded at the egress boundary.
@@ -6071,7 +6073,7 @@ mod tests {
         // responder builds is dropped at the egress admit. Keep ingress
         // generous so the requests admit cleanly and the test isolates
         // the egress boundary.
-        let mut config = boule::transport::limits::RateLimitsConfig::production_defaults();
+        let mut config = boule_core::transport::limits::RateLimitsConfig::production_defaults();
         config.outbound_bytes_per_sec = 32.0;
         config.block_range_request_per_sec = 1_000.0;
         config.bytes_per_sec = 1.0e9;
@@ -6402,9 +6404,9 @@ mod tests {
     /// which it isn't — it's just wrong about its own BLS key).
     #[tokio::test(start_paused = true)]
     async fn bls_cluster_commits_dual_key_rotation_and_makes_progress() {
-        use boule::crypto::sig_scheme::BlsAggregated;
         use boule_consensus::View;
         use boule_consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+        use boule_core::crypto::sig_scheme::BlsAggregated;
 
         let mut cluster = SimCluster::spawn_bls(4, Duration::from_millis(50)).await;
 
@@ -6545,7 +6547,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn validator_key_rotation_spanning_votes_correctness() {
         use crate::consensus_node::{STORAGE_KEY_VALIDATOR_KEY_HISTORY, WireMessage};
-        use boule::crypto::signed::Signed;
         use boule_consensus::View;
         use boule_consensus::dispatch::{IngressError, ingress_wire};
         use boule_consensus::hotstuff::qc::Vote;
@@ -6555,6 +6556,7 @@ mod tests {
         };
         use boule_consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
         use boule_consensus::validator_set::{Pubkey, ValidatorId, ValidatorSet};
+        use boule_core::crypto::signed::Signed;
 
         let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
 

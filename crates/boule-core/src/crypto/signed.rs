@@ -203,8 +203,8 @@ where
     /// any other type, even when the byte layout happens to match.
     ///
     /// ```
-    /// use boule::crypto::signed::{ChainId, NodeSigner, Signed, SignedMessage, Signer};
-    /// use boule::identity::NodeIdentity;
+    /// use boule_core::crypto::signed::{ChainId, NodeSigner, Signed, SignedMessage, Signer};
+    /// use boule_core::identity::NodeIdentity;
     /// use rcgen::{KeyPair, PKCS_ED25519};
     /// use serde::{Deserialize, Serialize};
     /// use zeroize::Zeroizing;

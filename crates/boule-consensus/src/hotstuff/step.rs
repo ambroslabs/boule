@@ -16,14 +16,14 @@
 //! # Purity
 //!
 //! Everything here is deliberately I/O-free: no `tokio`, no
-//! [`boule::clock::Clock`], no storage, no network. Inputs are
+//! [`boule_core::clock::Clock`], no storage, no network. Inputs are
 //! [`Event`]s; outputs are [`Action`]s. Signatures on inbound
 //! [`Signed`] payloads are assumed verified by the integration layer
 //! (#24) before `step` is called — the core trusts the envelope so
 //! replay harnesses can feed a deterministic trace without recomputing
 //! Ed25519.
 //!
-//! [`Signed`]: boule::crypto::signed::Signed
+//! [`Signed`]: boule_core::crypto::signed::Signed
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,19 +31,19 @@ use std::sync::Arc;
 use crate::limits::{CacheEvictionCounters, CacheLimits};
 use crate::replication::block::{Block, BlockHash};
 use crate::{Height, View};
-use boule::crypto::signed::Signed;
-use boule::identity::NodeId;
+use boule_core::crypto::signed::Signed;
+use boule_core::identity::NodeId;
 
 use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, VerifiedQc, Vote};
 use super::safety_rules::{safe_to_vote, should_update_high_qc, three_chain_commit};
 use super::state::{HotStuffState, Locked};
 use crate::validator_set::{ValidatorId, ValidatorSet};
-use boule::crypto::sig_scheme::{BlsPartialSig, SignatureSchemeChoice};
+use boule_core::crypto::sig_scheme::{BlsPartialSig, SignatureSchemeChoice};
 
 /// Tracing target shared with the integration layer; lifted here so
 /// safety-core eviction logs flow through the same `RUST_LOG` filter
 /// (see `crate::wire::TRACE_TARGET`).
-const TRACE_TARGET: &str = "boule::consensus";
+const TRACE_TARGET: &str = "boule_core::consensus";
 
 /// Inputs the safety core reacts to.
 ///
@@ -3135,8 +3135,8 @@ mod tests {
         // aggregate that verifies via `verify_aggregate_bls` against
         // the genesis BLS pubkey table — the same path the dispatch
         // verifier uses on inbound proposals.
-        use boule::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
-        use boule::crypto::signed::preimage;
+        use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
+        use boule_core::crypto::signed::preimage;
 
         let validators_set = validators();
         // Generate one BLS keypair per validator, deterministic in
@@ -3166,7 +3166,7 @@ mod tests {
             view: View(3),
             block_hash: block_v3_hash,
         };
-        let preimg = preimage::<Vote>(&vote, &boule::crypto::signed::ChainId::TEST).unwrap();
+        let preimg = preimage::<Vote>(&vote, &boule_core::crypto::signed::ChainId::TEST).unwrap();
         let voters = [(1, nid(2)), (2, nid(3)), (3, nid(4))];
 
         let mut step_actions = Vec::new();
@@ -5804,8 +5804,8 @@ mod tests {
             /// adversarial helpers can sign forged Vote partials
             /// under the Byzantine validator's own BLS key.
             pub bls_keys: Vec<(
-                boule::crypto::sig_scheme::BlsSecretKey,
-                boule::crypto::sig_scheme::BlsPublicKey,
+                boule_core::crypto::sig_scheme::BlsSecretKey,
+                boule_core::crypto::sig_scheme::BlsPublicKey,
             )>,
         }
 
@@ -5867,7 +5867,7 @@ mod tests {
                             // seed scheme is unlikely.
                             ikm[0] = (i as u8) ^ 0xA0;
                             ikm[1] = ((i >> 8) as u8) ^ 0x5A;
-                            boule::crypto::sig_scheme::BlsAggregated::keygen(&ikm)
+                            boule_core::crypto::sig_scheme::BlsAggregated::keygen(&ikm)
                                 .expect("proptest BLS keygen must not fail")
                         })
                         .collect()
@@ -5896,18 +5896,18 @@ mod tests {
                 &self,
                 signer_idx: usize,
                 vote: &Vote,
-            ) -> Option<boule::crypto::sig_scheme::BlsPartialSig> {
+            ) -> Option<boule_core::crypto::sig_scheme::BlsPartialSig> {
                 if self.signature_scheme != SignatureSchemeChoice::BlsAggregated {
                     return None;
                 }
-                let preimg = boule::crypto::signed::preimage::<Vote>(
+                let preimg = boule_core::crypto::signed::preimage::<Vote>(
                     vote,
-                    &boule::crypto::signed::ChainId::TEST,
+                    &boule_core::crypto::signed::ChainId::TEST,
                 )
                 .expect("preimage of a fixed-shape Vote must succeed");
                 let sk = &self.bls_keys[signer_idx].0;
                 Some(
-                    boule::crypto::sig_scheme::BlsAggregated::sign_partial(sk, &preimg)
+                    boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(sk, &preimg)
                         .expect("BLS partial signing must not fail under valid inputs"),
                 )
             }
@@ -6061,16 +6061,18 @@ mod tests {
                         let mut qc =
                             QuorumCertificate::new_bls(view, block_hash, self.validators.len());
                         let vote = Vote { view, block_hash };
-                        let preimg = boule::crypto::signed::preimage::<Vote>(
+                        let preimg = boule_core::crypto::signed::preimage::<Vote>(
                             &vote,
-                            &boule::crypto::signed::ChainId::TEST,
+                            &boule_core::crypto::signed::ChainId::TEST,
                         )
                         .expect("Vote preimage must succeed");
                         for i in 0..self.validators.len() {
                             let sk = &self.bls_keys[i].0;
                             let partial =
-                                boule::crypto::sig_scheme::BlsAggregated::sign_partial(sk, &preimg)
-                                    .expect("BLS partial signing must not fail");
+                                boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(
+                                    sk, &preimg,
+                                )
+                                .expect("BLS partial signing must not fail");
                             qc.add_bls_partial(i, partial);
                         }
                         qc
@@ -6087,7 +6089,7 @@ mod tests {
             /// *do* attach a real BLS partial under `source`'s BLS
             /// key, because `add_bls_partial` panics on bad bytes
             /// (see `BlsAggregated::add_partial` in
-            /// `boule::crypto::sig_scheme`).
+            /// `boule_core::crypto::sig_scheme`).
             fn event_from_msg(&self, source: NodeId, msg: ConsensusMsg) -> Event {
                 let sig = [0u8; 64];
                 match msg {

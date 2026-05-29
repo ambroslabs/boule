@@ -13,7 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 # The node binary. `boule-core` exposes its library as `boule`, so both the
-# binary and the testnet driver import it as `use boule::...`.
+# binary and the testnet driver import it as `use boule_core::...`.
 [[bin]]
 name = "boule"
 path = "src/main.rs"

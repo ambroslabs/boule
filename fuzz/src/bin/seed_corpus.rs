@@ -35,8 +35,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use boule::crypto::signed::Signed;
-use boule::identity::NodeId;
+use boule_core::crypto::signed::Signed;
+use boule_core::identity::NodeId;
 use boule_consensus::hotstuff::qc::{NewView, Proposal, QuorumCertificate, TimeoutVote, Vote};
 use boule_consensus::replication::block::{Block, BlockHeader};
 use boule_consensus::wire::{BlockResponsePayload, WireMessage};
@@ -79,7 +79,7 @@ fn signed<T>(payload: T, signer_idx: u8) -> Signed<T> {
 /// well-formed under [`is_well_formed`] — libFuzzer mutates from there
 /// to explore stray-bit and length-mismatch territory.
 ///
-/// [`is_well_formed`]: boule::crypto::sig_scheme::SignerBitmap::is_well_formed
+/// [`is_well_formed`]: boule_core::crypto::sig_scheme::SignerBitmap::is_well_formed
 fn placeholder_qc(view: u64, block_hash: [u8; 32]) -> QuorumCertificate {
     let mut qc = QuorumCertificate::new(view, block_hash, N_VALIDATORS);
     for i in 0..N_VALIDATORS {
