@@ -1,0 +1,46 @@
+name: Smoke
+
+# The multi-process testnet smoke sweep (crates/boule-cli/tests/smoke_sweep.rs)
+# spins up real clusters and is far too slow for the per-PR gate. The sweep
+# test is `#[ignore]`d so the stable per-PR gate (fmt/clippy/test/deny in
+# ci.yml) compiles it but never runs it. This workflow is the cadence guard:
+# it runs the sweep on a nightly schedule and on demand, the same model as
+# fuzz.yml — without ever blocking the per-PR gate.
+on:
+  schedule:
+    # 07:00 America/Los_Angeles. GitHub cron is fixed UTC and does NOT
+    # observe daylight saving, so 15:00 UTC = 07:00 PST (standard time) and
+    # 08:00 PDT (daylight time). Pinned to standard-time 07:00 as requested.
+    - cron: '0 15 * * *'
+  workflow_dispatch:
+  pull_request:
+    # Adding the `smoke` label kicks off a run; the others re-run it on new
+    # pushes while the label is still applied.
+    types: [opened, synchronize, reopened, labeled]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  smoke:
+    name: Testnet smoke sweep
+    # Opt-in on PRs via the `smoke` label; always on nightly + manual dispatch.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.labels.*.name, 'smoke'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Nightly schedule runs the full 65-trial sweep; PR/manual runs the
+      # lighter `standard` tier to keep opt-in checks quick.
+      - name: Smoke sweep
+        env:
+          SMOKE_TIER: ${{ github.event_name == 'schedule' && 'full' || 'standard' }}
+        run: |
+          cargo test --release -p boule-cli --test smoke_sweep \
+            -- --ignored --nocapture --test-threads=1
