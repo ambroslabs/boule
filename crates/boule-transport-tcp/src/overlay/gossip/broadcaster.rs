@@ -26,15 +26,13 @@
 //! `BoxFuture` so callers can preserve `await`-on-send backpressure.
 //! That maps directly to `mpsc::Sender::send().await`: the broadcaster
 //! awaits capacity on the cmd channel, and a successful await means
-//! the bytes have been handed to the run loop's queue. Same contract
-//! as the legacy `MeshBroadcaster`.
+//! the bytes have been handed to the run loop's queue.
 //!
 //! # Drop on shutdown
 //!
 //! If the run loop has exited (cmd channel closed), `send` returns
 //! `Err`. We drop silently — the consumer-side has already torn
-//! down and there is no recovery available at this seam. Mirrors
-//! the `MeshBroadcaster` behaviour today.
+//! down and there is no recovery available at this seam.
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -91,7 +89,6 @@ impl Broadcaster for GossipBroadcaster {
         let cmd_tx = self.cmd_tx.clone();
         Box::pin(async move {
             // Best-effort: drop on shutdown (cmd channel closed).
-            // Identical posture to MeshBroadcaster's send_tx path.
             let _ = cmd_tx.send(OverlayCmd::Broadcast(payload)).await;
         })
     }

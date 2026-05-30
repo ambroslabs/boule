@@ -130,30 +130,26 @@ Library directory on macOS, `%APPDATA%\boule\config.toml` on
 Windows). Run `boule init` to write a starter template at that path
 on first use.
 
-### Topology overlay (mesh vs. gossip)
+### Topology overlay (gossip)
 
-Consensus consumes a `Broadcaster` + `Discovery` pair (`src/p2p/overlay/`)
-so the underlying topology is a black box. Two implementations ship:
+Consensus consumes a `Broadcaster` + `Discovery` pair
+(`crates/boule-transport-tcp/src/overlay/`) so the underlying topology
+is a black box. The production overlay is **`gossip`**: each node keeps
+at most `target_degree` direct TLS connections (default 8) and learns
+about the rest of the validator set through periodic peer-list gossip.
+Add new operators by pointing one or two seed addresses at any
+reachable validator; no coordinated config rollouts when the validator
+set grows.
 
-- **`gossip`** (default) — each node keeps at most `target_degree`
-  direct TLS connections (default 8) and learns about the rest of the
-  validator set through periodic peer-list gossip. Add new operators
-  by pointing one or two seed addresses at any reachable validator;
-  no coordinated config rollouts when the validator set grows.
-- **`mesh`** — every node holds an explicit TLS connection to every
-  other node. Simple, predictable, and the right choice for a
-  single-operator testnet, but doesn't scale beyond a handful of
-  validators.
-
-Switch with the `[overlay]` table:
+Tune it with the `[overlay]` table:
 
 ```toml
 [overlay]
-mode = "gossip"                 # "gossip" (default) | "mesh"
-target_degree = 8               # gossip-only: max direct peers per node
-peer_gossip_interval_ms = 5000  # gossip-only: peer-list publish cadence
-mesh_check_interval_ms = 5000   # gossip-only: maintenance dial cadence
-bootstrap_addrs = ["10.0.0.1:7000"]  # gossip-only: TOFU seeds
+mode = "gossip"                 # "gossip" (the only overlay)
+target_degree = 8               # max direct peers per node
+peer_gossip_interval_ms = 5000  # peer-list publish cadence
+mesh_check_interval_ms = 5000   # partial-mesh maintenance dial cadence
+bootstrap_addrs = ["10.0.0.1:7000"]  # TOFU seeds
 ```
 
 The remaining knobs (`peer_gossip_fanout`, `dedup_capacity`,

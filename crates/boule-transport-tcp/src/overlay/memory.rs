@@ -1,9 +1,18 @@
-//! Full-mesh implementations of [`Broadcaster`] and [`Discovery`].
+//! In-memory [`Broadcaster`] and [`Discovery`] fakes for tests.
 //!
-//! These were the original implementations carved out when issue #131
-//! introduced the overlay traits. They are still the default while the
-//! gossip overlay (issue #137, see [`super::gossip`]) is under
-//! construction.
+//! These are **test doubles, not a transport.** Consensus is
+//! transport-agnostic — [`boule_consensus`]'s `ConsensusNode::run` takes
+//! `Arc<dyn Broadcaster>` + `Arc<dyn Discovery>` — so tests drive a node
+//! by handing it these fakes instead of standing up TCP+TLS:
+//!
+//! - [`MemoryBroadcaster`] forwards every frame onto an `mpsc` channel
+//!   the test (or the in-process `SimCluster` router) drains; there is
+//!   no peer table and no fan-out.
+//! - [`MemoryDiscovery`] tracks a peer set fed by a [`DiscoveryEvent`]
+//!   broadcast the test publishes onto; [`Discovery::add_bootstrap`] is a
+//!   no-op because there is nothing to dial.
+//!
+//! The real production overlay is [`super::gossip`].
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -20,33 +29,33 @@ use super::super::ProtocolOutbound;
 use super::super::tls::NodeId;
 use boule_core::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 
-// ── MeshBroadcaster ──────────────────────────────────────────────────────────
+// ── MemoryBroadcaster ────────────────────────────────────────────────────────
 
-/// [`Broadcaster`] backed by the full-mesh peer manager.
+/// In-memory [`Broadcaster`] fake: forwards each frame onto an
+/// `mpsc::Sender<ProtocolOutbound>` that a test drains.
 ///
-/// Wraps a clone of the per-protocol `mpsc::Sender<ProtocolOutbound>`
-/// returned by [`super::super::PeerCommand::RegisterProtocol`]. Awaiting
-/// a `broadcast` / `send_to` is exactly equivalent to the previous
-/// `send_tx.send(ProtocolOutbound::Broadcast(...)).await` call site —
-/// the manager fans it out across the peer table.
-pub struct MeshBroadcaster {
+/// `broadcast` enqueues a [`ProtocolOutbound::Broadcast`] and `send_to`
+/// a [`ProtocolOutbound::SendTo`]; the receiving end of the channel is
+/// the test's in-process router (e.g. `SimCluster`), which decides who
+/// actually "receives" the frame. There is no peer table, no transport,
+/// and no fan-out here — that is the test harness's job.
+pub struct MemoryBroadcaster {
     send_tx: mpsc::Sender<ProtocolOutbound>,
 }
 
-impl MeshBroadcaster {
-    /// Wrap an outbound `send_tx` channel obtained from a
-    /// [`super::super::ProtocolHandle`] into a [`Broadcaster`].
+impl MemoryBroadcaster {
+    /// Wrap an outbound `send_tx` channel whose receiver the test owns.
     pub fn new(send_tx: mpsc::Sender<ProtocolOutbound>) -> Self {
         Self { send_tx }
     }
 }
 
-impl Broadcaster for MeshBroadcaster {
+impl Broadcaster for MemoryBroadcaster {
     fn broadcast(&self, payload: Bytes) -> BoxFuture<'_, ()> {
         let send_tx = self.send_tx.clone();
         Box::pin(async move {
-            // Best-effort: drop on shutdown (channel closed) just like
-            // the previous direct `send_tx.send().await` call sites.
+            // Best-effort: drop on shutdown (channel closed), matching
+            // the real overlays' send posture.
             let _ = send_tx.send(ProtocolOutbound::Broadcast(payload)).await;
         })
     }
@@ -64,32 +73,32 @@ impl Broadcaster for MeshBroadcaster {
     }
 }
 
-// ── MeshDiscovery ────────────────────────────────────────────────────────────
+// ── MemoryDiscovery ──────────────────────────────────────────────────────────
 
-/// [`Discovery`] backed by the full-mesh peer manager.
+/// In-memory [`Discovery`] fake: tracks a peer set fed by a
+/// [`DiscoveryEvent`] broadcast the test publishes onto.
 ///
-/// Maintains a local snapshot of the peer set, fed by a background task
-/// that subscribes to the manager's [`DiscoveryEvent`] broadcast. The
-/// snapshot is read-only for callers; updates flow exclusively from the
-/// manager-spawned task.
-pub struct MeshDiscovery {
+/// A background task drains the `source` receiver, applies each
+/// add/remove to a local snapshot (read by [`Discovery::known_peers`]),
+/// and re-broadcasts the delta so every [`Discovery::subscribe`] caller
+/// gets its own independently-lagging stream. There is no dialer, so
+/// [`Discovery::add_bootstrap`] is a no-op.
+pub struct MemoryDiscovery {
     peers: Arc<RwLock<BTreeSet<NodeId>>>,
     events: broadcast::Sender<DiscoveryEvent>,
 }
 
-impl MeshDiscovery {
+impl MemoryDiscovery {
     /// Spawn the cache-maintenance task and return the resulting
-    /// [`Discovery`] implementation.
+    /// [`Discovery`] fake.
     ///
-    /// `source` is the broadcast receiver wired into the peer manager;
-    /// the spawned task forwards every delta into a re-broadcast channel
-    /// (so every subsequent `subscribe` call can independently lag) and
-    /// updates the local cache used by [`Discovery::known_peers`].
+    /// `source` is a [`DiscoveryEvent`] receiver the test publishes
+    /// peer add/remove deltas onto; the spawned task folds each into the
+    /// local cache and re-broadcasts it to downstream subscribers.
     pub fn spawn(mut source: broadcast::Receiver<DiscoveryEvent>) -> Arc<Self> {
         let peers: Arc<RwLock<BTreeSet<NodeId>>> = Arc::new(RwLock::new(BTreeSet::new()));
-        // `64` matches the depth of the peer-gone broadcast in `manager.rs`;
-        // peer add/remove churn happens at the same rate, so the same
-        // capacity is appropriate.
+        // 64 is generous for the churn a test drives; matches the
+        // depth the production overlays use for the same event stream.
         let (events, _) = broadcast::channel::<DiscoveryEvent>(64);
 
         let peers_for_task = Arc::clone(&peers);
@@ -113,12 +122,7 @@ impl MeshDiscovery {
                         let _ = events_for_task.send(ev);
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Lost some events; the cache is now stale. The
-                        // manager is the only sender, so this is rare in
-                        // practice; we log at debug and keep going. A
-                        // future enhancement could trigger a `ListPeers`
-                        // resync after lag.
-                        debug!("MeshDiscovery: source channel lagged; cache may be stale");
+                        debug!("MemoryDiscovery: source channel lagged; cache may be stale");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -129,19 +133,15 @@ impl MeshDiscovery {
     }
 }
 
-impl Discovery for MeshDiscovery {
+impl Discovery for MemoryDiscovery {
     fn known_peers(&self) -> Vec<NodeId> {
         self.peers.read().iter().copied().collect()
     }
 
     fn add_bootstrap(&self, _addr: SocketAddr) {
-        // Mesh today builds its dialer once at boot from the static
-        // peer list (`src/p2p/dialer.rs` + `main.rs`'s wiring). Adding a
-        // dial post-boot would require plumbing through the dialer
-        // factory — explicitly out of scope for #131 (which calls out
-        // dynamic membership as a non-goal). Logged at debug so future
-        // callers can see they hit the no-op.
-        debug!("MeshDiscovery::add_bootstrap is a no-op on the mesh implementation");
+        // No-op: the in-memory fake has no dialer; the peer set is
+        // driven entirely by the `DiscoveryEvent` source the test feeds.
+        debug!("MemoryDiscovery::add_bootstrap is a no-op on the in-memory fake");
     }
 
     fn subscribe(&self) -> broadcast::Receiver<DiscoveryEvent> {
@@ -162,9 +162,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_broadcaster_forwards_broadcast_to_send_tx() {
+    async fn memory_broadcaster_forwards_broadcast_to_send_tx() {
         let (send_tx, mut send_rx) = mpsc::channel::<ProtocolOutbound>(8);
-        let bc = MeshBroadcaster::new(send_tx);
+        let bc = MemoryBroadcaster::new(send_tx);
 
         bc.broadcast(Bytes::from_static(b"hello")).await;
 
@@ -175,9 +175,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_broadcaster_forwards_send_to_to_send_tx() {
+    async fn memory_broadcaster_forwards_send_to_to_send_tx() {
         let (send_tx, mut send_rx) = mpsc::channel::<ProtocolOutbound>(8);
-        let bc = MeshBroadcaster::new(send_tx);
+        let bc = MemoryBroadcaster::new(send_tx);
 
         bc.send_to(nid(7), Bytes::from_static(b"hi")).await;
 
@@ -191,9 +191,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_discovery_tracks_add_and_remove() {
+    async fn memory_discovery_tracks_add_and_remove() {
         let (source_tx, source_rx) = broadcast::channel::<DiscoveryEvent>(8);
-        let disc = MeshDiscovery::spawn(source_rx);
+        let disc = MemoryDiscovery::spawn(source_rx);
 
         source_tx
             .send(DiscoveryEvent::PeerAdded(nid(1)))
@@ -226,9 +226,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_discovery_subscribe_receives_subsequent_events() {
+    async fn memory_discovery_subscribe_receives_subsequent_events() {
         let (source_tx, source_rx) = broadcast::channel::<DiscoveryEvent>(8);
-        let disc = MeshDiscovery::spawn(source_rx);
+        let disc = MemoryDiscovery::spawn(source_rx);
 
         let mut sub = disc.subscribe();
 
@@ -244,9 +244,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mesh_discovery_add_bootstrap_is_a_noop() {
+    async fn memory_discovery_add_bootstrap_is_a_noop() {
         let (_source_tx, source_rx) = broadcast::channel::<DiscoveryEvent>(8);
-        let disc = MeshDiscovery::spawn(source_rx);
+        let disc = MemoryDiscovery::spawn(source_rx);
         // Just exercises the no-op path; the assertion is that this
         // doesn't panic and known_peers stays empty.
         disc.add_bootstrap("127.0.0.1:9".parse().unwrap());
