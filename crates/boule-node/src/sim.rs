@@ -54,7 +54,7 @@
 //! [`heal_partition`]: SimCluster::heal_partition
 //! [`cut_link`]: SimCluster::cut_link
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,6 +106,224 @@ type LinkCut = (NodeId, NodeId);
 /// tests so that under normal use the bound never trips; on overflow
 /// the [`MpscCommitNotifier`] bumps a counter the harness can poll.
 pub const SIM_COMMIT_CHANNEL_CAP: usize = 4096;
+
+// ── Selective-drop / packet-reorder primitives (audit L3-2) ──────────────────
+//
+// The whole-link adversary surface (`partition_node`, `cut_link`,
+// `partition_into_groups`, `set_slow_node`, `kill_node`) drops or delays
+// *every* frame on a link. Partial-synchrony attacks instead need the
+// network to drop or reorder *specific* frames — a Byzantine leader that
+// withholds one `Proposal` from one follower, or a relay that drags one
+// replica's freshest `TimeoutVote` behind the rest. These two primitives
+// add that surface: [`SimCluster::drop_messages_if`] and
+// [`SimCluster::reorder_link`]. Both are evaluated at the network seam
+// ([`route_one_frame`]) on a *decoded* view of the wire frame, never
+// inside the dispatch verifier — drops are silent at the wire.
+
+/// Message kind exposed to a [`SimCluster::drop_messages_if`] predicate.
+///
+/// Mirrors the consensus-relevant variants of
+/// [`boule_consensus::wire::WireMessage`]. The snapshot / block-range
+/// sync frames collapse into [`SimMessageKind::Other`] so predicates can
+/// match the common consensus kinds without enumerating every sync
+/// variant; widen this enum if a test needs to target a sync frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimMessageKind {
+    Proposal,
+    Vote,
+    NewView,
+    TimeoutVote,
+    BlockRequest,
+    BlockResponse,
+    /// Any wire frame outside the consensus/block-sync kinds above
+    /// (snapshot manifest/chunk, block-range request/response).
+    Other,
+}
+
+/// Decoded, read-only view of an in-flight wire frame, handed to a
+/// selective-drop predicate registered via
+/// [`SimCluster::drop_messages_if`].
+///
+/// Carries just enough to filter by message kind, view, and originating
+/// signer — the dimensions partial-synchrony attacks select on. Frames
+/// that don't decode to a [`boule_consensus::wire::WireMessage`] never
+/// reach a predicate (they're delivered unfiltered); see
+/// [`decode_sim_message`].
+#[derive(Debug, Clone)]
+pub struct SimMessage {
+    /// Which wire variant this frame is.
+    pub kind: SimMessageKind,
+    /// The view the frame pertains to, when one is encoded in it.
+    /// `None` for frames keyed by hash/height rather than view
+    /// ([`SimMessageKind::BlockRequest`] / [`SimMessageKind::BlockResponse`]).
+    /// For [`SimMessageKind::NewView`] this is the carried `high_qc.view`
+    /// (a `NewView` has no view field of its own).
+    pub view: Option<View>,
+    /// The originating safety-core signer, for signed envelopes. `None`
+    /// for unsigned frames ([`SimMessageKind::BlockRequest`]).
+    pub signer: Option<NodeId>,
+}
+
+impl SimMessage {
+    /// Project a decoded wire frame onto the predicate-visible surface.
+    fn from_wire(w: &boule_consensus::wire::WireMessage) -> Self {
+        use boule_consensus::wire::WireMessage as W;
+        match w {
+            W::Proposal(s) => Self {
+                kind: SimMessageKind::Proposal,
+                view: Some(s.payload.block.header.view),
+                signer: Some(s.signer),
+            },
+            W::Vote(s, _) => Self {
+                kind: SimMessageKind::Vote,
+                view: Some(s.payload.view),
+                signer: Some(s.signer),
+            },
+            W::NewView(s) => Self {
+                kind: SimMessageKind::NewView,
+                view: Some(s.payload.high_qc.view),
+                signer: Some(s.signer),
+            },
+            W::TimeoutVote(s) => Self {
+                kind: SimMessageKind::TimeoutVote,
+                view: Some(s.payload.view),
+                signer: Some(s.signer),
+            },
+            W::BlockRequest(_) => Self {
+                kind: SimMessageKind::BlockRequest,
+                view: None,
+                signer: None,
+            },
+            W::BlockResponse(s) => Self {
+                kind: SimMessageKind::BlockResponse,
+                view: None,
+                signer: Some(s.signer),
+            },
+            _ => Self {
+                kind: SimMessageKind::Other,
+                view: None,
+                signer: None,
+            },
+        }
+    }
+}
+
+/// Decode `payload` (already framing-peeled per `framing`) into a
+/// [`SimMessage`]. Returns `None` when the bytes aren't a
+/// [`boule_consensus::wire::WireMessage`] — e.g. the raw non-wire
+/// payloads the `BareRouting` harness injects — in which case the
+/// selective-drop predicate is not consulted and the frame is delivered.
+fn decode_sim_message(payload: &[u8], framing: PayloadFraming) -> Option<SimMessage> {
+    let wire_bytes: &[u8] = match framing {
+        PayloadFraming::Mesh => payload,
+        PayloadFraming::GossipOverlay => {
+            // Unwrap the gossip `Forward` envelope to reach the inner
+            // consensus frame, mirroring `VoteObserver::observe_outbound`.
+            // Decode straight from the borrowed inner `Bytes`.
+            match postcard::from_bytes::<boule_transport_tcp::overlay::gossip::wire::OverlayFrame>(
+                payload,
+            ) {
+                Ok(boule_transport_tcp::overlay::gossip::wire::OverlayFrame::Forward {
+                    payload: inner,
+                    ..
+                }) => {
+                    return postcard::from_bytes::<boule_consensus::wire::WireMessage>(&inner)
+                        .ok()
+                        .map(|w| SimMessage::from_wire(&w));
+                }
+                _ => return None,
+            }
+        }
+    };
+    postcard::from_bytes::<boule_consensus::wire::WireMessage>(wire_bytes)
+        .ok()
+        .map(|w| SimMessage::from_wire(&w))
+}
+
+/// A selective-drop predicate. Consulted on every decodable frame on the
+/// link it's registered for; returning `true` drops that frame silently.
+pub type DropPredicate = Arc<dyn Fn(&SimMessage) -> bool + Send + Sync>;
+
+/// Fold a directed link `(from → to)` into a deterministic `u64` seed.
+///
+/// FNV-1a over the two 32-byte ids, `from` then `to`, so the seed is
+/// order-sensitive (the `from → to` reorder schedule differs from
+/// `to → from`) and depends only on the fixed topology — no `SystemTime`
+/// or thread RNG leaks in, so a run replays identically given the same
+/// node identities.
+fn link_seed(from: NodeId, to: NodeId) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in from.iter().chain(to.iter()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Per-link reorder buffer installed by [`SimCluster::reorder_link`].
+///
+/// Holds up to `depth` in-flight frames; once full, every new arrival
+/// evicts one buffered frame chosen by the per-link seeded RNG and
+/// releases it. That bounds the buffer at `depth` (no growth, no stall:
+/// one in, one out in steady state) while permuting delivery order
+/// within a `depth`-wide window. The residual `< depth` frames are
+/// flushed by [`SimCluster::heal_partition`].
+struct ReorderBuf {
+    depth: usize,
+    buf: VecDeque<Bytes>,
+    rng: ChaCha20Rng,
+}
+
+impl ReorderBuf {
+    fn new(from: NodeId, to: NodeId, depth: usize) -> Self {
+        Self {
+            depth: depth.max(1),
+            buf: VecDeque::new(),
+            rng: ChaCha20Rng::seed_from_u64(link_seed(from, to)),
+        }
+    }
+
+    /// Buffer `payload`; once the buffer exceeds `depth`, evict and
+    /// return one frame chosen by the seeded RNG (reordering it past the
+    /// frames still buffered). Returns `None` while the buffer is still
+    /// filling — the frame stays buffered, delivered by a later eviction
+    /// or by [`Self::drain_permuted`].
+    fn push(&mut self, payload: Bytes) -> Option<Bytes> {
+        self.buf.push_back(payload);
+        if self.buf.len() > self.depth {
+            let idx = (self.rng.random::<u64>() as usize) % self.buf.len();
+            self.buf.remove(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Drain every buffered frame in seeded-permuted order. Used on heal
+    /// to release the residual window so the link returns to full
+    /// delivery.
+    fn drain_permuted(&mut self) -> Vec<Bytes> {
+        let mut out = Vec::with_capacity(self.buf.len());
+        while !self.buf.is_empty() {
+            let idx = (self.rng.random::<u64>() as usize) % self.buf.len();
+            out.push(self.buf.remove(idx).expect("idx < len"));
+        }
+        out
+    }
+}
+
+/// Per-link selective-drop and reorder state, shared with every route
+/// task (audit L3-2). Bundled behind one handle so the route-task
+/// signature grows by a single parameter rather than two more `Arc`s.
+/// Both maps are empty by default, so honest clusters pay only an
+/// `is_empty()` check per frame.
+#[derive(Clone, Default)]
+struct SelectiveControls {
+    /// Per-link drop predicates. Multiple predicates on a link compose:
+    /// any returning `true` drops the frame.
+    drop_predicates: Arc<Mutex<HashMap<LinkCut, Vec<DropPredicate>>>>,
+    /// Per-link reorder buffers.
+    reorder: Arc<Mutex<HashMap<LinkCut, ReorderBuf>>>,
+}
 
 // ── Per-replica vote-uniqueness observer (issue #422) ────────────────────────
 
@@ -493,6 +711,11 @@ pub struct SimCluster {
     /// [`SimCluster::set_slow_node`]. Each `Arc` is shared with the
     /// running bridge task spawned in [`SimCluster::spawn_inner`].
     slow_node_delays_us: Arc<HashMap<NodeId, Arc<AtomicU64>>>,
+    /// Per-link selective-drop / reorder state (audit L3-2). Shared with
+    /// every route task; installed via [`SimCluster::drop_messages_if`]
+    /// and [`SimCluster::reorder_link`], cleared by
+    /// [`SimCluster::heal_partition`].
+    controls: SelectiveControls,
 }
 
 impl SimCluster {
@@ -847,6 +1070,9 @@ impl SimCluster {
         // a dead node and also short-circuit outbound frames from a node
         // that has already been killed.
         let dead_nodes: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
+        // Per-link selective-drop / reorder controls (audit L3-2); empty
+        // until a test installs one.
+        let controls = SelectiveControls::default();
 
         // Per-node event channel: routing tasks write here; each node's
         // run() loop reads from its receiver.
@@ -1062,6 +1288,7 @@ impl SimCluster {
                 route_adv,
                 Arc::clone(&vote_observer),
                 PayloadFraming::Mesh,
+                controls.clone(),
             );
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1137,6 +1364,7 @@ impl SimCluster {
             equivocations_counters,
             proposal_equivocations_counters,
             slow_node_delays_us,
+            controls,
         };
         (cluster, limiters)
     }
@@ -1371,14 +1599,104 @@ impl SimCluster {
         }
     }
 
+    /// Drop frames on the directed link `from_idx → to_idx` whose
+    /// decoded [`SimMessage`] satisfies `predicate`. The predicate is
+    /// consulted on every frame the route task would deliver on this
+    /// link (after the whole-link partition / cut filters); returning
+    /// `true` drops the frame silently at the wire — the receiver never
+    /// sees it and no counter moves.
+    ///
+    /// Unlike [`cut_link`], which severs the whole link, this drops only
+    /// the matching subset — e.g. a Byzantine leader that withholds its
+    /// `Proposal` from one follower while delivering everything else:
+    ///
+    /// ```ignore
+    /// cluster.drop_messages_if(leader, follower, Arc::new(|m: &SimMessage| {
+    ///     m.kind == SimMessageKind::Proposal
+    /// }));
+    /// ```
+    ///
+    /// Multiple predicates on the same link compose: a frame is dropped
+    /// if *any* of them returns `true`. Frames that don't decode to a
+    /// [`boule_consensus::wire::WireMessage`] are delivered unfiltered.
+    /// All predicates are cleared by [`SimCluster::heal_partition`].
+    ///
+    /// [`cut_link`]: SimCluster::cut_link
+    pub fn drop_messages_if(&self, from_idx: usize, to_idx: usize, predicate: DropPredicate) {
+        let key = (self.node_ids[from_idx], self.node_ids[to_idx]);
+        self.controls
+            .drop_predicates
+            .lock()
+            .entry(key)
+            .or_default()
+            .push(predicate);
+    }
+
+    /// Buffer up to `depth` frames on the directed link `from_idx →
+    /// to_idx` and release them in seeded-deterministic permuted order,
+    /// modelling a relay that reorders packets.
+    ///
+    /// Each new arrival past the first `depth` evicts one buffered frame
+    /// chosen by a per-link RNG seeded from the link identity (no
+    /// `SystemTime` / thread RNG), so a fixed topology replays
+    /// identically. The buffer is bounded at `depth`: one frame leaves
+    /// per arrival in steady state, so the link neither stalls nor grows
+    /// — it just permutes delivery order within a `depth`-wide window.
+    /// The residual `< depth` frames left buffered when traffic stops are
+    /// flushed by [`SimCluster::heal_partition`].
+    ///
+    /// Installing a buffer on a link that already has one replaces it
+    /// (resetting the window and reseeding). `depth` is clamped to a
+    /// minimum of 1.
+    pub fn reorder_link(&self, from_idx: usize, to_idx: usize, depth: usize) {
+        let from = self.node_ids[from_idx];
+        let to = self.node_ids[to_idx];
+        self.controls
+            .reorder
+            .lock()
+            .insert((from, to), ReorderBuf::new(from, to, depth));
+    }
+
     /// Clear every partition cut installed by
     /// [`SimCluster::partition_into_groups`],
     /// [`SimCluster::partition_into_two`], or
-    /// [`SimCluster::partition_one_way`]. Application-level cuts
-    /// installed via [`SimCluster::cut_link`] and per-node partitions
-    /// installed via [`SimCluster::partition_node`] are unaffected.
+    /// [`SimCluster::partition_one_way`], plus all selective-drop
+    /// predicates ([`SimCluster::drop_messages_if`]) and reorder buffers
+    /// ([`SimCluster::reorder_link`]) — restoring full delivery on every
+    /// link. Reorder buffers are *flushed* (their residual frames
+    /// delivered in seeded order) rather than discarded, so heal does not
+    /// silently swallow in-flight messages.
+    ///
+    /// Application-level cuts installed via [`SimCluster::cut_link`] and
+    /// per-node partitions installed via [`SimCluster::partition_node`]
+    /// are unaffected.
     pub fn heal_partition(&self) {
         self.partition_blocks.lock().clear();
+        self.controls.drop_predicates.lock().clear();
+
+        // Flush each reorder buffer's residual window before clearing,
+        // then deliver via the inbound mailboxes directly (heal is sync,
+        // so we can't go back through the async route loop). Collect and
+        // sort by (from, to) so the cross-link flush order into any
+        // shared receiver is deterministic rather than HashMap-ordered.
+        let mut drained: Vec<(NodeId, NodeId, Bytes)> = Vec::new();
+        {
+            let mut bufs = self.controls.reorder.lock();
+            for ((from, to), buf) in bufs.iter_mut() {
+                for payload in buf.drain_permuted() {
+                    drained.push((*from, *to, payload));
+                }
+            }
+            bufs.clear();
+        }
+        drained.sort_by_key(|t| (t.0, t.1));
+        for (from, to, payload) in drained {
+            if let Some(slot) = self.event_txs.get(&to) {
+                let _ = slot
+                    .lock()
+                    .try_send(ProtocolEvent::Message { from, payload });
+            }
+        }
     }
 
     /// Drain all blocks currently buffered in every `commit_rx` — plus
@@ -1579,6 +1897,11 @@ impl SimCluster {
         self.partitioned.lock().clear();
         self.link_cuts.lock().clear();
         self.partition_blocks.lock().clear();
+        // Selective-drop / reorder controls don't survive a full restart
+        // (the honest-recovery scenario installs none); clear for parity
+        // with the partition sets above.
+        self.controls.drop_predicates.lock().clear();
+        self.controls.reorder.lock().clear();
 
         let mut new_event_txs: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> = HashMap::new();
         let mut new_event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
@@ -1661,6 +1984,7 @@ impl SimCluster {
                 None,
                 Arc::clone(&self.vote_observer),
                 PayloadFraming::Mesh,
+                self.controls.clone(),
             );
 
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1898,6 +2222,7 @@ impl SimCluster {
             None,
             Arc::clone(&self.vote_observer),
             PayloadFraming::Mesh,
+            self.controls.clone(),
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -2062,6 +2387,7 @@ fn spawn_route_task(
     adversary: Option<(Arc<dyn Adversary>, AdversaryCtx)>,
     vote_observer: Arc<VoteObserver>,
     framing: PayloadFraming,
+    controls: SelectiveControls,
 ) {
     tokio::spawn(async move {
         while let Some(outbound) = send_rx.recv().await {
@@ -2108,6 +2434,8 @@ fn spawn_route_task(
                     &link_cuts,
                     &partition_blocks,
                     &dead_nodes,
+                    &controls,
+                    framing,
                 )
                 .await;
             }
@@ -2129,9 +2457,23 @@ async fn route_one_frame(
     link_cuts: &Mutex<HashSet<LinkCut>>,
     partition_blocks: &Mutex<HashSet<LinkCut>>,
     dead_nodes: &Mutex<HashSet<NodeId>>,
+    controls: &SelectiveControls,
+    framing: PayloadFraming,
 ) {
+    // Cheap per-frame gate: skip the decode + per-target predicate/buffer
+    // locks entirely on honest clusters that installed no controls.
+    let drop_active = !controls.drop_predicates.lock().is_empty();
+    let reorder_active = !controls.reorder.lock().is_empty();
+
     match outbound {
         ProtocolOutbound::Broadcast(payload) => {
+            // Decode once per frame (not per target): the payload is the
+            // same for every broadcast recipient.
+            let decoded = if drop_active {
+                decode_sim_message(&payload, framing)
+            } else {
+                None
+            };
             for (target, tx_slot) in route_txs.iter() {
                 if *target == my_id {
                     continue;
@@ -2148,17 +2490,17 @@ async fn route_one_frame(
                 if partition_blocks.lock().contains(&(my_id, *target)) {
                     continue;
                 }
-                // Clone the sender out of the per-entry mutex so we
-                // never hold the lock across the async send. The
-                // `restart_node_with_recover` path swaps the inner
-                // sender; subsequent frames re-clone the new one.
-                let tx = tx_slot.lock().clone();
-                let _ = tx
-                    .send(ProtocolEvent::Message {
-                        from: my_id,
-                        payload: payload.clone(),
-                    })
-                    .await;
+                deliver_one(
+                    my_id,
+                    *target,
+                    &payload,
+                    &decoded,
+                    tx_slot,
+                    controls,
+                    drop_active,
+                    reorder_active,
+                )
+                .await;
             }
         }
         ProtocolOutbound::SendTo { node_id, payload } => {
@@ -2178,15 +2520,87 @@ async fn route_one_frame(
                 return;
             }
             if let Some(tx_slot) = route_txs.get(&node_id) {
-                let tx = tx_slot.lock().clone();
-                let _ = tx
-                    .send(ProtocolEvent::Message {
-                        from: my_id,
-                        payload,
-                    })
-                    .await;
+                let decoded = if drop_active {
+                    decode_sim_message(&payload, framing)
+                } else {
+                    None
+                };
+                deliver_one(
+                    my_id,
+                    node_id,
+                    &payload,
+                    &decoded,
+                    tx_slot,
+                    controls,
+                    drop_active,
+                    reorder_active,
+                )
+                .await;
             }
         }
+    }
+}
+
+/// Apply the selective-drop predicate and reorder buffer for the single
+/// directed link `my_id → target`, then deliver whatever should leave the
+/// link now. Runs *after* the partition / dead / cut filters in
+/// [`route_one_frame`], so the whole-link controls still take precedence.
+///
+/// `decoded` is the frame projected to [`SimMessage`] once by the caller
+/// (`None` when no drop predicate is registered or the frame didn't
+/// decode — either way the predicate is not consulted). No
+/// [`parking_lot`] guard is held across the `.await`: the reorder lock is
+/// scoped to compute the to-send frame and the sender is cloned out of
+/// its slot before sending.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_one(
+    my_id: NodeId,
+    target: NodeId,
+    payload: &Bytes,
+    decoded: &Option<SimMessage>,
+    tx_slot: &Mutex<mpsc::Sender<ProtocolEvent>>,
+    controls: &SelectiveControls,
+    drop_active: bool,
+    reorder_active: bool,
+) {
+    // Selective drop: any registered predicate on this link that returns
+    // `true` drops the frame silently at the wire.
+    if drop_active {
+        if let Some(msg) = decoded {
+            let preds = controls.drop_predicates.lock();
+            if let Some(list) = preds.get(&(my_id, target)) {
+                if list.iter().any(|p| p(msg)) {
+                    return;
+                }
+            }
+        }
+    }
+
+    // Reorder: buffer on the link and release a (possibly different)
+    // earlier frame. With no reorder buffer the frame passes straight
+    // through. The lock is dropped before the await below.
+    let to_send: Option<Bytes> = if reorder_active {
+        let mut bufs = controls.reorder.lock();
+        match bufs.get_mut(&(my_id, target)) {
+            Some(buf) => buf.push(payload.clone()),
+            None => Some(payload.clone()),
+        }
+    } else {
+        Some(payload.clone())
+    };
+
+    if let Some(payload) = to_send {
+        // Clone the sender out of the per-entry mutex so we never hold
+        // the lock across the async send. The
+        // `restart_node_with_recover` path swaps the inner sender;
+        // subsequent frames re-clone the new one.
+        let tx = tx_slot.lock().clone();
+        let _ = tx
+            .send(ProtocolEvent::Message {
+                from: my_id,
+                payload,
+            })
+            .await;
     }
 }
 
@@ -2336,6 +2750,7 @@ impl SimCluster {
         let link_cuts: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
         let partition_blocks: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
         let dead_nodes: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
+        let controls = SelectiveControls::default();
 
         // Per-replica vote-uniqueness observer (issue #422). Same
         // default-on observer the mesh constructors install; the
@@ -2494,6 +2909,7 @@ impl SimCluster {
                 None,
                 Arc::clone(&vote_observer),
                 PayloadFraming::GossipOverlay,
+                controls.clone(),
             );
 
             pending.push(PendingNode {
@@ -2606,6 +3022,7 @@ impl SimCluster {
             equivocations_counters,
             proposal_equivocations_counters,
             slow_node_delays_us: Arc::new(slow_node_delays_us),
+            controls,
         }
     }
 }
@@ -2650,7 +3067,8 @@ mod tests {
     use tokio::task::yield_now;
 
     use super::{
-        LinkCut, SimCluster, VoteObserver, assert_no_conflicts, fresh_signer, spawn_route_task,
+        LinkCut, SimCluster, SimMessage, SimMessageKind, VoteObserver, assert_no_conflicts,
+        fresh_signer, spawn_route_task,
     };
     use boule_consensus::View;
     use boule_consensus::replication::block::Block;
@@ -2774,6 +3192,7 @@ mod tests {
                     None,
                     Arc::clone(&vote_observer),
                     super::PayloadFraming::Mesh,
+                    super::SelectiveControls::default(),
                 );
             }
 
@@ -4090,6 +4509,201 @@ mod tests {
         // Connected nodes keep going at the same rate, so they should
         // also gain ≥ 5.
         assert_each_gained_at_least(&heights_mid, &heights_after_heal, 5, &[], "post_heal_phase");
+    }
+
+    // ── audit L3-2: selective-drop / packet-reorder primitives ────────────────
+
+    /// Deterministic-given-seed reorder: a fixed `(from, to, depth)` and
+    /// a fixed arrival sequence must produce a byte-identical release
+    /// order every run. Guards the acceptance criterion that the reorder
+    /// schedule depends only on the seeded RNG, never on `SystemTime` or
+    /// map iteration order.
+    #[test]
+    fn reorder_buf_is_deterministic_given_link() {
+        use super::ReorderBuf;
+
+        let from: NodeId = [7; 32];
+        let to: NodeId = [9; 32];
+
+        // Replay the same arrival stream through two independently
+        // constructed buffers; the evicted-frame sequence (including the
+        // drained residual) must match exactly.
+        let run = || {
+            let mut buf = ReorderBuf::new(from, to, 4);
+            let mut out: Vec<u8> = Vec::new();
+            for i in 0u8..20 {
+                if let Some(b) = buf.push(Bytes::from(vec![i])) {
+                    out.push(b[0]);
+                }
+            }
+            for b in buf.drain_permuted() {
+                out.push(b[0]);
+            }
+            out
+        };
+
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "reorder schedule must be identical given the link");
+        // Every pushed frame is eventually released — buffering reorders,
+        // it must not drop.
+        let mut sorted = a.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0u8..20).collect::<Vec<_>>(),
+            "reorder must release every buffered frame exactly once",
+        );
+        // And it actually permutes (the 20-frame window is not delivered
+        // in arrival order under depth 4).
+        assert_ne!(
+            a,
+            (0u8..20).collect::<Vec<_>>(),
+            "depth-4 reorder over 20 frames should not be the identity order",
+        );
+    }
+
+    /// Selective `Proposal` drop. An honest leader's `Proposal` is
+    /// dropped to exactly one honest follower while delivered to everyone
+    /// else. The cluster must keep committing via the 3-of-4 quorum, and
+    /// the starved follower must *catch up* (gain commits of its own) by
+    /// pulling the blocks it never saw proposed via block-sync — not just
+    /// limp along at `> 0`.
+    ///
+    /// `node_ids` are sorted ascending and the round-robin selector picks
+    /// `leader_for_view(v) = node_ids[v % n]`, so node 0 leads views
+    /// 0, 4, 8, …. Dropping `Proposal`s on the directed link `0 → 1`
+    /// therefore starves follower node 1 of node 0's proposals (and only
+    /// those) every fourth view.
+    #[tokio::test]
+    async fn selective_proposal_drop_commits_via_quorum_and_follower_catches_up() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Drop only `Proposal` frames on 0 → 1; votes, new-views, and
+        // block-sync replies still flow, so node 1's catch-up path is
+        // open.
+        cluster.drop_messages_if(
+            0,
+            1,
+            Arc::new(|m: &SimMessage| m.kind == SimMessageKind::Proposal),
+        );
+
+        let baseline = cluster.peek_commit_heights();
+        let n = baseline.len();
+
+        // Every node — including the starved follower — must gain ≥ 10
+        // commits. The follower can only do so by block-syncing node 0's
+        // blocks it never received as proposals; an 8s simulated cap
+        // leaves ample headroom over the ~50ms/view cadence.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(8), |c| {
+                let h = c.peek_commit_heights();
+                (0..n).all(|i| h[i] >= baseline[i] + 10)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "selective proposal drop: not every node (incl. starved follower 1) gained ≥ 10 \
+             commits within 8s simulated (heights: {:?})",
+            cluster.peek_commit_heights(),
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
+    /// Selective `TimeoutVote` drop. With the view-`v` leader silent
+    /// (partitioned), the surviving replicas time out and broadcast
+    /// `TimeoutVote`s; we drop one survivor's `TimeoutVote` to one other
+    /// survivor. The timeout-certificate path must still make progress —
+    /// the cluster keeps committing — because a TC needs only 3 of 4 and
+    /// the dropped link is not on the critical collector's inbound path.
+    ///
+    /// This is the L2-1-adjacent shape the issue calls out: it pins that
+    /// selectively starving a single timeout link does not wedge
+    /// liveness.
+    #[tokio::test]
+    async fn selective_timeout_vote_drop_preserves_liveness() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Warm up so every replica has a committed prefix to extend.
+        let warm = cluster
+            .advance_and_yield_until(Duration::from_secs(2), |c| {
+                c.peek_commit_heights().iter().all(|&h| h >= 3)
+            })
+            .await;
+        assert!(
+            warm,
+            "warm-up: every replica must commit ≥ 3 before the drop is meaningful"
+        );
+
+        // Silence node 0 so its leader views (0, 4, 8, …) actually time
+        // out, generating `TimeoutVote` traffic, and drop node 1's
+        // timeout votes to node 2 specifically.
+        cluster.partition_node(0);
+        cluster.drop_messages_if(
+            1,
+            2,
+            Arc::new(|m: &SimMessage| m.kind == SimMessageKind::TimeoutVote),
+        );
+
+        let baseline = cluster.peek_commit_heights();
+
+        // Survivors {1, 2, 3} must keep committing despite the timeouts
+        // and the selectively-dropped timeout votes.
+        let survivors = [1usize, 2, 3];
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(8), |c| {
+                let h = c.peek_commit_heights();
+                survivors.iter().all(|&i| h[i] >= baseline[i] + 5)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "selective timeout-vote drop: survivors did not all gain ≥ 5 commits within 8s \
+             simulated (heights: {:?})",
+            cluster.peek_commit_heights(),
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
+    /// Reorder smoke. Buffer-and-permute a couple of links on an
+    /// otherwise happy-path cluster; under partial synchrony the protocol
+    /// must tolerate reordered delivery and keep committing. Not a
+    /// regression on a specific ordering — just that reorder is survived.
+    #[tokio::test]
+    async fn reorder_link_smoke_still_commits() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Reorder two disjoint directed links with a depth-4 window.
+        cluster.reorder_link(0, 1, 4);
+        cluster.reorder_link(2, 3, 4);
+
+        let baseline = cluster.peek_commit_heights();
+        let n = baseline.len();
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(8), |c| {
+                let h = c.peek_commit_heights();
+                (0..n).all(|i| h[i] >= baseline[i] + 10)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "reorder smoke: not every node gained ≥ 10 commits within 8s simulated \
+             (heights: {:?})",
+            cluster.peek_commit_heights(),
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
     }
 
     // ── #206: divergent on-disk state recovery ───────────────────────────────
