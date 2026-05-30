@@ -40,6 +40,7 @@
 //! The mixed property cycles all five adversary kinds across 6
 //! deterministic cases.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +52,7 @@ use super::sim::{Adversary, AdversaryCtx, SimCluster, assert_no_conflicts};
 use boule_consensus::View;
 use boule_consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote, Vote};
 use boule_consensus::hotstuff::{NewView, Proposal};
-use boule_consensus::replication::block::Block;
+use boule_consensus::replication::block::{Block, BlockHash};
 use boule_consensus::wire::WireMessage;
 use boule_core::crypto::signed::{ChainId, Signed};
 use boule_transport_tcp::{NodeId, ProtocolOutbound};
@@ -634,6 +635,118 @@ impl Adversary for TwinValidatorAdversary {
     }
 }
 
+// ── Coordinated multi-Byzantine state (audit L3-1) ───────────────────────────
+
+/// Joint state shared by the two coordinated equivocators in the
+/// `f = 2` adjacent-view fork scenario.
+///
+/// Each Byzantine, when it leads, forges a twin proposal (same shape as
+/// [`TwinKind::Proposal`]) and publishes its fork-block hash here; its
+/// partner reads the other's fork before forging, so the two
+/// adjacent-view forks are *causally linked* rather than independent —
+/// the leader of view `v+1` chains its fork onto the one the leader of
+/// view `v` opened. Without this channel the two equivocations are
+/// uncoordinated and the second can't reference the first. This is the
+/// "meaningful coordination" the L3-1 acceptance criteria call for.
+#[derive(Default)]
+struct CoordinationState {
+    /// Latest forged fork-block hash published by each coordinated
+    /// equivocator, keyed by the publisher's own [`NodeId`].
+    forks: HashMap<NodeId, BlockHash>,
+    /// How many times an equivocator read a *partner's* fork (a `NodeId`
+    /// other than its own) out of `forks` before forging. A non-zero
+    /// value proves the channel actually carried data across the two
+    /// Byzantines — not just that each wrote its own slot in isolation.
+    coordinated_reads: usize,
+}
+
+/// Coordinated equivocator (audit L3-1): the multi-Byzantine analogue of
+/// [`TwinValidatorAdversary`] under [`TwinKind::Proposal`]. When leading,
+/// it broadcasts the honest proposal plus a forged twin (mutated
+/// `state_commitment`) to *every* peer, so each honest replica observes
+/// both forks at the same view and the proposal-equivocation evidence
+/// path fires. Two instances share a [`CoordinationState`]: the second
+/// to act folds the partner's published fork hash into its own forged
+/// block, linking the two adjacent-view forks.
+///
+/// Safety holds for the same reason the single equivocator's does — each
+/// honest replica's `last_voted_view` monotonic check votes for at most
+/// one fork per view, and neither fork reaches the `2f+1 = 5` quorum at
+/// `n = 7`. Liveness holds because only the two adjacent Byzantine-led
+/// views fork; the five consecutive honest-led views still form a
+/// three-chain.
+struct CoordinatedEquivocatorAdversary {
+    coord: Arc<Mutex<CoordinationState>>,
+}
+
+impl CoordinatedEquivocatorAdversary {
+    fn new(coord: Arc<Mutex<CoordinationState>>) -> Self {
+        Self { coord }
+    }
+}
+
+impl Adversary for CoordinatedEquivocatorAdversary {
+    fn intercept(&self, ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound> {
+        let payload = outbound_payload(&outbound);
+        // Only equivocate our own proposals (i.e. when we lead). Every
+        // other emission passes through honestly — so a coordinated
+        // equivocator that is currently a follower still votes, which is
+        // what makes the honest-led views reach quorum.
+        let Some(WireMessage::Proposal(signed_a)) = decode(&payload) else {
+            return vec![outbound];
+        };
+
+        // Read the partner's most-recent fork (any entry not our own)
+        // out of the shared channel and fold it into our mutation, so
+        // the two adjacent-view forks are causally linked. Record the
+        // cross-read so the test can prove the channel carried data.
+        let partner_fork: Option<BlockHash> = {
+            let mut c = self.coord.lock();
+            let partner = c
+                .forks
+                .iter()
+                .find(|(id, _)| **id != ctx.my_id)
+                .map(|(_, h)| *h);
+            if partner.is_some() {
+                c.coordinated_reads += 1;
+            }
+            partner
+        };
+
+        // Forge twin proposal B at the same view: mutate
+        // `state_commitment` so the block hash diverges from the honest
+        // proposal. If we saw a partner's fork, fold its first byte in
+        // so B's identity depends on the partner's fork (the causal
+        // link). Re-sign under `ctx.chain_id` so honest receivers accept
+        // the envelope and reach the content-level safety check.
+        let block_a = signed_a.payload.block.clone();
+        let mut header_b = block_a.header.clone();
+        header_b.state_commitment[0] ^= 0x01;
+        if let Some(pf) = partner_fork {
+            header_b.state_commitment[1] ^= pf[0];
+        }
+        let block_b = Block {
+            header: header_b,
+            commands: block_a.commands.clone(),
+        };
+        let proposal_b = Proposal {
+            block: block_b,
+            justify: signed_a.payload.justify.clone(),
+        };
+        let signed_b = Signed::sign(proposal_b, ctx.signer.as_ref(), &ctx.chain_id)
+            .expect("coordinated equivocator re-signing must not fail (own signer is healthy)");
+
+        // Publish our fork hash for the partner to extend on its turn.
+        self.coord
+            .lock()
+            .forks
+            .insert(ctx.my_id, signed_b.payload.block.hash());
+
+        let payload_b = encode(&WireMessage::Proposal(signed_b));
+        vec![outbound, ProtocolOutbound::Broadcast(payload_b)]
+    }
+}
+
 // ── Tests / proptest properties ──────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1092,6 +1205,299 @@ mod tests {
                     _ => AdvKind::TwinTimeoutVote,
                 };
                 run_one_property(victim, kind).await
+            })?;
+        }
+    }
+
+    // ── Multi-Byzantine (n = 7, f = 2) coordinated adversaries (L3-1) ─────────
+    //
+    // The single-Byzantine catalog above covers `n = 4, f = 1`. The
+    // HotStuff safety theorem is parameterised by `f` Byzantine in
+    // `n = 3f+1`; these properties lift coverage to `f = 2` with *two*
+    // adversaries, including a genuinely coordinated pair sharing joint
+    // state. Quorum is 5-of-7 (uniform weight), the honesty threshold is
+    // `f+1 = 3`. The honest commit floor (`HONEST_FLOOR`) and time cap
+    // (`SIM_CAP`) are reused from the f=1 suite.
+
+    /// `n = 3f+1` for `f = 2`.
+    const F2_N: usize = 7;
+
+    /// Map a `0..10` selector to an [`AdvKind`]; shared by the mixed
+    /// composition property so each Byzantine samples the catalog
+    /// independently.
+    fn adv_kind_from_index(i: usize) -> AdvKind {
+        match i {
+            0 => AdvKind::Equivocator,
+            1 => AdvKind::VoteWithholder,
+            2 => AdvKind::StaleReplayer,
+            3 => AdvKind::ForgedQc,
+            4 => AdvKind::TimeoutSpammer,
+            5 => AdvKind::ForgedPiggyback,
+            6 => AdvKind::ForgedHistoryCommitment,
+            7 => AdvKind::TwinVote,
+            8 => AdvKind::TwinProposal,
+            _ => AdvKind::TwinTimeoutVote,
+        }
+    }
+
+    /// Spawn an `n`-node cluster with a Byzantine adversary installed at
+    /// each `(index, adversary)` slot; the rest run honest. Returns the
+    /// cluster and the sorted list of honest indices.
+    async fn spawn_with_adversaries_at(
+        n: usize,
+        slots: Vec<(usize, Arc<dyn Adversary>)>,
+    ) -> (SimCluster, Vec<usize>) {
+        let mut adversaries: Vec<Option<Arc<dyn Adversary>>> = (0..n).map(|_| None).collect();
+        for (idx, adv) in &slots {
+            adversaries[*idx] = Some(Arc::clone(adv));
+        }
+        let cluster =
+            SimCluster::spawn_with_adversaries(n, Duration::from_millis(50), adversaries).await;
+        let byz: Vec<usize> = slots.iter().map(|(i, _)| *i).collect();
+        let honest: Vec<usize> = (0..n).filter(|i| !byz.contains(i)).collect();
+        (cluster, honest)
+    }
+
+    proptest! {
+        // 4 cases per property: an n=7 cluster spawns 7 fresh Ed25519
+        // keypairs and routes ~2× the f=1 message volume, so each case
+        // is heavier than the f=1 suite's. 4 keeps every property well
+        // under the 15s-per-test ceiling while still sampling a range of
+        // Byzantine placements.
+        #![proptest_config(ProptestConfig {
+            cases: 4,
+            failure_persistence: None,
+            ..Default::default()
+        })]
+
+        /// **Two coordinated equivocators at adjacent views.** Byzantines
+        /// at sorted indices `b` and `b+1` lead views `b` and `b+1`
+        /// (round-robin `leader_for_view(v) = node_ids[v % n]`, so
+        /// adjacent indices ⇒ adjacent views), each twin-equivocating its
+        /// proposal and chaining its fork onto the partner's via the
+        /// shared [`CoordinationState`]. Asserts: no commit on either
+        /// fork (`assert_no_conflicts`), the 5 honest replicas still meet
+        /// the commit floor through the five honest-led views, both
+        /// equivocations are evidenced on ≥ `f+1 = 3` honest replicas,
+        /// and the coordination channel actually carried data across the
+        /// two Byzantines.
+        #[test]
+        fn proptest_f2_two_coordinated_equivocators_preserve_safety_and_evidence(
+            b in 0usize..7,
+        ) {
+            run_paused(|| async move {
+                let coord = Arc::new(Mutex::new(CoordinationState::default()));
+                let b1 = b;
+                let b2 = (b + 1) % F2_N;
+                let slots: Vec<(usize, Arc<dyn Adversary>)> = vec![
+                    (
+                        b1,
+                        Arc::new(CoordinatedEquivocatorAdversary::new(Arc::clone(&coord))),
+                    ),
+                    (
+                        b2,
+                        Arc::new(CoordinatedEquivocatorAdversary::new(Arc::clone(&coord))),
+                    ),
+                ];
+                let (mut cluster, honest) = spawn_with_adversaries_at(F2_N, slots).await;
+                let baseline = cluster.peek_commit_heights();
+
+                // Drive until the honest floor is met *and* the
+                // coordination channel has been read across the two
+                // Byzantines. The second condition matters because the
+                // bare floor can be reached from the first few honest-led
+                // views before the second Byzantine ever leads a view to
+                // read its partner's fork; without it the run early-exits
+                // and `coordinated_reads` is racily still 0.
+                let coord_probe = Arc::clone(&coord);
+                let honest_pred = honest.clone();
+                let baseline_pred = baseline.clone();
+                let satisfied = cluster
+                    .advance_and_yield_until(SIM_CAP, |c| {
+                        let h = c.peek_commit_heights();
+                        let floor_met = honest_pred
+                            .iter()
+                            .all(|&i| h[i] >= baseline_pred[i] + HONEST_FLOOR);
+                        floor_met && coord_probe.lock().coordinated_reads >= 1
+                    })
+                    .await;
+                let final_heights = cluster.peek_commit_heights();
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                prop_assert!(
+                    satisfied,
+                    "two coordinated equivocators at {b1},{b2}: honest floor (≥ {HONEST_FLOOR}) \
+                     and a cross-Byzantine coordination read were not both reached within \
+                     {SIM_CAP:?} simulated; baseline = {baseline:?}, final = {final_heights:?}, \
+                     coordinated_reads = {}",
+                    coord.lock().coordinated_reads,
+                );
+
+                let evidence: Vec<u64> = honest
+                    .iter()
+                    .map(|&i| cluster.peek_proposal_equivocations_detected(i))
+                    .collect();
+                let detectors = evidence.iter().filter(|&&c| c > 0).count();
+                prop_assert!(
+                    detectors >= 3,
+                    "two coordinated equivocators at {b1},{b2}: expected the \
+                     proposal-equivocation evidence path to fire on ≥ f+1 = 3 honest replicas, \
+                     got {detectors} (per-honest counts = {evidence:?})",
+                );
+
+                let reads = coord.lock().coordinated_reads;
+                prop_assert!(
+                    reads >= 1,
+                    "coordination channel was never read across the two Byzantines \
+                     (coordinated_reads = {reads})",
+                );
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
+
+        /// **Equivocator + withholder.** Byzantine #1 equivocates as
+        /// leader; Byzantine #2 withholds every vote. Tests that the
+        /// 5-of-7 quorum survives losing both Byzantines' contribution
+        /// (the withholder's vote and the equivocator's forked
+        /// leader-views) — the five honest replicas still commit, safety
+        /// preserved.
+        #[test]
+        fn proptest_f2_equivocator_plus_withholder_preserves_liveness(b in 0usize..7) {
+            run_paused(|| async move {
+                let b1 = b;
+                // +3 (mod 7) keeps the two Byzantines distinct and
+                // non-adjacent across the placement sweep.
+                let b2 = (b + 3) % F2_N;
+                let slots: Vec<(usize, Arc<dyn Adversary>)> = vec![
+                    (b1, Arc::new(EquivocatorAdversary)),
+                    (b2, Arc::new(VoteWithholderAdversary)),
+                ];
+                let (mut cluster, honest) = spawn_with_adversaries_at(F2_N, slots).await;
+                let baseline = cluster.peek_commit_heights();
+                let (satisfied, final_heights) =
+                    run_until_honest_floor_or_cap(&mut cluster, &honest, &baseline).await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                prop_assert!(
+                    satisfied,
+                    "equivocator@{b1} + withholder@{b2}: honest nodes did not all gain \
+                     ≥ {HONEST_FLOOR} commits within {SIM_CAP:?} simulated; \
+                     baseline = {baseline:?}, final = {final_heights:?}",
+                );
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
+
+        /// **Two TimeoutVote spammers.** Both Byzantines flood the
+        /// timeout buckets at distinct leader views. Asserts: no spurious
+        /// view advance wedges progress (the honesty-threshold gate holds
+        /// — the per-bucket cap evicts under joint pressure without OOM),
+        /// the honest replicas still meet the commit floor, and safety is
+        /// preserved.
+        #[test]
+        fn proptest_f2_two_timeout_spammers_preserve_liveness(b in 0usize..7) {
+            run_paused(|| async move {
+                let b1 = b;
+                let b2 = (b + 2) % F2_N;
+                let slots: Vec<(usize, Arc<dyn Adversary>)> = vec![
+                    (b1, Arc::new(TimeoutSpammerAdversary::new(2))),
+                    (b2, Arc::new(TimeoutSpammerAdversary::new(2))),
+                ];
+                let (mut cluster, honest) = spawn_with_adversaries_at(F2_N, slots).await;
+                let baseline = cluster.peek_commit_heights();
+                let (satisfied, final_heights) =
+                    run_until_honest_floor_or_cap(&mut cluster, &honest, &baseline).await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                prop_assert!(
+                    satisfied,
+                    "two timeout spammers at {b1},{b2}: honest nodes did not all gain \
+                     ≥ {HONEST_FLOOR} commits within {SIM_CAP:?} simulated; \
+                     baseline = {baseline:?}, final = {final_heights:?}",
+                );
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
+
+        /// **Coordinated piggyback forge.** Both Byzantines attach forged
+        /// high-view `high_qc` piggybacks to their TimeoutVotes. Asserts
+        /// that piggyback verification (#321 / 10-F3) holds under joint
+        /// pressure: neither forged QC can wedge the cluster or fork it —
+        /// the honest replicas keep committing and safety is preserved.
+        /// (A forged QC that slipped into `best_high_qc` would either
+        /// stall a replica on a non-existent block or admit a conflicting
+        /// commit; both surface here as a floor/safety failure.)
+        #[test]
+        fn proptest_f2_two_piggyback_forgers_preserve_safety_and_liveness(b in 0usize..7) {
+            run_paused(|| async move {
+                let b1 = b;
+                let b2 = (b + 2) % F2_N;
+                let slots: Vec<(usize, Arc<dyn Adversary>)> = vec![
+                    (b1, Arc::new(ForgedPiggybackAdversary::new(2))),
+                    (b2, Arc::new(ForgedPiggybackAdversary::new(2))),
+                ];
+                let (mut cluster, honest) = spawn_with_adversaries_at(F2_N, slots).await;
+                let baseline = cluster.peek_commit_heights();
+                let (satisfied, final_heights) =
+                    run_until_honest_floor_or_cap(&mut cluster, &honest, &baseline).await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                prop_assert!(
+                    satisfied,
+                    "two piggyback forgers at {b1},{b2}: honest nodes did not all gain \
+                     ≥ {HONEST_FLOOR} commits within {SIM_CAP:?} simulated; \
+                     baseline = {baseline:?}, final = {final_heights:?}",
+                );
+                Ok::<(), TestCaseError>(())
+            })?;
+        }
+
+        /// **Mixed-class composition at f=2.** Each Byzantine
+        /// independently samples the 10-class catalog (the f=1 mixed
+        /// property lifted to two adversaries). `sep ∈ 1..7` guarantees
+        /// the two placements are distinct. Asserts safety and the honest
+        /// commit floor across every sampled composition.
+        #[test]
+        fn proptest_f2_mixed_composition_preserves_safety_and_liveness(
+            b in 0usize..7,
+            sep in 1usize..7,
+            k1 in 0usize..10,
+            k2 in 0usize..10,
+        ) {
+            run_paused(|| async move {
+                let b1 = b;
+                let b2 = (b + sep) % F2_N;
+                let kind1 = adv_kind_from_index(k1);
+                let kind2 = adv_kind_from_index(k2);
+                let slots: Vec<(usize, Arc<dyn Adversary>)> = vec![
+                    (b1, build_adversary(kind1)),
+                    (b2, build_adversary(kind2)),
+                ];
+                let (mut cluster, honest) = spawn_with_adversaries_at(F2_N, slots).await;
+                let baseline = cluster.peek_commit_heights();
+                let (satisfied, final_heights) =
+                    run_until_honest_floor_or_cap(&mut cluster, &honest, &baseline).await;
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
+
+                prop_assert!(
+                    satisfied,
+                    "mixed f=2 [{}@{b1}, {}@{b2}]: honest nodes did not all gain \
+                     ≥ {HONEST_FLOOR} commits within {SIM_CAP:?} simulated; \
+                     baseline = {baseline:?}, final = {final_heights:?}",
+                    adv_label(kind1),
+                    adv_label(kind2),
+                );
+                Ok::<(), TestCaseError>(())
             })?;
         }
     }
