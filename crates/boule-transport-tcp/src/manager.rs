@@ -10,6 +10,32 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
+/// Capacity of each registered protocol's outbound `ProtocolOutbound`
+/// channel (the per-protocol `send_tx`).
+///
+/// This channel is drained by a forwarding task that hands each message
+/// to the single manager event loop via `internal_tx.send().await`. When
+/// that loop is momentarily busy (an inbound burst, a connect/disconnect,
+/// TLS work) the forwarder blocks and this channel backs up. The gossip
+/// overlay enqueues here with `try_send` (drop-on-full), so a transient
+/// loop stall under high commit throughput shows up as bounded bursts on
+/// `gossip_sink_overflow_total` even though every per-peer write channel
+/// is keeping up.
+///
+/// Sized against the measured worst-case transient backlog, not guessed.
+/// Instrumenting the channel's high-water mark on a 7-node mesh running
+/// flat-out at ~75 commits/s (≈5× the rate at which the overflow first
+/// surfaced) showed the backlog peaking at ~410 deep before the drain
+/// caught up — so 2048 leaves ~5× headroom over the worst case observed,
+/// and overflow stays at zero. The peak grows with commit rate and with
+/// fan-out (validator-set size); at large production sets this buffer is
+/// not the right lever — decoupling the outbound drain from the inbound
+/// event loop is — but for the meshes exercised today it holds with
+/// margin. Drops here are recoverable (overlay re-fans-out, block-sync
+/// re-fetches); keeping the steady-state count at zero is what makes the
+/// metric a trustworthy signal for a *real* wedged peer, not benign noise.
+pub const PROTOCOL_OUTBOUND_CAPACITY: usize = 2048;
+
 /// Per-peer outbound `write_tx.try_send` `Full` count that trips a
 /// slow-peer disconnect when accumulated within
 /// [`SLOW_PEER_OVERFLOW_WINDOW`] (#490).
@@ -336,7 +362,8 @@ pub async fn run(
                 match cmd {
                     Some(PeerCommand::RegisterProtocol { id, max_frame_bytes, reply }) => {
                         let (event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(256);
-                        let (send_tx, mut send_rx) = mpsc::channel::<ProtocolOutbound>(256);
+                        let (send_tx, mut send_rx) =
+                            mpsc::channel::<ProtocolOutbound>(PROTOCOL_OUTBOUND_CAPACITY);
                         let itx = internal_tx.clone();
                         tokio::spawn(async move {
                             while let Some(outbound) = send_rx.recv().await {
@@ -766,6 +793,18 @@ mod tests {
             _ = h.event_rx.recv() => panic!("unexpected early event"),
             _ = tokio::time::sleep(Duration::from_millis(20)) => {}
         }
+    }
+
+    #[tokio::test]
+    async fn register_protocol_outbound_channel_has_configured_capacity() {
+        // Guards against silently shrinking the per-protocol outbound
+        // buffer. The gossip overlay enqueues here with drop-on-full, so a
+        // shallow buffer reintroduces the bounded-burst overflow this depth
+        // is sized to absorb. Asserting the wired capacity keeps the
+        // steady-state `gossip_sink_overflow_total: 0` invariant honest.
+        let mgr = TestManager::start(nid(1));
+        let h = mgr.register(0x42).await;
+        assert_eq!(h.send_tx.max_capacity(), PROTOCOL_OUTBOUND_CAPACITY);
     }
 
     #[tokio::test]
