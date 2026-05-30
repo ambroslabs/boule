@@ -98,7 +98,7 @@ File-move map (`git mv` into each new crate's `src/`):
   tokio. The `#[cfg(test)]` block in limits.rs that references `consensus::node::WireMessage`
   moves to boule-node (or is deleted).
 - **boule-transport-tcp** ← the rest of `p2p/*` (tls, manager, rpc, listener, dialer,
-  connection, api, tls_protocol, overlay/{gossip,mesh,sink}, mod.rs's ConnectionProtocol/
+  connection, api, tls_protocol, overlay/{gossip,memory,sink}, mod.rs's ConnectionProtocol/
   PeerCommand/Protocol*). Deps: boule-transport, boule-core.
 - **boule-consensus** ← `consensus/*` minus `consensus/node/`, `sim.rs`, `sim_byzantine.rs`,
   `sim_crashpoint.rs`, `wire_fuzz.rs`; plus all of `replication/*`. Deps: boule-core only

@@ -85,7 +85,7 @@ use boule_transport_tcp::overlay::gossip::overlay::{
 use boule_transport_tcp::overlay::gossip::peer_list_task::{OverlayUnicast, PeerListGossipConfig};
 use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
 use boule_transport_tcp::overlay::{
-    Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery,
+    Broadcaster, Discovery, DiscoveryEvent, MemoryBroadcaster, MemoryDiscovery,
 };
 use boule_transport_tcp::{NodeId, ProtocolEvent, ProtocolOutbound};
 use bytes::Bytes;
@@ -1302,7 +1302,7 @@ impl SimCluster {
             // Per-node outbound channel: node writes here through its
             // `Broadcaster`; the routing task reads on the other side.
             let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
-            let broadcaster: Arc<dyn Broadcaster> = Arc::new(MeshBroadcaster::new(send_tx));
+            let broadcaster: Arc<dyn Broadcaster> = Arc::new(MemoryBroadcaster::new(send_tx));
             // The sim's existing topology never published PeerConnected
             // / PeerDisconnected events into ProtocolEvent for ordinary
             // mesh edges (only `kill_node` did, for survivors). Mirroring
@@ -1313,7 +1313,7 @@ impl SimCluster {
             // initial topology if status-snapshot fidelity matters.
             let (_disco_src_tx, disco_src_rx) =
                 tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
-            let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(disco_src_rx);
+            let discovery: Arc<dyn Discovery> = MemoryDiscovery::spawn(disco_src_rx);
 
             let route_adv = adversary_for_node.map(|adv| {
                 let ctx = AdversaryCtx {
@@ -2014,10 +2014,10 @@ impl SimCluster {
                 .with_commit_notifier(commit_notifier);
 
             let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
-            let broadcaster: Arc<dyn Broadcaster> = Arc::new(MeshBroadcaster::new(send_tx));
+            let broadcaster: Arc<dyn Broadcaster> = Arc::new(MemoryBroadcaster::new(send_tx));
             let (_disco_src_tx, disco_src_rx) =
                 tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
-            let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(disco_src_rx);
+            let discovery: Arc<dyn Discovery> = MemoryDiscovery::spawn(disco_src_rx);
 
             // No adversary on restart: the adversary trait binds to a
             // single session's `AdversaryCtx`; replaying it across a
@@ -2257,9 +2257,9 @@ impl SimCluster {
             .with_commit_notifier(commit_notifier);
 
         let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
-        let broadcaster: Arc<dyn Broadcaster> = Arc::new(MeshBroadcaster::new(send_tx));
+        let broadcaster: Arc<dyn Broadcaster> = Arc::new(MemoryBroadcaster::new(send_tx));
         let (_disco_src_tx, disco_src_rx) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
-        let discovery: Arc<dyn Discovery> = MeshDiscovery::spawn(disco_src_rx);
+        let discovery: Arc<dyn Discovery> = MemoryDiscovery::spawn(disco_src_rx);
 
         spawn_route_task(
             nid,

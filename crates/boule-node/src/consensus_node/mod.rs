@@ -159,8 +159,8 @@ pub(super) fn pacemaker_event_kind(ev: &PacemakerEvent) -> &'static str {
 
 /// Dispatch an [`Outbound`] from the dispatch layer through the
 /// [`Broadcaster`] trait object. The trait's implementations decide
-/// whether to drop on backpressure; today's `MeshBroadcaster` preserves
-/// the previous "send-and-await" semantics by awaiting an mpsc send.
+/// whether to drop on backpressure; the gossip `Broadcaster` preserves
+/// the "send-and-await" semantics by awaiting an mpsc send.
 ///
 /// When `rate_limiter` is `Some`, the per-peer egress byte cap (#553)
 /// is consulted on every directed [`Outbound::SendTo`]: the recipient
@@ -2996,15 +2996,16 @@ mod tests {
         tokio::sync::mpsc::Receiver<ProtocolOutbound>,
     ) {
         let (send_tx, send_rx) = tokio::sync::mpsc::channel::<ProtocolOutbound>(16);
-        let bc: Arc<dyn Broadcaster> =
-            Arc::new(boule_transport_tcp::overlay::MeshBroadcaster::new(send_tx));
+        let bc: Arc<dyn Broadcaster> = Arc::new(
+            boule_transport_tcp::overlay::MemoryBroadcaster::new(send_tx),
+        );
         (bc, send_rx)
     }
 
     /// Build a [`Discovery`] with no peers and a never-firing source.
     fn make_test_discovery() -> Arc<dyn Discovery> {
         let (_tx, rx) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
-        boule_transport_tcp::overlay::MeshDiscovery::spawn(rx)
+        boule_transport_tcp::overlay::MemoryDiscovery::spawn(rx)
     }
 
     #[test]

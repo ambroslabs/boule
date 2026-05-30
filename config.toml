@@ -9,9 +9,8 @@ cleanup_interval_secs = 60
 # addr = "127.0.0.1:7001"
 
 # Topology-overlay configuration. The partial-mesh gossip overlay
-# (issue #137) is the default; pin `mode = "mesh"` if you need the
-# legacy N–1-direct-connections behaviour. All other knobs apply only
-# in gossip mode and default to the values shown below.
+# (issue #137) is the only overlay. The knobs below default to the
+# values shown.
 #
 # In gossip mode each node dials toward `outbound_target` direct
 # TCP/TLS connections (default 8) and accepts at most `inbound_max`
@@ -28,7 +27,7 @@ cleanup_interval_secs = 60
 # and emits a warning at config load.
 #
 # [overlay]
-# mode = "gossip"               # "gossip" (default) | "mesh"
+# mode = "gossip"               # "gossip" (the only overlay)
 # outbound_target = 8           # outbound dial floor (#187)
 # inbound_max = 16              # inbound cap (#187)
 # total_max = 24                # total ceiling (#187)

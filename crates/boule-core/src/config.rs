@@ -25,10 +25,8 @@ pub struct Config {
     /// is started alongside the gossip and ping protocols.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consensus: Option<ConsensusConfig>,
-    /// Topology overlay configuration. Selects between the legacy
-    /// full-mesh implementation and the partial-mesh gossip overlay
-    /// (issue #137). When absent, defaults — including
-    /// `mode = "mesh"` — apply.
+    /// Topology overlay configuration for the partial-mesh gossip
+    /// overlay (issue #137). When absent, the gossip defaults apply.
     #[serde(default)]
     pub overlay: OverlayConfig,
     /// Per-peer rate limiting and global connection caps (issue #134).
@@ -871,10 +869,8 @@ fn default_max_violations() -> u32 {
     100
 }
 
-/// Topology-overlay configuration. Selects between the partial-mesh
-/// gossip overlay (`mode = "gossip"`, the default) and the legacy
-/// full-mesh implementation (`mode = "mesh"`, retained for fallback
-/// and for tests that want N–1 connectivity guarantees).
+/// Topology-overlay configuration for the partial-mesh gossip overlay
+/// (`mode = "gossip"`, the only overlay).
 ///
 /// Defaults are tuned to match the per-module `Default` impls in the
 /// gossip building blocks (`boule_transport_tcp::overlay::gossip::peer_list_task::PeerListGossipConfig`,
@@ -898,11 +894,10 @@ fn default_max_violations() -> u32 {
 /// warning at config load.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct OverlayConfig {
-    /// Which overlay implementation to use. Defaults to `gossip`
-    /// after the 25-node sim convergence test landed in stack 8 of
-    /// issue #137. Operators who need the legacy full-mesh behaviour
-    /// (every node holds N–1 direct connections) can set
-    /// `mode = "mesh"`.
+    /// Which overlay implementation to use. Only `gossip` exists today
+    /// (the legacy full-mesh overlay was retired in #137); the field is
+    /// kept so a future overlay can be selected without reshaping the
+    /// config.
     #[serde(default)]
     pub mode: OverlayMode,
     /// Soft floor on the outbound direct-peer count maintained by the
@@ -1003,18 +998,17 @@ impl OverlayConfig {
 }
 
 /// Which topology overlay implementation to drive consensus with.
+///
+/// Single-variant today — the legacy full-mesh overlay was retired once
+/// gossip became the production default (#137). The enum is retained so
+/// a future overlay can be added without reshaping the config surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverlayMode {
-    /// Legacy full-mesh implementation. Retained as an opt-in for
-    /// operators who need N–1 direct connectivity guarantees; the
-    /// gossip overlay is the default.
-    Mesh,
-    /// Partial-mesh gossip overlay (issue #137). Default since
-    /// stack 9 of #137 — operators get bounded direct-peer count
-    /// (`outbound_target`, default 8, plus the inbound caps from
-    /// #187) without coordinated config rollouts when the validator
-    /// set grows.
+    /// Partial-mesh gossip overlay (issue #137). Operators get a
+    /// bounded direct-peer count (`outbound_target`, default 8, plus
+    /// the inbound caps from #187) without coordinated config rollouts
+    /// when the validator set grows.
     #[default]
     Gossip,
 }
@@ -1975,26 +1969,6 @@ listen_addr = "127.0.0.1:8080"
         assert_eq!(c.overlay.dedup_ttl_ms, 120_000);
         assert_eq!(c.overlay.peer_table_capacity, 1_024);
         assert!(c.overlay.bootstrap_addrs.is_empty());
-    }
-
-    #[test]
-    fn overlay_mode_mesh_parses_explicitly() {
-        // After the stack-9 cutover, `mode = "gossip"` is the default,
-        // so operators who want the legacy full-mesh behaviour must
-        // opt in explicitly.
-        let c = parse(
-            r#"
-[node]
-listen_addr = "127.0.0.1:7000"
-
-[api]
-listen_addr = "127.0.0.1:8080"
-
-[overlay]
-mode = "mesh"
-"#,
-        );
-        assert_eq!(c.overlay.mode, OverlayMode::Mesh);
     }
 
     #[test]

@@ -44,9 +44,7 @@ use boule_transport_tcp::overlay::gossip::overlay::{
 };
 use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
 use boule_transport_tcp::overlay::{self as overlay_traits};
-use boule_transport_tcp::overlay::{
-    Broadcaster, Discovery, DiscoveryEvent, MeshBroadcaster, MeshDiscovery,
-};
+use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use boule_transport_tcp::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
 use boule_transport_tcp::tls_protocol::TlsConnectionProtocol;
 use boule_transport_tcp::{self as p2p, ConnectionProtocol};
@@ -116,8 +114,11 @@ pub async fn run(
     let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
     let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
     let (peer_gone_tx, _) = broadcast::channel::<p2p::NodeId>(64);
-    // Discovery deltas (`PeerAdded`/`PeerRemoved`) feed `MeshDiscovery`
-    // and any other consumer that wants a topology-change event stream.
+    // The p2p manager publishes discovery deltas
+    // (`PeerAdded`/`PeerRemoved`) onto this channel for any consumer that
+    // wants a topology-change event stream. The gossip overlay tracks its
+    // own peer set, so today this has no subscriber in `node::run`; it is
+    // kept as part of the manager's general event surface.
     let (discovery_tx, _) = broadcast::channel::<DiscoveryEvent>(64);
 
     let manager_handle = {
@@ -131,9 +132,7 @@ pub async fn run(
         //     when absent we still want overlay-level caps (#187) to
         //     apply.
         //   - `[overlay]` (issue #187): degree-aware caps tied to the
-        //     gossip overlay's partial-mesh sizing. Active in
-        //     `mode = "gossip"`; in `mode = "mesh"` the operator opts
-        //     out by definition (full N–1 connectivity).
+        //     gossip overlay's partial-mesh sizing.
         let connection_limiter = build_connection_limiter(&config);
         tokio::spawn(p2p::manager::run(
             our_id,
@@ -188,8 +187,7 @@ pub async fn run(
     // Optionally start consensus. When the [consensus] section is
     // present, the protocol is registered, the ConsensusNode is
     // constructed (with disk storage if configured, otherwise in-memory)
-    // and its `run` loop is spawned. The active overlay (mesh or gossip)
-    // is selected from `config.overlay.mode`; for gossip mode the
+    // and its `run` loop is spawned. The gossip overlay's
     // bootstrap_addrs are dialed at boot via `Discovery::add_bootstrap`.
     let consensus_runtime = if let Some(cons_cfg) = config.consensus.as_ref() {
         // Build the rate limiter alongside consensus when `[p2p.limits]`
@@ -207,7 +205,6 @@ pub async fn run(
                 cons_cfg,
                 &config.overlay,
                 &p2p_cmd_tx,
-                &discovery_tx,
                 &validator_node_id,
                 &consensus_signer,
                 config.node.bls_validator_identity.as_ref(),
@@ -289,9 +286,7 @@ pub async fn run(
     Ok(())
 }
 
-/// Bundle returned by [`start_consensus`]. The overlay-related fields
-/// are populated when `[overlay] mode = "gossip"`; in mesh mode they
-/// are `None` / empty.
+/// Bundle returned by [`start_consensus`].
 struct RunningConsensus {
     /// Consensus event-loop join handle.
     join: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -300,30 +295,25 @@ struct RunningConsensus {
     /// Snapshot of the consensus status, served by the HTTP API.
     status_rx: watch::Receiver<Arc<ConsensusStatus>>,
     /// Oneshot that gracefully stops the gossip overlay (the
-    /// orchestrator + publisher + maintenance tasks). `None` in mesh
-    /// mode.
+    /// orchestrator + publisher + partial-mesh maintenance tasks).
     overlay_shutdown: Option<oneshot::Sender<()>>,
-    /// Overlay sub-task joins (orchestrator + publisher + mesh
-    /// maintenance). Empty in mesh mode.
+    /// Overlay sub-task joins (orchestrator + publisher + partial-mesh
+    /// maintenance).
     overlay_joins: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Start the HotStuff consensus protocol alongside gossip + ping.
 ///
-/// Branches on `overlay_cfg.mode`. In `Mesh` mode, registers
-/// `consensus::node::PROTOCOL_ID` and wraps the handle in
-/// [`MeshBroadcaster`] + [`MeshDiscovery`]. In `Gossip` mode,
-/// registers `boule_transport_tcp::overlay::gossip::PROTOCOL_ID`, spawns a
-/// `GossipOverlay` over the handle, ingests
+/// Registers `boule_transport_tcp::overlay::gossip::PROTOCOL_ID`, spawns
+/// a `GossipOverlay` over the handle, ingests
 /// `overlay_cfg.bootstrap_addrs` via `Discovery::add_bootstrap`, and
-/// uses `GossipBroadcaster` / `GossipDiscovery` in place of the mesh
-/// equivalents.
+/// wires consensus to the overlay's `GossipBroadcaster` /
+/// `GossipDiscovery`.
 #[allow(clippy::too_many_arguments)]
 async fn start_consensus(
     cons_cfg: &ConsensusConfig,
     overlay_cfg: &OverlayConfig,
     p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
-    discovery_tx: &broadcast::Sender<DiscoveryEvent>,
     self_id: &NodeId,
     signer: &Arc<NodeSigner>,
     bls_identity_config: Option<&BlsIdentityConfig>,
@@ -427,7 +417,6 @@ async fn start_consensus(
     } = build_overlay_wiring(
         overlay_cfg,
         p2p_cmd_tx,
-        discovery_tx,
         *self_id,
         self_listen_addr,
         inbound_disabled,
@@ -510,17 +499,14 @@ async fn start_consensus(
 /// without a connection limiter (the simulator and gossip-only test
 /// paths).
 ///
-/// Behaviour:
+/// Behaviour (the gossip overlay always contributes degree-aware caps
+/// from `[overlay]`, so a limiter is always built):
 ///
-/// - `[p2p.limits]` absent + `mode = "mesh"` → no limiter (back-compat).
-/// - `[p2p.limits]` absent + `mode = "gossip"` → limiter built from
-///   overlay caps only; outbound and per-IP fall through to
-///   `usize::MAX` (no abuse protection without `[p2p.limits]`).
-/// - Both present + `mode = "gossip"` → tighter of the two
-///   `max_inbound`s wins; overlay's `total_max` is the only source
-///   for `max_total`.
-/// - `mode = "mesh"` ignores overlay caps regardless — the operator
-///   explicitly opted into N–1 connectivity.
+/// - `[p2p.limits]` absent → limiter built from overlay caps only;
+///   outbound and per-IP fall through to `usize::MAX` (no abuse
+///   protection without `[p2p.limits]`).
+/// - `[p2p.limits]` present → tighter of the two `max_inbound`s wins;
+///   overlay's `total_max` is the only source for `max_total`.
 fn build_connection_limiter(
     config: &Config,
 ) -> Option<Arc<boule_core::transport::limits::ConnectionLimiter>> {
@@ -531,18 +517,15 @@ fn build_connection_limiter(
         .limits
         .as_ref()
         .map(boule_core::transport::limits::ConnectionLimitsConfig::from_config);
-    let overlay_caps_active = config.overlay.mode == OverlayMode::Gossip;
 
-    let merged = match (limits, overlay_caps_active) {
-        (None, false) => return None,
-        (None, true) => ConnectionLimitsConfig {
+    let merged = match limits {
+        None => ConnectionLimitsConfig {
             max_inbound: config.overlay.inbound_max,
             max_outbound: usize::MAX,
             max_per_ip: usize::MAX,
             max_total: config.overlay.total_max,
         },
-        (Some(l), false) => l,
-        (Some(l), true) => ConnectionLimitsConfig {
+        Some(l) => ConnectionLimitsConfig {
             max_inbound: l.max_inbound.min(config.overlay.inbound_max),
             max_outbound: l.max_outbound,
             max_per_ip: l.max_per_ip,
@@ -673,15 +656,14 @@ fn reconcile_bls_identity(
 
 /// Result of [`build_overlay_wiring`]: the broadcaster + discovery +
 /// event-receiver triple consensus consumes, plus the overlay-side
-/// shutdown / joins (only populated in gossip mode).
+/// shutdown / joins.
 struct OverlayWiring {
     broadcaster: Arc<dyn Broadcaster>,
     discovery: Arc<dyn Discovery>,
     event_rx: mpsc::Receiver<p2p::ProtocolEvent>,
     overlay_shutdown: Option<oneshot::Sender<()>>,
     overlay_joins: Vec<tokio::task::JoinHandle<()>>,
-    /// Shared overflow counter from the gossip [`OverlaySink`], when
-    /// `mode = OverlayMode::Gossip`. `None` for mesh-mode (no sink).
+    /// Shared overflow counter from the gossip [`OverlaySink`].
     /// Plumbed into [`ConsensusNode::with_gossip_sink_overflow_counter`]
     /// so [`boule_consensus::status::BackpressureStatus`] surfaces the
     /// running drop count.
@@ -700,7 +682,6 @@ struct OverlayWiring {
 async fn build_overlay_wiring(
     overlay_cfg: &OverlayConfig,
     p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
-    discovery_tx: &broadcast::Sender<DiscoveryEvent>,
     self_id: NodeId,
     self_listen_addr: std::net::SocketAddr,
     inbound_disabled: bool,
@@ -708,31 +689,6 @@ async fn build_overlay_wiring(
     clock: Arc<dyn Clock>,
 ) -> anyhow::Result<OverlayWiring> {
     match overlay_cfg.mode {
-        OverlayMode::Mesh => {
-            // Register the consensus protocol on its own ID; the mesh
-            // overlay routes consensus traffic through this channel
-            // directly.
-            let (reg_tx, reg_rx) = oneshot::channel();
-            p2p_cmd_tx
-                .send(p2p::PeerCommand::RegisterProtocol {
-                    id: boule_consensus::wire::PROTOCOL_ID,
-                    max_frame_bytes: Some(boule_consensus::wire::MAX_FRAME_BYTES),
-                    reply: reg_tx,
-                })
-                .await?;
-            let handle = reg_rx.await?;
-            info!("overlay: mesh");
-            let peer_outbound_overflows = Arc::clone(&handle.peer_outbound_overflows);
-            Ok(OverlayWiring {
-                broadcaster: Arc::new(MeshBroadcaster::new(handle.send_tx)),
-                discovery: MeshDiscovery::spawn(discovery_tx.subscribe()),
-                event_rx: handle.event_rx,
-                overlay_shutdown: None,
-                overlay_joins: Vec::new(),
-                gossip_sink_overflows: None,
-                peer_outbound_overflows,
-            })
-        }
         OverlayMode::Gossip => {
             // Register the gossip overlay's protocol. Consensus
             // traffic + overlay control frames share this channel

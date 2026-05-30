@@ -40,8 +40,7 @@
 //! fired before the subscriber existed are not replayed. Slow
 //! subscribers may lag (per `tokio::sync::broadcast` semantics) and
 //! miss events; combine `subscribe()` with a follow-up
-//! `known_peers()` snapshot for an always-current view. Same
-//! contract as the legacy [`super::super::MeshDiscovery`].
+//! `known_peers()` snapshot for an always-current view.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -55,8 +54,8 @@ use boule_core::transport::overlay::{Discovery, DiscoveryEvent};
 
 /// Broadcast channel depth for re-published `DiscoveryEvent`s.
 ///
-/// Matches the depth used by `MeshDiscovery::spawn` — peer churn
-/// happens at the same rate regardless of overlay impl.
+/// Peer churn happens at a bounded rate, so a small fixed depth is
+/// ample for the re-broadcast channel.
 const DISCOVERY_CHANNEL_DEPTH: usize = 64;
 
 /// [`Discovery`] implementation backed by the gossip overlay's
