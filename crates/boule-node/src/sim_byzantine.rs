@@ -1501,4 +1501,379 @@ mod tests {
             })?;
         }
     }
+
+    // ── Weighted-quorum re-validation of the adversary roster (#472) ──────────
+    //
+    // The catalog above (f=1 and f=2) ran at uniform weight = 1. The
+    // weighted-quorum stack (#463/#467) ships a strict-`>` predicate
+    // `3*signer_weight > 2*total_weight`; whether each adversary's
+    // safety/liveness story survives a *stake-heavy* Byzantine subset was
+    // unverified by automation (#470 covered only the silencing/kill
+    // fault model). These properties pair a non-uniform weight vector
+    // with each existing `Adversary` impl, picking the Byzantine subset
+    // weight-descending up to `floor(total_weight / 3)`.
+
+    /// Honest commit floor for the weighted properties. Deliberately a
+    /// single commit (vs. the f=1/f=2 floor of 3): the Byzantine subset
+    /// here sits right at the `floor(total/3)` weight boundary and `n` /
+    /// weight ranges are wide, so a `≥ 1` floor is the robust liveness
+    /// signal — "the honest survivors still make progress" — rather than
+    /// a throughput claim.
+    const WEIGHTED_FLOOR: u64 = 1;
+
+    /// Greedily pick the Byzantine subset *weight-descending* until the
+    /// next addition would push the running Byzantine weight past
+    /// `floor(total_weight / 3)`. Returns the chosen indices sorted
+    /// ascending (sorted-validator order, matching `cluster.node_ids`).
+    ///
+    /// Heaviest-first both maximises Byzantine influence within the bound
+    /// (the strongest test of the strict-`>` quorum boundary) and
+    /// *minimises the Byzantine node count* — reaching the weight cap in
+    /// the fewest validators — which keeps the honest-led run long enough
+    /// to form three-chains and is what makes liveness hold. Mirrors the
+    /// generator #470 used for its silencing test.
+    fn weight_descending_byzantine_subset(weights: &[u64]) -> Vec<usize> {
+        let total: u128 = weights.iter().map(|w| u128::from(*w)).sum();
+        let cap = total / 3;
+        let mut indexed: Vec<(usize, u64)> = weights.iter().copied().enumerate().collect();
+        indexed.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
+        let mut byz: Vec<usize> = Vec::new();
+        let mut byz_weight: u128 = 0;
+        for (idx, w) in indexed {
+            if byz_weight + u128::from(w) <= cap {
+                byz.push(idx);
+                byz_weight += u128::from(w);
+            }
+        }
+        byz.sort_unstable();
+        byz
+    }
+
+    /// Pick the *single* heaviest validator whose weight is ≤
+    /// `floor(total_weight / 3)` — one stake-heavy Byzantine carrying up
+    /// to ~⅓ of total weight.
+    ///
+    /// Used for the *leader-faulty* adversaries (the equivocator and the
+    /// forged-history-commitment leader) whose proposals produce **no QC
+    /// at their own leader views** — the equivocator's disjoint split
+    /// never reaches quorum on either fork, and the forged-history block
+    /// is rejected as structurally invalid. Under the round-robin (count-
+    /// based) leader rotation, a *multi*-validator Byzantine subset of
+    /// such leaders can occupy ≥1 of every three consecutive leader slots
+    /// and so deny chained HotStuff the three-consecutive-honest-leader
+    /// window it needs to commit — a real interaction between count-based
+    /// leadership and weighted quorums that this issue's *stake-weighted
+    /// leader selection* non-goal leaves open. A single Byzantine leaves
+    /// an `n-1`-length consecutive honest-leader run, so the three-chain
+    /// always forms and liveness is robust, while still stressing the
+    /// weighted-quorum boundary with a ~⅓-weight adversary. (Multi-
+    /// Byzantine equivocation *safety* at uniform weight is covered by the
+    /// f=2 coordinated-equivocator property above / #589.)
+    ///
+    /// Always returns exactly one index for `n ≥ 4`: the lowest-weight
+    /// validator has weight ≤ `total/n ≤ total/4 ≤ cap`, so the
+    /// candidate set is never empty.
+    fn heaviest_byzantine_within_cap(weights: &[u64]) -> Vec<usize> {
+        let total: u128 = weights.iter().map(|w| u128::from(*w)).sum();
+        let cap = total / 3;
+        weights
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, w)| u128::from(*w) <= cap)
+            .max_by_key(|(_, w)| *w)
+            .map(|(idx, _)| vec![idx])
+            .unwrap_or_default()
+    }
+
+    /// Map a `0..8` selector to a *QC-preserving* [`AdvKind`] — the
+    /// catalog minus the two leader-faulty kinds (`Equivocator`,
+    /// `ForgedHistoryCommitment`). Every kind here still produces a QC at
+    /// its own leader views (it proposes honestly, or — like
+    /// `TwinProposal` — broadcasts both forks so honest replicas converge
+    /// on the first), so a multi-Byzantine subset never denies the
+    /// three-chain window. Used by the weighted mixed-composition
+    /// property.
+    fn adv_kind_qc_preserving(i: usize) -> AdvKind {
+        match i % 8 {
+            0 => AdvKind::VoteWithholder,
+            1 => AdvKind::StaleReplayer,
+            2 => AdvKind::ForgedQc,
+            3 => AdvKind::TimeoutSpammer,
+            4 => AdvKind::ForgedPiggyback,
+            5 => AdvKind::TwinVote,
+            6 => AdvKind::TwinProposal,
+            _ => AdvKind::TwinTimeoutVote,
+        }
+    }
+
+    /// Shared body for the weighted-adversary properties. `select_byz`
+    /// picks the stake-heavy Byzantine subset from the weight vector
+    /// (multi-subset for QC-preserving adversaries, single-heaviest for
+    /// the leader-faulty ones); `make_adv(slot)` installs a fresh
+    /// adversary at each chosen index (stateful adversaries get their own
+    /// counters; `slot` lets the mixed variant vary the kind per
+    /// Byzantine). Spawns the weighted cluster and asserts:
+    ///
+    /// 1. Safety: `assert_no_conflicts` across every committed block.
+    /// 2. Liveness: every honest survivor gains ≥ `WEIGHTED_FLOOR`
+    ///    commits within `SIM_CAP` simulated.
+    async fn run_weighted_adversary_property<S, F>(
+        n: usize,
+        weights: Vec<u64>,
+        label: &str,
+        select_byz: S,
+        make_adv: F,
+    ) -> Result<(), TestCaseError>
+    where
+        S: Fn(&[u64]) -> Vec<usize>,
+        F: Fn(usize) -> Arc<dyn Adversary>,
+    {
+        let byz = select_byz(&weights);
+        let mut adversaries: Vec<Option<Arc<dyn Adversary>>> = (0..n).map(|_| None).collect();
+        for (slot, &idx) in byz.iter().enumerate() {
+            adversaries[idx] = Some(make_adv(slot));
+        }
+        let mut cluster = SimCluster::spawn_with_weights_and_adversaries(
+            n,
+            Duration::from_millis(50),
+            weights.clone(),
+            adversaries,
+        )
+        .await;
+
+        let honest: Vec<usize> = (0..n).filter(|i| !byz.contains(i)).collect();
+        let baseline = cluster.peek_commit_heights();
+        let honest_pred = honest.clone();
+        let baseline_pred = baseline.clone();
+        let satisfied = cluster
+            .advance_and_yield_until(SIM_CAP, |c| {
+                let h = c.peek_commit_heights();
+                honest_pred
+                    .iter()
+                    .all(|&i| h[i] >= baseline_pred[i] + WEIGHTED_FLOOR)
+            })
+            .await;
+        let final_heights = cluster.peek_commit_heights();
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        prop_assert!(
+            satisfied,
+            "{label}: honest survivors did not all gain ≥ {WEIGHTED_FLOOR} commit within \
+             {SIM_CAP:?} simulated (n={n}, weights={weights:?}, byzantine={byz:?}, \
+             baseline={baseline:?}, final={final_heights:?})",
+        );
+        Ok(())
+    }
+
+    proptest! {
+        // 4 cases per property: each spawns an n∈[4,7] weighted cluster
+        // and runs to a 1-commit floor, so the per-property wall-clock
+        // stays well under the 15s-per-test ceiling. `n ∈ [4, 7]`,
+        // weights ∈ `[1, 1000]` matches the spec the weighted-quorum
+        // proptests (#469) settled on.
+        #![proptest_config(ProptestConfig {
+            cases: 4,
+            failure_persistence: None,
+            ..Default::default()
+        })]
+
+        /// **Weighted equivocator** (single stake-heavy Byzantine — see
+        /// [`heaviest_byzantine_within_cap`] for why this adversary uses
+        /// the single-Byzantine selection). A ~⅓-weight equivocating
+        /// leader splits its proposal across disjoint subsets; two
+        /// disjoint honest subsets cannot each carry quorum weight (each
+        /// would need `> 2/3` of total, and `2·(2/3) > 1`), so at most one
+        /// fork commits — safety holds. With one Byzantine the remaining
+        /// `n-1` validators give a consecutive honest-leader run, so
+        /// honest-led views reach the weighted quorum and liveness holds.
+        #[test]
+        fn proptest_weighted_equivocator_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                run_weighted_adversary_property(
+                    n,
+                    weights,
+                    "weighted equivocator",
+                    heaviest_byzantine_within_cap,
+                    |_| build_adversary(AdvKind::Equivocator),
+                )
+                .await
+            })?;
+        }
+
+        /// **Weighted timeout spammer.** A stake-heavy spammer floods
+        /// spurious TimeoutVotes; the honesty-threshold gate (#218/#419)
+        /// is weight-aware, so the spam can't force a view advance, and
+        /// the honest super-majority keeps committing.
+        #[test]
+        fn proptest_weighted_timeout_spammer_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                run_weighted_adversary_property(
+                    n,
+                    weights,
+                    "weighted timeout-spammer",
+                    weight_descending_byzantine_subset,
+                    |_| build_adversary(AdvKind::TimeoutSpammer),
+                )
+                .await
+            })?;
+        }
+
+        /// **Weighted forged-piggyback spammer.** A stake-heavy adversary
+        /// attaches forged high-view `high_qc` piggybacks to its
+        /// TimeoutVotes; piggyback verification (#321 / 10-F3) must reject
+        /// them regardless of the signer's weight, so no forged QC enters
+        /// `best_high_qc` and the cluster keeps committing safely.
+        #[test]
+        fn proptest_weighted_forged_piggyback_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                run_weighted_adversary_property(
+                    n,
+                    weights,
+                    "weighted forged-piggyback",
+                    weight_descending_byzantine_subset,
+                    |_| build_adversary(AdvKind::ForgedPiggyback),
+                )
+                .await
+            })?;
+        }
+
+        /// **Weighted twin proposal.** A stake-heavy leader broadcasts a
+        /// genuine and a forged twin proposal at the same view to every
+        /// peer; each honest replica votes for at most one
+        /// (`last_voted_view` monotonic) so safety holds, and the
+        /// proposal-equivocation evidence path is exercised under weight.
+        #[test]
+        fn proptest_weighted_twin_proposal_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                run_weighted_adversary_property(
+                    n,
+                    weights,
+                    "weighted twin-proposal",
+                    weight_descending_byzantine_subset,
+                    |_| build_adversary(AdvKind::TwinProposal),
+                )
+                .await
+            })?;
+        }
+
+        /// **Weighted twin timeout-vote.** A stake-heavy adversary emits a
+        /// genuine and a forged twin TimeoutVote at the same view; the
+        /// timeout bucket folds at most one signature per `(view, signer)`
+        /// so the twin adds zero quorum weight under the weighted
+        /// predicate — safety and liveness hold.
+        #[test]
+        fn proptest_weighted_twin_timeout_vote_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                run_weighted_adversary_property(
+                    n,
+                    weights,
+                    "weighted twin-timeout-vote",
+                    weight_descending_byzantine_subset,
+                    |_| build_adversary(AdvKind::TwinTimeoutVote),
+                )
+                .await
+            })?;
+        }
+
+        /// **Weighted stale replayer.** A stake-heavy adversary replays
+        /// past signed envelopes on a schedule; stale frames are rejected
+        /// at ingress by view/round checks independent of signer weight,
+        /// so the honest super-majority keeps committing safely.
+        #[test]
+        fn proptest_weighted_stale_replayer_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                run_weighted_adversary_property(
+                    n,
+                    weights,
+                    "weighted stale-replayer",
+                    weight_descending_byzantine_subset,
+                    |_| build_adversary(AdvKind::StaleReplayer),
+                )
+                .await
+            })?;
+        }
+
+        /// **Weighted forged-history-commitment leader** (single
+        /// stake-heavy Byzantine — its rejected proposals produce no QC at
+        /// its leader views, so it uses the single-Byzantine selection for
+        /// the same reason as the equivocator; see
+        /// [`heaviest_byzantine_within_cap`]). A ~⅓-weight leader mutates
+        /// `block.header.validator_history_commitment`; honest replicas
+        /// reject the structurally-invalid block on the receive-side check
+        /// regardless of proposer weight, so no fork commits and liveness
+        /// recovers on the next honest leader.
+        #[test]
+        fn proptest_weighted_forged_history_commitment_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                run_weighted_adversary_property(
+                    n,
+                    weights,
+                    "weighted forged-history-commitment",
+                    heaviest_byzantine_within_cap,
+                    |_| build_adversary(AdvKind::ForgedHistoryCommitment),
+                )
+                .await
+            })?;
+        }
+
+        /// **Weighted mixed composition.** Each Byzantine slot in the
+        /// stake-heavy (multi-validator) subset independently runs a
+        /// *different* QC-preserving adversary (round-robin from a
+        /// proptest-chosen offset via [`adv_kind_qc_preserving`]) — the
+        /// `proptest_mixed_adversary` shape paired with a weight-bounded
+        /// Byzantine subset. The two leader-faulty kinds are excluded here
+        /// (they'd break the three-chain window under a multi-Byzantine
+        /// round-robin subset) and are covered by their own
+        /// single-Byzantine weighted properties above. Safety and the
+        /// honest commit floor must hold across every sampled composition.
+        #[test]
+        fn proptest_weighted_mixed_adversary_preserves_safety_and_liveness(
+            n in 4usize..=7,
+            weights7 in proptest::collection::vec(1u64..=1000, 7),
+            k0 in 0usize..10,
+        ) {
+            run_paused(|| async move {
+                let weights: Vec<u64> = weights7.into_iter().take(n).collect();
+                run_weighted_adversary_property(
+                    n,
+                    weights,
+                    "weighted mixed",
+                    weight_descending_byzantine_subset,
+                    move |slot| build_adversary(adv_kind_qc_preserving(k0 + slot)),
+                )
+                .await
+            })?;
+        }
+    }
 }
