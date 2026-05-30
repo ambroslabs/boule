@@ -938,6 +938,56 @@ impl SimCluster {
         .0
     }
 
+    /// Spawn `n` nodes with both non-uniform per-validator voting
+    /// `weights` and per-node Byzantine adversary slots, pairing the
+    /// weighted-quorum stack (#463/#467) with the [`Adversary`] hook so
+    /// the byzantine suite can re-validate each adversary under a
+    /// stake-heavy Byzantine subset (#472).
+    ///
+    /// Both vectors are indexed in *sorted* validator order — the slot
+    /// at index `i` belongs to the validator that sorts to index `i`,
+    /// the same order [`SimCluster::node_ids`] uses. `None` adversary
+    /// slots run the honest protocol unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n < 4`, `weights.len() != n`, `adversaries.len() != n`,
+    /// or any weight is 0.
+    pub async fn spawn_with_weights_and_adversaries(
+        n: usize,
+        timeout_base: Duration,
+        weights: Vec<u64>,
+        adversaries: Vec<Option<Arc<dyn Adversary>>>,
+    ) -> Self {
+        assert_eq!(
+            weights.len(),
+            n,
+            "spawn_with_weights_and_adversaries: weights.len() must equal n",
+        );
+        assert_eq!(
+            adversaries.len(),
+            n,
+            "spawn_with_weights_and_adversaries: adversaries.len() must equal n",
+        );
+        for (i, w) in weights.iter().enumerate() {
+            assert!(
+                *w >= 1,
+                "spawn_with_weights_and_adversaries: weight at index {i} is 0",
+            );
+        }
+        Self::spawn_inner(
+            n,
+            timeout_base,
+            SpawnExtras {
+                adversaries: Some(adversaries),
+                weights: Some(weights),
+                ..SpawnExtras::default()
+            },
+        )
+        .await
+        .0
+    }
+
     /// Same as [`SimCluster::spawn`] but installs a per-node rate
     /// limiter (issue #134) built from `rate_limits`. The returned
     /// `Vec<Arc<RateLimiter>>` is in the same order as
