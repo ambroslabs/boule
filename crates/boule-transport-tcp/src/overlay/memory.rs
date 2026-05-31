@@ -1,7 +1,7 @@
 //! In-memory [`Broadcaster`] and [`Discovery`] fakes for tests.
 //!
 //! These are **test doubles, not a transport.** Consensus is
-//! transport-agnostic — [`boule_consensus`]'s `ConsensusNode::run` takes
+//! transport-agnostic — `boule_consensus`'s `ConsensusNode::run` takes
 //! `Arc<dyn Broadcaster>` + `Arc<dyn Discovery>` — so tests drive a node
 //! by handing it these fakes instead of standing up TCP+TLS:
 //!
