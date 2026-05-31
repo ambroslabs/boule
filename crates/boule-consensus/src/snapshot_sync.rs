@@ -754,6 +754,8 @@ mod tests {
                 state_commitment: [0xCD; 32],
                 commands_commitment: Block::commands_commitment(&commands),
                 validator_history_commitment: [0; 32],
+                committed_height: crate::Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands,
         }

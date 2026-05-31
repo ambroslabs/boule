@@ -83,6 +83,10 @@ const TRACE_TARGET: &str = "boule_core::consensus";
 /// pacemaker (`AdvanceToView`) and re-injected at the integration
 /// layer, never wire-driven.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// `ProposalReceived` carries a full block and dwarfs the other event
+// variants; boxing it would churn every emission/match site for no real
+// win at consensus-event volumes.
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     /// A signed proposal arrived on the wire.
     ProposalReceived(crate::dispatch::Verified<Signed<Proposal>>),
@@ -2173,6 +2177,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             };
             let block = Block {
                 header,
@@ -2208,6 +2214,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             };
             Ok(Block {
                 header,
@@ -2240,6 +2248,8 @@ mod tests {
             state_commitment: [0; 32],
             commands_commitment: Block::commands_commitment(&[]),
             validator_history_commitment: [0; 32],
+            committed_height: Height::ZERO,
+            committed_state_root: [0; 32],
         };
         Block {
             header,
@@ -2399,6 +2409,8 @@ mod tests {
                 state_commitment: [0xFF; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -2441,6 +2453,8 @@ mod tests {
                 state_commitment: [view.0 as u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         }
@@ -2591,6 +2605,8 @@ mod tests {
                 state_commitment: [0xCC; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -2758,6 +2774,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -3096,6 +3114,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -3991,6 +4011,8 @@ mod tests {
                 state_commitment: [tag; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         }
@@ -4202,6 +4224,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -5402,6 +5426,8 @@ mod tests {
                     state_commitment: [0xCC; 32],
                     commands_commitment: Block::commands_commitment(&[]),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands: Vec::new(),
             };
@@ -6493,6 +6519,8 @@ mod tests {
                 state_commitment: [view.0 as u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             };
             let block = Block {
                 header,
@@ -7114,6 +7142,8 @@ mod tests {
                     state_commitment: [0xC0 + i as u8; 32],
                     commands_commitment: Block::commands_commitment(&[]),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 };
                 let fork = Block {
                     header,

@@ -221,6 +221,7 @@ mod tests {
             dropped_commands: 0,
             equivocations_detected: 0,
             proposal_equivocations_detected: 0,
+            state_divergence_detected: 0,
             backpressure: crate::status::BackpressureStatus::default(),
         }
     }
