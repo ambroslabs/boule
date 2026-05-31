@@ -864,24 +864,22 @@ impl ConsensusNode {
     /// discipline: any `Persist` updates are written atomically to storage
     /// before the next non-`Persist` action is executed.
     ///
-    /// # Self-loopback for `Broadcast` / `SendTo`
+    /// # Self-loopback for `Broadcast`
     ///
-    /// Production p2p broadcasts exclude the sender and `SendTo(self)`
-    /// is dropped by the p2p manager (see `src/p2p/manager.rs`). Without
-    /// help from this layer the proposing leader would never receive its
-    /// own `Broadcast(Proposal)` and the next-view leader would never
-    /// count the `SendTo(self_id, Vote)` it emits when it votes on the
-    /// current leader's proposal. Both losses combine to keep quorum one
-    /// signer short of threshold and deadlock the cluster (#118).
+    /// Production p2p broadcasts exclude the sender, so without help from
+    /// this layer the proposing leader would never receive its own
+    /// `Broadcast(Proposal)` and a replica would never count its own
+    /// `Broadcast(Vote)` — both losses keep quorum one signer short of
+    /// threshold and deadlock the cluster (#118). The safety core
+    /// broadcasts votes and new-views and emits no point-to-point sends
+    /// (#124), so the loopback only needs to handle `Broadcast`.
     ///
     /// For every `Broadcast(msg)` we both ship the signed frame on the
     /// wire AND feed the same signed envelope through the local
-    /// dispatcher, mirroring what a peer would do on receipt. For
-    /// `SendTo(target, msg)` where `target == self.self_id` we skip the
-    /// wire and only feed locally; for any other target we wire-send
-    /// without a local feed. `RequestBlock { peer, .. }` where
-    /// `peer == self.self_id` is degenerate (we would be asking
-    /// ourselves for a block we just asked about) and is dropped.
+    /// dispatcher, mirroring what a peer would do on receipt.
+    /// `RequestBlock { peer, .. }` where `peer == self.self_id` is
+    /// degenerate (we would be asking ourselves for a block we just
+    /// asked about) and is dropped.
     pub(super) async fn apply_safety_actions(
         &mut self,
         actions: Vec<SafetyAction>,
@@ -990,56 +988,6 @@ impl ConsensusNode {
                     }
                     self.deliver_loopback(loopback, broadcaster, view_timer, signer)
                         .await?;
-                }
-
-                SafetyAction::SendTo(target, msg) => {
-                    let bls_signer = self.bls_signer.as_deref();
-                    let (payload, loopback) = dispatch::egress_consensus_msg_with_loopback(
-                        &msg,
-                        signer.as_ref(),
-                        bls_signer,
-                        &self.validator_key_history,
-                        &self.chain_id,
-                    )?;
-                    let msg_is_vote = matches!(msg, ConsensusMsg::Vote(_));
-                    if target == self.self_id {
-                        tracing::debug!(
-                            target: TRACE_TARGET,
-                            msg = msg_kind(&msg),
-                            "outbound_loopback",
-                        );
-                        // Self-addressed: deliver locally; do not put bytes
-                        // on the wire (the p2p layer would drop them).
-                        self.deliver_loopback(loopback, broadcaster, view_timer, signer)
-                            .await?;
-                    } else {
-                        tracing::debug!(
-                            target: TRACE_TARGET,
-                            dest = %node_id_to_base58(&target),
-                            msg = msg_kind(&msg),
-                            "outbound_send_to",
-                        );
-                        send_outbound(
-                            broadcaster,
-                            self.rate_limiter.as_deref(),
-                            &self.peers_connected,
-                            Outbound::SendTo {
-                                to: target,
-                                payload,
-                            },
-                        )
-                        .await;
-                        // Vote frames are unicast `SendTo(next_leader)`
-                        // by default. After the bytes are on the wire
-                        // the replica has committed to that vote — so a
-                        // crash here exercises audit finding #1 (the
-                        // peer accepts the vote, the local replica
-                        // restarts, and if `last_voted_view` was not
-                        // already durable the restart equivocates).
-                        if msg_is_vote {
-                            crashpoint!("after_broadcast_vote");
-                        }
-                    }
                 }
 
                 SafetyAction::RequestBlock {

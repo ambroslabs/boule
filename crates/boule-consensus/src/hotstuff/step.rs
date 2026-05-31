@@ -197,11 +197,10 @@ pub enum StateUpdate {
 /// introduce that ordering alongside the unit tests that pin it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Send `msg` to every validator in the set.
+    /// Send `msg` to every validator in the set. The safety core emits
+    /// votes and new-views this way; there is no point-to-point variant
+    /// (votes are deliberately broadcast — #124).
     Broadcast(ConsensusMsg),
-    /// Send `msg` to a single validator. Used for votes addressed to
-    /// the leader of the next view.
-    SendTo(NodeId, ConsensusMsg),
     /// Persist `update` durably before any outbound network effect that
     /// semantically depends on it is flushed.
     Persist(StateUpdate),
@@ -5980,17 +5979,6 @@ mod tests {
                             // mutable `self.inboxes` borrow.
                             for target in 0..self.cores.len() {
                                 let event = self.event_from_msg(source_nid, msg.clone());
-                                self.inboxes[target].push_back(event);
-                            }
-                        }
-                        Action::SendTo(target_id, msg) => {
-                            // Drop silently if the target is
-                            // Byzantine — the adversary sees it on
-                            // the wire, but we don't model what they
-                            // do with it beyond the strategies in
-                            // the property tests.
-                            if let Some(target) = self.honest_index_of(&target_id) {
-                                let event = self.event_from_msg(source_nid, msg);
                                 self.inboxes[target].push_back(event);
                             }
                         }

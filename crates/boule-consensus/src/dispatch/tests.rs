@@ -411,29 +411,6 @@ fn egress_broadcast_encodes_signed_proposal() {
 }
 
 #[test]
-fn egress_send_to_encodes_vote() {
-    let signer = fresh_signer();
-    let target: NodeId = [0x55u8; 32];
-
-    let vote = Vote {
-        view: View(5),
-        block_hash: [0x77; 32],
-    };
-    let action =
-        crate::hotstuff::step::Action::SendTo(target, crate::hotstuff::ConsensusMsg::Vote(vote));
-
-    let out = egress_safety(&action, &signer, None, &ChainId::TEST)
-        .unwrap()
-        .unwrap();
-    let Outbound::SendTo { to, payload } = out else {
-        panic!("expected SendTo");
-    };
-    assert_eq!(to, target);
-    let decoded: WireMessage = postcard::from_bytes(&payload).unwrap();
-    assert!(matches!(decoded, WireMessage::Vote(_, _)));
-}
-
-#[test]
 fn egress_persist_returns_none() {
     let signer = fresh_signer();
     use crate::hotstuff::step::StateUpdate;
