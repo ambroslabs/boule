@@ -171,6 +171,8 @@ fn arb_block(genesis_hash: BlockHash) -> impl Strategy<Value = Block> {
                     state_commitment,
                     commands_commitment: Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 };
                 Block { header, commands }
             },
@@ -352,6 +354,8 @@ impl BlockBuilder for TestBlockBuilder {
             state_commitment: [0; 32],
             commands_commitment: Block::commands_commitment(&[]),
             validator_history_commitment: [0; 32],
+            committed_height: Height::ZERO,
+            committed_state_root: [0; 32],
         };
         Ok(Block {
             header,
@@ -640,6 +644,8 @@ fn malformed_signed_proposal(p: MalformedProposalInputs) -> Signed<Proposal> {
         state_commitment: [p.view.0 as u8; 32],
         commands_commitment: Block::commands_commitment(&[]),
         validator_history_commitment: [0; 32],
+        committed_height: Height::ZERO,
+        committed_state_root: [0; 32],
     };
     let block = Block {
         header,
@@ -874,6 +880,8 @@ proptest! {
                         state_commitment: [view.0 as u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
                         validator_history_commitment: [0; 32],
+                        committed_height: Height::ZERO,
+                        committed_state_root: [0; 32],
                     };
                     let block = Block { header, commands: Vec::new() };
                     let mut justify = QuorumCertificate::new(View::ZERO, [0; 32], validators.len());
@@ -896,6 +904,8 @@ proptest! {
                         state_commitment: [view.0 as u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
                         validator_history_commitment: [0; 32],
+                        committed_height: Height::ZERO,
+                        committed_state_root: [0; 32],
                     };
                     let block = Block { header, commands: Vec::new() };
                     let mut justify = QuorumCertificate::new(View::ZERO, genesis.hash(), validators.len());

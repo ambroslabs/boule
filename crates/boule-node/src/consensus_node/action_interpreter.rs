@@ -989,6 +989,48 @@ impl ConsensusNode {
                                 self.min_v_eff_delay,
                             );
                     }
+                    // Deferred state-root divergence check (#599). Before
+                    // broadcasting a vote, reproduce the proposed block's
+                    // deferred (lagged) committed state root from our own
+                    // execution. The check only fires when the block
+                    // anchors at a height we have already committed — so
+                    // the safety core has not yet applied this round's
+                    // `Action::Commit` (it follows the vote), our state
+                    // machine still sits at that committed frontier, and
+                    // the comparison is against state we have executed. A
+                    // mismatch means our state machine has diverged from
+                    // the chain (or the leader stamped a forged root);
+                    // either way we abstain — suppress the vote — rather
+                    // than help a block we cannot validate reach quorum.
+                    // The block's deferred root is in its header hash, so
+                    // a quorum's votes attest to it: a wrong root simply
+                    // loses that block its honest votes (rejected, no
+                    // halt), while genuine divergence isolates a minority
+                    // or, at >= f+1, stalls the chain — the intended
+                    // fail-safe.
+                    if self.vote_divergence_check_enabled
+                        && let ConsensusMsg::Vote(vote) = &msg
+                        && let Some(block) = self.core.state().pending_blocks.get(&vote.block_hash)
+                        && block.header.committed_height.0
+                            == self.last_committed_height.load(Ordering::Relaxed)
+                    {
+                        let local_root = self.state_machine.lock().state_commitment();
+                        if local_root != block.header.committed_state_root {
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                view = vote.view.0,
+                                committed_height = block.header.committed_height.0,
+                                claimed = %hex::encode(block.header.committed_state_root),
+                                local = %hex::encode(local_root),
+                                "consensus_state_divergence_detected",
+                            );
+                            self.state_divergence_detected
+                                .fetch_add(1, Ordering::Relaxed);
+                            // Abstain: skip both the wire send and the
+                            // self-loopback for this view.
+                            continue;
+                        }
+                    }
                     let bls_signer = self.bls_signer.as_deref();
                     let (payload, loopback) = dispatch::egress_consensus_msg_with_loopback(
                         &msg,

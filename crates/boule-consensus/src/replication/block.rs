@@ -78,6 +78,26 @@ pub struct BlockHeader {
     /// time is wired in by follow-up PRs in the #325 stack — until those
     /// land, the field is informational and never cross-checked.
     pub validator_history_commitment: [u8; 32],
+
+    /// Height of the proposer's committed frontier at the time this block
+    /// was built — the anchor for the deferred (lagged) state-root check.
+    pub committed_height: Height,
+
+    /// `StateMachine::state_commitment` over the proposer's committed
+    /// frontier (the block at [`Self::committed_height`]) — the *lagged*
+    /// state root, deliberately not this block's own post-state.
+    ///
+    /// A voter that has committed to `committed_height` reproduces this
+    /// from its own execution before voting; a mismatch means the voter's
+    /// state machine has diverged from the chain, and it abstains. Because
+    /// the field is in the header hash, the votes that form a block's QC
+    /// attest to it — so the lagged root is *agreed*, not one leader's
+    /// unverified claim. The deferral (vs. this block's immediate
+    /// `state_commitment`) is what makes the check verifiable at vote time
+    /// without re-executing the proposed block: execution happens at
+    /// commit, so only an already-committed ancestor's root can be
+    /// reproduced before voting.
+    pub committed_state_root: [u8; 32],
 }
 
 impl BlockHeader {
@@ -134,6 +154,12 @@ impl Block {
                 state_commitment,
                 commands_commitment: Self::commands_commitment(&commands),
                 validator_history_commitment,
+                // Genesis is its own committed frontier: height 0 with the
+                // initial state root. Inert for the deferred-root check,
+                // which only ever compares against a non-genesis proposing
+                // block's stamped frontier.
+                committed_height: Height::ZERO,
+                committed_state_root: state_commitment,
             },
             commands,
         }
@@ -227,6 +253,8 @@ mod tests {
             state_commitment: [0x33; 32],
             commands_commitment: Block::commands_commitment(&cmds(&[b"a", b"b"])),
             validator_history_commitment: [0; 32],
+            committed_height: Height(2),
+            committed_state_root: [0x66; 32],
         }
     }
 
@@ -239,6 +267,8 @@ mod tests {
             state_commitment: [0x55; 32],
             commands_commitment: Block::commands_commitment(&commands),
             validator_history_commitment: [0; 32],
+            committed_height: Height::ZERO,
+            committed_state_root: [0; 32],
         };
         Block { header, commands }
     }
@@ -305,8 +335,16 @@ mod tests {
         perturbed.commands_commitment[0] ^= 0xFF;
         assert_ne!(perturbed.hash(), original);
 
-        let mut perturbed = h;
+        let mut perturbed = h.clone();
         perturbed.validator_history_commitment[0] ^= 0xFF;
+        assert_ne!(perturbed.hash(), original);
+
+        let mut perturbed = h.clone();
+        perturbed.committed_height = Height(perturbed.committed_height.0.wrapping_add(1));
+        assert_ne!(perturbed.hash(), original);
+
+        let mut perturbed = h;
+        perturbed.committed_state_root[0] ^= 0xFF;
         assert_ne!(perturbed.hash(), original);
     }
 

@@ -300,6 +300,16 @@ pub struct ConsensusStatus {
     /// evidence.
     #[serde(default)]
     pub proposal_equivocations_detected: u64,
+    /// Cumulative count of state-machine divergences this node detected
+    /// at vote time: a proposed block's deferred (lagged) committed state
+    /// root, anchored at a height this node has committed, disagreed with
+    /// this node's own execution. Each increment corresponds to one
+    /// suppressed (abstained) vote. A non-zero, growing value means
+    /// either this node's state machine has diverged from the chain, or a
+    /// leader is stamping a forged committed root — both warrant
+    /// investigation. Monotonic for the lifetime of the node.
+    #[serde(default)]
+    pub state_divergence_detected: u64,
     /// Cumulative drop counts on the production drop-on-full
     /// back-pressure paths. See [`BackpressureStatus`].
     #[serde(default)]
@@ -393,6 +403,7 @@ mod tests {
             dropped_commands: 11,
             equivocations_detected: 2,
             proposal_equivocations_detected: 4,
+            state_divergence_detected: 7,
             backpressure: BackpressureStatus {
                 gossip_sink_overflow_total: 5,
                 peer_outbound_overflow_total: 9,
@@ -496,6 +507,9 @@ mod tests {
         // Proposal-equivocation counter (audit L5-1).
         assert_eq!(json["proposal_equivocations_detected"], 4);
 
+        // State-divergence counter (#599).
+        assert_eq!(json["state_divergence_detected"], 7);
+
         // Back-pressure overflow counters (#163 / #486 / #498 / #553).
         assert_eq!(json["backpressure"]["gossip_sink_overflow_total"], 5);
         assert_eq!(json["backpressure"]["peer_outbound_overflow_total"], 9);
@@ -560,6 +574,7 @@ mod tests {
             dropped_commands: 0,
             equivocations_detected: 0,
             proposal_equivocations_detected: 0,
+            state_divergence_detected: 0,
             backpressure: BackpressureStatus::default(),
         };
         let json = serde_json::to_value(&s).unwrap();

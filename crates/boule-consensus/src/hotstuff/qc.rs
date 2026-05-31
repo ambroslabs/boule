@@ -652,6 +652,11 @@ impl SignedMessage for TimeoutVote {
 /// [`Action::Broadcast`]: super::step::Action::Broadcast
 /// [`Signed`]: boule_core::crypto::signed::Signed
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// The `Proposal` variant carries a full block and is inherently far
+// larger than the vote/new-view variants; boxing it would churn every
+// construction and match site across dispatch and the integration layer
+// for no real memory win at consensus-message volumes.
+#[allow(clippy::large_enum_variant)]
 pub enum ConsensusMsg {
     Proposal(Proposal),
     Vote(Vote),

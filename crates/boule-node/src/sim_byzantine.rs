@@ -466,6 +466,46 @@ impl Adversary for ForgedHistoryCommitmentAdversary {
     }
 }
 
+/// A Byzantine leader that stamps a forged `committed_state_root` (the
+/// deferred/lagged state root, #599) into every proposal it broadcasts,
+/// leaving `committed_height` honest so the height-gate still passes on
+/// every honest voter at that frontier. Honest voters reproduce the real
+/// root from their own committed execution, see the mismatch, and abstain
+/// — the block gets no honest votes and is rejected, while honest nodes
+/// stay live. Models a leader trying to commit a state it cannot prove.
+///
+/// Re-signs with **`ctx.chain_id`** (the cluster's genesis-derived chain
+/// id), not `ChainId::TEST`, so the envelope verifies at recipients and
+/// the rejection comes specifically from the vote-time root check rather
+/// than an envelope-signature failure.
+pub struct ForgedCommittedRootAdversary;
+
+impl Adversary for ForgedCommittedRootAdversary {
+    fn intercept(&self, ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound> {
+        let payload = match &outbound {
+            ProtocolOutbound::Broadcast(p) => p.clone(),
+            _ => return vec![outbound],
+        };
+        let Some(WireMessage::Proposal(signed)) = decode(&payload) else {
+            return vec![outbound];
+        };
+
+        let mut block = signed.payload.block.clone();
+        // Sentinel root no honest replica would compute. `committed_height`
+        // is deliberately left untouched so the honest height-gate fires.
+        block.header.committed_state_root = [0xDE; 32];
+        let proposal = Proposal {
+            block,
+            justify: signed.payload.justify.clone(),
+        };
+        let signed_b = Signed::sign(proposal, ctx.signer.as_ref(), &ctx.chain_id)
+            .expect("forged-committed-root adversary re-signing must not fail");
+        vec![ProtocolOutbound::Broadcast(encode(&WireMessage::Proposal(
+            signed_b,
+        )))]
+    }
+}
+
 // ── Twin-mode adversary (issue #421) ─────────────────────────────────────────
 
 /// Which honest emission [`TwinValidatorAdversary`] should equivocate

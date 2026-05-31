@@ -533,6 +533,9 @@ pub trait Adversary: Send + Sync {
     fn intercept(&self, ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound>;
 }
 
+/// A shareable, mutable state machine as the consensus node holds it.
+pub(crate) type SimStateMachine = Arc<Mutex<Box<dyn StateMachine>>>;
+
 /// Internal bundle of optional features for [`SimCluster::spawn_inner`]
 /// so the public callers stay flat.
 #[derive(Default)]
@@ -574,6 +577,12 @@ struct SpawnExtras {
     /// value — this field only seeds the initial delays.
     /// Length must equal `n` if supplied.
     slow_node_delays: Option<Vec<Duration>>,
+    /// Per-node state machines (#599). When `Some(sms)`, node `i` gets
+    /// `sms[i]` instead of a fresh `CounterStateMachine`, letting a test
+    /// seed a *divergent* state machine on a subset of nodes to exercise
+    /// the deferred state-root divergence check. Length must equal `n`
+    /// if supplied.
+    state_machines: Option<Vec<SimStateMachine>>,
 }
 
 /// An in-memory cluster of N consensus nodes connected by channel-backed
@@ -702,6 +711,11 @@ pub struct SimCluster {
     /// [`SimCluster::peek_proposal_equivocations_detected`] without
     /// subscribing to a status publisher.
     proposal_equivocations_counters: Vec<Arc<AtomicU64>>,
+    /// Per-node clones of [`ConsensusNode::state_divergence_counter`]
+    /// (#599), captured at spawn time so a test can read each replica's
+    /// running state-divergence detection count via
+    /// [`SimCluster::peek_state_divergence_detected`].
+    state_divergence_counters: Vec<Arc<AtomicU64>>,
     /// Per-node runtime-mutable processing delay in microseconds,
     /// keyed by `NodeId`. Used by the slow-node bridge (#497) inserted
     /// between each node's inbound `event_rx` and its consensus
@@ -893,6 +907,7 @@ impl SimCluster {
                 weights: None,
                 slow_disk_delays: None,
                 slow_node_delays: None,
+                state_machines: None,
             },
         )
         .await
@@ -931,6 +946,38 @@ impl SimCluster {
                 weights: None,
                 slow_disk_delays: None,
                 slow_node_delays: None,
+                state_machines: None,
+            },
+        )
+        .await
+        .0
+    }
+
+    /// Spawn `n` nodes with a caller-supplied state machine per node
+    /// (#599). `state_machines` must have length `n`; entries are paired
+    /// with validators in [`SimCluster::node_ids`] (sorted) order. Lets a
+    /// test seed a *divergent* state machine on a subset of nodes to
+    /// exercise the deferred state-root divergence check.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `state_machines.len() != n` or `n < 4`.
+    pub async fn spawn_with_state_machines(
+        n: usize,
+        timeout_base: Duration,
+        state_machines: Vec<SimStateMachine>,
+    ) -> Self {
+        assert_eq!(
+            state_machines.len(),
+            n,
+            "spawn_with_state_machines: state_machines.len() must equal n",
+        );
+        Self::spawn_inner(
+            n,
+            timeout_base,
+            SpawnExtras {
+                state_machines: Some(state_machines),
+                ..SpawnExtras::default()
             },
         )
         .await
@@ -1014,6 +1061,7 @@ impl SimCluster {
                 weights: None,
                 slow_disk_delays: None,
                 slow_node_delays: None,
+                state_machines: None,
             },
         )
         .await
@@ -1034,10 +1082,14 @@ impl SimCluster {
             weights,
             slow_disk_delays,
             slow_node_delays,
+            state_machines,
         } = extras;
         let scheme = signature_scheme.unwrap_or_default();
         if let Some(adv) = adversaries.as_ref() {
             assert_eq!(adv.len(), n, "adversary slots must equal n");
+        }
+        if let Some(sms) = state_machines.as_ref() {
+            assert_eq!(sms.len(), n, "state_machines slots must equal n");
         }
         if let Some(ws) = weights.as_ref() {
             assert_eq!(ws.len(), n, "weights slots must equal n");
@@ -1199,6 +1251,7 @@ impl SimCluster {
         // Per-node proposal-equivocation counter Arcs (audit finding
         // L5-1), captured here for the same reason.
         let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut state_divergence_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
 
         for (idx, (nid, event_rx)) in event_rxs.into_iter().enumerate() {
             let signer = signer_map[&nid].clone();
@@ -1220,8 +1273,10 @@ impl SimCluster {
                 block_retention_window: 0,
             };
 
-            let sm: Arc<Mutex<Box<dyn StateMachine>>> =
-                Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+            let sm: Arc<Mutex<Box<dyn StateMachine>>> = state_machines
+                .as_ref()
+                .and_then(|sms| sms.get(idx).cloned())
+                .unwrap_or_else(|| Arc::new(Mutex::new(Box::new(CounterStateMachine::new()))));
             let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(256));
             mempools_captured.push(Arc::clone(&mempool));
             let raw_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -1367,6 +1422,7 @@ impl SimCluster {
             // L5-1), surfaced via
             // `SimCluster::peek_proposal_equivocations_detected`.
             proposal_equivocations_counters.push(node.proposal_equivocations_counter());
+            state_divergence_counters.push(node.state_divergence_counter());
 
             // Slow-node bridge (#497): the route-task side writes into
             // `event_rx`'s sender; the bridge drains `event_rx`,
@@ -1418,6 +1474,7 @@ impl SimCluster {
             vote_observer,
             equivocations_counters,
             proposal_equivocations_counters,
+            state_divergence_counters,
             slow_node_delays_us,
             controls,
         };
@@ -1789,6 +1846,15 @@ impl SimCluster {
     /// the run loop increments.
     pub fn peek_proposal_equivocations_detected(&self, idx: usize) -> u64 {
         self.proposal_equivocations_counters[idx].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of state-machine divergences node `idx` detected
+    /// at vote time (#599): a proposed block's deferred committed state
+    /// root, anchored at a height node `idx` had committed, disagreed
+    /// with node `idx`'s own execution, so it abstained. Used by the
+    /// divergence-detection sim tests.
+    pub fn peek_state_divergence_detected(&self, idx: usize) -> u64 {
+        self.state_divergence_counters[idx].load(Ordering::Relaxed)
     }
 
     /// Non-destructively report the highest committed [`Block`] height
@@ -2836,6 +2902,7 @@ impl SimCluster {
         let mut mempools_captured_gossip: Vec<Arc<dyn Mempool>> = Vec::new();
         let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
         let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut state_divergence_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
         // Hold the overlay shutdown senders for the lifetime of the
         // SimCluster — dropping them eagerly wakes the orchestrator's
         // `_ = &mut self.shutdown` select arm and tears the run loop
@@ -2891,6 +2958,7 @@ impl SimCluster {
                 .with_commit_notifier(commit_notifier);
             equivocations_counters.push(node.equivocations_counter());
             proposal_equivocations_counters.push(node.proposal_equivocations_counter());
+            state_divergence_counters.push(node.state_divergence_counter());
 
             // Per-node outbound channel: orchestrator's OverlaySink writes
             // here; the route task reads on the other side.
@@ -3076,6 +3144,7 @@ impl SimCluster {
             vote_observer,
             equivocations_counters,
             proposal_equivocations_counters,
+            state_divergence_counters,
             slow_node_delays_us: Arc::new(slow_node_delays_us),
             controls,
         }
@@ -7159,6 +7228,157 @@ mod tests {
             rotation_committed,
             "expected at least one committed block to carry the rotation tx",
         );
+    }
+
+    // ── #599: deferred state-root divergence detection ────────────────────
+
+    /// Test-only state machine that applies commands correctly (so the
+    /// committed chain content stays identical across nodes) but reports a
+    /// deterministically *perturbed* `state_commitment`. Seeding this on a
+    /// node simulates that node's execution having diverged — its
+    /// committed roots disagree with honest replicas'. The perturbation is
+    /// identical on every divergent node, so a set of divergent nodes
+    /// agree with each other but not with the honest majority.
+    #[derive(Debug)]
+    struct DivergentCounterStateMachine {
+        inner: boule_consensus::replication::impls::CounterStateMachine,
+    }
+
+    impl DivergentCounterStateMachine {
+        fn new() -> Self {
+            Self {
+                inner: boule_consensus::replication::impls::CounterStateMachine::new(),
+            }
+        }
+    }
+
+    impl boule_consensus::replication::state_machine::StateMachine for DivergentCounterStateMachine {
+        fn apply(&mut self, cmd: &[u8]) -> anyhow::Result<Bytes> {
+            self.inner.apply(cmd)
+        }
+        fn state_commitment(&self) -> [u8; 32] {
+            let mut c = self.inner.state_commitment();
+            c[0] ^= 0xFF;
+            c
+        }
+        fn snapshot(&self) -> Bytes {
+            self.inner.snapshot()
+        }
+        fn restore(&mut self, snap: &[u8]) -> anyhow::Result<()> {
+            self.inner.restore(snap)
+        }
+    }
+
+    /// Build `n` state machines, the indices in `divergent` getting a
+    /// [`DivergentCounterStateMachine`] and the rest a plain
+    /// `CounterStateMachine`.
+    fn state_machines_with_divergent(n: usize, divergent: &[usize]) -> Vec<super::SimStateMachine> {
+        (0..n)
+            .map(|i| {
+                let sm: Box<dyn boule_consensus::replication::state_machine::StateMachine> =
+                    if divergent.contains(&i) {
+                        Box::new(DivergentCounterStateMachine::new())
+                    } else {
+                        Box::new(boule_consensus::replication::impls::CounterStateMachine::new())
+                    };
+                Arc::new(Mutex::new(sm))
+            })
+            .collect()
+    }
+
+    /// A single diverged replica (minority, f = 1 of n = 4) is detected at
+    /// vote time and isolated: it abstains on honest blocks (its committed
+    /// root disagrees) and its own proposals are rejected, but the honest
+    /// majority keeps committing. Divergence is detected (counter > 0)
+    /// rather than silent — the core property of #599.
+    #[tokio::test(start_paused = true)]
+    async fn divergent_minority_is_detected_and_cluster_survives() {
+        let sms = state_machines_with_divergent(4, &[0]);
+        let mut cluster =
+            SimCluster::spawn_with_state_machines(4, Duration::from_millis(50), sms).await;
+
+        let progressed = cluster
+            .advance_and_yield_until(Duration::from_secs(12), |c| {
+                // The honest majority (>= 3 nodes) keeps committing.
+                c.peek_commit_heights().iter().filter(|&&h| h >= 6).count() >= 3
+            })
+            .await;
+        assert!(
+            progressed,
+            "honest majority must keep committing past a diverged minority; heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let total: u64 = (0..4)
+            .map(|i| cluster.peek_state_divergence_detected(i))
+            .sum();
+        assert!(
+            total > 0,
+            "the deferred state-root check must have detected the divergence",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
+    /// A diverged *majority* (>= f + 1 = 2 of n = 4) cannot form a quorum
+    /// on any honest block — the chain halts, the intended fail-safe. No
+    /// node commits past genesis.
+    #[tokio::test(start_paused = true)]
+    async fn divergent_majority_halts_the_chain() {
+        let sms = state_machines_with_divergent(4, &[0, 1]);
+        let mut cluster =
+            SimCluster::spawn_with_state_machines(4, Duration::from_millis(50), sms).await;
+
+        let progressed = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                c.peek_commit_heights().iter().any(|&h| h >= 1)
+            })
+            .await;
+        assert!(
+            !progressed,
+            "a >= f+1 diverged majority must stall the chain (no quorum); heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
+    /// A Byzantine leader stamping a forged `committed_state_root` is
+    /// rejected at vote time by every honest replica (they reproduce the
+    /// real root and abstain), so its blocks never reach quorum — but the
+    /// honest nodes stay live and keep committing under the other leaders.
+    #[tokio::test(start_paused = true)]
+    async fn byzantine_forged_committed_root_is_rejected_chain_survives() {
+        let mut adversaries: Vec<Option<Arc<dyn super::Adversary>>> =
+            (0..4).map(|_| None).collect();
+        adversaries[1] = Some(Arc::new(crate::sim_byzantine::ForgedCommittedRootAdversary));
+        let mut cluster =
+            SimCluster::spawn_with_adversaries(4, Duration::from_millis(50), adversaries).await;
+
+        let progressed = cluster
+            .advance_and_yield_until(Duration::from_secs(12), |c| {
+                c.peek_commit_heights().iter().filter(|&&h| h >= 8).count() >= 3
+            })
+            .await;
+        assert!(
+            progressed,
+            "honest nodes must stay live past a forged-root byzantine leader; heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let honest_detections: u64 = [0usize, 2, 3]
+            .iter()
+            .map(|&i| cluster.peek_state_divergence_detected(i))
+            .sum();
+        assert!(
+            honest_detections > 0,
+            "honest nodes must have rejected the byzantine leader's forged committed root",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
     }
 
     // ── #358: BLS-chain rotation end-to-end ───────────────────────────────

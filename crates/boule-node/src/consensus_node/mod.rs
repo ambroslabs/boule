@@ -374,6 +374,18 @@ pub struct ConsensusNode {
     /// voter-side metric stays interpretable. Surfaced under
     /// [`ConsensusStatus::proposal_equivocations_detected`].
     proposal_equivocations_detected: Arc<AtomicU64>,
+    /// Cumulative count of state-machine divergences detected at vote
+    /// time (#599): a proposed block's deferred committed state root,
+    /// anchored at a height this node has committed, disagreed with this
+    /// node's own execution, so the vote was suppressed (abstained).
+    /// Surfaced under [`ConsensusStatus::state_divergence_detected`].
+    state_divergence_detected: Arc<AtomicU64>,
+    /// Whether the deferred state-root divergence check runs at vote
+    /// time (#599). Always `true` in production; disabled by
+    /// `with_vote_divergence_check_disabled` (test-only) for unit tests
+    /// that drive hand-crafted blocks carrying placeholder committed
+    /// roots through the vote path.
+    vote_divergence_check_enabled: bool,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -584,6 +596,8 @@ impl ConsensusNode {
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
+            state_divergence_detected: Arc::new(AtomicU64::new(0)),
+            vote_divergence_check_enabled: true,
             last_committed_view: View::ZERO,
             status_tx: None,
             rate_limiter: None,
@@ -744,6 +758,26 @@ impl ConsensusNode {
     /// to verify the proposer-side detection path end-to-end.
     pub fn proposal_equivocations_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.proposal_equivocations_detected)
+    }
+
+    /// Clone the shared state-divergence counter (#599). The same `Arc`
+    /// the integration layer increments whenever it suppresses a vote
+    /// because a proposed block's deferred committed state root
+    /// disagreed with this node's own execution. Used by
+    /// `SimCluster::peek_state_divergence_detected` to verify the
+    /// detection path end-to-end.
+    pub fn state_divergence_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.state_divergence_detected)
+    }
+
+    /// Test-only: disable the deferred state-root divergence check at
+    /// vote time (#599). Unit tests that drive hand-crafted blocks
+    /// carrying placeholder committed roots through the vote path use
+    /// this so the check doesn't suppress an expected vote.
+    #[cfg(test)]
+    pub(crate) fn with_vote_divergence_check_disabled(mut self) -> Self {
+        self.vote_divergence_check_enabled = false;
+        self
     }
 
     /// Borrow the eviction counters this node aggregates across the
@@ -942,6 +976,8 @@ impl ConsensusNode {
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
+            state_divergence_detected: Arc::new(AtomicU64::new(0)),
+            vote_divergence_check_enabled: true,
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
@@ -1581,6 +1617,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         }
@@ -2029,6 +2067,8 @@ mod tests {
                     state_commitment: [0u8; 32],
                     commands_commitment: Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -2121,6 +2161,8 @@ mod tests {
                     state_commitment: [0u8; 32],
                     commands_commitment: Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -2573,6 +2615,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -2585,6 +2629,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -2704,6 +2750,8 @@ mod tests {
                     state_commitment: [0u8; 32],
                     commands_commitment: Block::commands_commitment(&[]),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands: vec![],
             });
@@ -2784,6 +2832,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -2796,6 +2846,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -2808,6 +2860,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -3085,6 +3139,8 @@ mod tests {
                         std::slice::from_ref(&cmd),
                     ),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![cmd],
         };
@@ -3131,6 +3187,8 @@ mod tests {
                 &commands,
             ),
             validator_history_commitment: [0; 32],
+            committed_height: Height::ZERO,
+            committed_state_root: [0; 32],
         };
         boule_consensus::replication::block::Block { header, commands }
     }
@@ -3288,6 +3346,8 @@ mod tests {
                 &commands,
             ),
             validator_history_commitment: [0; 32],
+            committed_height: Height::ZERO,
+            committed_state_root: [0; 32],
         };
         let block = boule_consensus::replication::block::Block { header, commands };
         node.apply_commit(block);
@@ -3440,6 +3500,8 @@ mod tests {
                 &commands,
             ),
             validator_history_commitment: [0; 32],
+            committed_height: Height::ZERO,
+            committed_state_root: [0; 32],
         };
         let block = boule_consensus::replication::block::Block { header, commands };
         node.apply_commit(block);
@@ -3645,6 +3707,8 @@ mod tests {
                         state_commitment: [0u8; 32],
                         commands_commitment: Block::commands_commitment(&[]),
                         validator_history_commitment: [0; 32],
+                        committed_height: Height::ZERO,
+                        committed_state_root: [0; 32],
                     },
                     commands: vec![],
                 };
@@ -3941,6 +4005,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         }
@@ -4749,6 +4815,8 @@ mod tests {
                     commands_commitment:
                         boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -5168,6 +5236,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&commands),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands,
         };
@@ -5259,6 +5329,8 @@ mod tests {
                     commands_commitment:
                         boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -5610,6 +5682,8 @@ mod tests {
                     state_commitment: [0xCD; 32],
                     commands_commitment: Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -5773,6 +5847,8 @@ mod tests {
                     commands_commitment:
                         boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: commitment,
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -5951,6 +6027,8 @@ mod tests {
                     commands_commitment:
                         boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -6124,6 +6202,8 @@ mod tests {
                     commands_commitment:
                         boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -6330,6 +6410,8 @@ mod tests {
                     commands_commitment:
                         boule_consensus::replication::block::Block::commands_commitment(&commands),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands,
             }
@@ -7077,6 +7159,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -7598,7 +7682,11 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        // This test drives a hand-crafted block with a placeholder
+        // committed root through the vote path; disable the #599
+        // divergence check so the expected vote is not suppressed.
+        .with_vote_divergence_check_disabled();
         let signer: Arc<dyn Signer> = Arc::new(self_signer);
 
         let (inner_bc, _outbound_rx) = make_test_broadcaster();
@@ -7625,6 +7713,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -7825,7 +7915,11 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        // This test drives a hand-crafted block with a placeholder
+        // committed root through the vote path; disable the #599
+        // divergence check so the expected vote is not suppressed.
+        .with_vote_divergence_check_disabled();
         let signer: Arc<dyn Signer> = Arc::new(self_signer);
 
         let (inner_bc, _outbound_rx) = make_test_broadcaster();
@@ -7852,6 +7946,8 @@ mod tests {
                     state_commitment: [0; 32],
                     commands_commitment: Block::commands_commitment(&[]),
                     validator_history_commitment: [0; 32],
+                    committed_height: Height::ZERO,
+                    committed_state_root: [0; 32],
                 },
                 commands: vec![],
             }
@@ -8326,6 +8422,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&commands),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands,
         }
@@ -8629,6 +8727,8 @@ mod tests {
             state_commitment: [0u8; 32],
             commands_commitment: Block::commands_commitment(&commands),
             validator_history_commitment,
+            committed_height: Height::ZERO,
+            committed_state_root: [0; 32],
         };
         Block { header, commands }
     }
@@ -8806,6 +8906,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: pre_block_commitment,
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -8886,6 +8988,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: pre_block_commitment,
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -8988,6 +9092,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: pre_block_commitment,
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         };
@@ -9040,6 +9146,8 @@ mod tests {
                 state_commitment: [0u8; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: vec![],
         }

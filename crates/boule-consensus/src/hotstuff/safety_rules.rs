@@ -166,6 +166,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             };
             let block = Block {
                 header,
@@ -229,6 +231,8 @@ mod tests {
                 state_commitment: [1; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -282,6 +286,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -294,6 +300,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -365,6 +373,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };
@@ -397,6 +407,8 @@ mod tests {
                 state_commitment: [0; 32],
                 commands_commitment: Block::commands_commitment(&[]),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands: Vec::new(),
         };

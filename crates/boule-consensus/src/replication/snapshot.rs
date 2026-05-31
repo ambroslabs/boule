@@ -1050,6 +1050,8 @@ mod tests {
                 state_commitment,
                 commands_commitment: Block::commands_commitment(&commands),
                 validator_history_commitment: [0; 32],
+                committed_height: Height::ZERO,
+                committed_state_root: [0; 32],
             },
             commands,
         }

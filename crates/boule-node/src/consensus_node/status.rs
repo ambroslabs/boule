@@ -190,6 +190,7 @@ impl ConsensusNode {
             proposal_equivocations_detected: self
                 .proposal_equivocations_detected
                 .load(Ordering::Relaxed),
+            state_divergence_detected: self.state_divergence_detected.load(Ordering::Relaxed),
             backpressure: BackpressureStatus {
                 gossip_sink_overflow_total: self
                     .gossip_sink_overflows

@@ -116,11 +116,19 @@ impl BlockBuilder for MempoolBlockBuilder {
         // Fork the committed SM state: snapshot, apply ancestor commands
         // and candidate commands, read commitment, then restore so the
         // SM is left unchanged.
-        let state_commitment = {
+        //
+        // `committed_state_root` is the SM commitment over our committed
+        // frontier (`committed_height`) *before* applying any uncommitted
+        // ancestor or candidate commands — the deferred (lagged) root a
+        // voter reproduces from its own committed execution before voting.
+        // It is read here, inside the lock, while the SM is still at the
+        // committed state.
+        let (state_commitment, committed_state_root) = {
             let mut sm = self.state_machine.lock();
             let snap = sm.snapshot();
 
             let mut commitment = sm.state_commitment();
+            let committed_state_root = commitment;
             // Apply each in-flight ancestor's commands in chain order,
             // oldest first, then the candidate commands on top. A
             // failed `apply` leaves state unchanged per the
@@ -195,7 +203,7 @@ impl BlockBuilder for MempoolBlockBuilder {
                     "MempoolBlockBuilder: state-machine restore from own snapshot failed: {e}",
                 );
             }
-            commitment
+            (commitment, committed_state_root)
         };
 
         let commands_commitment = Block::commands_commitment(&commands);
@@ -208,6 +216,8 @@ impl BlockBuilder for MempoolBlockBuilder {
                 state_commitment,
                 commands_commitment,
                 validator_history_commitment: [0; 32],
+                committed_height,
+                committed_state_root,
             },
             commands,
         })
