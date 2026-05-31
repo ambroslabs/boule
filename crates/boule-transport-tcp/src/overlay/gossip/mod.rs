@@ -7,10 +7,9 @@
 //!
 //! # Overview
 //!
-//! The gossip overlay sits at the same seam as [`super::mesh`] — it
-//! implements the [`super::Broadcaster`] and [`super::Discovery`] traits
-//! — but instead of relying on the peer manager's full N–1 connection
-//! table, it:
+//! The gossip overlay implements the [`super::Broadcaster`] and
+//! [`super::Discovery`] traits over a partial mesh: instead of relying
+//! on the peer manager's full N–1 connection table, it:
 //!
 //! 1. Maintains direct TCP/TLS connections to ≤ `outbound_target` peers
 //!    (default 8).

@@ -39,10 +39,12 @@
 //! - [`crate::overlay::gossip`] — the partial-mesh gossip overlay (issue
 //!   #137). The production overlay, and the only one wired into
 //!   `node::run`.
-//! - [`memory`] — in-memory [`Broadcaster`] / [`Discovery`] **test
-//!   fakes** ([`MemoryBroadcaster`] / [`MemoryDiscovery`]). Not a
-//!   transport: they let tests drive a transport-agnostic
-//!   `ConsensusNode` over plain channels without standing up TCP+TLS.
+//! - `memory` — in-memory [`crate::overlay::Broadcaster`] /
+//!   [`crate::overlay::Discovery`] **test fakes**
+//!   ([`crate::overlay::MemoryBroadcaster`] /
+//!   [`crate::overlay::MemoryDiscovery`]). Not a transport: they let
+//!   tests drive a transport-agnostic `ConsensusNode` over plain
+//!   channels without standing up TCP+TLS.
 //!
 //! # Non-goals (deferred to follow-up issues)
 //!
