@@ -666,6 +666,69 @@ pub struct P2pConfig {
     /// cluster knows not to attempt to dial back.
     #[serde(default)]
     pub inbound_disabled: bool,
+    /// `[p2p.keepalive]` sub-table. Application-layer dead-peer
+    /// detection on every connection. Absent disables it — the default
+    /// until the mechanism is validated in the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive: Option<P2pKeepaliveConfig>,
+}
+
+/// `[p2p.keepalive]` — application-layer keepalive / dead-peer
+/// detection.
+///
+/// Each connection sends a keepalive probe once it has been silent (no
+/// inbound frame of any protocol) for `interval_ms`, and is dropped
+/// once it has been silent for `timeout_ms`. This catches a peer that
+/// has gone silent *without* closing its socket — a failed NIC, a hung
+/// kernel, a network blackhole — within `timeout_ms`, even when this
+/// node has no traffic of its own to send that peer and so would never
+/// otherwise notice. Application traffic counts as liveness, so a busy
+/// link never spends a probe.
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+pub struct P2pKeepaliveConfig {
+    /// Idle time before a keepalive probe is sent.
+    #[serde(default = "default_keepalive_interval_ms")]
+    pub interval_ms: u64,
+    /// Idle time before the connection is dropped. Must exceed
+    /// `interval_ms` so at least one probe goes out before the deadline.
+    #[serde(default = "default_keepalive_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for P2pKeepaliveConfig {
+    fn default() -> Self {
+        Self {
+            interval_ms: default_keepalive_interval_ms(),
+            timeout_ms: default_keepalive_timeout_ms(),
+        }
+    }
+}
+
+impl P2pKeepaliveConfig {
+    /// Reject a config whose deadline would fire before the first probe
+    /// (or a zero interval that would busy-spin).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.interval_ms == 0 {
+            anyhow::bail!("[p2p.keepalive] interval_ms must be greater than 0");
+        }
+        if self.timeout_ms <= self.interval_ms {
+            anyhow::bail!(
+                "[p2p.keepalive] timeout_ms ({}) must exceed interval_ms ({}) so at least \
+                 one keepalive probe is sent before the connection is dropped",
+                self.timeout_ms,
+                self.interval_ms,
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_keepalive_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_keepalive_timeout_ms() -> u64 {
+    30_000
 }
 
 /// Per-peer rate limits + connection caps. Surfaced as the
@@ -1167,6 +1230,9 @@ impl Config {
         if let Some(cons) = self.consensus.as_ref() {
             cons.validate_snapshot_policy()?;
             cons.resolve_genesis_bls_keys()?;
+        }
+        if let Some(keepalive) = self.p2p.keepalive.as_ref() {
+            keepalive.validate()?;
         }
         Ok(())
     }
@@ -2130,6 +2196,85 @@ inbound_disabled = true
 "#,
         );
         assert!(c.p2p.inbound_disabled);
+    }
+
+    #[test]
+    fn p2p_keepalive_absent_means_disabled() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[p2p]
+inbound_disabled = false
+"#,
+        );
+        assert!(c.p2p.keepalive.is_none());
+    }
+
+    #[test]
+    fn p2p_keepalive_empty_table_uses_defaults() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[p2p.keepalive]
+"#,
+        );
+        let ka = c.p2p.keepalive.expect("keepalive table present");
+        assert_eq!(ka.interval_ms, 10_000);
+        assert_eq!(ka.timeout_ms, 30_000);
+        ka.validate().expect("defaults must validate");
+    }
+
+    #[test]
+    fn p2p_keepalive_partial_override_keeps_other_default() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[p2p.keepalive]
+timeout_ms = 45000
+"#,
+        );
+        let ka = c.p2p.keepalive.expect("keepalive table present");
+        assert_eq!(ka.interval_ms, 10_000);
+        assert_eq!(ka.timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn p2p_keepalive_validate_rejects_timeout_not_above_interval() {
+        // Equal is rejected (no ping fits before the deadline)…
+        let equal = P2pKeepaliveConfig {
+            interval_ms: 10_000,
+            timeout_ms: 10_000,
+        };
+        assert!(equal.validate().is_err());
+
+        // …as is a zero interval that would busy-spin.
+        let zero = P2pKeepaliveConfig {
+            interval_ms: 0,
+            timeout_ms: 30_000,
+        };
+        assert!(zero.validate().is_err());
+
+        // A sane pair passes.
+        let ok = P2pKeepaliveConfig {
+            interval_ms: 10_000,
+            timeout_ms: 30_000,
+        };
+        ok.validate().expect("interval < timeout must validate");
     }
 
     #[test]

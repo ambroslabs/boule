@@ -7,8 +7,9 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::manager::{AnyStream, ManagerMsg};
 use crate::tls::{NodeId, node_id_to_base58};
@@ -31,12 +32,43 @@ pub type ProtocolCaps = Arc<RwLock<HashMap<u8, usize>>>;
 /// task after the read/write loop has already decided to exit.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Reserved transport-level protocol id for connection keepalive frames.
+/// Keepalive is answered entirely inside the connection task and never
+/// reaches the manager's protocol demux, so no application protocol may
+/// register this id.
+pub const KEEPALIVE_PROTOCOL_ID: u8 = 0x00;
+
+/// Keepalive frame discriminator (the byte after the protocol id): a
+/// liveness probe expecting a [`KEEPALIVE_PONG`] in reply.
+const KEEPALIVE_PING: u8 = 0x01;
+/// Keepalive frame discriminator: the reply to a [`KEEPALIVE_PING`].
+const KEEPALIVE_PONG: u8 = 0x02;
+
+const PING_FRAME: &[u8] = &[KEEPALIVE_PROTOCOL_ID, KEEPALIVE_PING];
+const PONG_FRAME: &[u8] = &[KEEPALIVE_PROTOCOL_ID, KEEPALIVE_PONG];
+
+/// Connection keepalive parameters. Passing `None` to [`run`] disables
+/// keepalive entirely: the task installs no timer and neither originates
+/// nor requires liveness frames — matching the pre-keepalive behaviour.
+#[derive(Debug, Clone, Copy)]
+pub struct KeepaliveConfig {
+    /// Send a `Ping` once the link has been silent — no inbound frame of
+    /// any protocol — for this long. Application traffic counts as
+    /// liveness, so a busy link never spends a ping.
+    pub interval: Duration,
+    /// Drop the connection once the link has been silent for this long.
+    /// Must exceed `interval` so at least one `Ping` goes out before the
+    /// deadline.
+    pub timeout: Duration,
+}
+
 pub async fn run(
     node_id: NodeId,
     stream: AnyStream,
     mut write_rx: mpsc::Receiver<Bytes>,
     inbound_tx: mpsc::Sender<ManagerMsg>,
     protocol_caps: ProtocolCaps,
+    keepalive: Option<KeepaliveConfig>,
 ) {
     let id = node_id_to_base58(&node_id);
     let codec = LengthDelimitedCodec::builder()
@@ -44,11 +76,28 @@ pub async fn run(
         .new_codec();
     let mut framed = Framed::new(stream, codec);
 
+    // Keepalive state. `last_recv` is the time of the last inbound frame
+    // of *any* protocol. When enabled the ticker fires every `interval`;
+    // each tick pings if the link has gone quiet and disconnects once it
+    // has been quiet past `timeout`. When disabled the keepalive select
+    // arm parks on a never-ready future, so the loop behaves exactly as
+    // it did before keepalive existed.
+    let mut last_recv = Instant::now();
+    let mut keepalive_tick = keepalive.map(|cfg| {
+        let mut tick = tokio::time::interval(cfg.interval);
+        // After a stall, a single ping on the next tick is the right
+        // recovery — don't fire a backlog of catch-up ticks.
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        tick
+    });
+
     loop {
         tokio::select! {
             result = framed.next() => {
                 match result {
                     Some(Ok(buf)) => {
+                        // Any inbound frame is a liveness signal.
+                        last_recv = Instant::now();
                         if let Some(&protocol_id) = buf.first() {
                             if let Some(cap) = protocol_caps.read().get(&protocol_id).copied() {
                                 if buf.len() > cap {
@@ -59,6 +108,22 @@ pub async fn run(
                                     );
                                     break;
                                 }
+                            }
+                            // Keepalive is a transport-level concern handled
+                            // here; these frames must not reach the manager's
+                            // protocol demux (which would log them as an
+                            // unknown protocol id). A `Ping` is answered with
+                            // a `Pong`; a `Pong` needs nothing beyond the
+                            // `last_recv` bump above.
+                            if protocol_id == KEEPALIVE_PROTOCOL_ID {
+                                if buf.get(1) == Some(&KEEPALIVE_PING)
+                                    && let Err(e) =
+                                        framed.send(Bytes::from_static(PONG_FRAME)).await
+                                {
+                                    error!("keepalive pong write to {id} failed: {e}");
+                                    break;
+                                }
+                                continue;
                             }
                         }
                         let _ = inbound_tx
@@ -92,6 +157,34 @@ pub async fn run(
                         }
                     }
                     None => break, // write channel closed — shutting down
+                }
+            }
+
+            // Keepalive tick. The `pending` branch keeps this arm inert
+            // (never ready) when keepalive is disabled.
+            _ = async {
+                match keepalive_tick.as_mut() {
+                    Some(tick) => { tick.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let cfg = keepalive.expect("keepalive tick fires only when configured");
+                let idle = last_recv.elapsed();
+                if idle >= cfg.timeout {
+                    warn!(
+                        peer = %id,
+                        idle_ms = idle.as_millis() as u64,
+                        timeout_ms = cfg.timeout.as_millis() as u64,
+                        reason = "keepalive_timeout",
+                        "disconnecting unresponsive peer",
+                    );
+                    break;
+                }
+                if idle >= cfg.interval
+                    && let Err(e) = framed.send(Bytes::from_static(PING_FRAME)).await
+                {
+                    error!("keepalive ping write to {id} failed: {e}");
+                    break;
                 }
             }
         }
@@ -182,11 +275,42 @@ mod tests {
         mpsc::Receiver<ManagerMsg>,
         tokio::task::JoinHandle<()>,
     ) {
+        spawn_connection_inner(caps, None)
+    }
+
+    fn spawn_connection_with_keepalive(
+        keepalive: KeepaliveConfig,
+    ) -> (
+        tokio::io::DuplexStream,
+        mpsc::Sender<Bytes>,
+        mpsc::Receiver<ManagerMsg>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_connection_inner(empty_caps(), Some(keepalive))
+    }
+
+    fn spawn_connection_inner(
+        caps: ProtocolCaps,
+        keepalive: Option<KeepaliveConfig>,
+    ) -> (
+        tokio::io::DuplexStream,
+        mpsc::Sender<Bytes>,
+        mpsc::Receiver<ManagerMsg>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (local, remote) = duplex(64 * 1024);
         let (write_tx, write_rx) = mpsc::channel::<Bytes>(16);
         let (inbound_tx, inbound_rx) = mpsc::channel::<ManagerMsg>(16);
         let join = tokio::spawn(async move {
-            run(nid(7), Box::new(local), write_rx, inbound_tx, caps).await;
+            run(
+                nid(7),
+                Box::new(local),
+                write_rx,
+                inbound_tx,
+                caps,
+                keepalive,
+            )
+            .await;
         });
         (remote, write_tx, inbound_rx, join)
     }
@@ -368,6 +492,166 @@ mod tests {
         }
     }
 
+    // ── Keepalive (#492) ──────────────────────────────────────────────
+
+    /// Wrap a duplex remote end in the same length-delimited framing the
+    /// connection task uses, so a test can read/write whole frames.
+    fn frame_remote(
+        remote: tokio::io::DuplexStream,
+    ) -> Framed<tokio::io::DuplexStream, LengthDelimitedCodec> {
+        let codec = LengthDelimitedCodec::builder()
+            .max_frame_length(DEFAULT_MAX_FRAME_LEN)
+            .new_codec();
+        Framed::new(remote, codec)
+    }
+
+    /// A peer that goes silent without closing its socket is dropped once
+    /// the link has been quiet past `timeout` — the dead-peer case the
+    /// feature exists for. `_remote` is held open so the disconnect is
+    /// driven by keepalive, not by an EOF.
+    #[tokio::test]
+    async fn keepalive_disconnects_silent_peer() {
+        let cfg = KeepaliveConfig {
+            interval: Duration::from_millis(100),
+            timeout: Duration::from_millis(400),
+        };
+        let (_remote, _write_tx, mut inbound_rx, join) = spawn_connection_with_keepalive(cfg);
+
+        tokio::time::timeout(Duration::from_secs(3), join)
+            .await
+            .expect("keepalive did not disconnect a silent peer within budget")
+            .expect("connection task panicked");
+        assert!(inbound_rx.recv().await.is_none());
+        drop(_remote);
+    }
+
+    /// A peer that answers pings stays connected indefinitely: each pong
+    /// resets the idle clock well before `timeout`. Also confirms the
+    /// task actually pings a quiet-but-live link.
+    #[tokio::test]
+    async fn keepalive_keeps_responsive_peer_connected() {
+        let cfg = KeepaliveConfig {
+            interval: Duration::from_millis(100),
+            timeout: Duration::from_millis(400),
+        };
+        let (remote, _write_tx, _inbound_rx, join) = spawn_connection_with_keepalive(cfg);
+        let mut framed = frame_remote(remote);
+
+        // Answer every ping with a pong for ~1s — several timeout windows.
+        // The `timeout_at` `Err` (deadline reached) ends the loop; an
+        // inner `None`/`Err` means the connection closed early.
+        let mut pings = 0u32;
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        while let Ok(next) = tokio::time::timeout_at(deadline, framed.next()).await {
+            match next {
+                Some(Ok(frame)) => {
+                    if frame.as_ref() == PING_FRAME {
+                        pings += 1;
+                        framed.send(Bytes::from_static(PONG_FRAME)).await.unwrap();
+                    }
+                }
+                Some(Err(_)) | None => break,
+            }
+        }
+
+        assert!(
+            pings >= 1,
+            "connection should have pinged at least once over a quiet second",
+        );
+        // `framed` (and the remote) are still open here, so a still-running
+        // task means keepalive kept it alive rather than an EOF.
+        assert!(
+            !join.is_finished(),
+            "a peer that answers pings must not be disconnected by keepalive",
+        );
+    }
+
+    /// An inbound `Ping` is answered with a `Pong`. Long interval so the
+    /// task's own idle-ping never fires inside the test window.
+    #[tokio::test]
+    async fn keepalive_answers_inbound_ping_with_pong() {
+        let cfg = KeepaliveConfig {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(90),
+        };
+        let (remote, _write_tx, _inbound_rx, _join) = spawn_connection_with_keepalive(cfg);
+        let mut framed = frame_remote(remote);
+
+        framed.send(Bytes::from_static(PING_FRAME)).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_millis(500), framed.next())
+            .await
+            .expect("no pong within budget")
+            .expect("connection closed")
+            .expect("frame decode error");
+        assert_eq!(reply.as_ref(), PONG_FRAME);
+    }
+
+    /// Keepalive frames are consumed in the connection task and never
+    /// reach the manager's protocol demux. A following app frame proves
+    /// the keepalive frames were filtered, not merely delayed.
+    #[tokio::test]
+    async fn keepalive_frames_are_not_forwarded_to_manager() {
+        let cfg = KeepaliveConfig {
+            interval: Duration::from_secs(30),
+            timeout: Duration::from_secs(90),
+        };
+        let (remote, _write_tx, mut inbound_rx, _join) = spawn_connection_with_keepalive(cfg);
+        let mut framed = frame_remote(remote);
+
+        framed.send(Bytes::from_static(PING_FRAME)).await.unwrap();
+        framed.send(Bytes::from_static(PONG_FRAME)).await.unwrap();
+        let mut app = BytesMut::new();
+        app.put_u8(0x42);
+        app.extend_from_slice(b"hello");
+        framed.send(app.freeze()).await.unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_millis(500), inbound_rx.recv())
+            .await
+            .expect("timed out")
+            .expect("connection exited");
+        match msg {
+            ManagerMsg::InboundMessage { msg, .. } => {
+                assert_eq!(msg.as_ref(), b"\x42hello");
+            }
+            _ => panic!("expected InboundMessage"),
+        }
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "keepalive frames must not be forwarded — only the app frame should arrive",
+        );
+    }
+
+    /// A link carrying steady application traffic is never pinged: each
+    /// inbound app frame counts as liveness and resets the idle clock.
+    #[tokio::test]
+    async fn keepalive_does_not_ping_busy_link() {
+        let cfg = KeepaliveConfig {
+            interval: Duration::from_millis(200),
+            timeout: Duration::from_millis(800),
+        };
+        let (remote, _write_tx, mut inbound_rx, _join) = spawn_connection_with_keepalive(cfg);
+        let mut framed = frame_remote(remote);
+
+        // An app frame every 50ms (< interval) for ~500ms (< timeout).
+        for _ in 0..10 {
+            let mut app = BytesMut::new();
+            app.put_u8(0x42);
+            app.extend_from_slice(b"x");
+            framed.send(app.freeze()).await.unwrap();
+            // Nothing should come back on the wire — no ping on a busy link.
+            match tokio::time::timeout(Duration::from_millis(50), framed.next()).await {
+                Err(_) => {} // expected: the read times out, no frame sent
+                Ok(other) => panic!("unexpected frame on a busy link: {other:?}"),
+            }
+        }
+
+        let mut got = 0;
+        while let Ok(_msg) = inbound_rx.try_recv() {
+            got += 1;
+        }
+        assert_eq!(got, 10, "all app frames should have reached the manager");
+    }
+
     #[tokio::test]
     async fn write_channel_closed_exits_loop() {
         let (_remote, write_tx, _inbound_rx, join) = spawn_connection();
@@ -400,7 +684,15 @@ mod tests {
         let (write_tx, write_rx) = mpsc::channel::<Bytes>(16);
         let (inbound_tx, _inbound_rx) = mpsc::channel::<ManagerMsg>(16);
         let join = tokio::spawn(async move {
-            run(nid(7), Box::new(spy), write_rx, inbound_tx, empty_caps()).await;
+            run(
+                nid(7),
+                Box::new(spy),
+                write_rx,
+                inbound_tx,
+                empty_caps(),
+                None,
+            )
+            .await;
         });
 
         // Initiate orderly shutdown from our side: drop the write sender
@@ -522,6 +814,7 @@ mod tests {
                 client_write_rx,
                 client_inbound_tx,
                 empty_caps(),
+                None,
             )
             .await;
         });

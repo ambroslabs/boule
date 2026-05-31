@@ -134,6 +134,18 @@ pub async fn run(
         //   - `[overlay]` (issue #187): degree-aware caps tied to the
         //     gossip overlay's partial-mesh sizing.
         let connection_limiter = build_connection_limiter(&config);
+        // `[p2p.keepalive]`: per-connection liveness probing. Absent
+        // leaves every connection task without a keepalive timer.
+        // Validated in `Config::validate`, so `timeout > interval` holds
+        // here.
+        let keepalive = config
+            .p2p
+            .keepalive
+            .as_ref()
+            .map(|k| p2p::connection::KeepaliveConfig {
+                interval: std::time::Duration::from_millis(k.interval_ms),
+                timeout: std::time::Duration::from_millis(k.timeout_ms),
+            });
         tokio::spawn(p2p::manager::run(
             our_id,
             p2p_cmd_rx,
@@ -142,6 +154,7 @@ pub async fn run(
             pgt,
             dtx,
             connection_limiter,
+            keepalive,
         ))
     };
 
