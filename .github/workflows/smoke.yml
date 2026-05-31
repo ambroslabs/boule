@@ -36,6 +36,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # This sweep is a slow `--release` build of multi-process
+          # integration tests that can flake on an individual trial.
+          # rust-cache skips saving on a failed job by default, so one
+          # flaky trial would discard the whole expensive build cache and
+          # force the next run to rebuild from scratch. Save regardless of
+          # the test outcome.
+          cache-on-failure: true
       # Nightly schedule runs the full 65-trial sweep; PR/manual runs the
       # lighter `standard` tier to keep opt-in checks quick.
       - name: Smoke sweep

@@ -617,31 +617,14 @@ async fn run_gossip_steady(root: &Path, binary: &Path, group: &str, seed: u64) -
         if !v.is_empty() {
             return Err(format!("{} safety violation(s)", v.len()));
         }
-        let counters = telemetry::collect(&state).map_err(|e| e.to_string())?;
-        // The point-to-point gossip send-to path (block-sync
-        // request/response) need only be exercised *somewhere* in the
-        // cluster to prove the routing works — not on every node. In a
-        // smooth steady-state run a node can legitimately never fall
-        // behind nor serve a request, so its counter stays 0; requiring
-        // the per-node minimum to be nonzero is seed/timing-dependent and
-        // flakes. Mirror the block-sync `emit`/`recv` check above and
-        // assert the cluster-wide maximum instead.
-        let max_gossip = state
-            .nodes
-            .iter()
-            .map(|n| {
-                counters
-                    .get(&n.display_name())
-                    .and_then(|c| c.get("gossip_send_to_dispatched"))
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .max()
-            .unwrap_or(0);
-        if max_gossip == 0 {
-            return Err("gossip send-to not exercised on any node".to_string());
-        }
-        Ok(format!("gossip_max={max_gossip}"))
+        // No block-sync assertion here. `gossip_send_to_dispatched` only
+        // ticks on point-to-point sends — block-sync request/response —
+        // and a smooth steady-state run never induces block-sync (no node
+        // falls behind), so the counter is legitimately zero cluster-wide.
+        // Asserting it here is seed/timing-dependent. Block-sync coverage
+        // lives in `run_kill_restart`, which deterministically forces it
+        // by killing and restarting a node.
+        Ok("steady".to_string())
     }
     .await;
     // The back-pressure invariant is the headline check for this trial.
