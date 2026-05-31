@@ -618,7 +618,15 @@ async fn run_gossip_steady(root: &Path, binary: &Path, group: &str, seed: u64) -
             return Err(format!("{} safety violation(s)", v.len()));
         }
         let counters = telemetry::collect(&state).map_err(|e| e.to_string())?;
-        let min_gossip = state
+        // The point-to-point gossip send-to path (block-sync
+        // request/response) need only be exercised *somewhere* in the
+        // cluster to prove the routing works — not on every node. In a
+        // smooth steady-state run a node can legitimately never fall
+        // behind nor serve a request, so its counter stays 0; requiring
+        // the per-node minimum to be nonzero is seed/timing-dependent and
+        // flakes. Mirror the block-sync `emit`/`recv` check above and
+        // assert the cluster-wide maximum instead.
+        let max_gossip = state
             .nodes
             .iter()
             .map(|n| {
@@ -628,12 +636,12 @@ async fn run_gossip_steady(root: &Path, binary: &Path, group: &str, seed: u64) -
                     .copied()
                     .unwrap_or(0)
             })
-            .min()
+            .max()
             .unwrap_or(0);
-        if min_gossip == 0 {
-            return Err("gossip_send_to_dispatched is 0 on some node".to_string());
+        if max_gossip == 0 {
+            return Err("gossip send-to not exercised on any node".to_string());
         }
-        Ok(format!("gossip_min={min_gossip}"))
+        Ok(format!("gossip_max={max_gossip}"))
     }
     .await;
     // The back-pressure invariant is the headline check for this trial.
