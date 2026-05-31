@@ -10,8 +10,8 @@
 //! The persist-before-send discipline that HotStuff safety requires is
 //! enforced by [`super::ConsensusNode::persist_updates`]: every
 //! [`StateUpdate`] from a `step` is written atomically before the
-//! dependent `Broadcast` / `SendTo` / `Commit` action is allowed to
-//! proceed. See the function's doc-comment for the durability contract.
+//! dependent `Broadcast` / `Commit` action is allowed to proceed. See
+//! the function's doc-comment for the durability contract.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -860,8 +860,8 @@ impl ConsensusNode {
     ///
     /// The integration event loop (Phase D) must call this for every
     /// `Action::Persist` **before** forwarding any `Action::Broadcast` /
-    /// `Action::SendTo` / `Action::Commit` that depends on the persisted
-    /// state. That ordering is the durability discipline HotStuff
+    /// `Action::Commit` that depends on the persisted state. That
+    /// ordering is the durability discipline HotStuff
     /// safety requires — a crash between "send vote" and "write
     /// `last_voted_view`" would otherwise let a restarted replica vote
     /// twice at the same view.

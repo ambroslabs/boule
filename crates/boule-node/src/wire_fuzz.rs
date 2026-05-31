@@ -423,15 +423,6 @@ impl ReplicaSet {
                         self.inboxes[target].push_back(event_from_msg(source_nid, msg.clone()));
                     }
                 }
-                Action::SendTo(target_id, msg) => {
-                    let target_vid =
-                        boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(target_id);
-                    if let Some(target) = self.validators.index_of(&target_vid) {
-                        if target < self.cores.len() {
-                            self.inboxes[target].push_back(event_from_msg(source_nid, msg));
-                        }
-                    }
-                }
                 Action::Commit(block) => {
                     self.commits[source].insert(block.header.height, block);
                 }

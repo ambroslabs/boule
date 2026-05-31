@@ -646,12 +646,10 @@ impl SignedMessage for TimeoutVote {
 }
 
 /// Logical consensus message emitted by the safety core via
-/// [`Action::Broadcast`] / [`Action::SendTo`]. The integration layer
-/// (#24) wraps the contained payload in a [`Signed`] before putting it
-/// on the wire.
+/// [`Action::Broadcast`]. The integration layer (#24) wraps the
+/// contained payload in a [`Signed`] before putting it on the wire.
 ///
 /// [`Action::Broadcast`]: super::step::Action::Broadcast
-/// [`Action::SendTo`]: super::step::Action::SendTo
 /// [`Signed`]: boule_core::crypto::signed::Signed
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusMsg {

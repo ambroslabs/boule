@@ -345,9 +345,8 @@ enum PayloadFraming {
 
 /// A safety-core vote-uniqueness violation observed by [`VoteObserver`].
 ///
-/// The same replica emitted two distinct votes for the same view —
-/// either via `Action::Broadcast(ConsensusMsg::Vote)` or
-/// `Action::SendTo(_, ConsensusMsg::Vote)`. This is a direct breach of
+/// The same replica emitted two distinct votes for the same view via
+/// `Action::Broadcast(ConsensusMsg::Vote)`. This is a direct breach of
 /// the HotStuff `vote_once` invariant and would silently bypass the
 /// existing global oracle [`assert_no_conflicts`] until it propagated
 /// to a conflicting commit (audit finding 14-3).
@@ -376,10 +375,10 @@ pub struct VoteViolation {
 /// on `block_hash`.
 ///
 /// Wired into every [`spawn_route_task`] so each per-node routing task
-/// sees the safety core's outbound `Action::Broadcast` /
-/// `Action::SendTo` frames *before* the adversary intercept hook runs —
-/// ensuring the observer attributes only what the honest safety core
-/// produced, not synthetic frames a Byzantine adversary fabricated.
+/// sees the safety core's outbound `Action::Broadcast` frames *before*
+/// the adversary intercept hook runs — ensuring the observer attributes
+/// only what the honest safety core produced, not synthetic frames a
+/// Byzantine adversary fabricated.
 ///
 /// Idempotent re-emissions for the same `(view, block_hash)` are
 /// allowed: HotStuff's safety core may legitimately re-broadcast the
@@ -3892,8 +3891,8 @@ mod tests {
     ///
     /// Mechanically: node 0's outbound directed links to nodes 1, 2, and 3
     /// are cut. Node 0 still receives proposals (inbound intact) and will
-    /// itself observe three-chain commits. But its `SendTo(next_leader, Vote)`
-    /// frames are silently dropped.
+    /// itself observe three-chain commits. But its `Broadcast(Vote)`
+    /// frames are silently dropped on those links.
     ///
     /// With n=4 / quorum=3: the view-K leader's self-vote (via
     /// broadcast-to-self) plus two votes from the other honest nodes = 3 =

@@ -56,15 +56,6 @@ pub fn egress_safety(
             Ok(Some(Outbound::Broadcast(payload)))
         }
 
-        SafetyAction::SendTo(target, msg) => {
-            let wire = sign_consensus_msg(msg, signer, bls_signer, chain_id)?;
-            let payload = codec::encode(&wire).map_err(anyhow::Error::from)?;
-            Ok(Some(Outbound::SendTo {
-                to: *target,
-                payload,
-            }))
-        }
-
         SafetyAction::RequestBlock { hash, peer, .. } => {
             Ok(Some(egress_block_request(*hash, *peer)))
         }
