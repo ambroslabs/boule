@@ -92,7 +92,7 @@ impl SlowPeerTracker {
 }
 
 use super::connection;
-use super::connection::{KeepaliveConfig, ProtocolCaps};
+use super::connection::{KEEPALIVE_PROTOCOL_ID, KeepaliveConfig, ProtocolCaps};
 use super::overlay::DiscoveryEvent;
 use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
@@ -364,6 +364,23 @@ pub async fn run(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(PeerCommand::RegisterProtocol { id, max_frame_bytes, reply }) => {
+                        // The keepalive protocol id is reserved by the
+                        // connection task, which intercepts those frames
+                        // before the demux — a protocol registered here under
+                        // the same id would have its inbound frames silently
+                        // swallowed. Catch the collision loudly in dev/test;
+                        // warn (and still register) in release.
+                        debug_assert_ne!(
+                            id, KEEPALIVE_PROTOCOL_ID,
+                            "protocol id {KEEPALIVE_PROTOCOL_ID:#04x} is reserved for keepalive",
+                        );
+                        if id == KEEPALIVE_PROTOCOL_ID {
+                            warn!(
+                                "registering protocol under reserved keepalive id \
+                                 {KEEPALIVE_PROTOCOL_ID:#04x}; its inbound frames will be \
+                                 swallowed by the connection-task keepalive handler",
+                            );
+                        }
                         let (event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(256);
                         let (send_tx, mut send_rx) =
                             mpsc::channel::<ProtocolOutbound>(PROTOCOL_OUTBOUND_CAPACITY);
