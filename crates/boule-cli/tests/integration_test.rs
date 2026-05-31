@@ -164,10 +164,13 @@ async fn spawn_node_with_schema(peers: &[PeerDesc<'_>], schema: IdentitySchema) 
         .expect("failed to spawn node binary");
 
     // Poll until the node writes its actual bound addresses to addr_file.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s (not 10s): under CI's oversubscribed test-thread parallelism a
+    // freshly-spawned binary can take well over 10s just to bind its
+    // listener and write addr_file, which flaked this setup step (#303).
+    let deadline = Instant::now() + Duration::from_secs(30);
     let addrs = loop {
         if Instant::now() > deadline {
-            panic!("node did not write addr_file within 10s");
+            panic!("node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
         if !content.is_empty() {
@@ -423,12 +426,14 @@ async fn launch_once_for_discovery(key_path: &str) -> DiscoveryInfo {
         .spawn()
         .expect("failed to spawn node binary");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s headroom for a spawned binary to bind + write addr_file under
+    // CI's oversubscribed parallelism (#303).
+    let deadline = Instant::now() + Duration::from_secs(30);
     let info = loop {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("discovery node did not write addr_file within 10s");
+            panic!("discovery node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
         if !content.is_empty() {
@@ -488,10 +493,13 @@ async fn spawn_node_fixed_port(
         .spawn()
         .expect("failed to spawn node binary");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s headroom for a spawned binary to bind + write addr_file under
+    // CI's oversubscribed parallelism (#303). This is the phase-2
+    // concurrent spawn fan-out, the worst case for startup contention.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let addrs = loop {
         if Instant::now() > deadline {
-            panic!("phase-2 node did not write addr_file within 10s");
+            panic!("phase-2 node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
         if !content.is_empty() {
@@ -659,10 +667,12 @@ async fn spawn_consensus_node(
         .spawn()
         .expect("failed to spawn consensus node binary");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s headroom for a spawned binary to bind + write addr_file under
+    // CI's oversubscribed parallelism (#303).
+    let deadline = Instant::now() + Duration::from_secs(30);
     let addrs = loop {
         if Instant::now() > deadline {
-            panic!("consensus node did not write addr_file within 10s");
+            panic!("consensus node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
         if !content.is_empty() {
@@ -834,10 +844,12 @@ async fn spawn_consensus_node_gossip(
         .spawn()
         .expect("failed to spawn gossip-overlay consensus node");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s headroom for a spawned binary to bind + write addr_file under
+    // CI's oversubscribed parallelism (#303).
+    let deadline = Instant::now() + Duration::from_secs(30);
     let addrs = loop {
         if Instant::now() > deadline {
-            panic!("gossip-overlay node did not write addr_file within 10s");
+            panic!("gossip-overlay node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
         if !content.is_empty() {
@@ -1060,10 +1072,12 @@ async fn spawn_consensus_node_inbound_disabled(
         .spawn()
         .expect("failed to spawn inbound-disabled consensus node");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s headroom for a spawned binary to bind + write addr_file under
+    // CI's oversubscribed parallelism (#303).
+    let deadline = Instant::now() + Duration::from_secs(30);
     let addrs = loop {
         if Instant::now() > deadline {
-            panic!("inbound-disabled node did not write addr_file within 10s");
+            panic!("inbound-disabled node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
         if !content.is_empty() {
@@ -1679,11 +1693,13 @@ async fn test_self_loopback_dial_is_refused_at_handshake() {
         .spawn()
         .expect("failed to spawn node binary");
 
-    // Wait for the node to bind both listeners.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Wait for the node to bind both listeners. 30s headroom for a
+    // spawned binary to bind + write addr_file under CI's oversubscribed
+    // parallelism (#303).
+    let deadline = Instant::now() + Duration::from_secs(30);
     let addrs = loop {
         if Instant::now() > deadline {
-            panic!("self-loopback node did not write addr_file within 10s");
+            panic!("self-loopback node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
         if !content.is_empty() {
