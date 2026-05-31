@@ -7272,10 +7272,7 @@ mod tests {
     /// Build `n` state machines, the indices in `divergent` getting a
     /// [`DivergentCounterStateMachine`] and the rest a plain
     /// `CounterStateMachine`.
-    fn state_machines_with_divergent(
-        n: usize,
-        divergent: &[usize],
-    ) -> Vec<super::SimStateMachine> {
+    fn state_machines_with_divergent(n: usize, divergent: &[usize]) -> Vec<super::SimStateMachine> {
         (0..n)
             .map(|i| {
                 let sm: Box<dyn boule_consensus::replication::state_machine::StateMachine> =
