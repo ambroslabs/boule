@@ -4364,8 +4364,8 @@ mod tests {
         );
     }
 
-    /// **#529 — pipelining.** When a `BlockRangeRequest` response lands
-    /// and a proposal is still parked more than one window above the
+    /// Pipelining: when a `BlockRangeRequest` response lands and a
+    /// proposal is still parked more than one window above the
     /// (post-insert) commit frontier, the requester fires the *next*
     /// window immediately rather than waiting for a fresh proposal to
     /// re-trigger gap detection. Pins that the follow-on emission
@@ -4437,8 +4437,8 @@ mod tests {
         );
     }
 
-    /// **#529 — no pipelining without progress.** A range response that
-    /// commits nothing — e.g. a gap-leaving response from a slow or
+    /// No pipelining without progress: a range response that commits
+    /// nothing — e.g. a gap-leaving response from a slow or
     /// Byzantine peer whose blocks sit above a hole the frontier hasn't
     /// reached — must NOT pipeline the next window. Otherwise the
     /// response-driven re-emission would re-ask the same window on every

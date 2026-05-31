@@ -5159,20 +5159,20 @@ mod tests {
         assert_no_conflicts(&committed);
     }
 
-    /// **#529 — end-to-end budget guard.** A gap wider than one
-    /// bulk-range response window (`BLOCK_RANGE_RESPONSE_MAX_BLOCKS =
-    /// 64`) must still close within the same ≤5s simulated budget as
+    /// End-to-end budget guard for wide-gap pipelining. A gap wider
+    /// than one bulk-range response window (`BLOCK_RANGE_RESPONSE_MAX_BLOCKS
+    /// = 64`) must still close within the same ≤5s simulated budget as
     /// the single-window case above. Same partition → open-gap → heal
     /// shape as [`block_sync_catchup_completes_within_185_budget`],
     /// scaled to a 200-block gap so catch-up crosses ~four response
-    /// windows — the case #529 pipelines by firing the next
+    /// windows — the case the requester pipelines by firing the next
     /// `BlockRangeRequest` off each `ReceiveBlockRange` arrival
     /// instead of waiting for the next proposal.
     ///
     /// This is the integration-level liveness + safety guard: a wide
     /// gap closes inside budget and no fork appears. The emission-level
     /// proof that the *pipelining path itself* fires — and would not
-    /// without #529 — lives in the deterministic unit test
+    /// without the change — lives in the deterministic unit test
     /// `range_response_pipelines_next_window_while_proposal_still_parked`.
     /// (A pure wall-clock sim assertion can't isolate pipelining here:
     /// the single-block retry path and the steady proposal stream
@@ -5252,7 +5252,7 @@ mod tests {
         let post_heal_heights = cluster.peek_commit_heights();
         assert!(
             satisfied,
-            "wide-gap block-sync catch-up exceeded 5s simulated budget (#529). \
+            "wide-gap block-sync catch-up exceeded 5s simulated budget. \
              pre_heal={pre_heal_heights:?} pre_heal_max_survivor={max_survivor_pre_heal} \
              post_heal={post_heal_heights:?} gap_remaining={}",
             (max_survivor_pre_heal as i64) - (post_heal_heights[lagging_idx] as i64),

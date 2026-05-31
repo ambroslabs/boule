@@ -767,7 +767,7 @@ impl ConsensusNode {
             self.apply_safety_actions(actions, broadcaster, view_timer, signer)
                 .await?;
         }
-        // Pipeline the next window (#529). For a gap wider than one
+        // Pipeline the next window. For a gap wider than one
         // response window (`BLOCK_RANGE_RESPONSE_MAX_BLOCKS`) the replica
         // still parks a proposal far above the new frontier after the
         // re-drive above. Rather than wait for the next proposal to
@@ -788,7 +788,7 @@ impl ConsensusNode {
         // — would re-emit the *same* window on every arrival and amplify
         // traffic in a 1:1 request/response loop. A stalled gap instead
         // falls back to the proposal-driven path and the bounded range
-        // retry timer (#530).
+        // retry timer.
         let frontier = self.last_committed_height.load(Ordering::Relaxed);
         if frontier >= from_height.0
             && let Some((proposer, proposal_height)) = self
