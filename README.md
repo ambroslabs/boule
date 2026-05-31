@@ -25,10 +25,10 @@ cargo build
 
 # Bootstrap a single node (writes a starter config at the platform
 # default location if --config is omitted)
-cargo run -- init --config config.toml
+cargo run --bin boule -- init --config config.toml
 
 # Run that node
-cargo run -- start --config config.toml
+cargo run --bin boule -- start --config config.toml
 
 # Unit tests (includes the deterministic simulator)
 cargo test --lib
@@ -56,53 +56,23 @@ cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 ```
 
-## Layer map
+## Workspace layout
 
-```text
-             ┌────────────────────────────────────┐
-             │             consensus              │   HotStuff-style BFT
-             └─────────────────┬──────────────────┘
-   signed envelopes            │            durable state
-              ┌────────────────┴────────────────┐
-              ▼                                 ▼
-   ┌────────────────────┐              ┌────────────────────┐
-   │       crypto       │              │      storage       │
-   │  Ed25519 signing   │              │ Storage + Wal KV   │
-   └────────────────────┘              └────────────────────┘
-              │                                 │
-              │           dissemination         │
-              │         ┌────────────────┐      │
-              └────────▶│     gossip     │◀─────┘
-                        │ store + engine │
-                        └───────┬────────┘
-                                │ ProtocolHandle
-                                ▼
-                       ┌────────────────┐
-                       │      p2p       │
-                       │ TLS transport, │
-                       │ rpc, manager   │
-                       └───────┬────────┘
-                               │ Clock + network I/O
-                ┌──────────────┴──────────────┐
-                ▼                             ▼
-        ┌───────────────┐             ┌───────────────┐
-        │     clock     │             │      sim      │
-        │ real/virtual  │             │ deterministic │
-        │     time      │             │ test harness  │
-        └───────────────┘             └───────────────┘
-```
+`boule` is a Cargo workspace. `boule-core` is the leaf every other crate
+builds on; `boule-consensus` and `boule-transport-tcp` sit on top of it as
+siblings; `boule-node` wires them into a runtime; `boule-cli` is the
+binary.
 
-Module crib sheet (see `cargo doc` for the authoritative version):
+| Crate                 | Role                                                                                                                                                                |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `boule-core`          | Leaf primitives shared by everything: config, Ed25519/BLS signing and `Signed<T>` envelopes, the object-safe `Clock`, `Storage`/`Wal` KV traits, node identity, and transport rate-limit policy. |
+| `boule-consensus`     | HotStuff-style BFT: the safety core, pacemaker, message dispatch + wire format, block/mempool/snapshot replication and the state-machine seam, and validator-set rotation. |
+| `boule-transport-tcp` | TLS-authenticated transport, peer manager, dialer, RPC, and the gossip overlay (`Broadcaster` + `Discovery`). A node's Ed25519 public key is its overlay address.    |
+| `boule-node`          | The runtime that drives consensus over the transport, plus the `#[cfg(test)]` deterministic simulator and the local testnet driver.                                  |
+| `boule-cli`           | The `boule` binary, its subcommands, and the end-to-end integration tests.                                                                                           |
 
-| Module    | Role                                                                              |
-| --------- | --------------------------------------------------------------------------------- |
-| `p2p`     | TLS-authenticated transport, peer manager, protocol multiplexer, and the RPC layer. The node's Ed25519 public key is its overlay address. |
-| `gossip`  | Best-effort dissemination of opaque application messages over a `ProtocolHandle`. |
-| `crypto`  | Application-level `Signed<T>` envelopes for consensus votes, proposals, etc.      |
-| `clock`   | Object-safe time abstraction; `TokioClock` in prod, `SimClock` in tests.          |
-| `sim`     | `#[cfg(test)]`-only deterministic simulator: in-memory pipes, virtual time, seeded RNG. |
-| `storage` | `Storage` (KV) and `Wal` (append-only) traits with in-memory and `redb` backends. |
-| `config`  | TOML config loading and identity-backend resolution.                              |
+Each crate's `lib.rs` carries its own module breakdown; `cargo doc` is the
+authoritative reference.
 
 ## Configuration
 
@@ -122,7 +92,7 @@ listen_addr = "127.0.0.1:8080"
 The node's long-term Ed25519 identity can be sourced from a file, an
 environment variable, an encrypted file, an OS keyring, or an external
 command; see the `[node.identity]` table and the `key migrate` subcommand
-(`cargo run -- --help`).
+(`cargo run --bin boule -- --help`).
 
 When `--config` is omitted, `boule` reads from the platform-specific
 default (`$XDG_CONFIG_HOME/boule/config.toml` on Linux, the standard
@@ -134,19 +104,20 @@ on first use.
 
 Consensus consumes a `Broadcaster` + `Discovery` pair
 (`crates/boule-transport-tcp/src/overlay/`) so the underlying topology
-is a black box. The production overlay is **`gossip`**: each node keeps
-at most `target_degree` direct TLS connections (default 8) and learns
-about the rest of the validator set through periodic peer-list gossip.
-Add new operators by pointing one or two seed addresses at any
-reachable validator; no coordinated config rollouts when the validator
-set grows.
+is a black box. The production overlay is **`gossip`**: each node keeps a
+bounded set of direct TLS connections (up to `outbound_target` it dials
+out, `inbound_max` it accepts, `total_max` overall) and learns about the
+rest of the validator set through periodic peer-list gossip. Add new
+operators by pointing one or two seed addresses at any reachable
+validator; no coordinated config rollouts when the validator set grows.
 
 Tune it with the `[overlay]` table:
 
 ```toml
 [overlay]
-mode = "gossip"                 # "gossip" (the only overlay)
-target_degree = 8               # max direct peers per node
+outbound_target = 8             # direct peers this node dials out to
+inbound_max = 16                # direct peers it accepts inbound
+total_max = 24                  # hard ceiling on direct peers
 peer_gossip_interval_ms = 5000  # peer-list publish cadence
 mesh_check_interval_ms = 5000   # partial-mesh maintenance dial cadence
 bootstrap_addrs = ["10.0.0.1:7000"]  # TOFU seeds
@@ -155,7 +126,8 @@ bootstrap_addrs = ["10.0.0.1:7000"]  # TOFU seeds
 The remaining knobs (`peer_gossip_fanout`, `dedup_capacity`,
 `dedup_ttl_ms`, `peer_table_capacity`) tune the gossip overlay's
 internals; defaults are sized for validator-set-scale clusters and
-most operators leave them alone. See `[OverlayConfig](src/config.rs)`
+most operators leave them alone. See `OverlayConfig` in
+[`crates/boule-core/src/config.rs`](crates/boule-core/src/config.rs)
 for the full schema.
 
 `bootstrap_addrs` are TOFU dials — the gossip overlay accepts whatever
