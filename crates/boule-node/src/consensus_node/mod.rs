@@ -71,6 +71,7 @@ use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::pacemaker::Pacemaker;
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::pacemaker::timeout::ExponentialBackoff;
+use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
@@ -81,7 +82,6 @@ use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
 use boule_core::crypto::signed::{ChainId, Signer};
 use boule_core::storage::{Storage, Wal};
-use boule_core::transport::limits::RateLimiter;
 use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use boule_transport_tcp::tls::node_id_to_base58;
 use boule_transport_tcp::{NodeId, ProtocolEvent};
@@ -1364,12 +1364,12 @@ mod tests {
     use boule_consensus::hotstuff::qc::TimeoutVote;
     use boule_consensus::hotstuff::step::{Action as SafetyAction, Event as SafetyEvent};
     use boule_consensus::limits::CacheLimits;
+    use boule_consensus::rate_limit::MessageKind;
     use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
     use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
     use boule_consensus::validator_set::ValidatorSet;
     use boule_core::crypto::signed::Signed;
     use boule_core::storage::{MemoryStorage, MemoryWal};
-    use boule_core::transport::limits::MessageKind;
     use boule_transport_tcp::NodeId;
 
     fn nid(b: u8) -> NodeId {
@@ -7938,8 +7938,9 @@ mod tests {
 
     // ── RateLimiter integration (issue #134) ────────────────────────────────
 
+    use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
     use boule_core::clock::{Clock, TokioClock};
-    use boule_core::transport::limits::{RateLimiter, RateLimitsConfig};
+    use boule_core::transport::limits::RateLimitsConfig;
     use boule_transport_tcp::PeerCommand;
 
     /// Build a `WireMessage::BlockRequest([0; 32])` postcard frame.
@@ -7961,18 +7962,7 @@ mod tests {
         // Build a config with a tight per-kind bucket and a low
         // K so the test finishes quickly.
         let cfg = RateLimitsConfig {
-            proposal_per_sec: 1.0,
-            vote_per_sec: 1.0,
-            timeout_vote_per_sec: 1.0,
-            new_view_per_sec: 1.0,
-            request_block_per_sec: 1.0,
-            receive_block_per_sec: 1.0,
-            snapshot_manifest_request_per_sec: 1.0,
-            snapshot_manifest_response_per_sec: 1.0,
-            snapshot_chunk_request_per_sec: 1.0,
-            snapshot_chunk_response_per_sec: 1.0,
-            block_range_request_per_sec: 1.0,
-            block_range_response_per_sec: 1.0,
+            per_kind_per_sec: vec![1.0; MessageKind::ALL.len()],
             bytes_per_sec: 1024.0 * 1024.0, // generous, isolate the test on per-kind
             outbound_bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
@@ -8043,7 +8033,7 @@ mod tests {
         // The limiter's per-kind drop counter and disconnect counter
         // also reflect the flood.
         assert!(
-            limiter.counters().drops(MessageKind::RequestBlock) > 0,
+            limiter.counters().drops(MessageKind::RequestBlock as usize) > 0,
             "BlockRequest drops must accumulate"
         );
         assert_eq!(limiter.counters().disconnects(), 1);
@@ -8060,7 +8050,7 @@ mod tests {
     async fn honest_steady_state_does_not_trip_default_limits() {
         let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
         let limiter = Arc::new(RateLimiter::new(
-            RateLimitsConfig::production_defaults(),
+            boule_consensus::rate_limit::production_message_rate_limits(),
             Arc::clone(&clock),
         ));
 
@@ -8126,18 +8116,7 @@ mod tests {
     #[tokio::test]
     async fn one_peer_saturating_one_type_does_not_starve_another() {
         let cfg = RateLimitsConfig {
-            proposal_per_sec: 4.0,
-            vote_per_sec: 4.0,
-            timeout_vote_per_sec: 4.0,
-            new_view_per_sec: 4.0,
-            request_block_per_sec: 4.0,
-            receive_block_per_sec: 4.0,
-            snapshot_manifest_request_per_sec: 4.0,
-            snapshot_manifest_response_per_sec: 4.0,
-            snapshot_chunk_request_per_sec: 4.0,
-            snapshot_chunk_response_per_sec: 4.0,
-            block_range_request_per_sec: 4.0,
-            block_range_response_per_sec: 4.0,
+            per_kind_per_sec: vec![4.0; MessageKind::ALL.len()],
             bytes_per_sec: 1024.0 * 1024.0,
             outbound_bytes_per_sec: 1024.0 * 1024.0,
             burst_seconds: 1.0,
@@ -8153,7 +8132,7 @@ mod tests {
         for _ in 0..20 {
             let _ = limiter.admit(peer_a, MessageKind::RequestBlock, frame.len());
         }
-        assert!(limiter.counters().drops(MessageKind::RequestBlock) > 0);
+        assert!(limiter.counters().drops(MessageKind::RequestBlock as usize) > 0);
 
         // Peer B's Vote bucket is unaffected.
         let peer_b = nid(0xBB);

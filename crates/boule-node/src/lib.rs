@@ -195,8 +195,8 @@ pub async fn run(
         // ConsensusNode below so ingress is gated before
         // `dispatch::ingress` ever runs.
         let rate_limiter = config.p2p.limits.as_ref().map(|l| {
-            Arc::new(boule_core::transport::limits::RateLimiter::new(
-                boule_core::transport::limits::RateLimitsConfig::from_config(l),
+            Arc::new(boule_consensus::rate_limit::MessageRateLimiter::new(
+                boule_consensus::rate_limit::message_rate_limits(l),
                 Arc::clone(&clock),
             ))
         });
@@ -321,7 +321,7 @@ async fn start_consensus(
     clock: Arc<dyn Clock>,
     self_listen_addr: std::net::SocketAddr,
     inbound_disabled: bool,
-    rate_limiter: Option<Arc<boule_core::transport::limits::RateLimiter>>,
+    rate_limiter: Option<Arc<boule_consensus::rate_limit::MessageRateLimiter>>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     info!(

@@ -3,26 +3,25 @@
 //!
 //! Two independent limiters live here:
 //!
-//! - [`RateLimiter`] enforces per-peer token buckets keyed by
-//!   [`MessageKind`] (one bucket per consensus message type), a
-//!   per-peer **inbound** wire-bytes/sec cap, and a per-peer
-//!   **outbound** wire-bytes/sec cap (#553). The consensus
-//!   integration layer classifies an inbound frame's first byte
-//!   into a [`MessageKind`], asks [`RateLimiter::admit`], and either
-//!   drops or dispatches based on the [`Decision`]. After K
-//!   violations within a sliding window of W seconds,
-//!   [`Decision::Disconnect`] is returned exactly once per peer —
-//!   the caller is responsible for tearing down the connection
-//!   (typically by sending `boule_transport_tcp::PeerCommand::Disconnect`).
-//!   On egress, every directed `SendTo` frame is charged against
-//!   the recipient peer's outbound bucket via
-//!   [`RateLimiter::admit_outbound`]; on overflow the caller skips
-//!   the send. The outbound cap defends against the
-//!   request/response amplification vector where a Byzantine peer
-//!   sends tiny [`MessageKind::BlockRangeRequest`] frames at low
-//!   ingress cost and pulls hundreds of KB of
-//!   [`MessageKind::BlockRangeResponse`] out of the responder per
-//!   request.
+//! - [`RateLimiter`] enforces per-peer token buckets keyed by a
+//!   [`RateLimitKind`] (one bucket per message kind), a per-peer
+//!   **inbound** wire-bytes/sec cap, and a per-peer **outbound**
+//!   wire-bytes/sec cap (#553). It is generic over the kind taxonomy
+//!   `K`; the concrete consensus taxonomy (`boule_consensus`'s
+//!   `MessageKind`, mirroring the wire schema) is supplied by the
+//!   consensus layer, which classifies an inbound frame's first byte
+//!   into a kind, asks [`RateLimiter::admit`], and either drops or
+//!   dispatches based on the [`Decision`]. After K violations within a
+//!   sliding window of W seconds, [`Decision::Disconnect`] is returned
+//!   exactly once per peer — the caller is responsible for tearing down
+//!   the connection (typically by sending
+//!   `boule_transport_tcp::PeerCommand::Disconnect`). On egress, every
+//!   directed frame is charged against the recipient peer's outbound
+//!   bucket via [`RateLimiter::admit_outbound`]; on overflow the caller
+//!   skips the send. The outbound cap defends against the
+//!   request/response amplification vector where a Byzantine peer sends
+//!   tiny range-requests at low ingress cost and pulls hundreds of KB of
+//!   range-responses out of the responder per request.
 //!
 //! - [`ConnectionLimiter`] enforces global inbound / outbound /
 //!   per-source-IP caps at the manager. The listener and dialer pass
@@ -51,120 +50,28 @@ use parking_lot::Mutex;
 use crate::clock::Clock;
 use crate::identity::NodeId;
 
-// ── MessageKind ──────────────────────────────────────────────────────────────
+// ── RateLimitKind ────────────────────────────────────────────────────────────
 
-/// One classification per consensus wire-message type.
+/// A message-kind taxonomy the [`RateLimiter`] buckets traffic by.
 ///
-/// The numeric value matches the postcard variant tag emitted at byte 0
-/// of a serialized `WireMessage` (postcard
-/// encodes enum discriminants as a varint in declaration order; for
-/// the ten variants here the tag fits in a single byte). Locked in by
-/// the unit test `tests::wire_tag_layout_locked` below — reordering
-/// `WireMessage` without updating this enum is a test failure, not a
-/// silent miscount.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MessageKind {
-    /// `WireMessage::Proposal` — postcard tag 0.
-    Proposal,
-    /// `WireMessage::Vote` — postcard tag 1.
-    Vote,
-    /// `WireMessage::NewView` — postcard tag 2.
-    NewView,
-    /// `WireMessage::TimeoutVote` — postcard tag 3.
-    TimeoutVote,
-    /// `WireMessage::BlockRequest` — postcard tag 4.
-    RequestBlock,
-    /// `WireMessage::BlockResponse` — postcard tag 5.
-    ReceiveBlock,
-    /// `WireMessage::SnapshotManifestRequest` — postcard tag 6.
-    SnapshotManifestRequest,
-    /// `WireMessage::SnapshotManifestResponse` — postcard tag 7.
-    SnapshotManifestResponse,
-    /// `WireMessage::SnapshotChunkRequest` — postcard tag 8.
-    SnapshotChunkRequest,
-    /// `WireMessage::SnapshotChunkResponse` — postcard tag 9.
-    SnapshotChunkResponse,
-    /// `WireMessage::BlockRangeRequest` — postcard tag 10. Bulk-range
-    /// catch-up RPC introduced in #514 (parent #185).
-    BlockRangeRequest,
-    /// `WireMessage::BlockRangeResponse` — postcard tag 11.
-    BlockRangeResponse,
-}
+/// Implementors supply a dense `0..N` index for array-backed per-kind
+/// storage and a stable label for logs. The concrete consensus taxonomy
+/// — `boule_consensus`'s `MessageKind`, which mirrors the `WireMessage`
+/// postcard tags — lives next to that wire schema, so this foundational
+/// crate stays free of higher-layer message definitions: the rate
+/// limiter is generic over whatever kind enum its owner supplies.
+pub trait RateLimitKind: Copy + Eq + std::hash::Hash + 'static {
+    /// Every kind, in [`index`](RateLimitKind::index) order. Its length
+    /// sizes the per-kind bucket and counter arrays, so it must be
+    /// stable for a given `Self` and the returned `index()` values must
+    /// densely cover `0..all().len()`.
+    fn all() -> &'static [Self];
 
-impl MessageKind {
-    /// Iteration helper used by the rate limiter to construct one
-    /// bucket per kind in a fixed order.
-    pub const ALL: [MessageKind; 12] = [
-        MessageKind::Proposal,
-        MessageKind::Vote,
-        MessageKind::NewView,
-        MessageKind::TimeoutVote,
-        MessageKind::RequestBlock,
-        MessageKind::ReceiveBlock,
-        MessageKind::SnapshotManifestRequest,
-        MessageKind::SnapshotManifestResponse,
-        MessageKind::SnapshotChunkRequest,
-        MessageKind::SnapshotChunkResponse,
-        MessageKind::BlockRangeRequest,
-        MessageKind::BlockRangeResponse,
-    ];
-
-    /// Map a `WireMessage`'s first postcard byte to a `MessageKind`.
-    /// Returns `None` for unknown tags so callers can fall through to
-    /// the existing `dispatch::ingress` decoder (which then surfaces
-    /// the proper `IngressError::Decode`).
-    pub fn from_wire_tag(tag: u8) -> Option<Self> {
-        Some(match tag {
-            0 => Self::Proposal,
-            1 => Self::Vote,
-            2 => Self::NewView,
-            3 => Self::TimeoutVote,
-            4 => Self::RequestBlock,
-            5 => Self::ReceiveBlock,
-            6 => Self::SnapshotManifestRequest,
-            7 => Self::SnapshotManifestResponse,
-            8 => Self::SnapshotChunkRequest,
-            9 => Self::SnapshotChunkResponse,
-            10 => Self::BlockRangeRequest,
-            11 => Self::BlockRangeResponse,
-            _ => return None,
-        })
-    }
+    /// Dense index in `0..all().len()` for array-backed per-kind storage.
+    fn index(self) -> usize;
 
     /// Stable short label for log fields.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Proposal => "Proposal",
-            Self::Vote => "Vote",
-            Self::NewView => "NewView",
-            Self::TimeoutVote => "TimeoutVote",
-            Self::RequestBlock => "RequestBlock",
-            Self::ReceiveBlock => "ReceiveBlock",
-            Self::SnapshotManifestRequest => "SnapshotManifestRequest",
-            Self::SnapshotManifestResponse => "SnapshotManifestResponse",
-            Self::SnapshotChunkRequest => "SnapshotChunkRequest",
-            Self::SnapshotChunkResponse => "SnapshotChunkResponse",
-            Self::BlockRangeRequest => "BlockRangeRequest",
-            Self::BlockRangeResponse => "BlockRangeResponse",
-        }
-    }
-
-    fn idx(self) -> usize {
-        match self {
-            Self::Proposal => 0,
-            Self::Vote => 1,
-            Self::NewView => 2,
-            Self::TimeoutVote => 3,
-            Self::RequestBlock => 4,
-            Self::ReceiveBlock => 5,
-            Self::SnapshotManifestRequest => 6,
-            Self::SnapshotManifestResponse => 7,
-            Self::SnapshotChunkRequest => 8,
-            Self::SnapshotChunkResponse => 9,
-            Self::BlockRangeRequest => 10,
-            Self::BlockRangeResponse => 11,
-        }
-    }
+    fn label(self) -> &'static str;
 }
 
 // ── TokenBucket ──────────────────────────────────────────────────────────────
@@ -175,8 +82,8 @@ impl MessageKind {
 ///
 /// Safe to construct with `rate_per_sec == capacity == 0.0`, which
 /// permanently denies; with `rate_per_sec == f64::INFINITY` or any
-/// huge number, the bucket effectively never empties (used by
-/// [`RateLimitsConfig::unbounded_for_tests`]).
+/// huge number, the bucket effectively never empties (the shape a
+/// test "unbounded" config uses to disable rate limiting).
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     capacity: f64,
@@ -224,62 +131,23 @@ impl TokenBucket {
 
 // ── RateLimitsConfig ─────────────────────────────────────────────────────────
 
-/// Plain-data configuration for [`RateLimiter`]. Every rate is in
-/// units-per-second; the burst capacity is `rate_per_sec *
-/// burst_seconds` so a peer can spike for a short window without
-/// tripping the limit.
+/// Plain-data configuration for [`RateLimiter`]. Rates are in
+/// units-per-second; the burst capacity is `rate × burst_seconds` so a
+/// peer can spike for a short window without tripping the limit.
 ///
-/// Defaults are sized loose enough that an honest 4-validator cluster
-/// running 200ms-view-timer never trips a bucket; see
-/// [`Self::production_defaults`].
+/// The per-kind rates live in `per_kind_per_sec`, indexed by
+/// [`RateLimitKind::index`] — slot `i` is the steady-state rate for the
+/// kind whose `index()` is `i`. The owner of the concrete kind enum
+/// (the consensus crate) builds this vector from its named
+/// `[p2p.limits.rate]` config; this crate never names a concrete kind.
 #[derive(Debug, Clone)]
 pub struct RateLimitsConfig {
-    /// Steady-state rate of `Proposal` frames. A leader proposes once
-    /// per view; over a 4-node cluster every replica receives one
-    /// proposal per view from the leader — set generously to allow
-    /// for view changes and recovery flurries.
-    pub proposal_per_sec: f64,
-    /// Steady-state rate of `Vote` frames. Each replica sends one vote
-    /// per view × (n - 1) recipients, so the per-peer inbound vote
-    /// rate is one per view.
-    pub vote_per_sec: f64,
-    /// Steady-state rate of `TimeoutVote` frames.
-    pub timeout_vote_per_sec: f64,
-    /// Steady-state rate of `NewView` frames.
-    pub new_view_per_sec: f64,
-    /// Steady-state rate of `BlockRequest` frames received from a
-    /// peer. Sized for catch-up rather than steady-state — a
-    /// healthy peer does not request blocks in steady state.
-    pub request_block_per_sec: f64,
-    /// Steady-state rate of `BlockResponse` frames received from a
-    /// peer. Mirrors `request_block_per_sec` since each request
-    /// elicits at most one response.
-    pub receive_block_per_sec: f64,
-    /// Steady-state rate of `SnapshotManifestRequest` frames received
-    /// from a peer. Snapshot fetches are bursty but rare — sized for
-    /// a joiner negotiating manifests with its known peers, not for
-    /// steady-state traffic.
-    pub snapshot_manifest_request_per_sec: f64,
-    /// Steady-state rate of `SnapshotManifestResponse` frames. Mirrors
-    /// the request side.
-    pub snapshot_manifest_response_per_sec: f64,
-    /// Steady-state rate of `SnapshotChunkRequest` frames received from
-    /// a peer. Sized for chunked catch-up — a joiner pulling a 100 MiB
-    /// snapshot at 1 MiB chunks fits well under the default.
-    pub snapshot_chunk_request_per_sec: f64,
-    /// Steady-state rate of `SnapshotChunkResponse` frames. Mirrors
-    /// the request side.
-    pub snapshot_chunk_response_per_sec: f64,
-    /// Steady-state rate of `BlockRangeRequest` frames received from a
-    /// peer. Sized for catch-up: a recovering replica issues at most
-    /// a handful of range requests in flight per peer (#514).
-    pub block_range_request_per_sec: f64,
-    /// Steady-state rate of `BlockRangeResponse` frames received from
-    /// a peer. Mirrors the request side; each request elicits at most
-    /// one response.
-    pub block_range_response_per_sec: f64,
-    /// Per-peer wire-bytes/sec ceiling, applied independently of the
-    /// per-kind buckets so a flood of any one kind that fits within
+    /// Per-kind steady-state rates (units/sec), indexed by
+    /// [`RateLimitKind::index`]. Length must equal `K::all().len()` for
+    /// the `K` the [`RateLimiter`] is built with.
+    pub per_kind_per_sec: Vec<f64>,
+    /// Per-peer inbound wire-bytes/sec ceiling, applied independently of
+    /// the per-kind buckets so a flood of any one kind that fits within
     /// its bucket can still be dropped on bytes alone.
     pub bytes_per_sec: f64,
     /// Per-peer outbound wire-bytes/sec ceiling (#553). Symmetric to
@@ -287,13 +155,13 @@ pub struct RateLimitsConfig {
     /// frame the node hands to the transport is consulted against the
     /// recipient peer's outbound bucket. Defends against the
     /// request/response amplification vector where a Byzantine peer
-    /// sends tiny [`MessageKind::BlockRangeRequest`]s at low ingress
-    /// cost and pulls hundreds of KB of [`MessageKind::BlockRangeResponse`]
-    /// out of the responder per request — the ingress bucket sees only
-    /// the cheap requests while egress goes uncapped.
+    /// sends tiny range-requests at low ingress cost and pulls hundreds
+    /// of KB of range-responses out of the responder per request — the
+    /// ingress bucket sees only the cheap requests while egress goes
+    /// uncapped.
     pub outbound_bytes_per_sec: f64,
     /// Burst window in seconds; capacity for each bucket is
-    /// `rate_per_sec * burst_seconds`.
+    /// `rate × burst_seconds`.
     pub burst_seconds: f64,
     /// Rolling window over which violations are counted. After
     /// `max_violations` violations within this window, [`admit`]
@@ -309,125 +177,12 @@ pub struct RateLimitsConfig {
 }
 
 impl RateLimitsConfig {
-    /// Project the parsed `[p2p.limits]` rate + violation fields into
-    /// the runtime rate-limit shape.
-    pub fn from_config(c: &crate::config::P2pLimitsConfig) -> Self {
-        Self {
-            proposal_per_sec: c.rate.proposal_per_sec,
-            vote_per_sec: c.rate.vote_per_sec,
-            timeout_vote_per_sec: c.rate.timeout_vote_per_sec,
-            new_view_per_sec: c.rate.new_view_per_sec,
-            request_block_per_sec: c.rate.request_block_per_sec,
-            receive_block_per_sec: c.rate.receive_block_per_sec,
-            snapshot_manifest_request_per_sec: c.rate.snapshot_manifest_request_per_sec,
-            snapshot_manifest_response_per_sec: c.rate.snapshot_manifest_response_per_sec,
-            snapshot_chunk_request_per_sec: c.rate.snapshot_chunk_request_per_sec,
-            snapshot_chunk_response_per_sec: c.rate.snapshot_chunk_response_per_sec,
-            block_range_request_per_sec: c.rate.block_range_request_per_sec,
-            block_range_response_per_sec: c.rate.block_range_response_per_sec,
-            bytes_per_sec: c.rate.bytes_per_sec,
-            outbound_bytes_per_sec: c.rate.outbound_bytes_per_sec,
-            burst_seconds: c.rate.burst_seconds,
-            violation_window: std::time::Duration::from_secs(c.violations.window_secs),
-            max_violations: c.violations.max_violations,
-        }
-    }
-
-    /// Permissive defaults that effectively disable rate limiting.
-    /// Used by the consensus property tests and the simulator's
-    /// happy-path harness so an unrelated rate spike never perturbs
-    /// the assertion under test.
-    pub fn unbounded_for_tests() -> Self {
-        const HUGE: f64 = 1.0e12;
-        Self {
-            proposal_per_sec: HUGE,
-            vote_per_sec: HUGE,
-            timeout_vote_per_sec: HUGE,
-            new_view_per_sec: HUGE,
-            request_block_per_sec: HUGE,
-            receive_block_per_sec: HUGE,
-            snapshot_manifest_request_per_sec: HUGE,
-            snapshot_manifest_response_per_sec: HUGE,
-            snapshot_chunk_request_per_sec: HUGE,
-            snapshot_chunk_response_per_sec: HUGE,
-            block_range_request_per_sec: HUGE,
-            block_range_response_per_sec: HUGE,
-            bytes_per_sec: HUGE,
-            outbound_bytes_per_sec: HUGE,
-            burst_seconds: 1.0,
-            violation_window: Duration::from_secs(10),
-            max_violations: u32::MAX,
-        }
-    }
-
-    /// Defaults baked into the binary when the operator omits
-    /// `[p2p.limits.rate]`. Sized generously above honest steady-state
-    /// for a four-validator cluster; see issue #134 for the design
-    /// rationale.
-    pub fn production_defaults() -> Self {
-        Self {
-            proposal_per_sec: 16.0,
-            vote_per_sec: 256.0,
-            timeout_vote_per_sec: 64.0,
-            new_view_per_sec: 64.0,
-            request_block_per_sec: 8.0,
-            receive_block_per_sec: 8.0,
-            // Snapshot rates: bursty but rare. A joiner fetching a
-            // 1 GiB snapshot at 1 MiB chunks issues ~1024 chunk
-            // requests; 32/sec lets the fetch complete in ~30s
-            // without tripping the limiter, and steady-state traffic
-            // (zero in healthy clusters) sits comfortably below.
-            // Manifest exchanges happen O(1) per fetch; cap them
-            // tighter to bound a Byzantine peer's manifest-flood.
-            snapshot_manifest_request_per_sec: 4.0,
-            snapshot_manifest_response_per_sec: 4.0,
-            snapshot_chunk_request_per_sec: 32.0,
-            snapshot_chunk_response_per_sec: 32.0,
-            // Block-range RPC: bursty during catch-up but rare in
-            // steady state. A recovering replica typically pipelines
-            // a handful of requests at a time; 8/s leaves plenty of
-            // headroom for rotation across peers without inviting a
-            // flood vector.
-            block_range_request_per_sec: 8.0,
-            block_range_response_per_sec: 8.0,
-            bytes_per_sec: 1024.0 * 1024.0,
-            // Sized symmetric to `bytes_per_sec`. Honest steady-state
-            // egress on a 4-validator cluster is dominated by proposals
-            // (~16/sec × a few KB) and votes (next-leader unicast at
-            // similar cadence) — comfortably under 1 MiB/sec per peer.
-            // Bulk-range catch-up bursts up to
-            // `BLOCK_RANGE_RESPONSE_MAX_BLOCKS`
-            // blocks per response and is the dominant drainer; the cap
-            // bounds amplification without throttling honest catch-up.
-            outbound_bytes_per_sec: 1024.0 * 1024.0,
-            burst_seconds: 1.0,
-            violation_window: Duration::from_secs(10),
-            max_violations: 100,
-        }
-    }
-
-    fn rate_for(&self, k: MessageKind) -> f64 {
-        match k {
-            MessageKind::Proposal => self.proposal_per_sec,
-            MessageKind::Vote => self.vote_per_sec,
-            MessageKind::NewView => self.new_view_per_sec,
-            MessageKind::TimeoutVote => self.timeout_vote_per_sec,
-            MessageKind::RequestBlock => self.request_block_per_sec,
-            MessageKind::ReceiveBlock => self.receive_block_per_sec,
-            MessageKind::SnapshotManifestRequest => self.snapshot_manifest_request_per_sec,
-            MessageKind::SnapshotManifestResponse => self.snapshot_manifest_response_per_sec,
-            MessageKind::SnapshotChunkRequest => self.snapshot_chunk_request_per_sec,
-            MessageKind::SnapshotChunkResponse => self.snapshot_chunk_response_per_sec,
-            MessageKind::BlockRangeRequest => self.block_range_request_per_sec,
-            MessageKind::BlockRangeResponse => self.block_range_response_per_sec,
-        }
-    }
-
-    fn bucket_capacity(&self, k: MessageKind) -> f64 {
-        // Capacity = rate × burst_seconds. Floor at 1 token so a
-        // bucket whose configured rate is < 1/burst_seconds still
-        // admits a single message rather than refusing every one.
-        (self.rate_for(k) * self.burst_seconds).max(1.0)
+    /// Capacity for the per-kind bucket at `index`. Capacity = rate ×
+    /// burst_seconds, floored at 1 token so a bucket whose configured
+    /// rate is < 1/burst_seconds still admits a single message rather
+    /// than refusing every one.
+    fn bucket_capacity(&self, index: usize) -> f64 {
+        (self.per_kind_per_sec[index] * self.burst_seconds).max(1.0)
     }
 
     fn bytes_capacity(&self) -> f64 {
@@ -458,32 +213,53 @@ pub enum Decision {
     Disconnect,
 }
 
-/// Atomic per-kind drop counters plus a global disconnect counter.
-/// Cheap to clone (each inner counter is shared via `Arc`).
-#[derive(Debug, Clone, Default)]
+/// Atomic per-kind drop counters plus global byte / disconnect
+/// counters. Cheap to clone (the inner state is shared via `Arc`).
+///
+/// Per-kind drops are read via [`drops`](Self::drops), keyed by the
+/// kind's [`RateLimitKind::index`].
+#[derive(Debug, Clone)]
 pub struct RateLimitCounters {
     inner: Arc<RateLimitCountersInner>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RateLimitCountersInner {
-    by_kind: [AtomicU64; 12],
+    /// One drop counter per kind, indexed by [`RateLimitKind::index`].
+    by_kind: Vec<AtomicU64>,
     bytes: AtomicU64,
     outbound_bytes: AtomicU64,
     disconnects: AtomicU64,
 }
 
 impl RateLimitCounters {
-    /// Cumulative drops for `kind` since the counter was created.
-    pub fn drops(&self, kind: MessageKind) -> u64 {
-        self.inner.by_kind[kind.idx()].load(Ordering::Relaxed)
+    /// Build counters for a taxonomy of `kind_count` kinds.
+    fn with_kinds(kind_count: usize) -> Self {
+        Self {
+            inner: Arc::new(RateLimitCountersInner {
+                by_kind: (0..kind_count).map(|_| AtomicU64::new(0)).collect(),
+                bytes: AtomicU64::new(0),
+                outbound_bytes: AtomicU64::new(0),
+                disconnects: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Cumulative drops for the kind at `kind_index`
+    /// ([`RateLimitKind::index`]). Returns 0 for an out-of-range index.
+    pub fn drops(&self, kind_index: usize) -> u64 {
+        self.inner
+            .by_kind
+            .get(kind_index)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
     /// Total drops across every message kind.
     pub fn total_drops(&self) -> u64 {
-        MessageKind::ALL
+        self.inner
+            .by_kind
             .iter()
-            .map(|k| self.drops(*k))
+            .map(|c| c.load(Ordering::Relaxed))
             .sum::<u64>()
             .saturating_add(self.bytes_drops())
     }
@@ -497,9 +273,9 @@ impl RateLimitCounters {
     /// Cumulative drops attributed to the outbound bytes/sec cap (#553).
     /// Each increment is one egress frame the limiter declined to hand
     /// to the transport because the recipient peer's outbound bucket
-    /// was empty — typically a [`MessageKind::BlockRangeResponse`] the
-    /// responder skipped to stop a Byzantine peer from amplifying tiny
-    /// requests into hundreds of KB/sec of egress.
+    /// was empty — typically a fat range-response the responder skipped
+    /// to stop a Byzantine peer from amplifying tiny requests into
+    /// hundreds of KB/sec of egress.
     pub fn outbound_drops_total(&self) -> u64 {
         self.inner.outbound_bytes.load(Ordering::Relaxed)
     }
@@ -509,8 +285,10 @@ impl RateLimitCounters {
         self.inner.disconnects.load(Ordering::Relaxed)
     }
 
-    fn inc_drops(&self, kind: MessageKind) {
-        self.inner.by_kind[kind.idx()].fetch_add(1, Ordering::Relaxed);
+    fn inc_drops(&self, kind_index: usize) {
+        if let Some(c) = self.inner.by_kind.get(kind_index) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn inc_bytes(&self) {
@@ -529,7 +307,9 @@ impl RateLimitCounters {
 // ── PeerState + RateLimiter ──────────────────────────────────────────────────
 
 struct PeerState {
-    buckets: [TokenBucket; 12],
+    /// One token bucket per kind, indexed by [`RateLimitKind::index`].
+    /// Length equals the config's `per_kind_per_sec.len()`.
+    buckets: Vec<TokenBucket>,
     bytes_bucket: TokenBucket,
     /// Per-peer egress bytes/sec ceiling (#553). Independent of
     /// `bytes_bucket` so the inbound-vs-outbound budgets do not
@@ -547,23 +327,14 @@ struct PeerState {
 
 impl PeerState {
     fn new(config: &RateLimitsConfig, now: Duration) -> Self {
-        let mk =
-            |k: MessageKind| TokenBucket::new(config.rate_for(k), config.bucket_capacity(k), now);
+        let buckets = config
+            .per_kind_per_sec
+            .iter()
+            .enumerate()
+            .map(|(i, &rate)| TokenBucket::new(rate, config.bucket_capacity(i), now))
+            .collect();
         Self {
-            buckets: [
-                mk(MessageKind::Proposal),
-                mk(MessageKind::Vote),
-                mk(MessageKind::NewView),
-                mk(MessageKind::TimeoutVote),
-                mk(MessageKind::RequestBlock),
-                mk(MessageKind::ReceiveBlock),
-                mk(MessageKind::SnapshotManifestRequest),
-                mk(MessageKind::SnapshotManifestResponse),
-                mk(MessageKind::SnapshotChunkRequest),
-                mk(MessageKind::SnapshotChunkResponse),
-                mk(MessageKind::BlockRangeRequest),
-                mk(MessageKind::BlockRangeResponse),
-            ],
+            buckets,
             bytes_bucket: TokenBucket::new(config.bytes_per_sec, config.bytes_capacity(), now),
             outbound_bytes_bucket: TokenBucket::new(
                 config.outbound_bytes_per_sec,
@@ -583,24 +354,37 @@ impl PeerState {
 /// at consensus message rates (a few thousand admits/sec across all
 /// peers). If profiles ever surface contention, sharding by peer is
 /// the natural follow-up.
-pub struct RateLimiter {
+pub struct RateLimiter<K: RateLimitKind> {
     config: RateLimitsConfig,
     state: Mutex<HashMap<NodeId, PeerState>>,
     clock: Arc<dyn Clock>,
     counters: RateLimitCounters,
+    _kind: std::marker::PhantomData<fn() -> K>,
 }
 
-impl RateLimiter {
+impl<K: RateLimitKind> RateLimiter<K> {
     /// Construct a rate limiter from `config`. The supplied [`Clock`]
     /// drives the bucket refill timestamps; pass the consensus
     /// node's clock so the limiter and the pacemaker share a time
     /// base under virtual-clock tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.per_kind_per_sec.len() != K::all().len()` — the
+    /// per-kind rate vector must have exactly one entry per kind.
     pub fn new(config: RateLimitsConfig, clock: Arc<dyn Clock>) -> Self {
+        assert_eq!(
+            config.per_kind_per_sec.len(),
+            K::all().len(),
+            "RateLimitsConfig.per_kind_per_sec length must equal the kind count",
+        );
+        let counters = RateLimitCounters::with_kinds(K::all().len());
         Self {
             config,
             state: Mutex::new(HashMap::new()),
             clock,
-            counters: RateLimitCounters::default(),
+            counters,
+            _kind: std::marker::PhantomData,
         }
     }
 
@@ -609,7 +393,7 @@ impl RateLimiter {
     /// length (after framing strips the protocol-tag prefix); it is
     /// charged against the bytes/sec cap independently of the per-
     /// kind bucket.
-    pub fn admit(&self, peer: NodeId, kind: MessageKind, bytes_len: usize) -> Decision {
+    pub fn admit(&self, peer: NodeId, kind: K, bytes_len: usize) -> Decision {
         let now = self.clock.now_monotonic();
         let mut state = self.state.lock();
         let peer_state = state
@@ -636,7 +420,7 @@ impl RateLimiter {
         // Type bucket first: returning Drop on a per-type cap is the
         // most common outcome under flood, and the bytes bucket
         // correctness only matters when the type bucket admitted.
-        let kind_admitted = peer_state.buckets[kind.idx()].try_take(now, 1.0);
+        let kind_admitted = peer_state.buckets[kind.index()].try_take(now, 1.0);
         let bytes_admitted = peer_state.bytes_bucket.try_take(now, bytes_len as f64);
 
         if kind_admitted && bytes_admitted {
@@ -650,7 +434,7 @@ impl RateLimiter {
         // and could mask the per-type rate when one peer spams a
         // single huge frame.
         if kind_admitted && !bytes_admitted {
-            peer_state.buckets[kind.idx()].tokens += 1.0;
+            peer_state.buckets[kind.index()].tokens += 1.0;
         }
         if bytes_admitted && !kind_admitted {
             peer_state.bytes_bucket.tokens += bytes_len as f64;
@@ -659,7 +443,7 @@ impl RateLimiter {
         peer_state.violations.push_back(now);
 
         if !kind_admitted {
-            self.counters.inc_drops(kind);
+            self.counters.inc_drops(kind.index());
         } else {
             self.counters.inc_bytes();
         }
@@ -686,10 +470,10 @@ impl RateLimiter {
     /// the connection — the inbound limiter is the canonical
     /// disconnect trigger.
     ///
-    /// Dropping a directed response (e.g. [`MessageKind::BlockRangeResponse`])
-    /// is safe under the existing protocol: the requester's
-    /// inflight/timeout state machine treats the silence identically
-    /// to a packet loss event and re-requests on its own cadence.
+    /// Dropping a directed response (e.g. a bulk range-response) is safe
+    /// under the existing protocol: the requester's inflight/timeout
+    /// state machine treats the silence identically to a packet loss
+    /// event and re-requests on its own cadence.
     pub fn admit_outbound(&self, peer: NodeId, bytes_len: usize) -> Decision {
         let now = self.clock.now_monotonic();
         let mut state = self.state.lock();
@@ -964,17 +748,36 @@ mod tests {
         [b; 32]
     }
 
+    /// A small kind taxonomy for exercising the generic limiter in
+    /// isolation. The concrete `MessageKind` (mirroring the wire schema)
+    /// lives in the consensus crate; three distinct kinds is enough to
+    /// test per-kind bucket independence here.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    enum TestKind {
+        A,
+        B,
+        C,
+    }
+
+    impl RateLimitKind for TestKind {
+        fn all() -> &'static [Self] {
+            &[TestKind::A, TestKind::B, TestKind::C]
+        }
+        fn index(self) -> usize {
+            self as usize
+        }
+        fn label(self) -> &'static str {
+            match self {
+                TestKind::A => "A",
+                TestKind::B => "B",
+                TestKind::C => "C",
+            }
+        }
+    }
+
     #[test]
-    fn from_config_projects_p2p_limits() {
+    fn connection_limits_from_config_projects_p2p_limits() {
         let cfg = crate::config::P2pLimitsConfig::default();
-        let rate = RateLimitsConfig::from_config(&cfg);
-        assert_eq!(rate.vote_per_sec, cfg.rate.vote_per_sec);
-        assert_eq!(rate.bytes_per_sec, cfg.rate.bytes_per_sec);
-        assert_eq!(
-            rate.violation_window,
-            std::time::Duration::from_secs(cfg.violations.window_secs)
-        );
-        assert_eq!(rate.max_violations, cfg.violations.max_violations);
         let conn = ConnectionLimitsConfig::from_config(&cfg);
         assert_eq!(conn.max_inbound, cfg.max_inbound_connections);
         assert_eq!(conn.max_outbound, cfg.max_outbound_connections);
@@ -1058,18 +861,7 @@ mod tests {
 
     fn limits_for_test() -> RateLimitsConfig {
         RateLimitsConfig {
-            proposal_per_sec: 4.0,
-            vote_per_sec: 4.0,
-            timeout_vote_per_sec: 4.0,
-            new_view_per_sec: 4.0,
-            request_block_per_sec: 4.0,
-            receive_block_per_sec: 4.0,
-            snapshot_manifest_request_per_sec: 4.0,
-            snapshot_manifest_response_per_sec: 4.0,
-            snapshot_chunk_request_per_sec: 4.0,
-            snapshot_chunk_response_per_sec: 4.0,
-            block_range_request_per_sec: 4.0,
-            block_range_response_per_sec: 4.0,
+            per_kind_per_sec: vec![4.0; TestKind::all().len()],
             bytes_per_sec: 4096.0,
             outbound_bytes_per_sec: 4096.0,
             burst_seconds: 1.0,
@@ -1081,31 +873,22 @@ mod tests {
     #[test]
     fn admit_allows_within_capacity() {
         let clock = ManualClock::new();
-        let limiter = RateLimiter::new(limits_for_test(), clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(limits_for_test(), clock.clone());
         for _ in 0..4 {
-            assert_eq!(
-                limiter.admit(nid(1), MessageKind::Proposal, 100),
-                Decision::Allow
-            );
+            assert_eq!(limiter.admit(nid(1), TestKind::A, 100), Decision::Allow);
         }
     }
 
     #[test]
     fn admit_drops_after_per_kind_capacity_exceeded() {
         let clock = ManualClock::new();
-        let limiter = RateLimiter::new(limits_for_test(), clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(limits_for_test(), clock.clone());
         // 4 admits drain the bucket, 5th drops.
         for _ in 0..4 {
-            assert_eq!(
-                limiter.admit(nid(1), MessageKind::Proposal, 1),
-                Decision::Allow
-            );
+            assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Allow);
         }
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Proposal, 1),
-            Decision::Drop
-        );
-        assert_eq!(limiter.counters().drops(MessageKind::Proposal), 1);
+        assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Drop);
+        assert_eq!(limiter.counters().drops(TestKind::A.index()), 1);
     }
 
     #[test]
@@ -1113,51 +896,36 @@ mod tests {
         let clock = ManualClock::new();
         let mut config = limits_for_test();
         config.max_violations = 3;
-        let limiter = RateLimiter::new(config, clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(config, clock.clone());
 
         // Drain.
         for _ in 0..4 {
-            limiter.admit(nid(1), MessageKind::Proposal, 1);
+            limiter.admit(nid(1), TestKind::A, 1);
         }
         // First two violations: Drop.
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Proposal, 1),
-            Decision::Drop
-        );
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Proposal, 1),
-            Decision::Drop
-        );
+        assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Drop);
+        assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Drop);
         // Third violation: Disconnect.
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Proposal, 1),
-            Decision::Disconnect
-        );
+        assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Disconnect);
         // Subsequent violations stay at Drop until the window
         // clears — Disconnect must be one-shot per streak so the
         // caller's teardown runs exactly once.
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Proposal, 1),
-            Decision::Drop
-        );
+        assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Drop);
         assert_eq!(limiter.counters().disconnects(), 1);
     }
 
     #[test]
     fn per_kind_buckets_are_independent() {
         let clock = ManualClock::new();
-        let limiter = RateLimiter::new(limits_for_test(), clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(limits_for_test(), clock.clone());
         // Saturate Proposal.
         for _ in 0..4 {
-            limiter.admit(nid(1), MessageKind::Proposal, 1);
+            limiter.admit(nid(1), TestKind::A, 1);
         }
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Proposal, 1),
-            Decision::Drop
-        );
+        assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Drop);
         // Vote bucket independent of Proposal.
         for _ in 0..4 {
-            assert_eq!(limiter.admit(nid(1), MessageKind::Vote, 1), Decision::Allow);
+            assert_eq!(limiter.admit(nid(1), TestKind::B, 1), Decision::Allow);
         }
     }
 
@@ -1166,18 +934,15 @@ mod tests {
         let clock = ManualClock::new();
         let mut config = limits_for_test();
         config.bytes_per_sec = 100.0;
-        let limiter = RateLimiter::new(config, clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(config, clock.clone());
         // First 100 bytes admitted in one frame.
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Vote, 100),
-            Decision::Allow
-        );
+        assert_eq!(limiter.admit(nid(1), TestKind::B, 100), Decision::Allow);
         // Next 1-byte frame fails on bytes (the kind bucket has
         // plenty of headroom). The bytes-drop counter records it
         // separately from per-kind drops.
-        assert_eq!(limiter.admit(nid(1), MessageKind::Vote, 1), Decision::Drop);
+        assert_eq!(limiter.admit(nid(1), TestKind::B, 1), Decision::Drop);
         assert_eq!(limiter.counters().bytes_drops(), 1);
-        assert_eq!(limiter.counters().drops(MessageKind::Vote), 0);
+        assert_eq!(limiter.counters().drops(TestKind::B.index()), 0);
     }
 
     /// #553 acceptance: a tiny outbound budget drains after a single
@@ -1188,7 +953,7 @@ mod tests {
         let clock = ManualClock::new();
         let mut config = limits_for_test();
         config.outbound_bytes_per_sec = 100.0;
-        let limiter = RateLimiter::new(config, clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(config, clock.clone());
 
         // First 100 bytes admitted.
         assert_eq!(limiter.admit_outbound(nid(1), 100), Decision::Allow);
@@ -1213,18 +978,15 @@ mod tests {
         let mut config = limits_for_test();
         config.bytes_per_sec = 100.0;
         config.outbound_bytes_per_sec = 100.0;
-        let limiter = RateLimiter::new(config, clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(config, clock.clone());
 
         // Drain inbound bytes by ingressing 100 bytes.
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Vote, 100),
-            Decision::Allow
-        );
+        assert_eq!(limiter.admit(nid(1), TestKind::B, 100), Decision::Allow);
         // Outbound budget is still full.
         assert_eq!(limiter.admit_outbound(nid(1), 100), Decision::Allow);
         // Both buckets now drained — inbound-byte and outbound-byte
         // drops increment independently.
-        assert_eq!(limiter.admit(nid(1), MessageKind::Vote, 1), Decision::Drop);
+        assert_eq!(limiter.admit(nid(1), TestKind::B, 1), Decision::Drop);
         assert_eq!(limiter.admit_outbound(nid(1), 1), Decision::Drop);
         assert_eq!(limiter.counters().bytes_drops(), 1);
         assert_eq!(limiter.counters().outbound_drops_total(), 1);
@@ -1246,16 +1008,13 @@ mod tests {
         config.outbound_bytes_per_sec = 16_384.0;
         // Generous inbound buckets so the request side never trips.
         config.bytes_per_sec = 1.0e9;
-        config.block_range_request_per_sec = 1_000.0;
-        let limiter = RateLimiter::new(config, clock.clone());
+        config.per_kind_per_sec[TestKind::C.index()] = 1_000.0;
+        let limiter = RateLimiter::<TestKind>::new(config, clock.clone());
         let attacker = nid(7);
 
         // Attacker sends 100 cheap range requests; ingress admits all.
         for _ in 0..100 {
-            assert_eq!(
-                limiter.admit(attacker, MessageKind::BlockRangeRequest, 16),
-                Decision::Allow
-            );
+            assert_eq!(limiter.admit(attacker, TestKind::C, 16), Decision::Allow);
         }
         // Responder tries to serve each at 8 KiB; the first two pass
         // (16 KiB capacity at t=0), the rest are dropped at the
@@ -1281,19 +1040,13 @@ mod tests {
     #[test]
     fn peers_have_independent_state() {
         let clock = ManualClock::new();
-        let limiter = RateLimiter::new(limits_for_test(), clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(limits_for_test(), clock.clone());
         for _ in 0..4 {
-            limiter.admit(nid(1), MessageKind::Proposal, 1);
+            limiter.admit(nid(1), TestKind::A, 1);
         }
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Proposal, 1),
-            Decision::Drop
-        );
+        assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Drop);
         // nid(2) has a fresh bucket.
-        assert_eq!(
-            limiter.admit(nid(2), MessageKind::Proposal, 1),
-            Decision::Allow
-        );
+        assert_eq!(limiter.admit(nid(2), TestKind::A, 1), Decision::Allow);
     }
 
     #[test]
@@ -1302,44 +1055,44 @@ mod tests {
         let mut config = limits_for_test();
         config.max_violations = 3;
         config.violation_window = Duration::from_secs(1);
-        let limiter = RateLimiter::new(config, clock.clone());
+        let limiter = RateLimiter::<TestKind>::new(config, clock.clone());
 
         // Drain and earn two violations.
         for _ in 0..4 {
-            limiter.admit(nid(1), MessageKind::Proposal, 1);
+            limiter.admit(nid(1), TestKind::A, 1);
         }
-        limiter.admit(nid(1), MessageKind::Proposal, 1);
-        limiter.admit(nid(1), MessageKind::Proposal, 1);
+        limiter.admit(nid(1), TestKind::A, 1);
+        limiter.admit(nid(1), TestKind::A, 1);
         // Skip ahead past the window so the violations age out and
         // the bucket refills.
         clock.set(Duration::from_secs(10));
         // Drain the freshly refilled bucket and earn fresh
         // violations — the disconnect latch should rearm.
         for _ in 0..4 {
-            limiter.admit(nid(1), MessageKind::Proposal, 1);
+            limiter.admit(nid(1), TestKind::A, 1);
         }
         for _ in 0..2 {
-            assert_eq!(
-                limiter.admit(nid(1), MessageKind::Proposal, 1),
-                Decision::Drop
-            );
+            assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Drop);
         }
-        assert_eq!(
-            limiter.admit(nid(1), MessageKind::Proposal, 1),
-            Decision::Disconnect
-        );
+        assert_eq!(limiter.admit(nid(1), TestKind::A, 1), Decision::Disconnect);
         assert_eq!(limiter.counters().disconnects(), 1);
     }
 
     #[test]
-    fn unbounded_for_tests_does_not_drop() {
+    fn unbounded_config_does_not_drop() {
+        const HUGE: f64 = 1.0e12;
+        let config = RateLimitsConfig {
+            per_kind_per_sec: vec![HUGE; TestKind::all().len()],
+            bytes_per_sec: HUGE,
+            outbound_bytes_per_sec: HUGE,
+            burst_seconds: 1.0,
+            violation_window: Duration::from_secs(10),
+            max_violations: u32::MAX,
+        };
         let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-        let limiter = RateLimiter::new(RateLimitsConfig::unbounded_for_tests(), clock);
+        let limiter = RateLimiter::<TestKind>::new(config, clock);
         for _ in 0..1_000 {
-            assert_eq!(
-                limiter.admit(nid(7), MessageKind::Vote, 100),
-                Decision::Allow
-            );
+            assert_eq!(limiter.admit(nid(7), TestKind::B, 100), Decision::Allow);
         }
         assert_eq!(limiter.counters().total_drops(), 0);
     }
