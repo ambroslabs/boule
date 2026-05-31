@@ -1000,7 +1000,10 @@ impl SimCluster {
         n: usize,
         timeout_base: Duration,
         rate_limits: boule_core::transport::limits::RateLimitsConfig,
-    ) -> (Self, Vec<Arc<boule_core::transport::limits::RateLimiter>>) {
+    ) -> (
+        Self,
+        Vec<Arc<boule_consensus::rate_limit::MessageRateLimiter>>,
+    ) {
         Self::spawn_inner(
             n,
             timeout_base,
@@ -1020,7 +1023,10 @@ impl SimCluster {
         n: usize,
         timeout_base: Duration,
         extras: SpawnExtras,
-    ) -> (Self, Vec<Arc<boule_core::transport::limits::RateLimiter>>) {
+    ) -> (
+        Self,
+        Vec<Arc<boule_consensus::rate_limit::MessageRateLimiter>>,
+    ) {
         let SpawnExtras {
             rate_limits,
             adversaries,
@@ -1170,7 +1176,7 @@ impl SimCluster {
         let mut commit_rxs: Vec<mpsc::Receiver<Block>> = Vec::new();
         let mut commit_overflow_counters: Vec<Arc<AtomicU64>> = Vec::new();
         let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
-        let mut limiters: Vec<Arc<boule_core::transport::limits::RateLimiter>> = Vec::new();
+        let mut limiters: Vec<Arc<boule_consensus::rate_limit::MessageRateLimiter>> = Vec::new();
         // Per-node fire-once crashpoint slots. One per node, in
         // `node_ids` order. The sim hands a clone of each into the
         // consensus task's `CRASH_SLOT.scope(...)`; the test's
@@ -1290,7 +1296,7 @@ impl SimCluster {
             // defaults leave orders-of-magnitude of headroom.
             if let Some(rl_cfg) = rate_limits.as_ref() {
                 let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-                let limiter = Arc::new(boule_core::transport::limits::RateLimiter::new(
+                let limiter = Arc::new(boule_consensus::rate_limit::MessageRateLimiter::new(
                     rl_cfg.clone(),
                     clock,
                 ));
@@ -6522,7 +6528,7 @@ mod tests {
         let (mut cluster, limiters) = SimCluster::spawn_with_rate_limits(
             4,
             Duration::from_millis(50),
-            boule_core::transport::limits::RateLimitsConfig::production_defaults(),
+            boule_consensus::rate_limit::production_message_rate_limits(),
         )
         .await;
 
@@ -6553,12 +6559,12 @@ mod tests {
                 "node {idx} unexpectedly dropped frames; per-kind: \
                  Proposal={} Vote={} NewView={} TimeoutVote={} \
                  RequestBlock={} ReceiveBlock={} bytes={}",
-                counters.drops(boule_core::transport::limits::MessageKind::Proposal),
-                counters.drops(boule_core::transport::limits::MessageKind::Vote),
-                counters.drops(boule_core::transport::limits::MessageKind::NewView),
-                counters.drops(boule_core::transport::limits::MessageKind::TimeoutVote),
-                counters.drops(boule_core::transport::limits::MessageKind::RequestBlock),
-                counters.drops(boule_core::transport::limits::MessageKind::ReceiveBlock),
+                counters.drops(boule_consensus::rate_limit::MessageKind::Proposal as usize),
+                counters.drops(boule_consensus::rate_limit::MessageKind::Vote as usize),
+                counters.drops(boule_consensus::rate_limit::MessageKind::NewView as usize),
+                counters.drops(boule_consensus::rate_limit::MessageKind::TimeoutVote as usize),
+                counters.drops(boule_consensus::rate_limit::MessageKind::RequestBlock as usize),
+                counters.drops(boule_consensus::rate_limit::MessageKind::ReceiveBlock as usize),
                 counters.bytes_drops(),
             );
             assert_eq!(
@@ -6595,8 +6601,9 @@ mod tests {
         // sufficient to trip the limiter without flooding for several
         // wall-seconds. The default is 8.0/sec — at 4.0/sec a 64-frame
         // flood lands well above the bucket capacity.
-        let mut config = boule_core::transport::limits::RateLimitsConfig::production_defaults();
-        config.request_block_per_sec = 4.0;
+        let mut config = boule_consensus::rate_limit::production_message_rate_limits();
+        config.per_kind_per_sec[boule_consensus::rate_limit::MessageKind::RequestBlock as usize] =
+            4.0;
         let (mut cluster, limiters) =
             SimCluster::spawn_with_rate_limits(4, Duration::from_millis(50), config).await;
 
@@ -6655,7 +6662,7 @@ mod tests {
             yield_now().await;
             let drops = limiters[target_idx]
                 .counters()
-                .drops(boule_core::transport::limits::MessageKind::RequestBlock);
+                .drops(boule_consensus::rate_limit::MessageKind::RequestBlock as usize);
             if drops > (FLOOD_COUNT as u64) / 2 {
                 break;
             }
@@ -6668,7 +6675,7 @@ mod tests {
         // than half the flood was dropped at the limiter boundary.
         let drops = limiters[target_idx]
             .counters()
-            .drops(boule_core::transport::limits::MessageKind::RequestBlock);
+            .drops(boule_consensus::rate_limit::MessageKind::RequestBlock as usize);
         assert!(
             drops > (FLOOD_COUNT as u64) / 2,
             "expected > {} RequestBlock drops on node {target_idx}; got {drops}",
@@ -6713,7 +6720,7 @@ mod tests {
     /// `BlockRangeRequest` frames cannot pull more than
     /// `outbound_bytes_per_sec` of responses out of the responder.
     /// The per-peer outbound bytes bucket on
-    /// [`boule_core::transport::limits::RateLimiter`] caps egress regardless of
+    /// [`boule_consensus::rate_limit::MessageRateLimiter`] caps egress regardless of
     /// how cheap the inbound requests are — the asymmetric
     /// request/response cost the issue documents (16 B request,
     /// hundreds of KB response) is bounded at the egress boundary.
@@ -6736,9 +6743,10 @@ mod tests {
         // responder builds is dropped at the egress admit. Keep ingress
         // generous so the requests admit cleanly and the test isolates
         // the egress boundary.
-        let mut config = boule_core::transport::limits::RateLimitsConfig::production_defaults();
+        let mut config = boule_consensus::rate_limit::production_message_rate_limits();
         config.outbound_bytes_per_sec = 32.0;
-        config.block_range_request_per_sec = 1_000.0;
+        config.per_kind_per_sec
+            [boule_consensus::rate_limit::MessageKind::BlockRangeRequest as usize] = 1_000.0;
         config.bytes_per_sec = 1.0e9;
         config.max_violations = u32::MAX;
         let (mut cluster, limiters) =

@@ -48,6 +48,7 @@ pub mod history_commitment;
 pub mod hotstuff;
 pub mod limits;
 pub mod pacemaker;
+pub mod rate_limit;
 pub mod reconfig;
 pub mod replication;
 pub mod snapshot_sync;
