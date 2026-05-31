@@ -92,7 +92,7 @@ impl SlowPeerTracker {
 }
 
 use super::connection;
-use super::connection::ProtocolCaps;
+use super::connection::{KEEPALIVE_PROTOCOL_ID, KeepaliveConfig, ProtocolCaps};
 use super::overlay::DiscoveryEvent;
 use super::tls::{NodeId, node_id_to_base58};
 use super::{PeerCommand, ProtocolEvent, ProtocolHandle, ProtocolOutbound};
@@ -154,6 +154,7 @@ pub enum ManagerMsg {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     our_node_id: NodeId,
     mut cmd_rx: mpsc::Receiver<PeerCommand>,
@@ -162,6 +163,7 @@ pub async fn run(
     peer_gone_tx: broadcast::Sender<NodeId>,
     discovery_tx: broadcast::Sender<DiscoveryEvent>,
     connection_limiter: Option<Arc<ConnectionLimiter>>,
+    keepalive: Option<KeepaliveConfig>,
 ) {
     // `BTreeMap` so broadcast and event-fan-out iteration is deterministic;
     // the sim's byte-identical-trace determinism test relies on this, and
@@ -236,6 +238,7 @@ pub async fn run(
                             internal_tx.clone(),
                             Arc::clone(&protocol_caps),
                             &discovery_tx,
+                            keepalive,
                         );
                         if let Some(limiter) = connection_limiter.as_ref() {
                             match outcome {
@@ -361,6 +364,23 @@ pub async fn run(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(PeerCommand::RegisterProtocol { id, max_frame_bytes, reply }) => {
+                        // The keepalive protocol id is reserved by the
+                        // connection task, which intercepts those frames
+                        // before the demux — a protocol registered here under
+                        // the same id would have its inbound frames silently
+                        // swallowed. Catch the collision loudly in dev/test;
+                        // warn (and still register) in release.
+                        debug_assert_ne!(
+                            id, KEEPALIVE_PROTOCOL_ID,
+                            "protocol id {KEEPALIVE_PROTOCOL_ID:#04x} is reserved for keepalive",
+                        );
+                        if id == KEEPALIVE_PROTOCOL_ID {
+                            warn!(
+                                "registering protocol under reserved keepalive id \
+                                 {KEEPALIVE_PROTOCOL_ID:#04x}; its inbound frames will be \
+                                 swallowed by the connection-task keepalive handler",
+                            );
+                        }
                         let (event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(256);
                         let (send_tx, mut send_rx) =
                             mpsc::channel::<ProtocolOutbound>(PROTOCOL_OUTBOUND_CAPACITY);
@@ -461,6 +481,7 @@ fn register_connection(
     internal_tx: mpsc::Sender<ManagerMsg>,
     protocol_caps: ProtocolCaps,
     discovery_tx: &broadcast::Sender<DiscoveryEvent>,
+    keepalive: Option<KeepaliveConfig>,
 ) -> RegisterOutcome {
     let id = node_id_to_base58(&peer_node_id);
 
@@ -496,6 +517,7 @@ fn register_connection(
             conn_id,
             internal_tx,
             protocol_caps,
+            keepalive,
         );
         return RegisterOutcome::Replaced {
             prev_direction,
@@ -536,6 +558,7 @@ fn register_connection(
         conn_id,
         internal_tx,
         protocol_caps,
+        keepalive,
     );
     RegisterOutcome::Admitted
 }
@@ -550,11 +573,20 @@ fn spawn_connection_task(
     conn_id: ConnectionId,
     internal_tx: mpsc::Sender<ManagerMsg>,
     protocol_caps: ProtocolCaps,
+    keepalive: Option<KeepaliveConfig>,
 ) {
     let conn_tx = internal_tx.clone();
     let id = node_id_to_base58(&peer_node_id);
     tokio::spawn(async move {
-        connection::run(peer_node_id, stream, write_rx, conn_tx, protocol_caps).await;
+        connection::run(
+            peer_node_id,
+            stream,
+            write_rx,
+            conn_tx,
+            protocol_caps,
+            keepalive,
+        )
+        .await;
         if internal_tx
             .send(ManagerMsg::PeerGone {
                 node_id: peer_node_id,
@@ -696,6 +728,7 @@ mod tests {
                     peer_gone_tx,
                     discovery_tx,
                     connection_limiter,
+                    None,
                 )
                 .await;
             });
