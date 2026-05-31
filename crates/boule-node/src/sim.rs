@@ -5159,6 +5159,109 @@ mod tests {
         assert_no_conflicts(&committed);
     }
 
+    /// **#529 — end-to-end budget guard.** A gap wider than one
+    /// bulk-range response window (`BLOCK_RANGE_RESPONSE_MAX_BLOCKS =
+    /// 64`) must still close within the same ≤5s simulated budget as
+    /// the single-window case above. Same partition → open-gap → heal
+    /// shape as [`block_sync_catchup_completes_within_185_budget`],
+    /// scaled to a 200-block gap so catch-up crosses ~four response
+    /// windows — the case #529 pipelines by firing the next
+    /// `BlockRangeRequest` off each `ReceiveBlockRange` arrival
+    /// instead of waiting for the next proposal.
+    ///
+    /// This is the integration-level liveness + safety guard: a wide
+    /// gap closes inside budget and no fork appears. The emission-level
+    /// proof that the *pipelining path itself* fires — and would not
+    /// without #529 — lives in the deterministic unit test
+    /// `range_response_pipelines_next_window_while_proposal_still_parked`.
+    /// (A pure wall-clock sim assertion can't isolate pipelining here:
+    /// the single-block retry path and the steady proposal stream
+    /// already close the gap inside budget regardless, so this test is
+    /// a regression guard rather than a before/after discriminator.)
+    #[tokio::test]
+    async fn block_sync_pipelines_wide_gap_within_budget() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(500)).await;
+
+        // Phase 1 — warm up so survivors have a real chain tip.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(10), |c| {
+                c.peek_commit_heights().iter().all(|&h| h >= 3)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "warm-up: every replica must commit at least 3 blocks before partition. \
+             heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        // Phase 2 — partition one replica and open a gap spanning
+        // ~four response windows (200 / 64). Allow generous simulated
+        // time to build the gap; the assertion under test is the
+        // post-heal budget, not how long the survivors take to pull
+        // ahead.
+        let lagging_idx = 0;
+        cluster.partition_node(lagging_idx);
+
+        let baseline_for_survivors = cluster.peek_commit_heights();
+        let n = baseline_for_survivors.len();
+        const WIDE_GAP: u64 = 200;
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(180), |c| {
+                let h = c.peek_commit_heights();
+                (0..n)
+                    .filter(|&i| i != lagging_idx)
+                    .all(|i| h[i] >= baseline_for_survivors[i] + WIDE_GAP)
+            })
+            .await;
+        assert!(
+            satisfied,
+            "survivors did not gain >= {WIDE_GAP} commits. heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let pre_heal_heights = cluster.peek_commit_heights();
+        let max_survivor_pre_heal = (0..n)
+            .filter(|&i| i != lagging_idx)
+            .map(|i| pre_heal_heights[i])
+            .max()
+            .unwrap();
+        let gap = max_survivor_pre_heal - pre_heal_heights[lagging_idx];
+        assert!(
+            gap >= WIDE_GAP,
+            "test setup expects >= {WIDE_GAP}-block gap before heal; \
+             got lagging={} survivors_max={}",
+            pre_heal_heights[lagging_idx],
+            max_survivor_pre_heal,
+        );
+
+        // Phase 3 — heal. Catch-up budget starts here.
+        cluster.heal_node(lagging_idx);
+
+        // Phase 4 — assert catch-up within 5s simulated despite the
+        // gap spanning three response windows. Without pipelining the
+        // second and third windows would each wait for a fresh
+        // proposal to land at the recovering replica.
+        let satisfied = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                c.peek_commit_heights()[lagging_idx] >= max_survivor_pre_heal
+            })
+            .await;
+        let post_heal_heights = cluster.peek_commit_heights();
+        assert!(
+            satisfied,
+            "wide-gap block-sync catch-up exceeded 5s simulated budget (#529). \
+             pre_heal={pre_heal_heights:?} pre_heal_max_survivor={max_survivor_pre_heal} \
+             post_heal={post_heal_heights:?} gap_remaining={}",
+            (max_survivor_pre_heal as i64) - (post_heal_heights[lagging_idx] as i64),
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+    }
+
     // ── L-series: network partition + heal proptests (#133) ──────────────────
     //
     // The K-series above use fixed scenarios (one node partitioned for a

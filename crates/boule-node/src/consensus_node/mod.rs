@@ -4364,6 +4364,138 @@ mod tests {
         );
     }
 
+    /// **#529 — pipelining.** When a `BlockRangeRequest` response lands
+    /// and a proposal is still parked more than one window above the
+    /// (post-insert) commit frontier, the requester fires the *next*
+    /// window immediately rather than waiting for a fresh proposal to
+    /// re-trigger gap detection. Pins that the follow-on emission
+    /// targets `[new_last_committed + 1, …]` capped at the per-response
+    /// budget and goes to the proposer of the still-parked proposal.
+    #[tokio::test]
+    async fn range_response_pipelines_next_window_while_proposal_still_parked() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let proposer_signer = fresh_signer();
+        let proposer_id = proposer_signer.node_id();
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // A proposal at height 200 with an unknown parent parks on this
+        // fresh node and fires the first window `[1, 64]` (parent 199
+        // capped at the 64-block response budget). Drain that initial
+        // emission so the assertion below only sees the pipelined one.
+        let parent_hash: BlockHash = [0xAB; 32];
+        let d = synthetic_proposal_dispatch(&proposer_signer, 200, 200, parent_hash);
+        node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .expect("apply_dispatch proposal");
+        let _drained = drain_send_to_outbound(&mut outbound_rx);
+
+        // Model the first window having committed on this replica: the
+        // synthetic range blocks below carry no valid justify-QC, so
+        // they land in `pending_blocks` without advancing the safety
+        // core's commit frontier the way a real window would. Set the
+        // frontier to 64 directly so the pipelined follow-on computes
+        // the next window from where production would resume.
+        node.last_committed_height.store(64, Ordering::Relaxed);
+
+        // The `[1, 64]` window's response arrives. `handle_block_range_response`
+        // clears the inflight entry, inserts the in-range block, and —
+        // because height 200 is still parked far above the frontier —
+        // pipelines the next window.
+        node.apply_dispatch(
+            Dispatch::ReceiveBlockRange {
+                from_height: Height(1),
+                to_height: Height(64),
+                blocks: vec![range_block_at(50)],
+                from: proposer_id,
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch range response");
+
+        let frames = drain_send_to_outbound(&mut outbound_rx);
+        let range_emissions: Vec<_> = frames
+            .iter()
+            .filter_map(|(to, w)| match w {
+                WireMessage::BlockRangeRequest {
+                    from_height,
+                    to_height,
+                } => Some((*to, *from_height, *to_height)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            range_emissions,
+            vec![(proposer_id, Height(65), Height(128))],
+            "range response with a still-parked proposal must pipeline the next \
+             window [65, 128] to the proposer; saw {frames:?}",
+        );
+    }
+
+    /// **#529 — no pipelining without progress.** A range response that
+    /// commits nothing — e.g. a gap-leaving response from a slow or
+    /// Byzantine peer whose blocks sit above a hole the frontier hasn't
+    /// reached — must NOT pipeline the next window. Otherwise the
+    /// response-driven re-emission would re-ask the same window on every
+    /// arrival in a 1:1 request/response loop. The stalled gap falls
+    /// back to the proposal-driven path and the bounded retry timer.
+    #[tokio::test]
+    async fn range_response_without_frontier_progress_does_not_pipeline() {
+        let mut node = make_node(nid(1));
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let proposer_signer = fresh_signer();
+        let proposer_id = proposer_signer.node_id();
+        let (broadcaster, mut outbound_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // Park a proposal at height 200, then drain the initial window
+        // emission so only a follow-on would show below.
+        let parent_hash: BlockHash = [0xAB; 32];
+        let d = synthetic_proposal_dispatch(&proposer_signer, 200, 200, parent_hash);
+        node.apply_dispatch(d, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .expect("apply_dispatch proposal");
+        let _drained = drain_send_to_outbound(&mut outbound_rx);
+
+        // Frontier is parked at 64; the response below is for the next
+        // window [65, 128] but its only block (height 100) sits above
+        // the still-missing block 65, so nothing commits and the
+        // frontier stays at 64 — short of this window's `from_height`.
+        node.last_committed_height.store(64, Ordering::Relaxed);
+        node.install_block_sync_range_inflight_for_test(Height(65), Height(128), proposer_id);
+
+        node.apply_dispatch(
+            Dispatch::ReceiveBlockRange {
+                from_height: Height(65),
+                to_height: Height(128),
+                blocks: vec![range_block_at(100)],
+                from: proposer_id,
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .expect("apply_dispatch range response");
+
+        let frames = drain_send_to_outbound(&mut outbound_rx);
+        let range_emissions: Vec<_> = frames
+            .iter()
+            .filter(|(_, w)| matches!(w, WireMessage::BlockRangeRequest { .. }))
+            .collect();
+        assert!(
+            range_emissions.is_empty(),
+            "a response that commits no progress must not pipeline the next window; \
+             saw {range_emissions:?}",
+        );
+    }
+
     // ── Range-keyed retry timer (#530) ───────────────────────────────────
 
     /// Wall-clock-driven retry walk re-emits the next

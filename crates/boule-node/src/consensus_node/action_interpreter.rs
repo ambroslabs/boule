@@ -767,6 +767,39 @@ impl ConsensusNode {
             self.apply_safety_actions(actions, broadcaster, view_timer, signer)
                 .await?;
         }
+        // Pipeline the next window (#529). For a gap wider than one
+        // response window (`BLOCK_RANGE_RESPONSE_MAX_BLOCKS`) the replica
+        // still parks a proposal far above the new frontier after the
+        // re-drive above. Rather than wait for the next proposal to
+        // arrive — paced by the cluster's view tempo — fire the
+        // follow-on `BlockRangeRequest` immediately, targeting the
+        // highest still-parked proposal. `maybe_emit_block_range_request`
+        // reuses the multi-block-gap threshold (so the single-block path
+        // takes over once the gap shrinks below one block), caps the
+        // span at the per-response budget, and dedups on the
+        // `(from, to)` tuple.
+        //
+        // Gate on the frontier having advanced at least to this
+        // response's `from_height`, i.e. this window committed real
+        // progress, so the next window is strictly above the one just
+        // cleared. Pipelining is response-driven, not proposal-paced, so
+        // without the progress check a response that commits nothing —
+        // an empty or gap-leaving response from a slow or Byzantine peer
+        // — would re-emit the *same* window on every arrival and amplify
+        // traffic in a 1:1 request/response loop. A stalled gap instead
+        // falls back to the proposal-driven path and the bounded range
+        // retry timer (#530).
+        let frontier = self.last_committed_height.load(Ordering::Relaxed);
+        if frontier >= from_height.0
+            && let Some((proposer, proposal_height)) = self
+                .core
+                .parked_proposals()
+                .map(|s| (s.signer, s.payload.block.header.height))
+                .max_by_key(|(_, height)| height.0)
+        {
+            self.maybe_emit_block_range_request(proposer, proposal_height, broadcaster, signer)
+                .await?;
+        }
         Ok(())
     }
 
