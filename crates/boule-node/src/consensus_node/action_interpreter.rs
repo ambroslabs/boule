@@ -1198,9 +1198,22 @@ impl ConsensusNode {
                     // skip: `proposal_built` is not called, so the core's
                     // `proposed_in_view` stays unset and the next-view leader
                     // (or a later re-attempt) takes over.
+                    // Proposal time: wall clock in Unix epoch millis. The
+                    // builder clamps this to the parent so block time stays
+                    // non-decreasing (see `BlockHeader::timestamp`).
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
                     match self
                         .app
-                        .build_proposal(&parent, view, &high_qc, &self.core.state().pending_blocks)
+                        .build_proposal(
+                            &parent,
+                            view,
+                            &high_qc,
+                            &self.core.state().pending_blocks,
+                            timestamp,
+                        )
                         .await
                     {
                         Ok(block) => {

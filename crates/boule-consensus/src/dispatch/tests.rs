@@ -127,6 +127,7 @@ fn ingress_proposal_emits_on_qc_at_justify_view() {
         validator_history_commitment: [0; 32],
         committed_height: Height::ZERO,
         committed_state_root: [0; 32],
+        timestamp: 0,
     };
     let block = Block {
         header,
@@ -514,6 +515,7 @@ fn sample_manifest_for_dispatch() -> SnapshotManifest {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         },
         commands,
     };
@@ -869,6 +871,7 @@ fn proposal_at_v_eff_verifies_against_post_boundary_set() {
         validator_history_commitment: [0; 32],
         committed_height: Height::ZERO,
         committed_state_root: [0; 32],
+        timestamp: 0,
     };
     let block = Block {
         header,
@@ -1306,6 +1309,7 @@ fn proposal_after_rotation_signed_with_new_key_accepted() {
         validator_history_commitment: [0; 32],
         committed_height: Height::ZERO,
         committed_state_root: [0; 32],
+        timestamp: 0,
     };
     let proposal = Proposal {
         block: Block {
@@ -1520,6 +1524,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         },
         commands: vec![],
     };
@@ -1593,6 +1598,7 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
             validator_history_commitment: forged_commitment,
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         },
         commands: vec![],
     };
@@ -1653,6 +1659,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         },
         commands: vec![],
     };
@@ -2095,6 +2102,7 @@ fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         },
         commands: vec![],
     };

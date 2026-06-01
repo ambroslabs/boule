@@ -1694,6 +1694,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         }
@@ -1914,7 +1915,7 @@ mod tests {
         let qc = sample_qc();
 
         let block = builder
-            .build(&parent, View(3), &qc, &HashMap::new())
+            .build(&parent, View(3), &qc, &HashMap::new(), 0)
             .expect("test builder must not fail");
 
         assert_eq!(block.header.parent_hash, parent.hash());
@@ -1934,7 +1935,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new(), 0)
             .expect("test builder must not fail");
 
         assert_eq!(block.commands.len(), 2);
@@ -1953,10 +1954,10 @@ mod tests {
         let qc = sample_qc();
 
         let b1 = builder
-            .build(&parent, View(1), &qc, &HashMap::new())
+            .build(&parent, View(1), &qc, &HashMap::new(), 0)
             .expect("test builder must not fail");
         let b2 = builder
-            .build(&parent, View(1), &qc, &HashMap::new())
+            .build(&parent, View(1), &qc, &HashMap::new(), 0)
             .expect("test builder must not fail");
 
         assert_eq!(b1.hash(), b2.hash(), "build must be deterministic");
@@ -1976,7 +1977,7 @@ mod tests {
 
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         builder
-            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new(), 0)
             .expect("test builder must not fail");
 
         let after = sm.lock().state_commitment();
@@ -1997,7 +1998,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new(), 0)
             .expect("test builder must not fail");
 
         // Manually apply the same command and check commitment matches.
@@ -2020,7 +2021,7 @@ mod tests {
         let sm = make_sm();
         let builder = make_builder(nid(1), Arc::clone(&mp), Arc::clone(&sm));
         let block = builder
-            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new(), 0)
             .expect("test builder must not fail");
 
         let recomputed = Block::commands_commitment(&block.commands);
@@ -2077,7 +2078,7 @@ mod tests {
         // The fork-and-restore round trip inside `build` triggers our
         // simulated failure. The builder must surface this as `Err`,
         // not panic.
-        let result = builder.build(&genesis(), View(1), &sample_qc(), &HashMap::new());
+        let result = builder.build(&genesis(), View(1), &sample_qc(), &HashMap::new(), 0);
         let err = result.expect_err("builder must propagate restore failure as Err");
         let msg = format!("{err:#}");
         assert!(
@@ -2144,6 +2145,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -2159,7 +2161,7 @@ mod tests {
         pending_blocks.insert(b3.hash(), b3.clone());
 
         let proposal = builder
-            .build(&b3, View(4), &sample_qc(), &pending_blocks)
+            .build(&b3, View(4), &sample_qc(), &pending_blocks, 0)
             .expect("test builder must not fail");
 
         // The builder must not have left the SM mutated — the apply
@@ -2238,6 +2240,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -2251,7 +2254,7 @@ mod tests {
         pending_blocks.insert(b2.hash(), b2.clone());
 
         let proposal = builder
-            .build(&b2, View(3), &sample_qc(), &pending_blocks)
+            .build(&b2, View(3), &sample_qc(), &pending_blocks, 0)
             .expect("test builder must not fail");
 
         // SM unmutated.
@@ -2323,7 +2326,7 @@ mod tests {
             Arc::clone(&dropped_commands),
         );
         let block = builder
-            .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(1), &sample_qc(), &HashMap::new(), 0)
             .expect("builder must skip-and-warn rather than fail the proposal");
 
         // The undecodable command is dropped by the #598 includability
@@ -2370,7 +2373,7 @@ mod tests {
         // monotonic for the lifetime of the node, like
         // `cache_evictions`.
         builder
-            .build(&genesis(), View(2), &sample_qc(), &HashMap::new())
+            .build(&genesis(), View(2), &sample_qc(), &HashMap::new(), 0)
             .expect("second build must also succeed");
         assert_eq!(
             dropped_commands.load(Ordering::Relaxed),
@@ -2703,6 +2706,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -2717,6 +2721,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -2838,6 +2843,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands: vec![],
             });
@@ -2920,6 +2926,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -2934,6 +2941,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -2948,6 +2956,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -3220,6 +3229,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![cmd],
         };
@@ -3268,6 +3278,7 @@ mod tests {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         };
         boule_consensus::replication::block::Block { header, commands }
     }
@@ -3427,6 +3438,7 @@ mod tests {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         };
         let block = boule_consensus::replication::block::Block { header, commands };
         node.apply_commit(block);
@@ -3581,6 +3593,7 @@ mod tests {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         };
         let block = boule_consensus::replication::block::Block { header, commands };
         node.apply_commit(block);
@@ -3788,6 +3801,7 @@ mod tests {
                         validator_history_commitment: [0; 32],
                         committed_height: Height::ZERO,
                         committed_state_root: [0; 32],
+                        timestamp: 0,
                     },
                     commands: vec![],
                 };
@@ -4086,6 +4100,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         }
@@ -4896,6 +4911,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -5317,6 +5333,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands,
         };
@@ -5410,6 +5427,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -5763,6 +5781,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -5928,6 +5947,7 @@ mod tests {
                     validator_history_commitment: commitment,
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -6108,6 +6128,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -6283,6 +6304,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -6491,6 +6513,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands,
             }
@@ -7240,6 +7263,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -7866,6 +7890,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -8099,6 +8124,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands: vec![],
             }
@@ -8575,6 +8601,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands,
         }
@@ -8880,6 +8907,7 @@ mod tests {
             validator_history_commitment,
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         };
         Block { header, commands }
     }
@@ -9059,6 +9087,7 @@ mod tests {
                 validator_history_commitment: pre_block_commitment,
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -9141,6 +9170,7 @@ mod tests {
                 validator_history_commitment: pre_block_commitment,
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -9245,6 +9275,7 @@ mod tests {
                 validator_history_commitment: pre_block_commitment,
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         };
@@ -9299,6 +9330,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: vec![],
         }

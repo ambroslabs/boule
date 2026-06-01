@@ -51,6 +51,12 @@ pub trait Application: Send + Sync {
     ///   (issue #326): the integration layer logs and skips, leaving the
     ///   core's `proposed_in_view` unset so a later leader retries.
     ///
+    /// `timestamp` is the proposal time in Unix epoch milliseconds (the
+    /// integration layer's wall clock), stamped into the header clamped to
+    /// the parent so block time is non-decreasing. An execution layer also
+    /// uses it as the block's execution time — see
+    /// [`BlockHeader::timestamp`](crate::replication::block::BlockHeader::timestamp).
+    ///
     /// All borrowed arguments share the future's lifetime, so the
     /// integration layer holds them across the `await`.
     ///
@@ -61,6 +67,7 @@ pub trait Application: Send + Sync {
         view: View,
         high_qc: &'a QuorumCertificate,
         pending_blocks: &'a HashMap<BlockHash, Block>,
+        timestamp: u64,
     ) -> BoxFuture<'a, anyhow::Result<Block>>;
 
     /// Execute a committed `block` — the deferred-execution step. This is

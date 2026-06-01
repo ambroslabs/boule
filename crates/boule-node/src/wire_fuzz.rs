@@ -173,6 +173,7 @@ fn arb_block(genesis_hash: BlockHash) -> impl Strategy<Value = Block> {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 };
                 Block { header, commands }
             },
@@ -345,6 +346,7 @@ impl BlockBuilder for TestBlockBuilder {
         view: View,
         _high_qc: &QuorumCertificate,
         _pending_blocks: &HashMap<BlockHash, Block>,
+        timestamp: u64,
     ) -> anyhow::Result<Block> {
         let header = BlockHeader {
             parent_hash: parent.hash(),
@@ -356,6 +358,7 @@ impl BlockBuilder for TestBlockBuilder {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: timestamp.max(parent.header.timestamp),
         };
         Ok(Block {
             header,
@@ -448,6 +451,7 @@ impl ReplicaSet {
                         view,
                         &high_qc,
                         &self.cores[source].state().pending_blocks,
+                        0,
                     ) {
                         let built = self.cores[source].proposal_built(view, block, high_qc);
                         self.apply_actions(source, built);
@@ -522,7 +526,7 @@ fn kickoff_proposal(replicas: &ReplicaSet) -> Signed<Proposal> {
         proposer: leader_nid,
     };
     let block_v1 = builder
-        .build(&replicas.genesis, View(1), &genesis_qc, &HashMap::new())
+        .build(&replicas.genesis, View(1), &genesis_qc, &HashMap::new(), 0)
         .expect("test builder must not fail");
     Signed {
         payload: Proposal {
@@ -665,6 +669,7 @@ fn malformed_signed_proposal(p: MalformedProposalInputs) -> Signed<Proposal> {
         validator_history_commitment: [0; 32],
         committed_height: Height::ZERO,
         committed_state_root: [0; 32],
+        timestamp: 0,
     };
     let block = Block {
         header,
@@ -900,6 +905,7 @@ proptest! {
                         validator_history_commitment: [0; 32],
                         committed_height: Height::ZERO,
                         committed_state_root: [0; 32],
+                        timestamp: 0,
                     };
                     let block = Block { header, commands: Vec::new() };
                     let mut justify = QuorumCertificate::new(View::ZERO, [0; 32], validators.len());
@@ -924,6 +930,7 @@ proptest! {
                         validator_history_commitment: [0; 32],
                         committed_height: Height::ZERO,
                         committed_state_root: [0; 32],
+                        timestamp: 0,
                     };
                     let block = Block { header, commands: Vec::new() };
                     let mut justify = QuorumCertificate::new(View::ZERO, genesis.hash(), validators.len());

@@ -98,6 +98,20 @@ pub struct BlockHeader {
     /// commit, so only an already-committed ancestor's root can be
     /// reproduced before voting.
     pub committed_state_root: [u8; 32],
+
+    /// Proposal time as Unix epoch **milliseconds**. The leader stamps
+    /// this at build from its wall clock, clamped to never precede the
+    /// parent's timestamp so the chain's time is non-decreasing
+    /// regardless of clock jumps (NTP, suspend/resume). Genesis is `0`.
+    ///
+    /// First-class block time for the application's build context — an
+    /// execution layer (e.g. a reth EVM payload) derives its block
+    /// timestamp from this agreed value rather than inventing its own, so
+    /// the time a block executes against is part of what the QC attests
+    /// to. [`validate_structural`] enforces only monotonicity
+    /// (`child >= parent`); any tighter policy (e.g. EVM's strict
+    /// increase, or bounded future drift) is the application's concern.
+    pub timestamp: u64,
 }
 
 impl BlockHeader {
@@ -160,6 +174,8 @@ impl Block {
                 // block's stamped frontier.
                 committed_height: Height::ZERO,
                 committed_state_root: state_commitment,
+                // Genesis is the chain's time origin.
+                timestamp: 0,
             },
             commands,
         }
@@ -192,6 +208,12 @@ impl Block {
 ///    only advances views forward).
 /// 4. `child.header.commands_commitment == Block::commands_commitment(&child.commands)`
 ///    — header binds the command sequence that appeared with it.
+/// 5. `child.header.timestamp >= parent_header.timestamp` — block time is
+///    non-decreasing. Only monotonicity is enforced here; an honest
+///    leader clamps to the parent so this always holds, and a Byzantine
+///    leader that stamps time backward loses honest votes. Any tighter
+///    time policy is the application's concern (see
+///    [`BlockHeader::timestamp`]).
 ///
 /// Application validation (running each command through
 /// [`crate::replication::StateMachine::apply`] and checking the resulting
@@ -233,6 +255,13 @@ pub fn validate_structural(child: &Block, parent_header: &BlockHeader) -> anyhow
             hex::encode(recomputed),
         );
     }
+    if child.header.timestamp < parent_header.timestamp {
+        anyhow::bail!(
+            "timestamp must not decrease: parent {}, child {}",
+            parent_header.timestamp,
+            child.header.timestamp,
+        );
+    }
     Ok(())
 }
 
@@ -255,6 +284,7 @@ mod tests {
             validator_history_commitment: [0; 32],
             committed_height: Height(2),
             committed_state_root: [0x66; 32],
+            timestamp: 0,
         }
     }
 
@@ -269,6 +299,7 @@ mod tests {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: parent.timestamp,
         };
         Block { header, commands }
     }
@@ -395,6 +426,29 @@ mod tests {
         child.header.view = parent.view.saturating_sub(View(1));
         let err = validate_structural(&child, &parent).unwrap_err();
         assert!(err.to_string().contains("view must strictly increase"));
+    }
+
+    #[test]
+    fn non_decreasing_timestamp_passes() {
+        let mut parent = sample_header();
+        parent.timestamp = 1_000;
+        // Equal to the parent is allowed (sub-second blocks may share a
+        // millisecond); strictly greater is the common case.
+        let mut child = child_of(&parent, cmds(&[b"a"]));
+        child.header.timestamp = parent.timestamp;
+        validate_structural(&child, &parent).unwrap();
+        child.header.timestamp = parent.timestamp + 1;
+        validate_structural(&child, &parent).unwrap();
+    }
+
+    #[test]
+    fn decreasing_timestamp_fails() {
+        let mut parent = sample_header();
+        parent.timestamp = 1_000;
+        let mut child = child_of(&parent, cmds(&[b"a"]));
+        child.header.timestamp = parent.timestamp - 1;
+        let err = validate_structural(&child, &parent).unwrap_err();
+        assert!(err.to_string().contains("timestamp must not decrease"));
     }
 
     #[test]
