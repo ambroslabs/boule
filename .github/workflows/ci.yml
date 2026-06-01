@@ -71,8 +71,10 @@ jobs:
       # Optional cargo features are off by default, so the line above never
       # compiles the feature-gated code. Lint the `reth` backend explicitly
       # so it can't silently rot (as the workspace-excluded fuzz crate did).
+      # `-p boule-cli --features reth` is the user-facing build path and
+      # transitively compiles boule-node's gated code too.
       - if: needs.changes.outputs.rust == 'true'
-        run: cargo clippy -p boule-node --features reth --all-targets -- -D warnings
+        run: cargo clippy -p boule-cli --features reth --all-targets -- -D warnings
 
   test:
     # Two shards on separate runners to isolate CPU-bound tests from the rest
