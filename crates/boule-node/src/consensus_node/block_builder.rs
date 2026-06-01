@@ -271,6 +271,29 @@ impl Application for MempoolBlockBuilder {
         let built = BlockBuilder::build(self, parent, view, high_qc, pending_blocks);
         Box::pin(async move { built })
     }
+
+    /// The counter application's commit is in-process: lock the shared
+    /// state machine and apply the committed block's commands. A failed
+    /// `apply` is a no-op per the [`StateMachine`] contract — it is logged
+    /// and skipped, never propagated, because consensus commits the block
+    /// regardless of execution outcome. There is no real I/O, so the
+    /// future is already resolved; a reth EL would instead `await` the
+    /// Engine-API round trip here.
+    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let mut sm = self.state_machine.lock();
+            for cmd in &block.commands {
+                if let Err(e) = sm.apply(cmd) {
+                    tracing::error!(
+                        "consensus: SM apply failed for committed block (height={}, view={}): {e}",
+                        block.header.height,
+                        block.header.view,
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Walk `parent`'s ancestors backwards through `pending_blocks`,

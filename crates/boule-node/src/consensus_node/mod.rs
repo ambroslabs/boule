@@ -24,9 +24,11 @@
 //! - `action_interpreter` — dispatcher, the persist-before-send
 //!   middleware that drives [`Action`](boule_consensus::hotstuff::step::Action)
 //!   slices, and structured tracing at every safety/pacemaker step.
-//! - `commit` — the [`ConsensusNode::apply_commit`] handler that
-//!   persists the committed block + last_committed checkpoint and
-//!   delegates to the reconfig/rotation/snapshot siblings.
+//! - `commit` — [`ConsensusNode::commit_block`], which `await`s the
+//!   application's deferred-execution step and then runs
+//!   [`ConsensusNode::apply_commit`] (persists the committed block +
+//!   last_committed checkpoint and delegates to the
+//!   reconfig/rotation/snapshot siblings).
 //! - `reconfig_apply` — commit-time application of
 //!   [`ReconfigCommand`](boule_consensus::reconfig::ReconfigCommand)
 //!   payloads.
@@ -3186,8 +3188,8 @@ mod tests {
         assert!(node.core.state().pending_blocks.contains_key(&hash));
     }
 
-    #[test]
-    fn apply_commit_advances_state_machine_and_drains_mempool() {
+    #[tokio::test]
+    async fn apply_commit_advances_state_machine_and_drains_mempool() {
         use boule_consensus::replication::impls::counter_sm::CounterCommand;
 
         let mp: Arc<dyn boule_consensus::replication::mempool::Mempool> =
@@ -3227,7 +3229,7 @@ mod tests {
         };
 
         let sm_before = sm.lock().state_commitment();
-        node.apply_commit(block);
+        node.commit_block(block).await;
         let sm_after = sm.lock().state_commitment();
 
         assert_ne!(sm_before, sm_after, "state machine must advance on commit");

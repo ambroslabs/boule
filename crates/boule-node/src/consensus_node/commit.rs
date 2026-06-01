@@ -1,7 +1,10 @@
-//! Block-commit handler. Applies committed commands to the state
-//! machine, drains the mempool, persists the committed block and the
-//! `last_committed` checkpoint, then delegates to the
-//! reconfig/rotation/snapshot siblings.
+//! Block-commit handlers. [`ConsensusNode::commit_block`] is the
+//! end-to-end commit entry point: it `await`s the application's
+//! deferred-execution step ([`Application::commit`](boule_consensus::replication::application::Application::commit)) and then runs the
+//! synchronous consensus-layer bookkeeping in
+//! [`ConsensusNode::apply_commit`] — drain the mempool, persist the
+//! committed block and the `last_committed` checkpoint, then delegate to
+//! the reconfig/rotation/snapshot siblings.
 
 use std::sync::atomic::Ordering;
 
@@ -17,8 +20,38 @@ use super::{
 };
 
 impl ConsensusNode {
-    /// Commit `block` to the state machine and drain the committed commands
-    /// from the mempool.
+    /// End-to-end commit of `block`: execute it against the application,
+    /// then run the consensus-layer bookkeeping.
+    ///
+    /// Execution ([`Application::commit`](boule_consensus::replication::application::Application::commit)) comes first and is `await`ed —
+    /// this is the deferred-execution step where a reth EL does its
+    /// `newPayloadV3` + `forkchoiceUpdatedV3` round trip; the counter
+    /// application applies the block's commands to its state machine. An
+    /// execution `Err` is logged and swallowed: consensus commits the
+    /// block regardless of execution outcome (the safety core is
+    /// independent of payload validity), so [`Self::apply_commit`] runs
+    /// unconditionally afterward to make the commit durable.
+    ///
+    /// Ordering matters: the application's state must be advanced before
+    /// the synchronous bookkeeping runs, because the snapshot-creation
+    /// hook in [`Self::apply_commit`] serializes that state.
+    pub(super) async fn commit_block(&mut self, block: Block) {
+        if let Err(e) = self.app.commit(&block).await {
+            tracing::error!(
+                target: TRACE_TARGET,
+                height = block.header.height.0,
+                view = block.header.view.0,
+                error = %e,
+                "application_commit_failed",
+            );
+        }
+        self.apply_commit(block);
+    }
+
+    /// Drain the committed commands from the mempool and make the commit
+    /// durable. Runs *after* [`Self::commit_block`] has executed the block
+    /// against the application, so the state the snapshot hook serializes
+    /// is already advanced.
     ///
     /// # Durability
     ///
@@ -47,18 +80,6 @@ impl ConsensusNode {
     /// happens through [`Self::persist_updates`] before any outbound vote),
     /// so a transient block-store hiccup must not stop liveness.
     pub(super) fn apply_commit(&mut self, block: Block) {
-        {
-            let mut sm = self.state_machine.lock();
-            for cmd in &block.commands {
-                if let Err(e) = sm.apply(cmd) {
-                    tracing::error!(
-                        "consensus: SM apply failed for committed block (height={}, view={}): {e}",
-                        block.header.height,
-                        block.header.view,
-                    );
-                }
-            }
-        }
         self.mempool.remove_committed(&block.commands);
         // Track the most recent commit for the status snapshot. The
         // safety core emits `Action::Commit` in height order, so a
