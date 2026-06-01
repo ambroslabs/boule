@@ -12,10 +12,18 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+# Build the reth execution-layer backend (`[consensus.application] backend
+# = "reth"`). Pulls in `boule-reth`; off by default so the standard build
+# stays lean. A config that selects the reth backend without this feature
+# fails at startup with a clear error.
+reth = ["dep:boule-reth"]
+
 [dependencies]
 boule-core          = { path = "../boule-core", version = "0.1.0" }
 boule-transport-tcp = { path = "../boule-transport-tcp", version = "0.1.0" }
 boule-consensus     = { path = "../boule-consensus", version = "0.1.0" }
+boule-reth          = { path = "../boule-reth", version = "0.1.0", optional = true }
 tokio               = { version = "1", features = ["full"] }
 tokio-util          = { version = "0.7", features = ["codec"] }
 serde               = { version = "1", features = ["derive"] }
