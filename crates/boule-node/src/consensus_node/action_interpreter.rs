@@ -1132,7 +1132,7 @@ impl ConsensusNode {
                 }
 
                 SafetyAction::Commit(block) => {
-                    self.apply_commit(block);
+                    self.commit_block(block).await;
                 }
 
                 SafetyAction::EquivocationEvidence {

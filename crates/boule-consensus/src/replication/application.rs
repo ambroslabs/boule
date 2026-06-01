@@ -60,4 +60,28 @@ pub trait Application: Send + Sync {
         high_qc: &'a QuorumCertificate,
         pending_blocks: &'a HashMap<BlockHash, Block>,
     ) -> BoxFuture<'a, anyhow::Result<Block>>;
+
+    /// Execute a committed `block` — the deferred-execution step. This is
+    /// the only point at which the application mutates its own state in
+    /// response to consensus, and it is where an out-of-process execution
+    /// layer does real async I/O: a reth EL runs `newPayloadV3` to execute
+    /// the payload and `forkchoiceUpdatedV3` to finalize it. The counter
+    /// application applies the block's commands to its in-process state
+    /// machine.
+    ///
+    /// Called once per commit, in height order, by the integration layer
+    /// *before* it does its own consensus-layer bookkeeping (durable block
+    /// write, prune, snapshot, commit-notifier fan-out).
+    ///
+    /// `Err` is informational, not fatal: consensus commits a block
+    /// regardless of execution outcome — the safety core is independent of
+    /// payload validity (the deferred-execution model, where a leader's
+    /// claimed post-state is validated one block later, not at vote time).
+    /// The integration layer logs an `Err` and proceeds with the commit.
+    /// Individual command-level failures the application treats as no-ops
+    /// (per the [`StateMachine::apply`] contract) are its own concern and
+    /// need not surface here.
+    ///
+    /// [`StateMachine::apply`]: crate::replication::state_machine::StateMachine::apply
+    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<()>>;
 }
