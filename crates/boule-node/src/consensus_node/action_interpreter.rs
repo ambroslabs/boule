@@ -1190,8 +1190,9 @@ impl ConsensusNode {
                     parent,
                 } => {
                     // #606: block-building moved out of the synchronous safety
-                    // core. Run the builder here, then feed the result back
-                    // through `proposal_built` to get the
+                    // core. `await` the application's async build seam (#225
+                    // M1) here, then feed the result back through
+                    // `proposal_built` to get the
                     // Persist(ProposedInView) + Broadcast(Proposal) pair, which
                     // the recursive `apply_safety_actions` carries out via the
                     // Broadcast arm above (history-stamp, sign, broadcast,
@@ -1199,12 +1200,11 @@ impl ConsensusNode {
                     // skip: `proposal_built` is not called, so the core's
                     // `proposed_in_view` stays unset and the next-view leader
                     // (or a later re-attempt) takes over.
-                    match self.builder.build(
-                        &parent,
-                        view,
-                        &high_qc,
-                        &self.core.state().pending_blocks,
-                    ) {
+                    match self
+                        .app
+                        .build_proposal(&parent, view, &high_qc, &self.core.state().pending_blocks)
+                        .await
+                    {
                         Ok(block) => {
                             let built = self.core.proposal_built(view, block, high_qc);
                             Box::pin(self.apply_safety_actions(

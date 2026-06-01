@@ -9,9 +9,12 @@
 //!
 //! - `wire` — [`WireMessage`] envelope and frame constants.
 //! - `config` — [`NodeConfigForConsensus`].
-//! - `block_builder` — [`MempoolBlockBuilder`] (the [`BlockBuilder`]
+//! - `block_builder` — [`MempoolBlockBuilder`] (the
+//!   [`BlockBuilder`](boule_consensus::hotstuff::step::BlockBuilder)
 //!   that pulls commands from the mempool and stamps `state_commitment`
-//!   by forking the committed SM).
+//!   by forking the committed SM; it also implements the async
+//!   [`Application`](boule_consensus::replication::application::Application)
+//!   build seam the integration layer now drives).
 //! - `persistence` — storage-key constants, codec helpers, the
 //!   [`recover_state`] entry point, and `persist_updates` /
 //!   `verify_persisted_history_consistency` on [`ConsensusNode`].
@@ -64,7 +67,7 @@ use boule_consensus::block_sync_retry_timer::{
 };
 use boule_consensus::dispatch::{self, Outbound};
 use boule_consensus::hotstuff::qc::{ConsensusMsg, VerifiedQc, genesis_qc_bls};
-use boule_consensus::hotstuff::step::{BlockBuilder, HotStuffCore, StateUpdate};
+use boule_consensus::hotstuff::step::{HotStuffCore, StateUpdate};
 use boule_consensus::hotstuff::{HotStuffState, QuorumCertificate, genesis_qc};
 use boule_consensus::limits::CacheEvictionCounters;
 use boule_consensus::pacemaker::Event as PacemakerEvent;
@@ -72,6 +75,7 @@ use boule_consensus::pacemaker::Pacemaker;
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::pacemaker::timeout::ExponentialBackoff;
 use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
+use boule_consensus::replication::application::Application;
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
@@ -352,11 +356,13 @@ pub struct ConsensusNode {
     /// path to bound the uncommitted-ancestor walk (issue #375)
     /// without having to thread a borrow through the trait object.
     last_committed_height: Arc<AtomicU64>,
-    /// Block builder, owned by the integration layer (#606 / #225 M1) — the
-    /// safety core no longer holds it. The `BuildProposal` action handler runs
-    /// it to construct the leader's proposal. Becomes the async `Application`
-    /// in a follow-up.
-    builder: Arc<dyn BlockBuilder>,
+    /// The async application seam (#225 M1), owned by the integration
+    /// layer — the safety core no longer holds the builder. The
+    /// `BuildProposal` action handler `await`s [`Application::build_proposal`]
+    /// to construct the leader's proposal. The counter node plugs in the
+    /// in-process [`MempoolBlockBuilder`]; a reth node will plug in an
+    /// execution layer that builds payloads over the Engine API.
+    app: Arc<dyn Application>,
     /// Heap-resident work stack of self-addressed (loopback) dispatches — the
     /// node's own Vote/Proposal echoed back so the safety core tallies them
     /// like a peer message would. `apply_safety_actions` enqueues here and
@@ -552,7 +558,7 @@ impl ConsensusNode {
 
         let last_committed_height = Arc::new(AtomicU64::new(0));
         let dropped_commands = Arc::new(AtomicU64::new(0));
-        let builder: Arc<dyn BlockBuilder> = Arc::new(MempoolBlockBuilder::new(
+        let app: Arc<dyn Application> = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
             Arc::clone(&state_machine),
@@ -626,7 +632,7 @@ impl ConsensusNode {
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             last_committed_height,
-            builder,
+            app,
             loopback_stack: Vec::new(),
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
@@ -929,7 +935,7 @@ impl ConsensusNode {
 
         let last_committed_height = Arc::new(AtomicU64::new(last_committed.height.0));
         let dropped_commands = Arc::new(AtomicU64::new(0));
-        let builder: Arc<dyn BlockBuilder> = Arc::new(MempoolBlockBuilder::new(
+        let app: Arc<dyn Application> = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
             Arc::clone(&state_machine),
@@ -1018,7 +1024,7 @@ impl ConsensusNode {
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             last_committed_height,
-            builder,
+            app,
             loopback_stack: Vec::new(),
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
@@ -1467,7 +1473,9 @@ mod tests {
     use boule_consensus::dispatch::Dispatch;
     use boule_consensus::hotstuff::Locked;
     use boule_consensus::hotstuff::qc::TimeoutVote;
-    use boule_consensus::hotstuff::step::{Action as SafetyAction, Event as SafetyEvent};
+    use boule_consensus::hotstuff::step::{
+        Action as SafetyAction, BlockBuilder, Event as SafetyEvent,
+    };
     use boule_consensus::limits::CacheLimits;
     use boule_consensus::rate_limit::MessageKind;
     use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
