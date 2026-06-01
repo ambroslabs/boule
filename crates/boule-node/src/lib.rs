@@ -411,6 +411,7 @@ async fn start_consensus(
         min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
         signature_scheme: cons_cfg.signature_scheme,
         block_retention_window: cons_cfg.block_retention_window,
+        min_block_interval: Duration::from_millis(cons_cfg.min_block_interval_ms),
     };
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -856,6 +857,7 @@ mod tests {
             signature_scheme: scheme,
             validators_bls: vec![],
             block_retention_window: 0,
+            min_block_interval_ms: 0,
         }
     }
 

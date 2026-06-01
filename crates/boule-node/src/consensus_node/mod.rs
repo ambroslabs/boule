@@ -366,6 +366,19 @@ pub struct ConsensusNode {
     /// enqueues and returns instead of recursing — the flattening that bounds
     /// the call stack (#613).
     draining_loopback: bool,
+    /// Minimum wall-clock spacing between proposals this node produces as
+    /// leader (#614). `Duration::ZERO` disables pacing. See
+    /// [`NodeConfigForConsensus::min_block_interval`].
+    min_block_interval: Duration,
+    /// When this node, as leader, last broadcast a proposal. Used to decide
+    /// whether a fresh proposal must wait out [`Self::min_block_interval`].
+    last_proposal_at: Option<tokio::time::Instant>,
+    /// A QC-triggered proposal held back by pacing, waiting for the block
+    /// interval to elapse. The run loop's pacing arm broadcasts it once the
+    /// deadline (`last_proposal_at + min_block_interval`) passes. Holding it
+    /// here (rather than looping it back immediately) is what terminates the
+    /// per-round loopback chain so a single-validator chain settles (#614).
+    stashed_proposal: Option<ConsensusMsg>,
     /// Cumulative count of commands the local [`MempoolBlockBuilder`]
     /// dropped because `StateMachine::apply` returned `Err` (issue
     /// #376). Surfaced under [`ConsensusStatus::dropped_commands`].
@@ -615,6 +628,9 @@ impl ConsensusNode {
             last_committed_height,
             loopback_stack: Vec::new(),
             draining_loopback: false,
+            min_block_interval: config.min_block_interval,
+            last_proposal_at: None,
+            stashed_proposal: None,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
@@ -1008,6 +1024,9 @@ impl ConsensusNode {
             last_committed_height,
             loopback_stack: Vec::new(),
             draining_loopback: false,
+            min_block_interval: config.min_block_interval,
+            last_proposal_at: None,
+            stashed_proposal: None,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
@@ -1155,6 +1174,23 @@ impl ConsensusNode {
                     let pm_actions = self.step_pacemaker(PacemakerEvent::OnTimeout(view));
                     self.apply_pacemaker_actions(pm_actions, broadcaster.as_ref(), &mut view_timer, &signer)
                         .await?;
+                }
+
+                // Block-production pacing (#614): once `min_block_interval`
+                // has elapsed since our last proposal, broadcast the one we
+                // held back. The guard makes this arm inert unless a proposal
+                // is actually stashed (so pacing is off by default / at n>=4),
+                // and `sleep_until` targets a fixed deadline so re-creating it
+                // each loop iteration is harmless.
+                () = tokio::time::sleep_until(
+                    self.last_proposal_at
+                        .map(|t| t + self.min_block_interval)
+                        .unwrap_or_else(tokio::time::Instant::now),
+                ), if self.stashed_proposal.is_some() => {
+                    if let Some(msg) = self.stashed_proposal.take() {
+                        self.broadcast_consensus_msg(msg, broadcaster.as_ref(), &mut view_timer, &signer)
+                            .await?;
+                    }
                 }
 
                 Some(()) = retry_timer_rx.recv() => {
@@ -7411,6 +7447,75 @@ mod tests {
         );
         // No further traffic.
         assert!(send_rx.try_recv().is_err());
+    }
+
+    /// Pacing (#614): a proposal produced within `min_block_interval` of the
+    /// previous one is held in `stashed_proposal` instead of broadcast, so
+    /// block production is rate-limited and (at a single-validator set) the
+    /// loopback chain terminates. The run loop's pacing arm sends it once the
+    /// interval elapses.
+    #[tokio::test]
+    async fn proposal_within_min_block_interval_is_stashed_not_broadcast() {
+        let ns = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&ns, 1);
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+        // Enable pacing and pretend we proposed a moment ago.
+        node.min_block_interval = Duration::from_secs(60);
+        node.last_proposal_at = Some(tokio::time::Instant::now());
+
+        let (broadcaster, mut send_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let actions = node.core.become_leader(1);
+        node.apply_safety_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .unwrap();
+
+        assert!(
+            node.stashed_proposal.is_some(),
+            "a proposal within the interval must be stashed, not broadcast",
+        );
+        assert!(
+            send_rx.try_recv().is_err(),
+            "nothing should hit the wire while the proposal is paced",
+        );
+        // The proposal was never delivered to us, so no self-vote happened.
+        assert_eq!(node.core.state().last_voted_view, View::ZERO);
+    }
+
+    /// Pacing (#614): pacing only delays back-to-back proposals — the first
+    /// proposal (no prior `last_proposal_at`) is broadcast immediately, and
+    /// records the time so the *next* one is paced.
+    #[tokio::test]
+    async fn first_proposal_is_broadcast_despite_pacing() {
+        let ns = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&ns, 1);
+        let signer: Arc<dyn Signer> = Arc::new(ns);
+        node.min_block_interval = Duration::from_secs(60);
+        node.last_proposal_at = None; // never proposed yet
+
+        let (broadcaster, mut send_rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        let actions = node.core.become_leader(1);
+        node.apply_safety_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .unwrap();
+
+        assert!(
+            node.stashed_proposal.is_none(),
+            "the first proposal must not be stashed",
+        );
+        assert!(
+            send_rx.try_recv().is_ok(),
+            "the first proposal must be broadcast immediately",
+        );
+        // It self-delivered, so we voted on it, and the broadcast time is now
+        // recorded — the next proposal would be paced.
+        assert_eq!(node.core.state().last_voted_view, View(1));
+        assert!(node.last_proposal_at.is_some());
     }
 
     /// PR A of #325: outbound proposals must carry a real

@@ -266,6 +266,14 @@ pub struct ConsensusConfig {
     /// serve?" — not a safety knob.
     #[serde(default = "default_block_retention_window")]
     pub block_retention_window: u64,
+    /// Minimum wall-clock spacing, in milliseconds, between proposals this
+    /// node produces as leader. `0` (the default) disables pacing. At
+    /// `n >= 4` the network already paces block production, so this only
+    /// bites a local leader that would otherwise outrun it — most usefully a
+    /// single-validator dev chain, where it sets a steady block time instead
+    /// of producing blocks as fast as the loop spins.
+    #[serde(default)]
+    pub min_block_interval_ms: u64,
 }
 
 /// One row of [`ConsensusConfig::validators_bls`]: the BLS half of a

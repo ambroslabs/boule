@@ -1072,46 +1072,24 @@ impl ConsensusNode {
                             continue;
                         }
                     }
-                    let bls_signer = self.bls_signer.as_deref();
-                    let (payload, loopback) = dispatch::egress_consensus_msg_with_loopback(
-                        &msg,
-                        signer.as_ref(),
-                        bls_signer,
-                        &self.validator_key_history,
-                        &self.chain_id,
-                    )?;
-                    let msg_is_proposal = matches!(msg, ConsensusMsg::Proposal(_));
-                    let msg_is_vote = matches!(msg, ConsensusMsg::Vote(_));
-                    send_outbound(
-                        broadcaster,
-                        self.rate_limiter.as_deref(),
-                        &self.peers_connected,
-                        Outbound::Broadcast(payload),
-                    )
-                    .await;
-                    // After a Proposal hits the wire the leader has a
-                    // de-facto commitment to view N — but
-                    // `proposed_in_view` is in-memory only (audit
-                    // finding 4-3 / issue #407). After a Vote hits the
-                    // wire the replica has a de-facto commitment to
-                    // last_voted_view = view, which `persist_voted_view`
-                    // either has or has not flushed depending on
-                    // discipline (audit finding 4-1 / issue #405).
-                    if msg_is_proposal {
-                        crashpoint!("after_send_outbound_for_proposal");
+                    // Pace block production (#614): hold a QC-triggered
+                    // proposal behind the configured block interval. We skip
+                    // the broadcast + self-loopback now; the run loop's pacing
+                    // arm sends it once the deadline elapses. Ending the
+                    // loopback chain here is what lets a single-validator chain
+                    // settle to a steady block time instead of spinning. No-op
+                    // when the interval is zero or already elapsed.
+                    if matches!(msg, ConsensusMsg::Proposal(_))
+                        && !self.min_block_interval.is_zero()
+                        && self
+                            .last_proposal_at
+                            .is_some_and(|last| last.elapsed() < self.min_block_interval)
+                    {
+                        self.stashed_proposal = Some(msg);
+                        continue;
                     }
-                    if msg_is_vote {
-                        crashpoint!("after_broadcast_vote");
-                    }
-                    // Enqueue our own messages and drain them iteratively. The
-                    // re-entrancy guard in `drain_loopback` flattens the former
-                    // `deliver_loopback` -> `apply_dispatch` -> here recursion
-                    // into a single loop, so an unbounded loopback chain (a
-                    // single-validator set) cannot overflow the stack — while
-                    // preserving the exact synchronous depth-first delivery
-                    // order, so observable behaviour is unchanged (#613).
-                    self.enqueue_loopback(loopback);
-                    Box::pin(self.drain_loopback(broadcaster, view_timer, signer)).await?;
+                    self.broadcast_consensus_msg(msg, broadcaster, view_timer, signer)
+                        .await?;
                 }
 
                 SafetyAction::RequestBlock {
@@ -1225,6 +1203,53 @@ impl ConsensusNode {
             }
         }
 
+        Ok(())
+    }
+
+    /// Sign, broadcast, and self-loop a consensus message — the egress half of
+    /// the `Broadcast` action, factored out so the run loop's pacing arm (#614)
+    /// can send a proposal it held back. Records the proposal-broadcast time so
+    /// pacing can space the next one.
+    pub(super) async fn broadcast_consensus_msg(
+        &mut self,
+        msg: ConsensusMsg,
+        broadcaster: &dyn Broadcaster,
+        view_timer: &mut ViewTimer,
+        signer: &Arc<dyn Signer>,
+    ) -> anyhow::Result<()> {
+        let bls_signer = self.bls_signer.as_deref();
+        let (payload, loopback) = dispatch::egress_consensus_msg_with_loopback(
+            &msg,
+            signer.as_ref(),
+            bls_signer,
+            &self.validator_key_history,
+            &self.chain_id,
+        )?;
+        let msg_is_proposal = matches!(msg, ConsensusMsg::Proposal(_));
+        let msg_is_vote = matches!(msg, ConsensusMsg::Vote(_));
+        send_outbound(
+            broadcaster,
+            self.rate_limiter.as_deref(),
+            &self.peers_connected,
+            Outbound::Broadcast(payload),
+        )
+        .await;
+        // After a Proposal hits the wire the leader has a de-facto commitment
+        // to view N (audit 4-3 / #407); after a Vote, to last_voted_view
+        // (4-1 / #405).
+        if msg_is_proposal {
+            self.last_proposal_at = Some(tokio::time::Instant::now());
+            crashpoint!("after_send_outbound_for_proposal");
+        }
+        if msg_is_vote {
+            crashpoint!("after_broadcast_vote");
+        }
+        // Enqueue our own messages and drain them iteratively (#613): the
+        // re-entrancy guard in `drain_loopback` flattens what was mutual
+        // recursion into one loop, preserving depth-first delivery order while
+        // bounding the call stack.
+        self.enqueue_loopback(loopback);
+        Box::pin(self.drain_loopback(broadcaster, view_timer, signer)).await?;
         Ok(())
     }
 

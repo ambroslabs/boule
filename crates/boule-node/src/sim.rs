@@ -1278,6 +1278,7 @@ impl SimCluster {
                 min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
                 signature_scheme: scheme,
                 block_retention_window: 0,
+                min_block_interval: Duration::ZERO,
             };
 
             let sm: Arc<Mutex<Box<dyn StateMachine>>> = state_machines
@@ -2078,6 +2079,7 @@ impl SimCluster {
                 min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
                 signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
                 block_retention_window: 0,
+                min_block_interval: Duration::ZERO,
             };
             // Fresh state machine and mempool — the previous session's
             // state machine doesn't survive a process restart in
@@ -2322,6 +2324,7 @@ impl SimCluster {
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
             signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
             block_retention_window: 0,
+            min_block_interval: Duration::ZERO,
         };
         let sm: Arc<Mutex<Box<dyn StateMachine>>> =
             Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
@@ -2956,6 +2959,7 @@ impl SimCluster {
                 min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
                 signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
                 block_retention_window: 0,
+                min_block_interval: Duration::ZERO,
             };
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
