@@ -97,6 +97,9 @@ fn placeholder_block(parent_hash: [u8; 32], height: u64, view: u64, proposer: No
         state_commitment: [view as u8; 32],
         commands_commitment: Block::commands_commitment(&[]),
         validator_history_commitment: [0; 32],
+        committed_height: Height(0),
+        committed_state_root: [0; 32],
+        timestamp: 0,
     };
     Block {
         header,
