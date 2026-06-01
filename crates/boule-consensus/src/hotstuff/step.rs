@@ -395,6 +395,11 @@ pub trait BlockBuilder: Send + Sync {
     /// affected view, letting the next-view leader take over rather
     /// than crashing the node.
     ///
+    /// `timestamp` is the proposal time in Unix epoch milliseconds, read
+    /// from the integration layer's wall clock. The builder stamps it into
+    /// the header clamped to the parent so block time is non-decreasing
+    /// (see [`BlockHeader::timestamp`](crate::replication::block::BlockHeader::timestamp)).
+    ///
     /// [`HotStuffState::pending_blocks`]: super::state::HotStuffState::pending_blocks
     fn build(
         &self,
@@ -402,6 +407,7 @@ pub trait BlockBuilder: Send + Sync {
         view: View,
         high_qc: &QuorumCertificate,
         pending_blocks: &HashMap<BlockHash, Block>,
+        timestamp: u64,
     ) -> anyhow::Result<Block>;
 }
 
@@ -959,7 +965,7 @@ impl HotStuffCore {
         tests::TestBlockBuilder {
             proposer: self.self_id,
         }
-        .build(parent, view, high_qc, &self.state.pending_blocks)
+        .build(parent, view, high_qc, &self.state.pending_blocks, 0)
     }
 
     /// Finalize a proposal the integration layer just built for `view`: set
@@ -2203,6 +2209,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             };
             let block = Block {
                 header,
@@ -2229,6 +2236,7 @@ mod tests {
             view: View,
             _high_qc: &QuorumCertificate,
             _pending_blocks: &HashMap<BlockHash, Block>,
+            timestamp: u64,
         ) -> anyhow::Result<Block> {
             let header = BlockHeader {
                 parent_hash: parent.hash(),
@@ -2240,6 +2248,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: timestamp.max(parent.header.timestamp),
             };
             Ok(Block {
                 header,
@@ -2271,6 +2280,7 @@ mod tests {
             validator_history_commitment: [0; 32],
             committed_height: Height::ZERO,
             committed_state_root: [0; 32],
+            timestamp: 0,
         };
         Block {
             header,
@@ -2432,6 +2442,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -2476,6 +2487,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         }
@@ -2628,6 +2640,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -2797,6 +2810,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -3137,6 +3151,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -4073,6 +4088,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         }
@@ -4286,6 +4302,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -5469,6 +5486,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 },
                 commands: Vec::new(),
             };
@@ -6230,7 +6248,7 @@ mod tests {
                 proposer: leader_nid,
             };
             let block_v1 = builder
-                .build(&replicas.genesis, View(1), &genesis_qc, &HashMap::new())
+                .build(&replicas.genesis, View(1), &genesis_qc, &HashMap::new(), 0)
                 .expect("test builder must not fail");
             Signed {
                 payload: Proposal {
@@ -6594,6 +6612,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             };
             let block = Block {
                 header,
@@ -7213,6 +7232,7 @@ mod tests {
                     validator_history_commitment: [0; 32],
                     committed_height: Height::ZERO,
                     committed_state_root: [0; 32],
+                    timestamp: 0,
                 };
                 let fork = Block {
                     header,

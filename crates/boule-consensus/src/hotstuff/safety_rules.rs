@@ -168,6 +168,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             };
             let block = Block {
                 header,
@@ -233,6 +234,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -288,6 +290,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -302,6 +305,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -375,6 +379,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };
@@ -409,6 +414,7 @@ mod tests {
                 validator_history_commitment: [0; 32],
                 committed_height: Height::ZERO,
                 committed_state_root: [0; 32],
+                timestamp: 0,
             },
             commands: Vec::new(),
         };

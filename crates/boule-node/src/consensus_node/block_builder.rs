@@ -107,7 +107,13 @@ impl BlockBuilder for MempoolBlockBuilder {
         view: View,
         _high_qc: &QuorumCertificate,
         pending_blocks: &HashMap<BlockHash, Block>,
+        timestamp: u64,
     ) -> anyhow::Result<Block> {
+        // Clamp to the parent so block time is non-decreasing even if the
+        // wall clock jumped backward since the parent was built (NTP,
+        // suspend/resume); a strictly correct `validate_structural` then
+        // never rejects an honest proposal on time alone.
+        let timestamp = timestamp.max(parent.header.timestamp);
         let mut commands = self.mempool.propose(self.propose_limit);
 
         // Walk parent's uncommitted ancestor chain. The result is
@@ -247,6 +253,7 @@ impl BlockBuilder for MempoolBlockBuilder {
                 validator_history_commitment: [0; 32],
                 committed_height,
                 committed_state_root,
+                timestamp,
             },
             commands,
         })
@@ -267,8 +274,9 @@ impl Application for MempoolBlockBuilder {
         view: View,
         high_qc: &'a QuorumCertificate,
         pending_blocks: &'a HashMap<BlockHash, Block>,
+        timestamp: u64,
     ) -> BoxFuture<'a, anyhow::Result<Block>> {
-        let built = BlockBuilder::build(self, parent, view, high_qc, pending_blocks);
+        let built = BlockBuilder::build(self, parent, view, high_qc, pending_blocks, timestamp);
         Box::pin(async move { built })
     }
 
@@ -402,7 +410,7 @@ mod tests {
         let genesis = Block::genesis([0; 32], [0; 32]);
         let qc = QuorumCertificate::new(0, genesis.hash(), 4);
         let block = builder
-            .build(&genesis, View(1), &qc, &HashMap::new())
+            .build(&genesis, View(1), &qc, &HashMap::new(), 0)
             .expect("build must succeed");
 
         assert!(
