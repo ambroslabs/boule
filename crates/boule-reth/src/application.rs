@@ -117,13 +117,43 @@ fn state_root_of(payload: &Value) -> Result<[u8; 32]> {
     root_from_hex(payload["stateRoot"].as_str().context("payload stateRoot")?)
 }
 
+/// `parent` plus its uncommitted ancestors (strictly above the committed
+/// frontier), walked through `pending_blocks` and returned **oldest-first**.
+///
+/// This is the chain a leader must make sure reth knows before it can build
+/// on `parent`. The committed frontier and everything below it are already in
+/// reth (commit runs `newPayloadV3`), but under HotStuff pipelining `parent`
+/// and its recent ancestors may still be uncommitted — and a *rotated* leader
+/// only ever **voted** on them (deferred execution: it never executed them),
+/// so its reth has not seen those payloads. Registering this chain oldest-
+/// first, on top of the known committed frontier, lets the build chain on
+/// `parent`. The walk stops at the first block at/below `committed_height` or
+/// the first parent missing from `pending_blocks` (the committed boundary).
+fn uncommitted_chain<'b>(
+    parent: &'b Block,
+    pending_blocks: &'b HashMap<BlockHash, Block>,
+    committed_height: Height,
+) -> Vec<&'b Block> {
+    let mut chain = Vec::new();
+    let mut cursor = parent;
+    while cursor.header.height.0 > committed_height.0 {
+        chain.push(cursor);
+        match pending_blocks.get(&cursor.header.parent_hash) {
+            Some(p) => cursor = p,
+            None => break,
+        }
+    }
+    chain.reverse();
+    chain
+}
+
 impl Application for RethApplication {
     fn build_proposal<'a>(
         &'a self,
         parent: &'a Block,
         view: View,
         _high_qc: &'a QuorumCertificate,
-        _pending_blocks: &'a HashMap<BlockHash, Block>,
+        pending_blocks: &'a HashMap<BlockHash, Block>,
         timestamp: u64,
     ) -> BoxFuture<'a, Result<Block>> {
         Box::pin(async move {
@@ -140,6 +170,20 @@ impl Application for RethApplication {
             let evm_ts = (parent_evm_ts + 1).max(timestamp / 1000);
 
             let engine = self.engine();
+            // Make sure reth knows the uncommitted chain we're about to build
+            // on. A rotated leader may have only voted on `parent` and its
+            // recent ancestors (never executed them), so register each payload
+            // (`newPayloadV3`, no finalize) oldest-first before building.
+            // Idempotent for blocks reth already knows; the genesis parent has
+            // an empty chain. This is what makes the reth backend work across
+            // leader rotation under pipelining.
+            for ancestor in uncommitted_chain(parent, pending_blocks, committed_height) {
+                if let Some(cmd) = ancestor.commands.first() {
+                    let payload: Value = serde_json::from_slice(cmd)
+                        .context("uncommitted ancestor command is not a JSON execution payload")?;
+                    engine.register_payload(&payload).await?;
+                }
+            }
             let built = engine
                 .build_block(&parent_evm_hash, evm_ts, self.build_wait)
                 .await?;
@@ -341,5 +385,150 @@ mod tests {
     fn restore_rejects_a_wrong_length_blob() {
         let app = make_app([0u8; 32]);
         assert!(app.restore(&[0u8; 16]).is_err());
+    }
+
+    // ── #629: uncommitted-ancestor registration on the build path ──────────
+
+    fn evm_payload(block_hash: &str) -> Bytes {
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "blockHash": block_hash,
+                "stateRoot": format!("0x{}", "11".repeat(32)),
+                "timestamp": "0x1",
+            }))
+            .unwrap(),
+        )
+    }
+
+    fn block_with_payload(parent_hash: [u8; 32], height: u64, block_hash: &str) -> Block {
+        let commands = vec![evm_payload(block_hash)];
+        Block {
+            header: BlockHeader {
+                parent_hash,
+                height: Height(height),
+                view: View(height),
+                proposer: [1u8; 32],
+                state_commitment: [0u8; 32],
+                commands_commitment: Block::commands_commitment(&commands),
+                validator_history_commitment: [0u8; 32],
+                committed_height: Height(0),
+                committed_state_root: [0u8; 32],
+                timestamp: 1,
+            },
+            commands,
+        }
+    }
+
+    #[test]
+    fn uncommitted_chain_returns_parent_and_ancestors_oldest_first() {
+        // genesis(0) <- a(1) <- b(2) <- c(3); committed frontier at height 1.
+        let g = genesis();
+        let a = block_with_payload(g.hash(), 1, "0xaa");
+        let b = block_with_payload(a.hash(), 2, "0xbb");
+        let c = block_with_payload(b.hash(), 3, "0xcc");
+        let pending: HashMap<BlockHash, Block> =
+            [(a.hash(), a), (b.hash(), b), (c.hash(), c.clone())]
+                .into_iter()
+                .collect();
+
+        // a is at the committed frontier (excluded); b, c are uncommitted, so
+        // the chain is oldest-first [b, c].
+        let chain = uncommitted_chain(&c, &pending, Height(1));
+        let heights: Vec<u64> = chain.iter().map(|blk| blk.header.height.0).collect();
+        assert_eq!(heights, vec![2, 3]);
+    }
+
+    #[test]
+    fn uncommitted_chain_is_empty_for_the_genesis_parent() {
+        let g = genesis();
+        assert!(uncommitted_chain(&g, &HashMap::new(), Height(0)).is_empty());
+    }
+
+    #[test]
+    fn uncommitted_chain_stops_at_a_missing_parent() {
+        // Only c is in pending (its ancestors absent); the walk stops at c.
+        let g = genesis();
+        let a = block_with_payload(g.hash(), 1, "0xaa");
+        let b = block_with_payload(a.hash(), 2, "0xbb");
+        let c = block_with_payload(b.hash(), 3, "0xcc");
+        let pending: HashMap<BlockHash, Block> = [(c.hash(), c.clone())].into_iter().collect();
+        let chain = uncommitted_chain(&c, &pending, Height(0));
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].header.height.0, 3);
+    }
+
+    /// Transport that records the engine methods called while replaying the
+    /// golden fixtures, so the driver runs and the call sequence is observable.
+    struct RecordingTransport {
+        methods: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl EngineTransport for RecordingTransport {
+        fn call(
+            &self,
+            method: &str,
+            params: Value,
+            _tag: &str,
+        ) -> BoxFuture<'_, anyhow::Result<Value>> {
+            self.methods.lock().push(method.to_string());
+            let raw = match method {
+                "engine_forkchoiceUpdatedV3" => {
+                    if params.get(1).is_some_and(|v| !v.is_null()) {
+                        include_str!("../fixtures/01-fcu-attrs.json")
+                    } else {
+                        include_str!("../fixtures/04-fcu-final.json")
+                    }
+                }
+                "engine_getPayloadV3" => include_str!("../fixtures/02-getpayload.json"),
+                "engine_newPayloadV3" => include_str!("../fixtures/03-newpayload.json"),
+                other => panic!("unexpected engine method {other}"),
+            };
+            let v = serde_json::from_str::<Value>(raw).unwrap()["result"].clone();
+            Box::pin(async move { Ok(v) })
+        }
+    }
+
+    #[tokio::test]
+    async fn build_registers_the_uncommitted_ancestor_chain_before_building() {
+        let methods = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let app = RethApplication::new(
+            Box::new(RecordingTransport {
+                methods: methods.clone(),
+            }),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+        );
+
+        // Two uncommitted blocks above the (genesis) committed frontier; build
+        // on the tip `b`.
+        let g = genesis();
+        let a = block_with_payload(g.hash(), 1, "0xaa");
+        let b = block_with_payload(a.hash(), 2, "0xbb");
+        let pending: HashMap<BlockHash, Block> =
+            [(a.hash(), a), (b.hash(), b.clone())].into_iter().collect();
+
+        app.build_proposal(&b, View(3), &sample_qc(&b), &pending, 1_000)
+            .await
+            .expect("build");
+
+        let m = methods.lock();
+        let new_payloads = m.iter().filter(|x| *x == "engine_newPayloadV3").count();
+        assert_eq!(new_payloads, 3, "two ancestors (a, b) + the built block");
+        // Both ancestors are registered before the build's forkchoiceUpdatedV3.
+        let first_fcu = m
+            .iter()
+            .position(|x| x == "engine_forkchoiceUpdatedV3")
+            .expect("build issues a forkchoiceUpdatedV3");
+        let registered_before_build = m[..first_fcu]
+            .iter()
+            .filter(|x| *x == "engine_newPayloadV3")
+            .count();
+        assert_eq!(
+            registered_before_build, 2,
+            "ancestors registered before building"
+        );
     }
 }
