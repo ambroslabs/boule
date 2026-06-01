@@ -56,13 +56,13 @@ pub fn root_from_hex(s: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("root is not 32 bytes"))
 }
 
-pub struct RethEngine<'a, T> {
-    transport: &'a T,
+pub struct RethEngine<'a> {
+    transport: &'a dyn EngineTransport,
     fee_recipient: String,
 }
 
-impl<'a, T: EngineTransport> RethEngine<'a, T> {
-    pub fn new(transport: &'a T, fee_recipient: impl Into<String>) -> Self {
+impl<'a> RethEngine<'a> {
+    pub fn new(transport: &'a dyn EngineTransport, fee_recipient: impl Into<String>) -> Self {
         Self {
             transport,
             fee_recipient: fee_recipient.into(),
@@ -70,17 +70,20 @@ impl<'a, T: EngineTransport> RethEngine<'a, T> {
     }
 
     /// Leader side: start a build on `head_hash` and retrieve the payload.
-    /// `build_wait` lets the async build pull pool txs in before `getPayload`
-    /// (pass `Duration::ZERO` in tests / when the transport is synchronous).
+    /// `evm_timestamp` is the new block's Unix-seconds timestamp; the caller
+    /// derives it from the consensus block time and must ensure it is strictly
+    /// greater than the parent's (EVM requires strictly increasing block
+    /// times). `build_wait` lets reth's async build pull pool txs in before
+    /// `getPayload` (pass `Duration::ZERO` in tests / for a fixture transport).
     pub async fn build_block(
         &self,
         head_hash: &str,
-        parent_ts: u64,
+        evm_timestamp: u64,
         build_wait: Duration,
     ) -> Result<BuiltBlock> {
         let z = zero32();
         let attrs = json!({
-            "timestamp": format!("0x{:x}", parent_ts + 1), // strictly > parent.
+            "timestamp": format!("0x{evm_timestamp:x}"),
             "prevRandao": z,
             "suggestedFeeRecipient": self.fee_recipient,
             "withdrawals": [],
@@ -203,10 +206,10 @@ mod tests {
     const BLOCK1_STATE_ROOT: &str =
         "0x351714af72d74259f45cd7eab0b04527cd40e74836a45abcae50f92d919d988f";
 
-    fn engine() -> RethEngine<'static, FixtureTransport> {
+    fn engine() -> RethEngine<'static> {
         // Leak a unit transport so the test engine can be 'static; trivial.
         RethEngine::new(
-            Box::leak(Box::new(FixtureTransport)),
+            Box::leak(Box::new(FixtureTransport)) as &dyn EngineTransport,
             "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
         )
     }
@@ -214,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn build_block_parses_payload_and_state_root() {
         let built = engine()
-            .build_block(GENESIS, 0, Duration::ZERO)
+            .build_block(GENESIS, 1, Duration::ZERO)
             .await
             .expect("build");
         assert_eq!(built.block_number, 1);

@@ -530,8 +530,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "boule-consensus",
+ "boule-core",
+ "bytes",
  "hex",
  "hmac",
+ "parking_lot",
  "reqwest",
  "serde_json",
  "sha2",

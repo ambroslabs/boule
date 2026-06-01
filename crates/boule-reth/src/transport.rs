@@ -6,6 +6,7 @@
 //! the fixture basename; the HTTP transport uses it to record each exchange.
 
 use anyhow::{Context, Result, bail};
+use boule_core::clock::BoxFuture;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,13 +14,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::jwt;
 
 /// One authenticated Engine API round-trip.
-pub trait EngineTransport {
-    fn call(
-        &self,
-        method: &str,
-        params: Value,
-        tag: &str,
-    ) -> impl std::future::Future<Output = Result<Value>> + Send;
+///
+/// Object-safe via the codebase's [`BoxFuture`] convention (rather than
+/// `-> impl Future`), so the driver and the application can hold a
+/// `Box<dyn EngineTransport>` and swap the live HTTP transport for the
+/// fixture transport without a type parameter — matching the async-trait
+/// style of `boule_core`'s `Clock`/`Broadcaster`.
+pub trait EngineTransport: Send + Sync {
+    fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>>;
 }
 
 /// Live transport over reth's two ports: authenticated Engine API (`:8551`,
@@ -80,18 +82,22 @@ impl HttpTransport {
 }
 
 impl EngineTransport for HttpTransport {
-    async fn call(&self, method: &str, params: Value, tag: &str) -> Result<Value> {
-        let result = self
-            .rpc(&self.engine_url, method, params.clone(), true)
-            .await?;
-        // Capture the exchange as a golden fixture when a dir is configured.
-        if let Some(dir) = &self.fixtures_dir {
-            let record = json!({ "method": method, "params": params, "result": result });
-            if let Ok(bytes) = serde_json::to_vec_pretty(&record) {
-                let _ = std::fs::write(dir.join(format!("{tag}.json")), bytes);
+    fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+        let method = method.to_string();
+        let tag = tag.to_string();
+        Box::pin(async move {
+            let result = self
+                .rpc(&self.engine_url, &method, params.clone(), true)
+                .await?;
+            // Capture the exchange as a golden fixture when a dir is configured.
+            if let Some(dir) = &self.fixtures_dir {
+                let record = json!({ "method": method, "params": params, "result": result });
+                if let Ok(bytes) = serde_json::to_vec_pretty(&record) {
+                    let _ = std::fs::write(dir.join(format!("{tag}.json")), bytes);
+                }
             }
-        }
-        Ok(result)
+            Ok(result)
+        })
     }
 }
 
