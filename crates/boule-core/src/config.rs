@@ -176,6 +176,40 @@ pub struct ApiConfig {
     pub listen_addr: SocketAddr,
 }
 
+/// `[consensus.application]` — which execution backend processes the
+/// blocks consensus orders. Absent means the built-in counter state
+/// machine. `backend = "reth"` drives an external reth execution layer
+/// over the Engine API (one block = one EVM payload); it requires the
+/// node binary to be built with the `reth` cargo feature, otherwise
+/// startup fails with a clear error.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "backend", rename_all = "kebab-case")]
+pub enum ApplicationConfig {
+    /// The built-in in-process counter state machine (the default).
+    Counter,
+    /// An external reth EL driven over the Engine API.
+    Reth {
+        /// Authenticated Engine API endpoint (reth `--authrpc`, e.g.
+        /// `http://127.0.0.1:8551`).
+        engine_url: String,
+        /// Public `eth_*` JSON-RPC endpoint (e.g. `http://127.0.0.1:8545`),
+        /// used to read reth's genesis for the consensus↔EL genesis bridge.
+        eth_url: String,
+        /// Path to reth's `--authrpc.jwtsecret` (32-byte hex).
+        jwt_secret_path: PathBuf,
+        /// EVM `suggestedFeeRecipient` for built payloads.
+        fee_recipient: String,
+        /// Pause between `forkchoiceUpdatedV3(attrs)` and `getPayloadV3`
+        /// so reth's async build can pull pool transactions in.
+        #[serde(default = "default_reth_build_wait_ms")]
+        build_wait_ms: u64,
+    },
+}
+
+fn default_reth_build_wait_ms() -> u64 {
+    200
+}
+
 /// HotStuff consensus configuration. Opt-in via the top-level
 /// `[consensus]` table; absent means the binary runs gossip-only.
 ///
@@ -188,9 +222,15 @@ pub struct ConsensusConfig {
     /// Must include this node's own ID.
     pub validators: Vec<String>,
     /// 32-byte hex string used as the genesis block's `state_commitment`.
-    /// Must match across all replicas. Defaults to all zeros.
+    /// Must match across all replicas. Defaults to all zeros. For the
+    /// reth backend this must equal reth's genesis state root (the node
+    /// verifies that bridge at startup).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_seed_hex: Option<String>,
+    /// Execution backend (`[consensus.application]`). Absent = the
+    /// built-in counter state machine. See [`ApplicationConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application: Option<ApplicationConfig>,
     /// Maximum commands the leader pulls from the mempool per proposal.
     #[serde(default = "default_propose_limit")]
     pub propose_limit: usize,

@@ -33,7 +33,9 @@ use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_set::ValidatorSet;
 use boule_core::clock::{Clock, TokioClock};
-use boule_core::config::{BlsIdentityConfig, Config, ConsensusConfig, OverlayConfig, OverlayMode};
+use boule_core::config::{
+    ApplicationConfig, BlsIdentityConfig, Config, ConsensusConfig, OverlayConfig, OverlayMode,
+};
 use boule_core::crypto::signed::{NodeSigner, Signer};
 use boule_core::identity::NodeIdentity;
 use boule_core::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
@@ -315,6 +317,68 @@ struct RunningConsensus {
     overlay_joins: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Build the reth-backed
+/// [`Application`](boule_consensus::replication::application::Application)
+/// from `[consensus.application] backend = "reth"`, bridging the consensus
+/// genesis to reth's: the configured genesis `state_commitment` must equal
+/// reth's genesis state root, or replicas would diverge on the first block.
+/// Compiled only with the `reth` feature.
+#[cfg(feature = "reth")]
+async fn reth_application(
+    cfg: &ApplicationConfig,
+    self_id: NodeId,
+    genesis_state_commitment: [u8; 32],
+) -> anyhow::Result<Arc<dyn boule_consensus::replication::application::Application>> {
+    let ApplicationConfig::Reth {
+        engine_url,
+        eth_url,
+        jwt_secret_path,
+        fee_recipient,
+        build_wait_ms,
+    } = cfg
+    else {
+        unreachable!("reth_application called for a non-reth backend");
+    };
+    let (reth_genesis_hash, reth_genesis_root) = boule_reth::fetch_genesis(eth_url)
+        .await
+        .context("querying reth genesis over eth_url (is reth reachable?)")?;
+    if reth_genesis_root != genesis_state_commitment {
+        anyhow::bail!(
+            "consensus genesis state_commitment {} does not match reth's genesis state root {}; \
+             set [consensus] genesis_seed_hex = \"{}\"",
+            hex::encode(genesis_state_commitment),
+            hex::encode(reth_genesis_root),
+            hex::encode(reth_genesis_root),
+        );
+    }
+    let secret = boule_reth::jwt::load_secret(jwt_secret_path)?;
+    let transport =
+        boule_reth::HttpTransport::new(engine_url.clone(), eth_url.clone(), secret, None);
+    info!(target: "boule::node", %engine_url, %eth_url, "reth execution backend enabled");
+    Ok(Arc::new(boule_reth::RethApplication::new(
+        Box::new(transport),
+        self_id,
+        fee_recipient.clone(),
+        reth_genesis_hash,
+        reth_genesis_root,
+        Duration::from_millis(*build_wait_ms),
+    )))
+}
+
+/// Stub for builds without the `reth` feature: selecting the reth backend
+/// in config is a clear startup error rather than a silent fallback.
+#[cfg(not(feature = "reth"))]
+async fn reth_application(
+    _cfg: &ApplicationConfig,
+    _self_id: NodeId,
+    _genesis_state_commitment: [u8; 32],
+) -> anyhow::Result<Arc<dyn boule_consensus::replication::application::Application>> {
+    anyhow::bail!(
+        "config selects [consensus.application] backend = \"reth\", but this binary was built \
+         without the `reth` cargo feature (rebuild the node with `--features reth`)"
+    )
+}
+
 /// Start the HotStuff consensus protocol alongside gossip + ping.
 ///
 /// Registers `boule_transport_tcp::overlay::gossip::PROTOCOL_ID`, spawns
@@ -369,6 +433,9 @@ async fn start_consensus(
 
     let genesis = boule_consensus::genesis::build_genesis(cons_cfg, &validator_set, &genesis_bls)?;
     info!("consensus: genesis hash = {:?}", genesis.hash());
+    // Captured before `genesis` is moved into the node config; the reth
+    // backend bridges this against reth's genesis state root.
+    let genesis_state_commitment = genesis.header.state_commitment;
 
     // Now the chain_id is known: verify the operator-supplied
     // proof-of-possession bytes bind to *this* deployment's chain_id
@@ -465,6 +532,18 @@ async fn start_consensus(
                 >,
         > = Arc::new(boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity));
         node = node.with_bls_signer(bls_signer);
+    }
+
+    // Select the execution backend (`[consensus.application]`). Absent or
+    // `counter` keeps the in-process counter application the constructor
+    // wired; `reth` swaps in the Engine-API-backed application after
+    // bridging the consensus genesis to reth's.
+    match cons_cfg.application.as_ref() {
+        None | Some(ApplicationConfig::Counter) => {}
+        Some(reth_cfg) => {
+            let app = reth_application(reth_cfg, *self_id, genesis_state_commitment).await?;
+            node = node.with_application(app);
+        }
     }
 
     // #325 PR B: gate startup on rebuild-from-chain validation. The
@@ -842,6 +921,7 @@ mod tests {
         ConsensusConfig {
             validators: vec![],
             genesis_seed_hex: None,
+            application: None,
             propose_limit: 64,
             mempool_capacity: 1024,
             timeout_base_ms: 200,

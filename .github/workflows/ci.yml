@@ -68,6 +68,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --all-targets -- -D warnings
+      # Optional cargo features are off by default, so the line above never
+      # compiles the feature-gated code. Lint the `reth` backend explicitly
+      # so it can't silently rot (as the workspace-excluded fuzz crate did).
+      - if: needs.changes.outputs.rust == 'true'
+        run: cargo clippy -p boule-node --features reth --all-targets -- -D warnings
 
   test:
     # Two shards on separate runners to isolate CPU-bound tests from the rest

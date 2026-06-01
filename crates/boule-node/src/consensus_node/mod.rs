@@ -711,6 +711,16 @@ impl ConsensusNode {
         self
     }
 
+    /// Replace the [`Application`] this node drives. The constructors wire
+    /// the default in-process counter application; a node that orders an
+    /// external execution layer (e.g. reth over the Engine API) installs
+    /// its [`Application`] here at startup. The counter's mempool and
+    /// state machine constructed by `new`/`recover` are then unused.
+    pub fn with_application(mut self, app: Arc<dyn Application>) -> Self {
+        self.app = app;
+        self
+    }
+
     /// Wire the gossip-mode overlay's
     /// [`boule_transport_tcp::overlay::gossip::sink::OverlaySink`] overflow
     /// counter into this node so

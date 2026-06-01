@@ -498,6 +498,7 @@ dependencies = [
  "axum",
  "boule-consensus",
  "boule-core",
+ "boule-reth",
  "boule-transport-tcp",
  "bs58",
  "bytes",
