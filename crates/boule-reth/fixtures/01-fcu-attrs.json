@@ -1,0 +1,25 @@
+{
+  "method": "engine_forkchoiceUpdatedV3",
+  "params": [
+    {
+      "finalizedBlockHash": "0x48d8efff29130c4b1149a8cb877448dc06421f6617b92dc0f817ef96d8973767",
+      "headBlockHash": "0x48d8efff29130c4b1149a8cb877448dc06421f6617b92dc0f817ef96d8973767",
+      "safeBlockHash": "0x48d8efff29130c4b1149a8cb877448dc06421f6617b92dc0f817ef96d8973767"
+    },
+    {
+      "parentBeaconBlockRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "prevRandao": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "suggestedFeeRecipient": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "timestamp": "0x1",
+      "withdrawals": []
+    }
+  ],
+  "result": {
+    "payloadId": "0xea77001b7ea8e4a8",
+    "payloadStatus": {
+      "latestValidHash": "0x48d8efff29130c4b1149a8cb877448dc06421f6617b92dc0f817ef96d8973767",
+      "status": "VALID",
+      "validationError": null
+    }
+  }
+}

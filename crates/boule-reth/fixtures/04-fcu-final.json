@@ -1,0 +1,19 @@
+{
+  "method": "engine_forkchoiceUpdatedV3",
+  "params": [
+    {
+      "finalizedBlockHash": "0x24df01d105151ebf3d2a6c33530c4d3078d632fb7be477e4ce038ec645a61e91",
+      "headBlockHash": "0x24df01d105151ebf3d2a6c33530c4d3078d632fb7be477e4ce038ec645a61e91",
+      "safeBlockHash": "0x24df01d105151ebf3d2a6c33530c4d3078d632fb7be477e4ce038ec645a61e91"
+    },
+    null
+  ],
+  "result": {
+    "payloadId": null,
+    "payloadStatus": {
+      "latestValidHash": "0x24df01d105151ebf3d2a6c33530c4d3078d632fb7be477e4ce038ec645a61e91",
+      "status": "VALID",
+      "validationError": null
+    }
+  }
+}
