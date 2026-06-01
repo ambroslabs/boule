@@ -137,7 +137,7 @@ impl<'a> RethEngine<'a> {
     /// All nodes: execute `payload` and advance forkchoice to it
     /// (`head = safe = finalized` — BFT finality, no reorgs). Returns the
     /// committed block hash.
-    pub async fn commit_block(&self, payload: &Value) -> Result<String> {
+    pub async fn commit_block(&self, payload: &Value) -> Result<(String, ElStatus)> {
         let executed = self
             .transport
             .call(
@@ -146,12 +146,17 @@ impl<'a> RethEngine<'a> {
                 "03-newpayload",
             )
             .await?;
-        expect_valid(&executed["status"], "newPayloadV3")?;
+        let exec_status = payload_status(&executed["status"], "newPayloadV3")?;
 
         let hash = payload["blockHash"]
             .as_str()
             .context("payload blockHash")?
             .to_string();
+        // Always drive forkchoice — even when newPayloadV3 returned SYNCING — so
+        // the EL has a canonical head to sync toward. This is the Engine API
+        // contract: `SYNCING` means "I don't have the parent yet"; the CL must
+        // still send forkchoiceUpdated so the EL knows where to sync. The fcU
+        // itself returns SYNCING while the EL backfills; that is not an error.
         let finalized = self
             .transport
             .call(
@@ -160,18 +165,26 @@ impl<'a> RethEngine<'a> {
                 "04-fcu-final",
             )
             .await?;
-        expect_valid(
+        let fcu_status = payload_status(
             &finalized["payloadStatus"]["status"],
             "forkchoiceUpdatedV3(final)",
         )?;
-        Ok(hash)
+
+        // VALID only when the payload executed *and* forkchoice accepted it;
+        // anything else means the EL is still catching up to this head.
+        let status = if exec_status == ElStatus::Valid && fcu_status == ElStatus::Valid {
+            ElStatus::Valid
+        } else {
+            ElStatus::Syncing
+        };
+        Ok((hash, status))
     }
 
     /// Deliver a built payload to reth (`newPayloadV3`) WITHOUT finalizing, so
     /// the block becomes known and later builds can chain on it. Needed under
     /// HotStuff pipelining: when the leader builds block N, its parent N-1 may
     /// not be committed/finalized yet, so reth must already know N-1's payload.
-    pub async fn register_payload(&self, payload: &Value) -> Result<()> {
+    pub async fn register_payload(&self, payload: &Value) -> Result<ElStatus> {
         let executed = self
             .transport
             .call(
@@ -180,15 +193,39 @@ impl<'a> RethEngine<'a> {
                 "03-newpayload",
             )
             .await?;
-        expect_valid(&executed["status"], "newPayloadV3(register)")?;
-        Ok(())
+        payload_status(&executed["status"], "newPayloadV3(register)")
     }
+}
+
+/// How the CL must interpret an Engine API payload/forkchoice status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElStatus {
+    /// The EL executed the payload and adopted it as canonical.
+    Valid,
+    /// The EL does not yet have the payload's parent chain and is syncing
+    /// toward the head (`SYNCING`/`ACCEPTED`). Normal during catch-up — the CL
+    /// keeps driving `forkchoiceUpdated` and the EL converges in the
+    /// background; it is not an error.
+    Syncing,
 }
 
 fn forkchoice(hash: &str) -> Value {
     json!({ "headBlockHash": hash, "safeBlockHash": hash, "finalizedBlockHash": hash })
 }
 
+/// Map an Engine API status string to an [`ElStatus`]. `INVALID` (and anything
+/// unrecognized) is a genuine error; `SYNCING`/`ACCEPTED` are catch-up states.
+fn payload_status(status: &Value, what: &str) -> Result<ElStatus> {
+    match status.as_str() {
+        Some("VALID") => Ok(ElStatus::Valid),
+        Some("SYNCING") | Some("ACCEPTED") => Ok(ElStatus::Syncing),
+        Some("INVALID") => bail!("{what}: EL rejected the payload as INVALID"),
+        other => bail!("{what}: unexpected Engine API status {other:?}"),
+    }
+}
+
+/// Strict status check for the build path's `forkchoiceUpdated(attrs)`, where a
+/// non-`VALID` status means the leader cannot build (it lacks the head).
 fn expect_valid(status: &Value, what: &str) -> Result<()> {
     match status.as_str() {
         Some("VALID") => Ok(()),
@@ -231,15 +268,87 @@ mod tests {
         let payload = serde_json::from_str::<Value>(include_str!("../fixtures/02-getpayload.json"))
             .unwrap()["result"]["executionPayload"]
             .clone();
-        let hash = engine().commit_block(&payload).await.expect("commit");
+        let (hash, status) = engine().commit_block(&payload).await.expect("commit");
         assert_eq!(hash, BLOCK1);
+        assert_eq!(status, ElStatus::Valid);
     }
 
     #[tokio::test]
     async fn build_then_commit_threads_the_payload_through() {
         let eng = engine();
         let built = eng.build_block(GENESIS, 0, Duration::ZERO).await.unwrap();
-        let committed = eng.commit_block(&built.execution_payload).await.unwrap();
+        let (committed, _) = eng.commit_block(&built.execution_payload).await.unwrap();
         assert_eq!(committed, built.block_hash);
+    }
+
+    /// A transport whose `newPayloadV3`/`forkchoiceUpdatedV3` return `SYNCING`,
+    /// and which records the methods called.
+    struct SyncingTransport {
+        methods: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    impl EngineTransport for SyncingTransport {
+        fn call(
+            &self,
+            method: &str,
+            _params: Value,
+            _tag: &str,
+        ) -> boule_core::clock::BoxFuture<'_, Result<Value>> {
+            self.methods.lock().push(method.to_string());
+            let v = match method {
+                "engine_newPayloadV3" => json!({ "status": "SYNCING", "latestValidHash": null }),
+                "engine_forkchoiceUpdatedV3" => {
+                    json!({ "payloadStatus": { "status": "SYNCING" }, "payloadId": null })
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            Box::pin(async move { Ok(v) })
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_block_tolerates_syncing_and_still_drives_forkchoice() {
+        let methods = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let transport = SyncingTransport {
+            methods: methods.clone(),
+        };
+        let eng = RethEngine::new(&transport, "0xfee");
+        let payload = json!({ "blockHash": BLOCK1 });
+
+        let (hash, status) = eng
+            .commit_block(&payload)
+            .await
+            .expect("no error on SYNCING");
+        assert_eq!(hash, BLOCK1);
+        assert_eq!(status, ElStatus::Syncing, "EL reported syncing");
+        // Crucially, forkchoiceUpdated was still issued so the EL has a target.
+        let m = methods.lock();
+        assert!(m.iter().any(|x| x == "engine_newPayloadV3"));
+        assert!(
+            m.iter().any(|x| x == "engine_forkchoiceUpdatedV3"),
+            "forkchoiceUpdated must be sent even when newPayload is SYNCING"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_is_a_hard_error() {
+        struct InvalidTransport;
+        impl EngineTransport for InvalidTransport {
+            fn call(
+                &self,
+                _m: &str,
+                _p: Value,
+                _t: &str,
+            ) -> boule_core::clock::BoxFuture<'_, Result<Value>> {
+                Box::pin(async { Ok(json!({ "status": "INVALID" })) })
+            }
+        }
+        let t = InvalidTransport;
+        let eng = RethEngine::new(&t, "0xfee");
+        assert!(
+            eng.commit_block(&json!({ "blockHash": BLOCK1 }))
+                .await
+                .is_err()
+        );
     }
 }

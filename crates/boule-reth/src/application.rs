@@ -35,7 +35,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use serde_json::Value;
 
-use crate::engine::{RethEngine, root_from_hex};
+use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::transport::EngineTransport;
 
 /// The committed frontier reth has executed and finalized: the height of the
@@ -181,7 +181,20 @@ impl Application for RethApplication {
                 if let Some(cmd) = ancestor.commands.first() {
                     let payload: Value = serde_json::from_slice(cmd)
                         .context("uncommitted ancestor command is not a JSON execution payload")?;
-                    engine.register_payload(&payload).await?;
+                    if engine.register_payload(&payload).await? == ElStatus::Syncing {
+                        // Our EL is still syncing the uncommitted chain — it
+                        // can't build on a head it doesn't have. Skip proposing
+                        // this view; the EL catches up via the commit path, and
+                        // a later leader (or this node once caught up) builds.
+                        // Retriable: the safety core treats a build Err as a
+                        // skipped proposal (#326), not a fault.
+                        anyhow::bail!(
+                            "reth EL still syncing the uncommitted ancestor chain (height {}); \
+                             skipping proposal for view {}",
+                            ancestor.header.height.0,
+                            view.0,
+                        );
+                    }
                 }
             }
             let built = engine
@@ -225,11 +238,28 @@ impl Application for RethApplication {
             let payload: Value = serde_json::from_slice(cmd)
                 .context("committed block command is not a JSON execution payload")?;
             let new_root = state_root_of(&payload)?;
-            self.engine().commit_block(&payload).await?;
-            // Advance the committed frontier only after reth confirms.
-            let mut c = self.committed.lock();
-            c.height = block.header.height;
-            c.state_root = new_root;
+            let (_, status) = self.engine().commit_block(&payload).await?;
+            match status {
+                ElStatus::Valid => {
+                    // The EL executed it — advance the committed frontier.
+                    let mut c = self.committed.lock();
+                    c.height = block.header.height;
+                    c.state_root = new_root;
+                }
+                ElStatus::Syncing => {
+                    // The EL doesn't have this block's parent yet; commit_block
+                    // pointed it at the head via forkchoiceUpdated and it is
+                    // syncing in the background. Hold the committed frontier at
+                    // the last executed block until the EL reports VALID — don't
+                    // claim a state the EL hasn't reached. Not an error:
+                    // consensus commits regardless of EL execution outcome.
+                    tracing::info!(
+                        target: "boule::reth",
+                        height = block.header.height.0,
+                        "reth EL syncing toward committed block; frontier held until VALID",
+                    );
+                }
+            }
             Ok(())
         })
     }
@@ -530,5 +560,74 @@ mod tests {
             registered_before_build, 2,
             "ancestors registered before building"
         );
+    }
+
+    // ── #636: tolerate Engine-API SYNCING (EL catch-up) ────────────────────
+
+    /// Transport whose newPayload/fcU return `SYNCING` (EL is behind).
+    struct SyncingTransport;
+    impl EngineTransport for SyncingTransport {
+        fn call(
+            &self,
+            method: &str,
+            _params: Value,
+            _tag: &str,
+        ) -> BoxFuture<'_, anyhow::Result<Value>> {
+            let v = match method {
+                "engine_newPayloadV3" => serde_json::json!({ "status": "SYNCING" }),
+                "engine_forkchoiceUpdatedV3" => {
+                    serde_json::json!({ "payloadStatus": { "status": "SYNCING" } })
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            Box::pin(async move { Ok(v) })
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_holds_the_frontier_when_the_el_is_syncing() {
+        let app = RethApplication::new(
+            Box::new(SyncingTransport),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+        );
+        {
+            let mut c = app.committed.lock();
+            c.height = Height(5);
+            c.state_root = [0x55; 32];
+        }
+        // A committed block the EL can't execute yet (SYNCING).
+        let block = block_with_payload([0u8; 32], 10, BLOCK1);
+        app.commit(&block)
+            .await
+            .expect("SYNCING commit is not an error");
+        // Frontier held at the last executed block, not advanced to 10.
+        assert_eq!(app.committed.lock().height, Height(5));
+        assert_eq!(app.state_commitment(), [0x55; 32]);
+    }
+
+    #[tokio::test]
+    async fn build_skips_when_the_el_is_syncing() {
+        let app = RethApplication::new(
+            Box::new(SyncingTransport),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+        );
+        let g = genesis();
+        let a = block_with_payload(g.hash(), 1, "0xaa");
+        let pending: HashMap<BlockHash, Block> = [(a.hash(), a.clone())].into_iter().collect();
+        // The leader's EL can't register the uncommitted ancestor (SYNCING) →
+        // build is skipped (retriable), not a forged proposal.
+        let err = app
+            .build_proposal(&a, View(2), &sample_qc(&a), &pending, 1_000)
+            .await
+            .expect_err("build must skip while the EL is syncing");
+        assert!(err.to_string().contains("still syncing"));
     }
 }
