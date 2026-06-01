@@ -29,12 +29,15 @@
 // `crypto/mod.rs`.
 #![allow(dead_code)]
 
+pub mod application;
 pub mod block;
 pub mod impls;
 pub mod mempool;
 pub mod snapshot;
 pub mod state_machine;
 
+#[allow(unused_imports)]
+pub use application::Application;
 #[allow(unused_imports)]
 pub use block::{Block, BlockHash, BlockHeader, validate_structural};
 #[allow(unused_imports)]

@@ -9,10 +9,12 @@ use parking_lot::Mutex;
 
 use boule_consensus::hotstuff::QuorumCertificate;
 use boule_consensus::hotstuff::step::BlockBuilder;
+use boule_consensus::replication::application::Application;
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::{Height, View};
+use boule_core::clock::BoxFuture;
 use boule_transport_tcp::NodeId;
 
 use super::TRACE_TARGET;
@@ -248,6 +250,26 @@ impl BlockBuilder for MempoolBlockBuilder {
             },
             commands,
         })
+    }
+}
+
+impl Application for MempoolBlockBuilder {
+    /// The counter application's build path is genuine in-process work
+    /// (mempool pull + SM fork), so there is nothing to `await`: it runs
+    /// the synchronous [`BlockBuilder::build`] and returns an
+    /// already-resolved future. The async signature exists for the
+    /// out-of-process case (a reth execution layer building a payload
+    /// over the Engine API), where this future would not resolve until
+    /// the remote round trip completes.
+    fn build_proposal<'a>(
+        &'a self,
+        parent: &'a Block,
+        view: View,
+        high_qc: &'a QuorumCertificate,
+        pending_blocks: &'a HashMap<BlockHash, Block>,
+    ) -> BoxFuture<'a, anyhow::Result<Block>> {
+        let built = BlockBuilder::build(self, parent, view, high_qc, pending_blocks);
+        Box::pin(async move { built })
     }
 }
 
