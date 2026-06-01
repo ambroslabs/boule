@@ -228,8 +228,6 @@ pub struct ConsensusNode {
     pub core: HotStuffCore,
     /// View-management state machine (pure, no I/O).
     pub pacemaker: Pacemaker,
-    /// Shared state machine; mutated on `Action::Commit`.
-    pub state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
     /// Source of pending commands for the block builder / leader path.
     pub mempool: Arc<dyn Mempool>,
     /// Durable KV store for control-plane state
@@ -613,7 +611,6 @@ impl ConsensusNode {
             self_id,
             core,
             pacemaker,
-            state_machine,
             mempool,
             storage,
             wal,
@@ -1005,7 +1002,6 @@ impl ConsensusNode {
             self_id,
             core,
             pacemaker,
-            state_machine,
             mempool,
             storage,
             wal,

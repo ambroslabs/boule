@@ -294,6 +294,25 @@ impl Application for MempoolBlockBuilder {
             Ok(())
         })
     }
+
+    // The counter application's state queries delegate to the shared
+    // in-process state machine under its lock.
+
+    fn check(&self, cmd: &[u8]) -> anyhow::Result<()> {
+        self.state_machine.lock().check(cmd)
+    }
+
+    fn state_commitment(&self) -> [u8; 32] {
+        self.state_machine.lock().state_commitment()
+    }
+
+    fn snapshot(&self) -> bytes::Bytes {
+        self.state_machine.lock().snapshot()
+    }
+
+    fn restore(&self, snap: &[u8]) -> anyhow::Result<()> {
+        self.state_machine.lock().restore(snap)
+    }
 }
 
 /// Walk `parent`'s ancestors backwards through `pending_blocks`,

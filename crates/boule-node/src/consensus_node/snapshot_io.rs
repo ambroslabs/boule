@@ -176,15 +176,14 @@ impl ConsensusNode {
         manifest: boule_consensus::replication::snapshot::SnapshotManifest,
         payload: Bytes,
     ) -> anyhow::Result<()> {
-        // Step 1: restore the application state machine.
-        self.state_machine
-            .lock()
+        // Step 1: restore the application state.
+        self.app
             .restore(&payload)
-            .map_err(|e| anyhow::anyhow!("state_machine.restore failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("application restore failed: {e}"))?;
         // Step 2: confirm the post-restore commitment matches the
         // manifest. A mismatch indicates a buggy or malicious
         // producer; bail before touching durable state.
-        let post_restore = self.state_machine.lock().state_commitment();
+        let post_restore = self.app.state_commitment();
         if post_restore != manifest.state_commitment {
             anyhow::bail!(
                 "post-restore state_commitment {} does not match manifest {}",
@@ -501,9 +500,10 @@ impl ConsensusNode {
                 return Ok(());
             }
         };
-        // Capture the state-machine bytes and its commitment under one
-        // lock so the snapshot is internally consistent.
-        let snapshot_bytes = self.state_machine.lock().snapshot();
+        // Serialize the application state for the snapshot. The matching
+        // commitment is the snapshot block's stamped `state_commitment`
+        // (read below), which is what `manifest.verify` cross-checks.
+        let snapshot_bytes = self.app.snapshot();
         let chunks_with_hashes =
             chunk_snapshot(&snapshot_bytes, self.snapshot_policy.chunk_size_bytes);
         let chunk_hashes: Vec<[u8; 32]> = chunks_with_hashes.iter().map(|(_, h)| *h).collect();

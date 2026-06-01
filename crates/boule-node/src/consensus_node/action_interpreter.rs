@@ -1014,7 +1014,7 @@ impl ConsensusNode {
                         && block.header.committed_height.0
                             == self.last_committed_height.load(Ordering::Relaxed)
                     {
-                        let local_root = self.state_machine.lock().state_commitment();
+                        let local_root = self.app.state_commitment();
                         if local_root != block.header.committed_state_root {
                             tracing::warn!(
                                 target: TRACE_TARGET,
@@ -1049,16 +1049,14 @@ impl ConsensusNode {
                     if let ConsensusMsg::Vote(vote) = &msg
                         && let Some(block) = self.core.state().pending_blocks.get(&vote.block_hash)
                     {
-                        let sm = self.state_machine.lock();
                         let rejected = block.commands.iter().find_map(|cmd| {
                             if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
                                 || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
                             {
                                 return None;
                             }
-                            sm.check(cmd).err()
+                            self.app.check(cmd).err()
                         });
-                        drop(sm);
                         if let Some(e) = rejected {
                             tracing::warn!(
                                 target: TRACE_TARGET,

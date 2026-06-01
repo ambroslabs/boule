@@ -26,6 +26,8 @@ use std::collections::HashMap;
 
 use boule_core::clock::BoxFuture;
 
+use bytes::Bytes;
+
 use crate::View;
 use crate::hotstuff::qc::QuorumCertificate;
 use crate::replication::block::{Block, BlockHash};
@@ -84,4 +86,45 @@ pub trait Application: Send + Sync {
     ///
     /// [`StateMachine::apply`]: crate::replication::state_machine::StateMachine::apply
     fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    // ── Synchronous state queries ──────────────────────────────────────
+    //
+    // These mirror the same-named [`StateMachine`] methods and are the
+    // integration layer's read/serialize/restore window onto application
+    // state. They are synchronous by contract: each is cheap and on a hot
+    // or latency-sensitive path (the per-command vote check, the
+    // divergence check on every vote, snapshot create/restore), and an
+    // execution layer must answer them from already-resolved local state
+    // (a tracked committed state root, an on-disk snapshot) rather than a
+    // fresh round trip. The reth EL satisfies this: `state_commitment` is
+    // its tracked committed state root and `check` is form-only.
+
+    /// Tier-1 includability check for one command — the
+    /// [`StateMachine::check`] contract. Stateless and deterministic, run
+    /// on both the build and the vote paths.
+    ///
+    /// [`StateMachine::check`]: crate::replication::state_machine::StateMachine::check
+    fn check(&self, cmd: &[u8]) -> anyhow::Result<()>;
+
+    /// A deterministic 32-byte commitment over the application's current
+    /// committed state — the [`StateMachine::state_commitment`] contract.
+    /// Used to detect divergence (compared against a block's stamped
+    /// `committed_state_root`) and to cross-check a restored snapshot.
+    ///
+    /// [`StateMachine::state_commitment`]: crate::replication::state_machine::StateMachine::state_commitment
+    fn state_commitment(&self) -> [u8; 32];
+
+    /// Serialize the application's current state to opaque bytes for a
+    /// consensus snapshot — the [`StateMachine::snapshot`] contract.
+    ///
+    /// [`StateMachine::snapshot`]: crate::replication::state_machine::StateMachine::snapshot
+    fn snapshot(&self) -> Bytes;
+
+    /// Overwrite the application's state from a snapshot blob previously
+    /// produced by [`Self::snapshot`] — the [`StateMachine::restore`]
+    /// contract. `Err` is recoverable: the joiner abandons this restore
+    /// attempt rather than the node panicking.
+    ///
+    /// [`StateMachine::restore`]: crate::replication::state_machine::StateMachine::restore
+    fn restore(&self, snap: &[u8]) -> anyhow::Result<()>;
 }
