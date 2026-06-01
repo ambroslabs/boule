@@ -7117,6 +7117,26 @@ mod tests {
             any_post_boundary,
             "expected at least one committed block at view >= v_eff",
         );
+
+        // The reconfig tx itself landed in a committed block — the
+        // observable proof that the propose → vote → commit pipeline
+        // carried the tagged payload. This also pins the includability
+        // skip: a leader must keep `RECFG`-tagged commands at build, and
+        // voters must not reject blocks that carry them, or this payload
+        // (undecodable as an app command) would be dropped and never
+        // commit. The liveness check above passes on a healthy set
+        // regardless, so without this assertion the skip is unguarded.
+        let reconfig_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|cmd| ReconfigCommand::is_reconfig_payload(cmd))
+            })
+        });
+        assert!(
+            reconfig_committed,
+            "expected at least one committed block to carry the reconfig tx",
+        );
     }
 
     // ── #260: validator key rotation end-to-end ───────────────────────────
