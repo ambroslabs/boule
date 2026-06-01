@@ -1,0 +1,5 @@
+# Generated at runtime by run-reth.sh.
+jwt.hex
+
+# fixtures/ holds the committed golden Engine API exchanges (captured from a
+# real reth v2.2.0 green run) — tracked on purpose, not ignored.
