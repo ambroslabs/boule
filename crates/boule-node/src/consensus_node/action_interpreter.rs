@@ -1199,7 +1199,12 @@ impl ConsensusNode {
                     // skip: `proposal_built` is not called, so the core's
                     // `proposed_in_view` stays unset and the next-view leader
                     // (or a later re-attempt) takes over.
-                    match self.core.build_proposal(view, &high_qc, &parent) {
+                    match self.builder.build(
+                        &parent,
+                        view,
+                        &high_qc,
+                        &self.core.state().pending_blocks,
+                    ) {
                         Ok(block) => {
                             let built = self.core.proposal_built(view, block, high_qc);
                             Box::pin(self.apply_safety_actions(
