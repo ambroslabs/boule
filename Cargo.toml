@@ -6,6 +6,7 @@ members = [
     "crates/boule-consensus",
     "crates/boule-node",
     "crates/boule-cli",
+    "crates/boule-reth",
 ]
 # `fuzz` is intentionally excluded: it hosts nightly-only `cargo-fuzz`
 # targets and must not be pulled into the stable workspace build.

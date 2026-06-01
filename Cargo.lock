@@ -525,6 +525,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boule-reth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "boule-transport-tcp"
 version = "0.1.0"
 dependencies = [

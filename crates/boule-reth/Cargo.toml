@@ -1,0 +1,25 @@
+[package]
+name = "boule-reth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reth execution-layer backend for boule: drives a reth EVM node over the Engine API (V3) so boule consensus can order Ethereum execution payloads. Implements the boule consensus `Application` seam."
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+anyhow     = "1"
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde_json = "1"
+tokio      = { version = "1", features = ["time"] }
+hex        = "0.4"
+base64     = "0.22"
+hmac       = "0.12"
+sha2       = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
