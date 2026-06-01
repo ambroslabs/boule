@@ -434,6 +434,18 @@ impl ReplicaSet {
                 | Action::RequestBlock { .. }
                 | Action::EquivocationEvidence { .. }
                 | Action::ProposalEquivocationEvidence { .. } => {}
+                // #606: stand in for the integration layer — build the
+                // proposal and re-apply the resulting Broadcast(Proposal).
+                Action::BuildProposal {
+                    view,
+                    high_qc,
+                    parent,
+                } => {
+                    if let Ok(block) = self.cores[source].build_proposal(view, &high_qc, &parent) {
+                        let built = self.cores[source].proposal_built(view, block, high_qc);
+                        self.apply_actions(source, built);
+                    }
+                }
             }
         }
     }

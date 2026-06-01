@@ -3159,23 +3159,16 @@ mod tests {
             Some(&expected)
         );
 
-        // And `become_leader(1)` must now yield an
-        // Action::Broadcast(Proposal) (preceded by the
-        // ProposedInView persist that closes the audit-4-6 / #407
-        // self-equivocation hazard) rather than the empty Vec the
-        // pre-fix code returned.
+        // And `become_leader(1)` must now emit a single `BuildProposal`
+        // (#606) — which the dispatcher fulfills into the
+        // `Persist(ProposedInView)` + `Broadcast(Proposal)` pair — rather than
+        // the empty Vec the pre-#116 code returned.
         let mut node = node;
         let actions = node.core.become_leader(1);
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(matches!(
             &actions[0],
-            SafetyAction::Persist(boule_consensus::hotstuff::StateUpdate::ProposedInView {
-                view: View(1)
-            }),
-        ));
-        assert!(matches!(
-            &actions[1],
-            SafetyAction::Broadcast(boule_consensus::hotstuff::ConsensusMsg::Proposal(_)),
+            SafetyAction::BuildProposal { view: View(1), .. },
         ));
     }
 
@@ -7387,14 +7380,17 @@ mod tests {
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
 
-        // Safety core emits `[Persist(ProposedInView), Broadcast(Proposal)]`
-        // for a freshly booted leader seeded with the genesis QC
-        // (regression-tested by
-        // `new_seeds_genesis_qc_so_view_one_leader_can_propose`). The
-        // ProposedInView persist is the audit-4-6 / #407 self-equivocation
-        // guard the dispatcher flushes before the broadcast.
+        // #606: the safety core emits a single `BuildProposal`; the
+        // dispatcher's BuildProposal handler runs the builder and re-applies
+        // the resulting `Persist(ProposedInView)` + `Broadcast(Proposal)`
+        // (persist first, audit 4-6 / #407), then self-delivers the proposal.
+        // The broadcast/self-delivery assertions below verify the fulfillment.
         let actions = node.core.become_leader(1);
-        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions.len(),
+            1,
+            "become_leader emits one BuildProposal: {actions:?}"
+        );
 
         node.apply_safety_actions(actions, broadcaster.as_ref(), &mut view_timer, &signer)
             .await
