@@ -61,6 +61,16 @@ pub struct NodeConfigForConsensus {
     /// commit, alongside their secondary-index entry. `0` disables
     /// pruning (archive mode); see #194 for the policy rationale.
     pub block_retention_window: u64,
+
+    /// Minimum wall-clock spacing between proposals this node produces as
+    /// leader (#614). The local leader holds a QC-triggered proposal behind
+    /// a timer until this interval has elapsed since its previous proposal,
+    /// so block production has a floor on its rate. `0` (the default)
+    /// disables pacing — at n >= 4 the network is already slower than any
+    /// sane block time, so this only ever bites a local leader that would
+    /// otherwise outrun it (most sharply a single-validator set, where it
+    /// turns an unbounded propose/self-vote loop into a steady block time).
+    pub min_block_interval: Duration,
 }
 
 impl NodeConfigForConsensus {
@@ -89,6 +99,9 @@ impl NodeConfigForConsensus {
             // hand never trips over a pruned block. Tests that exercise
             // pruning override this explicitly.
             block_retention_window: 0,
+            // Pacing off by default: tests assert on per-event scheduling
+            // and must not gain an artificial block-time floor.
+            min_block_interval: Duration::ZERO,
         }
     }
 }
