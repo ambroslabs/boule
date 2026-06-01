@@ -7253,6 +7253,9 @@ mod tests {
     }
 
     impl boule_consensus::replication::state_machine::StateMachine for DivergentCounterStateMachine {
+        fn check(&self, cmd: &[u8]) -> anyhow::Result<()> {
+            self.inner.check(cmd)
+        }
         fn apply(&mut self, cmd: &[u8]) -> anyhow::Result<Bytes> {
             self.inner.apply(cmd)
         }

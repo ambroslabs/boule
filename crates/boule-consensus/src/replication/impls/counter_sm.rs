@@ -53,6 +53,15 @@ impl CounterStateMachine {
 }
 
 impl StateMachine for CounterStateMachine {
+    fn check(&self, cmd: &[u8]) -> anyhow::Result<()> {
+        // Includable iff it decodes to a `CounterCommand`. Overflow /
+        // underflow are *not* a check concern: they depend on the current
+        // value and are handled (as a no-op) at `apply`.
+        postcard::from_bytes::<CounterCommand>(cmd)
+            .map_err(|e| anyhow::anyhow!("decoding CounterCommand: {e}"))?;
+        Ok(())
+    }
+
     fn apply(&mut self, cmd: &[u8]) -> anyhow::Result<Bytes> {
         let decoded: CounterCommand = postcard::from_bytes(cmd)
             .map_err(|e| anyhow::anyhow!("decoding CounterCommand: {e}"))?;
@@ -138,6 +147,37 @@ mod tests {
         assert!(err.to_string().contains("underflow"));
         assert_eq!(sm.value(), 0);
         assert_eq!(sm.state_commitment(), before);
+    }
+
+    #[test]
+    fn check_accepts_well_formed_commands() {
+        let sm = CounterStateMachine::new();
+        sm.check(&cmd_bytes(CounterCommand::Increment))
+            .expect("a valid Increment is includable");
+        sm.check(&cmd_bytes(CounterCommand::Decrement))
+            .expect("a valid Decrement is includable");
+    }
+
+    #[test]
+    fn check_rejects_undecodable_bytes() {
+        let sm = CounterStateMachine::new();
+        // Postcard encodes the two-variant enum as a single discriminant
+        // byte (0 or 1); 0x07 is not a valid CounterCommand discriminant.
+        let err = sm.check(&[0x07]).unwrap_err();
+        assert!(err.to_string().contains("decoding CounterCommand"));
+    }
+
+    #[test]
+    fn check_is_form_only_not_outcome() {
+        // Includability is about form, not whether `apply` would succeed:
+        // an Increment at u64::MAX still *checks* (it overflows only at
+        // apply, where it no-ops).
+        let mut sm = CounterStateMachine::new();
+        sm.restore(&postcard::to_stdvec(&u64::MAX).unwrap())
+            .unwrap();
+        sm.check(&cmd_bytes(CounterCommand::Increment))
+            .expect("Increment is includable regardless of current value");
+        assert!(sm.apply(&cmd_bytes(CounterCommand::Increment)).is_err());
     }
 
     #[test]

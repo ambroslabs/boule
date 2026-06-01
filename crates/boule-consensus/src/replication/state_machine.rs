@@ -49,6 +49,26 @@ use bytes::Bytes;
 /// Applying further commands to the restored machine must produce the same
 /// state commitment as applying them to the original.
 pub trait StateMachine: Send + Sync {
+    /// Whether `cmd` is well-formed enough to include in a block — the
+    /// tier-1 *includability* predicate (cf. ABCI `CheckTx` /
+    /// `ValidateBasic`). `Ok(())` means a leader may put it in a block;
+    /// `Err` means it should not.
+    ///
+    /// This is **not** execution. A command can be includable yet fail at
+    /// [`Self::apply`] (and no-op) — e.g. a counter `Increment` at
+    /// `u64::MAX`: well-formed (includable) but it overflows on apply.
+    /// Includability is about *form*, not *outcome*. Keep it cheap — no
+    /// state mutation — and **deterministic** under the same contract as
+    /// [`Self::apply`], so it is safe to call on the proposal-build path
+    /// (and, later, the vote path) and have every honest replica agree.
+    ///
+    /// The default accepts everything, preserving the apply-only
+    /// "include any opaque bytes, no-op on failure" behaviour for an
+    /// implementation that does not opt in.
+    fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Apply one command to the state, returning an opaque output.
     ///
     /// The caller passes raw command bytes as they appeared in a block;

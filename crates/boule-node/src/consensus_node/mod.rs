@@ -2202,19 +2202,22 @@ mod tests {
         assert_eq!(reference.value(), 3);
     }
 
-    /// Issue #376: a command whose `apply` returns `Err` is dropped
-    /// silently from the leader's commitment computation. The block
-    /// itself still carries the (invalid) command bytes — replicas
-    /// will fail the same `apply` deterministically and end up at
-    /// the same commitment — but operators get no signal that any
-    /// of their submitted commands were rejected. After the fix the
-    /// builder emits a `tracing::warn!` per failed apply with
-    /// `cmd_idx`, `view`, and `error` and bumps a shared cumulative
-    /// counter that surfaces under `ConsensusStatus::dropped_commands`.
-    /// The behavioural contract is that the build still succeeds, the
-    /// resulting `state_commitment` matches the partial application
-    /// of only the commands that did apply, and the counter
-    /// increments by the number of skipped commands.
+    /// Issue #376 + #598: the builder must surface dropped commands and
+    /// keep the state machine pristine. Two kinds of "bad" command,
+    /// handled differently after #598's includability filter:
+    ///
+    /// - A command that fails the SM's `check` (undecodable, not
+    ///   includable) is **dropped from the block entirely** at build time
+    ///   — the leader never proposes it.
+    /// - A command that is well-formed (`check` passes) but fails `apply`
+    ///   (here a `Decrement` underflow against a fresh counter) still
+    ///   **rides the block** and no-ops on every replica, so they
+    ///   converge on the same commitment.
+    ///
+    /// Both bump the shared `dropped_commands` counter (surfaced under
+    /// `ConsensusStatus::dropped_commands`) with a `tracing::warn!`. The
+    /// build still succeeds, the `state_commitment` reflects only the
+    /// commands that applied, and the SM is left untouched.
     #[test]
     fn builder_skips_failing_commands_and_commitment_matches_partial_apply() {
         use boule_consensus::replication::StateMachine;
@@ -2248,9 +2251,17 @@ mod tests {
             .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
             .expect("builder must skip-and-warn rather than fail the proposal");
 
-        // All three commands ride the block — replicas hit the same
-        // `apply` errors deterministically and converge.
-        assert_eq!(block.commands.len(), 3);
+        // The undecodable command is dropped by the #598 includability
+        // check; `good` and the well-formed-but-underflowing `Decrement`
+        // ride the block (the latter no-ops on every replica, so they
+        // converge).
+        assert_eq!(block.commands.len(), 2);
+        assert!(block.commands.contains(&good));
+        assert!(block.commands.contains(&bad_underflow));
+        assert!(
+            !block.commands.contains(&bad_decode),
+            "an undecodable command must not be proposed",
+        );
 
         // Reference: apply only the one good command to a fresh
         // counter SM and compare commitments.
