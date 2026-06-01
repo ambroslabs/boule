@@ -17,6 +17,7 @@ boule-consensus = { path = "../boule-consensus", version = "0.1.0" }
 anyhow     = "1"
 bytes      = { version = "1", features = ["serde"] }
 parking_lot = "0.12"
+tracing    = "0.1"
 reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde_json = "1"
 tokio      = { version = "1", features = ["time"] }
