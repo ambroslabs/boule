@@ -352,6 +352,20 @@ pub struct ConsensusNode {
     /// path to bound the uncommitted-ancestor walk (issue #375)
     /// without having to thread a borrow through the trait object.
     last_committed_height: Arc<AtomicU64>,
+    /// Heap-resident work stack of self-addressed (loopback) dispatches — the
+    /// node's own Vote/Proposal echoed back so the safety core tallies them
+    /// like a peer message would. `apply_safety_actions` enqueues here and
+    /// drains via [`Self::drain_loopback`], a re-entrancy-guarded flat loop
+    /// that replaces the former `deliver_loopback` mutual recursion. Same
+    /// depth-first delivery order, but the chain lives on the heap so it can't
+    /// blow the call stack when long — e.g. a single-validator set, where one
+    /// self-vote is a quorum and every round arms the next (#613).
+    loopback_stack: Vec<boule_consensus::dispatch::Dispatch>,
+    /// `true` while the top-level [`Self::drain_loopback`] loop is running, so
+    /// a re-entrant drain (from an `apply_dispatch` inside that loop) just
+    /// enqueues and returns instead of recursing — the flattening that bounds
+    /// the call stack (#613).
+    draining_loopback: bool,
     /// Cumulative count of commands the local [`MempoolBlockBuilder`]
     /// dropped because `StateMachine::apply` returned `Err` (issue
     /// #376). Surfaced under [`ConsensusStatus::dropped_commands`].
@@ -599,6 +613,8 @@ impl ConsensusNode {
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             last_committed_height,
+            loopback_stack: Vec::new(),
+            draining_loopback: false,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
@@ -990,6 +1006,8 @@ impl ConsensusNode {
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             last_committed_height,
+            loopback_stack: Vec::new(),
+            draining_loopback: false,
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
