@@ -97,7 +97,7 @@ use boule_core::clock::Clock;
 use super::broadcaster::{GossipBroadcaster, OverlayCmd};
 use super::dedup::{InsertOutcome, MsgIdRing};
 use super::discovery::GossipDiscovery;
-use super::maintenance::{Dialer, MeshMaintenanceConfig, run_mesh_maintenance};
+use super::maintenance::{Dialer, MaintenanceMetrics, MeshMaintenanceConfig, run_mesh_maintenance};
 use super::peer_list_task::{
     DirectPeers, FrameOutcome, LockedVec, OverlayUnicast, PeerListGossipConfig, SelfAdvertise,
     apply_overlay_frame, run_peer_list_publisher,
@@ -240,6 +240,10 @@ pub struct GossipOverlayHandles {
     /// Read-only handle on the shared peer table. Cheap to clone.
     /// Useful for status pages and tests.
     pub peer_table: PeerTable,
+    /// Shared maintenance-loop counters (trim disconnects). Cheap to
+    /// clone; read via [`MaintenanceMetrics::trims`] from a status
+    /// page or test to spot churn above `outbound_target`.
+    pub maintenance_metrics: Arc<MaintenanceMetrics>,
     /// Orchestrator task join.
     pub overlay_join: JoinHandle<()>,
     /// Peer-list publisher task join.
@@ -328,6 +332,7 @@ impl GossipOverlay {
             publisher_sd_rx,
         ));
 
+        let maintenance_metrics = Arc::new(MaintenanceMetrics::default());
         let maintenance_join = tokio::spawn(run_mesh_maintenance(
             config.maintenance.clone(),
             peer_table.clone(),
@@ -335,6 +340,7 @@ impl GossipOverlay {
             dialer,
             clock,
             maintenance_seed,
+            maintenance_metrics.clone(),
             maintenance_sd_rx,
         ));
 
@@ -363,6 +369,7 @@ impl GossipOverlay {
             discovery,
             event_rx: upstream_event_rx,
             peer_table: peer_table_for_handles,
+            maintenance_metrics,
             overlay_join,
             publisher_join,
             maintenance_join,

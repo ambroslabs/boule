@@ -55,6 +55,7 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rand::SeedableRng;
@@ -186,11 +187,48 @@ impl MaintenanceState {
     }
 }
 
+/// Cumulative counters for the maintenance loop, shared between the
+/// running task and any status / introspection reader via an [`Arc`].
+///
+/// This is the egress-side analogue of
+/// [`ConnectionLimiter::rejects`](boule_core::transport::limits::ConnectionLimiter::rejects):
+/// that counter covers admit-side rejections, this one covers the trim
+/// path's outbound tear-downs. Trim disconnects bypass the limiter
+/// entirely — they go out via `PeerCommand::Disconnect` rather than
+/// `try_admit` — so without this counter a node churning above
+/// `outbound_target` is invisible to anything but INFO-log grepping.
+#[derive(Debug, Default)]
+pub struct MaintenanceMetrics {
+    /// Cumulative outbound peers torn down by the trim path. One per
+    /// `dialer.disconnect` the loop issued because the realised
+    /// outbound count drifted above `outbound_target` for two
+    /// consecutive ticks.
+    trims: AtomicU64,
+}
+
+impl MaintenanceMetrics {
+    /// Cumulative trim disconnects since the loop started.
+    pub fn trims(&self) -> u64 {
+        self.trims.load(Ordering::Relaxed)
+    }
+
+    /// Fold one tick's [`TickOutcome::trimmed`] into the running
+    /// total. Called once per tick by [`run_mesh_maintenance`]; the
+    /// per-tick count is exactly the number of `dialer.disconnect`
+    /// calls that tick issued.
+    fn record_trims(&self, n: usize) {
+        if n > 0 {
+            self.trims.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Run the partial-mesh maintenance loop until `shutdown` fires.
 ///
 /// `direct` is sampled every tick to read the live direct-peer
 /// count. `table` is consulted for unconnected candidates when there
 /// is a deficit.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_mesh_maintenance(
     config: MeshMaintenanceConfig,
     table: PeerTable,
@@ -198,6 +236,7 @@ pub async fn run_mesh_maintenance(
     dialer: Arc<dyn Dialer>,
     clock: Arc<dyn Clock>,
     rng_seed: u64,
+    metrics: Arc<MaintenanceMetrics>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut rng = ChaCha20Rng::seed_from_u64(rng_seed);
@@ -213,7 +252,7 @@ pub async fn run_mesh_maintenance(
             biased;
             _ = &mut shutdown => return,
             _ = interval.tick() => {
-                tick_once(
+                let outcome = tick_once(
                     &config,
                     &table,
                     direct.as_ref(),
@@ -221,6 +260,7 @@ pub async fn run_mesh_maintenance(
                     &mut state,
                     &mut rng,
                 );
+                metrics.record_trims(outcome.trimmed);
             }
         }
     }
@@ -773,6 +813,7 @@ mod tests {
         let dialer_dyn: Arc<dyn Dialer> = recording.clone();
         let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 
+        let metrics = Arc::new(MaintenanceMetrics::default());
         let (sd_tx, sd_rx) = oneshot::channel();
         let task = tokio::spawn(run_mesh_maintenance(
             cfg(4),
@@ -781,6 +822,7 @@ mod tests {
             dialer_dyn,
             clock,
             /* seed */ 99,
+            metrics,
             sd_rx,
         ));
 
@@ -797,5 +839,99 @@ mod tests {
 
         let dialed = recording.dialed.lock();
         assert_eq!(dialed.len(), 4, "fired one tick that filled deficit=4");
+    }
+
+    #[test]
+    fn maintenance_metrics_accumulate_trims() {
+        let m = MaintenanceMetrics::default();
+        assert_eq!(m.trims(), 0, "fresh counter starts at zero");
+        // A no-op tick (nothing trimmed) leaves the counter untouched.
+        m.record_trims(0);
+        assert_eq!(m.trims(), 0);
+        // Subsequent trimming ticks fold their per-tick counts in.
+        m.record_trims(3);
+        m.record_trims(2);
+        assert_eq!(m.trims(), 5);
+    }
+
+    /// End-to-end through the real loop: the counter reflects the
+    /// `TickOutcome::trimmed` the trim path produced. Drives three
+    /// real ticks — fill, defer (streak=1), trim (streak=2) — and
+    /// asserts the metric matches the disconnects the dialer saw.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn run_mesh_maintenance_counts_trim_disconnects() {
+        use boule_core::clock::TokioClock;
+
+        let table = PeerTable::new(nid(0), 32);
+        for i in 1..=12u8 {
+            table.upsert(nid(i), addr(7000 + i as u16), 100);
+        }
+        let direct = Arc::new(LockedVec::new());
+        let recording = Arc::new(RecordingDialer::default());
+        let metrics = Arc::new(MaintenanceMetrics::default());
+
+        let direct_dyn: Arc<dyn DirectPeers> = direct.clone();
+        let dialer_dyn: Arc<dyn Dialer> = recording.clone();
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+
+        let (sd_tx, sd_rx) = oneshot::channel();
+        let task = tokio::spawn(run_mesh_maintenance(
+            cfg(4),
+            table,
+            direct_dyn,
+            dialer_dyn,
+            clock,
+            /* seed */ 7,
+            metrics.clone(),
+            sd_rx,
+        ));
+
+        // Discard the immediate-tick.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        // Tick 1: direct is empty → fill the deficit of 4. These four
+        // become the only dialer-initiated (and thus trimmable) peers.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        let dialed: Vec<NodeId> = recording
+            .dialed
+            .lock()
+            .iter()
+            .map(|(_, id)| id.expect("maintenance path passes Some"))
+            .collect();
+        assert_eq!(dialed.len(), 4);
+        assert_eq!(metrics.trims(), 0, "fill ticks trim nothing");
+
+        // Make the four dialer-initiated peers direct, plus four
+        // inbound peers the trim path must leave alone → 8 direct,
+        // target 4.
+        let mut now_direct = dialed.clone();
+        now_direct.extend([nid(200), nid(201), nid(202), nid(203)]);
+        direct.set(now_direct);
+
+        // Tick 2: above target, first consecutive tick → defer.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(metrics.trims(), 0, "first over-target tick defers trim");
+
+        // Tick 3: above target, second consecutive tick → trim the
+        // four dialer-initiated peers (inbound peers are out of scope).
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        let _ = sd_tx.send(());
+        let _ = task.await;
+
+        assert_eq!(
+            recording.disconnected.lock().len(),
+            4,
+            "trimmed the four dialer-initiated peers",
+        );
+        assert_eq!(
+            metrics.trims(),
+            4,
+            "counter equals the cumulative trim disconnects",
+        );
     }
 }
