@@ -716,6 +716,12 @@ pub struct SimCluster {
     /// running state-divergence detection count via
     /// [`SimCluster::peek_state_divergence_detected`].
     state_divergence_counters: Vec<Arc<AtomicU64>>,
+    /// Per-node clones of
+    /// [`ConsensusNode::proposal_command_rejections_counter`] (#598),
+    /// captured at spawn time so a test can read each replica's running
+    /// count of proposals rejected for a non-includable command via
+    /// [`SimCluster::peek_proposal_command_rejections`].
+    proposal_command_rejection_counters: Vec<Arc<AtomicU64>>,
     /// Per-node runtime-mutable processing delay in microseconds,
     /// keyed by `NodeId`. Used by the slow-node bridge (#497) inserted
     /// between each node's inbound `event_rx` and its consensus
@@ -1252,6 +1258,7 @@ impl SimCluster {
         // L5-1), captured here for the same reason.
         let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
         let mut state_divergence_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut proposal_command_rejection_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
 
         for (idx, (nid, event_rx)) in event_rxs.into_iter().enumerate() {
             let signer = signer_map[&nid].clone();
@@ -1423,6 +1430,7 @@ impl SimCluster {
             // `SimCluster::peek_proposal_equivocations_detected`.
             proposal_equivocations_counters.push(node.proposal_equivocations_counter());
             state_divergence_counters.push(node.state_divergence_counter());
+            proposal_command_rejection_counters.push(node.proposal_command_rejections_counter());
 
             // Slow-node bridge (#497): the route-task side writes into
             // `event_rx`'s sender; the bridge drains `event_rx`,
@@ -1475,6 +1483,7 @@ impl SimCluster {
             equivocations_counters,
             proposal_equivocations_counters,
             state_divergence_counters,
+            proposal_command_rejection_counters,
             slow_node_delays_us,
             controls,
         };
@@ -1855,6 +1864,12 @@ impl SimCluster {
     /// divergence-detection sim tests.
     pub fn peek_state_divergence_detected(&self, idx: usize) -> u64 {
         self.state_divergence_counters[idx].load(Ordering::Relaxed)
+    }
+
+    /// Cumulative count of proposals node `idx` refused to vote for
+    /// because they carried a non-includable application command (#598).
+    pub fn peek_proposal_command_rejections(&self, idx: usize) -> u64 {
+        self.proposal_command_rejection_counters[idx].load(Ordering::Relaxed)
     }
 
     /// Non-destructively report the highest committed [`Block`] height
@@ -2903,6 +2918,7 @@ impl SimCluster {
         let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
         let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
         let mut state_divergence_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
+        let mut proposal_command_rejection_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
         // Hold the overlay shutdown senders for the lifetime of the
         // SimCluster — dropping them eagerly wakes the orchestrator's
         // `_ = &mut self.shutdown` select arm and tears the run loop
@@ -2959,6 +2975,7 @@ impl SimCluster {
             equivocations_counters.push(node.equivocations_counter());
             proposal_equivocations_counters.push(node.proposal_equivocations_counter());
             state_divergence_counters.push(node.state_divergence_counter());
+            proposal_command_rejection_counters.push(node.proposal_command_rejections_counter());
 
             // Per-node outbound channel: orchestrator's OverlaySink writes
             // here; the route task reads on the other side.
@@ -3145,6 +3162,7 @@ impl SimCluster {
             equivocations_counters,
             proposal_equivocations_counters,
             state_divergence_counters,
+            proposal_command_rejection_counters,
             slow_node_delays_us: Arc::new(slow_node_delays_us),
             controls,
         }
@@ -7099,6 +7117,26 @@ mod tests {
             any_post_boundary,
             "expected at least one committed block at view >= v_eff",
         );
+
+        // The reconfig tx itself landed in a committed block — the
+        // observable proof that the propose → vote → commit pipeline
+        // carried the tagged payload. This also pins the includability
+        // skip: a leader must keep `RECFG`-tagged commands at build, and
+        // voters must not reject blocks that carry them, or this payload
+        // (undecodable as an app command) would be dropped and never
+        // commit. The liveness check above passes on a healthy set
+        // regardless, so without this assertion the skip is unguarded.
+        let reconfig_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|cmd| ReconfigCommand::is_reconfig_payload(cmd))
+            })
+        });
+        assert!(
+            reconfig_committed,
+            "expected at least one committed block to carry the reconfig tx",
+        );
     }
 
     // ── #260: validator key rotation end-to-end ───────────────────────────
@@ -7253,6 +7291,9 @@ mod tests {
     }
 
     impl boule_consensus::replication::state_machine::StateMachine for DivergentCounterStateMachine {
+        fn check(&self, cmd: &[u8]) -> anyhow::Result<()> {
+            self.inner.check(cmd)
+        }
         fn apply(&mut self, cmd: &[u8]) -> anyhow::Result<Bytes> {
             self.inner.apply(cmd)
         }
@@ -7379,6 +7420,57 @@ mod tests {
 
         let committed = cluster.drain_commits();
         assert_no_conflicts(&committed);
+    }
+
+    /// A Byzantine leader injecting a non-includable application command
+    /// (#598) is rejected at vote time by every honest replica (their
+    /// includability `check` fails on the command, so they abstain), so
+    /// its blocks never reach quorum — but the honest nodes stay live and
+    /// keep committing under the other leaders. The voter-side counterpart
+    /// to the leader's build-time drop.
+    #[tokio::test(start_paused = true)]
+    async fn byzantine_non_includable_command_is_rejected_chain_survives() {
+        let mut adversaries: Vec<Option<Arc<dyn super::Adversary>>> =
+            (0..4).map(|_| None).collect();
+        adversaries[1] = Some(Arc::new(
+            crate::sim_byzantine::NonIncludableCommandAdversary,
+        ));
+        let mut cluster =
+            SimCluster::spawn_with_adversaries(4, Duration::from_millis(50), adversaries).await;
+
+        let progressed = cluster
+            .advance_and_yield_until(Duration::from_secs(12), |c| {
+                c.peek_commit_heights().iter().filter(|&&h| h >= 8).count() >= 3
+            })
+            .await;
+        assert!(
+            progressed,
+            "honest nodes must stay live past a byzantine leader injecting a \
+             non-includable command; heights={:?}",
+            cluster.peek_commit_heights(),
+        );
+
+        let honest_rejections: u64 = [0usize, 2, 3]
+            .iter()
+            .map(|&i| cluster.peek_proposal_command_rejections(i))
+            .sum();
+        assert!(
+            honest_rejections > 0,
+            "honest nodes must have refused to vote for the byzantine leader's \
+             non-includable command",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+        // The non-includable command must never have committed.
+        for node_blocks in &committed {
+            for b in node_blocks {
+                assert!(
+                    !b.commands.contains(&bytes::Bytes::from_static(&[0x07])),
+                    "a non-includable command must never commit",
+                );
+            }
+        }
     }
 
     // ── #358: BLS-chain rotation end-to-end ───────────────────────────────

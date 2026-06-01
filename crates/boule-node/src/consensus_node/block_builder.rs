@@ -106,7 +106,7 @@ impl BlockBuilder for MempoolBlockBuilder {
         _high_qc: &QuorumCertificate,
         pending_blocks: &HashMap<BlockHash, Block>,
     ) -> anyhow::Result<Block> {
-        let commands = self.mempool.propose(self.propose_limit);
+        let mut commands = self.mempool.propose(self.propose_limit);
 
         // Walk parent's uncommitted ancestor chain. The result is
         // newest-first; reversing gives the apply order.
@@ -161,6 +161,33 @@ impl BlockBuilder for MempoolBlockBuilder {
                     }
                 }
             }
+            // Leader-side includability filter (#598). Drop candidate
+            // application commands the state machine declares not
+            // well-formed enough to include, so this leader never proposes
+            // a block carrying them. System txs (rotation/reconfig) are
+            // consensus-layer commands, not the SM's domain — their
+            // validity is checked at commit — so they pass through
+            // untouched. Order-preserving via `retain`.
+            commands.retain(|cmd| {
+                if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
+                    || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
+                {
+                    return true;
+                }
+                match sm.check(cmd) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        self.dropped_commands.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            view = view.0,
+                            error = %e,
+                            "block_builder_command_check_rejected",
+                        );
+                        false
+                    }
+                }
+            });
             for (cmd_idx, cmd) in commands.iter().enumerate() {
                 match sm.apply(cmd) {
                     Ok(_) => {
@@ -267,4 +294,69 @@ fn uncommitted_ancestor_chain(
         }
     }
     chain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boule_consensus::replication::impls::counter_sm::CounterCommand;
+    use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
+    use bytes::Bytes;
+
+    /// The leader-side includability filter (#598) drops candidate
+    /// application commands the state machine rejects via `check`, keeps
+    /// well-formed ones, and passes system txs (rotation/reconfig) through
+    /// untouched.
+    #[test]
+    fn build_drops_non_includable_app_commands_and_keeps_system_txs() {
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(64));
+        let valid = CounterCommand::Increment.encode();
+        // An undecodable application command — rejected at `check`.
+        let garbage = Bytes::from_static(&[0x07]);
+        // A system tx (rotation-tagged). `check` is never consulted for it;
+        // it passes through and is applied at commit by the rotation path.
+        let mut system = Vec::from(*boule_consensus::validator_rotation::ROTATION_TAG);
+        system.push(0xAA);
+        let system = Bytes::from(system);
+
+        mempool.insert(valid.clone()).unwrap();
+        mempool.insert(garbage.clone()).unwrap();
+        mempool.insert(system.clone()).unwrap();
+
+        let dropped = Arc::new(AtomicU64::new(0));
+        let builder = MempoolBlockBuilder::new(
+            [1u8; 32],
+            Arc::clone(&mempool),
+            Arc::new(Mutex::new(
+                Box::new(CounterStateMachine::new()) as Box<dyn StateMachine>
+            )),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&dropped),
+            64,
+        );
+
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let qc = QuorumCertificate::new(0, genesis.hash(), 4);
+        let block = builder
+            .build(&genesis, View(1), &qc, &HashMap::new())
+            .expect("build must succeed");
+
+        assert!(
+            block.commands.contains(&valid),
+            "the well-formed application command must be included",
+        );
+        assert!(
+            block.commands.contains(&system),
+            "the system tx must pass through and be included",
+        );
+        assert!(
+            !block.commands.contains(&garbage),
+            "the non-includable application command must be dropped",
+        );
+        assert_eq!(block.commands.len(), 2);
+        // At least the garbage rejection bumped the counter (the system tx
+        // also fails `apply` since it isn't a CounterCommand, which is the
+        // pre-existing behaviour).
+        assert!(dropped.load(Ordering::Relaxed) >= 1);
+    }
 }

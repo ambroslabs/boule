@@ -506,6 +506,50 @@ impl Adversary for ForgedCommittedRootAdversary {
     }
 }
 
+/// A Byzantine leader that injects a non-includable *application* command
+/// (one the `CounterStateMachine`'s `check` rejects — here a single byte
+/// that is not a valid `CounterCommand` and carries no system-tx tag) into
+/// every proposal it broadcasts (#598). It recomputes `commands_commitment`
+/// so the block is otherwise structurally valid and reaches the honest
+/// voters' vote-time includability check, which then abstains — the block
+/// gets no honest votes and is rejected, while honest nodes stay live.
+/// Models a leader trying to commit a command an honest leader would have
+/// dropped at build.
+///
+/// Re-signs with `ctx.chain_id` so the rejection comes from the
+/// includability check, not an envelope-signature failure.
+pub struct NonIncludableCommandAdversary;
+
+impl Adversary for NonIncludableCommandAdversary {
+    fn intercept(&self, ctx: &AdversaryCtx, outbound: ProtocolOutbound) -> Vec<ProtocolOutbound> {
+        let payload = match &outbound {
+            ProtocolOutbound::Broadcast(p) => p.clone(),
+            _ => return vec![outbound],
+        };
+        let Some(WireMessage::Proposal(signed)) = decode(&payload) else {
+            return vec![outbound];
+        };
+
+        let mut block = signed.payload.block.clone();
+        // 0x07 is not a valid CounterCommand discriminant and starts with
+        // no system-tx tag, so the SM's `check` rejects it.
+        block.commands.push(bytes::Bytes::from_static(&[0x07]));
+        // Recompute the commands commitment so the block passes structural
+        // validation and reaches the vote-time includability check.
+        block.header.commands_commitment =
+            boule_consensus::replication::block::Block::commands_commitment(&block.commands);
+        let proposal = Proposal {
+            block,
+            justify: signed.payload.justify.clone(),
+        };
+        let signed_b = Signed::sign(proposal, ctx.signer.as_ref(), &ctx.chain_id)
+            .expect("non-includable-command adversary re-signing must not fail");
+        vec![ProtocolOutbound::Broadcast(encode(&WireMessage::Proposal(
+            signed_b,
+        )))]
+    }
+}
+
 // ── Twin-mode adversary (issue #421) ─────────────────────────────────────────
 
 /// Which honest emission [`TwinValidatorAdversary`] should equivocate

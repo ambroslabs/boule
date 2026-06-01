@@ -386,6 +386,12 @@ pub struct ConsensusNode {
     /// that drive hand-crafted blocks carrying placeholder committed
     /// roots through the vote path.
     vote_divergence_check_enabled: bool,
+    /// Cumulative count of proposals this node refused to vote for
+    /// because they carried an application command the state machine's
+    /// `check` rejected as not includable (#598) — the voter-side
+    /// counterpart to the leader's build-time drop. Surfaced under
+    /// [`ConsensusStatus::proposal_command_rejections`].
+    proposal_command_rejections: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -598,6 +604,7 @@ impl ConsensusNode {
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
+            proposal_command_rejections: Arc::new(AtomicU64::new(0)),
             last_committed_view: View::ZERO,
             status_tx: None,
             rate_limiter: None,
@@ -768,6 +775,16 @@ impl ConsensusNode {
     /// detection path end-to-end.
     pub fn state_divergence_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.state_divergence_detected)
+    }
+
+    /// Clone the shared proposal-command-rejection counter (#598). The
+    /// same `Arc` the integration layer increments whenever it suppresses
+    /// a vote because a proposed block carried a non-includable
+    /// application command. Used by
+    /// `SimCluster::peek_proposal_command_rejections` to verify the
+    /// voter-side enforcement path end-to-end.
+    pub fn proposal_command_rejections_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.proposal_command_rejections)
     }
 
     /// Test-only: disable the deferred state-root divergence check at
@@ -978,6 +995,7 @@ impl ConsensusNode {
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
+            proposal_command_rejections: Arc::new(AtomicU64::new(0)),
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
@@ -2202,19 +2220,22 @@ mod tests {
         assert_eq!(reference.value(), 3);
     }
 
-    /// Issue #376: a command whose `apply` returns `Err` is dropped
-    /// silently from the leader's commitment computation. The block
-    /// itself still carries the (invalid) command bytes — replicas
-    /// will fail the same `apply` deterministically and end up at
-    /// the same commitment — but operators get no signal that any
-    /// of their submitted commands were rejected. After the fix the
-    /// builder emits a `tracing::warn!` per failed apply with
-    /// `cmd_idx`, `view`, and `error` and bumps a shared cumulative
-    /// counter that surfaces under `ConsensusStatus::dropped_commands`.
-    /// The behavioural contract is that the build still succeeds, the
-    /// resulting `state_commitment` matches the partial application
-    /// of only the commands that did apply, and the counter
-    /// increments by the number of skipped commands.
+    /// Issue #376 + #598: the builder must surface dropped commands and
+    /// keep the state machine pristine. Two kinds of "bad" command,
+    /// handled differently after #598's includability filter:
+    ///
+    /// - A command that fails the SM's `check` (undecodable, not
+    ///   includable) is **dropped from the block entirely** at build time
+    ///   — the leader never proposes it.
+    /// - A command that is well-formed (`check` passes) but fails `apply`
+    ///   (here a `Decrement` underflow against a fresh counter) still
+    ///   **rides the block** and no-ops on every replica, so they
+    ///   converge on the same commitment.
+    ///
+    /// Both bump the shared `dropped_commands` counter (surfaced under
+    /// `ConsensusStatus::dropped_commands`) with a `tracing::warn!`. The
+    /// build still succeeds, the `state_commitment` reflects only the
+    /// commands that applied, and the SM is left untouched.
     #[test]
     fn builder_skips_failing_commands_and_commitment_matches_partial_apply() {
         use boule_consensus::replication::StateMachine;
@@ -2248,9 +2269,17 @@ mod tests {
             .build(&genesis(), View(1), &sample_qc(), &HashMap::new())
             .expect("builder must skip-and-warn rather than fail the proposal");
 
-        // All three commands ride the block — replicas hit the same
-        // `apply` errors deterministically and converge.
-        assert_eq!(block.commands.len(), 3);
+        // The undecodable command is dropped by the #598 includability
+        // check; `good` and the well-formed-but-underflowing `Decrement`
+        // ride the block (the latter no-ops on every replica, so they
+        // converge).
+        assert_eq!(block.commands.len(), 2);
+        assert!(block.commands.contains(&good));
+        assert!(block.commands.contains(&bad_underflow));
+        assert!(
+            !block.commands.contains(&bad_decode),
+            "an undecodable command must not be proposed",
+        );
 
         // Reference: apply only the one good command to a fresh
         // counter SM and compare commitments.

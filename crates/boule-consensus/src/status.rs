@@ -310,6 +310,15 @@ pub struct ConsensusStatus {
     /// investigation. Monotonic for the lifetime of the node.
     #[serde(default)]
     pub state_divergence_detected: u64,
+    /// Cumulative count of proposals this node refused to vote for at
+    /// vote time because they carried an application command the state
+    /// machine declared not includable (#598). Each increment is one
+    /// abstained vote — the voter-side counterpart to the leader's
+    /// build-time drop. A non-zero, growing value means a leader is
+    /// proposing blocks with non-includable commands. Monotonic for the
+    /// lifetime of the node.
+    #[serde(default)]
+    pub proposal_command_rejections: u64,
     /// Cumulative drop counts on the production drop-on-full
     /// back-pressure paths. See [`BackpressureStatus`].
     #[serde(default)]
@@ -404,6 +413,7 @@ mod tests {
             equivocations_detected: 2,
             proposal_equivocations_detected: 4,
             state_divergence_detected: 7,
+            proposal_command_rejections: 9,
             backpressure: BackpressureStatus {
                 gossip_sink_overflow_total: 5,
                 peer_outbound_overflow_total: 9,
@@ -509,6 +519,7 @@ mod tests {
 
         // State-divergence counter (#599).
         assert_eq!(json["state_divergence_detected"], 7);
+        assert_eq!(json["proposal_command_rejections"], 9);
 
         // Back-pressure overflow counters (#163 / #486 / #498 / #553).
         assert_eq!(json["backpressure"]["gossip_sink_overflow_total"], 5);
@@ -575,6 +586,7 @@ mod tests {
             equivocations_detected: 0,
             proposal_equivocations_detected: 0,
             state_divergence_detected: 0,
+            proposal_command_rejections: 0,
             backpressure: BackpressureStatus::default(),
         };
         let json = serde_json::to_value(&s).unwrap();
