@@ -386,6 +386,12 @@ pub struct ConsensusNode {
     /// that drive hand-crafted blocks carrying placeholder committed
     /// roots through the vote path.
     vote_divergence_check_enabled: bool,
+    /// Cumulative count of proposals this node refused to vote for
+    /// because they carried an application command the state machine's
+    /// `check` rejected as not includable (#598) — the voter-side
+    /// counterpart to the leader's build-time drop. Surfaced under
+    /// [`ConsensusStatus::proposal_command_rejections`].
+    proposal_command_rejections: Arc<AtomicU64>,
     /// View of the most recently committed block. Zero before the
     /// first commit.
     last_committed_view: View,
@@ -598,6 +604,7 @@ impl ConsensusNode {
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
+            proposal_command_rejections: Arc::new(AtomicU64::new(0)),
             last_committed_view: View::ZERO,
             status_tx: None,
             rate_limiter: None,
@@ -768,6 +775,16 @@ impl ConsensusNode {
     /// detection path end-to-end.
     pub fn state_divergence_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.state_divergence_detected)
+    }
+
+    /// Clone the shared proposal-command-rejection counter (#598). The
+    /// same `Arc` the integration layer increments whenever it suppresses
+    /// a vote because a proposed block carried a non-includable
+    /// application command. Used by
+    /// `SimCluster::peek_proposal_command_rejections` to verify the
+    /// voter-side enforcement path end-to-end.
+    pub fn proposal_command_rejections_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.proposal_command_rejections)
     }
 
     /// Test-only: disable the deferred state-root divergence check at
@@ -978,6 +995,7 @@ impl ConsensusNode {
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
+            proposal_command_rejections: Arc::new(AtomicU64::new(0)),
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,

@@ -1031,6 +1031,47 @@ impl ConsensusNode {
                             continue;
                         }
                     }
+                    // Includability check (#598), the voter-side counterpart
+                    // to the leader's build-time drop. Before voting, run the
+                    // state machine's `check` over each *application* command
+                    // in the proposed block; if any is not includable, abstain
+                    // — so a *Byzantine* leader cannot get a non-includable
+                    // command committed (an honest leader already drops them at
+                    // build). System txs (rotation/reconfig) are consensus-layer
+                    // commands, not the SM's domain — their validity is checked
+                    // at commit — so they are skipped, exactly as in the
+                    // builder. Because honest leaders self-censor at build, an
+                    // honest proposal always passes this check, so it never
+                    // rejects an honest block (no #316 livelock): only a
+                    // Byzantine leader's bad block loses its honest votes. The
+                    // check must be deterministic (it is — same contract as
+                    // `apply`) so honest voters agree.
+                    if let ConsensusMsg::Vote(vote) = &msg
+                        && let Some(block) = self.core.state().pending_blocks.get(&vote.block_hash)
+                    {
+                        let sm = self.state_machine.lock();
+                        let rejected = block.commands.iter().find_map(|cmd| {
+                            if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
+                                || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
+                            {
+                                return None;
+                            }
+                            sm.check(cmd).err()
+                        });
+                        drop(sm);
+                        if let Some(e) = rejected {
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                view = vote.view.0,
+                                error = %e,
+                                "consensus_proposal_command_not_includable",
+                            );
+                            self.proposal_command_rejections
+                                .fetch_add(1, Ordering::Relaxed);
+                            // Abstain: skip both the wire send and loopback.
+                            continue;
+                        }
+                    }
                     let bls_signer = self.bls_signer.as_deref();
                     let (payload, loopback) = dispatch::egress_consensus_msg_with_loopback(
                         &msg,
