@@ -1183,6 +1183,44 @@ impl ConsensusNode {
                         "consensus_proposal_equivocation_detected",
                     );
                 }
+
+                SafetyAction::BuildProposal {
+                    view,
+                    high_qc,
+                    parent,
+                } => {
+                    // #606: block-building moved out of the synchronous safety
+                    // core. Run the builder here, then feed the result back
+                    // through `proposal_built` to get the
+                    // Persist(ProposedInView) + Broadcast(Proposal) pair, which
+                    // the recursive `apply_safety_actions` carries out via the
+                    // Broadcast arm above (history-stamp, sign, broadcast,
+                    // self-loopback). A build failure is the retriable `#326`
+                    // skip: `proposal_built` is not called, so the core's
+                    // `proposed_in_view` stays unset and the next-view leader
+                    // (or a later re-attempt) takes over.
+                    match self.core.build_proposal(view, &high_qc, &parent) {
+                        Ok(block) => {
+                            let built = self.core.proposal_built(view, block, high_qc);
+                            Box::pin(self.apply_safety_actions(
+                                built,
+                                broadcaster,
+                                view_timer,
+                                signer,
+                            ))
+                            .await?;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                view = view.0,
+                                parent_height = parent.header.height.0,
+                                error = %e,
+                                "block_builder_build_failed",
+                            );
+                        }
+                    }
+                }
             }
         }
 

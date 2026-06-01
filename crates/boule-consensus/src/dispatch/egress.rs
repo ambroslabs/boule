@@ -61,10 +61,14 @@ pub fn egress_safety(
         }
 
         // Non-wire actions: handled by the event loop directly.
+        // `BuildProposal` (#606) is consumed by `apply_safety_actions`, which
+        // runs the builder and re-applies the resulting Broadcast(Proposal);
+        // it never reaches the wire as itself.
         SafetyAction::Persist(_)
         | SafetyAction::Commit(_)
         | SafetyAction::EquivocationEvidence { .. }
-        | SafetyAction::ProposalEquivocationEvidence { .. } => Ok(None),
+        | SafetyAction::ProposalEquivocationEvidence { .. }
+        | SafetyAction::BuildProposal { .. } => Ok(None),
     }
 }
 

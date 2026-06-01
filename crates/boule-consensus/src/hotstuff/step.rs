@@ -285,6 +285,23 @@ pub enum Action {
         block_a: BlockHash,
         block_b: BlockHash,
     },
+
+    /// This replica is the leader of `view` and should build a proposal
+    /// extending `parent` with `high_qc` as its justify. The safety core
+    /// emits this instead of building inline so block construction happens
+    /// in the (async-capable) integration layer rather than inside the
+    /// synchronous core (#606). The integration layer runs its
+    /// `BlockBuilder`, then calls [`HotStuffCore::proposal_built`] with the
+    /// result to get the `Persist(ProposedInView)` + `Broadcast(Proposal)`
+    /// actions and the per-view double-propose guard set. A build failure is
+    /// dropped by the integration layer without calling `proposal_built`, so
+    /// `proposed_in_view` stays unset and the view remains retriable
+    /// (matching the old inline `#326` skip).
+    BuildProposal {
+        view: View,
+        high_qc: QuorumCertificate,
+        parent: Block,
+    },
 }
 
 /// Why the safety core emitted [`Action::RequestBlock`]. Surfaced via
@@ -918,44 +935,53 @@ impl HotStuffCore {
         let Some(parent) = self.state.pending_blocks.get(&high_qc.block_hash).cloned() else {
             return Vec::new();
         };
-        // #326: a builder failure (e.g. state-machine snapshot/restore
-        // round trip detected disk corruption) skips the proposal at
-        // this view rather than panicking. The next-view leader
-        // takes over; the bad replica avoids producing a block whose
-        // `state_commitment` it can't trust. Log the cause so an
-        // operator can correlate the skip with whatever local issue
-        // produced it.
-        let new_block =
-            match self
-                .builder
-                .build(&parent, view, &high_qc, &self.state.pending_blocks)
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(
-                        target: TRACE_TARGET,
-                        view = view.0,
-                        parent_height = parent.header.height.0,
-                        error = %e,
-                        "block_builder_build_failed",
-                    );
-                    return Vec::new();
-                }
-            };
+        // #606: don't build inline. Emit a `BuildProposal` action; the
+        // integration layer runs the (async-capable) builder and calls
+        // [`Self::proposal_built`] with the result, which sets
+        // `proposed_in_view` and emits the `Persist(ProposedInView)` +
+        // `Broadcast(Proposal)` pair this used to emit directly. A build
+        // failure there leaves `proposed_in_view` unset, so the view stays
+        // retriable — matching the old inline `#326` skip.
+        vec![Action::BuildProposal {
+            view,
+            high_qc,
+            parent,
+        }]
+    }
+
+    /// Run the block builder for a [`Action::BuildProposal`] the integration
+    /// layer received. Sync today; the builder moves to an async
+    /// `Application` owned by the integration layer in a follow-up (#225 M1).
+    /// `Err` propagates the builder's failure so the caller skips this view —
+    /// the retriable `#326` skip the inline build used to do.
+    pub fn build_proposal(
+        &self,
+        view: View,
+        high_qc: &QuorumCertificate,
+        parent: &Block,
+    ) -> anyhow::Result<Block> {
+        self.builder
+            .build(parent, view, high_qc, &self.state.pending_blocks)
+    }
+
+    /// Finalize a proposal the integration layer just built for `view`: set
+    /// the per-view double-propose guard and return the
+    /// `Persist(ProposedInView)` + `Broadcast(Proposal)` actions — the same
+    /// pair [`Self::build_proposal_at_view`] used to emit inline, in the same
+    /// order (persist before broadcast, audit 4-6 / #407). Called only after a
+    /// successful build, so a failed build leaves `proposed_in_view` unset and
+    /// the view retriable.
+    pub fn proposal_built(
+        &mut self,
+        view: View,
+        block: Block,
+        high_qc: QuorumCertificate,
+    ) -> Vec<Action> {
         self.proposed_in_view = view;
-        // Persist `proposed_in_view` first so a crash between
-        // `Signed::sign` (inside the integration layer's egress path
-        // for the Broadcast below) and the network bytes leaving the
-        // host can't re-mint a *different* proposal at this view on
-        // restart. The dispatcher's `apply_safety_actions` flushes
-        // every Persist in the action vec before the next non-Persist
-        // action fires, so emitting `Persist` immediately before the
-        // `Broadcast` gives us the required ordering for free.
-        // Audit finding 4-6, issue #407.
         vec![
             Action::Persist(StateUpdate::ProposedInView { view }),
             Action::Broadcast(ConsensusMsg::Proposal(Proposal {
-                block: new_block,
+                block,
                 justify: high_qc,
             })),
         ]
@@ -3124,17 +3150,37 @@ mod tests {
             crate::dispatch::Verified::unchecked(signed_vote(3, block_v3_hash, nid(4))),
         )));
 
+        // #606: the quorum transition now emits the HighQc persist and a
+        // `BuildProposal` action. The `Persist(ProposedInView)` + Broadcast
+        // come from `proposal_built`, which the integration layer (here,
+        // simulated below) calls once it has built the block.
         assert_eq!(
             step3,
             vec![
                 Action::Persist(StateUpdate::HighQc(expected_qc.clone())),
+                Action::BuildProposal {
+                    view: View(4),
+                    high_qc: expected_qc.clone(),
+                    parent: block_v3.clone(),
+                },
+            ],
+            "quorum transition emits HighQc persist + BuildProposal",
+        );
+        // Simulate the integration layer fulfilling BuildProposal.
+        let built = core
+            .build_proposal(View(4), &expected_qc, &block_v3)
+            .expect("builder succeeds");
+        assert_eq!(built, expected_new_block);
+        assert_eq!(
+            core.proposal_built(View(4), built, expected_qc.clone()),
+            vec![
                 Action::Persist(StateUpdate::ProposedInView { view: View(4) }),
                 Action::Broadcast(ConsensusMsg::Proposal(Proposal {
                     block: expected_new_block,
                     justify: expected_qc.clone(),
                 })),
             ],
-            "quorum transition emits HighQc + ProposedInView persists then Broadcast(Proposal)",
+            "proposal_built emits ProposedInView persist then Broadcast(Proposal)",
         );
         assert_eq!(
             core.state().high_qc.as_ref().map(|q| q.inner()),
@@ -3315,7 +3361,7 @@ mod tests {
         let advance_to_5 = core.step(Event::PacemakerAdvance(View(5)));
         let proposed_now = advance_to_5
             .iter()
-            .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
+            .any(|a| matches!(a, Action::BuildProposal { .. }));
         assert!(
             !proposed_now,
             "before block-sync delivers high_qc parent, leader must not propose: {advance_to_5:?}",
@@ -3330,7 +3376,7 @@ mod tests {
         let become_leader_actions = core.become_leader(5);
         let proposed_in_become_leader = become_leader_actions
             .iter()
-            .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
+            .any(|a| matches!(a, Action::BuildProposal { .. }));
         assert!(
             !proposed_in_become_leader,
             "become_leader must not propose while high_qc parent is missing: {become_leader_actions:?}",
@@ -3347,16 +3393,36 @@ mod tests {
         // available the safety core MUST broadcast the leader's
         // proposal — this is the recovery path issue #243 needs.
         let recovery = core.step(Event::PacemakerAdvance(View(5)));
-        let proposal = recovery.iter().find_map(|a| match a {
-            Action::Broadcast(ConsensusMsg::Proposal(p)) => Some(p.clone()),
-            _ => None,
-        });
-        let proposal = proposal.unwrap_or_else(|| {
-            panic!(
-                "issue #243: leader must re-attempt the proposal after \
-                 block-sync brings in the missing high_qc parent. actions={recovery:?}"
-            )
-        });
+        // #606: the leader emits BuildProposal; simulate the integration layer
+        // building + finalizing to get the actual proposal — this also sets
+        // the per-view double-propose guard the idempotency check below relies on.
+        let (bp_view, bp_high_qc, bp_parent) = recovery
+            .iter()
+            .find_map(|a| match a {
+                Action::BuildProposal {
+                    view,
+                    high_qc,
+                    parent,
+                } => Some((*view, high_qc.clone(), parent.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "issue #243: leader must re-attempt the proposal after \
+                     block-sync brings in the missing high_qc parent. actions={recovery:?}"
+                )
+            });
+        let built = core
+            .build_proposal(bp_view, &bp_high_qc, &bp_parent)
+            .expect("builder succeeds once the parent is present");
+        let proposal = core
+            .proposal_built(bp_view, built, bp_high_qc)
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Broadcast(ConsensusMsg::Proposal(p)) => Some(p),
+                _ => None,
+            })
+            .expect("proposal_built emits Broadcast(Proposal)");
         assert_eq!(
             proposal.block.header.view,
             View(5),
@@ -3384,7 +3450,7 @@ mod tests {
         let dup = core.step(Event::PacemakerAdvance(View(5)));
         let dup_proposed = dup
             .iter()
-            .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
+            .any(|a| matches!(a, Action::BuildProposal { .. }));
         assert!(
             !dup_proposed,
             "leader must propose at most once per view; got {dup:?}",
@@ -5207,8 +5273,8 @@ mod tests {
         assert!(
             run1[6]
                 .iter()
-                .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_)))),
-            "step 7 (quorum fires) must broadcast a Proposal",
+                .any(|a| matches!(a, Action::BuildProposal { .. })),
+            "step 7 (quorum fires) must emit BuildProposal (#606)",
         );
         assert!(
             run1[8]
@@ -5678,25 +5744,45 @@ mod tests {
             pre.state.high_qc = Some(VerifiedQc::unchecked(qc_genesis.clone()));
 
             let pre_actions = pre.become_leader(4);
-            let proposed_idx = pre_actions.iter().position(|a| {
+            // #606: become_leader emits BuildProposal; simulate the integration
+            // layer building + finalizing. `proposal_built` emits the
+            // Persist(ProposedInView) + Broadcast(Proposal) pair (persist
+            // first, #407) and sets the per-view guard.
+            let (bp_view, bp_high_qc, bp_parent) = pre_actions
+                .iter()
+                .find_map(|a| match a {
+                    Action::BuildProposal {
+                        view,
+                        high_qc,
+                        parent,
+                    } => Some((*view, high_qc.clone(), parent.clone())),
+                    _ => None,
+                })
+                .expect("pre-restart leader emits BuildProposal");
+            assert_eq!(bp_view, View(4));
+            let built = pre
+                .build_proposal(bp_view, &bp_high_qc, &bp_parent)
+                .expect("builder succeeds");
+            let finalize = pre.proposal_built(bp_view, built, bp_high_qc);
+            let proposed_idx = finalize.iter().position(|a| {
                 matches!(
                     a,
                     Action::Persist(StateUpdate::ProposedInView { view: View(4) })
                 )
             });
-            let broadcast_idx = pre_actions
+            let broadcast_idx = finalize
                 .iter()
                 .position(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(_))));
             assert!(
                 matches!((proposed_idx, broadcast_idx), (Some(p), Some(b)) if p < b),
                 "Persist(ProposedInView) must precede Broadcast(Proposal) so the \
                  dispatcher flushes the durable mirror before any bytes leave: \
-                 {pre_actions:?}",
+                 {finalize:?}",
             );
             assert_eq!(pre.proposed_in_view(), View(4));
             // Capture the proposal envelope; a second build at view 4
             // must not produce *any* envelope, distinct or otherwise.
-            let pre_proposal = pre_actions
+            let pre_proposal = finalize
                 .iter()
                 .find_map(|a| match a {
                     Action::Broadcast(ConsensusMsg::Proposal(p)) => Some(p.clone()),
@@ -5741,8 +5827,8 @@ mod tests {
             assert!(
                 unguarded_actions
                     .iter()
-                    .any(|a| matches!(a, Action::Broadcast(ConsensusMsg::Proposal(p)) if p.block.header.view == View(4))),
-                "without the persisted guard, restart *would* re-mint at view 4: \
+                    .any(|a| matches!(a, Action::BuildProposal { view: View(4), .. })),
+                "without the persisted guard, restart *would* re-attempt the proposal at view 4: \
                  {unguarded_actions:?}",
             );
             // The second envelope here happens to be byte-identical
@@ -6023,6 +6109,23 @@ mod tests {
                         | Action::RequestBlock { .. }
                         | Action::EquivocationEvidence { .. }
                         | Action::ProposalEquivocationEvidence { .. } => {}
+                        // #606: build moved out of the core. Stand in for the
+                        // integration layer — run the builder and re-apply the
+                        // resulting Persist + Broadcast(Proposal) (which then
+                        // fans out to inboxes like any broadcast). A build
+                        // failure is the retriable skip.
+                        Action::BuildProposal {
+                            view,
+                            high_qc,
+                            parent,
+                        } => {
+                            if let Ok(block) =
+                                self.cores[source].build_proposal(view, &high_qc, &parent)
+                            {
+                                let built = self.cores[source].proposal_built(view, block, high_qc);
+                                self.apply_actions(source, built);
+                            }
+                        }
                     }
                 }
             }
