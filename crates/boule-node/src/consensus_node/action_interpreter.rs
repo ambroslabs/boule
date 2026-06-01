@@ -1103,8 +1103,15 @@ impl ConsensusNode {
                     if msg_is_vote {
                         crashpoint!("after_broadcast_vote");
                     }
-                    self.deliver_loopback(loopback, broadcaster, view_timer, signer)
-                        .await?;
+                    // Enqueue our own messages and drain them iteratively. The
+                    // re-entrancy guard in `drain_loopback` flattens the former
+                    // `deliver_loopback` -> `apply_dispatch` -> here recursion
+                    // into a single loop, so an unbounded loopback chain (a
+                    // single-validator set) cannot overflow the stack — while
+                    // preserving the exact synchronous depth-first delivery
+                    // order, so observable behaviour is unchanged (#613).
+                    self.enqueue_loopback(loopback);
+                    Box::pin(self.drain_loopback(broadcaster, view_timer, signer)).await?;
                 }
 
                 SafetyAction::RequestBlock {
@@ -1221,21 +1228,55 @@ impl ConsensusNode {
         Ok(())
     }
 
-    /// Feed self-addressed dispatch items back through the same entry
-    /// point a peer message would take.
+    /// Push self-addressed (loopback) dispatches onto the work stack in
+    /// reverse, so [`Self::drain_loopback`] pops them in their original order
+    /// — and a dispatch's own loopback is processed before its later siblings
+    /// (depth-first, matching the old recursion).
+    fn enqueue_loopback(&mut self, loopback: Vec<Dispatch>) {
+        for d in loopback.into_iter().rev() {
+            self.loopback_stack.push(d);
+        }
+    }
+
+    /// Drain the loopback work stack, feeding each dispatch back through the
+    /// same entry point a peer message would take.
     ///
-    /// Boxed so the mutual recursion with [`Self::apply_safety_actions`]
-    /// and [`Self::apply_pacemaker_actions`] compiles as an async fn.
-    pub(super) async fn deliver_loopback(
+    /// Replaces the former `deliver_loopback` mutual recursion. The
+    /// `draining_loopback` guard means only the outermost call runs the loop;
+    /// a re-entrant call (from an `apply_dispatch` below, via
+    /// `apply_safety_actions`) has already left its items on the stack and
+    /// returns immediately — so the call stack stays a constant few frames
+    /// deep no matter how long the loopback chain is. The processing order is
+    /// identical to the old depth-first recursion, so observable behaviour
+    /// (and the deterministic simulator) is unchanged (#613).
+    ///
+    /// The call in `apply_safety_actions` is `Box::pin`-ed to break the async
+    /// recursion cycle for the compiler.
+    pub(super) async fn drain_loopback(
         &mut self,
-        loopback: Vec<Dispatch>,
         broadcaster: &dyn Broadcaster,
         view_timer: &mut ViewTimer,
         signer: &Arc<dyn Signer>,
     ) -> anyhow::Result<()> {
-        for d in loopback {
-            Box::pin(self.apply_dispatch(d, broadcaster, view_timer, signer)).await?;
+        if self.draining_loopback {
+            // An outer drain is already running; it will process what the
+            // caller just enqueued.
+            return Ok(());
         }
+        self.draining_loopback = true;
+        while let Some(d) = self.loopback_stack.pop() {
+            if let Err(e) = self
+                .apply_dispatch(d, broadcaster, view_timer, signer)
+                .await
+            {
+                // Reset the guard (and drop any half-processed chain) before
+                // surfacing the error so a later dispatch can drain again.
+                self.draining_loopback = false;
+                self.loopback_stack.clear();
+                return Err(e);
+            }
+        }
+        self.draining_loopback = false;
         Ok(())
     }
 
