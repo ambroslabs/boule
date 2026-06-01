@@ -36,7 +36,7 @@
 //! tripping CI's wall-clock limit.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use bytes::Bytes;
 use proptest::prelude::*;
@@ -380,8 +380,7 @@ impl ReplicaSet {
             .map(|i| {
                 let nid = validators.get(i).unwrap().into_node_id();
                 let state = HotStuffState::new(validators.clone(), genesis.clone());
-                let builder = Arc::new(TestBlockBuilder { proposer: nid });
-                HotStuffCore::new(nid, state, builder)
+                HotStuffCore::new(nid, state)
             })
             .collect();
         let inboxes = (0..n).map(|_| VecDeque::new()).collect();
@@ -441,7 +440,15 @@ impl ReplicaSet {
                     high_qc,
                     parent,
                 } => {
-                    if let Ok(block) = self.cores[source].build_proposal(view, &high_qc, &parent) {
+                    let builder = TestBlockBuilder {
+                        proposer: source_nid,
+                    };
+                    if let Ok(block) = builder.build(
+                        &parent,
+                        view,
+                        &high_qc,
+                        &self.cores[source].state().pending_blocks,
+                    ) {
                         let built = self.cores[source].proposal_built(view, block, high_qc);
                         self.apply_actions(source, built);
                     }
@@ -861,8 +868,7 @@ proptest! {
             block_sync_max_attempts: u32::MAX,
         };
         let counters = CacheEvictionCounters::default();
-        let builder = Arc::new(TestBlockBuilder { proposer: self_id });
-        let mut core = HotStuffCore::with_limits(self_id, state, builder, limits, counters);
+        let mut core = HotStuffCore::with_limits(self_id, state, limits, counters);
 
         for step in steps {
             let event = match step {

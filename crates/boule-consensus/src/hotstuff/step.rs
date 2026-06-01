@@ -26,7 +26,6 @@
 //! [`Signed`]: boule_core::crypto::signed::Signed
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::limits::{CacheEvictionCounters, CacheLimits};
 use crate::replication::block::{Block, BlockHash};
@@ -494,7 +493,6 @@ pub struct HotStuffCore {
     /// leaving the host can't re-mint a different proposal at the
     /// same view (audit finding 4-6, issue #407).
     proposed_in_view: View,
-    builder: Arc<dyn BlockBuilder>,
     /// Per-cache caps. Forced evictions fire when an `insert` would
     /// otherwise grow a cache past its cap; see
     /// [`CacheLimits`]. Tests pass [`CacheLimits::unbounded_for_tests`]
@@ -542,17 +540,15 @@ struct BlockSyncInflight {
 }
 
 impl HotStuffCore {
-    /// Build a fresh core around `state`, with `builder` supplying
-    /// block contents when this replica is the leader. Uses
-    /// [`CacheLimits::unbounded_for_tests`] — the production wiring in
-    /// `boule_node::consensus_node::ConsensusNode` uses
-    /// [`HotStuffCore::with_limits`] to plumb the operator-configured
-    /// caps through.
-    pub fn new(self_id: NodeId, state: HotStuffState, builder: Arc<dyn BlockBuilder>) -> Self {
+    /// Build a fresh core around `state`. Block construction lives in the
+    /// integration layer now (#606): the core emits [`Action::BuildProposal`]
+    /// and the integration layer runs its builder. Uses
+    /// [`CacheLimits::unbounded_for_tests`]; production uses
+    /// [`HotStuffCore::with_limits`] to plumb the operator-configured caps.
+    pub fn new(self_id: NodeId, state: HotStuffState) -> Self {
         Self::with_limits(
             self_id,
             state,
-            builder,
             CacheLimits::unbounded_for_tests(),
             CacheEvictionCounters::default(),
         )
@@ -565,7 +561,6 @@ impl HotStuffCore {
     pub fn with_limits(
         self_id: NodeId,
         mut state: HotStuffState,
-        builder: Arc<dyn BlockBuilder>,
         limits: CacheLimits,
         eviction_counters: CacheEvictionCounters,
     ) -> Self {
@@ -583,7 +578,6 @@ impl HotStuffCore {
             parked_proposals: HashMap::new(),
             block_sync_inflight: HashMap::new(),
             proposed_in_view: View::ZERO,
-            builder,
             limits,
             eviction_counters,
             signature_scheme: SignatureSchemeChoice::Ed25519Collected,
@@ -949,19 +943,23 @@ impl HotStuffCore {
         }]
     }
 
-    /// Run the block builder for a [`Action::BuildProposal`] the integration
-    /// layer received. Sync today; the builder moves to an async
-    /// `Application` owned by the integration layer in a follow-up (#225 M1).
-    /// `Err` propagates the builder's failure so the caller skips this view —
-    /// the retriable `#326` skip the inline build used to do.
+    /// Test-only stand-in for the integration layer's block builder. Builds
+    /// the same deterministic empty-commands child `TestBlockBuilder` produces
+    /// (proposer = `self_id`), so the safety-core tests and multi-replica
+    /// harnesses can fabricate a proposal from a `BuildProposal` action
+    /// without owning a builder. Production builds in the integration layer
+    /// (`ConsensusNode`), which holds the real builder (#606 / #225 M1).
+    #[cfg(test)]
     pub fn build_proposal(
         &self,
         view: View,
         high_qc: &QuorumCertificate,
         parent: &Block,
     ) -> anyhow::Result<Block> {
-        self.builder
-            .build(parent, view, high_qc, &self.state.pending_blocks)
+        tests::TestBlockBuilder {
+            proposer: self.self_id,
+        }
+        .build(parent, view, high_qc, &self.state.pending_blocks)
     }
 
     /// Finalize a proposal the integration layer just built for `view`: set
@@ -2255,10 +2253,7 @@ mod tests {
     /// all-zero-state-commitment genesis block.
     pub(crate) fn make_core(self_byte: u8) -> HotStuffCore {
         let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-        let builder = Arc::new(TestBlockBuilder {
-            proposer: nid(self_byte),
-        });
-        HotStuffCore::new(nid(self_byte), state, builder)
+        HotStuffCore::new(nid(self_byte), state)
     }
 
     /// Build an orphan block whose `parent_hash` is `orphan_parent` and
@@ -3220,8 +3215,7 @@ mod tests {
         let block_v3_hash = block_v3.hash();
 
         let state = HotStuffState::new(validators_set.clone(), Block::genesis([0; 32], [0; 32]));
-        let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
-        let mut core = HotStuffCore::new(nid(1), state, builder)
+        let mut core = HotStuffCore::new(nid(1), state)
             .with_signature_scheme(SignatureSchemeChoice::BlsAggregated);
         core.state.insert_pending(block_v3.clone());
 
@@ -4565,13 +4559,9 @@ mod tests {
             limits.block_sync_max_attempts = max_attempts;
             // Backoff stays at 0/0: rotation cadence is the focus.
             let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-            let builder = Arc::new(TestBlockBuilder {
-                proposer: nid(self_byte),
-            });
             HotStuffCore::with_limits(
                 nid(self_byte),
                 state,
-                builder,
                 limits,
                 CacheEvictionCounters::default(),
             )
@@ -4807,14 +4797,8 @@ mod tests {
             limits.block_sync_initial_backoff_views = 2;
             limits.block_sync_max_backoff_views = 2;
             let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-            let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
-            let mut core = HotStuffCore::with_limits(
-                nid(1),
-                state,
-                builder,
-                limits,
-                CacheEvictionCounters::default(),
-            );
+            let mut core =
+                HotStuffCore::with_limits(nid(1), state, limits, CacheEvictionCounters::default());
 
             let parent: BlockHash = [0xCC; 32];
             let child = orphan_child(parent, 5, nid(3));
@@ -4860,14 +4844,8 @@ mod tests {
             limits.block_sync_initial_backoff_views = 4;
             limits.block_sync_max_backoff_views = 4;
             let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-            let builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
-            let mut core = HotStuffCore::with_limits(
-                nid(1),
-                state,
-                builder,
-                limits,
-                CacheEvictionCounters::default(),
-            );
+            let mut core =
+                HotStuffCore::with_limits(nid(1), state, limits, CacheEvictionCounters::default());
 
             let parent: BlockHash = [0xDD; 32];
             let child = orphan_child(parent, 7, nid(3));
@@ -5331,10 +5309,7 @@ mod tests {
             for block in pending {
                 state.insert_pending(block.clone());
             }
-            let builder = Arc::new(TestBlockBuilder {
-                proposer: nid(self_byte),
-            });
-            HotStuffCore::new(nid(self_byte), state, builder)
+            HotStuffCore::new(nid(self_byte), state)
         }
 
         /// Test 1 — vheight monotonicity across restart.
@@ -5796,9 +5771,7 @@ mod tests {
             // layer's `recover()` does.
             let mut post_state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             post_state.high_qc = Some(VerifiedQc::unchecked(qc_genesis.clone()));
-            let post_builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
-            let mut post =
-                HotStuffCore::new(nid(1), post_state, post_builder).with_proposed_in_view(View(4));
+            let mut post = HotStuffCore::new(nid(1), post_state).with_proposed_in_view(View(4));
 
             let post_actions = post.become_leader(4);
             assert!(
@@ -5820,9 +5793,7 @@ mod tests {
             let mut post_unguarded_state =
                 HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
             post_unguarded_state.high_qc = Some(VerifiedQc::unchecked(qc_genesis));
-            let unguarded_builder = Arc::new(TestBlockBuilder { proposer: nid(1) });
-            let mut post_unguarded =
-                HotStuffCore::new(nid(1), post_unguarded_state, unguarded_builder);
+            let mut post_unguarded = HotStuffCore::new(nid(1), post_unguarded_state);
             let unguarded_actions = post_unguarded.become_leader(4);
             assert!(
                 unguarded_actions
@@ -5961,8 +5932,7 @@ mod tests {
                     .map(|i| {
                         let nid = validators.get(i).unwrap().into_node_id();
                         let state = HotStuffState::new(validators.clone(), genesis.clone());
-                        let builder = Arc::new(TestBlockBuilder { proposer: nid });
-                        HotStuffCore::new(nid, state, builder).with_signature_scheme(scheme)
+                        HotStuffCore::new(nid, state).with_signature_scheme(scheme)
                     })
                     .collect();
                 let inboxes = (0..n_honest).map(|_| VecDeque::new()).collect();
@@ -6944,13 +6914,9 @@ mod tests {
         /// scale them independently.
         fn make_core_with_limits(self_byte: u8, limits: CacheLimits) -> HotStuffCore {
             let state = HotStuffState::new(validators(), Block::genesis([0; 32], [0; 32]));
-            let builder = Arc::new(TestBlockBuilder {
-                proposer: nid(self_byte),
-            });
             HotStuffCore::with_limits(
                 nid(self_byte),
                 state,
-                builder,
                 limits,
                 CacheEvictionCounters::default(),
             )

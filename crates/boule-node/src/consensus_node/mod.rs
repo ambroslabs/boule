@@ -352,6 +352,11 @@ pub struct ConsensusNode {
     /// path to bound the uncommitted-ancestor walk (issue #375)
     /// without having to thread a borrow through the trait object.
     last_committed_height: Arc<AtomicU64>,
+    /// Block builder, owned by the integration layer (#606 / #225 M1) — the
+    /// safety core no longer holds it. The `BuildProposal` action handler runs
+    /// it to construct the leader's proposal. Becomes the async `Application`
+    /// in a follow-up.
+    builder: Arc<dyn BlockBuilder>,
     /// Heap-resident work stack of self-addressed (loopback) dispatches — the
     /// node's own Vote/Proposal echoed back so the safety core tallies them
     /// like a peer message would. `apply_safety_actions` enqueues here and
@@ -547,7 +552,7 @@ impl ConsensusNode {
 
         let last_committed_height = Arc::new(AtomicU64::new(0));
         let dropped_commands = Arc::new(AtomicU64::new(0));
-        let builder = Arc::new(MempoolBlockBuilder::new(
+        let builder: Arc<dyn BlockBuilder> = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
             Arc::clone(&state_machine),
@@ -590,14 +595,9 @@ impl ConsensusNode {
         // is exactly equivalent. Audit finding 5-1 / issue #408.
         hs_state.high_qc = Some(VerifiedQc::unchecked(boot_qc));
         let eviction_counters = CacheEvictionCounters::default();
-        let core = HotStuffCore::with_limits(
-            self_id,
-            hs_state,
-            builder as Arc<dyn BlockBuilder>,
-            config.limits,
-            eviction_counters.clone(),
-        )
-        .with_signature_scheme(config.signature_scheme);
+        let core =
+            HotStuffCore::with_limits(self_id, hs_state, config.limits, eviction_counters.clone())
+                .with_signature_scheme(config.signature_scheme);
 
         let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         let validator_key_history = ValidatorKeyHistory::new(config.validator_set.iter().copied());
@@ -626,6 +626,7 @@ impl ConsensusNode {
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             last_committed_height,
+            builder,
             loopback_stack: Vec::new(),
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
@@ -928,7 +929,7 @@ impl ConsensusNode {
 
         let last_committed_height = Arc::new(AtomicU64::new(last_committed.height.0));
         let dropped_commands = Arc::new(AtomicU64::new(0));
-        let builder = Arc::new(MempoolBlockBuilder::new(
+        let builder: Arc<dyn BlockBuilder> = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
             Arc::clone(&state_machine),
@@ -950,15 +951,10 @@ impl ConsensusNode {
             None => View::ZERO,
         };
         let eviction_counters = CacheEvictionCounters::default();
-        let mut core = HotStuffCore::with_limits(
-            self_id,
-            hs_state,
-            builder as Arc<dyn BlockBuilder>,
-            config.limits,
-            eviction_counters.clone(),
-        )
-        .with_signature_scheme(config.signature_scheme)
-        .with_proposed_in_view(proposed_in_view);
+        let mut core =
+            HotStuffCore::with_limits(self_id, hs_state, config.limits, eviction_counters.clone())
+                .with_signature_scheme(config.signature_scheme)
+                .with_proposed_in_view(proposed_in_view);
 
         // #254: replay each post-genesis boundary into the safety
         // core's history so vote tally / QC sizing / proposal-time
@@ -1022,6 +1018,7 @@ impl ConsensusNode {
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             last_committed_height,
+            builder,
             loopback_stack: Vec::new(),
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
