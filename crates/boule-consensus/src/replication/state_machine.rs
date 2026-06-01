@@ -50,17 +50,29 @@ use bytes::Bytes;
 /// state commitment as applying them to the original.
 pub trait StateMachine: Send + Sync {
     /// Whether `cmd` is well-formed enough to include in a block — the
-    /// tier-1 *includability* predicate (cf. ABCI `CheckTx` /
-    /// `ValidateBasic`). `Ok(())` means a leader may put it in a block;
-    /// `Err` means it should not.
+    /// tier-1 *includability* predicate. The lineage is the **stateless**
+    /// validity tier: Bitcoin's `CheckTransaction`, Cosmos's `ValidateBasic`,
+    /// Ethereum's decode + signature + intrinsic-gas. `Ok(())` means a leader
+    /// may put it in a block; `Err` means it should not.
     ///
-    /// This is **not** execution. A command can be includable yet fail at
+    /// It MUST depend only on `cmd` itself — never on machine state. This is
+    /// load-bearing, not stylistic: `check` runs on both the proposal-build
+    /// path *and* the vote path, where the leader and a voter sit at
+    /// different heights. A transaction-intrinsic predicate makes them agree
+    /// regardless; a state-dependent one would let an honest leader's block
+    /// fail an honest voter's check, degrading liveness (the same anchoring
+    /// problem [`Self::state_commitment`] verification has to solve). Stateful
+    /// *affordability* — gas balance, nonce ordering — is therefore **not** a
+    /// `check` concern; it belongs in a separate, state-anchored gate, not a
+    /// second argument here. Note this is why the lineage is `ValidateBasic`,
+    /// **not** ABCI `CheckTx`, which is Cosmos's stateful tier.
+    ///
+    /// This is also **not** execution. A command can be includable yet fail at
     /// [`Self::apply`] (and no-op) — e.g. a counter `Increment` at
     /// `u64::MAX`: well-formed (includable) but it overflows on apply.
-    /// Includability is about *form*, not *outcome*. Keep it cheap — no
-    /// state mutation — and **deterministic** under the same contract as
-    /// [`Self::apply`], so it is safe to call on the proposal-build path
-    /// (and, later, the vote path) and have every honest replica agree.
+    /// Includability is about *form*, not *outcome*. Keep it cheap, with no
+    /// state access, under the same determinism contract as [`Self::apply`],
+    /// so every honest replica agrees on both paths.
     ///
     /// The default accepts everything, preserving the apply-only
     /// "include any opaque bytes, no-op on failure" behaviour for an
