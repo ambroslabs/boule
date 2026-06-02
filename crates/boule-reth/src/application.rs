@@ -289,6 +289,13 @@ impl Application for RethApplication {
         Ok(())
     }
 
+    fn executed_height(&self) -> Option<Height> {
+        // reth's executed frontier: the last committed block whose payload the
+        // EL reported VALID. Lags the consensus committed height while the EL
+        // is SYNCING, which is what the startup EL-catch-up (#635) keys off.
+        Some(self.committed.lock().height)
+    }
+
     fn state_commitment(&self) -> [u8; 32] {
         self.committed.lock().state_root
     }
@@ -428,6 +435,16 @@ mod tests {
     fn restore_rejects_a_wrong_length_blob() {
         let app = make_app([0u8; 32]);
         assert!(app.restore(&[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn executed_height_tracks_the_committed_frontier() {
+        // The EL's executed height is the committed frontier — what the startup
+        // EL-catch-up (#635) compares against the consensus committed height.
+        let app = make_app([0u8; 32]);
+        assert_eq!(app.executed_height(), Some(Height(0)), "starts at genesis");
+        app.recover_frontier(Height(42), [0xAB; 32]);
+        assert_eq!(app.executed_height(), Some(Height(42)));
     }
 
     #[test]
