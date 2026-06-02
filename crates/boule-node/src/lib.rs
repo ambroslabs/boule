@@ -337,6 +337,7 @@ async fn reth_application(
     self_id: NodeId,
     genesis_state_commitment: [u8; 32],
     genesis_stake: Vec<([u8; 32], u64)>,
+    mempool: Arc<dyn Mempool>,
 ) -> anyhow::Result<Arc<dyn boule_consensus::replication::application::Application>> {
     let ApplicationConfig::Reth {
         engine_url,
@@ -381,6 +382,7 @@ async fn reth_application(
         reth_genesis_root,
         Duration::from_millis(*build_wait_ms),
         stake_source,
+        mempool,
     );
     // On restart, reth (its own persistent DB) is already at the finalized head
     // while `new` reset the in-memory frontier to genesis. Reconcile the two so
@@ -409,6 +411,7 @@ async fn reth_application(
     _self_id: NodeId,
     _genesis_state_commitment: [u8; 32],
     _genesis_stake: Vec<([u8; 32], u64)>,
+    _mempool: Arc<dyn Mempool>,
 ) -> anyhow::Result<Arc<dyn boule_consensus::replication::application::Application>> {
     anyhow::bail!(
         "config selects [consensus.application] backend = \"reth\", but this binary was built \
@@ -609,8 +612,14 @@ async fn start_consensus(
     match cons_cfg.application.as_ref() {
         None | Some(ApplicationConfig::Counter) => {}
         Some(reth_cfg) => {
-            let app = reth_application(reth_cfg, *self_id, genesis_state_commitment, genesis_stake)
-                .await?;
+            let app = reth_application(
+                reth_cfg,
+                *self_id,
+                genesis_state_commitment,
+                genesis_stake,
+                std::sync::Arc::clone(&mempool),
+            )
+            .await?;
             node = node.with_application(app);
         }
     }

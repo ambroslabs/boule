@@ -22,13 +22,17 @@
 //!   path; full reth state-sync is out of scope.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use boule_consensus::hotstuff::QuorumCertificate;
+use boule_consensus::reconfig::ReconfigCommand;
 use boule_consensus::replication::application::{Application, CommitResult, ValidatorUpdate};
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
+use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::stake_source::StakeSource;
+use boule_consensus::validator_rotation::DualSignedRotation;
 use boule_consensus::{Height, View};
 use boule_core::clock::BoxFuture;
 use boule_core::identity::NodeId;
@@ -39,6 +43,11 @@ use serde_json::Value;
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::staking;
 use crate::transport::EngineTransport;
+
+/// Max boule system txs to pull from the mempool into one proposal. Only a
+/// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
+/// just bounds the scan.
+const SYSTEM_TX_LIMIT: usize = 16;
 
 /// The committed frontier reth has executed and finalized: the height of the
 /// last committed boule block and its EVM post-state root.
@@ -62,6 +71,10 @@ pub struct RethApplication {
     /// the staking predeploy's `Deposit`/`Withdraw` events, which `commit`
     /// reads from each executed block. Seeded from the genesis validator set.
     stake_source: Mutex<Box<dyn StakeSource>>,
+    /// boule's mempool, shared with the integration layer. `build_proposal`
+    /// pulls pending consensus-layer system txs (reconfig/rotation) from it
+    /// into the block — the only path for them onto the reth backend.
+    mempool: Arc<dyn Mempool>,
 }
 
 impl RethApplication {
@@ -69,6 +82,7 @@ impl RethApplication {
     /// consensus genesis block's `state_commitment` — the caller verifies that
     /// bridge at startup. `reth_genesis_hash` is reth's genesis block hash, the
     /// EVM parent of the first proposed block.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         transport: Box<dyn EngineTransport>,
         self_id: NodeId,
@@ -77,6 +91,7 @@ impl RethApplication {
         genesis_root: [u8; 32],
         build_wait: Duration,
         stake_source: Box<dyn StakeSource>,
+        mempool: Arc<dyn Mempool>,
     ) -> Self {
         Self {
             transport,
@@ -89,6 +104,7 @@ impl RethApplication {
                 state_root: genesis_root,
             }),
             stake_source: Mutex::new(stake_source),
+            mempool,
         }
     }
 
@@ -261,10 +277,27 @@ impl Application for RethApplication {
             // before it commits (HotStuff pipelining).
             engine.register_payload(&built.execution_payload).await?;
 
-            let commands = vec![Bytes::from(
+            // The block's first command is always the EVM execution payload.
+            let mut commands = vec![Bytes::from(
                 serde_json::to_vec(&built.execution_payload)
                     .context("serializing the EVM execution payload")?,
             )];
+            // Carry pending boule *system* txs (reconfig/rotation) from the
+            // mempool too. Application transactions live in reth's own pool
+            // and ride the EVM payload, but consensus-layer system txs — e.g.
+            // the ReconfigCommand the staking read path mints (#655) — have no
+            // other way into a block on the reth backend, since this builder
+            // does not draw application commands from boule's mempool. Without
+            // this, a minted reconfig would never commit. Their validity is
+            // checked at commit (apply_committed_reconfigs); app commands in
+            // the pool are ignored here.
+            for cmd in self.mempool.propose(SYSTEM_TX_LIMIT) {
+                if ReconfigCommand::is_reconfig_payload(&cmd)
+                    || DualSignedRotation::is_rotation_payload(&cmd)
+                {
+                    commands.push(cmd);
+                }
+            }
             let commands_commitment = Block::commands_commitment(&commands);
 
             Ok(Block {
@@ -402,6 +435,9 @@ mod tests {
             genesis_root,
             Duration::ZERO,
             Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
         )
     }
 
@@ -498,6 +534,9 @@ mod tests {
             [0u8; 32],
             Duration::ZERO,
             Box::new(BondedStakeLedger::seeded_from([(node, 1u64)])),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
         );
 
         let g = genesis();
@@ -513,6 +552,54 @@ mod tests {
                 weight: 0,
             }],
             "a Withdraw of the full stake removes the validator (weight 0)",
+        );
+    }
+
+    /// The reth builder must carry a pending boule system tx (a minted
+    /// reconfig) from the mempool into the block alongside the EVM payload —
+    /// otherwise a staking-driven reconfig never commits (the gap the
+    /// multi-process reth e2e caught). App-level pool txs are *not* included
+    /// (they ride reth's payload).
+    #[tokio::test]
+    async fn build_proposal_carries_a_pending_reconfig_from_the_mempool() {
+        use boule_consensus::replication::impls::InMemoryMempool;
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(16));
+        let reconfig = ReconfigCommand {
+            adds: vec![],
+            removes: vec![[9u8; 32]],
+            changes: vec![],
+            v_eff: View(10),
+        }
+        .encode();
+        mempool.insert(reconfig).unwrap();
+        // A plain app command must be ignored (it belongs to reth's pool).
+        mempool.insert(Bytes::from_static(b"an-app-tx")).unwrap();
+
+        let app = RethApplication::new(
+            Box::new(FixtureTransport),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::empty()),
+            Arc::clone(&mempool),
+        );
+        let g = genesis();
+        let block = app
+            .build_proposal(&g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        assert_eq!(
+            block.commands.len(),
+            2,
+            "the EVM payload plus the one pending reconfig (the app tx is excluded)",
+        );
+        assert!(
+            ReconfigCommand::is_reconfig_payload(&block.commands[1]),
+            "the second command is the carried reconfig",
         );
     }
 
@@ -692,6 +779,9 @@ mod tests {
             [0u8; 32],
             Duration::ZERO,
             Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
         );
 
         // Two uncommitted blocks above the (genesis) committed frontier; build
@@ -756,6 +846,9 @@ mod tests {
             [0u8; 32],
             Duration::ZERO,
             Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
         );
         {
             let mut c = app.committed.lock();
@@ -782,6 +875,9 @@ mod tests {
             [0u8; 32],
             Duration::ZERO,
             Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
         );
         let g = genesis();
         let a = block_with_payload(g.hash(), 1, "0xaa");
