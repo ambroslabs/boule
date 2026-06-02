@@ -300,6 +300,12 @@ pub struct ConsensusStatus {
     /// evidence.
     #[serde(default)]
     pub proposal_equivocations_detected: u64,
+    /// Cumulative count of non-repudiable equivocation proofs this node built
+    /// and self-verified (#656b) — the two conflicting signed messages paired
+    /// from retained envelopes and accepted by the independent verifier. This
+    /// is the input a slashing pipeline (#658) acts on.
+    #[serde(default)]
+    pub equivocation_proofs_built: u64,
     /// Cumulative count of state-machine divergences this node detected
     /// at vote time: a proposed block's deferred (lagged) committed state
     /// root, anchored at a height this node has committed, disagreed with
@@ -412,6 +418,7 @@ mod tests {
             dropped_commands: 11,
             equivocations_detected: 2,
             proposal_equivocations_detected: 4,
+            equivocation_proofs_built: 0,
             state_divergence_detected: 7,
             proposal_command_rejections: 9,
             backpressure: BackpressureStatus {
@@ -585,6 +592,7 @@ mod tests {
             dropped_commands: 0,
             equivocations_detected: 0,
             proposal_equivocations_detected: 0,
+            equivocation_proofs_built: 0,
             state_divergence_detected: 0,
             proposal_command_rejections: 0,
             backpressure: BackpressureStatus::default(),
