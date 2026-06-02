@@ -37,7 +37,7 @@ pub mod transport;
 
 pub use application::RethApplication;
 pub use engine::{BuiltBlock, RethEngine, root_from_hex};
-pub use transport::{EngineTransport, HttpTransport, fetch_genesis};
+pub use transport::{EngineTransport, HttpTransport, fetch_genesis, peer_reths};
 
 /// Test-only transport that replays the committed golden Engine API
 /// fixtures, so the driver can be exercised offline without a live reth.
