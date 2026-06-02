@@ -8981,6 +8981,50 @@ mod tests {
             .expect("happy-path recovery must pass consistency check");
     }
 
+    /// #637: when `block_retention_window` has pruned a committed block the
+    /// backward walk needs, the best-effort anti-rollback check must **skip**
+    /// (not refuse to start) — a node has to be able to restart after
+    /// retention has pruned old blocks.
+    #[test]
+    fn verify_persisted_history_consistency_skips_when_chain_pruned_below_retention() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let vs = four_validators();
+        let g = genesis_with_real_commitment(&vs);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Commit a two-block chain (both empty / no reconfig), so
+        // `last_committed` points at block 2 whose parent is block 1.
+        let block1 = empty_block(g.hash(), 1, 1);
+        let block1_hash = block1.hash();
+        node.apply_commit(block1);
+        let block2 = empty_block(block1_hash, 2, 2);
+        node.apply_commit(block2);
+
+        // Simulate retention pruning the older committed block from storage.
+        storage
+            .delete(&block_storage_key(&block1_hash))
+            .expect("delete pruned block");
+        assert!(
+            load_block_from_storage(storage.as_ref(), &block1_hash)
+                .unwrap()
+                .is_none(),
+            "block 1 must be pruned for the test to exercise the skip path"
+        );
+
+        // The walk reaches the pruned block 1 and can't continue to genesis;
+        // it must skip the check and return Ok, not bail.
+        node.verify_persisted_history_consistency()
+            .expect("a chain pruned below retention must skip the check, not refuse to start");
+    }
+
     /// Test 2 (corrupt blob — single byte flip): flip one byte inside
     /// a boundary's `v_eff` field of the persisted validator-history
     /// blob. Recovery's consistency check must reject.
