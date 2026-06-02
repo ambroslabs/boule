@@ -240,6 +240,11 @@ print("0x" + n.to_bytes(32, "big").hex())
 PY
 }
 
+# Removing one validator must keep the set at or above MIN_VALIDATOR_FLOOR (4),
+# else the reconfig is correctly rejected. So this removal assertion needs N≥5.
+if [ "$N" -lt 5 ]; then
+  echo "  … skipping staking-removal assertion: needs N≥5 (removing 1 of $N would drop below the validator floor of 4). Re-run with: N=5 $0"
+else
 REMOVE_B58="${NID[$N]}"            # remove the last validator; survivors = 1..N-1
 REMOVE_HEX=$(b58_to_hex "$REMOVE_B58")
 BEFORE=$(boule_status 1 | jq -r '.validator_set | length')
@@ -280,6 +285,7 @@ if [ "$HA" -gt "$HB" ]; then
 else
   fail "staking: cluster stalled after the removal ($HB → $HA)"
 fi
+fi  # N≥5 staking-removal guard
 
 echo "═════════════════════════════════════════════════════"
 if [ "$FAILS" = 0 ]; then
