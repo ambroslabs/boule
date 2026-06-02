@@ -202,6 +202,35 @@ Operator-supplied trust parameters:
 Liveness assumptions: at least one honest reth peer serving state, and a pivot
 recent enough that non-archive peers still retain its state.
 
+## 8. Multi-validator testnet (`testnet.sh`)
+
+`testnet.sh` brings up a whole reth-backed cluster on one host and asserts the
+properties §1–7 only gesture at — that **N independent reths** execute the same
+ordered payloads to the **same** state across leader rotations. It launches `N`
+boule validators, each driving its own reth (distinct datadirs/ports from this
+`genesis.json`), peers the reths (§4), runs past several rotations, then checks:
+
+1. **liveness** — the chain passes `2N` committed blocks, so the round-robin
+   leader schedule has had every validator lead;
+2. **agreement** — all `N` reths report a byte-identical EVM state root at a deep
+   committed height;
+3. **tx landing** — a tx sent to *one* node's reth is mined, in the same block,
+   on *all* reths;
+4. **no divergence** — no node ever logged `consensus_state_divergence_detected`.
+
+Prereqs on `PATH`: `reth`, `cast` (foundry), `openssl`, `jq`, `curl`, plus a
+boule binary built with the reth feature. From the repo root:
+
+```
+cargo build --release -p boule-cli --features reth
+./crates/boule-reth/testnet.sh            # 4 validators (default)
+N=7 ./crates/boule-reth/testnet.sh        # or any N
+```
+
+It prints a `✓`/`✗` per assertion and exits non-zero if any fail, so it doubles
+as a smoke test for the reth backend. It needs `reth`/`cast`, so it is an
+operator/local harness rather than a CI gate (like `run-reth.sh`).
+
 ## Re-capturing the test fixtures
 
 `boule-reth`'s offline tests replay golden Engine API exchanges in
