@@ -105,6 +105,97 @@ async fn driver_lifecycle_4_nodes() {
     }
 }
 
+/// End-to-end tx ingress: a transaction submitted over `POST
+/// /mempool/submit` to a running cluster is committed. Proves the
+/// submission endpoint admits a command and the cluster carries it through
+/// propose → commit (observable as every node draining it from its mempool,
+/// which only happens on commit, with none dropped).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submitted_tx_is_committed() {
+    use boule_consensus::replication::impls::counter_sm::CounterCommand;
+    use boule_node::testnet::admin;
+
+    let _serial = TEST_SERIAL.lock().await;
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_boule"));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let wd = tmp.path().to_path_buf();
+
+    let spec = topology::TopologySpec {
+        nodes: 4,
+        seed_extra: 0,
+        target_degree: 3,
+        seed: 11,
+    };
+    let state = lifecycle::new_cluster(lifecycle::NewArgs {
+        workdir: wd.clone(),
+        spec,
+        binary: bin.clone(),
+        timeout_base_ms: 200,
+        timeout_max_ms: 1_500,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+    })
+    .await
+    .expect("new_cluster");
+    let _pids = lifecycle::up_all(&wd, &bin, &state).await.expect("up_all");
+
+    wait::all_reach_height(&state, 2, Duration::from_secs(6))
+        .await
+        .expect("warm-up commits before submitting");
+
+    // Submit a valid counter command to every node's ingress endpoint.
+    // Submitting to all nodes means whichever validator leads next picks it
+    // up — there is no cross-validator tx gossip yet, so a tx only reaches a
+    // block via the mempool of a node that leads.
+    let cmd = CounterCommand::Increment.encode().to_vec();
+    let http = reqwest::Client::new();
+    for n in &state.nodes {
+        let api = n.api_addr.expect("api_addr");
+        let resp = http
+            .post(format!("http://{api}/mempool/submit"))
+            .body(cmd.clone())
+            .send()
+            .await
+            .expect("submit request");
+        assert_eq!(
+            resp.status().as_u16(),
+            202,
+            "{} should accept the submitted tx",
+            n.display_name(),
+        );
+    }
+
+    // The command must be committed, not dropped: every node drains it from
+    // its mempool (remove_committed runs only on commit) and the leader-side
+    // includability check did not reject it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        let mut all_drained = true;
+        for n in &state.nodes {
+            let api = n.api_addr.expect("api_addr");
+            let st = admin::consensus_status(api).await.expect("status");
+            assert_eq!(
+                st.dropped_commands,
+                0,
+                "{} dropped a valid submitted command",
+                n.display_name(),
+            );
+            if st.mempool_size != 0 {
+                all_drained = false;
+            }
+        }
+        if all_drained {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "submitted tx was not committed (drained from all mempools) within budget",
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    lifecycle::down(&wd, &state).expect("down");
+}
+
 /// Issue #205, items 1 and 3 in one test: `Step::Up` is now idempotent
 /// (no-op when the node is already alive), and `wait::all_advance_by`
 /// gates on *new* commits since the wait started.

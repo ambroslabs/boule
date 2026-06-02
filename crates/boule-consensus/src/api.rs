@@ -25,8 +25,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::routing::get;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::sync::watch;
 
@@ -35,6 +37,7 @@ use super::Height;
 use super::View;
 use super::status::ConsensusStatus;
 use crate::replication::block::Block;
+use crate::replication::mempool::Mempool;
 
 /// Hook fired by the consensus pipeline after each block has been
 /// applied to the state machine, persisted, and had its reconfig and
@@ -192,6 +195,44 @@ async fn get_status(
     Json(status)
 }
 
+/// HTTP router exposing the minimal transaction-ingress endpoint
+/// `POST /mempool/submit`, mounted alongside [`router`] when `[consensus]`
+/// is configured.
+///
+/// The request body is the raw command bytes; they are inserted into this
+/// node's mempool, from which the leader's block builder draws the next
+/// proposal. A submitted command therefore reaches a committed block only
+/// once *this* node is leader (or it is also submitted to whichever node
+/// is) — cross-validator gossip of submitted txs is a separate concern.
+///
+/// Deliberately minimal: unauthenticated and unvalidated beyond a
+/// non-empty check, bounded only by the mempool capacity. Admission cost /
+/// rate-limiting (#545) and tx gossip are follow-ups.
+pub fn submit_router(mempool: Arc<dyn Mempool>) -> Router {
+    Router::new()
+        .route("/mempool/submit", post(submit_tx))
+        .with_state(mempool)
+}
+
+/// `POST /mempool/submit` handler: admit the raw body into the mempool.
+/// `202` newly admitted, `200` duplicate (no-op), `400` empty body, `503`
+/// mempool full.
+async fn submit_tx(
+    State(mempool): State<Arc<dyn Mempool>>,
+    body: Bytes,
+) -> (StatusCode, &'static str) {
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty command rejected");
+    }
+    match mempool.insert(body) {
+        Ok(true) => (StatusCode::ACCEPTED, "accepted"),
+        Ok(false) => (StatusCode::OK, "duplicate"),
+        // The only structural failure today is a full bounded pool —
+        // backpressure, not a client error in the request itself.
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "mempool full"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -251,6 +292,51 @@ mod tests {
         assert_eq!(status.current_view, View(0));
         assert_eq!(status.last_committed_height, Height(0));
         assert!(status.locked.is_none());
+    }
+
+    #[tokio::test]
+    async fn submit_admits_new_command_and_reports_duplicate() {
+        use crate::replication::impls::InMemoryMempool;
+
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(16));
+        let cmd = Bytes::from_static(b"a-command");
+
+        let (code, _) = submit_tx(State(mempool.clone()), cmd.clone()).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "first submit is admitted");
+        assert_eq!(mempool.len(), 1, "command lands in the mempool");
+
+        let (code, _) = submit_tx(State(mempool.clone()), cmd).await;
+        assert_eq!(
+            code,
+            StatusCode::OK,
+            "re-submitting the same command is a no-op"
+        );
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_empty_body_without_touching_the_mempool() {
+        use crate::replication::impls::InMemoryMempool;
+
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(16));
+        let (code, _) = submit_tx(State(mempool.clone()), Bytes::new()).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(mempool.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_returns_503_when_the_mempool_is_full() {
+        use crate::replication::impls::InMemoryMempool;
+
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(1));
+        let (code, _) = submit_tx(State(mempool.clone()), Bytes::from_static(b"first")).await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+        let (code, _) = submit_tx(State(mempool), Bytes::from_static(b"second")).await;
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "full pool is backpressure"
+        );
     }
 
     #[tokio::test]
