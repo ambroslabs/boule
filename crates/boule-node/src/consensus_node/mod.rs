@@ -9726,11 +9726,14 @@ mod tests {
         fn commit<'a>(
             &'a self,
             block: &'a Block,
-        ) -> boule_core::clock::BoxFuture<'a, anyhow::Result<()>> {
+        ) -> boule_core::clock::BoxFuture<
+            'a,
+            anyhow::Result<boule_consensus::replication::application::CommitResult>,
+        > {
             let h = block.header.height.0;
             Box::pin(async move {
                 self.commits.lock().unwrap().push(h);
-                Ok(())
+                Ok(boule_consensus::replication::application::CommitResult::default())
             })
         }
         fn executed_height(&self) -> Option<Height> {
