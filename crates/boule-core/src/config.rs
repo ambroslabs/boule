@@ -203,6 +203,14 @@ pub enum ApplicationConfig {
         /// so reth's async build can pull pool transactions in.
         #[serde(default = "default_reth_build_wait_ms")]
         build_wait_ms: u64,
+        /// Other validators' reth `enode://…` URLs. At startup the node
+        /// connects its local reth to each via `admin_addPeer` (reth's
+        /// `admin` RPC namespace must be enabled). Peering the validator
+        /// reths enables EVM tx-pool gossip (a tx submitted to any node is
+        /// seen by every leader) and lets a behind/fresh reth self-sync
+        /// (snap/full) from its peers. Empty = isolated reths.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reth_peers: Vec<String>,
     },
 }
 

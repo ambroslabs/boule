@@ -97,6 +97,34 @@ jwt_secret_path = "crates/boule-reth/jwt.hex"
 fee_recipient   = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 ```
 
+### Multi-validator: peer the reths
+
+For a multi-validator chain, set `reth_peers` to the **other** validators'
+reth `enode://…` URLs:
+
+```toml
+[consensus.application]
+backend     = "reth"
+# … engine_url / eth_url / jwt_secret_path / fee_recipient as above …
+reth_peers  = [
+  "enode://<peer1-pubkey>@<peer1-host>:30304",
+  "enode://<peer2-pubkey>@<peer2-host>:30305",
+]
+```
+
+At startup the node connects its local reth to each peer via `admin_addPeer`
+(so `run-reth.sh` enables the `admin` RPC namespace). Get a reth's enode with
+`cast rpc --rpc-url <its eth_url> admin_nodeInfo | jq -r .enode` (or
+`admin_nodeInfo` over JSON-RPC). Peering the validator reths is what makes:
+
+- **tx-pool gossip** work — a tx submitted to *any* node's reth reaches every
+  leader's pool, so it's included no matter which node receives it; and
+- **EL self-sync** work — a behind or fresh reth backfills (snap/full) from its
+  peers when consensus points it at a head it doesn't have yet.
+
+Peering is best-effort: an unreachable peer is logged and skipped (reth keeps
+retrying), so node startup never blocks on it.
+
 ## 5. Run the validator
 
 ```

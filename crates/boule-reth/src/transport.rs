@@ -118,3 +118,48 @@ pub async fn fetch_genesis(eth_url: &str) -> Result<(String, [u8; 32])> {
         crate::engine::root_from_hex(block["stateRoot"].as_str().context("genesis stateRoot")?)?;
     Ok((hash, root))
 }
+
+/// Connect the local reth (at `eth_url`) to each peer `enode://…` via
+/// `admin_addPeer` over the public RPC. Requires reth's `admin` namespace
+/// (`--http.api …,admin`).
+///
+/// Best-effort: a failed add is logged and skipped — reth keeps retrying the
+/// dial, and the other peers may still connect. Peering the validator reths
+/// enables EVM tx-pool gossip (any leader sees a tx submitted to any node) and
+/// lets a behind/fresh reth self-sync (snap/full) from its peers. No JWT.
+pub async fn peer_reths(eth_url: &str, enodes: &[String]) -> Result<()> {
+    if enodes.is_empty() {
+        return Ok(());
+    }
+    let transport = HttpTransport::new(String::new(), eth_url.to_string(), Vec::new(), None);
+    for enode in enodes {
+        match transport.eth("admin_addPeer", json!([enode])).await {
+            Ok(_) => tracing::info!(target: "boule::reth", %enode, "added reth peer"),
+            Err(e) => tracing::warn!(
+                target: "boule::reth",
+                %enode,
+                error = %e,
+                "admin_addPeer failed (reth `admin` RPC enabled? peer reachable?); continuing",
+            ),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_reths;
+
+    #[tokio::test]
+    async fn peer_reths_empty_is_a_noop() {
+        assert!(peer_reths("http://127.0.0.1:1", &[]).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn peer_reths_is_best_effort_when_reth_unreachable() {
+        // No reth at that port → admin_addPeer fails, but peering is
+        // best-effort and must not fail node startup.
+        let enodes = vec!["enode://ab@127.0.0.1:30303".to_string()];
+        assert!(peer_reths("http://127.0.0.1:1", &enodes).await.is_ok());
+    }
+}

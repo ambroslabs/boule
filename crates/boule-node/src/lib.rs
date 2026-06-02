@@ -335,10 +335,14 @@ async fn reth_application(
         jwt_secret_path,
         fee_recipient,
         build_wait_ms,
+        reth_peers,
     } = cfg
     else {
         unreachable!("reth_application called for a non-reth backend");
     };
+    // Connect the local reth to the other validators' reths (best-effort) so
+    // tx-pool gossip and EL self-sync work across the cluster.
+    boule_reth::peer_reths(eth_url, reth_peers).await?;
     let (reth_genesis_hash, reth_genesis_root) = boule_reth::fetch_genesis(eth_url)
         .await
         .context("querying reth genesis over eth_url (is reth reachable?)")?;

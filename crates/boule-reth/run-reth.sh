@@ -23,7 +23,7 @@ exec reth node \
   --datadir "$DATADIR" \
   --authrpc.addr 127.0.0.1 --authrpc.port 8551 --authrpc.jwtsecret "$JWT" \
   --http --http.addr 127.0.0.1 --http.port 8545 \
-  --http.api "eth,net,web3,txpool" \
+  --http.api "eth,net,web3,txpool,admin" \
   --disable-discovery \
   --ipcdisable \
   "$@"
