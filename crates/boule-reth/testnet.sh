@@ -104,6 +104,8 @@ listen_addr = "127.0.0.1:$(boule_p2p "$i")"
 [node.identity]
 backend = "file"
 path = "$WORK/node$i/node.key"
+[api]
+listen_addr = "127.0.0.1:$((8000 + i))"
 EOF
   NID[$i]=$("$BOULE" init --config "$WORK/node$i/init.toml" 2>&1 | grep -oP 'NodeId = \K\S+')
 done
@@ -207,7 +209,10 @@ fi
 # 4. No node ever flagged execution-state divergence.
 DIV=0
 for i in $(seq 1 "$N"); do
-  c=$(grep -c 'consensus_state_divergence_detected' "$WORK/node$i.log" 2>/dev/null || echo 0)
+  # grep -c prints the count (0 on no match) and exits 1 when zero; capture the
+  # count and normalize, rather than letting the exit status double-append.
+  c=$(grep -c 'consensus_state_divergence_detected' "$WORK/node$i.log" 2>/dev/null)
+  c=${c:-0}
   [ "$c" -ne 0 ] && { DIV=$((DIV + c)); echo "    node$i logged $c divergence event(s)"; }
 done
 if [ "$DIV" = 0 ]; then
