@@ -1205,6 +1205,12 @@ impl ConsensusNode {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
+                    // Deferred materialisation (#225 M5): if the application
+                    // requested validator-set changes at a recent commit,
+                    // mint them into a ReconfigCommand in the mempool now so
+                    // the block this node is about to build carries it. A
+                    // no-op unless updates are staged.
+                    self.mint_staged_reconfig(view);
                     match self
                         .app
                         .build_proposal(
