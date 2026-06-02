@@ -28,6 +28,14 @@ use boule_core::identity::NodeId;
 
 use super::{ConsensusNode, TRACE_TARGET};
 
+/// Views to defer an app-driven reconfig's `v_eff` beyond the proposing
+/// block's view, on top of the validation floor. The reconfig is minted
+/// into the block this node proposes; that block only commits a few views
+/// later (HotStuff's three-chain), so `v_eff` must sit comfortably past the
+/// commit depth or the boundary would already be in the past when applied —
+/// leaving replicas disagreeing on the committee around the boundary view.
+const APP_RECONFIG_SETTLE_VIEWS: View = View::new(8);
+
 impl ConsensusNode {
     /// If this node has staged application-driven validator updates and no
     /// reconfig boundary is already pending, mint them into a single
@@ -58,9 +66,14 @@ impl ConsensusNode {
             return;
         }
 
-        // v_eff must clear the same min-delay the apply-time validation
-        // enforces against the proposing block's view (== `view`).
-        let effective_delay = std::cmp::max(self.min_v_eff_delay, MIN_V_EFF_DELAY);
+        // v_eff must clear not just the apply-time validation floor
+        // (`block_view + min_v_eff_delay`) but the commit latency — see
+        // APP_RECONFIG_SETTLE_VIEWS — so the boundary is still in the future
+        // when the reconfig block lands.
+        let effective_delay = std::cmp::max(
+            std::cmp::max(self.min_v_eff_delay, MIN_V_EFF_DELAY),
+            APP_RECONFIG_SETTLE_VIEWS,
+        );
         let Some(v_eff) = view.checked_add(effective_delay) else {
             tracing::error!(target: TRACE_TARGET, view = view.0, "mint_staged_reconfig_v_eff_overflow");
             return;

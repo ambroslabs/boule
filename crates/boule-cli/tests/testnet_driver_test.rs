@@ -196,6 +196,145 @@ async fn submitted_tx_is_committed() {
     lifecycle::down(&wd, &state).expect("down");
 }
 
+/// End-to-end app-driven validator-set change (#225 M5/M6): a `StakeCommand`
+/// submitted over `POST /mempool/submit` makes the demo application return a
+/// `validator_update` from `commit`, which the consensus layer materialises
+/// as a reconfig — so a submitted tx removes a validator on a live cluster.
+/// Exercises the whole app→consensus membership stack (#651/#652) through
+/// real tx ingress (#663).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submitted_stake_command_changes_the_validator_set() {
+    use boule_core::identity::base58_to_node_id;
+    use boule_node::demo_staking::StakeCommand;
+    use boule_node::testnet::admin;
+
+    let _serial = TEST_SERIAL.lock().await;
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_boule"));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let wd = tmp.path().to_path_buf();
+
+    // 5 nodes so removing one leaves a still-BFT set of 4 (f=1).
+    let spec = topology::TopologySpec {
+        nodes: 5,
+        seed_extra: 0,
+        target_degree: 4,
+        seed: 13,
+    };
+    let state = lifecycle::new_cluster(lifecycle::NewArgs {
+        workdir: wd.clone(),
+        spec,
+        binary: bin.clone(),
+        timeout_base_ms: 200,
+        timeout_max_ms: 1_500,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+    })
+    .await
+    .expect("new_cluster");
+    let _pids = lifecycle::up_all(&wd, &bin, &state).await.expect("up_all");
+
+    wait::all_reach_height(&state, 2, Duration::from_secs(6))
+        .await
+        .expect("warm-up commits");
+
+    // Remove the highest-sorted validator (`validator_set` is ordered), then
+    // observe liveness on a node that is still seated.
+    let api0 = state.nodes[0].api_addr.expect("api_addr");
+    let st0 = admin::consensus_status(api0).await.expect("status");
+    assert_eq!(st0.validator_set.len(), 5, "genesis set has 5 validators");
+    let removed_b58 = st0
+        .validator_set
+        .last()
+        .expect("non-empty validator set")
+        .clone();
+    let removed = base58_to_node_id(&removed_b58).expect("decode removed node id");
+
+    // An API of a node that will remain seated, to watch progress afterward.
+    let mut obs_api = None;
+    for n in &state.nodes {
+        let api = n.api_addr.expect("api_addr");
+        let st = admin::consensus_status(api).await.expect("status");
+        if st.node_id != removed_b58 {
+            obs_api = Some(api);
+            break;
+        }
+    }
+    let obs_api = obs_api.expect("a node other than the removed one");
+
+    // Submit an app-level stake command (weight 0 = remove) to every node —
+    // no cross-validator tx gossip yet, so whichever node leads next must
+    // already hold it.
+    let cmd = StakeCommand {
+        node_id: removed,
+        weight: 0,
+    }
+    .encode()
+    .to_vec();
+    let http = reqwest::Client::new();
+    for n in &state.nodes {
+        let api = n.api_addr.expect("api_addr");
+        let resp = http
+            .post(format!("http://{api}/mempool/submit"))
+            .body(cmd.clone())
+            .send()
+            .await
+            .expect("submit request");
+        assert_eq!(
+            resp.status().as_u16(),
+            202,
+            "{} should accept the stake tx",
+            n.display_name(),
+        );
+    }
+
+    // The demo app turns the committed stake command into a validator_update,
+    // materialised as a reconfig: the active set shrinks to 4 and no longer
+    // contains the removed validator, on every node.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut all_reduced = true;
+        for n in &state.nodes {
+            let api = n.api_addr.expect("api_addr");
+            let st = admin::consensus_status(api).await.expect("status");
+            if st.validator_set.len() != 4 || st.validator_set.contains(&removed_b58) {
+                all_reduced = false;
+            }
+        }
+        if all_reduced {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "validator set did not shrink to 4 (app-driven removal) within budget",
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Liveness under the reduced set: a still-seated node keeps committing.
+    let base_h = admin::consensus_status(obs_api)
+        .await
+        .expect("status")
+        .last_committed_height
+        .0;
+    let live_deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        let h = admin::consensus_status(obs_api)
+            .await
+            .expect("status")
+            .last_committed_height
+            .0;
+        if h >= base_h + 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < live_deadline,
+            "cluster did not keep committing under the reduced validator set",
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    lifecycle::down(&wd, &state).expect("down");
+}
+
 /// Issue #205, items 1 and 3 in one test: `Step::Up` is now idempotent
 /// (no-op when the node is already alive), and `wait::all_advance_by`
 /// gates on *new* commits since the wait started.

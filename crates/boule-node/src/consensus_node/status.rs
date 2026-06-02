@@ -135,8 +135,15 @@ impl ConsensusNode {
             .collect();
         peers_connected.sort();
 
-        let validator_set: Vec<String> = self
-            .validator_set
+        // Report the set authoritative at the current view, not the
+        // construction-time `self.validator_set` field — the latter is not
+        // advanced when a reconfig boundary takes effect, so it would show a
+        // stale committee after any membership change (governance or
+        // app-driven). `set_at(current_view)` reflects committed boundaries
+        // and is identical to genesis until one lands.
+        let active_set = self.validator_history.set_at(current_view);
+        let validator_set: Vec<String> = active_set
+            .for_view(current_view)
             .iter()
             .map(|v| boule_transport_tcp::tls::node_id_to_base58(v.as_node_id()))
             .collect();

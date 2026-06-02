@@ -6,6 +6,7 @@
 //! running node looks like".
 
 pub mod consensus_node;
+pub mod demo_staking;
 pub mod testnet;
 
 #[cfg(test)]
