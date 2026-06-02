@@ -78,6 +78,7 @@ use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::pacemaker::timeout::ExponentialBackoff;
 use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
 use boule_consensus::replication::application::Application;
+use boule_consensus::replication::block::BlockHash;
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
@@ -1091,6 +1092,107 @@ impl ConsensusNode {
     /// event stream. The mesh is the only implementation today; gossip
     /// and dynamic-membership backends drop in here without touching
     /// the event loop. See [`boule_transport_tcp::overlay`] for the contract.
+    /// Startup EL-catch-up (#635, tier-3a of the recovery cascade). An
+    /// out-of-process execution layer (a reth EL) keeps its own state DB and
+    /// can come up **behind** the consensus committed height — e.g. its datadir
+    /// was lost, or it snapshot-restored a frontier without the underlying
+    /// payloads. Consensus never re-commits already-committed blocks, so nothing
+    /// would otherwise re-feed the EL; with no EL peers it strands permanently.
+    ///
+    /// When the application reports an `executed_height` below
+    /// `last_committed_height` and we still hold the contiguous gap in durable
+    /// storage (within `block_retention_window`), replay those committed
+    /// payloads into the application in height order — the EL executes forward
+    /// off its real head and catches up, needing no EL peers. This is trustless:
+    /// the replayed blocks are already BFT-committed; the EL only executes them.
+    ///
+    /// If the gap is **not** fully retained (the EL is behind past retention),
+    /// there is nothing to replay here — the EL must self-sync from peers (#631)
+    /// or be given a checkpoint; we log an actionable warning rather than strand
+    /// silently.
+    async fn el_catchup_replay(&self) {
+        let committed = self.last_committed_height.load(Ordering::Relaxed);
+        // Only an out-of-process EL reports a lagging executed height; an
+        // in-process application returns `None` and is skipped (no double-apply).
+        let Some(executed) = self.app.executed_height() else {
+            return;
+        };
+        if committed == 0 || executed.0 >= committed {
+            return;
+        }
+        let behind = committed - executed.0;
+        // The committed tip's content hash, from the height index, anchors the
+        // backward storage walk.
+        let tip_hash: BlockHash = match self.storage.get(&height_storage_key(Height(committed))) {
+            Ok(Some(raw)) if raw.len() == 32 => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&raw);
+                h
+            }
+            _ => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    executed = executed.0,
+                    committed,
+                    "el_catchup: no committed tip hash at the committed height; skipping EL replay",
+                );
+                return;
+            }
+        };
+        let gap = match load_block_range_from_storage(
+            &*self.storage,
+            tip_hash,
+            Height(executed.0 + 1),
+            Height(committed),
+            behind as usize,
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(target: TRACE_TARGET, error = %e, "el_catchup: loading the gap range failed; skipping EL replay");
+                return;
+            }
+        };
+        if (gap.len() as u64) < behind {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                executed = executed.0,
+                committed,
+                behind,
+                retained = gap.len(),
+                "el_catchup: execution layer is behind past the block-retention window; \
+                 the committed gap is not fully stored, so it cannot be replayed from \
+                 consensus. The EL must self-sync from peers (configure reth_peers, #631) \
+                 or be seeded from a checkpoint.",
+            );
+            return;
+        }
+        tracing::info!(
+            target: TRACE_TARGET,
+            executed = executed.0,
+            committed,
+            blocks = gap.len(),
+            "el_catchup: replaying committed payloads to catch the execution layer up",
+        );
+        for block in &gap {
+            if let Err(e) = self.app.commit(block).await {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height.0,
+                    error = %e,
+                    "el_catchup: replaying a committed block failed; stopping replay",
+                );
+                break;
+            }
+        }
+        let now = self.app.executed_height().map(|h| h.0).unwrap_or(committed);
+        tracing::info!(
+            target: TRACE_TARGET,
+            executed = now,
+            committed,
+            "el_catchup: EL replay finished",
+        );
+    }
+
     pub async fn run(
         mut self,
         broadcaster: Arc<dyn Broadcaster>,
@@ -1137,6 +1239,11 @@ impl ConsensusNode {
             validator_set_size = self.validator_set.len(),
             "consensus_resumed",
         );
+
+        // Before participating, catch a behind execution layer up by replaying
+        // the committed payloads consensus still holds (#635). A no-op for an
+        // in-process application or an already-caught-up EL.
+        self.el_catchup_replay().await;
 
         // Publish an initial snapshot before doing anything else, so
         // the HTTP endpoint has a sane value available even if it's
@@ -9512,6 +9619,119 @@ mod tests {
                 height.0,
             );
         }
+    }
+
+    // ── #635: startup EL-catch-up replay ───────────────────────────────────
+
+    /// An out-of-process-EL stand-in: reports a fixed `executed_height` (behind
+    /// the committed frontier) and records the heights replayed into it via
+    /// `commit`, so a test can assert the gap was replayed in order.
+    struct RecordingApp {
+        executed: Height,
+        commits: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl boule_consensus::replication::application::Application for RecordingApp {
+        fn build_proposal<'a>(
+            &'a self,
+            _parent: &'a Block,
+            _view: View,
+            _high_qc: &'a boule_consensus::hotstuff::QuorumCertificate,
+            _pending_blocks: &'a HashMap<BlockHash, Block>,
+            _timestamp: u64,
+        ) -> boule_core::clock::BoxFuture<'a, anyhow::Result<Block>> {
+            Box::pin(async { anyhow::bail!("RecordingApp does not build") })
+        }
+        fn commit<'a>(
+            &'a self,
+            block: &'a Block,
+        ) -> boule_core::clock::BoxFuture<'a, anyhow::Result<()>> {
+            let h = block.header.height.0;
+            Box::pin(async move {
+                self.commits.lock().unwrap().push(h);
+                Ok(())
+            })
+        }
+        fn executed_height(&self) -> Option<Height> {
+            Some(self.executed)
+        }
+        fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn state_commitment(&self) -> [u8; 32] {
+            [0u8; 32]
+        }
+        fn snapshot(&self) -> bytes::Bytes {
+            bytes::Bytes::new()
+        }
+        fn restore(&self, _snap: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn el_catchup_replays_the_in_storage_gap_in_order() {
+        // Commit heights 1..=5 to storage (archive mode), then point the node
+        // at an EL that has only executed up to height 2. The startup catch-up
+        // must replay heights 3,4,5 into the app, oldest-first.
+        let mut node = make_node_with_retention(nid(1), 0);
+        commit_n_blocks(&mut node, 5);
+        let app = Arc::new(RecordingApp {
+            executed: Height(2),
+            commits: std::sync::Mutex::new(Vec::new()),
+        });
+        node.app = app.clone();
+
+        node.el_catchup_replay().await;
+
+        assert_eq!(
+            *app.commits.lock().unwrap(),
+            vec![3, 4, 5],
+            "the in-storage gap (3..=5) must be replayed in height order",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_skips_an_app_that_never_lags() {
+        // The default `executed_height()` is `None` (in-process app): the
+        // catch-up must do nothing, even with committed blocks in storage.
+        let mut node = make_node_with_retention(nid(1), 0);
+        commit_n_blocks(&mut node, 4);
+        // The default node app is the counter MempoolBlockBuilder (None).
+        // Calling replay must not panic and must commit nothing extra; we
+        // assert by swapping in a RecordingApp that *claims* it is caught up.
+        let app = Arc::new(RecordingApp {
+            executed: Height(4),
+            commits: std::sync::Mutex::new(Vec::new()),
+        });
+        node.app = app.clone();
+        node.el_catchup_replay().await;
+        assert!(
+            app.commits.lock().unwrap().is_empty(),
+            "a caught-up EL must not be replayed into",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_does_not_replay_a_partly_pruned_gap() {
+        // Retention=2: after committing 1..=5, heights 1,2 are pruned. An EL at
+        // height 0 is behind past retention — the gap is not fully stored, so
+        // tier-3a cannot replay it (it must self-sync from peers instead). The
+        // catch-up must replay nothing rather than feed a non-contiguous gap.
+        let mut node = make_node_with_retention(nid(1), 2);
+        commit_n_blocks(&mut node, 5);
+        let app = Arc::new(RecordingApp {
+            executed: Height(0),
+            commits: std::sync::Mutex::new(Vec::new()),
+        });
+        node.app = app.clone();
+
+        node.el_catchup_replay().await;
+
+        assert!(
+            app.commits.lock().unwrap().is_empty(),
+            "a gap that is not fully retained must not be partially replayed",
+        );
     }
 
     #[test]

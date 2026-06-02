@@ -28,9 +28,9 @@ use boule_core::clock::BoxFuture;
 
 use bytes::Bytes;
 
-use crate::View;
 use crate::hotstuff::qc::QuorumCertificate;
 use crate::replication::block::{Block, BlockHash};
+use crate::{Height, View};
 
 /// The asynchronous production application seam.
 ///
@@ -93,6 +93,21 @@ pub trait Application: Send + Sync {
     ///
     /// [`StateMachine::apply`]: crate::replication::state_machine::StateMachine::apply
     fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    /// The height this application has actually **executed** — for an
+    /// out-of-process execution layer (a reth EL) this can lag the consensus
+    /// committed height, because [`Self::commit`] only advances the executed
+    /// frontier when the EL reports the payload `VALID`; while the EL is
+    /// `SYNCING` (missing the block's parent state) the frontier is held.
+    ///
+    /// `None` (the default) means "never lags": an in-process application that
+    /// executes synchronously at commit is always at the committed height, so
+    /// the integration layer's startup EL-catch-up (#635) skips it entirely.
+    /// `Some(h)` lets the integration layer detect a behind EL and replay the
+    /// committed payloads `(h, committed]` it still holds in storage.
+    fn executed_height(&self) -> Option<Height> {
+        None
+    }
 
     // ── Synchronous state queries ──────────────────────────────────────
     //
