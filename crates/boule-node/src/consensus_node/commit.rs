@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 
 use boule_consensus::Height;
 use boule_consensus::crashpoint::crashpoint;
+use boule_consensus::replication::application::CommitResult;
 use boule_consensus::replication::block::{Block, BlockHash};
 use boule_core::storage::{Storage, StorageExt};
 
@@ -36,16 +37,43 @@ impl ConsensusNode {
     /// the synchronous bookkeeping runs, because the snapshot-creation
     /// hook in [`Self::apply_commit`] serializes that state.
     pub(super) async fn commit_block(&mut self, block: Block) {
-        if let Err(e) = self.app.commit(&block).await {
-            tracing::error!(
-                target: TRACE_TARGET,
-                height = block.header.height.0,
-                view = block.header.view.0,
-                error = %e,
-                "application_commit_failed",
-            );
+        match self.app.commit(&block).await {
+            Ok(result) => self.stage_app_validator_updates(result, &block),
+            Err(e) => {
+                tracing::error!(
+                    target: TRACE_TARGET,
+                    height = block.header.height.0,
+                    view = block.header.view.0,
+                    error = %e,
+                    "application_commit_failed",
+                );
+            }
         }
         self.apply_commit(block);
+    }
+
+    /// Stage any validator-set changes the application requested at this
+    /// commit (the [`CommitResult`]'s `validator_updates`) so the next
+    /// proposal this node builds as leader can mint them into a `ReconfigCommand`
+    /// (deferred materialisation — see
+    /// [`ConsensusNode::staged_validator_updates`](super::ConsensusNode#structfield.staged_validator_updates)
+    /// and [`ConsensusNode::mint_staged_reconfig`](super::ConsensusNode::mint_staged_reconfig)).
+    /// A no-op for an application that does not drive membership (the reth
+    /// EL returns no updates), so the common path costs only the `is_empty`
+    /// check.
+    fn stage_app_validator_updates(&mut self, result: CommitResult, block: &Block) {
+        if result.validator_updates.is_empty() {
+            return;
+        }
+        tracing::info!(
+            target: TRACE_TARGET,
+            height = block.header.height.0,
+            view = block.header.view.0,
+            count = result.validator_updates.len(),
+            "app_validator_updates_staged",
+        );
+        self.staged_validator_updates
+            .extend(result.validator_updates);
     }
 
     /// Drain the committed commands from the mempool and make the commit
