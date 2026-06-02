@@ -80,6 +80,7 @@ use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
 use boule_consensus::replication::application::{Application, ValidatorUpdate};
 use boule_consensus::replication::block::BlockHash;
 use boule_consensus::replication::mempool::Mempool;
+use boule_consensus::replication::stake_source::BondedStakeLedger;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_history::ValidatorSetHistory;
@@ -606,6 +607,14 @@ impl ConsensusNode {
             Arc::clone(&last_committed_height),
             Arc::clone(&dropped_commands),
             config.propose_limit,
+            // CL-native stake source (#654) seeded from the genesis weighted
+            // set, so the demo's stake commands produce correct deltas.
+            Box::new(BondedStakeLedger::seeded_from(
+                config
+                    .validator_set
+                    .iter_weighted()
+                    .map(|(id, w)| (*id.as_node_id(), w)),
+            )),
         ));
 
         let validator_set_len = config.validator_set.len();
@@ -994,6 +1003,14 @@ impl ConsensusNode {
             Arc::clone(&last_committed_height),
             Arc::clone(&dropped_commands),
             config.propose_limit,
+            // CL-native stake source (#654) seeded from the genesis weighted
+            // set, so the demo's stake commands produce correct deltas.
+            Box::new(BondedStakeLedger::seeded_from(
+                config
+                    .validator_set
+                    .iter_weighted()
+                    .map(|(id, w)| (*id.as_node_id(), w)),
+            )),
         ));
         // #407: restore the leader-side `proposed_in_view` guard so a
         // crash between `Signed::sign` and the `Broadcast(Proposal)`
@@ -2075,6 +2092,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             10,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
         )
     }
 
@@ -2094,6 +2112,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             dropped_commands,
             10,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
         )
     }
 
@@ -2115,6 +2134,7 @@ mod tests {
             last_committed_height,
             Arc::new(AtomicU64::new(0)),
             10,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
         )
     }
 

@@ -12,6 +12,7 @@ use boule_consensus::hotstuff::step::BlockBuilder;
 use boule_consensus::replication::application::{Application, CommitResult};
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
+use boule_consensus::replication::stake_source::StakeSource;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::{Height, View};
 use boule_core::clock::BoxFuture;
@@ -53,6 +54,12 @@ pub struct MempoolBlockBuilder {
     /// a flood of rejected commands without grepping logs.
     dropped_commands: Arc<AtomicU64>,
     propose_limit: usize,
+    /// Pluggable source of the weighted validator set (#654). The demo
+    /// backend routes tagged [`StakeCommand`]s into this CL-native ledger at
+    /// `commit` and returns the resulting validator-set deltas. Behind a
+    /// `Box<dyn StakeSource>` so an EVM/Cosmos source (#655) can replace it
+    /// without touching the builder. `Mutex` because `commit` is `&self`.
+    stake_source: Mutex<Box<dyn StakeSource>>,
 }
 
 impl MempoolBlockBuilder {
@@ -63,6 +70,7 @@ impl MempoolBlockBuilder {
         last_committed_height: Arc<AtomicU64>,
         dropped_commands: Arc<AtomicU64>,
         propose_limit: usize,
+        stake_source: Box<dyn StakeSource>,
     ) -> Self {
         Self {
             self_id,
@@ -71,6 +79,7 @@ impl MempoolBlockBuilder {
             last_committed_height,
             dropped_commands,
             propose_limit,
+            stake_source: Mutex::new(stake_source),
         }
     }
 }
@@ -310,12 +319,14 @@ impl Application for MempoolBlockBuilder {
     /// change through the deferred-materialisation path (#225 M5).
     fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<CommitResult>> {
         Box::pin(async move {
-            let mut validator_updates = Vec::new();
+            let mut stake = self.stake_source.lock();
             let mut sm = self.state_machine.lock();
             for cmd in &block.commands {
                 if StakeCommand::is_stake_payload(cmd) {
                     match StakeCommand::decode(cmd) {
-                        Ok(stake) => validator_updates.push(stake.to_validator_update()),
+                        // Route the stake op into the CL-native source; the
+                        // resulting validator-set deltas are drained below.
+                        Ok(c) => stake.apply(c.node_id, c.op),
                         Err(e) => tracing::warn!(
                             target: TRACE_TARGET,
                             height = block.header.height.0,
@@ -334,7 +345,7 @@ impl Application for MempoolBlockBuilder {
                 }
             }
             Ok(CommitResult {
-                validator_updates,
+                validator_updates: stake.take_updates(),
                 app_data: None,
             })
         })
@@ -450,6 +461,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&dropped),
             64,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
         );
 
         let genesis = Block::genesis([0; 32], [0; 32]);
