@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 
 use boule_consensus::hotstuff::QuorumCertificate;
 use boule_consensus::hotstuff::step::BlockBuilder;
-use boule_consensus::replication::application::Application;
+use boule_consensus::replication::application::{Application, CommitResult};
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
@@ -287,7 +287,7 @@ impl Application for MempoolBlockBuilder {
     /// regardless of execution outcome. There is no real I/O, so the
     /// future is already resolved; a reth EL would instead `await` the
     /// Engine-API round trip here.
-    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<CommitResult>> {
         Box::pin(async move {
             let mut sm = self.state_machine.lock();
             for cmd in &block.commands {
@@ -299,7 +299,8 @@ impl Application for MempoolBlockBuilder {
                     );
                 }
             }
-            Ok(())
+            // The counter application drives no validator-set changes.
+            Ok(CommitResult::default())
         })
     }
 
