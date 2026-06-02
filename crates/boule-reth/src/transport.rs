@@ -146,9 +146,49 @@ pub async fn peer_reths(eth_url: &str, enodes: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Fetch reth's finalized head — its persisted forkchoice `finalized` block —
+/// as `(height, state_root)`, used to recover [`crate::RethApplication`]'s
+/// committed frontier on restart (reth keeps its own state DB across restarts,
+/// so its finalized block is the true committed frontier). `None` when reth has
+/// finalized nothing past genesis (a fresh node), in which case the caller
+/// keeps the genesis-initialized frontier. No JWT (public RPC).
+pub async fn fetch_finalized_head(eth_url: &str) -> Result<Option<(u64, [u8; 32])>> {
+    let transport = HttpTransport::new(String::new(), eth_url.to_string(), Vec::new(), None);
+    let block = transport
+        .eth("eth_getBlockByNumber", json!(["finalized", false]))
+        .await
+        .context("querying reth finalized block")?;
+    parse_finalized_head(&block)
+}
+
+/// Parse an `eth_getBlockByNumber("finalized")` result into the committed
+/// frontier. A `null` result (reth has no finalized block) or a finalized block
+/// still at genesis (height 0) both yield `None` — there is nothing to recover
+/// past the genesis-initialized frontier.
+fn parse_finalized_head(block: &Value) -> Result<Option<(u64, [u8; 32])>> {
+    if block.is_null() {
+        return Ok(None);
+    }
+    let height = u64::from_str_radix(
+        block["number"]
+            .as_str()
+            .context("finalized block number")?
+            .trim_start_matches("0x"),
+        16,
+    )
+    .context("finalized block number not hex")?;
+    if height == 0 {
+        return Ok(None);
+    }
+    let root =
+        crate::engine::root_from_hex(block["stateRoot"].as_str().context("finalized stateRoot")?)?;
+    Ok(Some((height, root)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::peer_reths;
+    use super::{parse_finalized_head, peer_reths};
+    use serde_json::json;
 
     #[tokio::test]
     async fn peer_reths_empty_is_a_noop() {
@@ -161,5 +201,35 @@ mod tests {
         // best-effort and must not fail node startup.
         let enodes = vec!["enode://ab@127.0.0.1:30303".to_string()];
         assert!(peer_reths("http://127.0.0.1:1", &enodes).await.is_ok());
+    }
+
+    #[test]
+    fn finalized_head_none_when_null_or_genesis() {
+        // reth has finalized nothing → null result.
+        assert_eq!(
+            parse_finalized_head(&serde_json::Value::Null).unwrap(),
+            None
+        );
+        // Finalized still at genesis (height 0) → nothing to recover.
+        let genesis = json!({ "number": "0x0", "stateRoot": format!("0x{}", "11".repeat(32)) });
+        assert_eq!(parse_finalized_head(&genesis).unwrap(), None);
+    }
+
+    #[test]
+    fn finalized_head_parses_height_and_root() {
+        let block = json!({
+            "number": "0x2a",
+            "stateRoot": format!("0x{}", "ab".repeat(32)),
+        });
+        assert_eq!(
+            parse_finalized_head(&block).unwrap(),
+            Some((42, [0xab; 32]))
+        );
+    }
+
+    #[test]
+    fn finalized_head_errors_on_malformed_number() {
+        let block = json!({ "number": "not-hex", "stateRoot": format!("0x{}", "11".repeat(32)) });
+        assert!(parse_finalized_head(&block).is_err());
     }
 }
