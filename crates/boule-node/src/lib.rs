@@ -500,6 +500,23 @@ async fn start_consensus(
         signature_scheme: cons_cfg.signature_scheme,
         block_retention_window: cons_cfg.block_retention_window,
         min_block_interval: Duration::from_millis(cons_cfg.min_block_interval_ms),
+        // Decode the optional weak-subjectivity checkpoint (#642). The hex/height
+        // are already format-validated in `preflight_validate`; decode to the
+        // wire types here so the node can enforce it at commit/recover.
+        weak_subjectivity_checkpoint: cons_cfg
+            .weak_subjectivity_checkpoint
+            .as_ref()
+            .map(|cp| {
+                let h = cp.hash.strip_prefix("0x").unwrap_or(&cp.hash);
+                let bytes = hex::decode(h)
+                    .context("[consensus.weak_subjectivity_checkpoint].hash is not valid hex")?;
+                let hash: boule_consensus::replication::block::BlockHash = bytes
+                    .as_slice()
+                    .try_into()
+                    .context("[consensus.weak_subjectivity_checkpoint].hash must be 32 bytes")?;
+                anyhow::Ok((boule_consensus::Height(cp.height), hash))
+            })
+            .transpose()?,
     };
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -942,6 +959,7 @@ mod tests {
         ConsensusConfig {
             validators: vec![],
             genesis_seed_hex: None,
+            weak_subjectivity_checkpoint: None,
             application: None,
             propose_limit: 64,
             mempool_capacity: 1024,

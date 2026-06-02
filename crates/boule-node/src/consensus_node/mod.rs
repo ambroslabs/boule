@@ -382,6 +382,10 @@ pub struct ConsensusNode {
     /// leader (#614). `Duration::ZERO` disables pacing. See
     /// [`NodeConfigForConsensus::min_block_interval`].
     min_block_interval: Duration,
+    /// Optional weak-subjectivity checkpoint (#642): `(height, block_hash)` of a
+    /// recent operator-trusted finalized block. When set, the node halts rather
+    /// than commit or recover a chain whose block at that height disagrees.
+    weak_subjectivity_checkpoint: Option<(Height, BlockHash)>,
     /// When this node, as leader, last broadcast a proposal. Used to decide
     /// whether a fresh proposal must wait out [`Self::min_block_interval`].
     last_proposal_at: Option<tokio::time::Instant>,
@@ -521,6 +525,30 @@ pub(super) struct BlockSyncRangeInflight {
     pub(super) last_asked_at: tokio::time::Instant,
 }
 
+/// Returns a halt message if `block_hash` at `height` violates the configured
+/// weak-subjectivity checkpoint — the block sits exactly at the checkpoint
+/// height but does not hash to the trusted hash. `None` when there is no
+/// checkpoint, the heights differ, or the hash matches. Pure so the policy is
+/// unit-testable; the callers turn `Some` into a fatal halt (#642).
+pub(super) fn weak_subjectivity_violation(
+    checkpoint: Option<(Height, BlockHash)>,
+    height: Height,
+    block_hash: BlockHash,
+) -> Option<String> {
+    let (cp_height, cp_hash) = checkpoint?;
+    if height != cp_height || block_hash == cp_hash {
+        return None;
+    }
+    Some(format!(
+        "block at the weak-subjectivity checkpoint height {} hashes to {} but the configured \
+         checkpoint is {}; this node is on a chain that disagrees with the operator-trusted \
+         anchor",
+        cp_height.0,
+        hex::encode(block_hash),
+        hex::encode(cp_hash),
+    ))
+}
+
 impl ConsensusNode {
     /// Construct a `ConsensusNode` from configuration and backing
     /// resources. Does **not** start the event loop.
@@ -636,6 +664,7 @@ impl ConsensusNode {
             loopback_stack: Vec::new(),
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
+            weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             last_proposal_at: None,
             stashed_proposal: None,
             dropped_commands,
@@ -1037,6 +1066,7 @@ impl ConsensusNode {
             loopback_stack: Vec::new(),
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
+            weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             last_proposal_at: None,
             stashed_proposal: None,
             dropped_commands,
@@ -1110,6 +1140,54 @@ impl ConsensusNode {
     /// there is nothing to replay here — the EL must self-sync from peers (#631)
     /// or be given a checkpoint; we log an actionable warning rather than strand
     /// silently.
+    /// Verify the recovered committed chain against the weak-subjectivity
+    /// checkpoint on startup (#642). Commits at/after this point are checked as
+    /// they happen ([`Self::apply_commit`]); this catches a node that *already*
+    /// committed past the checkpoint height with a disagreeing block (e.g. it
+    /// synced a bad chain before the operator configured the anchor). Halts on a
+    /// mismatch. If the checkpoint height is pruned below the retention window
+    /// it cannot be re-checked here — it was enforced at commit time — so we
+    /// only note it.
+    fn verify_weak_subjectivity_on_startup(&self) {
+        let Some((cp_height, _)) = self.weak_subjectivity_checkpoint else {
+            return;
+        };
+        if self.last_committed_height.load(Ordering::Relaxed) < cp_height.0 {
+            return; // not yet at the checkpoint; enforced when we commit it
+        }
+        let stored = self.storage.get(&height_storage_key(cp_height));
+        let hash: BlockHash = match stored {
+            Ok(Some(raw)) if raw.len() == 32 => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&raw);
+                h
+            }
+            _ => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    checkpoint_height = cp_height.0,
+                    "weak-subjectivity checkpoint height is not in the durable block index \
+                     (pruned below retention?); skipping the startup re-check — it was enforced \
+                     at commit time",
+                );
+                return;
+            }
+        };
+        // Fatal: refuse to follow a chain that contradicts the trusted anchor.
+        // Same fail-stop stance (a logged `panic!`) as the durable-persist guard
+        // in `apply_commit` — consensus halts loudly so an operator intervenes.
+        if let Some(msg) =
+            weak_subjectivity_violation(self.weak_subjectivity_checkpoint, cp_height, hash)
+        {
+            panic!("consensus: {msg}; halting on startup (#642)");
+        }
+        tracing::info!(
+            target: TRACE_TARGET,
+            checkpoint_height = cp_height.0,
+            "weak-subjectivity checkpoint verified against the committed chain",
+        );
+    }
+
     async fn el_catchup_replay(&self) {
         let committed = self.last_committed_height.load(Ordering::Relaxed);
         // Only an out-of-process EL reports a lagging executed height; an
@@ -1239,6 +1317,9 @@ impl ConsensusNode {
             validator_set_size = self.validator_set.len(),
             "consensus_resumed",
         );
+
+        // Refuse to run a chain that contradicts the operator's trusted anchor.
+        self.verify_weak_subjectivity_on_startup();
 
         // Before participating, catch a behind execution layer up by replaying
         // the committed payloads consensus still holds (#635). A no-op for an
@@ -9732,6 +9813,69 @@ mod tests {
             app.commits.lock().unwrap().is_empty(),
             "a gap that is not fully retained must not be partially replayed",
         );
+    }
+
+    // ── #642: weak-subjectivity checkpoint ─────────────────────────────────
+
+    #[test]
+    fn weak_subjectivity_violation_only_fires_on_a_mismatch_at_the_height() {
+        let cp = Some((Height(5), [0xAA; 32]));
+        // No checkpoint → never fires.
+        assert!(weak_subjectivity_violation(None, Height(5), [0xBB; 32]).is_none());
+        // Different height → not the anchor, no opinion.
+        assert!(weak_subjectivity_violation(cp, Height(4), [0xBB; 32]).is_none());
+        // Same height, matching hash → fine.
+        assert!(weak_subjectivity_violation(cp, Height(5), [0xAA; 32]).is_none());
+        // Same height, different hash → violation.
+        assert!(weak_subjectivity_violation(cp, Height(5), [0xBB; 32]).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "weak-subjectivity checkpoint height")]
+    fn apply_commit_halts_on_a_checkpoint_mismatch() {
+        // Anchor height 2 to a hash the real block-2 cannot have → committing
+        // height 2 must halt the node.
+        let mut node = make_node(nid(1));
+        node.weak_subjectivity_checkpoint = Some((Height(2), [0xFF; 32]));
+        commit_n_blocks(&mut node, 3);
+    }
+
+    #[test]
+    fn apply_commit_accepts_a_matching_checkpoint() {
+        // Commit first (no checkpoint), then anchor to the real block-2 hash and
+        // commit further — the matching anchor must not halt.
+        let mut node = make_node(nid(1));
+        let hashes = commit_n_blocks(&mut node, 2);
+        node.weak_subjectivity_checkpoint = Some((Height(2), hashes[1]));
+        let next = empty_block(hashes[1], 3, 3);
+        node.apply_commit(next); // height 3 ≠ checkpoint height; no-op for the check
+        assert_eq!(node.last_committed_height.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn verify_weak_subjectivity_on_startup_passes_when_the_chain_agrees() {
+        let mut node = make_node(nid(1));
+        let hashes = commit_n_blocks(&mut node, 4);
+        node.weak_subjectivity_checkpoint = Some((Height(3), hashes[2]));
+        node.verify_weak_subjectivity_on_startup(); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "weak-subjectivity checkpoint height")]
+    fn verify_weak_subjectivity_on_startup_halts_when_the_chain_disagrees() {
+        let mut node = make_node(nid(1));
+        commit_n_blocks(&mut node, 4);
+        node.weak_subjectivity_checkpoint = Some((Height(3), [0xFF; 32]));
+        node.verify_weak_subjectivity_on_startup();
+    }
+
+    #[test]
+    fn verify_weak_subjectivity_on_startup_is_a_noop_before_the_checkpoint_height() {
+        // Committed only to height 2, checkpoint at 9 → nothing to check yet.
+        let mut node = make_node(nid(1));
+        commit_n_blocks(&mut node, 2);
+        node.weak_subjectivity_checkpoint = Some((Height(9), [0xFF; 32]));
+        node.verify_weak_subjectivity_on_startup(); // must not panic
     }
 
     #[test]

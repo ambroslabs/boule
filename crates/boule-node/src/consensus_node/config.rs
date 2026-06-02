@@ -2,10 +2,10 @@
 
 use std::time::Duration;
 
-use boule_consensus::View;
 use boule_consensus::limits::CacheLimits;
-use boule_consensus::replication::block::Block;
+use boule_consensus::replication::block::{Block, BlockHash};
 use boule_consensus::validator_set::ValidatorSet;
+use boule_consensus::{Height, View};
 
 /// Plain-data configuration for a [`super::ConsensusNode`].
 ///
@@ -71,6 +71,12 @@ pub struct NodeConfigForConsensus {
     /// otherwise outrun it (most sharply a single-validator set, where it
     /// turns an unbounded propose/self-vote loop into a steady block time).
     pub min_block_interval: Duration,
+
+    /// Optional weak-subjectivity checkpoint (#642): `(height, block_hash)` of a
+    /// recent operator-trusted finalized block. When set, the node refuses to
+    /// commit or recover a chain whose block at `height` does not hash to
+    /// `block_hash`. `None` (the default) is genesis-anchored.
+    pub weak_subjectivity_checkpoint: Option<(Height, BlockHash)>,
 }
 
 impl NodeConfigForConsensus {
@@ -102,6 +108,7 @@ impl NodeConfigForConsensus {
             // Pacing off by default: tests assert on per-event scheduling
             // and must not gain an artificial block-time floor.
             min_block_interval: Duration::ZERO,
+            weak_subjectivity_checkpoint: None,
         }
     }
 }

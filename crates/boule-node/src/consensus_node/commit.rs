@@ -100,6 +100,18 @@ impl ConsensusNode {
         // commit; there's no intermediate "wrote new block but didn't
         // delete old one" state to recover from.
         let block_hash = block.hash();
+        // Weak-subjectivity enforcement (#642): if this commit is at the
+        // operator-configured checkpoint height but disagrees with the trusted
+        // hash, the node is following a chain that contradicts its anchor —
+        // halt before persisting it, the same fail-stop stance as the
+        // durable-persist guard below.
+        if let Some(msg) = super::weak_subjectivity_violation(
+            self.weak_subjectivity_checkpoint,
+            block.header.height,
+            block_hash,
+        ) {
+            panic!("consensus: {msg}; halting (#642)");
+        }
         let key = block_storage_key(&block_hash);
         let height_key = height_storage_key(block.header.height);
         let last_committed = LastCommitted {

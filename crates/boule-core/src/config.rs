@@ -235,6 +235,14 @@ pub struct ConsensusConfig {
     /// verifies that bridge at startup).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_seed_hex: Option<String>,
+    /// Optional weak-subjectivity checkpoint (#642): a recent, operator-trusted
+    /// finalized block. When set, the node refuses to commit or recover a chain
+    /// whose block at `height` does not hash to `hash` — an anchor a fresh
+    /// joiner trusts instead of re-verifying the whole history from genesis, and
+    /// the snap-sync pivot anchor for the reth backend. Unset (the default) is
+    /// genesis-anchored, today's behaviour. See `[consensus.weak_subjectivity_checkpoint]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weak_subjectivity_checkpoint: Option<WeakSubjectivityCheckpoint>,
     /// Execution backend (`[consensus.application]`). Absent = the
     /// built-in counter state machine. See [`ApplicationConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -322,6 +330,25 @@ pub struct ConsensusConfig {
     /// of producing blocks as fast as the loop spins.
     #[serde(default)]
     pub min_block_interval_ms: u64,
+}
+
+/// A weak-subjectivity checkpoint: a recent, operator-trusted finalized block,
+/// surfaced as the `[consensus.weak_subjectivity_checkpoint]` TOML table.
+///
+/// It is the trust anchor a fresh joiner uses instead of re-verifying the whole
+/// chain from genesis: the node refuses to commit or recover any chain whose
+/// block at `height` does not hash to `hash`. Operators source it out of band
+/// (a block hash from a trusted node / explorer at a recent finalized height).
+/// Trade-off: a stale checkpoint still anchors safety but lets the node accept a
+/// longer prefix unverified-against-recent-state; genesis-only (unset) verifies
+/// everything but cannot rule out a long-range fork a fresh joiner is fed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WeakSubjectivityCheckpoint {
+    /// Committed height the checkpoint pins. Must be `> 0` (genesis is already
+    /// agreed via `genesis_seed_hex`).
+    pub height: u64,
+    /// 32-byte block content hash at `height`, lower-case hex (64 chars).
+    pub hash: String,
 }
 
 /// One row of [`ConsensusConfig::validators_bls`]: the BLS half of a
@@ -1314,6 +1341,21 @@ impl Config {
                     anyhow::bail!("[consensus].genesis_seed_hex must be 64 hex chars");
                 }
             }
+            if let Some(cp) = cons.weak_subjectivity_checkpoint.as_ref() {
+                if cp.height == 0 {
+                    anyhow::bail!(
+                        "[consensus.weak_subjectivity_checkpoint].height must be > 0 \
+                         (genesis is anchored by genesis_seed_hex)"
+                    );
+                }
+                let h = cp.hash.strip_prefix("0x").unwrap_or(&cp.hash);
+                if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+                    anyhow::bail!(
+                        "[consensus.weak_subjectivity_checkpoint].hash must be a 32-byte hex \
+                         block hash (64 hex chars)"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1701,6 +1743,52 @@ storage_dir = "/tmp/cons"
         assert_eq!(cons.timeout_base_ms, 100);
         assert_eq!(cons.timeout_max_ms, 5000);
         assert_eq!(cons.storage_dir, Some(PathBuf::from("/tmp/cons")));
+    }
+
+    const VALID_HASH64: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn weak_subjectivity_checkpoint_parses_and_validates() {
+        let c = parse(&format!(
+            "[node]\nlisten_addr = \"127.0.0.1:7000\"\n[api]\nlisten_addr = \"127.0.0.1:8080\"\n[consensus]\nvalidators = []\n\
+             [consensus.weak_subjectivity_checkpoint]\nheight = 1000\nhash = \"{VALID_HASH64}\"\n",
+        ));
+        let cp = c
+            .consensus
+            .as_ref()
+            .unwrap()
+            .weak_subjectivity_checkpoint
+            .as_ref()
+            .expect("checkpoint present");
+        assert_eq!(cp.height, 1000);
+        c.preflight_validate()
+            .expect("a valid checkpoint passes preflight");
+    }
+
+    #[test]
+    fn weak_subjectivity_checkpoint_unset_by_default() {
+        let c = parse(
+            "[node]\nlisten_addr = \"127.0.0.1:7000\"\n[api]\nlisten_addr = \"127.0.0.1:8080\"\n[consensus]\nvalidators = []\n",
+        );
+        assert!(c.consensus.unwrap().weak_subjectivity_checkpoint.is_none());
+    }
+
+    #[test]
+    fn weak_subjectivity_checkpoint_rejects_bad_hash() {
+        let c = parse(
+            "[node]\nlisten_addr = \"127.0.0.1:7000\"\n[api]\nlisten_addr = \"127.0.0.1:8080\"\n[consensus]\nvalidators = []\n\
+             [consensus.weak_subjectivity_checkpoint]\nheight = 5\nhash = \"not-hex\"\n",
+        );
+        assert!(c.preflight_validate().is_err());
+    }
+
+    #[test]
+    fn weak_subjectivity_checkpoint_rejects_zero_height() {
+        let c = parse(&format!(
+            "[node]\nlisten_addr = \"127.0.0.1:7000\"\n[api]\nlisten_addr = \"127.0.0.1:8080\"\n[consensus]\nvalidators = []\n\
+             [consensus.weak_subjectivity_checkpoint]\nheight = 0\nhash = \"{VALID_HASH64}\"\n",
+        ));
+        assert!(c.preflight_validate().is_err());
     }
 
     #[test]
