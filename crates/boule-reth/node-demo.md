@@ -14,17 +14,18 @@ Engine API, then sends an EVM transfer through consensus.
 
 ## Scope
 
-This is the **single-validator** path. It is correct for one validator on
-a **fresh start**. Not yet supported:
+This is the **single-validator** path. Not yet supported:
 
 - **Multi-validator** — a rotated leader building on a not-yet-committed
   parent needs that parent's payload registered in its own reth, which
   requires registering payloads on proposal-receipt (a follow-up).
-- **Restart** — the reth `Application` tracks its committed frontier in
-  memory and starts at genesis, so restarting a node against an
-  already-advanced reth is not yet reconciled. Run from a fresh datadir.
 - **State-sync** — a fresh joiner cannot reconstruct reth's world state
   from a consensus snapshot; it needs reth's own state-sync.
+
+On **restart** the node reconciles the reth `Application`'s committed frontier
+with reth's persisted finalized head, so a node restarted against an
+already-advanced reth resumes with the correct lagged `committed_state_root`
+(no fresh datadir required).
 
 ## 0. Prerequisites
 

@@ -359,14 +359,31 @@ async fn reth_application(
     let transport =
         boule_reth::HttpTransport::new(engine_url.clone(), eth_url.clone(), secret, None);
     info!(target: "boule::node", %engine_url, %eth_url, "reth execution backend enabled");
-    Ok(Arc::new(boule_reth::RethApplication::new(
+    let app = boule_reth::RethApplication::new(
         Box::new(transport),
         self_id,
         fee_recipient.clone(),
         reth_genesis_hash,
         reth_genesis_root,
         Duration::from_millis(*build_wait_ms),
-    )))
+    );
+    // On restart, reth (its own persistent DB) is already at the finalized head
+    // while `new` reset the in-memory frontier to genesis. Reconcile the two so
+    // the first post-restart proposal stamps the correct lagged
+    // `committed_state_root` (#630); a fresh node has no finalized head and
+    // keeps the genesis frontier.
+    if let Some((height, state_root)) = boule_reth::fetch_finalized_head(eth_url)
+        .await
+        .context("querying reth finalized head over eth_url")?
+    {
+        app.recover_frontier(boule_consensus::Height(height), state_root);
+        info!(
+            target: "boule::node",
+            height,
+            "recovered reth committed frontier from finalized head on restart",
+        );
+    }
+    Ok(Arc::new(app))
 }
 
 /// Stub for builds without the `reth` feature: selecting the reth backend

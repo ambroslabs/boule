@@ -88,6 +88,19 @@ impl RethApplication {
         RethEngine::new(&*self.transport, self.fee_recipient.clone())
     }
 
+    /// Reconcile the committed frontier with reality on restart. `new` starts at
+    /// `(0, genesis_root)`, but on a restart reth (its own persistent DB) is
+    /// already at the finalized head while consensus recovers its committed
+    /// height from storage — so without this the first post-restart proposal
+    /// would stamp a genesis lagged `committed_state_root` and fail the
+    /// deferred-root vote check. The caller passes reth's finalized
+    /// `(height, state_root)` (see [`crate::fetch_finalized_head`]).
+    pub fn recover_frontier(&self, height: Height, state_root: [u8; 32]) {
+        let mut c = self.committed.lock();
+        c.height = height;
+        c.state_root = state_root;
+    }
+
     /// The EVM `(block hash, timestamp-seconds)` to build the next block on.
     /// For the boule genesis parent (no commands) that's reth's genesis;
     /// otherwise it is read from the parent boule block's payload command.
@@ -415,6 +428,18 @@ mod tests {
     fn restore_rejects_a_wrong_length_blob() {
         let app = make_app([0u8; 32]);
         assert!(app.restore(&[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn recover_frontier_seeds_height_and_root_on_restart() {
+        // Fresh construction starts at the genesis frontier...
+        let app = make_app([7u8; 32]);
+        assert_eq!(app.committed.lock().height, Height(0));
+        assert_eq!(app.state_commitment(), [7u8; 32]);
+        // ...and restart recovery reconciles it to reth's finalized head.
+        app.recover_frontier(Height(99), [0xCD; 32]);
+        assert_eq!(app.committed.lock().height, Height(99));
+        assert_eq!(app.state_commitment(), [0xCD; 32]);
     }
 
     // ── #629: uncommitted-ancestor registration on the build path ──────────
