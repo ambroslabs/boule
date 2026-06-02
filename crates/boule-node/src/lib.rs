@@ -29,6 +29,7 @@ use tracing::{info, warn};
 
 use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
 use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
+use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_set::ValidatorSet;
@@ -242,7 +243,9 @@ pub async fn run(
     let api_handle = {
         let mut app = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx.clone()));
         if let Some(rc) = consensus_runtime.as_ref() {
-            app = app.merge(boule_consensus::api::router(rc.status_rx.clone()));
+            app = app
+                .merge(boule_consensus::api::router(rc.status_rx.clone()))
+                .merge(boule_consensus::api::submit_router(Arc::clone(&rc.mempool)));
         }
         tokio::spawn(async move {
             info!("HTTP API listening on {api_actual_addr}");
@@ -309,6 +312,10 @@ struct RunningConsensus {
     consensus_shutdown: oneshot::Sender<()>,
     /// Snapshot of the consensus status, served by the HTTP API.
     status_rx: watch::Receiver<Arc<ConsensusStatus>>,
+    /// The node's mempool, shared with the HTTP API so `POST
+    /// /mempool/submit` can admit transactions into the same pool the
+    /// block builder draws from.
+    mempool: Arc<dyn Mempool>,
     /// Oneshot that gracefully stops the gossip overlay (the
     /// orchestrator + publisher + partial-mesh maintenance tasks).
     overlay_shutdown: Option<oneshot::Sender<()>>,
@@ -521,7 +528,7 @@ async fn start_consensus(
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
         Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
-    let mempool = Arc::new(InMemoryMempool::new(cons_cfg.mempool_capacity));
+    let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(cons_cfg.mempool_capacity));
 
     // Wire the broadcaster + discovery + upstream event channel
     // according to the configured overlay mode.
@@ -560,8 +567,14 @@ async fn start_consensus(
         storage.as_ref(),
     )?;
 
-    let mut node =
-        ConsensusNode::recover(*self_id, node_cfg, state_machine, mempool, storage, wal)?;
+    let mut node = ConsensusNode::recover(
+        *self_id,
+        node_cfg,
+        state_machine,
+        Arc::clone(&mempool),
+        storage,
+        wal,
+    )?;
     if let Some(BlsBootstrap { history, identity }) = bls_setup {
         node = node.with_bls_key_history(history);
         let bls_signer: Arc<
@@ -617,6 +630,7 @@ async fn start_consensus(
         join,
         consensus_shutdown: shutdown_tx,
         status_rx,
+        mempool,
         overlay_shutdown,
         overlay_joins,
     })
