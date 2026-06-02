@@ -260,15 +260,10 @@ async fn submitted_stake_command_changes_the_validator_set() {
     }
     let obs_api = obs_api.expect("a node other than the removed one");
 
-    // Submit an app-level stake command (weight 0 = remove) to every node —
-    // no cross-validator tx gossip yet, so whichever node leads next must
-    // already hold it.
-    let cmd = StakeCommand {
-        node_id: removed,
-        weight: 0,
-    }
-    .encode()
-    .to_vec();
+    // Submit an app-level stake command (fully unbond -> remove) to every
+    // node — no cross-validator tx gossip yet, so whichever node leads next
+    // must already hold it. Genesis stake is 1, so unbonding 1 zeroes it.
+    let cmd = StakeCommand::unbond(removed, 1).encode().to_vec();
     let http = reqwest::Client::new();
     for n in &state.nodes {
         let api = n.api_addr.expect("api_addr");
@@ -394,12 +389,8 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
     }
     let obs_api = obs_api.expect("a node other than the removed one");
 
-    let cmd = StakeCommand {
-        node_id: removed,
-        weight: 0,
-    }
-    .encode()
-    .to_vec();
+    // Genesis stake is 1, so a full unbond removes the validator.
+    let cmd = StakeCommand::unbond(removed, 1).encode().to_vec();
     let http = reqwest::Client::new();
     for n in &state.nodes {
         let api = n.api_addr.expect("api_addr");
