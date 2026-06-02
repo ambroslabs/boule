@@ -35,7 +35,7 @@ WORK="${WORK:-/tmp/boule-reth-testnet}"
 SENDER_PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 RECIPIENT=0x000000000000000000000000000000000000dEaD
 
-for bin in reth cast openssl jq curl; do
+for bin in reth cast openssl jq curl python3; do
   command -v "$bin" >/dev/null || { echo "FATAL: '$bin' not found on PATH"; exit 2; }
 done
 if [ ! -x "$BOULE" ]; then
@@ -221,9 +221,69 @@ else
   fail "no divergence: $DIV total divergence events across the cluster"
 fi
 
+# 5. EVM-native staking (#655): a `withdraw` to the staking predeploy removes
+#    a validator from the boule set, and the cluster keeps committing. This
+#    exercises the whole P1→P2 path on real reth — predeploy event → eth_getLogs
+#    in commit → StakeSource → validator_updates → reconfig.
+STAKING=0x0000000000000000000000000000000000000b0e
+boule_status() { curl -s "http://127.0.0.1:$((8000 + $1))/consensus/status"; }
+# boule NodeIds are base58; the contract's `bytes32 nodeId` arg needs the
+# 32-byte hex. Decode here (no external python module needed).
+b58_to_hex() {
+  python3 - "$1" <<'PY'
+import sys
+A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+n = 0
+for c in sys.argv[1]:
+    n = n * 58 + A.index(c)
+print("0x" + n.to_bytes(32, "big").hex())
+PY
+}
+
+REMOVE_B58="${NID[$N]}"            # remove the last validator; survivors = 1..N-1
+REMOVE_HEX=$(b58_to_hex "$REMOVE_B58")
+BEFORE=$(boule_status 1 | jq -r '.validator_set | length')
+echo "  … unbonding validator $REMOVE_B58 ($REMOVE_HEX) via $STAKING (set size before=$BEFORE)"
+# A large amount saturates the ledger to zero regardless of the seeded stake,
+# so the validator is removed (weight 0). Sent to node1's reth; gossip carries
+# it to whichever validator leads next.
+if ! cast send --rpc-url "$(eth_rpc 1)" --private-key "$SENDER_PK" "$STAKING" \
+      "withdraw(bytes32,uint256)" "$REMOVE_HEX" 1000000 --json >/dev/null 2>&1; then
+  fail "staking: cast send withdraw failed"
+fi
+
+# Poll the survivors until the app-driven reconfig has materialised and taken
+# effect (commit-latency + the mint's v_eff settle margin → ~tens of seconds).
+REMOVED=0
+for _ in $(seq 1 60); do
+  ok=1
+  for i in $(seq 1 "$N"); do
+    [ "$i" -eq "$N" ] && continue          # the removed node need not keep following
+    st=$(boule_status "$i")
+    len=$(echo "$st" | jq -r '.validator_set | length')
+    has=$(echo "$st" | jq -r --arg v "$REMOVE_B58" '.validator_set | index($v) // "no"')
+    { [ "$len" = "$((N - 1))" ] && [ "$has" = "no" ]; } || ok=0
+  done
+  [ "$ok" = 1 ] && { REMOVED=1; break; }
+  sleep 2
+done
+if [ "$REMOVED" = 1 ]; then
+  pass "staking: a withdraw removed $REMOVE_B58 — set shrank to $((N - 1)) on all survivors"
+else
+  fail "staking: validator set did not shrink to $((N - 1)) after the withdraw"
+fi
+
+# Liveness under the reduced set: a survivor keeps committing.
+HB=$(head_of 1); sleep 8; HA=$(head_of 1)
+if [ "$HA" -gt "$HB" ]; then
+  pass "staking: cluster keeps committing under the reduced set ($HB → $HA)"
+else
+  fail "staking: cluster stalled after the removal ($HB → $HA)"
+fi
+
 echo "═════════════════════════════════════════════════════"
 if [ "$FAILS" = 0 ]; then
-  echo "RESULT: PASS — $N-validator reth cluster commits in agreement across leader rotations and lands a tx."
+  echo "RESULT: PASS — $N-validator reth cluster commits in agreement across leader rotations, lands a tx, and an EVM staking withdraw removes a validator (#655)."
   exit 0
 else
   echo "RESULT: FAIL — $FAILS assertion(s) failed (logs under $WORK)."
