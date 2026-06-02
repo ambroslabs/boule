@@ -44,16 +44,26 @@ pub const RECONFIG_TAG: &[u8; 6] = b"RECFG\0";
 /// this is rejected pre-commit.
 pub const MIN_VALIDATOR_FLOOR: usize = 4;
 
-/// Minimum gap (in views) between the current view at validation time and
-/// the proposed effective view.
+/// Minimum gap (in views) between the proposing block's view and the
+/// proposed effective view.
 ///
-/// With `MIN_V_EFF_DELAY = 2`, a reconfig validated at view `N` must
-/// target `v_eff >= N + 2`, giving a newly-added validator a window to
-/// finish state sync (#139) before it must vote. #140 open question
-/// "Effective-view delay" — value is settled here as the consensus-side
-/// minimum; operators may target a larger delay via the CLI but cannot
-/// undercut this floor.
-pub const MIN_V_EFF_DELAY: View = View::new(2);
+/// A reconfig validated against block view `N` must target `v_eff >= N +
+/// MIN_V_EFF_DELAY`. The floor must exceed the **commit depth**: a reconfig
+/// rides in a block at view `N` that only commits ~`N + 3` views later (the
+/// HotStuff three-chain), and the boundary is applied at commit. A `v_eff`
+/// at or below the commit view lands *in the past* — retroactively
+/// reassigning the validator set for views where QCs were already formed
+/// under the old set, which then fail verification and stall the chain
+/// (#667). At `MIN_V_EFF_DELAY = 4`, `v_eff >= N + 4` clears the three-chain
+/// commit (~`N + 3`), so the boundary is still in the future when applied.
+/// This also gives a newly-added validator a window to finish state sync
+/// (#139) before it must vote. Operators may target a larger delay via the
+/// CLI but cannot undercut this floor.
+///
+/// Note: this is a happy-path floor. Under sustained timeouts a reconfig
+/// block can commit much later than `N + 3`, so even `N + 4` can be
+/// overtaken — a fully timeout-robust bound is tracked in #667.
+pub const MIN_V_EFF_DELAY: View = View::new(4);
 
 /// A pubkey + network address pair describing a validator to admit.
 ///

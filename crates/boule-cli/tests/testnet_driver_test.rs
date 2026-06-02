@@ -335,6 +335,137 @@ async fn submitted_stake_command_changes_the_validator_set() {
     lifecycle::down(&wd, &state).expect("down");
 }
 
+/// Reconfig hardening (#668): app-driven removal of a *middle* validator on
+/// the multi-process testnet. Removing a non-last validator re-indexes the
+/// Ed25519-collected QC signer bitmap for every validator sorted after it,
+/// so QCs under the post-boundary 4-set must still verify — i.e. the
+/// cluster must keep committing. (`submitted_stake_command_changes_the_validator_set`
+/// removes the highest-sorted validator, the trivial bitmap case.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
+    use boule_core::identity::base58_to_node_id;
+    use boule_node::demo_staking::StakeCommand;
+    use boule_node::testnet::admin;
+
+    let _serial = TEST_SERIAL.lock().await;
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_boule"));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let wd = tmp.path().to_path_buf();
+
+    let spec = topology::TopologySpec {
+        nodes: 5,
+        seed_extra: 0,
+        target_degree: 4,
+        seed: 21,
+    };
+    let state = lifecycle::new_cluster(lifecycle::NewArgs {
+        workdir: wd.clone(),
+        spec,
+        binary: bin.clone(),
+        timeout_base_ms: 200,
+        timeout_max_ms: 1_500,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+    })
+    .await
+    .expect("new_cluster");
+    let _pids = lifecycle::up_all(&wd, &bin, &state).await.expect("up_all");
+
+    wait::all_reach_height(&state, 2, Duration::from_secs(6))
+        .await
+        .expect("warm-up commits");
+
+    // Remove the *median* validator (index 2 of the sorted 5), shifting the
+    // bitmap positions of the two validators sorted after it.
+    let api0 = state.nodes[0].api_addr.expect("api_addr");
+    let st0 = admin::consensus_status(api0).await.expect("status");
+    assert_eq!(st0.validator_set.len(), 5, "genesis set has 5 validators");
+    let removed_b58 = st0.validator_set[2].clone();
+    let removed = base58_to_node_id(&removed_b58).expect("decode removed node id");
+
+    // An API of a node that stays seated, to watch progress afterward.
+    let mut obs_api = None;
+    for n in &state.nodes {
+        let api = n.api_addr.expect("api_addr");
+        let st = admin::consensus_status(api).await.expect("status");
+        if st.node_id != removed_b58 {
+            obs_api = Some(api);
+            break;
+        }
+    }
+    let obs_api = obs_api.expect("a node other than the removed one");
+
+    let cmd = StakeCommand {
+        node_id: removed,
+        weight: 0,
+    }
+    .encode()
+    .to_vec();
+    let http = reqwest::Client::new();
+    for n in &state.nodes {
+        let api = n.api_addr.expect("api_addr");
+        let resp = http
+            .post(format!("http://{api}/mempool/submit"))
+            .body(cmd.clone())
+            .send()
+            .await
+            .expect("submit request");
+        assert_eq!(
+            resp.status().as_u16(),
+            202,
+            "{} accepts stake tx",
+            n.display_name()
+        );
+    }
+
+    // Active set shrinks to 4 and the median is gone, on every node.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut all_reduced = true;
+        for n in &state.nodes {
+            let api = n.api_addr.expect("api_addr");
+            let st = admin::consensus_status(api).await.expect("status");
+            if st.validator_set.len() != 4 || st.validator_set.contains(&removed_b58) {
+                all_reduced = false;
+            }
+        }
+        if all_reduced {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mid-set removal did not take effect within budget",
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    // Liveness under the re-indexed 4-set: a still-seated node keeps
+    // committing. If the bitmap re-index were wrong, post-boundary QCs would
+    // fail verification and this would stall.
+    let base_h = admin::consensus_status(obs_api)
+        .await
+        .expect("status")
+        .last_committed_height
+        .0;
+    let live_deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        let h = admin::consensus_status(obs_api)
+            .await
+            .expect("status")
+            .last_committed_height
+            .0;
+        if h >= base_h + 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < live_deadline,
+            "cluster did not keep committing after a mid-set removal",
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    lifecycle::down(&wd, &state).expect("down");
+}
+
 /// Issue #205, items 1 and 3 in one test: `Step::Up` is now idempotent
 /// (no-op when the node is already alive), and `wait::all_advance_by`
 /// gates on *new* commits since the wait started.
