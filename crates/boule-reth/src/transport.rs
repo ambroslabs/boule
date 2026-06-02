@@ -22,6 +22,15 @@ use crate::jwt;
 /// style of `boule_core`'s `Clock`/`Broadcaster`.
 pub trait EngineTransport: Send + Sync {
     fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>>;
+
+    /// A public `eth_*` JSON-RPC call (no JWT) — e.g. `eth_getLogs`, used to
+    /// read the staking predeploy's events (#655). The default errors; only
+    /// transports backed by reth's public RPC (the live [`HttpTransport`])
+    /// or test fixtures override it.
+    fn eth_rpc(&self, method: &str, _params: Value) -> BoxFuture<'_, Result<Value>> {
+        let method = method.to_string();
+        Box::pin(async move { bail!("eth_* RPC unsupported by this transport: {method}") })
+    }
 }
 
 /// Live transport over reth's two ports: authenticated Engine API (`:8551`,
@@ -82,6 +91,11 @@ impl HttpTransport {
 }
 
 impl EngineTransport for HttpTransport {
+    fn eth_rpc(&self, method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+        let method = method.to_string();
+        Box::pin(async move { self.rpc(&self.eth_url, &method, params, false).await })
+    }
+
     fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
         let method = method.to_string();
         let tag = tag.to_string();
