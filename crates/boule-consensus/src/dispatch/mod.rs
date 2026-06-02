@@ -75,6 +75,7 @@ pub use ingress::{
     ingress_snapshot_manifest_response, ingress_timeout_vote, ingress_vote,
     ingress_wire_with_qc_verification, ingress_with_qc_verification,
 };
+pub use verify::equivocation::{EquivocationError, EquivocationProof, verify_equivocation_proof};
 
 // Re-imports referenced from doc-comments above.
 #[allow(unused_imports)]
