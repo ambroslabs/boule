@@ -672,14 +672,30 @@ impl ConsensusNode {
                     );
                 }
             } else {
-                load_block_from_storage(self.storage.as_ref(), &cursor)?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "validator history rebuild: storage missing committed block at \
-                             hash {} (chain walk diverged from persisted \
-                             last_committed_hash)",
-                        hex::encode(cursor),
-                    )
-                })?
+                match load_block_from_storage(self.storage.as_ref(), &cursor)? {
+                    Some(block) => block,
+                    None => {
+                        // The backward walk reached a committed block that
+                        // `block_retention_window` has pruned from storage. On
+                        // a chain longer than the retention window this is the
+                        // *expected* state, not tampering — we simply can't
+                        // rebuild the validator history all the way to genesis
+                        // to cross-check it. Skip this best-effort anti-rollback
+                        // verification (trusting the persisted history blob for
+                        // the pruned prefix) rather than refusing to start: a
+                        // node must be able to restart after retention has
+                        // pruned old blocks. Full coverage would require never
+                        // pruning reconfig-boundary blocks (a follow-up).
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            pruned_hash = %hex::encode(cursor),
+                            "validator-history consistency check skipped: committed chain pruned \
+                             below the retention window; trusting the persisted history for the \
+                             pruned prefix",
+                        );
+                        return Ok(());
+                    }
+                }
             };
             let is_genesis = block.header.height == Height::ZERO;
             let parent = block.header.parent_hash;
