@@ -18,6 +18,7 @@ use boule_core::clock::BoxFuture;
 use boule_transport_tcp::NodeId;
 
 use super::TRACE_TARGET;
+use crate::demo_staking::StakeCommand;
 
 /// [`BlockBuilder`] that assembles a child block from the local mempool
 /// and the current committed state machine.
@@ -151,6 +152,12 @@ impl BlockBuilder for MempoolBlockBuilder {
             // failures (which carry only `cmd_idx`).
             for ancestor in ancestor_chain.iter().rev() {
                 for (cmd_idx, cmd) in ancestor.commands.iter().enumerate() {
+                    // App-level stake commands (the demo backend) are not
+                    // counter-SM commands — skip them here so they neither
+                    // fail `apply` nor affect the counter commitment.
+                    if StakeCommand::is_stake_payload(cmd) {
+                        continue;
+                    }
                     match sm.apply(cmd) {
                         Ok(_) => {
                             commitment = sm.state_commitment();
@@ -179,6 +186,11 @@ impl BlockBuilder for MempoolBlockBuilder {
             commands.retain(|cmd| {
                 if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
                     || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
+                    // App-level stake commands (the demo backend) are
+                    // includable by the application even though the counter
+                    // SM doesn't decode them; `commit` turns them into
+                    // validator updates.
+                    || StakeCommand::is_stake_payload(cmd)
                 {
                     return true;
                 }
@@ -197,6 +209,9 @@ impl BlockBuilder for MempoolBlockBuilder {
                 }
             });
             for (cmd_idx, cmd) in commands.iter().enumerate() {
+                if StakeCommand::is_stake_payload(cmd) {
+                    continue;
+                }
                 match sm.apply(cmd) {
                     Ok(_) => {
                         commitment = sm.state_commitment();
@@ -287,10 +302,29 @@ impl Application for MempoolBlockBuilder {
     /// regardless of execution outcome. There is no real I/O, so the
     /// future is already resolved; a reth EL would instead `await` the
     /// Engine-API round trip here.
+    ///
+    /// As the demo app-driven-validator backend (#225 M6), it also
+    /// recognises tagged [`StakeCommand`]s: these are not counter-SM
+    /// commands, so they are surfaced as `validator_updates` rather than
+    /// applied to the state machine, driving an app-driven validator-set
+    /// change through the deferred-materialisation path (#225 M5).
     fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<CommitResult>> {
         Box::pin(async move {
+            let mut validator_updates = Vec::new();
             let mut sm = self.state_machine.lock();
             for cmd in &block.commands {
+                if StakeCommand::is_stake_payload(cmd) {
+                    match StakeCommand::decode(cmd) {
+                        Ok(stake) => validator_updates.push(stake.to_validator_update()),
+                        Err(e) => tracing::warn!(
+                            target: TRACE_TARGET,
+                            height = block.header.height.0,
+                            error = %e,
+                            "demo_stake_command_malformed",
+                        ),
+                    }
+                    continue;
+                }
                 if let Err(e) = sm.apply(cmd) {
                     tracing::error!(
                         "consensus: SM apply failed for committed block (height={}, view={}): {e}",
@@ -299,8 +333,10 @@ impl Application for MempoolBlockBuilder {
                     );
                 }
             }
-            // The counter application drives no validator-set changes.
-            Ok(CommitResult::default())
+            Ok(CommitResult {
+                validator_updates,
+                app_data: None,
+            })
         })
     }
 
@@ -308,6 +344,14 @@ impl Application for MempoolBlockBuilder {
     // in-process state machine under its lock.
 
     fn check(&self, cmd: &[u8]) -> anyhow::Result<()> {
+        // App-level stake commands (the demo backend) are includable even
+        // though the counter SM doesn't decode them — `commit` turns them
+        // into validator updates. This is what lets the vote-time
+        // includability check (which calls `app.check`) accept a block
+        // carrying a stake command.
+        if StakeCommand::is_stake_payload(cmd) {
+            return Ok(());
+        }
         self.state_machine.lock().check(cmd)
     }
 
