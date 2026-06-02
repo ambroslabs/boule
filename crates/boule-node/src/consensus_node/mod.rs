@@ -77,7 +77,7 @@ use boule_consensus::pacemaker::Pacemaker;
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::pacemaker::timeout::ExponentialBackoff;
 use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
-use boule_consensus::replication::application::Application;
+use boule_consensus::replication::application::{Application, ValidatorUpdate};
 use boule_consensus::replication::block::BlockHash;
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
@@ -94,6 +94,7 @@ use boule_transport_tcp::tls::node_id_to_base58;
 use boule_transport_tcp::{NodeId, ProtocolEvent};
 
 mod action_interpreter;
+mod app_reconfig;
 mod block_builder;
 mod block_sync;
 mod commit;
@@ -386,6 +387,17 @@ pub struct ConsensusNode {
     /// recent operator-trusted finalized block. When set, the node halts rather
     /// than commit or recover a chain whose block at that height disagrees.
     weak_subjectivity_checkpoint: Option<(Height, BlockHash)>,
+    /// Validator-set changes the [`Application`] requested at its last
+    /// `commit` (the [`CommitResult`](boule_consensus::replication::application::CommitResult)'s
+    /// `validator_updates`) that have not yet been
+    /// materialised into a committed reconfig. Staged here at commit and,
+    /// when this node next builds a proposal as leader, minted into a
+    /// [`ReconfigCommand`](boule_consensus::reconfig::ReconfigCommand) on the
+    /// block (deferred materialisation, #225 M5) so the change flows through
+    /// the same validated, header-committed, recoverable reconfig path as a
+    /// governance reconfig. Cleared once a reconfig boundary lands. Always
+    /// empty for an application that does not drive membership (the reth EL).
+    staged_validator_updates: Vec<ValidatorUpdate>,
     /// When this node, as leader, last broadcast a proposal. Used to decide
     /// whether a fresh proposal must wait out [`Self::min_block_interval`].
     last_proposal_at: Option<tokio::time::Instant>,
@@ -665,6 +677,7 @@ impl ConsensusNode {
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
+            staged_validator_updates: Vec::new(),
             last_proposal_at: None,
             stashed_proposal: None,
             dropped_commands,
@@ -1067,6 +1080,7 @@ impl ConsensusNode {
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
+            staged_validator_updates: Vec::new(),
             last_proposal_at: None,
             stashed_proposal: None,
             dropped_commands,
@@ -9726,11 +9740,14 @@ mod tests {
         fn commit<'a>(
             &'a self,
             block: &'a Block,
-        ) -> boule_core::clock::BoxFuture<'a, anyhow::Result<()>> {
+        ) -> boule_core::clock::BoxFuture<
+            'a,
+            anyhow::Result<boule_consensus::replication::application::CommitResult>,
+        > {
             let h = block.header.height.0;
             Box::pin(async move {
                 self.commits.lock().unwrap().push(h);
-                Ok(())
+                Ok(boule_consensus::replication::application::CommitResult::default())
             })
         }
         fn executed_height(&self) -> Option<Height> {
@@ -9748,6 +9765,138 @@ mod tests {
         fn restore(&self, _snap: &[u8]) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    /// An application that requests a batch of validator updates from its
+    /// first `commit` and nothing thereafter — the test stand-in for a
+    /// staking backend driving the validator set (#225 M5).
+    struct StakingTestApp {
+        pending: std::sync::Mutex<Option<Vec<ValidatorUpdate>>>,
+    }
+    impl StakingTestApp {
+        fn new(updates: Vec<ValidatorUpdate>) -> Self {
+            Self {
+                pending: std::sync::Mutex::new(Some(updates)),
+            }
+        }
+    }
+    impl boule_consensus::replication::application::Application for StakingTestApp {
+        fn build_proposal<'a>(
+            &'a self,
+            _parent: &'a Block,
+            _view: View,
+            _high_qc: &'a boule_consensus::hotstuff::QuorumCertificate,
+            _pending_blocks: &'a HashMap<BlockHash, Block>,
+            _timestamp: u64,
+        ) -> boule_core::clock::BoxFuture<'a, anyhow::Result<Block>> {
+            Box::pin(async { anyhow::bail!("StakingTestApp does not build") })
+        }
+        fn commit<'a>(
+            &'a self,
+            _block: &'a Block,
+        ) -> boule_core::clock::BoxFuture<
+            'a,
+            anyhow::Result<boule_consensus::replication::application::CommitResult>,
+        > {
+            let validator_updates = self.pending.lock().unwrap().take().unwrap_or_default();
+            Box::pin(async move {
+                Ok(boule_consensus::replication::application::CommitResult {
+                    validator_updates,
+                    app_data: None,
+                })
+            })
+        }
+        fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn state_commitment(&self) -> [u8; 32] {
+            [0u8; 32]
+        }
+        fn snapshot(&self) -> bytes::Bytes {
+            bytes::Bytes::new()
+        }
+        fn restore(&self, _snap: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// End-to-end seam (#225 M5): an application that returns
+    /// `validator_updates` from `commit` has them staged, minted into a
+    /// `ReconfigCommand` on the next proposal this node builds as leader, and
+    /// — once that command commits — reflected in the active validator set.
+    /// This exercises the whole deferred-materialisation path: stage →
+    /// mint-into-mempool → existing reconfig apply.
+    #[tokio::test]
+    async fn app_validator_updates_become_a_committed_reconfig() {
+        use boule_consensus::reconfig::ReconfigCommand;
+        use boule_consensus::validator_set::ValidatorId;
+
+        let node = make_node_with_retention(nid(1), 0);
+        let mempool = Arc::clone(&node.mempool);
+        // The app asks to raise validator nid(2)'s weight from 1 to 5.
+        let app = Arc::new(StakingTestApp::new(vec![ValidatorUpdate {
+            node_id: nid(2),
+            weight: 5,
+        }]));
+        let mut node = node.with_application(app);
+
+        // 1. Commit a trigger block — the app returns the update, staged.
+        let trigger = empty_block(genesis().hash(), 1, 1);
+        let trigger_hash = trigger.hash();
+        node.commit_block(trigger).await;
+        assert_eq!(
+            node.staged_validator_updates.len(),
+            1,
+            "the app's validator update is staged at commit",
+        );
+
+        // 2. As leader building at view 2, mint the staged update into a
+        //    ReconfigCommand in the mempool. The stage stays put until the
+        //    reconfig actually lands.
+        node.mint_staged_reconfig(View(2));
+        assert_eq!(
+            node.staged_validator_updates.len(),
+            1,
+            "minting does not clear the stage (only a committed boundary does)",
+        );
+
+        // 3. The mempool now carries a reconfig expressing the weight change.
+        let proposed = mempool.propose(16);
+        let reconfig_bytes = proposed
+            .iter()
+            .find(|c| ReconfigCommand::is_reconfig_payload(c))
+            .expect("a reconfig command was minted into the mempool");
+        let cmd = ReconfigCommand::decode(reconfig_bytes).expect("minted reconfig decodes");
+        assert!(
+            cmd.adds.is_empty() && cmd.removes.is_empty(),
+            "a weight change mints neither adds nor removes",
+        );
+        assert_eq!(cmd.changes.len(), 1);
+        assert_eq!(cmd.changes[0].node_id, nid(2));
+        assert_eq!(cmd.changes[0].weight, 5);
+        let v_eff = cmd.v_eff;
+
+        // 4. Commit a block at view 2 carrying the reconfig (so the apply-time
+        //    delay check `v_eff >= block_view + delay` holds).
+        let mut reconfig_block = empty_block(trigger_hash, 2, 2);
+        reconfig_block.commands = vec![reconfig_bytes.clone()];
+        reconfig_block.header.commands_commitment =
+            Block::commands_commitment(&reconfig_block.commands);
+        node.apply_commit(reconfig_block);
+
+        // 5. The active set at v_eff carries the new weight, and the stage is
+        //    cleared now that the boundary has landed.
+        let set_at = node.validator_history.set_at(v_eff);
+        let set = set_at.for_view(v_eff);
+        assert_eq!(
+            set.weight_for(&ValidatorId::from_genesis_pubkey(nid(2))),
+            Some(5),
+            "the app-driven weight change is active at v_eff",
+        );
+        assert!(
+            node.staged_validator_updates.is_empty(),
+            "the stage is cleared once the reconfig boundary commits",
+        );
     }
 
     #[tokio::test]

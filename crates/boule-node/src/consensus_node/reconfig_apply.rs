@@ -195,6 +195,15 @@ impl ConsensusNode {
         // just reset to whatever state was durably written before the
         // last successful flush.
         if applied_any {
+            // A reconfig boundary landed, so any app-driven validator
+            // updates this node had staged are now materialised (this is
+            // where a minted ReconfigCommand takes effect). Clear the stage
+            // so the next proposal does not re-mint them. A governance
+            // reconfig committing also clears the stage — app-driven and
+            // governance reconfigs racing is out of scope for now; the
+            // application re-requests on a future commit if needed.
+            self.staged_validator_updates.clear();
+
             let persisted = self.validator_history.to_persisted();
             match postcard::to_stdvec(&persisted) {
                 Ok(bytes) => {

@@ -25,12 +25,63 @@
 use std::collections::HashMap;
 
 use boule_core::clock::BoxFuture;
+use boule_core::identity::NodeId;
 
 use bytes::Bytes;
 
 use crate::hotstuff::qc::QuorumCertificate;
 use crate::replication::block::{Block, BlockHash};
 use crate::{Height, View};
+
+/// One application-driven change to the validator set, mirroring ABCI's
+/// `ValidatorUpdate { pub_key, power }`: the application names a validator
+/// by its identity key and the voting weight it should have.
+///
+/// `weight == 0` removes the validator; `weight >= 1` adds it (if not
+/// currently seated) or changes its weight (if it is). The integration
+/// layer translates a batch of these into the existing reconfig path and
+/// applies them at a view boundary — that *consumer* is a follow-up; today
+/// the integration layer only **receives** them, so this type is the seam,
+/// not yet a live control path.
+///
+/// Resolving a network endpoint for a newly *added* validator is out of
+/// scope here (it is the validator endpoint-advertisement concern); a
+/// `weight`-only update is what the stake-source backends this seam exists
+/// for need — a CL-native staking ledger, an EVM staking interface, or a
+/// Cosmos x/staking module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatorUpdate {
+    /// The validator's identity key (its [`NodeId`]). ABCI's `pub_key`.
+    pub node_id: NodeId,
+    /// The voting weight the validator should have at the next view
+    /// boundary; `0` removes it. ABCI's `power`.
+    pub weight: u64,
+}
+
+/// What an [`Application`] returns from [`Application::commit`] — the channel
+/// by which a committed block's execution feeds information back to consensus.
+///
+/// This is the application seam's commit-time return value, mirroring ABCI's
+/// `ResponseFinalizeBlock`. It exists so an application that owns membership
+/// (a staking module) can drive the validator set. [`Default`] is "nothing to
+/// report": an application that does not drive membership — the reth EL, where
+/// Ethereum keeps the validator set in the *consensus* layer, not the
+/// execution layer — returns `CommitResult::default()` and behaves exactly as
+/// the previous `Result<()>` return did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitResult {
+    /// Validator-set changes the application requests as a result of this
+    /// commit. Empty for an application that does not drive membership. The
+    /// integration layer does not consume these yet — applying them at a view
+    /// boundary via the reconfig path is the next step on this seam.
+    pub validator_updates: Vec<ValidatorUpdate>,
+    /// Opaque application output for this commit (an ABCI `app_data`-style
+    /// escape hatch). Carried for backends that need to surface per-commit
+    /// data to consensus; the *commitment* story for it — a new header field
+    /// vs. folding into the commands commitment — is deliberately left
+    /// unsettled, so the integration layer currently ignores it.
+    pub app_data: Option<Bytes>,
+}
 
 /// The asynchronous production application seam.
 ///
@@ -91,8 +142,14 @@ pub trait Application: Send + Sync {
     /// (per the [`StateMachine::apply`] contract) are its own concern and
     /// need not surface here.
     ///
+    /// On success the application returns a [`CommitResult`] — the channel
+    /// by which an application that owns membership feeds validator-set
+    /// changes back to consensus. An application that does not drive
+    /// membership (the reth EL) returns [`CommitResult::default`], which is
+    /// behaviourally identical to the previous `Result<()>`.
+    ///
     /// [`StateMachine::apply`]: crate::replication::state_machine::StateMachine::apply
-    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<()>>;
+    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<CommitResult>>;
 
     /// The height this application has actually **executed** — for an
     /// out-of-process execution layer (a reth EL) this can lag the consensus
@@ -149,4 +206,42 @@ pub trait Application: Send + Sync {
     ///
     /// [`StateMachine::restore`]: crate::replication::state_machine::StateMachine::restore
     fn restore(&self, snap: &[u8]) -> anyhow::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_result_default_reports_nothing() {
+        // The contract a non-membership-driving application (the reth EL)
+        // relies on: the default is empty, i.e. behaviourally identical to
+        // the old `Result<()>` return.
+        let r = CommitResult::default();
+        assert!(r.validator_updates.is_empty());
+        assert!(r.app_data.is_none());
+    }
+
+    #[test]
+    fn commit_result_carries_validator_updates() {
+        // Locks the public shape the membership consumer will read: a
+        // weight-keyed update where 0 removes. ABCI's `{pub_key, power}`.
+        let r = CommitResult {
+            validator_updates: vec![
+                ValidatorUpdate {
+                    node_id: [1u8; 32],
+                    weight: 5,
+                },
+                ValidatorUpdate {
+                    node_id: [2u8; 32],
+                    weight: 0,
+                },
+            ],
+            app_data: Some(Bytes::from_static(b"opaque")),
+        };
+        assert_eq!(r.validator_updates.len(), 2);
+        assert_eq!(r.validator_updates[0].weight, 5);
+        assert_eq!(r.validator_updates[1].weight, 0);
+        assert_eq!(r.app_data.as_deref(), Some(b"opaque".as_ref()));
+    }
 }

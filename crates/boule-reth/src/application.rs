@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use boule_consensus::hotstuff::QuorumCertificate;
-use boule_consensus::replication::application::Application;
+use boule_consensus::replication::application::{Application, CommitResult};
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::{Height, View};
 use boule_core::clock::BoxFuture;
@@ -242,11 +242,11 @@ impl Application for RethApplication {
         })
     }
 
-    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, Result<()>> {
+    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, Result<CommitResult>> {
         Box::pin(async move {
             let Some(cmd) = block.commands.first() else {
                 // Genesis / empty block: nothing to execute.
-                return Ok(());
+                return Ok(CommitResult::default());
             };
             let payload: Value = serde_json::from_slice(cmd)
                 .context("committed block command is not a JSON execution payload")?;
@@ -273,7 +273,9 @@ impl Application for RethApplication {
                     );
                 }
             }
-            Ok(())
+            // Ethereum keeps the validator set in the consensus layer, not
+            // the EL, so the reth application drives no membership changes.
+            Ok(CommitResult::default())
         })
     }
 
@@ -392,7 +394,10 @@ mod tests {
             .build_proposal(&g, View(1), &sample_qc(&g), &HashMap::new(), 0)
             .await
             .expect("build");
-        app.commit(&block).await.expect("commit");
+        let result = app.commit(&block).await.expect("commit");
+        // The reth EL drives no membership changes — Ethereum keeps the
+        // validator set in the consensus layer.
+        assert!(result.validator_updates.is_empty());
 
         assert_eq!(hex::encode(app.state_commitment()), BLOCK1_STATE_ROOT);
     }

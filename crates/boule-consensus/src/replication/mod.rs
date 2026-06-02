@@ -37,7 +37,7 @@ pub mod snapshot;
 pub mod state_machine;
 
 #[allow(unused_imports)]
-pub use application::Application;
+pub use application::{Application, CommitResult, ValidatorUpdate};
 #[allow(unused_imports)]
 pub use block::{Block, BlockHash, BlockHeader, validate_structural};
 #[allow(unused_imports)]
