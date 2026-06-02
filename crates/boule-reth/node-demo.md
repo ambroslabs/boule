@@ -156,6 +156,51 @@ time as boule drives reth. A MetaMask wallet pointed at `:8545`
 (chain-specific settings from `genesis.json`) can deploy and call
 contracts the same way.
 
+## 7. Recovery: fresh and behind nodes
+
+A node that joins from genesis, or restarts after losing its data, recovers in
+two independent layers:
+
+- **Consensus (CL).** boule catches its committed chain up over the network —
+  by block-sync when the gap is within `block_retention_window`, or by
+  snapshot-sync (then following live consensus) when it is further behind. The
+  node ends up committed at the live tip without necessarily holding every
+  intermediate block locally.
+- **Execution (EL).** reth catches its EVM state up *itself* over devp2p. When
+  consensus commits a block whose parent state reth doesn't have, the Engine
+  API returns `SYNCING`; boule keeps driving `forkchoiceUpdated` (head = safe =
+  `finalized`) so reth has a target, and reth backfills from its peers — **full
+  sync** (re-execute bodies) or **snap sync** (download the state trie at a
+  recent pivot, then execute forward). It needs the validator reths **peered**
+  (§4); an unpeered reth has no one to backfill from and stays at genesis.
+
+So peering is not just a steady-state nicety — it is what lets a fresh or
+deeply-behind EL recover at all. With it, a node wiped past the retention
+window rejoins end to end: consensus jumps to the tip and reth self-syncs up to
+the same `stateRoot` the rest of the cluster agrees on.
+
+### Trust model
+
+Snap-downloaded state is **Merkle-verified against the pivot block's
+`stateRoot`**: account ranges carry boundary proofs, storage verifies against
+each account's `storageRoot`, bytecode against its `codeHash` — all chaining up
+to `stateRoot`. A malicious EL peer can therefore only *withhold* state
+(liveness), never *forge* it (safety). The single trusted input is the **pivot
+`stateRoot`**, and boule supplies it: `forkchoiceUpdated(finalized = H)` names a
+BFT-committed block whose header carries the consensus-agreed EVM commitment
+(itself validated by the lagged deferred-root check). Unlike mainnet there is no
+probabilistic pivot — finality is real.
+
+Operator-supplied trust parameters:
+
+- the **genesis validator set** (already required to join consensus), and/or
+- an optional **weak-subjectivity checkpoint** — a recent finalized boule block
+  a fresh joiner can anchor to instead of QC-verifying from genesis (not yet a
+  config knob; tracked as a follow-up).
+
+Liveness assumptions: at least one honest reth peer serving state, and a pivot
+recent enough that non-archive peers still retain its state.
+
 ## Re-capturing the test fixtures
 
 `boule-reth`'s offline tests replay golden Engine API exchanges in
