@@ -336,6 +336,7 @@ async fn reth_application(
     cfg: &ApplicationConfig,
     self_id: NodeId,
     genesis_state_commitment: [u8; 32],
+    genesis_stake: Vec<([u8; 32], u64)>,
 ) -> anyhow::Result<Arc<dyn boule_consensus::replication::application::Application>> {
     let ApplicationConfig::Reth {
         engine_url,
@@ -367,6 +368,11 @@ async fn reth_application(
     let transport =
         boule_reth::HttpTransport::new(engine_url.clone(), eth_url.clone(), secret, None);
     info!(target: "boule::node", %engine_url, %eth_url, "reth execution backend enabled");
+    // CL-native stake ledger (#654) seeded from the genesis validator set;
+    // the reth application feeds it the staking predeploy's events (#655).
+    let stake_source: Box<dyn boule_consensus::replication::stake_source::StakeSource> = Box::new(
+        boule_consensus::replication::stake_source::BondedStakeLedger::seeded_from(genesis_stake),
+    );
     let app = boule_reth::RethApplication::new(
         Box::new(transport),
         self_id,
@@ -374,6 +380,7 @@ async fn reth_application(
         reth_genesis_hash,
         reth_genesis_root,
         Duration::from_millis(*build_wait_ms),
+        stake_source,
     );
     // On restart, reth (its own persistent DB) is already at the finalized head
     // while `new` reset the in-memory frontier to genesis. Reconcile the two so
@@ -401,6 +408,7 @@ async fn reth_application(
     _cfg: &ApplicationConfig,
     _self_id: NodeId,
     _genesis_state_commitment: [u8; 32],
+    _genesis_stake: Vec<([u8; 32], u64)>,
 ) -> anyhow::Result<Arc<dyn boule_consensus::replication::application::Application>> {
     anyhow::bail!(
         "config selects [consensus.application] backend = \"reth\", but this binary was built \
@@ -434,6 +442,14 @@ async fn start_consensus(
         "consensus: validator_set has {} members",
         validator_set.len()
     );
+    // Genesis stake (= genesis weight) per validator, captured before
+    // `validator_set` is moved into the node config. Seeds the reth backend's
+    // stake ledger (#655) so a post-genesis unbond computes the right delta;
+    // unused by the counter backend.
+    let genesis_stake: Vec<([u8; 32], u64)> = validator_set
+        .iter_weighted()
+        .map(|(id, w)| (*id.as_node_id(), w))
+        .collect();
 
     // Resolve genesis BLS keys + reconcile this node's local BLS
     // identity with the chain's scheme (#335). This catches three
@@ -593,7 +609,8 @@ async fn start_consensus(
     match cons_cfg.application.as_ref() {
         None | Some(ApplicationConfig::Counter) => {}
         Some(reth_cfg) => {
-            let app = reth_application(reth_cfg, *self_id, genesis_state_commitment).await?;
+            let app = reth_application(reth_cfg, *self_id, genesis_state_commitment, genesis_stake)
+                .await?;
             node = node.with_application(app);
         }
     }

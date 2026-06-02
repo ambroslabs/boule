@@ -26,8 +26,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use boule_consensus::hotstuff::QuorumCertificate;
-use boule_consensus::replication::application::{Application, CommitResult};
+use boule_consensus::replication::application::{Application, CommitResult, ValidatorUpdate};
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
+use boule_consensus::replication::stake_source::StakeSource;
 use boule_consensus::{Height, View};
 use boule_core::clock::BoxFuture;
 use boule_core::identity::NodeId;
@@ -36,6 +37,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
+use crate::staking;
 use crate::transport::EngineTransport;
 
 /// The committed frontier reth has executed and finalized: the height of the
@@ -56,6 +58,10 @@ pub struct RethApplication {
     /// async build can pull pool transactions in before the payload is sealed.
     build_wait: Duration,
     committed: Mutex<Committed>,
+    /// Validator-set source-of-truth (#654/#655). The CL-native ledger fed by
+    /// the staking predeploy's `Deposit`/`Withdraw` events, which `commit`
+    /// reads from each executed block. Seeded from the genesis validator set.
+    stake_source: Mutex<Box<dyn StakeSource>>,
 }
 
 impl RethApplication {
@@ -70,6 +76,7 @@ impl RethApplication {
         reth_genesis_hash: impl Into<String>,
         genesis_root: [u8; 32],
         build_wait: Duration,
+        stake_source: Box<dyn StakeSource>,
     ) -> Self {
         Self {
             transport,
@@ -81,11 +88,48 @@ impl RethApplication {
                 height: Height::ZERO,
                 state_root: genesis_root,
             }),
+            stake_source: Mutex::new(stake_source),
         }
     }
 
     fn engine(&self) -> RethEngine<'_> {
         RethEngine::new(&*self.transport, self.fee_recipient.clone())
+    }
+
+    /// Read the staking predeploy's `Deposit`/`Withdraw` events for the
+    /// just-executed `payload`, apply them to the CL-native stake ledger,
+    /// and return the validator-set deltas (#655). Only called once the EL
+    /// reports the payload `VALID`, so its logs are available. A failed
+    /// `eth_getLogs` is logged and yields no updates — a transient RPC error
+    /// must not fail the commit (consensus commits regardless of the EL).
+    async fn derive_validator_updates(&self, payload: &Value) -> Vec<ValidatorUpdate> {
+        let Some(block_hash) = payload["blockHash"].as_str() else {
+            return Vec::new();
+        };
+        let logs = match self
+            .transport
+            .eth_rpc("eth_getLogs", staking::logs_filter(block_hash))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "boule::reth",
+                    error = %e,
+                    "eth_getLogs for staking events failed; no validator updates this block",
+                );
+                return Vec::new();
+            }
+        };
+        let ops = staking::parse_stake_logs(&logs);
+        if ops.is_empty() {
+            return Vec::new();
+        }
+        let mut src = self.stake_source.lock();
+        for (node_id, op) in ops {
+            src.apply(node_id, op);
+        }
+        src.take_updates()
     }
 
     /// Reconcile the committed frontier with reality on restart. `new` starts at
@@ -266,16 +310,28 @@ impl Application for RethApplication {
                     // the last executed block until the EL reports VALID — don't
                     // claim a state the EL hasn't reached. Not an error:
                     // consensus commits regardless of EL execution outcome.
+                    //
+                    // Staking events are read only once the EL reports VALID
+                    // (below) — its logs aren't available while syncing — so
+                    // membership changes from this block are deferred until the
+                    // EL catches up and the block is re-committed (#635).
                     tracing::info!(
                         target: "boule::reth",
                         height = block.header.height.0,
-                        "reth EL syncing toward committed block; frontier held until VALID",
+                        "reth EL syncing toward committed block; frontier + staking held until VALID",
                     );
+                    return Ok(CommitResult::default());
                 }
             }
-            // Ethereum keeps the validator set in the consensus layer, not
-            // the EL, so the reth application drives no membership changes.
-            Ok(CommitResult::default())
+            // The EL executed this block, so the staking predeploy's events for
+            // it are now readable. Read them (#655) and feed the CL-native
+            // stake ledger; the resulting deltas become validator_updates the
+            // integration layer materialises into a reconfig (#652).
+            let validator_updates = self.derive_validator_updates(&payload).await;
+            Ok(CommitResult {
+                validator_updates,
+                app_data: None,
+            })
         })
     }
 
@@ -345,6 +401,7 @@ mod tests {
             RETH_GENESIS,
             genesis_root,
             Duration::ZERO,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
         )
     }
 
@@ -400,6 +457,63 @@ mod tests {
         assert!(result.validator_updates.is_empty());
 
         assert_eq!(hex::encode(app.state_commitment()), BLOCK1_STATE_ROOT);
+    }
+
+    /// Test transport: engine_* via the golden fixtures (so `commit` reaches
+    /// VALID), plus a canned `eth_getLogs` result so the staking read path
+    /// can be exercised without a live reth.
+    struct StakingTransport {
+        inner: FixtureTransport,
+        logs: Value,
+    }
+    impl EngineTransport for StakingTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, _method: &str, _params: Value) -> BoxFuture<'_, Result<Value>> {
+            let logs = self.logs.clone();
+            Box::pin(async move { Ok(logs) })
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_reads_staking_logs_into_validator_updates() {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        // A validator seeded with genesis stake 1; a Withdraw of 1 fully
+        // unbonds it, which the ledger reports as a removal (weight 0).
+        let node = [2u8; 32];
+        let logs = serde_json::json!([{
+            "topics": [staking::WITHDRAW_TOPIC, format!("0x{}", "02".repeat(32))],
+            "data": format!("0x{:064x}", 1u64),
+        }]);
+        let app = RethApplication::new(
+            Box::new(StakingTransport {
+                inner: FixtureTransport,
+                logs,
+            }),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::seeded_from([(node, 1u64)])),
+        );
+
+        let g = genesis();
+        let block = app
+            .build_proposal(&g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        let result = app.commit(&block).await.expect("commit");
+        assert_eq!(
+            result.validator_updates,
+            vec![ValidatorUpdate {
+                node_id: node,
+                weight: 0,
+            }],
+            "a Withdraw of the full stake removes the validator (weight 0)",
+        );
     }
 
     #[tokio::test]
@@ -577,6 +691,7 @@ mod tests {
             RETH_GENESIS,
             [0u8; 32],
             Duration::ZERO,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
         );
 
         // Two uncommitted blocks above the (genesis) committed frontier; build
@@ -640,6 +755,7 @@ mod tests {
             RETH_GENESIS,
             [0u8; 32],
             Duration::ZERO,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
         );
         {
             let mut c = app.committed.lock();
@@ -665,6 +781,7 @@ mod tests {
             RETH_GENESIS,
             [0u8; 32],
             Duration::ZERO,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
         );
         let g = genesis();
         let a = block_with_payload(g.hash(), 1, "0xaa");
