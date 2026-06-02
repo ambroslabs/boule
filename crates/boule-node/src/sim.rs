@@ -1279,6 +1279,7 @@ impl SimCluster {
                 signature_scheme: scheme,
                 block_retention_window: 0,
                 min_block_interval: Duration::ZERO,
+                weak_subjectivity_checkpoint: None,
             };
 
             let sm: Arc<Mutex<Box<dyn StateMachine>>> = state_machines
@@ -2080,6 +2081,7 @@ impl SimCluster {
                 signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
                 block_retention_window: 0,
                 min_block_interval: Duration::ZERO,
+                weak_subjectivity_checkpoint: None,
             };
             // Fresh state machine and mempool — the previous session's
             // state machine doesn't survive a process restart in
@@ -2325,6 +2327,7 @@ impl SimCluster {
             signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
             block_retention_window: 0,
             min_block_interval: Duration::ZERO,
+            weak_subjectivity_checkpoint: None,
         };
         let sm: Arc<Mutex<Box<dyn StateMachine>>> =
             Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
@@ -2960,6 +2963,7 @@ impl SimCluster {
                 signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
                 block_retention_window: 0,
                 min_block_interval: Duration::ZERO,
+                weak_subjectivity_checkpoint: None,
             };
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));

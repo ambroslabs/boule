@@ -196,8 +196,20 @@ Operator-supplied trust parameters:
 
 - the **genesis validator set** (already required to join consensus), and/or
 - an optional **weak-subjectivity checkpoint** — a recent finalized boule block
-  a fresh joiner can anchor to instead of QC-verifying from genesis (not yet a
-  config knob; tracked as a follow-up).
+  a fresh joiner anchors to instead of trusting genesis alone. Configure it under
+  `[consensus.weak_subjectivity_checkpoint]`:
+
+  ```toml
+  [consensus.weak_subjectivity_checkpoint]
+  height = 1000000
+  hash   = "<64-hex block hash at that height, from a trusted source>"
+  ```
+
+  The node then refuses to commit or recover any chain whose block at `height`
+  does not hash to `hash` — fail-stop, so a fresh joiner cannot be walked onto a
+  long-range fork. Unset (the default) is genesis-anchored. Trade-off: a stale
+  checkpoint still anchors safety but leaves a longer recent prefix trusted on
+  the validator set alone.
 
 Liveness assumptions: at least one honest reth peer serving state, and a pivot
 recent enough that non-archive peers still retain its state.
