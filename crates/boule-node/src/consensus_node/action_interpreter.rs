@@ -1155,6 +1155,9 @@ impl ConsensusNode {
                         block_b = ?block_b,
                         "consensus_equivocation_detected",
                     );
+                    // Pair the two conflicting signed votes we retained into a
+                    // non-repudiable, independently-verified proof (#656b).
+                    self.build_vote_equivocation_proof(voter, view, block_a, block_b);
                 }
 
                 SafetyAction::ProposalEquivocationEvidence {
@@ -1180,6 +1183,7 @@ impl ConsensusNode {
                         block_b = ?block_b,
                         "consensus_proposal_equivocation_detected",
                     );
+                    self.build_proposal_equivocation_proof(leader, view, block_a, block_b);
                 }
 
                 SafetyAction::BuildProposal {
@@ -1459,6 +1463,16 @@ impl ConsensusNode {
             }),
             SafetyEvent::PacemakerAdvance(_) => None,
         };
+
+        // Retain the signed Vote/Proposal envelope so a later equivocation
+        // action can pair it into a non-repudiable proof (#656b), and GC the
+        // retention maps as the view advances. Done before the event is
+        // consumed by the core.
+        self.retain_for_equivocation_evidence(&ev);
+        if let SafetyEvent::PacemakerAdvance(current) = &ev {
+            let current = *current;
+            self.gc_equivocation_evidence(current);
+        }
 
         let actions = self.core.step(ev);
 

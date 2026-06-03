@@ -100,6 +100,7 @@ mod block_builder;
 mod block_sync;
 mod commit;
 mod config;
+mod equivocation;
 mod persistence;
 mod reconfig_apply;
 mod rotation_apply;
@@ -430,6 +431,15 @@ pub struct ConsensusNode {
     /// voter-side metric stays interpretable. Surfaced under
     /// [`ConsensusStatus::proposal_equivocations_detected`].
     proposal_equivocations_detected: Arc<AtomicU64>,
+    /// Verified vote envelopes retained so an equivocation the safety core
+    /// flags can be paired into a non-repudiable proof (#656b). Bounded by a
+    /// retention window + a hard cap; GC'd on `PacemakerAdvance`.
+    seen_votes: equivocation::SeenVotes,
+    /// Verified proposal envelopes, for proposal-equivocation proofs (#656b).
+    seen_proposals: equivocation::SeenProposals,
+    /// Count of equivocation proofs built and self-verified (#656b). Surfaced
+    /// under [`ConsensusStatus::equivocation_proofs_built`].
+    equivocation_proofs_built: u64,
     /// Cumulative count of state-machine divergences detected at vote
     /// time (#599): a proposed block's deferred committed state root,
     /// anchored at a height this node has committed, disagreed with this
@@ -692,6 +702,9 @@ impl ConsensusNode {
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
+            seen_votes: equivocation::SeenVotes::new(),
+            seen_proposals: equivocation::SeenProposals::new(),
+            equivocation_proofs_built: 0,
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
             proposal_command_rejections: Arc::new(AtomicU64::new(0)),
@@ -1103,6 +1116,9 @@ impl ConsensusNode {
             dropped_commands,
             equivocations_detected: Arc::new(AtomicU64::new(0)),
             proposal_equivocations_detected: Arc::new(AtomicU64::new(0)),
+            seen_votes: equivocation::SeenVotes::new(),
+            seen_proposals: equivocation::SeenProposals::new(),
+            equivocation_proofs_built: 0,
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
             proposal_command_rejections: Arc::new(AtomicU64::new(0)),
@@ -4136,6 +4152,71 @@ mod tests {
             }
             other => panic!("expected SendTo, got {other:?}"),
         }
+    }
+
+    /// #656b end-to-end: a validator that double-votes at one view is
+    /// detected by the core, and the integration layer pairs the two retained
+    /// signed votes into a non-repudiable, independently-verified
+    /// `EquivocationProof` (counter + status field advance).
+    #[tokio::test]
+    async fn double_vote_builds_a_verified_equivocation_proof() {
+        use boule_consensus::dispatch::{Dispatch, Verified};
+        use boule_consensus::hotstuff::qc::Vote;
+        use boule_consensus::hotstuff::step::{Event as SafetyEvent, VoteVariant};
+        use boule_consensus::validator_set::{ValidatorId, ValidatorSet};
+        use boule_core::crypto::signed::Signed;
+
+        // The validator set holds a REAL signer (the equivocator) so the
+        // proof's signatures verify in the build's self-check.
+        let equivocator = fresh_signer();
+        let eq_id = ValidatorId::from_genesis_pubkey(equivocator.node_id());
+        let vs = ValidatorSet::new(vec![eq_id, vid(2), vid(3), vid(4)]);
+        let mut node = ConsensusNode::new(
+            nid(2),
+            test_config(vs),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+        let chain_id = node.chain_id;
+
+        let view = View(3);
+        let vote = |block: u8| {
+            let signed = Signed::sign(
+                Vote {
+                    view,
+                    block_hash: [block; 32],
+                },
+                &equivocator,
+                &chain_id,
+            )
+            .unwrap();
+            let verified = Verified::wrap_after_verify_with_signer(signed, eq_id);
+            Dispatch::Safety(SafetyEvent::VoteReceived(VoteVariant::Ed25519(verified)))
+        };
+
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, _rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        // First vote: recorded, no equivocation.
+        node.apply_dispatch(vote(0xAA), broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .unwrap();
+        assert_eq!(node.equivocation_proofs_built, 0);
+
+        // Conflicting vote at the same view: the core flags equivocation and
+        // the integration layer builds + verifies the proof.
+        node.apply_dispatch(vote(0xBB), broadcaster.as_ref(), &mut view_timer, &signer)
+            .await
+            .unwrap();
+        assert_eq!(
+            node.equivocation_proofs_built, 1,
+            "a verified equivocation proof must be built from the two signed votes",
+        );
+        assert_eq!(node.build_status().equivocation_proofs_built, 1);
     }
 
     /// `Dispatch::ServeBlock` for an unknown hash returns
