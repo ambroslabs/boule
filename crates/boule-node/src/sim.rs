@@ -1526,6 +1526,154 @@ impl SimCluster {
         self.signers.as_ref().map(|s| Arc::clone(&s[idx]))
     }
 
+    /// Tail-spawn a fresh validator into the already-running cluster (#284).
+    ///
+    /// Mints a new Ed25519 signer + node and wires it into the live routing
+    /// (the now-mutable `event_txs`), so existing nodes reach it and it
+    /// reaches them on their next frame. The node boots from the **genesis**
+    /// config (the original committee + genesis block) with empty
+    /// storage — exactly like a real new validator — so it must block-sync
+    /// the chain so far and apply the committed `ReconfigCommand` that adds
+    /// it before it can participate at `v_eff`.
+    ///
+    /// Records are **appended** to every parallel vector (`node_ids`,
+    /// `commit_rxs`, `mempools`, …); `node_ids` order is test bookkeeping
+    /// (index-paired with the other vectors), not consensus order, which
+    /// each node derives from its own sorted `ValidatorSet`. Returns the new
+    /// node's `(NodeId, mempool)` for the test to introspect.
+    ///
+    /// Ed25519, default counter state machine, in-memory storage; the
+    /// per-node knobs (BLS / adversary / slow-disk / slow-node) are not
+    /// wired for a tail-spawned node.
+    pub fn spawn_validator_into(&mut self) -> (NodeId, Arc<dyn Mempool>) {
+        let signer = fresh_signer();
+        let nid = signer.node_id();
+        let signer: Arc<dyn Signer> = Arc::new(signer);
+
+        let config = NodeConfigForConsensus {
+            validator_set: self.validator_set.clone(),
+            genesis: self.genesis.clone(),
+            propose_limit: 16,
+            timeout_base: self.timeout_base,
+            timeout_max: Duration::from_secs(30),
+            limits: CacheLimits::unbounded_for_tests(),
+            snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
+            min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
+            signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
+            block_retention_window: 0,
+            min_block_interval: Duration::ZERO,
+            weak_subjectivity_checkpoint: None,
+            operator_keys: Vec::new(),
+            max_endpoint_list_length: 8,
+        };
+
+        let sm: Arc<Mutex<Box<dyn StateMachine>>> =
+            Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(256));
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+
+        let (commit_tx, commit_rx) = mpsc::channel::<Block>(SIM_COMMIT_CHANNEL_CAP);
+        let notifier = MpscCommitNotifier::new(commit_tx);
+        let commit_overflow = notifier.overflow_counter();
+        let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
+
+        let node = ConsensusNode::new(
+            nid,
+            config,
+            sm,
+            Arc::clone(&mempool),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .with_commit_notifier(commit_notifier);
+
+        // Capture the counters before the node moves into its task.
+        self.equivocations_counters
+            .push(node.equivocations_counter());
+        self.proposal_equivocations_counters
+            .push(node.proposal_equivocations_counter());
+        self.state_divergence_counters
+            .push(node.state_divergence_counter());
+        self.proposal_command_rejection_counters
+            .push(node.proposal_command_rejections_counter());
+
+        // Inbound event channel + a fresh slow-node delay atomic (the new
+        // node is not in the shared `slow_node_delays_us` map; `set_slow_node`
+        // does not apply to a tail-spawned node).
+        let (event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(1024);
+        let consensus_event_rx = spawn_event_bridge(event_rx, Arc::new(AtomicU64::new(0)));
+        // Publish the new node's inbound sender so peers' route tasks pick
+        // it up on their next frame.
+        self.event_txs.write().insert(nid, event_tx);
+
+        // Outbound channel + route task wired into the shared topology state.
+        let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
+        let broadcaster: Arc<dyn Broadcaster> = Arc::new(MemoryBroadcaster::new(send_tx));
+        let (_disco_src_tx, disco_src_rx) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
+        let discovery: Arc<dyn Discovery> = MemoryDiscovery::spawn(disco_src_rx);
+        spawn_route_task(
+            nid,
+            send_rx,
+            Arc::clone(&self.event_txs),
+            Arc::clone(&self.partitioned),
+            Arc::clone(&self.link_cuts),
+            Arc::clone(&self.partition_blocks),
+            Arc::clone(&self.dead_nodes),
+            None,
+            Arc::clone(&self.vote_observer),
+            PayloadFraming::Mesh,
+            self.controls.clone(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let crash_slot = boule_consensus::crashpoint::CrashSlot::empty();
+
+        let rotatable = Arc::new(crate::rotatable_signer::RotatableSigner::new(
+            Arc::clone(&signer),
+            node.signing_view_handle(),
+        ));
+        let run_signer: Arc<dyn Signer> = rotatable.clone();
+
+        let crash_for_task = crash_slot.clone();
+        tokio::spawn(async move {
+            let _ = boule_consensus::crashpoint::CRASH_SLOT
+                .scope(crash_for_task, async move {
+                    node.run(
+                        broadcaster,
+                        discovery,
+                        consensus_event_rx,
+                        run_signer,
+                        shutdown_rx,
+                    )
+                    .await
+                })
+                .await;
+        });
+
+        // Append the new node's records to every parallel vector, preserving
+        // index alignment with `node_ids`.
+        self.node_ids.push(nid);
+        self.commit_rxs.push(commit_rx);
+        self.commit_overflow_counters.push(commit_overflow);
+        self.commit_cache.push(Vec::new());
+        self.shutdown_txs.push(Some(shutdown_tx));
+        self.crash_slots.push(crash_slot);
+        self.mempools.push(Arc::clone(&mempool));
+        self.rotatable_signers.push(rotatable);
+        if let Some(s) = self.signers.as_mut() {
+            s.push(Arc::clone(&signer));
+        }
+        if let Some(s) = self.storages.as_mut() {
+            s.push(storage);
+        }
+        if let Some(w) = self.wals.as_mut() {
+            w.push(wal);
+        }
+
+        (nid, mempool)
+    }
+
     /// Inject a committed signing-key rotation into node `idx`'s running
     /// signer (#312): at and after `v_eff` the node signs with `new_signer`,
     /// no restart. Models the operator having provisioned the new key + the
@@ -7192,6 +7340,87 @@ mod tests {
             reconfig_committed,
             "expected at least one committed block to carry the reconfig tx",
         );
+    }
+
+    /// #284: the *add* direction. Tail-spawn a fresh validator into a running
+    /// 4-node cluster, commit a `ReconfigCommand` adding it at a future
+    /// `v_eff`, and assert the joiner block-syncs from genesis, applies the
+    /// reconfig that seats it, and commits past the boundary under the
+    /// 5-validator committee.
+    #[tokio::test]
+    async fn cluster_tail_spawns_added_validator_which_syncs_and_participates() {
+        use boule_consensus::View;
+        use boule_consensus::reconfig::{ReconfigCommand, ValidatorEntry};
+
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Warm-up under the genesis 4-set so the joiner has real chain depth
+        // to sync.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 3
+            })
+            .await;
+        assert!(warmed, "cluster failed to commit warm-up blocks");
+
+        // Tail-spawn the joiner (boots from genesis, empty storage) BEFORE
+        // its add takes effect, so it can sync the chain in the meantime.
+        let (joiner, _joiner_mempool) = cluster.spawn_validator_into();
+        let joiner_idx = cluster.node_ids.len() - 1;
+
+        // Add the joiner at a future v_eff. No operator key → no inbound
+        // consent required (#548).
+        let v_eff: View = View(60);
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: joiner,
+                addr: "127.0.0.1:9100".parse().unwrap(),
+                bls_pop: None,
+                weight: 1,
+                operator_pubkey: None,
+                consent_sig: None,
+                initial_endpoints: vec![],
+            }],
+            removes: vec![],
+            changes: vec![],
+            v_eff,
+        };
+        let payload = cmd.encode();
+        for mp in &cluster.mempools {
+            let _ = mp.insert(payload.clone());
+        }
+
+        // Drive until the JOINER itself has committed past v_eff — proving it
+        // synced the chain from genesis, applied the reconfig that seats it,
+        // and is committing under the post-boundary 5-validator committee.
+        let joined = cluster
+            .advance_and_yield_until(Duration::from_secs(20), |c| {
+                c.peek_commit_heights()
+                    .get(joiner_idx)
+                    .copied()
+                    .unwrap_or(0)
+                    >= v_eff.0 + 3
+            })
+            .await;
+        assert!(
+            joined,
+            "tail-spawned validator failed to sync + commit past v_eff within budget",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        // The reconfig add landed in a committed block.
+        let reconfig_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|c| ReconfigCommand::is_reconfig_payload(c))
+            })
+        });
+        assert!(reconfig_committed, "expected the add reconfig to commit");
     }
 
     /// #548: a reconfig that adds a validator carrying an `operator_pubkey`
