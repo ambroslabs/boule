@@ -227,6 +227,55 @@ pub struct AppContext {
     pub evidence: Vec<Evidence>,
 }
 
+/// One validator-relevant behaviour an [`Application`] backend can drive
+/// through the execution-layer transaction seam — the in-code catalog of the
+/// milestone-#4 integration surface. A backend *declares* the subset it
+/// implements via [`Application::capabilities`]; the integration layer logs the
+/// declared set when the application is wired, so a missing hook is a visible
+/// gap rather than a silent one.
+///
+/// This is the full bidirectional surface, broader than [`ValidatorEffect`]
+/// (which is only the EL→consensus *emit* side): it also names the behaviours
+/// that *consume* an [`AppContext`] signal ([`Self::Slashing`] reads
+/// `evidence`, [`Self::Rewards`] reads `last_commit`) and emit nothing typed.
+///
+/// Every capability is **optional** and chosen by the validator-authority
+/// model: a PoA / genesis-fixed-set backend declares none (consensus runs with
+/// a static set); a PoS backend declares [`Self::Membership`] and usually
+/// [`Self::Slashing`]; only a PoS-with-rewards backend declares
+/// [`Self::Rewards`] — rewards are never forced. See
+/// `docs/el-transaction-integration.md` for the full capability catalog
+/// (signal consumed, effect emitted, consensus-native residue, and the
+/// required-vs-optional matrix per authority model).
+///
+/// `#[non_exhaustive]`: new capabilities are added by their own milestone-#4
+/// sub-issues without a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IntegrationCapability {
+    /// Drives the validator set's membership and voting weights via
+    /// [`CommitResult::validator_updates`]. Required for any
+    /// stake-derived-weight model.
+    Membership,
+    /// Drives validator signing- / operator-key rotations via
+    /// [`ValidatorEffect::KeyRotation`] (#730).
+    KeyRotation,
+    /// Drives validator network-endpoint advertisement via
+    /// [`ValidatorEffect::EndpointUpdate`] (#731 / #546).
+    EndpointAdvertisement,
+    /// Drives live consensus-parameter updates via
+    /// [`ValidatorEffect::ParamUpdate`] (#542).
+    ParameterUpdates,
+    /// Penalises committed misbehaviour: reads [`AppContext::evidence`] and
+    /// emits a jail (`weight 0` in [`CommitResult::validator_updates`]) and/or
+    /// an economic [`Application::slash`] (#732 / #658).
+    Slashing,
+    /// Apportions rewards to the validators whose votes formed a quorum: reads
+    /// [`AppContext::last_commit`] at `build_proposal`. PoS-with-rewards only;
+    /// never forced.
+    Rewards,
+}
+
 /// The asynchronous production application seam.
 ///
 /// Object-safe (`Arc<dyn Application>`) and async via the codebase's
@@ -340,6 +389,20 @@ pub trait Application: Send + Sync {
     /// *membership* consequence is the consensus-layer jail (#658a / #457),
     /// which runs regardless of this hook.
     fn slash(&self, _node_id: NodeId) {}
+
+    /// The validator-relevant behaviours this backend drives through the
+    /// execution-layer transaction seam — the subset of
+    /// [`IntegrationCapability`] its authority model implements. Purely
+    /// declarative: the integration layer logs it when the application is wired
+    /// so the integration surface a backend covers (and, by omission, the
+    /// hooks it leaves to consensus) is visible rather than silent. See
+    /// `docs/el-transaction-integration.md`.
+    ///
+    /// The default is empty — a PoA / genesis-fixed-set backend, and the reth
+    /// EL default, drive nothing and let consensus run with a static set.
+    fn capabilities(&self) -> Vec<IntegrationCapability> {
+        Vec::new()
+    }
 
     // ── Synchronous state queries ──────────────────────────────────────
     //
