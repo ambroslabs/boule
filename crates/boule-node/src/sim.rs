@@ -7248,6 +7248,7 @@ mod tests {
             weight: 1,
             operator_pubkey: Some(operator.node_id()),
             consent_sig: None,
+            initial_endpoints: vec![],
         };
         let consent = ReconfigAddConsent::for_entry(&entry, v_eff).unwrap();
         entry.consent_sig = Some(consent.sign(&operator, &chain_id).unwrap());

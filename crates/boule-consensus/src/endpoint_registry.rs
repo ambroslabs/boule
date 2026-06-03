@@ -279,6 +279,41 @@ impl EndpointRegistry {
         self.by_validator.remove(validator).is_some()
     }
 
+    /// Seed a validator's initial endpoint list (#547) when it is seated by a
+    /// reconfig add. Sets the list directly with `last_seq = 0`, so the
+    /// validator's first explicit [`SignedEndpointCommand`] (`seq >= 1`)
+    /// supersedes it. Enforces the same `max_len` cap and no-duplicate-
+    /// `network_id` invariant as [`Self::apply`]; on violation the registry
+    /// is left unchanged and the caller skips seeding (the validator is
+    /// still seated — it just starts with no published endpoints).
+    ///
+    /// Seeding an empty list is a no-op (the absence of a registry entry and
+    /// an empty published list are equivalent).
+    pub fn seed(
+        &mut self,
+        validator: NodeId,
+        entries: Vec<EndpointEntry>,
+    ) -> Result<(), EndpointApplyError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        dedup_check(entries.iter().map(|e| &e.network_id))?;
+        if entries.len() > self.max_len {
+            return Err(EndpointApplyError::TooLong {
+                max: self.max_len,
+                got: entries.len(),
+            });
+        }
+        self.by_validator.insert(
+            validator,
+            ValidatorEndpoints {
+                last_seq: 0,
+                entries,
+            },
+        );
+        Ok(())
+    }
+
     /// Apply a (already signature-verified) command. Enforces the monotone
     /// `seq` replay guard, the no-duplicate-`network_id` invariant, and the
     /// `max_len` cap; mutates the validator's list per the op. On any error

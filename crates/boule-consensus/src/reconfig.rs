@@ -28,6 +28,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::View;
+use crate::endpoint_registry::EndpointEntry;
 use crate::validator_set::{ValidatorId, ValidatorSet};
 use boule_core::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop, SignatureSchemeChoice};
 use boule_core::crypto::signed::ChainId;
@@ -132,6 +133,21 @@ pub struct ValidatorEntry {
     /// like `bls_pop` / `operator_pubkey`.
     #[serde(with = "serde_optional_sig")]
     pub consent_sig: Option<[u8; 64]>,
+    /// Initial endpoint-advertisement list (#547): `(network_id, address)`
+    /// hints the validator publishes *at registration*, so a freshly-added
+    /// validator is reachable via the optimized route without a separate
+    /// publish tx (#546). Empty (the common case) seats the validator with
+    /// no published endpoints — it relies on the gossip overlay until it
+    /// publishes.
+    ///
+    /// Bound into the inbound-consent pre-image alongside the other terms:
+    /// when `operator_pubkey` is `Some`, the operator's `consent_sig`
+    /// authenticates this list too (a leader cannot inject endpoints the
+    /// operator did not agree to). Seeded into the
+    /// [`EndpointRegistry`](crate::endpoint_registry::EndpointRegistry) at
+    /// `v_eff` when the validator is seated.
+    #[serde(default)]
+    pub initial_endpoints: Vec<EndpointEntry>,
 }
 
 /// Serialize an `Option<[u8; 64]>` signature as an optional byte sequence
@@ -236,6 +252,7 @@ impl ReconfigCommand {
                 weight,
                 operator_pubkey: None,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -636,6 +653,7 @@ pub fn build_add_validator_payload(
     bls_key_file: Option<&Path>,
     operator_pubkey: Option<NodeId>,
     consent_sig: Option<[u8; 64]>,
+    initial_endpoints: Vec<EndpointEntry>,
 ) -> anyhow::Result<Bytes> {
     let (entry, _chain_id) = resolve_add_entry(
         config,
@@ -646,6 +664,7 @@ pub fn build_add_validator_payload(
         bls_key_file,
         operator_pubkey,
         consent_sig,
+        initial_endpoints,
     )?;
     let cmd = ReconfigCommand {
         adds: vec![entry],
@@ -675,6 +694,7 @@ fn resolve_add_entry(
     bls_key_file: Option<&Path>,
     operator_pubkey: Option<NodeId>,
     consent_sig: Option<[u8; 64]>,
+    initial_endpoints: Vec<EndpointEntry>,
 ) -> anyhow::Result<(ValidatorEntry, Option<ChainId>)> {
     if bls_pop_file.is_some() && bls_key_file.is_some() {
         anyhow::bail!(
@@ -755,6 +775,7 @@ fn resolve_add_entry(
         weight,
         operator_pubkey,
         consent_sig,
+        initial_endpoints,
     };
     Ok((entry, cfg_chain_id))
 }
@@ -773,6 +794,9 @@ pub struct ReconfigConsentSignRequest {
     pub operator_key_backend: Option<String>,
     pub operator_key_path: Option<PathBuf>,
     pub operator_key_passphrase_env: Option<String>,
+    /// Initial endpoint list (#547) to bind into the consent, byte-identical
+    /// to the `add-validator --endpoint` list the submitter will carry.
+    pub initial_endpoints: Vec<EndpointEntry>,
 }
 
 /// Produce an inbound-consent signature (#548) for a validator add, signed
@@ -833,6 +857,7 @@ pub fn build_add_consent_signature(
         req.bls_key_file.as_deref(),
         Some(operator_pubkey),
         None,
+        req.initial_endpoints.clone(),
     )?;
     let chain_id =
         chain_id.expect("config supplied above, so resolve_add_entry returns the chain_id");
@@ -948,6 +973,7 @@ mod tests {
             weight,
             operator_pubkey: None,
             consent_sig: None,
+            initial_endpoints: vec![],
         }
     }
 
@@ -977,6 +1003,7 @@ mod tests {
             weight: 1,
             operator_pubkey: Some(operator.node_id()),
             consent_sig: None,
+            initial_endpoints: vec![],
         };
         let consent =
             crate::reconfig_consent::ReconfigAddConsent::for_entry(&entry, v_eff).unwrap();
@@ -1010,6 +1037,7 @@ mod tests {
                 weight: 1,
                 operator_pubkey: Some(operator.node_id()),
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -1370,6 +1398,7 @@ mod tests {
             operator_key_backend: Some("file".into()),
             operator_key_path: Some(operator_key.clone()),
             operator_key_passphrase_env: None,
+            initial_endpoints: vec![],
         };
         let (sig, reported_operator) =
             build_add_consent_signature(&req).expect("consent-sign must succeed");
@@ -1385,6 +1414,7 @@ mod tests {
             weight: 3,
             operator_pubkey: Some(operator_pubkey),
             consent_sig: Some(sig),
+            initial_endpoints: vec![],
         };
         let consent = ReconfigAddConsent::for_entry(&entry, View(60)).unwrap();
         assert_eq!(consent.verify(&sig, &chain_id), Ok(()));
@@ -1400,6 +1430,7 @@ mod tests {
             None,
             Some(operator_pubkey),
             Some(sig),
+            vec![],
         )
         .unwrap();
         let cmd = ReconfigCommand::decode(&payload).unwrap();
@@ -1448,6 +1479,7 @@ mod tests {
             operator_key_backend: Some("file".into()),
             operator_key_path: Some(dir.path().join("nope.key")),
             operator_key_passphrase_env: None,
+            initial_endpoints: vec![],
         };
         let err = build_add_consent_signature(&req).unwrap_err();
         assert!(err.to_string().contains("operator key"), "{err}");
@@ -1512,6 +1544,7 @@ mod tests {
             weight: 1,
             operator_pubkey: None,
             consent_sig: None,
+            initial_endpoints: vec![],
         }
     }
 
