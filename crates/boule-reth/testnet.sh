@@ -34,6 +34,20 @@ WORK="${WORK:-/tmp/boule-reth-testnet}"
 # anvil dev account #0 (prefunded in genesis.json).
 SENDER_PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 RECIPIENT=0x000000000000000000000000000000000000dEaD
+# Per-node fee recipients (#659b): a *distinct* well-known anvil address per
+# validator (accounts #1.., none of them the sender #0 or RECIPIENT), so a
+# priority-fee tip credits exactly the proposer's recipient and the reward
+# assertion can attribute it. Index 1-based to match the node loop.
+FEE_RECIP=(
+  _unused_
+  0x70997970C51812dc3A010C7d01b50e0d17dc79C8
+  0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
+  0x90F79bf6EB2c4f870365E785982E1f101E93b906
+  0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65
+  0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc
+  0x976EA74026E726554dB657fA54763abd0C3a0aa9
+  0x14dC79964da2C08b23698B3D3cc7Ca32193d9955
+)
 
 for bin in reth cast openssl jq curl python3; do
   command -v "$bin" >/dev/null || { echo "FATAL: '$bin' not found on PATH"; exit 2; }
@@ -137,7 +151,7 @@ backend = "reth"
 engine_url = "http://127.0.0.1:$(reth_auth "$i")"
 eth_url = "$(eth_rpc "$i")"
 jwt_secret_path = "$JWT"
-fee_recipient = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+fee_recipient = "${FEE_RECIP[$i]}"
 reth_peers = [$PEERS]
 EOF
   "$BOULE" start --config "$WORK/node$i/node.toml" >"$WORK/node$i.log" 2>&1 &
@@ -287,9 +301,37 @@ else
 fi
 fi  # N≥5 staking-removal guard
 
+# 6. EVM fee reward (#659b): priority-fee tips from the transactions above are
+#    paid to each block's proposer via its *distinct* configured fee recipient
+#    (the EVM coinbase = `suggestedFeeRecipient`). Base fee is burned under
+#    EIP-1559; only the priority tip reaches the coinbase. The recipients start
+#    unfunded (none are in the genesis alloc), so a positive accumulated balance
+#    proves tips were credited to proposers' recipients — and a non-empty subset
+#    being credited proves the attribution is per-proposer, not a single shared
+#    address.
+fee_sum() {
+  local s=0 b
+  for i in $(seq 1 "$N"); do
+    b=$(cast balance --rpc-url "$(eth_rpc 1)" "${FEE_RECIP[$i]}" 2>/dev/null)
+    s=$(python3 -c "print($s + ${b:-0})")
+  done
+  echo "$s"
+}
+CREDITED=0
+for i in $(seq 1 "$N"); do
+  b=$(cast balance --rpc-url "$(eth_rpc 1)" "${FEE_RECIP[$i]}" 2>/dev/null)
+  [ "${b:-0}" != "0" ] && CREDITED=$((CREDITED + 1))
+done
+FEES=$(fee_sum)
+if [ "$CREDITED" -ge 1 ] && python3 -c "import sys; sys.exit(0 if $FEES > 0 else 1)"; then
+  pass "rewards: priority-fee tips credited $CREDITED proposer fee recipient(s) (Σ = $FEES wei)"
+else
+  fail "rewards: no proposer fee recipient was credited a tip (Σ = $FEES wei)"
+fi
+
 echo "═════════════════════════════════════════════════════"
 if [ "$FAILS" = 0 ]; then
-  echo "RESULT: PASS — $N-validator reth cluster commits in agreement across leader rotations, lands a tx, and an EVM staking withdraw removes a validator (#655)."
+  echo "RESULT: PASS — $N-validator reth cluster commits in agreement across leader rotations, lands a tx, an EVM staking withdraw removes a validator (#655), and a priority-fee tip credits the proposer's fee recipient (#659b)."
   exit 0
 else
   echo "RESULT: FAIL — $FAILS assertion(s) failed (logs under $WORK)."
