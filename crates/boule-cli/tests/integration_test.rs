@@ -487,18 +487,33 @@ async fn spawn_node_fixed_port(
     run_init(config_file.path().to_str().unwrap());
 
     let bin = env!("CARGO_BIN_EXE_boule");
-    let child = Command::new(bin)
-        .args(["start", "--config", config_file.path().to_str().unwrap()])
-        .env("RUST_LOG", "warn")
-        .spawn()
-        .expect("failed to spawn node binary");
+    let config_path = config_file.path().to_str().unwrap().to_owned();
+    let spawn_child = || {
+        Command::new(bin)
+            .args(["start", "--config", &config_path])
+            .env("RUST_LOG", "warn")
+            .spawn()
+            .expect("failed to spawn node binary")
+    };
+    let mut child = spawn_child();
 
     // 30s headroom for a spawned binary to bind + write addr_file under
     // CI's oversubscribed parallelism (#303). This is the phase-2
     // concurrent spawn fan-out, the worst case for startup contention.
+    //
+    // The P2P listener binds a *fixed* port rediscovered in phase 1. Between
+    // phase 1 freeing that ephemeral port (SIGKILL) and this bind, another
+    // concurrent test in the shard can transiently be assigned the same port
+    // by the OS, so the node exits immediately with `EADDRINUSE` (#678). When
+    // the child exits before publishing its addr file, re-spawn it on the
+    // same port: the squatter is another short-lived test bind that releases
+    // the port well within the deadline, and once we win the bind the running
+    // node holds it.
     let deadline = Instant::now() + Duration::from_secs(30);
     let addrs = loop {
         if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
             panic!("phase-2 node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
@@ -506,6 +521,11 @@ async fn spawn_node_fixed_port(
             if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
                 break addrs;
             }
+        }
+        // Reap-and-retry on an early exit (the EADDRINUSE bind race).
+        // `try_wait` reaps the process when it reports `Some`.
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            child = spawn_child();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -526,6 +546,38 @@ async fn spawn_node_fixed_port(
         _key_dir: placeholder_dir,
         _addr_file: addr_file,
     }
+}
+
+/// Regression for #678: `spawn_node_fixed_port` must survive the
+/// phase-2 `EADDRINUSE` bind race. Hold the target P2P port with a
+/// listener (standing in for the concurrent test that transiently grabbed
+/// the phase-1-freed port), start the node against it, then release the
+/// port and assert the node still binds it and comes up within the
+/// deadline — i.e. the helper re-spawned across the failed bind(s).
+#[tokio::test]
+async fn phase_two_node_recovers_from_transient_port_squatter() {
+    // Reserve a concrete port and keep squatting it so the node's first
+    // bind attempts fail with EADDRINUSE.
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let p2p_addr = squatter.local_addr().unwrap().to_string();
+
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_path = key_dir.path().join("node.key").to_str().unwrap().to_owned();
+
+    // Release the port ~800ms in, after the node has failed to bind at
+    // least once and re-spawned, so the test exercises the retry path.
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        drop(squatter);
+    });
+
+    let guard = spawn_node_fixed_port(&key_path, &p2p_addr, &[]).await;
+    release.await.unwrap();
+
+    // The node bound the previously-squatted fixed port. `key_dir` and
+    // `guard` live to the end of scope, keeping the key file and the node
+    // process alive for the assertion.
+    assert_eq!(guard.p2p_addr, p2p_addr);
 }
 
 #[tokio::test]
