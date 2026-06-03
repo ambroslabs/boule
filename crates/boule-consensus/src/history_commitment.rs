@@ -301,6 +301,67 @@ pub fn validator_history_commitment_v1(
     hasher.finalize().into()
 }
 
+/// Domain tag for the v2 commitment — a distinct function/domain from v1
+/// because it folds in a *fourth* history table (the operator-key history,
+/// #549), per the module-doc versioning convention.
+const DOMAIN_V2: &[u8] = b"boule.history_commitment.v2";
+
+/// Compute the v2 commitment over the `(set, key, bls?, operator?)` quad
+/// (#549). Identical framing to [`validator_history_commitment_v1`] for the
+/// first three sections, then appends the operator-key history with the same
+/// presence-discriminant scheme as the BLS section, under a distinct domain
+/// tag so a v1 and a v2 hash over the same first three histories never
+/// collide.
+///
+/// `operator_key_history` is `Some(_)` on chains that declared operator keys
+/// (possibly an empty history) and `None` otherwise; the discriminant is
+/// mixed in so the two cases hash distinctly.
+pub fn validator_history_commitment_v2(
+    set_history: &ValidatorSetHistory,
+    key_history: &ValidatorKeyHistory,
+    bls_key_history: Option<&BlsKeyHistory>,
+    operator_key_history: Option<&OperatorKeyHistory>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN_V2);
+
+    let set_bytes = postcard::to_stdvec(&set_history.to_persisted())
+        .expect("postcard encoding of PersistedValidatorHistory cannot fail");
+    feed_section(&mut hasher, &set_bytes);
+
+    let key_bytes = postcard::to_stdvec(&key_history.to_persisted())
+        .expect("postcard encoding of PersistedValidatorKeyHistory cannot fail");
+    feed_section(&mut hasher, &key_bytes);
+
+    match bls_key_history {
+        Some(bls) => {
+            hasher.update([1u8]);
+            let bls_bytes = postcard::to_stdvec(&bls.to_persisted())
+                .expect("postcard encoding of PersistedBlsKeyHistory cannot fail");
+            feed_section(&mut hasher, &bls_bytes);
+        }
+        None => {
+            hasher.update([0u8]);
+        }
+    }
+
+    // Operator-key history (#549): unlike BLS (where "Ed25519 chain, no BLS"
+    // and "BLS chain, empty history" are genuinely different chains and so
+    // need a presence discriminant), "no operator keys" *is* "empty operator
+    // history" — there is no separate operator-key scheme. So we always fold
+    // the (possibly-empty) persisted form, treating `None` as an empty
+    // history. This keeps `None` and `Some(empty)` byte-identical, so a caller
+    // that passes one can't diverge from a caller that passes the other.
+    let op_persisted = operator_key_history
+        .map(|op| op.to_persisted())
+        .unwrap_or_default();
+    let op_bytes = postcard::to_stdvec(&op_persisted)
+        .expect("postcard encoding of PersistedOperatorKeyHistory cannot fail");
+    feed_section(&mut hasher, &op_bytes);
+
+    hasher.finalize().into()
+}
+
 /// Length-prefix `bytes` into the running hash. The prefix is fixed-size
 /// `be_u64` so the framing is unambiguous regardless of section length.
 fn feed_section(hasher: &mut Sha256, bytes: &[u8]) {
@@ -624,7 +685,10 @@ pub fn compute_post_block_commitment(
         chain_id,
         scheme,
     );
-    validator_history_commitment_v1(&set, &key, bls.as_ref())
+    // #549: v2 folds the operator-key history into the anti-rollback
+    // commitment. Operator keys are immutable in this slice, so the operator
+    // history is passed through unchanged (PR-next makes it mutable).
+    validator_history_commitment_v2(&set, &key, bls.as_ref(), operator_key_history)
 }
 
 #[cfg(test)]
@@ -702,6 +766,49 @@ mod tests {
         assert_ne!(
             h_none, h_some_empty,
             "Ed25519 chain (None) must hash differently from BLS chain with empty history",
+        );
+    }
+
+    // ── validator_history_commitment_v2 (#549) ─────────────────────────
+
+    /// v2 and v1 over the same first three histories never collide — the
+    /// domain tag differs, so a v1-stamped chain can't be confused for v2.
+    #[test]
+    fn v2_is_domain_separated_from_v1() {
+        let (s, k) = fresh_histories(&[nid(1), nid(2), nid(3), nid(4)]);
+        let h_v1 = validator_history_commitment_v1(&s, &k, None);
+        let h_v2 = validator_history_commitment_v2(&s, &k, None, None);
+        assert_ne!(h_v1, h_v2);
+    }
+
+    /// The trap-avoidance invariant: `None` and `Some(empty)` operator
+    /// histories hash identically, so a caller passing one can't diverge from
+    /// one passing the other (genesis stamps with `None`-when-keyless; block
+    /// stamping passes `Some(&self.operator_key_history)`).
+    #[test]
+    fn v2_treats_none_and_empty_operator_history_identically() {
+        let (s, k) = fresh_histories(&[nid(1), nid(2), nid(3), nid(4)]);
+        let empty_op = OperatorKeyHistory::new();
+        let h_none = validator_history_commitment_v2(&s, &k, None, None);
+        let h_empty = validator_history_commitment_v2(&s, &k, None, Some(&empty_op));
+        assert_eq!(
+            h_none, h_empty,
+            "None and Some(empty) operator history must hash identically",
+        );
+    }
+
+    /// v2 distinguishes distinct operator histories — the whole point of
+    /// folding it in for anti-rollback.
+    #[test]
+    fn v2_distinguishes_distinct_operator_histories() {
+        let (s, k) = fresh_histories(&[nid(1), nid(2), nid(3), nid(4)]);
+        let op_a = OperatorKeyHistory::with_genesis([(vid(1), nid(0x11))]);
+        let op_b = OperatorKeyHistory::with_genesis([(vid(1), nid(0x22))]);
+        let h_a = validator_history_commitment_v2(&s, &k, None, Some(&op_a));
+        let h_b = validator_history_commitment_v2(&s, &k, None, Some(&op_b));
+        assert_ne!(
+            h_a, h_b,
+            "distinct operator keys must produce distinct commitments",
         );
     }
 

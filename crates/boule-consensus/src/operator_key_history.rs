@@ -257,7 +257,7 @@ impl OperatorKeyHistory {
 
 /// Serializable form of an [`OperatorKeyHistory`] (postcard-stable: no maps,
 /// no floats), mirroring `PersistedBlsKeyHistory`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedOperatorKeyHistory {
     pub validators: Vec<PersistedOperatorValidator>,
 }

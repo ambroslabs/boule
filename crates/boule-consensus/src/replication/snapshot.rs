@@ -74,7 +74,9 @@ pub const STORAGE_KEY_SNAPSHOT_LATEST: &[u8] = b"consensus/snap/latest";
 /// - `2`: adds the snapshot block as `block: Block` so the joiner can
 ///   restore `pending_blocks` without an extra round-trip — required
 ///   by the safety core's parent-walks (#229).
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 2;
+/// - `3`: adds `operator_key_history` and verifies against the v2
+///   `validator_history_commitment` that folds it in (#549).
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 3;
 
 /// Manifest describing one snapshot at `(height, view)`.
 ///
@@ -138,6 +140,14 @@ pub struct SnapshotManifest {
     /// [`crate::history_commitment::validator_history_commitment_v1`]
     /// mixes the discriminant into its hash.
     pub bls_key_history: Option<crate::bls_key_history::PersistedBlsKeyHistory>,
+    /// Persisted form of the producer's `OperatorKeyHistory` at snapshot
+    /// height (#549). `None` on chains that declared no operator keys.
+    /// Folded into the v2 `validator_history_commitment` the same way the
+    /// other histories are, so [`Self::verify`] cross-checks it against the
+    /// block's stamped commitment. (Immutable in this slice; the field is in
+    /// place so a state-synced joiner restores the operator history once it
+    /// becomes mutable.)
+    pub operator_key_history: Option<crate::operator_key_history::PersistedOperatorKeyHistory>,
 }
 
 impl SnapshotManifest {
@@ -176,8 +186,9 @@ impl SnapshotManifest {
             crate::validator_history::ValidatorSetHistory::from_genesis(validator_set.clone());
         let key_hist =
             crate::validator_key_history::ValidatorKeyHistory::new(validator_set.iter().copied());
-        let commitment =
-            crate::history_commitment::validator_history_commitment_v1(&set_hist, &key_hist, None);
+        let commitment = crate::history_commitment::validator_history_commitment_v2(
+            &set_hist, &key_hist, None, None,
+        );
         block.header.validator_history_commitment = commitment;
         // `commit_qc.block_hash` may have been built against the
         // pre-patch block hash; re-target it so the manifest's
@@ -193,6 +204,7 @@ impl SnapshotManifest {
             set_hist.to_persisted(),
             key_hist.to_persisted(),
             None,
+            None,
         )
     }
 
@@ -207,6 +219,7 @@ impl SnapshotManifest {
         validator_history: crate::validator_history::PersistedValidatorHistory,
         validator_key_history: crate::validator_key_history::PersistedValidatorKeyHistory,
         bls_key_history: Option<crate::bls_key_history::PersistedBlsKeyHistory>,
+        operator_key_history: Option<crate::operator_key_history::PersistedOperatorKeyHistory>,
     ) -> Self {
         let chunk_count: u32 = chunk_hashes
             .len()
@@ -233,6 +246,7 @@ impl SnapshotManifest {
             validator_history,
             validator_key_history,
             bls_key_history,
+            operator_key_history,
         }
     }
 
@@ -366,10 +380,19 @@ impl SnapshotManifest {
             ),
             None => None,
         };
-        let actual = crate::history_commitment::validator_history_commitment_v1(
+        // #549: the operator-key history is folded into the v2 commitment.
+        let rebuilt_operator = match &self.operator_key_history {
+            Some(p) => Some(
+                crate::operator_key_history::OperatorKeyHistory::from_persisted(p.clone())
+                    .map_err(|_| ManifestError::ValidatorHistoryCommitmentMismatch)?,
+            ),
+            None => None,
+        };
+        let actual = crate::history_commitment::validator_history_commitment_v2(
             &rebuilt_set,
             &rebuilt_key,
             rebuilt_bls.as_ref(),
+            rebuilt_operator.as_ref(),
         );
         if actual != self.block.header.validator_history_commitment {
             return Err(ManifestError::ValidatorHistoryCommitmentMismatch);
@@ -1376,7 +1399,7 @@ mod tests {
     /// is the rotated validator at view ≥ `v_eff`.
     #[test]
     fn manifest_round_trips_with_rotated_validator_key_history() {
-        use crate::history_commitment::validator_history_commitment_v1;
+        use crate::history_commitment::validator_history_commitment_v2;
         use crate::validator_history::ValidatorSetHistory;
         use crate::validator_key_history::ValidatorKeyHistory;
         use crate::validator_rotation::ValidatorKeyRotation;
@@ -1408,7 +1431,7 @@ mod tests {
             )
             .expect("rotation applies cleanly to a fresh history");
 
-        let commitment = validator_history_commitment_v1(&set_hist, &key_hist, None);
+        let commitment = validator_history_commitment_v2(&set_hist, &key_hist, None, None);
 
         // Mint the snapshot block at a view past v_eff so the post-
         // rotation history is what the chain has stamped.
@@ -1428,6 +1451,7 @@ mod tests {
             1_700_000_000,
             set_hist.to_persisted(),
             key_hist.to_persisted(),
+            None,
             None,
         );
 

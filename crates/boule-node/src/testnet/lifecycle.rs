@@ -288,6 +288,8 @@ fn mint_bls_keys_if_needed(
         &validator_ids,
         scheme,
         &bls_pubkeys,
+        // The testnet driver declares no operator keys (#549).
+        &[],
         [0u8; 32],
     );
 
