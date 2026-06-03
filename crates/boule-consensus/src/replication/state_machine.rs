@@ -19,7 +19,36 @@
 //! - Errors surface as `anyhow::Result` to match the rest of the crate
 //!   (see `storage/mod.rs`).
 
+use std::sync::Arc;
+
 use bytes::Bytes;
+
+/// The stateless includability predicate (#607), extracted from the
+/// mutable [`StateMachine`] into a standalone, cheaply-shareable handle.
+///
+/// Because [`StateMachine::check`] is stateless by contract, the
+/// includability decision needn't reach through the mutable state-machine
+/// handle at all. A `CommandValidator` captures exactly that predicate as a
+/// `Send + Sync` value the proposal-build and vote paths hold behind an
+/// `Arc` and call **without locking the apply state** — the same `Ok(())` =
+/// includable / `Err` = not contract as `check`.
+pub trait CommandValidator: Send + Sync {
+    /// See [`StateMachine::check`] — this MUST be the identical predicate.
+    fn check(&self, cmd: &[u8]) -> anyhow::Result<()>;
+}
+
+/// The default validator: every command is includable. Mirrors the
+/// apply-only "include any opaque bytes, no-op on failure" default of
+/// [`StateMachine::check`], so a machine that doesn't opt into a real
+/// `check` gets a matching validator for free.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcceptAllValidator;
+
+impl CommandValidator for AcceptAllValidator {
+    fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
 
 /// A deterministic state machine that consensus replicates over.
 ///
@@ -79,6 +108,21 @@ pub trait StateMachine: Send + Sync {
     /// implementation that does not opt in.
     fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// A detachable, stateless includability validator (#607): the same
+    /// predicate as [`Self::check`], but as a `Send + Sync` handle the
+    /// build and vote paths hold and call without locking the mutable
+    /// state machine. The default returns [`AcceptAllValidator`], matching
+    /// the default `check`.
+    ///
+    /// An implementation with a real `check` MUST override this to return a
+    /// validator running the **identical** predicate (share the logic so
+    /// the two can't drift) — the build and vote paths use the handle, not
+    /// `check`, so a mismatch would let an honest leader's block fail an
+    /// honest voter's includability gate.
+    fn validator(&self) -> Arc<dyn CommandValidator> {
+        Arc::new(AcceptAllValidator)
     }
 
     /// Apply one command to the state, returning an opaque output.

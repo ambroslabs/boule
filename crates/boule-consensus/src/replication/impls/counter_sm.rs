@@ -12,7 +12,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::replication::state_machine::StateMachine;
+use std::sync::Arc;
+
+use crate::replication::state_machine::{CommandValidator, StateMachine};
 
 /// Commands accepted by [`CounterStateMachine`].
 ///
@@ -30,6 +32,22 @@ impl CounterCommand {
     pub fn encode(&self) -> Bytes {
         // `postcard::to_stdvec` on a fixed-shape enum cannot fail.
         Bytes::from(postcard::to_stdvec(self).expect("postcard encoding of CounterCommand"))
+    }
+}
+
+/// The stateless includability predicate for [`CounterStateMachine`] (#607):
+/// a command is includable iff it decodes to a [`CounterCommand`]. Held by
+/// the block builder so the includability check runs without locking the
+/// mutable counter. Overflow / underflow are *not* a check concern — they
+/// depend on the current value and are handled (as a no-op) at `apply`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CounterValidator;
+
+impl CommandValidator for CounterValidator {
+    fn check(&self, cmd: &[u8]) -> anyhow::Result<()> {
+        postcard::from_bytes::<CounterCommand>(cmd)
+            .map_err(|e| anyhow::anyhow!("decoding CounterCommand: {e}"))?;
+        Ok(())
     }
 }
 
@@ -54,12 +72,14 @@ impl CounterStateMachine {
 
 impl StateMachine for CounterStateMachine {
     fn check(&self, cmd: &[u8]) -> anyhow::Result<()> {
-        // Includable iff it decodes to a `CounterCommand`. Overflow /
-        // underflow are *not* a check concern: they depend on the current
-        // value and are handled (as a no-op) at `apply`.
-        postcard::from_bytes::<CounterCommand>(cmd)
-            .map_err(|e| anyhow::anyhow!("decoding CounterCommand: {e}"))?;
-        Ok(())
+        // Delegate to the standalone validator so the two can't drift
+        // (#607) — the build/vote paths use `validator()`, this stays for
+        // the trait contract + unit tests.
+        CounterValidator.check(cmd)
+    }
+
+    fn validator(&self) -> Arc<dyn CommandValidator> {
+        Arc::new(CounterValidator)
     }
 
     fn apply(&mut self, cmd: &[u8]) -> anyhow::Result<Bytes> {
@@ -165,6 +185,22 @@ mod tests {
         // byte (0 or 1); 0x07 is not a valid CounterCommand discriminant.
         let err = sm.check(&[0x07]).unwrap_err();
         assert!(err.to_string().contains("decoding CounterCommand"));
+    }
+
+    #[test]
+    fn validator_handle_matches_check() {
+        // #607: the detached validator handle runs the identical predicate
+        // as `check` (same accept on a valid command, same reject on
+        // garbage), so the build/vote paths that use the handle agree with
+        // the trait contract.
+        let sm = CounterStateMachine::new();
+        let v = sm.validator();
+        let good = cmd_bytes(CounterCommand::Increment);
+        assert!(v.check(&good).is_ok() && sm.check(&good).is_ok());
+        assert!(v.check(&[0x07]).is_err() && sm.check(&[0x07]).is_err());
+        // The standalone struct is the shared source of the logic.
+        assert!(CounterValidator.check(&good).is_ok());
+        assert!(CounterValidator.check(&[0x07]).is_err());
     }
 
     #[test]
