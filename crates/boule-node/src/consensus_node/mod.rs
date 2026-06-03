@@ -3720,6 +3720,7 @@ mod tests {
             operator_pubkey: Some(operator),
             weight: 1,
             consent_sig: None,
+            initial_endpoints: vec![],
         };
         let consent = ReconfigAddConsent::for_entry(&entry, v_eff).unwrap();
         entry.consent_sig = Some(consent.sign(&operator_signer, &node.chain_id).unwrap());
@@ -3766,6 +3767,7 @@ mod tests {
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -3825,6 +3827,7 @@ mod tests {
             operator_pubkey: None,
             weight: 1,
             consent_sig: None,
+            initial_endpoints: vec![],
         };
         let block = block_with_reconfig(1, 0, nid(1), cmd);
         node.apply_commit(block);
@@ -3849,6 +3852,7 @@ mod tests {
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -3875,6 +3879,7 @@ mod tests {
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -3888,6 +3893,7 @@ mod tests {
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -3964,6 +3970,7 @@ mod tests {
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -4207,6 +4214,7 @@ mod tests {
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -4662,6 +4670,54 @@ mod tests {
         // The GC persisted: a reload sees the empty state too.
         let reloaded = ConsensusNode::load_endpoint_registry(node.storage.as_ref(), 8);
         assert!(reloaded.endpoints_of(&signer.node_id()).is_empty());
+    }
+
+    /// #547: a reconfig add carrying an initial endpoint list (authenticated
+    /// by the inbound-consent signature) seeds the registry when the
+    /// validator is seated.
+    #[test]
+    fn reconfig_add_with_initial_endpoints_seeds_them() {
+        use boule_consensus::endpoint_registry::EndpointEntry;
+        use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+        use boule_consensus::reconfig_consent::ReconfigAddConsent;
+        use boule_core::crypto::signed::Signer;
+
+        let mut node = make_node(nid(1)); // genesis 4-validator set
+        let v_eff = MIN_V_EFF_DELAY + 3;
+        let added = nid(5);
+        let operator = fresh_signer();
+        let ep = EndpointEntry {
+            network_id: nid(0x55),
+            network_address: "10.0.0.5:9005".parse().unwrap(),
+        };
+
+        // Build the add with an operator key + initial endpoints, then sign
+        // the inbound consent over the exact terms (which now bind the
+        // endpoint list).
+        let mut entry = ValidatorEntry {
+            node_id: added,
+            addr: "127.0.0.1:9005".parse().unwrap(),
+            bls_pop: None,
+            weight: 1,
+            operator_pubkey: Some(operator.node_id()),
+            consent_sig: None,
+            initial_endpoints: vec![ep.clone()],
+        };
+        let consent = ReconfigAddConsent::for_entry(&entry, v_eff).unwrap();
+        entry.consent_sig = Some(consent.sign(&operator, &node.chain_id).unwrap());
+
+        let cmd = ReconfigCommand {
+            adds: vec![entry],
+            removes: vec![],
+            changes: vec![],
+            v_eff,
+        };
+        node.apply_commit(block_with_reconfig(1, 0, nid(1), cmd));
+
+        assert_eq!(node.endpoint_registry.endpoints_of(&added), &[ep]);
+        // Seeded entries persist for recovery.
+        let reloaded = ConsensusNode::load_endpoint_registry(node.storage.as_ref(), 8);
+        assert_eq!(reloaded.endpoints_of(&added).len(), 1);
     }
 
     /// A node whose validator `v` (a real signer) declares operator key
@@ -10187,6 +10243,7 @@ mod tests {
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],
@@ -10291,6 +10348,7 @@ mod tests {
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
+                initial_endpoints: vec![],
             }],
             removes: vec![],
             changes: vec![],

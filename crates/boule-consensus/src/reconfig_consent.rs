@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
 use crate::View;
+use crate::endpoint_registry::EndpointEntry;
 use crate::reconfig::ValidatorEntry;
 use boule_core::crypto::sig_scheme::BlsPop;
 use boule_core::crypto::signed::{ChainId, SignedMessage, Signer, preimage};
@@ -81,6 +82,10 @@ pub struct ReconfigAddConsent {
     pub operator_pubkey: NodeId,
     /// The effective view the add takes hold at (the command's `v_eff`).
     pub v_eff: View,
+    /// The initial endpoint list (#547) the operator consents to publishing
+    /// at registration. Bound here so a leader cannot inject endpoints the
+    /// operator did not agree to. Empty for an add that seeds no endpoints.
+    pub initial_endpoints: Vec<EndpointEntry>,
 }
 
 impl SignedMessage for ReconfigAddConsent {
@@ -105,6 +110,7 @@ impl ReconfigAddConsent {
             weight: entry.weight,
             operator_pubkey,
             v_eff,
+            initial_endpoints: entry.initial_endpoints.clone(),
         })
     }
 
@@ -198,6 +204,7 @@ mod tests {
             weight: 7,
             operator_pubkey: Some(operator.node_id()),
             consent_sig: None,
+            initial_endpoints: vec![],
         }
     }
 
@@ -210,6 +217,7 @@ mod tests {
             weight: 1,
             operator_pubkey: None,
             consent_sig: None,
+            initial_endpoints: vec![],
         };
         assert!(ReconfigAddConsent::for_entry(&entry, View(100)).is_none());
     }

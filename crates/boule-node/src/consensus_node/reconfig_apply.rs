@@ -220,6 +220,36 @@ impl ConsensusNode {
                 }
             }
 
+            // #547: seed the initial endpoint list of newly-seated
+            // validators (authenticated by the inbound-consent signature
+            // when an operator key is present, #548). Best-effort: a list
+            // that violates the `max_endpoint_list_length` cap or carries a
+            // duplicate `network_id` is logged and skipped — the validator
+            // is still seated, it just starts with no published endpoints.
+            // An empty list is a no-op.
+            for entry in &cmd.adds {
+                if entry.initial_endpoints.is_empty() {
+                    continue;
+                }
+                let v_id =
+                    boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(entry.node_id);
+                if !new_set.contains(&v_id) {
+                    continue;
+                }
+                match self
+                    .endpoint_registry
+                    .seed(entry.node_id, entry.initial_endpoints.clone())
+                {
+                    Ok(()) => endpoint_registry_changed = true,
+                    Err(e) => tracing::warn!(
+                        target: TRACE_TARGET,
+                        validator = ?entry.node_id,
+                        error = %e,
+                        "initial_endpoint_seed_rejected",
+                    ),
+                }
+            }
+
             // #546: GC the endpoint entries of validators this reconfig
             // removes, so the registry doesn't grow without bound across
             // membership churn. Done at the reconfig's commit (slightly

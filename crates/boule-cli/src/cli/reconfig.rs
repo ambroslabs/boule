@@ -5,9 +5,26 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use boule_consensus::View;
+use boule_consensus::endpoint_registry::EndpointEntry;
 use boule_consensus::reconfig::{self, ReconfigCommand};
 use boule_core::config;
 use boule_core::identity::base58_to_node_id;
+
+/// Parse `<network_id_base58>@<host:port>` into an [`EndpointEntry`] (#547).
+fn parse_endpoint(s: &str) -> anyhow::Result<EndpointEntry> {
+    let (id, addr) = s.split_once('@').ok_or_else(|| {
+        anyhow::anyhow!("--endpoint {s:?} must be <network_id_base58>@<host:port>")
+    })?;
+    let network_id = base58_to_node_id(id)
+        .map_err(|e| anyhow::anyhow!("--endpoint network_id {id:?} is not a valid NodeId: {e}"))?;
+    let network_address = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("--endpoint address {addr:?} is not a socket address: {e}"))?;
+    Ok(EndpointEntry {
+        network_id,
+        network_address,
+    })
+}
 
 #[derive(Subcommand)]
 pub(crate) enum ReconfigCmd {
@@ -54,6 +71,12 @@ pub(crate) struct ReconfigAddArgs {
     /// is set: the add is rejected at commit without a valid consent.
     #[arg(long)]
     consent_sig: Option<String>,
+    /// Initial endpoint hint (#547) as `<network_id_base58>@<host:port>`,
+    /// repeatable. Seeds the validator's published endpoint list at
+    /// registration. When `--operator-pubkey` is set these must match the
+    /// `--endpoint`s the consent was signed over, or the add is rejected.
+    #[arg(long = "endpoint")]
+    endpoints: Vec<String>,
     /// Config path; enables the chain `signature_scheme` cross-check.
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
@@ -91,6 +114,11 @@ pub(crate) struct ReconfigConsentSignArgs {
     /// Env var holding the operator key's passphrase (encrypted-file).
     #[arg(long)]
     operator_key_passphrase_env: Option<String>,
+    /// Initial endpoint hint (#547) as `<network_id_base58>@<host:port>`,
+    /// repeatable. Must match the `--endpoint`s the `add-validator` will
+    /// carry — the consent signature binds them.
+    #[arg(long = "endpoint")]
+    endpoints: Vec<String>,
     /// Config path — required: the consent pre-image binds the chain_id.
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
@@ -156,6 +184,12 @@ pub(crate) fn handle_add(args: ReconfigAddArgs) -> anyhow::Result<()> {
         );
     }
 
+    let initial_endpoints = args
+        .endpoints
+        .iter()
+        .map(|s| parse_endpoint(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
     let config = args
         .config_path
         .as_ref()
@@ -171,6 +205,7 @@ pub(crate) fn handle_add(args: ReconfigAddArgs) -> anyhow::Result<()> {
         args.bls_key_file.as_deref(),
         operator_pubkey,
         consent_sig,
+        initial_endpoints,
     )?;
     println!("{}", hex::encode(&payload));
     Ok(())
@@ -200,6 +235,11 @@ pub(crate) fn handle_consent_sign(args: ReconfigConsentSignArgs) -> anyhow::Resu
         anyhow::anyhow!("--addr {:?} is not a valid socket address: {e}", args.addr)
     })?;
 
+    let initial_endpoints = args
+        .endpoints
+        .iter()
+        .map(|s| parse_endpoint(s))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let req = reconfig::ReconfigConsentSignRequest {
         config_path: Some(super::shared::resolve_config_path(args.config_path)?),
         node_id,
@@ -211,6 +251,7 @@ pub(crate) fn handle_consent_sign(args: ReconfigConsentSignArgs) -> anyhow::Resu
         operator_key_backend: Some(args.operator_key_backend),
         operator_key_path: args.operator_key_path,
         operator_key_passphrase_env: args.operator_key_passphrase_env,
+        initial_endpoints,
     };
     let (sig, operator_pubkey) = reconfig::build_add_consent_signature(&req)?;
     println!("{}", hex::encode(sig));
