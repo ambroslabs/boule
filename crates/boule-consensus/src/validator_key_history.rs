@@ -91,6 +91,15 @@ pub enum HistoryError {
     /// Rotating back to a key the same validator used previously is
     /// allowed (it's idempotent for the reverse index).
     NewKeyCollidesWithOtherValidator { new_pubkey: NodeId, owner: NodeId },
+    /// A rotation-cancel (#317) named a `cancelling_v_eff` that is not the
+    /// validator's most-recent *pending* (not-yet-effective) rotation: either
+    /// no rotation is pending, the named `v_eff` does not match the pending
+    /// one, or it has already taken effect (`v_eff <= commit_view`). Only the
+    /// last pending rotation can be cancelled, and only before its `v_eff`.
+    NoPendingRotationToCancel {
+        validator: NodeId,
+        cancelling_v_eff: View,
+    },
 }
 
 impl std::fmt::Display for HistoryError {
@@ -112,6 +121,14 @@ impl std::fmt::Display for HistoryError {
                 "rotation new_pubkey {} is already in use by validator {}",
                 hex::encode(new_pubkey),
                 hex::encode(owner),
+            ),
+            Self::NoPendingRotationToCancel {
+                validator,
+                cancelling_v_eff,
+            } => write!(
+                f,
+                "no pending rotation at v_eff={cancelling_v_eff} to cancel for validator {}",
+                hex::encode(validator),
             ),
         }
     }
@@ -379,6 +396,56 @@ impl ValidatorKeyHistory {
         self.pubkey_to_stable_id
             .insert(rotation.new_pubkey, stable_id);
         Ok(())
+    }
+
+    /// The new pubkey of the validator's most-recent *pending* rotation if it
+    /// matches `cancelling_v_eff` and has not yet taken effect at `commit_view`,
+    /// else `None` (#317). The consumer verifies a cancel's `sig_new` against
+    /// this — the same trusted-source discipline as rotation's `sig_old`.
+    pub fn pending_rotation_new_key(
+        &self,
+        validator: &Pubkey,
+        cancelling_v_eff: View,
+        commit_view: View,
+    ) -> Option<Pubkey> {
+        let stable_id = self.pubkey_to_stable_id.get(validator.as_node_id())?;
+        let last = self.by_stable_id.get(stable_id)?.last()?;
+        (last.v_eff == cancelling_v_eff && cancelling_v_eff > commit_view)
+            .then(|| Pubkey::from_node_id(last.pubkey))
+    }
+
+    /// Cancel (remove) the validator's most-recent pending rotation, restoring
+    /// the history to its pre-rotation state (#317). The *only* mutator that
+    /// removes an entry — every other path is append-only. Rejects unless the
+    /// last entry is exactly the named, not-yet-effective rotation (so a cancel
+    /// can never drop the genesis entry, which always has `v_eff = 0 <=
+    /// commit_view`). Returns the removed pubkey for the caller to mirror into
+    /// the BLS history.
+    pub fn cancel_pending_rotation(
+        &mut self,
+        validator: &Pubkey,
+        cancelling_v_eff: View,
+        commit_view: View,
+    ) -> Result<Pubkey, HistoryError> {
+        let no_pending = || HistoryError::NoPendingRotationToCancel {
+            validator: *validator.as_node_id(),
+            cancelling_v_eff,
+        };
+        let stable_id = *self
+            .pubkey_to_stable_id
+            .get(validator.as_node_id())
+            .ok_or_else(no_pending)?;
+        let entries = self
+            .by_stable_id
+            .get_mut(&stable_id)
+            .expect("reverse index points to a stable_id with no history");
+        let last = entries.last().expect("history list is non-empty");
+        if last.v_eff != cancelling_v_eff || cancelling_v_eff <= commit_view {
+            return Err(no_pending());
+        }
+        let removed = entries.pop().expect("checked non-empty").pubkey;
+        self.pubkey_to_stable_id.remove(&removed);
+        Ok(Pubkey::from_node_id(removed))
     }
 
     /// Snapshot the history into a serializable wire form, suitable for
@@ -734,6 +801,85 @@ mod tests {
             assert_eq!(h.key_at_for_pubkey(&query, 1_000), Some(pk(30)));
             assert_eq!(h.current_key(&query), Some(pk(30)));
         }
+    }
+
+    // ── rotation cancel (#317) ────────────────────────────────────────────
+
+    #[test]
+    fn cancel_pending_rotation_restores_pre_rotation_state() {
+        let mut h = ValidatorKeyHistory::new([vid(1), vid(2)]);
+        let pre = h.to_persisted();
+
+        // Rotate v1 → key 10, effective at view 100, committed at view 50.
+        h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
+        assert_eq!(
+            h.pending_rotation_new_key(&pk(1), View(100), View(75)),
+            Some(pk(10)),
+            "the pending rotation's new key is reported before v_eff",
+        );
+
+        // Cancel at view 75 (before v_eff 100).
+        let removed = h
+            .cancel_pending_rotation(&pk(1), View(100), View(75))
+            .unwrap();
+        assert_eq!(removed, pk(10));
+        assert_eq!(
+            h.to_persisted(),
+            pre,
+            "history restored to its pre-rotation state"
+        );
+        assert_eq!(
+            h.validator_for(&pk(10)),
+            None,
+            "the cancelled key no longer resolves"
+        );
+        // The validator is still active under its original key.
+        assert_eq!(h.key_at(&vid(1), 200), Some(pk(1)));
+    }
+
+    #[test]
+    fn cancel_rejects_an_already_effective_rotation() {
+        let mut h = ValidatorKeyHistory::new([vid(1), vid(2)]);
+        h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
+        // commit_view 120 >= v_eff 100 → no longer pending.
+        assert_eq!(
+            h.pending_rotation_new_key(&pk(1), View(100), View(120)),
+            None
+        );
+        assert!(matches!(
+            h.cancel_pending_rotation(&pk(1), View(100), View(120)),
+            Err(HistoryError::NoPendingRotationToCancel { .. }),
+        ));
+        // The rotation stays applied.
+        assert_eq!(h.key_at(&vid(1), 100), Some(pk(10)));
+    }
+
+    #[test]
+    fn cancel_rejects_when_no_rotation_is_pending() {
+        let mut h = ValidatorKeyHistory::new([vid(1), vid(2)]);
+        assert_eq!(
+            h.pending_rotation_new_key(&pk(1), View(100), View(50)),
+            None
+        );
+        assert!(matches!(
+            h.cancel_pending_rotation(&pk(1), View(100), View(50)),
+            Err(HistoryError::NoPendingRotationToCancel { .. }),
+        ));
+    }
+
+    #[test]
+    fn cancel_rejects_a_v_eff_that_does_not_match_the_pending_rotation() {
+        let mut h = ValidatorKeyHistory::new([vid(1), vid(2)]);
+        h.apply_rotation(&rot(nid(1), nid(10), 100), 50).unwrap();
+        // A cancel naming the wrong v_eff (99 ≠ pending 100) is rejected.
+        assert!(matches!(
+            h.cancel_pending_rotation(&pk(1), View(99), View(75)),
+            Err(HistoryError::NoPendingRotationToCancel { .. }),
+        ));
+        assert_eq!(
+            h.pending_rotation_new_key(&pk(1), View(100), View(75)),
+            Some(pk(10))
+        );
     }
 
     #[test]

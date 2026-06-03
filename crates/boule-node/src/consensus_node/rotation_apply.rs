@@ -200,6 +200,40 @@ impl ConsensusNode {
             applied_any = true;
         }
 
+        // #317: process any rotation-cancel commands after the rotations, via
+        // the shared apply helper so the result is byte-identical to the
+        // recovery rebuild (the parity assert below depends on it). A cancel
+        // always targets a rotation from an earlier block, so this block's
+        // rotations and cancels never alias. Logs + drops on failure.
+        for cmd_bytes in &block.commands {
+            match boule_consensus::history_commitment::apply_rotation_cancel_command(
+                &mut self.validator_key_history,
+                self.bls_key_history.as_mut(),
+                cmd_bytes,
+                &self.chain_id,
+                self.signature_scheme,
+                block_view,
+            ) {
+                Ok(false) => {} // not a cancel payload
+                Ok(true) => {
+                    applied_any = true;
+                    tracing::info!(
+                        target: TRACE_TARGET,
+                        height = block.header.height.0,
+                        view = block_view.0,
+                        "rotation_cancel_applied",
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height.0,
+                    view = block_view.0,
+                    error = %e,
+                    "rotation_cancel_apply_failed",
+                ),
+            }
+        }
+
         // Same persistence pattern as the reconfig path: write once
         // per commit if any rotation applied, encoded as a single
         // full-history blob (not a journal). Failures log + drop —
