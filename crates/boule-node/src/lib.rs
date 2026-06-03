@@ -1016,6 +1016,7 @@ mod tests {
             snapshot_chunk_size_bytes: 1024,
             signature_scheme: scheme,
             validators_bls: vec![],
+            validators_operator_keys: vec![],
             block_retention_window: 0,
             min_block_interval_ms: 0,
         }
