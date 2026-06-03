@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 pub mod api;
 pub mod block_sync_retry_timer;
 pub mod bls_key_history;
+pub mod consensus_params;
 pub mod crashpoint;
 pub mod dispatch;
 pub mod endpoint_registry;

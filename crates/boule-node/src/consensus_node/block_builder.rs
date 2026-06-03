@@ -236,6 +236,9 @@ impl BlockBuilder for MempoolBlockBuilder {
                     // Equivocation-evidence system txs (#657): self-authenticating
                     // proofs validated + recorded at commit, like reconfig/rotation.
                     || boule_consensus::equivocation_evidence::is_evidence_payload(cmd)
+                    // Consensus-parameter-update system txs (#542): validated +
+                    // scheduled at commit, like reconfig/rotation.
+                    || boule_consensus::consensus_params::ConsensusParamUpdate::is_param_update_payload(cmd)
                     // App-level stake commands (the demo backend) are
                     // includable by the application even though the counter
                     // SM doesn't decode them; `commit` turns them into

@@ -1073,6 +1073,10 @@ impl ConsensusNode {
                                 // honest voters abstain on every evidence block
                                 // and the chain wedges.
                                 || boule_consensus::equivocation_evidence::is_evidence_payload(cmd)
+                                // Consensus-parameter-update system txs (#542):
+                                // consensus-layer, validated + scheduled at
+                                // commit — skip the SM check here as above.
+                                || boule_consensus::consensus_params::ConsensusParamUpdate::is_param_update_payload(cmd)
                             {
                                 return None;
                             }
