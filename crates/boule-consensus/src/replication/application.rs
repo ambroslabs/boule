@@ -58,6 +58,63 @@ pub struct ValidatorUpdate {
     pub weight: u64,
 }
 
+/// One richer validator-relevant effect an [`Application`] drives back into
+/// consensus through [`CommitResult::effects`] — the part of the seam beyond a
+/// plain voting-weight delta ([`CommitResult::validator_updates`]).
+///
+/// This is the **execution-layer transaction channel** (milestone #4, the
+/// "route all transactions through the execution layer" direction): an EL that
+/// has already *authorized* a validator-relevant transaction — an EVM
+/// precompile that verified a dual-signed key rotation, a governance predeploy
+/// that approved a reconfig — returns the resulting effect here, and consensus
+/// re-materializes it as a real block command so it flows through the same
+/// validated / header-committed / recoverable path a natively-submitted system
+/// command would. Consensus applies a *typed* effect; it never reads "EVM logs"
+/// directly. See issue #727.
+///
+/// Each variant carries the already-encoded consensus **system command** the
+/// effect materializes into (e.g. a [`DualSignedRotation`] for a key rotation),
+/// not raw EL state. Carrying the encoded command — rather than mutating
+/// consensus state at commit — is what keeps recovery sound: the startup
+/// integrity check re-derives validator history from committed block
+/// *commands*, so any boundary an effect introduces must first become a real
+/// command in a block (see `app_reconfig` for the same argument applied to
+/// [`CommitResult::validator_updates`]).
+///
+/// Every category is **optional**: a backend emits only the variants its
+/// authority model uses. A PoA / genesis-fixed-set backend emits none; the reth
+/// EL's default emits none. The enum is `#[non_exhaustive]`: new categories are
+/// added by their own milestone-#4 sub-issues without a breaking change.
+///
+/// [`DualSignedRotation`]: crate::validator_rotation::DualSignedRotation
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ValidatorEffect {
+    /// A signing- or operator-key rotation the execution layer has already
+    /// authorized (e.g. an EVM precompile verified the dual signature — #730),
+    /// carried as the encoded consensus rotation command
+    /// ([`DualSignedRotation`] / `OperatorSignedRotation` /
+    /// `DualSignedOperatorRotation` / their cancels). Consensus re-materializes
+    /// it as a block command so it flows through the existing rotation
+    /// validate/apply path; the embedded signatures are re-verified there, so
+    /// the proposer minting it need not be the rotating validator.
+    ///
+    /// [`DualSignedRotation`]: crate::validator_rotation::DualSignedRotation
+    KeyRotation(Bytes),
+    /// A validator endpoint-list update (#731 / #546): the EL records a
+    /// validator's advertised network endpoints and surfaces the resulting
+    /// endpoint command here. The endpoint-registry mechanism does not exist on
+    /// this branch yet, so consensus currently has no apply path — the
+    /// materializer surfaces this as an *unsupported* effect (logged, not
+    /// silently dropped) until #731/#546 lands.
+    EndpointUpdate(Bytes),
+    /// A live consensus-parameter update (#542): the EL drives a change to a
+    /// tunable consensus parameter. As with [`Self::EndpointUpdate`], the
+    /// consensus-side apply path does not exist yet, so the materializer
+    /// surfaces this as an unsupported effect until #542 lands.
+    ParamUpdate(Bytes),
+}
+
 /// What an [`Application`] returns from [`Application::commit`] — the channel
 /// by which a committed block's execution feeds information back to consensus.
 ///
@@ -68,13 +125,26 @@ pub struct ValidatorUpdate {
 /// Ethereum keeps the validator set in the *consensus* layer, not the
 /// execution layer — returns `CommitResult::default()` and behaves exactly as
 /// the previous `Result<()>` return did.
+///
+/// It carries two effect channels: [`Self::validator_updates`], the
+/// ABCI-shaped voting-weight deltas (the common PoS/staking case), and
+/// [`Self::effects`], the richer [`ValidatorEffect`] categories that route
+/// every other validator-relevant transaction through the execution layer
+/// (milestone #4 / #727). Both default empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommitResult {
-    /// Validator-set changes the application requests as a result of this
-    /// commit. Empty for an application that does not drive membership. The
-    /// integration layer does not consume these yet — applying them at a view
-    /// boundary via the reconfig path is the next step on this seam.
+    /// Voting-weight / membership deltas the application requests as a result
+    /// of this commit — the ABCI `ValidatorUpdate`-shaped channel. The
+    /// integration layer stages these and mints them into a `ReconfigCommand`
+    /// at the next proposal it builds as leader (deferred materialisation; see
+    /// `app_reconfig`). Empty for an application that does not drive membership.
     pub validator_updates: Vec<ValidatorUpdate>,
+    /// Richer validator-relevant effects beyond a plain weight delta — key
+    /// rotations, endpoint updates, parameter updates (the execution-layer
+    /// transaction channel, milestone #4 / #727). Each is materialized into a
+    /// consensus system command at the next proposal. Empty for a backend that
+    /// drives none of these (PoA, the reth default).
+    pub effects: Vec<ValidatorEffect>,
     /// Opaque application output for this commit (an ABCI `app_data`-style
     /// escape hatch). Carried for backends that need to surface per-commit
     /// data to consensus; the *commitment* story for it — a new header field
@@ -222,10 +292,14 @@ pub trait Application: Send + Sync {
     /// need not surface here.
     ///
     /// On success the application returns a [`CommitResult`] — the channel
-    /// by which an application that owns membership feeds validator-set
-    /// changes back to consensus. An application that does not drive
-    /// membership (the reth EL) returns [`CommitResult::default`], which is
-    /// behaviourally identical to the previous `Result<()>`.
+    /// by which an application feeds validator-relevant effects back to
+    /// consensus: voting-weight deltas
+    /// ([`CommitResult::validator_updates`]) and the richer
+    /// [`ValidatorEffect`] categories ([`CommitResult::effects`]) that route
+    /// every other validator transaction through the execution layer
+    /// (milestone #4). An application that drives none of this (the reth EL)
+    /// returns [`CommitResult::default`], which is behaviourally identical to
+    /// the previous `Result<()>`.
     ///
     /// `ctx` ([`AppContext`]) carries the committed block's proposer and
     /// any resolved misbehaviour evidence — the channel by which a staking
@@ -320,6 +394,7 @@ mod tests {
         // the old `Result<()>` return.
         let r = CommitResult::default();
         assert!(r.validator_updates.is_empty());
+        assert!(r.effects.is_empty());
         assert!(r.app_data.is_none());
     }
 
@@ -339,10 +414,32 @@ mod tests {
                 },
             ],
             app_data: Some(Bytes::from_static(b"opaque")),
+            ..Default::default()
         };
         assert_eq!(r.validator_updates.len(), 2);
         assert_eq!(r.validator_updates[0].weight, 5);
         assert_eq!(r.validator_updates[1].weight, 0);
         assert_eq!(r.app_data.as_deref(), Some(b"opaque".as_ref()));
+    }
+
+    #[test]
+    fn commit_result_carries_typed_effects() {
+        // The execution-layer transaction channel (#727): the richer effect
+        // categories ride alongside weight deltas, each carrying the encoded
+        // consensus command it materializes into.
+        let r = CommitResult {
+            effects: vec![
+                ValidatorEffect::KeyRotation(Bytes::from_static(b"rot")),
+                ValidatorEffect::EndpointUpdate(Bytes::from_static(b"ep")),
+                ValidatorEffect::ParamUpdate(Bytes::from_static(b"param")),
+            ],
+            ..Default::default()
+        };
+        assert!(r.validator_updates.is_empty());
+        assert_eq!(r.effects.len(), 3);
+        assert_eq!(
+            r.effects[0],
+            ValidatorEffect::KeyRotation(Bytes::from_static(b"rot"))
+        );
     }
 }

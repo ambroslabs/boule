@@ -424,7 +424,7 @@ impl Application for MempoolBlockBuilder {
             }
             Ok(CommitResult {
                 validator_updates: stake.take_updates(),
-                app_data: None,
+                ..Default::default()
             })
         })
     }

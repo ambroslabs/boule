@@ -17,6 +17,13 @@
 //! *commands*, so a boundary that never appeared in any block's commands
 //! could not be reproduced and the node would refuse to start. A minted
 //! `ReconfigCommand` *is* a command, so the existing rebuild reproduces it.
+//!
+//! The same pattern carries the richer execution-layer transaction effects
+//! ([`ValidatorEffect`], #727): an EL that has already authorized a key
+//! rotation, endpoint update, or parameter change returns it from `commit`,
+//! and [`ConsensusNode::mint_staged_effects`] re-materialises it as the
+//! corresponding consensus system command at the next proposal — same
+//! recovery-sound, command-in-a-block path.
 
 use std::collections::BTreeMap;
 
@@ -24,11 +31,28 @@ use boule_consensus::View;
 use boule_consensus::reconfig::{
     MIN_V_EFF_DELAY, MIN_VALIDATOR_FLOOR, ReconfigCommand, WeightChange,
 };
-use boule_consensus::replication::application::ValidatorUpdate;
+use boule_consensus::replication::application::{ValidatorEffect, ValidatorUpdate};
+use boule_consensus::validator_rotation::{
+    DualSignedOperatorRotation, DualSignedRotation, DualSignedRotationCancel,
+    OperatorSignedRotation,
+};
 use boule_consensus::validator_set::{ValidatorId, ValidatorSet};
 use boule_core::identity::NodeId;
 
 use super::{ConsensusNode, TRACE_TARGET};
+
+/// Whether `bytes` is one of the consensus key-rotation system commands — the
+/// canonical 4-way predicate the block builder uses to recognise a rotation
+/// payload (dual-signed key rotation, its cancel, operator-signed recovery
+/// rotation, operator-key self-rotation). Used by
+/// [`ConsensusNode::mint_staged_effects`] to confirm a
+/// [`ValidatorEffect::KeyRotation`] payload's declared category before minting.
+fn is_rotation_command(bytes: &[u8]) -> bool {
+    DualSignedRotation::is_rotation_payload(bytes)
+        || DualSignedRotationCancel::is_cancel_payload(bytes)
+        || OperatorSignedRotation::is_operator_rotation_payload(bytes)
+        || DualSignedOperatorRotation::is_operator_key_rotation_payload(bytes)
+}
 
 /// Views to defer an app-driven reconfig's `v_eff` beyond the proposing
 /// block's view, on top of the validation floor. The reconfig is minted
@@ -128,6 +152,86 @@ impl ConsensusNode {
                 error = %e,
                 "mint_staged_reconfig_mempool_insert_failed",
             ),
+        }
+    }
+
+    /// Drain the staged execution-layer transaction effects (#727) and
+    /// materialise each into its consensus system command on the proposal this
+    /// node is about to build as leader. Called next to
+    /// [`Self::mint_staged_reconfig`] on the build path.
+    ///
+    /// A no-op when nothing is staged — the only case for a backend that drives
+    /// no effects (PoA, the reth EL default), so the common path costs one
+    /// `is_empty` check.
+    ///
+    /// Unlike `staged_validator_updates`, staged effects are **drained** (minted
+    /// once) rather than retained-until-landed. If the proposal that carries a
+    /// minted command never commits, re-emission is the producing execution
+    /// layer's responsibility: the EL holds the authorization in its own state
+    /// and re-emits the effect on a later commit until it observes the change
+    /// applied (#730). Retaining here would instead risk minting duplicate
+    /// rotation commands, which have no one-boundary-at-a-time guard to dedupe
+    /// them the way [`Self::mint_staged_reconfig`] does for reconfigs.
+    ///
+    /// Categories whose consensus apply path does not exist on this branch yet
+    /// ([`ValidatorEffect::EndpointUpdate`] → #731/#546,
+    /// [`ValidatorEffect::ParamUpdate`] → #542) are logged as unsupported rather
+    /// than silently dropped — a surfaced seam gap (cf. the integration-surface
+    /// catalog, #728).
+    pub(super) fn mint_staged_effects(&mut self, view: View) {
+        if self.staged_effects.is_empty() {
+            return;
+        }
+        for effect in std::mem::take(&mut self.staged_effects) {
+            match effect {
+                ValidatorEffect::KeyRotation(bytes) => {
+                    // The EL already authorized this rotation (e.g. a precompile
+                    // verified the dual signature, #730); re-materialise it as a
+                    // block command so it flows through the existing rotation
+                    // validate/apply path, where the embedded signatures are
+                    // re-verified. Confirm the declared category matches the
+                    // payload before minting (defense-in-depth: the effect
+                    // channel must not smuggle a non-rotation command in).
+                    if !is_rotation_command(&bytes) {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            view = view.0,
+                            "mint_staged_effects_key_rotation_payload_not_a_rotation",
+                        );
+                        continue;
+                    }
+                    match self.mempool.insert(bytes) {
+                        Ok(_) => tracing::info!(
+                            target: TRACE_TARGET,
+                            view = view.0,
+                            "app_effect_minted_key_rotation",
+                        ),
+                        Err(e) => tracing::error!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "mint_staged_effects_mempool_insert_failed",
+                        ),
+                    }
+                }
+                ValidatorEffect::EndpointUpdate(_) => tracing::warn!(
+                    target: TRACE_TARGET,
+                    view = view.0,
+                    "app_effect_endpoint_update_unsupported_dropped", // #731/#546
+                ),
+                ValidatorEffect::ParamUpdate(_) => tracing::warn!(
+                    target: TRACE_TARGET,
+                    view = view.0,
+                    "app_effect_param_update_unsupported_dropped", // #542
+                ),
+                // `ValidatorEffect` is `#[non_exhaustive]`: a category added by
+                // a future milestone-#4 issue without a materialiser here is
+                // surfaced rather than silently dropped.
+                _ => tracing::warn!(
+                    target: TRACE_TARGET,
+                    view = view.0,
+                    "app_effect_unknown_category_dropped",
+                ),
+            }
         }
     }
 

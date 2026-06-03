@@ -471,7 +471,7 @@ impl Application for RethApplication {
                 .await;
             Ok(CommitResult {
                 validator_updates,
-                app_data: None,
+                ..Default::default()
             })
         })
     }

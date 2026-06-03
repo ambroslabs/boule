@@ -55,28 +55,45 @@ impl ConsensusNode {
         self.apply_commit(block);
     }
 
-    /// Stage any validator-set changes the application requested at this
-    /// commit (the [`CommitResult`]'s `validator_updates`) so the next
-    /// proposal this node builds as leader can mint them into a `ReconfigCommand`
-    /// (deferred materialisation — see
-    /// [`ConsensusNode::staged_validator_updates`](super::ConsensusNode#structfield.staged_validator_updates)
-    /// and [`ConsensusNode::mint_staged_reconfig`](super::ConsensusNode::mint_staged_reconfig)).
-    /// A no-op for an application that does not drive membership (the reth
-    /// EL returns no updates), so the common path costs only the `is_empty`
-    /// check.
+    /// Stage the validator-relevant effects the application returned at this
+    /// commit so the next proposal this node builds as leader can materialise
+    /// them — deferred materialisation. The [`CommitResult`] carries two
+    /// channels:
+    ///
+    /// - `validator_updates` (voting-weight deltas) → staged for
+    ///   [`ConsensusNode::mint_staged_reconfig`](super::ConsensusNode::mint_staged_reconfig),
+    ///   which folds them into a `ReconfigCommand` (see
+    ///   [`ConsensusNode::staged_validator_updates`](super::ConsensusNode#structfield.staged_validator_updates)).
+    /// - `effects` (key rotations / endpoint / parameter updates — the
+    ///   execution-layer transaction channel, #727) → staged for
+    ///   [`ConsensusNode::mint_staged_effects`](super::ConsensusNode::mint_staged_effects),
+    ///   which mints each as its consensus system command.
+    ///
+    /// A no-op for an application that drives neither (the reth EL default
+    /// returns both empty), so the common path costs only two `is_empty`
+    /// checks.
     fn stage_app_validator_updates(&mut self, result: CommitResult, block: &Block) {
-        if result.validator_updates.is_empty() {
-            return;
+        if !result.validator_updates.is_empty() {
+            tracing::info!(
+                target: TRACE_TARGET,
+                height = block.header.height.0,
+                view = block.header.view.0,
+                count = result.validator_updates.len(),
+                "app_validator_updates_staged",
+            );
+            self.staged_validator_updates
+                .extend(result.validator_updates);
         }
-        tracing::info!(
-            target: TRACE_TARGET,
-            height = block.header.height.0,
-            view = block.header.view.0,
-            count = result.validator_updates.len(),
-            "app_validator_updates_staged",
-        );
-        self.staged_validator_updates
-            .extend(result.validator_updates);
+        if !result.effects.is_empty() {
+            tracing::info!(
+                target: TRACE_TARGET,
+                height = block.header.height.0,
+                view = block.header.view.0,
+                count = result.effects.len(),
+                "app_validator_effects_staged",
+            );
+            self.staged_effects.extend(result.effects);
+        }
     }
 
     /// Drain the committed commands from the mempool and make the commit
