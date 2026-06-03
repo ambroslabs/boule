@@ -622,7 +622,7 @@ impl ConsensusNode {
     pub fn verify_persisted_history_consistency(&self) -> anyhow::Result<()> {
         use boule_consensus::history_commitment::{
             apply_reconfig_commands_to_set_history, apply_rotation_commands_to_histories,
-            validator_history_commitment_v1,
+            validator_history_commitment_v2,
         };
         use boule_consensus::validator_history::ValidatorSetHistory;
         use boule_consensus::validator_key_history::ValidatorKeyHistory;
@@ -808,8 +808,15 @@ impl ConsensusNode {
                 self.signature_scheme,
             );
             let claimed = block.header.validator_history_commitment;
-            let actual =
-                validator_history_commitment_v1(&rebuilt_set, &rebuilt_key, rebuilt_bls.as_ref());
+            // #549: v2 folds the operator-key history. Immutable in this slice,
+            // so the live genesis-seeded history is the right value at every
+            // height (PR-next rebuilds it from commands as it becomes mutable).
+            let actual = validator_history_commitment_v2(
+                &rebuilt_set,
+                &rebuilt_key,
+                rebuilt_bls.as_ref(),
+                Some(&self.operator_key_history),
+            );
             if claimed != actual {
                 anyhow::bail!(
                     "validator_history_commitment mismatch at block height={} view={} hash={}: \

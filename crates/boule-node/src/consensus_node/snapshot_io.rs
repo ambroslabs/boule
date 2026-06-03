@@ -533,6 +533,8 @@ impl ConsensusNode {
         let validator_history_persisted = self.validator_history.to_persisted();
         let validator_key_history_persisted = self.validator_key_history.to_persisted();
         let bls_key_history_persisted = self.bls_key_history.as_ref().map(|h| h.to_persisted());
+        // #549: embed the operator-key history too, folded into the v2 hash.
+        let operator_key_history_persisted = Some(self.operator_key_history.to_persisted());
         let manifest = SnapshotManifest::build(
             block.clone(), // `block` is `&Block` here; clone for the manifest's owned field.
             active_set,
@@ -543,6 +545,7 @@ impl ConsensusNode {
             validator_history_persisted,
             validator_key_history_persisted,
             bls_key_history_persisted,
+            operator_key_history_persisted,
         );
         let store = SnapshotStore::new(Arc::clone(&self.storage));
         store.save(&manifest, &chunks)?;

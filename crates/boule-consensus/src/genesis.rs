@@ -52,10 +52,14 @@ pub fn derive_chain_id(
         seed = decode_hex32(hex)
             .ok_or_else(|| anyhow::anyhow!("genesis_seed_hex must be 64 hex chars (32 bytes)"))?;
     }
+    let operator_keys = cfg
+        .resolve_genesis_operator_keys()
+        .context("decoding genesis operator-key table")?;
     Ok(derive_chain_id_from_parts(
         &ids,
         cfg.signature_scheme,
         &bls_pubkeys,
+        &operator_keys,
         seed,
     ))
 }
@@ -76,6 +80,7 @@ pub fn derive_chain_id_from_parts(
     validator_node_ids: &[NodeId],
     signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
+    genesis_operator_keys: &[(NodeId, NodeId)],
     genesis_seed: [u8; 32],
 ) -> boule_core::crypto::signed::ChainId {
     let validator_ids: Vec<crate::validator_set::ValidatorId> = validator_node_ids
@@ -84,8 +89,12 @@ pub fn derive_chain_id_from_parts(
         .map(crate::validator_set::ValidatorId::from_genesis_pubkey)
         .collect();
     let validator_set = ValidatorSet::new(validator_ids);
-    let commitment =
-        compute_genesis_validator_history_commitment(&validator_set, signature_scheme, genesis_bls);
+    let commitment = compute_genesis_validator_history_commitment(
+        &validator_set,
+        signature_scheme,
+        genesis_bls,
+        genesis_operator_keys,
+    );
     let genesis = Block::genesis(genesis_seed, commitment);
     boule_core::crypto::signed::ChainId::from_genesis_hash(genesis.hash())
 }
@@ -94,10 +103,10 @@ pub fn derive_chain_id_from_parts(
 /// field. Defaults to all-zeros when unset.
 ///
 /// `validator_history_commitment` is computed from the genesis-time
-/// validator-set / key / BLS-key histories so a recovering node can
-/// cross-check its persisted history blobs against the chain's claim
-/// (#325 PR B). The triple is the canonical input to
-/// [`crate::history_commitment::validator_history_commitment_v1`].
+/// validator-set / key / BLS-key / operator-key histories so a recovering
+/// node can cross-check its persisted history blobs against the chain's claim
+/// (#325 PR B). The quad is the canonical input to
+/// [`crate::history_commitment::validator_history_commitment_v2`] (#549).
 pub fn build_genesis(
     cfg: &ConsensusConfig,
     validator_set: &ValidatorSet,
@@ -109,10 +118,12 @@ pub fn build_genesis(
             .ok_or_else(|| anyhow::anyhow!("genesis_seed_hex must be 64 hex chars (32 bytes)"))?;
         seed = bytes;
     }
+    let operator_keys = cfg.resolve_genesis_operator_keys()?;
     let commitment = compute_genesis_validator_history_commitment(
         validator_set,
         cfg.signature_scheme,
         genesis_bls,
+        &operator_keys,
     );
     Ok(Block::genesis(seed, commitment))
 }
@@ -125,6 +136,7 @@ fn compute_genesis_validator_history_commitment(
     validator_set: &ValidatorSet,
     scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
+    genesis_operator_keys: &[(NodeId, NodeId)],
 ) -> [u8; 32] {
     let set_hist =
         crate::validator_history::ValidatorSetHistory::from_genesis(validator_set.clone());
@@ -136,10 +148,28 @@ fn compute_genesis_validator_history_commitment(
         ),
         boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => None,
     };
-    crate::history_commitment::validator_history_commitment_v1(
+    // #549: v2 folds the operator-key history. `None` when the chain declared
+    // no operator keys, so an operator-keyless chain hashes (and so derives a
+    // chain_id) distinctly from one with an empty operator history.
+    let operator_hist = if genesis_operator_keys.is_empty() {
+        None
+    } else {
+        Some(
+            crate::operator_key_history::OperatorKeyHistory::with_genesis(
+                genesis_operator_keys.iter().map(|(v, op)| {
+                    (
+                        crate::validator_set::ValidatorId::from_genesis_pubkey(*v),
+                        *op,
+                    )
+                }),
+            ),
+        )
+    };
+    crate::history_commitment::validator_history_commitment_v2(
         &set_hist,
         &key_hist,
         bls_hist.as_ref(),
+        operator_hist.as_ref(),
     )
 }
 

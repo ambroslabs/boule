@@ -6779,7 +6779,6 @@ mod tests {
     /// This isolates the rotation-aware install logic.
     #[tokio::test]
     async fn joiner_restore_installs_rotated_validator_key_history() {
-        use boule_consensus::history_commitment::validator_history_commitment_v1;
         use boule_consensus::replication::impls::counter_sm::CounterCommand;
         use boule_consensus::validator_key_history::PersistedValidatorKeyHistory;
         use boule_consensus::validator_rotation::ValidatorKeyRotation;
@@ -6823,8 +6822,12 @@ mod tests {
             )
             .expect("rotation applies cleanly");
         let producer_set_hist = ValidatorSetHistory::from_genesis(vs.clone());
-        let commitment =
-            validator_history_commitment_v1(&producer_set_hist, &producer_key_hist, None);
+        let commitment = boule_consensus::history_commitment::validator_history_commitment_v2(
+            &producer_set_hist,
+            &producer_key_hist,
+            None,
+            None,
+        );
 
         // ── Build the snapshot at height 50 / view 50 with the
         //   right state-commitment and history-commitment.
@@ -6876,6 +6879,7 @@ mod tests {
             1_700_000_000,
             producer_set_hist.to_persisted(),
             producer_key_hist.to_persisted(),
+            None,
             None,
         );
         manifest
@@ -8471,10 +8475,11 @@ mod tests {
         // Snapshot the expected commitment before triggering the
         // broadcast — pre-block semantics, so this hash is what should
         // appear on the wire.
-        let expected = boule_consensus::history_commitment::validator_history_commitment_v1(
+        let expected = boule_consensus::history_commitment::validator_history_commitment_v2(
             &node.validator_history,
             &node.validator_key_history,
             node.bls_key_history.as_ref(),
+            None,
         );
 
         let (broadcaster, mut send_rx) = make_test_broadcaster();
@@ -9775,8 +9780,8 @@ mod tests {
     fn genesis_with_real_commitment(vs: &ValidatorSet) -> Block {
         let set_hist = ValidatorSetHistory::from_genesis(vs.clone());
         let key_hist = ValidatorKeyHistory::new(vs.iter().copied());
-        let commitment = boule_consensus::history_commitment::validator_history_commitment_v1(
-            &set_hist, &key_hist, None,
+        let commitment = boule_consensus::history_commitment::validator_history_commitment_v2(
+            &set_hist, &key_hist, None, None,
         );
         Block::genesis([0u8; 32], commitment)
     }
@@ -10031,9 +10036,10 @@ mod tests {
             Arc::new(MemoryWal::new()),
         );
         let pre_block_commitment =
-            boule_consensus::history_commitment::validator_history_commitment_v1(
+            boule_consensus::history_commitment::validator_history_commitment_v2(
                 &node.validator_history,
                 &node.validator_key_history,
+                None,
                 None,
             );
         let block1 = Block {
@@ -10114,9 +10120,10 @@ mod tests {
             Arc::new(MemoryWal::new()),
         );
         let pre_block_commitment =
-            boule_consensus::history_commitment::validator_history_commitment_v1(
+            boule_consensus::history_commitment::validator_history_commitment_v2(
                 &node.validator_history,
                 &node.validator_key_history,
+                None,
                 None,
             );
         let block1 = Block {
@@ -10194,10 +10201,11 @@ mod tests {
         // Build genesis with a commitment over the full BLS-aware triple.
         let set_hist = ValidatorSetHistory::from_genesis(vs.clone());
         let key_hist = ValidatorKeyHistory::new(vs.iter().copied());
-        let commitment = boule_consensus::history_commitment::validator_history_commitment_v1(
+        let commitment = boule_consensus::history_commitment::validator_history_commitment_v2(
             &set_hist,
             &key_hist,
             Some(&bls_history),
+            None,
         );
         let g = Block::genesis([0u8; 32], commitment);
 
@@ -10219,10 +10227,11 @@ mod tests {
         )
         .with_bls_key_history(bls_history.clone());
         let pre_block_commitment =
-            boule_consensus::history_commitment::validator_history_commitment_v1(
+            boule_consensus::history_commitment::validator_history_commitment_v2(
                 &node.validator_history,
                 &node.validator_key_history,
                 node.bls_key_history.as_ref(),
+                None,
             );
         let block1 = Block {
             header: boule_consensus::replication::block::BlockHeader {
