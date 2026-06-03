@@ -1257,9 +1257,13 @@ impl ConsensusNode {
                     // the block this node is about to build carries it. A
                     // no-op unless updates are staged.
                     self.mint_staged_reconfig(view);
+                    // #653: surface proposer + commit-info (the high_qc's
+                    // signers and their weights) to the application.
+                    let ctx = self.build_app_context(&high_qc);
                     match self
                         .app
                         .build_proposal(
+                            &ctx,
                             &parent,
                             view,
                             &high_qc,

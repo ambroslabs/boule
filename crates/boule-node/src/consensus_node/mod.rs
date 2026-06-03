@@ -95,6 +95,7 @@ use boule_transport_tcp::tls::node_id_to_base58;
 use boule_transport_tcp::{NodeId, ProtocolEvent};
 
 mod action_interpreter;
+mod app_context;
 mod app_reconfig;
 mod block_builder;
 mod block_sync;
@@ -1328,7 +1329,9 @@ impl ConsensusNode {
             "el_catchup: replaying committed payloads to catch the execution layer up",
         );
         for block in &gap {
-            if let Err(e) = self.app.commit(block).await {
+            // #653: same per-commit context as the live path.
+            let ctx = self.commit_app_context(block);
+            if let Err(e) = self.app.commit(&ctx, block).await {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     height = block.header.height.0,
@@ -4421,6 +4424,70 @@ mod tests {
         assert_eq!(node.build_status().equivocation_evidence_committed, 0);
     }
 
+    /// #653: the commit-time `AppContext` carries the block's proposer and
+    /// every valid equivocation proof in the block, each offender resolved to
+    /// its stable id. Garbage evidence is excluded.
+    #[test]
+    fn commit_app_context_carries_proposer_and_resolved_evidence() {
+        use boule_consensus::equivocation_evidence::{EVIDENCE_TAG, encode_evidence};
+
+        let (node, equivocator, eq_id) = node_with_equivocator();
+        let proof = double_vote_proof(&equivocator, &node.chain_id, 3, 0xAA, 0xBB);
+        let mut garbage = EVIDENCE_TAG.to_vec();
+        garbage.extend_from_slice(b"not a proof");
+        let block = block_with_commands(
+            1,
+            10,
+            vec![encode_evidence(&proof), bytes::Bytes::from(garbage)],
+        );
+
+        let ctx = node.commit_app_context(&block);
+        // Proposer comes straight off the committed header.
+        assert_eq!(ctx.proposer, block.header.proposer);
+        // Exactly one resolved offender — the garbage proof is dropped.
+        assert_eq!(ctx.evidence.len(), 1);
+        assert_eq!(ctx.evidence[0].offender, eq_id.into_node_id());
+        assert_eq!(ctx.evidence[0].view, View(3));
+        // No QC is threaded into the commit path, so last_commit is empty.
+        assert!(ctx.last_commit.is_empty());
+    }
+
+    /// #653: the build-time `AppContext` names this node as proposer and
+    /// resolves the high_qc's signers to `(validator, weight)` against the set
+    /// authoritative at the QC's view.
+    #[test]
+    fn build_app_context_resolves_qc_signers_to_weighted_commit_info() {
+        use boule_consensus::hotstuff::qc::QuorumCertificate;
+
+        let (node, _equivocator, eq_id) = node_with_equivocator();
+        // Mirror the node's genesis set so we can name the validator at each
+        // signed index (ValidatorSet sorts its members).
+        let vs = ValidatorSet::new(vec![eq_id, vid(2), vid(3), vid(4)]);
+
+        // A QC at view 7 signed by the validators at indices 0 and 2.
+        let mut qc = QuorumCertificate::new(7u64, [0xCD; 32], vs.len());
+        qc.add_signature(0, [0u8; 64]);
+        qc.add_signature(2, [0u8; 64]);
+
+        let ctx = node.build_app_context(&qc);
+        // Proposer is this node.
+        assert_eq!(ctx.proposer, node.self_id);
+        // Two signers, in ascending index order, each resolved to its id+weight.
+        assert_eq!(ctx.last_commit.len(), 2);
+        assert_eq!(
+            ctx.last_commit[0].validator,
+            *vs.get(0).unwrap().as_node_id()
+        );
+        assert_eq!(ctx.last_commit[0].weight, vs.weight_at(0));
+        assert_eq!(
+            ctx.last_commit[1].validator,
+            *vs.get(2).unwrap().as_node_id()
+        );
+        assert_eq!(ctx.last_commit[1].weight, vs.weight_at(2));
+        // Evidence is empty on the build path.
+        assert!(ctx.evidence.is_empty());
+    }
+
     /// #657: the committed-evidence registry is persisted, so a recovering
     /// node reloads it (exactly-once survives restart + block pruning).
     #[test]
@@ -4569,6 +4636,7 @@ mod tests {
         impl Application for SlashSpyApp {
             fn build_proposal<'a>(
                 &'a self,
+                _ctx: &'a boule_consensus::replication::application::AppContext,
                 _parent: &'a Block,
                 _view: View,
                 _high_qc: &'a boule_consensus::hotstuff::QuorumCertificate,
@@ -4579,6 +4647,7 @@ mod tests {
             }
             fn commit<'a>(
                 &'a self,
+                _ctx: &'a boule_consensus::replication::application::AppContext,
                 _block: &'a Block,
             ) -> boule_core::clock::BoxFuture<
                 'a,
@@ -10248,6 +10317,7 @@ mod tests {
     impl boule_consensus::replication::application::Application for RecordingApp {
         fn build_proposal<'a>(
             &'a self,
+            _ctx: &'a boule_consensus::replication::application::AppContext,
             _parent: &'a Block,
             _view: View,
             _high_qc: &'a boule_consensus::hotstuff::QuorumCertificate,
@@ -10258,6 +10328,7 @@ mod tests {
         }
         fn commit<'a>(
             &'a self,
+            _ctx: &'a boule_consensus::replication::application::AppContext,
             block: &'a Block,
         ) -> boule_core::clock::BoxFuture<
             'a,
@@ -10302,6 +10373,7 @@ mod tests {
     impl boule_consensus::replication::application::Application for StakingTestApp {
         fn build_proposal<'a>(
             &'a self,
+            _ctx: &'a boule_consensus::replication::application::AppContext,
             _parent: &'a Block,
             _view: View,
             _high_qc: &'a boule_consensus::hotstuff::QuorumCertificate,
@@ -10312,6 +10384,7 @@ mod tests {
         }
         fn commit<'a>(
             &'a self,
+            _ctx: &'a boule_consensus::replication::application::AppContext,
             _block: &'a Block,
         ) -> boule_core::clock::BoxFuture<
             'a,

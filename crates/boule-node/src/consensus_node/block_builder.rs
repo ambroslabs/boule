@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 
 use boule_consensus::hotstuff::QuorumCertificate;
 use boule_consensus::hotstuff::step::BlockBuilder;
-use boule_consensus::replication::application::{Application, CommitResult};
+use boule_consensus::replication::application::{AppContext, Application, CommitResult};
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::reward_ledger::{RewardConfig, RewardLedger};
@@ -321,6 +321,7 @@ impl Application for MempoolBlockBuilder {
     /// the remote round trip completes.
     fn build_proposal<'a>(
         &'a self,
+        _ctx: &'a AppContext,
         parent: &'a Block,
         view: View,
         high_qc: &'a QuorumCertificate,
@@ -351,7 +352,11 @@ impl Application for MempoolBlockBuilder {
     /// commands, so they are surfaced as `validator_updates` rather than
     /// applied to the state machine, driving an app-driven validator-set
     /// change through the deferred-materialisation path (#225 M5).
-    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<CommitResult>> {
+    fn commit<'a>(
+        &'a self,
+        _ctx: &'a AppContext,
+        block: &'a Block,
+    ) -> BoxFuture<'a, anyhow::Result<CommitResult>> {
         Box::pin(async move {
             let mut stake = self.stake_source.lock();
             // Advance the stake clock first so this block's unbondings schedule
@@ -577,7 +582,10 @@ mod tests {
             .build(&genesis, View(1), &qc, &HashMap::new(), 0)
             .expect("build");
         assert_eq!(block.header.proposer, v1);
-        builder.commit(&block).await.expect("commit");
+        builder
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit");
 
         // Issuance 100 over total stake 20 → 50 each by share; v1 also gets the
         // proposer bonus of 5.
