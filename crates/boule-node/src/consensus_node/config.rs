@@ -6,6 +6,7 @@ use boule_consensus::limits::CacheLimits;
 use boule_consensus::replication::block::{Block, BlockHash};
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::{Height, View};
+use boule_core::identity::NodeId;
 
 /// Plain-data configuration for a [`super::ConsensusNode`].
 ///
@@ -77,6 +78,14 @@ pub struct NodeConfigForConsensus {
     /// commit or recover a chain whose block at `height` does not hash to
     /// `block_hash`. `None` (the default) is genesis-anchored.
     pub weak_subjectivity_checkpoint: Option<(Height, BlockHash)>,
+
+    /// Genesis operator keys (#549): `(validator_id, operator_pubkey)` pairs
+    /// seeding the immutable [`OperatorKeyHistory`](boule_consensus::operator_key_history::OperatorKeyHistory).
+    /// The operator key authorises signing-key recovery without the old
+    /// signing key. Optional per validator — a validator absent here has no
+    /// operator-recovery path. Resolved from
+    /// [`ConsensusConfig::resolve_genesis_operator_keys`](boule_core::config::ConsensusConfig::resolve_genesis_operator_keys).
+    pub operator_keys: Vec<(NodeId, NodeId)>,
 }
 
 impl NodeConfigForConsensus {
@@ -109,6 +118,8 @@ impl NodeConfigForConsensus {
             // and must not gain an artificial block-time floor.
             min_block_interval: Duration::ZERO,
             weak_subjectivity_checkpoint: None,
+            // Tests opt into operator keys explicitly; default is none.
+            operator_keys: Vec::new(),
         }
     }
 }

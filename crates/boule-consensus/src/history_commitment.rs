@@ -437,6 +437,7 @@ pub fn apply_rotation_commands_to_histories(
     _set_history: &ValidatorSetHistory,
     key_history: &mut ValidatorKeyHistory,
     mut bls_key_history: Option<&mut BlsKeyHistory>,
+    operator_key_history: Option<&OperatorKeyHistory>,
     chain_id: &ChainId,
     scheme: SignatureSchemeChoice,
 ) {
@@ -535,6 +536,27 @@ pub fn apply_rotation_commands_to_histories(
             block_view,
         );
     }
+
+    // #549: process operator-signed signing-key recovery rotations. They
+    // mutate the same key history a dual-signed rotation would, so they must
+    // be reproduced here for the commitment/recovery rebuild to match the
+    // live commit path (the parity invariant). Verifying them needs the
+    // operator-key history; with none available (no operator keys on this
+    // chain) they are skipped, exactly as the live path drops them. Silent on
+    // failure — the rebuild matches the (logging) production path's final state.
+    if let Some(operator_key_history) = operator_key_history {
+        for cmd_bytes in &block.commands {
+            let _ = apply_operator_rotation_command(
+                key_history,
+                bls_key_history.as_deref_mut(),
+                operator_key_history,
+                cmd_bytes,
+                chain_id,
+                scheme,
+                block_view,
+            );
+        }
+    }
 }
 
 /// Compute the v1 commitment over the **post-block** state: forks the
@@ -569,11 +591,15 @@ pub fn apply_rotation_commands_to_histories(
 /// the commitment a function of the block content alone, so
 /// follower-side verification is sound regardless of the relative
 /// commit positions of leader and follower.
+#[allow(clippy::too_many_arguments)] // the post-block commitment is a pure
+// function of all four histories + chain/scheme/delay; bundling them into a
+// struct would obscure the call sites more than it clarifies.
 pub fn compute_post_block_commitment(
     block: &Block,
     set_history: &ValidatorSetHistory,
     key_history: &ValidatorKeyHistory,
     bls_key_history: Option<&BlsKeyHistory>,
+    operator_key_history: Option<&OperatorKeyHistory>,
     chain_id: &ChainId,
     scheme: SignatureSchemeChoice,
     min_v_eff_delay: View,
@@ -589,7 +615,15 @@ pub fn compute_post_block_commitment(
         min_v_eff_delay,
         chain_id,
     );
-    apply_rotation_commands_to_histories(block, &set, &mut key, bls.as_mut(), chain_id, scheme);
+    apply_rotation_commands_to_histories(
+        block,
+        &set,
+        &mut key,
+        bls.as_mut(),
+        operator_key_history,
+        chain_id,
+        scheme,
+    );
     validator_history_commitment_v1(&set, &key, bls.as_ref())
 }
 

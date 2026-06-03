@@ -72,6 +72,7 @@ use boule_consensus::hotstuff::qc::{ConsensusMsg, VerifiedQc, genesis_qc_bls};
 use boule_consensus::hotstuff::step::{HotStuffCore, StateUpdate};
 use boule_consensus::hotstuff::{HotStuffState, QuorumCertificate, genesis_qc};
 use boule_consensus::limits::CacheEvictionCounters;
+use boule_consensus::operator_key_history::OperatorKeyHistory;
 use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::pacemaker::Pacemaker;
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
@@ -261,6 +262,12 @@ pub struct ConsensusNode {
     /// validators), so verification semantics match the
     /// pre-rotation behaviour.
     pub validator_key_history: ValidatorKeyHistory,
+    /// Per-validator operator-key history (#549), seeded from genesis and
+    /// immutable in this slice. Authorises operator-signed signing-key
+    /// recovery rotations: a committed `OperatorSignedRotation` is verified
+    /// against the operator key active for the validator at the commit view.
+    /// Empty on chains whose genesis declared no operator keys.
+    pub operator_key_history: OperatorKeyHistory,
     /// Per-validator BLS pubkey history (#294). `Some` only on chains
     /// whose genesis declared `signature_scheme = "bls_aggregated"`
     /// (#288); `None` on Ed25519 chains. Used by the dispatch-layer QC
@@ -687,6 +694,13 @@ impl ConsensusNode {
 
         let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         let validator_key_history = ValidatorKeyHistory::new(config.validator_set.iter().copied());
+        // #549: seed the immutable operator-key history from genesis config.
+        let operator_key_history = OperatorKeyHistory::with_genesis(
+            config
+                .operator_keys
+                .iter()
+                .map(|(v, op)| (ValidatorId::from_genesis_pubkey(*v), *op)),
+        );
         Self {
             self_id,
             core,
@@ -697,6 +711,7 @@ impl ConsensusNode {
             validator_set: config.validator_set,
             validator_history,
             validator_key_history,
+            operator_key_history,
             bls_key_history: None,
             bls_signer: None,
             signature_scheme: config.signature_scheme,
@@ -1099,6 +1114,15 @@ impl ConsensusNode {
             None => ValidatorKeyHistory::from_set_history(&validator_history),
         };
 
+        // #549: operator keys are immutable genesis config, so recover
+        // rebuilds the same history a fresh boot does — no persistence.
+        let operator_key_history = OperatorKeyHistory::with_genesis(
+            config
+                .operator_keys
+                .iter()
+                .map(|(v, op)| (ValidatorId::from_genesis_pubkey(*v), *op)),
+        );
+
         // #324: same derivation as `ConsensusNode::new` — recover paths
         // must produce the same `ChainId` as a fresh boot, since both
         // share the same genesis bytes.
@@ -1119,6 +1143,7 @@ impl ConsensusNode {
             validator_set: active_set,
             validator_history,
             validator_key_history,
+            operator_key_history,
             bls_key_history: None,
             bls_signer: None,
             signature_scheme: config.signature_scheme,
@@ -1570,6 +1595,7 @@ impl ConsensusNode {
                             let qc_verification = dispatch::QcVerification::Verify {
                                 scheme: self.signature_scheme,
                                 bls_key_history: self.bls_key_history.as_ref(),
+                                operator_key_history: Some(&self.operator_key_history),
                                 min_v_eff_delay: self.min_v_eff_delay,
                                 genesis_hash: self.core.state().genesis_hash,
                             };
@@ -4365,6 +4391,91 @@ mod tests {
             timestamp: 0,
         };
         Block { header, commands }
+    }
+
+    /// A node whose validator `v` (a real signer) declares operator key
+    /// `operator` at genesis, plus a fresh `new` signer to recover to.
+    fn node_with_operator_key() -> (ConsensusNode, NodeSigner, NodeSigner, ValidatorId) {
+        let validator = fresh_signer();
+        let operator = fresh_signer();
+        let new = fresh_signer();
+        let v_id = ValidatorId::from_genesis_pubkey(validator.node_id());
+        let vs = ValidatorSet::new(vec![v_id, vid(2), vid(3), vid(4)]);
+        let mut cfg = test_config(vs);
+        cfg.operator_keys = vec![(validator.node_id(), operator.node_id())];
+        let node = ConsensusNode::new(
+            nid(2),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+        (node, operator, new, v_id)
+    }
+
+    /// #549: an operator-signed recovery rotation in a committed block rotates
+    /// the validator's signing key — authorised by its operator key, no old
+    /// signing key needed. The `#[cfg(debug_assertions)]` parity assert inside
+    /// `apply_committed_rotations` also fires, confirming the live apply and
+    /// the recovery/commitment rebuild reproduce identical state.
+    #[test]
+    fn operator_signed_rotation_applies_at_commit_and_matches_the_rebuild() {
+        use boule_consensus::validator_rotation::{OperatorSignedRotation, ValidatorKeyRotation};
+        use boule_consensus::validator_set::Pubkey;
+
+        let (mut node, operator, new, v_id) = node_with_operator_key();
+        let payload = ValidatorKeyRotation {
+            validator: v_id.into_node_id(),
+            new_pubkey: new.node_id(),
+            v_eff: View(20),
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        };
+        let env = OperatorSignedRotation::sign(payload, &operator, &new, &node.chain_id).unwrap();
+        let block = block_with_commands(1, 5, vec![env.encode_command()]);
+
+        node.apply_committed_rotations(&block);
+
+        // Rotated to `new` at v_eff; the genesis key remains active before it.
+        assert_eq!(
+            node.validator_key_history.key_at(&v_id, View(20)),
+            Some(Pubkey::from_node_id(new.node_id())),
+        );
+        assert_eq!(
+            node.validator_key_history.key_at(&v_id, View(19)),
+            Some(Pubkey::from_node_id(v_id.into_node_id())),
+        );
+    }
+
+    /// #549: a recovery rotation signed by a key that is NOT the validator's
+    /// operator key is dropped — the key history is unchanged. Guards against a
+    /// malicious leader smuggling in a forged operator rotation.
+    #[test]
+    fn operator_signed_rotation_with_wrong_operator_key_is_dropped() {
+        use boule_consensus::validator_rotation::{OperatorSignedRotation, ValidatorKeyRotation};
+        use boule_consensus::validator_set::Pubkey;
+
+        let (mut node, _operator, new, v_id) = node_with_operator_key();
+        let attacker = fresh_signer();
+        let payload = ValidatorKeyRotation {
+            validator: v_id.into_node_id(),
+            new_pubkey: new.node_id(),
+            v_eff: View(20),
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        };
+        // Signed by the attacker, not the validator's declared operator key.
+        let env = OperatorSignedRotation::sign(payload, &attacker, &new, &node.chain_id).unwrap();
+        let block = block_with_commands(1, 5, vec![env.encode_command()]);
+
+        node.apply_committed_rotations(&block);
+
+        // No rotation took effect — still the genesis key at v_eff.
+        assert_eq!(
+            node.validator_key_history.key_at(&v_id, View(20)),
+            Some(Pubkey::from_node_id(v_id.into_node_id())),
+        );
     }
 
     /// #657: a valid evidence system tx in a committed block records the
@@ -7828,6 +7939,7 @@ mod tests {
         let qc_verification = boule_consensus::dispatch::QcVerification::Verify {
             scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            operator_key_history: Some(&node.operator_key_history),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
             genesis_hash: node.core.state().genesis_hash,
         };
@@ -8703,6 +8815,7 @@ mod tests {
                 &node.validator_history,
                 &node.validator_key_history,
                 node.bls_key_history.as_ref(),
+                Some(&node.operator_key_history),
                 &node.chain_id,
                 node.signature_scheme,
                 node.min_v_eff_delay,
@@ -8716,6 +8829,7 @@ mod tests {
         let qc_verification = boule_consensus::dispatch::QcVerification::Verify {
             scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
             bls_key_history: None,
+            operator_key_history: Some(&node.operator_key_history),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
             genesis_hash: node.core.state().genesis_hash,
         };
@@ -8942,6 +9056,7 @@ mod tests {
                 &node.validator_history,
                 &node.validator_key_history,
                 node.bls_key_history.as_ref(),
+                Some(&node.operator_key_history),
                 &node.chain_id,
                 node.signature_scheme,
                 node.min_v_eff_delay,
@@ -9679,6 +9794,7 @@ mod tests {
                 &node.validator_history,
                 &node.validator_key_history,
                 node.bls_key_history.as_ref(),
+                Some(&node.operator_key_history),
                 &node.chain_id,
                 node.signature_scheme,
                 node.min_v_eff_delay,

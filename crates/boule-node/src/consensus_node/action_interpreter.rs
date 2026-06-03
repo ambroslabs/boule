@@ -995,6 +995,7 @@ impl ConsensusNode {
                                 &self.validator_history,
                                 &self.validator_key_history,
                                 self.bls_key_history.as_ref(),
+                                Some(&self.operator_key_history),
                                 &self.chain_id,
                                 self.signature_scheme,
                                 self.min_v_eff_delay,
@@ -1063,6 +1064,7 @@ impl ConsensusNode {
                         let rejected = block.commands.iter().find_map(|cmd| {
                             if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
                                 || boule_consensus::validator_rotation::DualSignedRotationCancel::is_cancel_payload(cmd)
+                                || boule_consensus::validator_rotation::OperatorSignedRotation::is_operator_rotation_payload(cmd)
                                 || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
                                 // Equivocation-evidence system txs (#657) are
                                 // consensus-layer, validated at commit — skip

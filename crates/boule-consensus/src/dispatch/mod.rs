@@ -521,6 +521,13 @@ pub enum QcVerification<'a> {
         /// both the QC aggregate verifier and the proposal-receive
         /// history-commitment verifier (#325 PR C).
         bls_key_history: Option<&'a crate::bls_key_history::BlsKeyHistory>,
+        /// Operator-key history (#549), used by the proposal-receive
+        /// history-commitment verifier so its fork-and-apply mirror
+        /// reproduces operator-signed signing-key rotations exactly as the
+        /// leader's stamping and the commit path do. `None` on chains with no
+        /// operator keys (operator rotations are then dropped identically on
+        /// every path).
+        operator_key_history: Option<&'a crate::operator_key_history::OperatorKeyHistory>,
         /// Minimum gap between a reconfig-carrying block's view and
         /// the reconfig's `v_eff`. Used by the proposal-receive
         /// history-commitment verifier (#325 PR C) so its

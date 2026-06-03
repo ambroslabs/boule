@@ -39,21 +39,28 @@ pub(in crate::dispatch) fn verify_proposal_history_commitment_if_requested(
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
-    let (scheme, bls_key_history, min_v_eff_delay) = match qc_verification {
+    let (scheme, bls_key_history, operator_key_history, min_v_eff_delay) = match qc_verification {
         #[cfg(any(test, feature = "testing"))]
         QcVerification::Skip => return Ok(()),
         QcVerification::Verify {
             scheme,
             bls_key_history,
+            operator_key_history,
             min_v_eff_delay,
             genesis_hash: _,
-        } => (scheme, bls_key_history, min_v_eff_delay),
+        } => (
+            scheme,
+            bls_key_history,
+            operator_key_history,
+            min_v_eff_delay,
+        ),
     };
     let actual = crate::history_commitment::compute_post_block_commitment(
         block,
         history,
         key_history,
         *bls_key_history,
+        *operator_key_history,
         chain_id,
         *scheme,
         *min_v_eff_delay,

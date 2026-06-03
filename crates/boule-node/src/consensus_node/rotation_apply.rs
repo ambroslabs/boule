@@ -234,6 +234,42 @@ impl ConsensusNode {
             }
         }
 
+        // #549: process operator-signed signing-key recovery rotations, via the
+        // shared helper so the result is byte-identical to the recovery rebuild
+        // (the parity assert below depends on it). Authorised by the operator
+        // key active at the commit view, not the old signing key — so a
+        // validator whose signing key was destroyed can rotate to a fresh one.
+        // Logs + drops on failure.
+        for cmd_bytes in &block.commands {
+            match boule_consensus::history_commitment::apply_operator_rotation_command(
+                &mut self.validator_key_history,
+                self.bls_key_history.as_mut(),
+                &self.operator_key_history,
+                cmd_bytes,
+                &self.chain_id,
+                self.signature_scheme,
+                block_view,
+            ) {
+                Ok(false) => {} // not an operator-rotation payload
+                Ok(true) => {
+                    applied_any = true;
+                    tracing::info!(
+                        target: TRACE_TARGET,
+                        height = block.header.height.0,
+                        view = block_view.0,
+                        "operator_rotation_applied",
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height.0,
+                    view = block_view.0,
+                    error = %e,
+                    "operator_rotation_apply_failed",
+                ),
+            }
+        }
+
         // Same persistence pattern as the reconfig path: write once
         // per commit if any rotation applied, encoded as a single
         // full-history blob (not a journal). Failures log + drop —
@@ -297,6 +333,7 @@ impl ConsensusNode {
                 &self.validator_history,
                 &mut rebuilt_keys,
                 rebuilt_bls.as_mut(),
+                Some(&self.operator_key_history),
                 &self.chain_id,
                 self.signature_scheme,
             );

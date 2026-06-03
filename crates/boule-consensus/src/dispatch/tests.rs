@@ -1534,6 +1534,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
             &history,
             &key_history,
             None,
+            None,
             &ChainId::TEST,
             SignatureSchemeChoice::Ed25519Collected,
             crate::reconfig::MIN_V_EFF_DELAY,
@@ -1546,6 +1547,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -1610,6 +1612,7 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -1673,6 +1676,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -1715,6 +1719,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -1763,6 +1768,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -1824,6 +1830,7 @@ fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback()
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -1889,6 +1896,7 @@ fn ingress_with_verify_drops_malformed_high_qc_in_timeout_vote_piggyback() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -1936,6 +1944,7 @@ fn ingress_with_verify_emits_high_qc_trusted_for_timeout_vote_with_no_piggyback(
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -1977,6 +1986,7 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
             &history,
             &key_history,
             None,
+            None,
             &ChainId::TEST,
             SignatureSchemeChoice::Ed25519Collected,
             crate::reconfig::MIN_V_EFF_DELAY,
@@ -1994,6 +2004,7 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -2047,6 +2058,7 @@ fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -2119,6 +2131,7 @@ fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -2194,6 +2207,7 @@ fn ingress_vote_on_bls_chain_accepts_valid_bls_partial() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -2233,6 +2247,7 @@ fn ingress_vote_on_bls_chain_rejects_missing_bls_partial() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -2272,6 +2287,7 @@ fn ingress_vote_on_bls_chain_rejects_tampered_bls_partial() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -2321,6 +2337,7 @@ fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -2361,6 +2378,7 @@ fn ingress_vote_on_ed25519_chain_ignores_bls_partial_field() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::Ed25519Collected,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
@@ -2401,6 +2419,7 @@ fn ingress_vote_on_bls_chain_rejects_when_bls_history_absent() {
     let qc_verify = QcVerification::Verify {
         scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
+        operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
     };
