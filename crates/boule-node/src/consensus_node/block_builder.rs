@@ -14,7 +14,7 @@ use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::reward_ledger::{RewardConfig, RewardLedger};
 use boule_consensus::replication::stake_source::StakeSource;
-use boule_consensus::replication::state_machine::StateMachine;
+use boule_consensus::replication::state_machine::{CommandValidator, StateMachine};
 use boule_consensus::{Height, View};
 use boule_core::clock::BoxFuture;
 use boule_transport_tcp::NodeId;
@@ -66,6 +66,11 @@ pub struct MempoolBlockBuilder {
     reward_ledger: Mutex<RewardLedger>,
     /// Reward policy: per-block issuance + proposer bonus. All-zero disables.
     reward_config: RewardConfig,
+    /// Stateless includability predicate (#607), captured from the state
+    /// machine once at construction. Used by the build *and* vote paths so
+    /// the includability check never locks the mutable `state_machine`
+    /// (`check` is stateless by contract, so a one-time snapshot is exact).
+    validator: Arc<dyn CommandValidator>,
 }
 
 impl MempoolBlockBuilder {
@@ -78,6 +83,9 @@ impl MempoolBlockBuilder {
         propose_limit: usize,
         stake_source: Box<dyn StakeSource>,
     ) -> Self {
+        // Capture the stateless includability validator once (#607); the
+        // check paths then never lock `state_machine`.
+        let validator = state_machine.lock().validator();
         Self {
             self_id,
             mempool,
@@ -88,6 +96,7 @@ impl MempoolBlockBuilder {
             stake_source: Mutex::new(stake_source),
             reward_ledger: Mutex::new(RewardLedger::new()),
             reward_config: RewardConfig::default(),
+            validator,
         }
     }
 
@@ -235,7 +244,10 @@ impl BlockBuilder for MempoolBlockBuilder {
                 {
                     return true;
                 }
-                match sm.check(cmd) {
+                // Includability via the stateless validator handle (#607),
+                // not the locked `sm` — the predicate doesn't touch apply
+                // state.
+                match self.validator.check(cmd) {
                     Ok(()) => true,
                     Err(e) => {
                         self.dropped_commands.fetch_add(1, Ordering::Relaxed);
@@ -429,7 +441,9 @@ impl Application for MempoolBlockBuilder {
         if StakeCommand::is_stake_payload(cmd) {
             return Ok(());
         }
-        self.state_machine.lock().check(cmd)
+        // #607: the includability predicate runs on the stateless validator
+        // handle, so the vote path never locks the mutable state machine.
+        self.validator.check(cmd)
     }
 
     fn state_commitment(&self) -> [u8; 32] {

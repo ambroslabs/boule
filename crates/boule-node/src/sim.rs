@@ -7891,6 +7891,14 @@ mod tests {
         fn check(&self, cmd: &[u8]) -> anyhow::Result<()> {
             self.inner.check(cmd)
         }
+        fn validator(
+            &self,
+        ) -> std::sync::Arc<dyn boule_consensus::replication::state_machine::CommandValidator>
+        {
+            // Delegate to the inner counter so the includability predicate
+            // matches `check` (#607).
+            self.inner.validator()
+        }
         fn apply(&mut self, cmd: &[u8]) -> anyhow::Result<Bytes> {
             self.inner.apply(cmd)
         }
