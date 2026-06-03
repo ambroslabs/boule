@@ -5887,23 +5887,25 @@ mod tests {
         }
 
         /// **L7 — non-uniform weights with a Byzantine-weight kill
-        /// set ≤ `floor(total_weight / 3)` preserve safety and
+        /// set strictly below `total_weight / 3` preserve safety and
         /// liveness** (#469).
         ///
         /// Pick a Byzantine subset by *weight-descending* greedy
         /// selection: keep adding the heaviest unpicked validator to
         /// the kill set while the next addition would not exceed
-        /// `floor(total_weight / 3)`. This maximizes Byzantine
-        /// influence within the bound and stresses the predicate's
+        /// `floor((total_weight - 1) / 3)` — the largest integer
+        /// strictly less than `total/3`. This maximizes Byzantine
+        /// influence within the BFT bound and stresses the predicate's
         /// strict-`>` boundary. Killed validators are silenced (the
         /// simplest weighted-Byzantine fault model — equivalent to a
         /// crash-fault subset in the weighted setting).
         ///
         /// Honest weight is `total_weight - byzantine_weight ≥ total
-        /// - floor(total/3) > 2/3 * total`, so the weighted-quorum
-        /// predicate (`3*signer > 2*total`) is satisfiable on the
-        /// honest subset alone. The cluster must commit at least one
-        /// block; safety must hold across the run.
+        /// - floor((total-1)/3) > 2/3 * total` (strictly, even when
+        /// `total` is divisible by 3), so the weighted-quorum predicate
+        /// (`3*signer > 2*total`) is satisfiable on the honest subset
+        /// alone. The cluster must commit at least one block; safety
+        /// must hold across the run.
         #[test]
         fn proptest_weighted_byzantine_committee_preserves_safety_and_liveness(
             n in 4usize..=7,
@@ -5912,7 +5914,15 @@ mod tests {
             run_paused(|| async move {
                 let weights: Vec<u64> = weights7.into_iter().take(n).collect();
                 let total: u128 = weights.iter().map(|w| u128::from(*w)).sum();
-                let byzantine_cap: u128 = total / 3;
+                // Byzantine weight must be *strictly* below total/3 for the
+                // honest remainder to *strictly* exceed 2/3 — which is what
+                // the strict-`>` quorum predicate (`3*signer > 2*total`)
+                // requires. `total/3` is wrong: when `total % 3 == 0` a kill
+                // set summing to exactly `total/3` leaves honest at exactly
+                // 2/3, so `3*honest == 2*total` is *not* a quorum and the
+                // survivors can never commit (#676). `(total-1)/3` is the
+                // largest integer strictly less than `total/3`.
+                let byzantine_cap: u128 = (total - 1) / 3;
 
                 let mut cluster =
                     SimCluster::spawn_with_weights(n, Duration::from_millis(50), weights.clone())
