@@ -82,6 +82,12 @@ pub const ROTATION_CANCEL_TAG: &[u8; 6] = b"VKCAN\0";
 /// instead of its old signing key.
 pub const OPERATOR_ROTATION_TAG: &[u8; 6] = b"VKOPR\0";
 
+/// Magic prefix tagging a `Block.commands` entry as an **operator-key
+/// self-rotation** ([`DualSignedOperatorRotation`], #549): a validator
+/// rotating its own operator key, dual-signed by the old and new operator
+/// keys (the operator-key analogue of [`DualSignedRotation`]).
+pub const OPERATOR_KEY_ROTATION_TAG: &[u8; 6] = b"OKROT\0";
+
 /// Minimum gap between the view in which a rotation is committed and its
 /// effective view, matching the convention established by validator-set
 /// reconfiguration (#140). Two views give the validator at least one full
@@ -539,6 +545,126 @@ impl OperatorSignedRotation {
             .map_err(|_| RotationVerifyError::InvalidOperatorSignature)?;
 
         UnparsedPublicKey::new(&ED25519, &self.payload.new_pubkey as &[u8])
+            .verify(&bytes, &self.sig_new)
+            .map_err(|_| RotationVerifyError::InvalidNewSignature)?;
+
+        Ok(())
+    }
+}
+
+/// An **operator-key self-rotation** payload (#549): a validator rotates its
+/// own operator key to `new_operator_pubkey`, effective at `v_eff`. The
+/// validator is named by its stable id (`validator`). This is the operator-key
+/// analogue of [`ValidatorKeyRotation`] — administrative, not consensus — and
+/// carries no BLS fields (operator keys are Ed25519 only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorKeyRotation {
+    /// The validator's stable id whose operator key is rotating.
+    pub validator: NodeId,
+    /// The new operator pubkey, effective at `v_eff`.
+    pub new_operator_pubkey: NodeId,
+    /// The view at which the new operator key takes effect. Must be strictly
+    /// greater than the validator's latest operator-key entry (replay guard).
+    pub v_eff: View,
+}
+
+impl SignedMessage for OperatorKeyRotation {
+    const DOMAIN: &'static str = "boule.consensus.operator_key_rotation.v1";
+}
+
+/// An [`OperatorKeyRotation`] dual-signed by the old and new operator keys —
+/// the same self-attestation property as [`DualSignedRotation`], one level up:
+/// only an operator holding *both* the current operator key (authorising the
+/// change) and the new operator key (proving control of it) can rotate. A
+/// compromise of just one cannot move the operator key to a key the legitimate
+/// operator does not hold.
+///
+/// Note this is distinct from [`OperatorSignedRotation`], which rotates the
+/// *signing* key under operator authority; this rotates the *operator* key
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DualSignedOperatorRotation {
+    pub payload: OperatorKeyRotation,
+    /// Signature by the validator's *current* operator key (looked up by the
+    /// consumer against the operator-key history, not carried on the envelope).
+    #[serde(with = "serde_sig")]
+    pub sig_old: [u8; 64],
+    /// Signature by `payload.new_operator_pubkey`.
+    #[serde(with = "serde_sig")]
+    pub sig_new: [u8; 64],
+}
+
+impl DualSignedOperatorRotation {
+    /// Encode as a tagged `Block.commands` slot: [`OPERATOR_KEY_ROTATION_TAG`]
+    /// || `postcard(self)`.
+    pub fn encode_command(&self) -> Bytes {
+        let body = postcard::to_stdvec(self)
+            .expect("postcard encoding of DualSignedOperatorRotation cannot fail");
+        let mut out = Vec::with_capacity(OPERATOR_KEY_ROTATION_TAG.len() + body.len());
+        out.extend_from_slice(OPERATOR_KEY_ROTATION_TAG);
+        out.extend_from_slice(&body);
+        Bytes::from(out)
+    }
+
+    /// True iff `bytes` carries the [`OPERATOR_KEY_ROTATION_TAG`] prefix.
+    pub fn is_operator_key_rotation_payload(bytes: &[u8]) -> bool {
+        bytes.starts_with(OPERATOR_KEY_ROTATION_TAG)
+    }
+
+    /// Decode a tagged operator-key rotation. Errors if the tag is absent or
+    /// the body is malformed. Follow with [`Self::verify`] before applying.
+    pub fn decode_command(bytes: &[u8]) -> Result<Self> {
+        let body = bytes
+            .strip_prefix(OPERATOR_KEY_ROTATION_TAG.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("missing operator-key-rotation tag prefix"))?;
+        postcard::from_bytes(body)
+            .map_err(|e| anyhow::anyhow!("malformed DualSignedOperatorRotation: {e}"))
+    }
+
+    /// Construct a dual-signed operator-key rotation envelope. `old` must hold
+    /// the validator's current operator key; `new` must hold the key being
+    /// rotated to (its `node_id()` must equal `payload.new_operator_pubkey`,
+    /// asserted so callers can't build an envelope whose `sig_new` would never
+    /// verify).
+    pub fn sign(
+        payload: OperatorKeyRotation,
+        old: &dyn Signer,
+        new: &dyn Signer,
+        chain_id: &ChainId,
+    ) -> Result<Self> {
+        if new.node_id() != payload.new_operator_pubkey {
+            anyhow::bail!(
+                "new signer's node_id does not match payload.new_operator_pubkey; the \
+                 resulting sig_new would never verify"
+            );
+        }
+        let bytes = preimage::<OperatorKeyRotation>(&payload, chain_id)?;
+        let sig_old = old.sign(&bytes);
+        let sig_new = new.sign(&bytes);
+        Ok(Self {
+            payload,
+            sig_old,
+            sig_new,
+        })
+    }
+
+    /// Verify both signatures: `sig_old` under `current_operator_pubkey` (the
+    /// validator's operator key active at the rotation's commit view), and
+    /// `sig_new` under `self.payload.new_operator_pubkey`. Both must verify
+    /// against `chain_id`.
+    pub fn verify(
+        &self,
+        current_operator_pubkey: &NodeId,
+        chain_id: &ChainId,
+    ) -> Result<(), RotationVerifyError> {
+        let bytes = preimage::<OperatorKeyRotation>(&self.payload, chain_id)
+            .map_err(|e| RotationVerifyError::Preimage(e.to_string()))?;
+
+        UnparsedPublicKey::new(&ED25519, current_operator_pubkey as &[u8])
+            .verify(&bytes, &self.sig_old)
+            .map_err(|_| RotationVerifyError::InvalidOldSignature)?;
+
+        UnparsedPublicKey::new(&ED25519, &self.payload.new_operator_pubkey as &[u8])
             .verify(&bytes, &self.sig_new)
             .map_err(|_| RotationVerifyError::InvalidNewSignature)?;
 
@@ -1736,6 +1862,106 @@ mod tests {
             ROTATION_TAG
         ));
         assert_eq!(OperatorSignedRotation::decode_command(&bytes).unwrap(), env);
+    }
+
+    // ── Operator-key self-rotation (#549) ──────────────────────────────
+
+    /// A valid `DualSignedOperatorRotation` plus `(old_operator, new_operator)`.
+    fn valid_operator_key_rotation() -> (DualSignedOperatorRotation, NodeId, NodeId) {
+        let old = fresh_signer();
+        let new = fresh_signer();
+        let payload = OperatorKeyRotation {
+            validator: nid(7),
+            new_operator_pubkey: new.node_id(),
+            v_eff: View(50),
+        };
+        let env = DualSignedOperatorRotation::sign(payload, &old, &new, &ChainId::TEST).unwrap();
+        (env, old.node_id(), new.node_id())
+    }
+
+    #[test]
+    fn operator_key_rotation_verify_accepts_old_and_new_signatures() {
+        let (env, old, _new) = valid_operator_key_rotation();
+        env.verify(&old, &ChainId::TEST).unwrap();
+    }
+
+    #[test]
+    fn operator_key_rotation_verify_rejects_zeroed_old_signature() {
+        let (mut env, old, _new) = valid_operator_key_rotation();
+        env.sig_old = [0u8; 64];
+        assert_eq!(
+            env.verify(&old, &ChainId::TEST),
+            Err(RotationVerifyError::InvalidOldSignature),
+        );
+    }
+
+    #[test]
+    fn operator_key_rotation_verify_rejects_zeroed_new_signature() {
+        let (mut env, old, _new) = valid_operator_key_rotation();
+        env.sig_new = [0u8; 64];
+        assert_eq!(
+            env.verify(&old, &ChainId::TEST),
+            Err(RotationVerifyError::InvalidNewSignature),
+        );
+    }
+
+    #[test]
+    fn operator_key_rotation_verify_rejects_wrong_current_operator_key() {
+        let (env, _old, _new) = valid_operator_key_rotation();
+        let stranger = fresh_signer().node_id();
+        assert_eq!(
+            env.verify(&stranger, &ChainId::TEST),
+            Err(RotationVerifyError::InvalidOldSignature),
+        );
+    }
+
+    #[test]
+    fn operator_key_rotation_verify_is_chain_scoped() {
+        let (env, old, _new) = valid_operator_key_rotation();
+        assert!(
+            env.verify(&old, &ChainId::from_genesis_hash([9u8; 32]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn operator_key_rotation_sign_rejects_new_signer_pubkey_mismatch() {
+        let old = fresh_signer();
+        let new = fresh_signer();
+        let payload = OperatorKeyRotation {
+            validator: nid(7),
+            new_operator_pubkey: nid(0xff), // disagrees with `new`
+            v_eff: View(50),
+        };
+        assert!(DualSignedOperatorRotation::sign(payload, &old, &new, &ChainId::TEST).is_err());
+    }
+
+    #[test]
+    fn operator_key_rotation_encode_decode_roundtrips_and_tag_is_distinct() {
+        let (env, _, _) = valid_operator_key_rotation();
+        let bytes = env.encode_command();
+        assert!(DualSignedOperatorRotation::is_operator_key_rotation_payload(&bytes));
+        // Distinct from every other system-tx tag.
+        assert!(!DualSignedRotation::is_rotation_payload(&bytes));
+        assert!(!DualSignedRotationCancel::is_cancel_payload(&bytes));
+        assert!(!OperatorSignedRotation::is_operator_rotation_payload(
+            &bytes
+        ));
+        assert!(
+            !DualSignedOperatorRotation::is_operator_key_rotation_payload(OPERATOR_ROTATION_TAG)
+        );
+        assert_eq!(
+            DualSignedOperatorRotation::decode_command(&bytes).unwrap(),
+            env
+        );
+    }
+
+    #[test]
+    fn operator_key_rotation_payload_has_stable_domain_string() {
+        assert_eq!(
+            OperatorKeyRotation::DOMAIN,
+            "boule.consensus.operator_key_rotation.v1"
+        );
     }
 
     #[test]
