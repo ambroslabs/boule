@@ -5,7 +5,8 @@
 use boule_consensus::replication::block::Block;
 
 use super::{
-    ConsensusNode, STORAGE_KEY_BLS_KEY_HISTORY, STORAGE_KEY_VALIDATOR_KEY_HISTORY, TRACE_TARGET,
+    ConsensusNode, STORAGE_KEY_BLS_KEY_HISTORY, STORAGE_KEY_OPERATOR_KEY_HISTORY,
+    STORAGE_KEY_VALIDATOR_KEY_HISTORY, TRACE_TARGET,
 };
 
 impl ConsensusNode {
@@ -30,6 +31,7 @@ impl ConsensusNode {
         let pre_state_for_parity = (
             self.validator_key_history.clone(),
             self.bls_key_history.clone(),
+            self.operator_key_history.clone(),
         );
 
         let block_view = block.header.view;
@@ -270,6 +272,56 @@ impl ConsensusNode {
             }
         }
 
+        // #549: operator-key self-rotations mutate the operator-key history.
+        // It persists under its own key (it can't be rebuilt from genesis once
+        // mutable — block pruning erases early self-rotation blocks), so track
+        // its dirtiness separately from the validator-key-history flush.
+        let mut operator_history_changed = false;
+        for cmd_bytes in &block.commands {
+            match boule_consensus::history_commitment::apply_operator_key_rotation_command(
+                &mut self.operator_key_history,
+                cmd_bytes,
+                &self.chain_id,
+                block_view,
+            ) {
+                Ok(false) => {} // not an operator-key-rotation payload
+                Ok(true) => {
+                    operator_history_changed = true;
+                    tracing::info!(
+                        target: TRACE_TARGET,
+                        height = block.header.height.0,
+                        view = block_view.0,
+                        "operator_key_rotation_applied",
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    target: TRACE_TARGET,
+                    height = block.header.height.0,
+                    view = block_view.0,
+                    error = %e,
+                    "operator_key_rotation_apply_failed",
+                ),
+            }
+        }
+        if operator_history_changed {
+            match postcard::to_stdvec(&self.operator_key_history.to_persisted()) {
+                Ok(bytes) => {
+                    if let Err(e) = self.storage.put(STORAGE_KEY_OPERATOR_KEY_HISTORY, &bytes) {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "operator_key_history_persist_failed",
+                        );
+                    }
+                }
+                Err(e) => tracing::error!(
+                    target: TRACE_TARGET,
+                    error = %e,
+                    "operator_key_history_encode_failed",
+                ),
+            }
+        }
+
         // Same persistence pattern as the reconfig path: write once
         // per commit if any rotation applied, encoded as a single
         // full-history blob (not a journal). Failures log + drop —
@@ -327,13 +379,13 @@ impl ConsensusNode {
         // in apply_committed_reconfigs for the rationale.
         #[cfg(debug_assertions)]
         {
-            let (mut rebuilt_keys, mut rebuilt_bls) = pre_state_for_parity;
+            let (mut rebuilt_keys, mut rebuilt_bls, mut rebuilt_operator) = pre_state_for_parity;
             boule_consensus::history_commitment::apply_rotation_commands_to_histories(
                 block,
                 &self.validator_history,
                 &mut rebuilt_keys,
                 rebuilt_bls.as_mut(),
-                Some(&self.operator_key_history),
+                Some(&mut rebuilt_operator),
                 &self.chain_id,
                 self.signature_scheme,
             );
@@ -348,6 +400,15 @@ impl ConsensusNode {
                 rebuilt_bls.as_ref().map(|h| h.to_persisted()),
                 self.bls_key_history.as_ref().map(|h| h.to_persisted()),
                 "pure-rebuild BLS rotation path diverged from wrapper at height={} view={}",
+                block.header.height,
+                block.header.view,
+            );
+            // #549: the rebuilt operator-key history must match the live one
+            // after applying this block's operator-key self-rotations.
+            debug_assert_eq!(
+                rebuilt_operator.to_persisted(),
+                self.operator_key_history.to_persisted(),
+                "pure-rebuild operator-key path diverged from wrapper at height={} view={}",
                 block.header.height,
                 block.header.view,
             );

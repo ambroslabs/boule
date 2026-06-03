@@ -221,6 +221,8 @@ impl BlockBuilder for MempoolBlockBuilder {
                     // Operator-signed recovery rotations (#549): authorised by
                     // the operator key, validated + applied at commit.
                     || boule_consensus::validator_rotation::OperatorSignedRotation::is_operator_rotation_payload(cmd)
+                    // Operator-key self-rotations (#549): validated + applied at commit.
+                    || boule_consensus::validator_rotation::DualSignedOperatorRotation::is_operator_key_rotation_payload(cmd)
                     || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
                     // Equivocation-evidence system txs (#657): self-authenticating
                     // proofs validated + recorded at commit, like reconfig/rotation.
