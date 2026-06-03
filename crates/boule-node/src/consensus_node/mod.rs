@@ -232,6 +232,13 @@ pub(super) async fn send_outbound(
 pub struct ConsensusNode {
     /// This replica's identity, used to sign outbound messages.
     pub self_id: NodeId,
+    /// Current view, mirrored from the pacemaker at every advance for the
+    /// hot-rotation signer (#312). A [`RotatableSigner`](crate::rotatable_signer::RotatableSigner)
+    /// built over a clone of this handle reads it to decide which signing key
+    /// is active, so a committed key rotation can take effect at its `v_eff`
+    /// without restarting the binary. Updated only at the `AdvanceToView`
+    /// chokepoint; defaults to view 0 (genesis).
+    signing_view: Arc<AtomicU64>,
     /// HotStuff safety core (pure state machine).
     pub core: HotStuffCore,
     /// View-management state machine (pure, no I/O).
@@ -710,6 +717,7 @@ impl ConsensusNode {
             wal,
             validator_set: config.validator_set,
             validator_history,
+            signing_view: Arc::new(AtomicU64::new(0)),
             validator_key_history,
             operator_key_history,
             bls_key_history: None,
@@ -1154,6 +1162,7 @@ impl ConsensusNode {
             wal,
             validator_set: active_set,
             validator_history,
+            signing_view: Arc::new(AtomicU64::new(0)),
             validator_key_history,
             operator_key_history,
             bls_key_history: None,
@@ -1207,6 +1216,15 @@ impl ConsensusNode {
     /// Current view from the pacemaker's perspective.
     pub fn current_view(&self) -> View {
         self.pacemaker.current_view()
+    }
+
+    /// A handle to the current-view atomic this node mirrors from the
+    /// pacemaker (#312). The run loop builds the consensus
+    /// [`RotatableSigner`](crate::rotatable_signer::RotatableSigner) over a
+    /// clone of this so the signer always uses the key active at the node's
+    /// current view. Returned before `run` consumes the node.
+    pub fn signing_view_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.signing_view)
     }
 
     // ── Event loop ───────────────────────────────────────────────────────────

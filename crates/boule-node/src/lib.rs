@@ -653,7 +653,15 @@ async fn start_consensus(
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let signer = Arc::clone(signer) as Arc<dyn boule_core::crypto::signed::Signer>;
+    // #312: sign through a RotatableSigner sharing the node's current-view
+    // handle, so a committed signing-key rotation can take effect at its
+    // `v_eff` without restarting. Until runtime key-injection lands (the
+    // operator-side follow-up), no rotation is registered, so this is
+    // behaviourally identical to signing with the genesis key.
+    let genesis_signer = Arc::clone(signer) as Arc<dyn boule_core::crypto::signed::Signer>;
+    let signer: Arc<dyn boule_core::crypto::signed::Signer> = Arc::new(
+        crate::rotatable_signer::RotatableSigner::new(genesis_signer, node.signing_view_handle()),
+    );
     let join = tokio::spawn(async move {
         node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
             .await

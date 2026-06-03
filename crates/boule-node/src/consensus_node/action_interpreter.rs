@@ -1443,6 +1443,12 @@ impl ConsensusNode {
                         cause = cause.as_str(),
                         "view_advanced",
                     );
+                    // #312: mirror the new view into the hot-rotation signer's
+                    // atomic so a `RotatableSigner` over this handle starts
+                    // signing under the key active at `v` (taking a committed
+                    // rotation into effect at its `v_eff` without a restart).
+                    self.signing_view
+                        .store(v.0, std::sync::atomic::Ordering::Relaxed);
                     // Feed PacemakerAdvance into the safety core so it updates
                     // current_view and un-parks pending proposals.
                     let safety_actions = self.step_safety(SafetyEvent::PacemakerAdvance(v));

@@ -663,6 +663,11 @@ pub struct SimCluster {
     /// `node_ids` order. `None` for clusters that don't support
     /// restart (e.g. the gossip-mode cluster).
     signers: Option<Vec<Arc<dyn Signer>>>,
+    /// Per-node hot-rotation signers (#312), in `node_ids` order. A test
+    /// injects a key rotation mid-run via [`SimCluster::register_rotation`],
+    /// which reaches the node's running signer so it swaps keys at `v_eff`.
+    /// Empty for spawn paths that don't capture them.
+    rotatable_signers: Vec<Arc<crate::rotatable_signer::RotatableSigner>>,
     /// Per-node durable storage handles, captured so
     /// [`SimCluster::restart_all_with_recover`] can resume against the
     /// same on-disk state. Same order as [`Self::signers`].
@@ -1246,6 +1251,10 @@ impl SimCluster {
         // as `commit_rxs` / `shutdown_txs`, so a `take`/`recover`
         // round-trip stays index-consistent.
         let mut signers_for_restart: Vec<Arc<dyn Signer>> = Vec::new();
+        // #312: per-node hot-rotation signers, so a test can inject a key
+        // rotation mid-run via `SimCluster::register_rotation`.
+        let mut rotatable_signers_captured: Vec<Arc<crate::rotatable_signer::RotatableSigner>> =
+            Vec::new();
         let mut storages_for_restart: Vec<Arc<dyn Storage>> = Vec::new();
         let mut wals_for_restart: Vec<Arc<dyn Wal>> = Vec::new();
         let mut mempools_captured: Vec<Arc<dyn Mempool>> = Vec::new();
@@ -1444,6 +1453,17 @@ impl SimCluster {
             let consensus_event_rx =
                 spawn_event_bridge(event_rx, Arc::clone(&slow_node_delays_us[&nid]));
 
+            // #312: sign through a RotatableSigner sharing the node's
+            // current-view handle, so `SimCluster::register_rotation` can make
+            // the node hot-swap its key at a rotation's `v_eff`. With no
+            // rotation registered it signs with the genesis key, unchanged.
+            let rotatable = Arc::new(crate::rotatable_signer::RotatableSigner::new(
+                Arc::clone(&signer),
+                node.signing_view_handle(),
+            ));
+            rotatable_signers_captured.push(Arc::clone(&rotatable));
+            let run_signer: Arc<dyn Signer> = rotatable;
+
             tokio::spawn(async move {
                 let _ = boule_consensus::crashpoint::CRASH_SLOT
                     .scope(crash_slot, async move {
@@ -1451,7 +1471,7 @@ impl SimCluster {
                             broadcaster,
                             discovery,
                             consensus_event_rx,
-                            signer,
+                            run_signer,
                             shutdown_rx,
                         )
                         .await
@@ -1476,6 +1496,7 @@ impl SimCluster {
             shutdown_txs,
             overlay_shutdowns: Vec::new(),
             signers: Some(signers_for_restart),
+            rotatable_signers: rotatable_signers_captured,
             storages: Some(storages_for_restart),
             wals: Some(wals_for_restart),
             mempools: mempools_captured,
@@ -1502,6 +1523,15 @@ impl SimCluster {
     /// validator's currently-active key.
     pub fn signer(&self, idx: usize) -> Option<Arc<dyn Signer>> {
         self.signers.as_ref().map(|s| Arc::clone(&s[idx]))
+    }
+
+    /// Inject a committed signing-key rotation into node `idx`'s running
+    /// signer (#312): at and after `v_eff` the node signs with `new_signer`,
+    /// no restart. Models the operator having provisioned the new key + the
+    /// node observing its own rotation commit. Returns `false` if `v_eff` is
+    /// not strictly past the node's latest scheduled rotation.
+    pub fn register_rotation(&self, idx: usize, v_eff: u64, new_signer: Arc<dyn Signer>) -> bool {
+        self.rotatable_signers[idx].register_rotation(v_eff, new_signer)
     }
 
     /// Per-node durable storage handle, in the same `node_ids` order as
@@ -3164,6 +3194,8 @@ impl SimCluster {
             // gossip overlay's orchestrator wiring isn't trivially
             // re-spawnable.
             signers: None,
+            // This spawn path doesn't capture hot-rotation signers.
+            rotatable_signers: Vec::new(),
             storages: None,
             wals: None,
             mempools: mempools_captured_gossip,
@@ -7227,9 +7259,14 @@ mod tests {
             new_bls_pubkey: None,
             new_bls_pop: None,
         };
-        let envelope =
-            DualSignedRotation::sign(payload, &*current_signer, &*new_signer, &ChainId::TEST)
-                .expect("constructing rotation envelope must succeed");
+        // The rotation envelope's `sig_old`/`sig_new` are verified at commit
+        // under each replica's own `chain_id`, which the cluster derives from
+        // the genesis hash (NOT `ChainId::TEST`). Signing under the wrong
+        // chain_id makes the rotation fail signature verification at apply,
+        // so it never lands in the key history and the boundary swap is moot.
+        let chain_id = ChainId::from_genesis_hash(cluster.genesis.hash());
+        let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer, &chain_id)
+            .expect("constructing rotation envelope must succeed");
         let cmd_bytes = envelope.encode_command();
 
         // Drop the encoded rotation into every node's mempool so
@@ -7238,15 +7275,24 @@ mod tests {
             let _ = mp.insert(cmd_bytes.clone());
         }
 
-        // Drive the cluster past v_eff. With one validator effectively
-        // offline post-boundary (signer not swapped, stale-keyed votes
-        // rejected), n=4 quorum=3 just barely holds — every honest view
-        // needs all three other validators to vote, and views that
-        // round-robin to the rotated validator timeout. Generous budget
-        // absorbs the wasted views.
+        // #312: hot-swap the rotated validator's running signer so that at
+        // `v_eff` it starts signing under `new_signer` — no restart. This is
+        // the whole point: without it the validator goes silent at the
+        // boundary (stale-keyed votes/proposals rejected). With it, the
+        // validator keeps voting AND can successfully lead post-boundary views.
+        assert!(
+            cluster.register_rotation(rotated_idx, v_eff.0, Arc::clone(&new_signer)),
+            "registering the hot rotation must succeed",
+        );
+
+        // Drive the cluster comfortably past v_eff — far enough that the
+        // round-robin lands on the rotated validator as leader at least once
+        // in the post-boundary regime (it leads views where view % n == its
+        // sorted index).
+        let target = v_eff.0 + 12;
         let crossed = cluster
             .advance_and_yield_until(Duration::from_secs(12), |c| {
-                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff.0 + 5
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= target
             })
             .await;
         assert!(
@@ -7257,26 +7303,7 @@ mod tests {
         let committed = cluster.drain_commits();
         assert_no_conflicts(&committed);
 
-        // At least one node committed a block at view >= v_eff: the
-        // post-boundary regime. (peek_commit_heights uses height not
-        // view, but in this sim view advances at least as fast as
-        // height, so a height of v_eff + 5 implies a view of at least
-        // v_eff somewhere on the chain.)
-        let any_post_boundary = committed
-            .iter()
-            .any(|node_blocks| node_blocks.iter().any(|b| b.header.view >= v_eff));
-        assert!(
-            any_post_boundary,
-            "expected at least one committed block at view >= v_eff",
-        );
-
-        // The rotation tx itself made it onto the chain — visible in
-        // some committed block's `commands`. This is the cleanest
-        // observable proof from the test harness that the propose →
-        // vote → commit pipeline carried the dual-signed envelope
-        // intact, at which point every replica's
-        // `apply_committed_rotations` runs deterministically over the
-        // same block.
+        // The rotation tx itself made it onto the chain.
         let rotation_committed = committed.iter().any(|node_blocks| {
             node_blocks.iter().any(|b| {
                 b.commands
@@ -7287,6 +7314,25 @@ mod tests {
         assert!(
             rotation_committed,
             "expected at least one committed block to carry the rotation tx",
+        );
+
+        // The #312 acceptance signal: a committed block PROPOSED BY the rotated
+        // validator at a view >= v_eff. Its `proposer` is the stable id
+        // (unchanged by rotation), but the proposal only commits if it was
+        // signed with the key active at that view — i.e. the *new* key. Before
+        // #312 (signer not swapped) the validator's post-boundary proposals are
+        // rejected and no such block exists; with the hot swap it leads and
+        // commits a view post-rotation, proving it stayed live across the
+        // boundary.
+        let rotated_led_post_boundary = committed.iter().any(|node_blocks| {
+            node_blocks
+                .iter()
+                .any(|b| b.header.proposer == rotated_validator && b.header.view >= v_eff)
+        });
+        assert!(
+            rotated_led_post_boundary,
+            "rotated validator must lead + commit a view >= v_eff after hot-swapping its key \
+             (proves it kept signing with the new key, not silenced at the boundary)",
         );
     }
 
