@@ -60,5 +60,8 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Rotation(rotation::RotationCmd::ProposeOperatorRecovery(a)) => {
             rotation::handle_propose_operator_recovery(a)
         }
+        Command::Rotation(rotation::RotationCmd::ProposeOperatorKeyRotation(a)) => {
+            rotation::handle_propose_operator_key_rotation(a)
+        }
     }
 }
