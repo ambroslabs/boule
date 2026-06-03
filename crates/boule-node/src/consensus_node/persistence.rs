@@ -803,6 +803,7 @@ impl ConsensusNode {
                 &rebuilt_set,
                 &mut rebuilt_key,
                 rebuilt_bls.as_mut(),
+                Some(&self.operator_key_history),
                 &self.chain_id,
                 self.signature_scheme,
             );

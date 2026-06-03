@@ -544,6 +544,11 @@ async fn start_consensus(
                 anyhow::Ok((boule_consensus::Height(cp.height), hash))
             })
             .transpose()?,
+        // #549: genesis operator keys (already format-validated in
+        // preflight). Empty if the optional table is absent.
+        operator_keys: cons_cfg
+            .resolve_genesis_operator_keys()
+            .context("validating genesis operator-key table")?,
     };
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =

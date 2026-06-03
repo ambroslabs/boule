@@ -45,6 +45,7 @@ pub(in crate::dispatch) fn verify_qc_if_requested(
         QcVerification::Verify {
             scheme,
             bls_key_history,
+            operator_key_history: _,
             min_v_eff_delay: _,
             genesis_hash,
         } => (scheme, bls_key_history, genesis_hash),

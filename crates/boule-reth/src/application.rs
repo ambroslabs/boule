@@ -379,6 +379,7 @@ impl Application for RethApplication {
                 if ReconfigCommand::is_reconfig_payload(&cmd)
                     || DualSignedRotation::is_rotation_payload(&cmd)
                     || boule_consensus::validator_rotation::DualSignedRotationCancel::is_cancel_payload(&cmd)
+                    || boule_consensus::validator_rotation::OperatorSignedRotation::is_operator_rotation_payload(&cmd)
                     // Equivocation-evidence system txs (#657): same rationale —
                     // no other path onto the reth backend; validated at commit.
                     || boule_consensus::equivocation_evidence::is_evidence_payload(&cmd)

@@ -40,6 +40,7 @@ pub(in crate::dispatch) fn verify_bls_partial_if_required(
         QcVerification::Verify {
             scheme,
             bls_key_history,
+            operator_key_history: _,
             min_v_eff_delay: _,
             genesis_hash: _,
         } => (scheme, bls_key_history),
