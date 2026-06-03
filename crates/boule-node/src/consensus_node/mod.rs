@@ -3653,6 +3653,52 @@ mod tests {
         boule_consensus::replication::block::Block { header, commands }
     }
 
+    /// #549: a reconfig that adds a validator carrying an `operator_pubkey`
+    /// registers it in the operator-key history at `v_eff` — the live wrapper
+    /// does this (operator keys aren't re-derivable from the set), and the
+    /// `#[cfg(debug_assertions)]` parity assert in `apply_committed_reconfigs`
+    /// confirms the live registration matches the rebuild.
+    #[test]
+    fn reconfig_add_with_operator_key_registers_it_live() {
+        use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+        use boule_consensus::validator_set::ValidatorId;
+
+        let mut node = make_node(nid(1));
+        assert!(
+            node.operator_key_history.is_empty(),
+            "genesis: no operator keys"
+        );
+
+        let v_eff = MIN_V_EFF_DELAY + 3;
+        let added = nid(5);
+        let operator = nid(0x9e);
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: added,
+                addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
+                operator_pubkey: Some(operator),
+                weight: 1,
+            }],
+            removes: vec![],
+            changes: vec![],
+            v_eff,
+        };
+        // apply_commit drives apply_committed_reconfigs (+ the parity assert).
+        node.apply_commit(block_with_reconfig(1, 0, nid(1), cmd));
+
+        let added_id = ValidatorId::from_genesis_pubkey(added);
+        // Registered at v_eff; absent before it.
+        assert_eq!(
+            node.operator_key_history.key_at(&added_id, v_eff),
+            Some(operator)
+        );
+        assert_eq!(
+            node.operator_key_history.key_at(&added_id, v_eff.0 - 1),
+            None
+        );
+    }
+
     #[test]
     fn apply_commit_with_valid_reconfig_inserts_boundary_into_history() {
         use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
@@ -3672,6 +3718,7 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                operator_pubkey: None,
                 weight: 1,
             }],
             removes: vec![],
@@ -3729,6 +3776,7 @@ mod tests {
             node_id: nid(0),
             addr: "127.0.0.1:0".parse().unwrap(),
             bls_pop: None,
+            operator_pubkey: None,
             weight: 1,
         };
         let block = block_with_reconfig(1, 0, nid(1), cmd);
@@ -3751,6 +3799,7 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                operator_pubkey: None,
                 weight: 1,
             }],
             removes: vec![],
@@ -3775,6 +3824,7 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                operator_pubkey: None,
                 weight: 1,
             }],
             removes: vec![],
@@ -3786,6 +3836,7 @@ mod tests {
                 node_id: nid(6),
                 addr: "127.0.0.1:9006".parse().unwrap(),
                 bls_pop: None,
+                operator_pubkey: None,
                 weight: 1,
             }],
             removes: vec![],
@@ -3860,6 +3911,7 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                operator_pubkey: None,
                 weight: 1,
             }],
             removes: vec![],
@@ -4101,6 +4153,7 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                operator_pubkey: None,
                 weight: 1,
             }],
             removes: vec![],
@@ -9925,6 +9978,7 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                operator_pubkey: None,
                 weight: 1,
             }],
             removes: vec![],
@@ -10027,6 +10081,7 @@ mod tests {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
                 bls_pop: None,
+                operator_pubkey: None,
                 weight: 1,
             }],
             removes: vec![],

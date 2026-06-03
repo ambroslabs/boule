@@ -39,6 +39,11 @@ pub(crate) struct ReconfigAddArgs {
     /// BlsKeyFile to derive the PoP from locally (BLS chains).
     #[arg(long)]
     bls_key_file: Option<PathBuf>,
+    /// Optional operator key (base58, #549): the cold-storage administrative
+    /// key that can later rotate this validator's signing key without the old
+    /// key (recovery) or rotate itself. Omit to seat with no operator key.
+    #[arg(long)]
+    operator_pubkey: Option<String>,
     /// Config path; enables the chain `signature_scheme` cross-check.
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
@@ -74,6 +79,14 @@ pub(crate) fn handle_add(args: ReconfigAddArgs) -> anyhow::Result<()> {
         anyhow::anyhow!("--addr {:?} is not a valid socket address: {e}", args.addr)
     })?;
     let v_eff = View(args.v_eff);
+    let operator_pubkey = args
+        .operator_pubkey
+        .as_deref()
+        .map(|s| {
+            base58_to_node_id(s)
+                .map_err(|e| anyhow::anyhow!("--operator-pubkey {s:?} is not a valid NodeId: {e}"))
+        })
+        .transpose()?;
 
     let config = args
         .config_path
@@ -88,6 +101,7 @@ pub(crate) fn handle_add(args: ReconfigAddArgs) -> anyhow::Result<()> {
         args.weight,
         args.bls_pop_file.as_deref(),
         args.bls_key_file.as_deref(),
+        operator_pubkey,
     )?;
     println!("{}", hex::encode(&payload));
     Ok(())

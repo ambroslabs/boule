@@ -82,6 +82,10 @@ pub enum OperatorHistoryError {
     /// monotonic-`v_eff` rule as the signing-key and BLS histories; it also
     /// provides replay protection for operator-signed rotations.
     VeffNotStrictlyIncreasing { last_v_eff: View, v_eff: View },
+    /// [`OperatorKeyHistory::register`] was called for a validator that already
+    /// has an operator-key history. `register` is for new reconfig-adds only;
+    /// existing validators rotate via [`OperatorKeyHistory::apply_rotation`].
+    AlreadyRegistered { stable_id: NodeId },
 }
 
 impl std::fmt::Display for OperatorHistoryError {
@@ -95,6 +99,11 @@ impl std::fmt::Display for OperatorHistoryError {
             Self::VeffNotStrictlyIncreasing { last_v_eff, v_eff } => write!(
                 f,
                 "operator-key rotation v_eff {v_eff} must be strictly > last v_eff {last_v_eff}",
+            ),
+            Self::AlreadyRegistered { stable_id } => write!(
+                f,
+                "operator key for validator {} already registered",
+                hex::encode(stable_id),
             ),
         }
     }
@@ -127,6 +136,33 @@ impl OperatorKeyHistory {
                 });
         }
         h
+    }
+
+    /// Register a brand-new validator's operator key, effective at `v_eff`.
+    /// Used when a reconfig **add** (#549) seats a validator that declared an
+    /// operator key — the operator-key analogue of mirroring the new validator
+    /// into `ValidatorKeyHistory`/`BlsKeyHistory` at the boundary. Errors if the
+    /// validator is already registered (callers guard with [`Self::contains`],
+    /// matching the key-history mirror).
+    pub fn register(
+        &mut self,
+        validator: &ValidatorId,
+        v_eff: impl Into<View>,
+        operator_pubkey: NodeId,
+    ) -> Result<(), OperatorHistoryError> {
+        let v_eff = v_eff.into();
+        let stable_id = validator.into_node_id();
+        if self.by_stable_id.contains_key(&stable_id) {
+            return Err(OperatorHistoryError::AlreadyRegistered { stable_id });
+        }
+        self.by_stable_id.insert(
+            stable_id,
+            vec![OperatorKeyEntry {
+                v_eff,
+                operator_pubkey,
+            }],
+        );
+        Ok(())
     }
 
     /// Apply an operator-key rotation for an already-seeded validator.
@@ -285,6 +321,25 @@ mod tests {
     }
     fn opk(b: u8) -> NodeId {
         [b; 32]
+    }
+
+    #[test]
+    fn register_seats_a_new_validators_operator_key_at_v_eff() {
+        // #549: a reconfig-added validator registers its operator key at v_eff.
+        let mut h = OperatorKeyHistory::with_genesis([(vid(1), opk(0x11))]);
+        h.register(&vid(5), 30u64, opk(0x55)).unwrap();
+        assert_eq!(h.key_at(&vid(5), 30u64), Some(opk(0x55)));
+        assert_eq!(h.key_at(&vid(5), 29u64), None); // absent before v_eff
+        // Re-registering an already-seated validator is rejected.
+        assert_eq!(
+            h.register(&vid(5), 40u64, opk(0x66)),
+            Err(OperatorHistoryError::AlreadyRegistered {
+                stable_id: [5u8; 32],
+            }),
+        );
+        // A registered validator can then self-rotate its operator key.
+        h.apply_rotation(&vid(5), 50u64, opk(0x77)).unwrap();
+        assert_eq!(h.key_at(&vid(5), 50u64), Some(opk(0x77)));
     }
 
     #[test]

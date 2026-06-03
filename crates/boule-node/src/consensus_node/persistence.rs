@@ -845,6 +845,7 @@ impl ConsensusNode {
                 block,
                 &mut rebuilt_set,
                 &mut rebuilt_key,
+                Some(&mut rebuilt_operator),
                 self.signature_scheme,
                 self.min_v_eff_delay,
                 &self.chain_id,
