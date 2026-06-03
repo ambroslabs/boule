@@ -37,7 +37,10 @@ impl ConsensusNode {
     /// the synchronous bookkeeping runs, because the snapshot-creation
     /// hook in [`Self::apply_commit`] serializes that state.
     pub(super) async fn commit_block(&mut self, block: Block) {
-        match self.app.commit(&block).await {
+        // #653: surface the block's proposer + resolved misbehaviour evidence
+        // to the application's commit seam.
+        let ctx = self.commit_app_context(&block);
+        match self.app.commit(&ctx, &block).await {
             Ok(result) => self.stage_app_validator_updates(result, &block),
             Err(e) => {
                 tracing::error!(

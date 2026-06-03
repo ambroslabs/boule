@@ -402,6 +402,18 @@ impl QuorumCertificate {
         self.signers.count()
     }
 
+    /// The validator indices whose bit is set in this QC's
+    /// [`SignerBitmap`] — i.e. who signed. Scheme-agnostic (the bitmap is
+    /// populated for both Ed25519 and BLS QCs), unlike
+    /// [`Self::iter_signatures`] which yields only Ed25519 partial
+    /// signatures. Each index is into the validator set authoritative at
+    /// `qc.view`; resolve it with [`ValidatorSet::get`] /
+    /// [`ValidatorSet::weight_at`]. Used to surface commit-info to the
+    /// application (#653).
+    pub fn signer_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.signers.iter_set()
+    }
+
     /// Sum of the voting weights of validators whose bit is set in
     /// this QC's [`SignerBitmap`], evaluated against `vs`. `vs` must
     /// be the validator set authoritative at `qc.view` (#460/#461).

@@ -28,7 +28,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use boule_consensus::hotstuff::QuorumCertificate;
 use boule_consensus::reconfig::ReconfigCommand;
-use boule_consensus::replication::application::{Application, CommitResult, ValidatorUpdate};
+use boule_consensus::replication::application::{
+    AppContext, Application, CommitResult, ValidatorUpdate,
+};
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::stake_source::StakeSource;
@@ -229,6 +231,7 @@ fn uncommitted_chain<'b>(
 impl Application for RethApplication {
     fn build_proposal<'a>(
         &'a self,
+        _ctx: &'a AppContext,
         parent: &'a Block,
         view: View,
         _high_qc: &'a QuorumCertificate,
@@ -329,7 +332,11 @@ impl Application for RethApplication {
         })
     }
 
-    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, Result<CommitResult>> {
+    fn commit<'a>(
+        &'a self,
+        _ctx: &'a AppContext,
+        block: &'a Block,
+    ) -> BoxFuture<'a, Result<CommitResult>> {
         Box::pin(async move {
             let Some(cmd) = block.commands.first() else {
                 // Genesis / empty block: nothing to execute.
@@ -474,7 +481,14 @@ mod tests {
         let app = make_app([0u8; 32]);
         let g = genesis();
         let block = app
-            .build_proposal(&g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
             .await
             .expect("build");
 
@@ -504,10 +518,20 @@ mod tests {
 
         let g = genesis();
         let block = app
-            .build_proposal(&g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
             .await
             .expect("build");
-        let result = app.commit(&block).await.expect("commit");
+        let result = app
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit");
         // The reth EL drives no membership changes — Ethereum keeps the
         // validator set in the consensus layer.
         assert!(result.validator_updates.is_empty());
@@ -561,10 +585,20 @@ mod tests {
 
         let g = genesis();
         let block = app
-            .build_proposal(&g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
             .await
             .expect("build");
-        let result = app.commit(&block).await.expect("commit");
+        let result = app
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit");
         assert_eq!(
             result.validator_updates,
             vec![ValidatorUpdate {
@@ -609,7 +643,14 @@ mod tests {
         );
         let g = genesis();
         let block = app
-            .build_proposal(&g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
             .await
             .expect("build");
         assert_eq!(
@@ -626,7 +667,9 @@ mod tests {
     #[tokio::test]
     async fn commit_of_genesis_is_a_noop() {
         let app = make_app([9u8; 32]);
-        app.commit(&genesis()).await.expect("genesis commit");
+        app.commit(&AppContext::default(), &genesis())
+            .await
+            .expect("genesis commit");
         assert_eq!(app.state_commitment(), [9u8; 32]);
     }
 
@@ -812,9 +855,16 @@ mod tests {
         let pending: HashMap<BlockHash, Block> =
             [(a.hash(), a), (b.hash(), b.clone())].into_iter().collect();
 
-        app.build_proposal(&b, View(3), &sample_qc(&b), &pending, 1_000)
-            .await
-            .expect("build");
+        app.build_proposal(
+            &AppContext::default(),
+            &b,
+            View(3),
+            &sample_qc(&b),
+            &pending,
+            1_000,
+        )
+        .await
+        .expect("build");
 
         let m = methods.lock();
         let new_payloads = m.iter().filter(|x| *x == "engine_newPayloadV3").count();
@@ -877,7 +927,7 @@ mod tests {
         }
         // A committed block the EL can't execute yet (SYNCING).
         let block = block_with_payload([0u8; 32], 10, BLOCK1);
-        app.commit(&block)
+        app.commit(&AppContext::default(), &block)
             .await
             .expect("SYNCING commit is not an error");
         // Frontier held at the last executed block, not advanced to 10.
@@ -905,7 +955,14 @@ mod tests {
         // The leader's EL can't register the uncommitted ancestor (SYNCING) →
         // build is skipped (retriable), not a forged proposal.
         let err = app
-            .build_proposal(&a, View(2), &sample_qc(&a), &pending, 1_000)
+            .build_proposal(
+                &AppContext::default(),
+                &a,
+                View(2),
+                &sample_qc(&a),
+                &pending,
+                1_000,
+            )
             .await
             .expect_err("build must skip while the EL is syncing");
         assert!(err.to_string().contains("still syncing"));

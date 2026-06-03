@@ -83,6 +83,80 @@ pub struct CommitResult {
     pub app_data: Option<Bytes>,
 }
 
+/// One validator's participation in the justifying QC, surfaced to the
+/// application via [`AppContext::last_commit`]. Mirrors a single entry of
+/// ABCI's `CommitInfo.votes`: the validator's identity and the voting
+/// weight it carried in the set active at the QC's view.
+///
+/// Only validators that *signed* the QC are listed (a present-and-signed
+/// entry); a non-signer simply does not appear. That is enough for the
+/// reward and proposer-incentive use this exists for — apportioning a
+/// reward across the validators whose votes actually formed the quorum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoteInfo {
+    /// The signing validator's identity key ([`NodeId`]).
+    pub validator: NodeId,
+    /// The validator's voting weight in the set active at the QC's view.
+    pub weight: u64,
+}
+
+/// One piece of committed misbehaviour evidence, surfaced to the
+/// application via [`AppContext::evidence`] with the offender already
+/// resolved to a stable validator id. Mirrors ABCI's `Misbehavior`.
+///
+/// Consensus has already verified the underlying proof (resolving the
+/// offender through the key history at the equivocation view) before
+/// placing it here — the application reads the resolved offender and need
+/// not re-verify the cryptographic proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence {
+    /// The misbehaving validator's stable identity key ([`NodeId`]).
+    pub offender: NodeId,
+    /// The view at which the equivocation occurred.
+    pub view: View,
+}
+
+/// Per-block contextual information consensus surfaces to the
+/// [`Application`] at proposal-build and commit time (#653) — an opaque
+/// escape-hatch the application *reads*. Consensus does not interpret what
+/// the application does with it; it is **not** consensus-interpreted state.
+///
+/// It exists to feed the application data that is not otherwise on the
+/// [`Block`] it receives: who proposed, which validators' votes justify
+/// the block (with weights), and any misbehaviour evidence committed in
+/// it. The reth EL ignores it (Ethereum keeps proposer/vote accounting in
+/// its own consensus layer); a Cosmos adapter maps it onto
+/// `RequestPrepareProposal` / `RequestFinalizeBlock`; a staking
+/// application reads `last_commit` to apportion rewards and `evidence` to
+/// drive slashing.
+///
+/// # Which fields are populated when
+///
+/// - At [`Application::build_proposal`]: `proposer` is the local building
+///   node, and `last_commit` is resolved from the `high_qc` the proposal
+///   extends. `evidence` is empty (the leader's evidence-embedding
+///   decision is made separately and lands in the block's commands).
+/// - At [`Application::commit`]: `proposer` is the committed block's
+///   proposer, and `evidence` is the resolved offenders from the block's
+///   evidence commands. `last_commit` is currently empty here: the QC that
+///   justified a committed block is not threaded into the commit path
+///   today, and no consumer needs it yet (reth ignores it). Filling it is
+///   a mechanical follow-up when a commit-time consumer (the Cosmos
+///   adapter) appears.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AppContext {
+    /// The block's proposer: the local node at build time, the committed
+    /// block's `header.proposer` at commit time.
+    pub proposer: NodeId,
+    /// Validators whose votes justify this block, with their weight in the
+    /// set active at the justifying QC's view. See the type-level note on
+    /// when this is populated.
+    pub last_commit: Vec<VoteInfo>,
+    /// Misbehaviour evidence committed in this block, offenders resolved.
+    /// Populated at commit; empty at build.
+    pub evidence: Vec<Evidence>,
+}
+
 /// The asynchronous production application seam.
 ///
 /// Object-safe (`Arc<dyn Application>`) and async via the codebase's
@@ -111,9 +185,14 @@ pub trait Application: Send + Sync {
     /// All borrowed arguments share the future's lifetime, so the
     /// integration layer holds them across the `await`.
     ///
+    /// `ctx` ([`AppContext`]) carries proposer/last-commit information the
+    /// application may fold into the proposal (e.g. a staking app crediting
+    /// the previous quorum); it is read-only and consensus-uninterpreted.
+    ///
     /// [`HotStuffState::pending_blocks`]: crate::hotstuff::HotStuffState::pending_blocks
     fn build_proposal<'a>(
         &'a self,
+        ctx: &'a AppContext,
         parent: &'a Block,
         view: View,
         high_qc: &'a QuorumCertificate,
@@ -148,8 +227,17 @@ pub trait Application: Send + Sync {
     /// membership (the reth EL) returns [`CommitResult::default`], which is
     /// behaviourally identical to the previous `Result<()>`.
     ///
+    /// `ctx` ([`AppContext`]) carries the committed block's proposer and
+    /// any resolved misbehaviour evidence — the channel by which a staking
+    /// application reads evidence to drive slashing and the proposer to
+    /// credit rewards. Read-only and consensus-uninterpreted.
+    ///
     /// [`StateMachine::apply`]: crate::replication::state_machine::StateMachine::apply
-    fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<CommitResult>>;
+    fn commit<'a>(
+        &'a self,
+        ctx: &'a AppContext,
+        block: &'a Block,
+    ) -> BoxFuture<'a, anyhow::Result<CommitResult>>;
 
     /// The height this application has actually **executed** — for an
     /// out-of-process execution layer (a reth EL) this can lag the consensus
