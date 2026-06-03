@@ -49,6 +49,7 @@ pub mod genesis;
 pub mod history_commitment;
 pub mod hotstuff;
 pub mod limits;
+pub mod liveness_tracker;
 pub mod operator_key_history;
 pub mod pacemaker;
 pub mod rate_limit;
