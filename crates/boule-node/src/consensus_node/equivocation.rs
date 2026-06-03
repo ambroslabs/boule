@@ -143,8 +143,32 @@ impl ConsensusNode {
                     view = view.0,
                     "consensus_equivocation_proof_built",
                 );
-                // #657 will persist / gossip / include the proof; for now it
-                // is built, verified, and counted.
+                // #657: hand the proof to block inclusion by minting it as a
+                // tagged system tx into the mempool, so this node includes it
+                // when it next leads (and the commit-apply path records it).
+                // Mint at most once per equivocator: a Byzantine validator
+                // equivocates every view, so re-minting would flood the
+                // mempool with a fresh distinct-view proof each view. Skip too
+                // if it already has committed evidence (post-restart, the
+                // in-memory `evidence_minted` set is empty but the persisted
+                // registry still blocks re-minting).
+                if !self.evidence_minted.contains(&who)
+                    && !self.committed_evidence.contains_key(&who)
+                {
+                    let payload = boule_consensus::equivocation_evidence::encode_evidence(&proof);
+                    match self.mempool.insert(payload) {
+                        Ok(_) => {
+                            self.evidence_minted.insert(who);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: TRACE_TARGET,
+                                error = %e,
+                                "evidence_mempool_insert_failed",
+                            );
+                        }
+                    }
+                }
             }
             other => {
                 tracing::error!(

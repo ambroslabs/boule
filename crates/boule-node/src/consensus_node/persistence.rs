@@ -138,6 +138,15 @@ pub const STORAGE_KEY_VALIDATOR_KEY_HISTORY: &[u8] = b"consensus/validator_key_h
 /// because the rotations are reseeded from genesis only.
 pub const STORAGE_KEY_BLS_KEY_HISTORY: &[u8] = b"consensus/bls_key_history";
 
+/// Storage key for the committed-equivocation-evidence registry (#657).
+/// Written after every commit that records new evidence; read at startup
+/// so the "this validator already has committed evidence" dedup survives
+/// restarts (and survives block pruning, which a rebuild-from-blocks
+/// approach would not). The blob is a postcard-encoded map from the
+/// equivocator's stable `ValidatorId` to the view it equivocated at — the
+/// input a later slashing pass (#658) consumes.
+pub const STORAGE_KEY_COMMITTED_EVIDENCE: &[u8] = b"consensus/committed_evidence";
+
 /// Bound on [`ConsensusNode::recent_qcs`]. The cache only needs to
 /// retain the QC for the most recently-committed block (so the
 /// snapshot creation hook can find it); a small buffer absorbs

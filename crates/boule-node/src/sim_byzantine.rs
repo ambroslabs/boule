@@ -1960,4 +1960,73 @@ mod tests {
             })?;
         }
     }
+
+    /// #657 end-to-end (the issue's "Done when"): a twin-vote equivocator is
+    /// detected by the honest replicas (#656), which mint the proof as a
+    /// tagged system tx; an honest leader then includes it and the cluster
+    /// commits it. Asserts a valid evidence payload — naming the byzantine —
+    /// lands in a committed block, exercising detect → mint → propose →
+    /// commit end to end (the gossip hop is #657b; here the detector includes
+    /// it once it rotates into leadership).
+    #[test]
+    fn twin_vote_evidence_lands_in_a_committed_block() {
+        use boule_consensus::dispatch::EquivocationProof;
+        use boule_consensus::equivocation_evidence::{decode_evidence, is_evidence_payload};
+
+        run_paused(|| async move {
+            let victim = 0usize;
+            let (mut cluster, _honest) =
+                spawn_with_one_adversary(victim, build_adversary(AdvKind::TwinVote)).await;
+            let byzantine_id = cluster.node_ids[victim];
+
+            // Advance in chunks, draining committed blocks each pass, until an
+            // evidence payload appears in a committed block (or the cap). The
+            // detector mints on detection; an honest leader includes it within
+            // a few round-robin rotations and it commits in the three-chain.
+            let mut found: Option<EquivocationProof> = None;
+            let mut all_committed = cluster.drain_commits();
+            'outer: for _ in 0..10 {
+                cluster.advance_and_yield(Duration::from_millis(500)).await;
+                let drained = cluster.drain_commits();
+                for (i, blocks) in drained.into_iter().enumerate() {
+                    for b in &blocks {
+                        for cmd in &b.commands {
+                            if is_evidence_payload(cmd) {
+                                found = Some(
+                                    decode_evidence(cmd).expect("committed evidence must decode"),
+                                );
+                            }
+                        }
+                    }
+                    all_committed[i].extend(blocks);
+                }
+                if found.is_some() {
+                    break 'outer;
+                }
+            }
+
+            // Safety holds across everything committed.
+            assert_no_conflicts(&all_committed);
+
+            let proof = found.expect(
+                "a committed block must carry an equivocation-evidence system tx within the cap",
+            );
+            // The evidence names the byzantine (genesis cluster → a signer's
+            // wire NodeId is its stable validator id).
+            match proof {
+                EquivocationProof::DoubleVote(a, b) => {
+                    assert_eq!(a.signer, byzantine_id, "evidence must name the equivocator");
+                    assert_eq!(b.signer, byzantine_id, "evidence must name the equivocator");
+                    assert_eq!(a.payload.view, b.payload.view, "conflict is at one view");
+                    assert_ne!(
+                        a.payload.block_hash, b.payload.block_hash,
+                        "conflict is over different blocks",
+                    );
+                }
+                EquivocationProof::DoubleProposal(..) => {
+                    panic!("twin-vote adversary must produce vote, not proposal, evidence");
+                }
+            }
+        });
+    }
 }

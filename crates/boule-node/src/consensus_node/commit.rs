@@ -257,6 +257,11 @@ impl ConsensusNode {
         // the reconfig has applied — though in practice committing
         // both in the same block is unusual).
         self.apply_committed_rotations(&block);
+        // #657: scan for tagged equivocation-evidence payloads and record
+        // each valid, fresh one in the committed-evidence registry exactly
+        // once per equivocator. After reconfigs/rotations so the verifier
+        // sees the post-boundary key history. Invalid/stale/dup is a no-op.
+        self.apply_committed_evidence(&block);
         if let Some(notifier) = &self.commit_notifier {
             notifier.on_commit(&block, &block.header.state_commitment, block.header.view);
         }
