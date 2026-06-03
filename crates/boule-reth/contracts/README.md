@@ -40,3 +40,46 @@ python3 -c "import solcx; solcx.install_solc('0.8.24'); \
 Paste the `bin-runtime` hex (prefixed with `0x`) into the predeploy account's
 `code` field in `genesis.json`. If the contract changes, update both the
 bytecode and the constants in `src/staking.rs`.
+
+## `Rotation.sol` — validator key-rotation predeploy (#730)
+
+The EVM-native submission path for validator signing-key / operator-key
+rotations on the reth backend (milestone #4). A validator rotates by sending an
+ordinary EVM transaction to `submitRotation(bytes32 validator, bytes
+rotationCommand)`, where `rotationCommand` is the **already-encoded, dual-signed**
+boule rotation command (`DualSignedRotation::encode_command()` or an
+operator/cancel variant). The contract is a pure event emitter; boule reads the
+`RotationSubmitted` event from each committed block (via `eth_getLogs`), turns
+it into a `ValidatorEffect::KeyRotation` on the widened `CommitResult` (#727),
+and re-materialises the command into a block — where the existing rotation path
+verifies the signatures and schedules the `v_eff` key swap. The
+`RotatableSigner` / key-history mechanism (#312/#258) is unchanged; only the
+submission path moves onto the EVM, replacing the bespoke rotation mempool tx.
+
+> [!NOTE]
+> The EVM never interprets `rotationCommand`; consensus validates the command's
+> tag and self-attestation signatures when it materialises the effect. The
+> submitter must set `v_eff` far enough ahead to clear the execution lag plus
+> the validation floor (a too-soon rotation is rejected at apply, not unsafe).
+
+| | |
+|---|---|
+| Address | `0x0000000000000000000000000000000000000b0f` |
+| `RotationSubmitted(bytes32,bytes)` topic0 | `0xde7f9466fbeb5e013694b9e04812cc106a0a764766c202e2f88a480ee27120d1` |
+| `submitRotation(bytes32,bytes)` selector | `0x37fe3f23` |
+
+These identifiers are mirrored as constants in `src/rotation.rs`; unit tests
+pin the address, topic, and selector to the genesis account's bytecode.
+
+### Reproducing the bytecode
+
+Same toolchain as `Staking.sol` above (**solc 0.8.24**, `bin-runtime`):
+
+```sh
+python3 -c "import solcx; solcx.install_solc('0.8.24'); \
+  print(solcx.compile_files(['contracts/Rotation.sol'], output_values=['bin-runtime'], solc_version='0.8.24'))"
+```
+
+Paste the `bin-runtime` hex (prefixed with `0x`) into the predeploy account's
+`code` field in `genesis.json`. If the contract changes, update both the
+bytecode and the constants in `src/rotation.rs`.
