@@ -107,6 +107,7 @@ mod config;
 mod endpoint_apply;
 mod equivocation;
 mod evidence_apply;
+mod param_apply;
 mod persistence;
 mod reconfig_apply;
 mod rotation_apply;
@@ -404,7 +405,21 @@ pub struct ConsensusNode {
     /// Minimum wall-clock spacing between proposals this node produces as
     /// leader (#614). `Duration::ZERO` disables pacing. See
     /// [`NodeConfigForConsensus::min_block_interval`].
+    ///
+    /// This is the *currently-active* value: it seeds from config and is
+    /// refreshed at each commit from [`Self::param_history`] as a live
+    /// [`ConsensusParamUpdate`](boule_consensus::consensus_params::ConsensusParamUpdate)
+    /// boundary activates (#542).
     min_block_interval: Duration,
+    /// Schedule of live-updateable consensus parameters over views (#542): the
+    /// genesis params and the committed `v_eff` boundaries that change them.
+    /// `apply_committed_param_updates` inserts boundaries at commit and
+    /// refreshes the active cached values (e.g. [`Self::min_block_interval`])
+    /// from `param_history.at(committed_view)`. Held in memory only for now —
+    /// durable persistence + recovery re-derivation is a follow-up needed
+    /// before a convergence-critical param (vs. the leader-local
+    /// `min_block_interval`) rides this path.
+    param_history: boule_consensus::consensus_params::ConsensusParamHistory,
     /// Optional weak-subjectivity checkpoint (#642): `(height, block_hash)` of a
     /// recent operator-trusted finalized block. When set, the node halts rather
     /// than commit or recover a chain whose block at that height disagrees.
@@ -765,6 +780,11 @@ impl ConsensusNode {
             loopback_stack: Vec::new(),
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
+            param_history: boule_consensus::consensus_params::ConsensusParamHistory::new(
+                boule_consensus::consensus_params::ConsensusParams {
+                    min_block_interval_ms: config.min_block_interval.as_millis() as u64,
+                },
+            ),
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             staged_validator_updates: Vec::new(),
             staged_effects: Vec::new(),
@@ -1227,6 +1247,11 @@ impl ConsensusNode {
             loopback_stack: Vec::new(),
             draining_loopback: false,
             min_block_interval: config.min_block_interval,
+            param_history: boule_consensus::consensus_params::ConsensusParamHistory::new(
+                boule_consensus::consensus_params::ConsensusParams {
+                    min_block_interval_ms: config.min_block_interval.as_millis() as u64,
+                },
+            ),
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             staged_validator_updates: Vec::new(),
             staged_effects: Vec::new(),
@@ -11143,28 +11168,108 @@ mod tests {
         );
     }
 
-    /// #727: effect categories whose consensus apply path does not exist on
-    /// this branch yet (`EndpointUpdate` → #731/#546, `ParamUpdate` → #542) are
-    /// surfaced-and-dropped rather than minted — nothing reaches the mempool —
-    /// and the stage is still drained.
+    /// An `EndpointUpdate` (no effect-materialiser producer yet, #731) is
+    /// surfaced-and-dropped, and a `ParamUpdate` carrying a non-param payload is
+    /// rejected (defense-in-depth) — neither reaches the mempool, and the stage
+    /// is still drained.
     #[test]
-    fn unsupported_effect_categories_are_dropped_not_minted() {
+    fn unsupported_or_malformed_effects_are_dropped_not_minted() {
         let mut node = make_node(nid(1));
         node.staged_effects = vec![
             ValidatorEffect::EndpointUpdate(bytes::Bytes::from_static(b"ep")),
-            ValidatorEffect::ParamUpdate(bytes::Bytes::from_static(b"param")),
+            ValidatorEffect::ParamUpdate(bytes::Bytes::from_static(b"not-a-param")),
         ];
 
         node.mint_staged_effects(View(2));
 
         assert!(
             node.mempool.propose(16).is_empty(),
-            "an unsupported effect category mints no command",
+            "an unsupported / malformed effect mints no command",
         );
         assert!(
             node.staged_effects.is_empty(),
             "the stage is drained even when nothing is materialisable",
         );
+    }
+
+    /// #542: a `ParamUpdate` effect carrying a well-formed ConsensusParamUpdate
+    /// is materialised — minted into the mempool as a tagged param-update
+    /// command (and drained), so the leader carries it into the next block.
+    #[test]
+    fn param_update_effect_is_minted_into_the_mempool() {
+        use boule_consensus::consensus_params::ConsensusParamUpdate;
+
+        let mut node = make_node(nid(1));
+        let cmd = ConsensusParamUpdate {
+            min_block_interval_ms: Some(123),
+            v_eff: View(10),
+        };
+        node.staged_effects = vec![ValidatorEffect::ParamUpdate(cmd.encode())];
+
+        node.mint_staged_effects(View(2));
+
+        let minted = node
+            .mempool
+            .propose(16)
+            .into_iter()
+            .find(|c| ConsensusParamUpdate::is_param_update_payload(c))
+            .expect("a param-update command was minted");
+        assert_eq!(ConsensusParamUpdate::decode(&minted).unwrap(), cmd);
+        assert!(node.staged_effects.is_empty(), "the stage is drained");
+    }
+
+    /// #542: a committed `ConsensusParamUpdate` schedules a future `v_eff`
+    /// boundary; the cached `min_block_interval` stays at its genesis value
+    /// until a committed block's view reaches `v_eff`, then activates — the
+    /// convergence discipline that makes every replica adopt the new value at
+    /// the same view.
+    #[test]
+    fn committed_param_update_activates_at_its_v_eff() {
+        use boule_consensus::consensus_params::ConsensusParamUpdate;
+
+        let mut node = make_node(nid(1));
+        // make_node seeds min_block_interval = 0 (ZERO disables pacing).
+        assert_eq!(node.min_block_interval, Duration::ZERO);
+
+        let update = ConsensusParamUpdate {
+            min_block_interval_ms: Some(250),
+            v_eff: View::new(5),
+        };
+        let mut b1 = empty_block(genesis().hash(), 1, 1);
+        b1.commands = vec![update.encode()];
+        node.apply_committed_param_updates(&b1);
+        assert_eq!(
+            node.min_block_interval,
+            Duration::ZERO,
+            "not yet active: committed view 1 < v_eff 5",
+        );
+
+        let b5 = empty_block(b1.hash(), 5, 5);
+        node.apply_committed_param_updates(&b5);
+        assert_eq!(
+            node.min_block_interval,
+            Duration::from_millis(250),
+            "active once a committed view reaches v_eff",
+        );
+    }
+
+    /// #542: an update whose `v_eff` is sooner than the delay floor is dropped;
+    /// the active value never changes, even after the chain passes that view.
+    #[test]
+    fn too_soon_param_update_is_dropped() {
+        use boule_consensus::consensus_params::ConsensusParamUpdate;
+
+        let mut node = make_node(nid(1));
+        let update = ConsensusParamUpdate {
+            min_block_interval_ms: Some(999),
+            v_eff: View::new(2), // < view 1 + MIN_PARAM_V_EFF_DELAY (2) = 3
+        };
+        let mut b = empty_block(genesis().hash(), 1, 1);
+        b.commands = vec![update.encode()];
+        node.apply_committed_param_updates(&b);
+        let b_later = empty_block(b.hash(), 9, 9);
+        node.apply_committed_param_updates(&b_later);
+        assert_eq!(node.min_block_interval, Duration::ZERO);
     }
 
     /// #727 defense-in-depth: a [`ValidatorEffect::KeyRotation`] whose payload

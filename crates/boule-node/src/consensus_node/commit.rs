@@ -286,6 +286,10 @@ impl ConsensusNode {
         // reconfigs/rotations so the membership + key history the verifier
         // consults reflect changes committed in the same block.
         self.apply_committed_endpoints(&block);
+        // #542: apply any committed consensus-parameter-update system txs,
+        // scheduling their v_eff boundaries and refreshing the cached active
+        // params (e.g. min_block_interval) for this committed view.
+        self.apply_committed_param_updates(&block);
 
         // #540: feed the liveness detector this view's credited
         // participation — the validators whose votes the committing QC
