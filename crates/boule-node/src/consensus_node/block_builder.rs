@@ -330,6 +330,9 @@ impl Application for MempoolBlockBuilder {
     fn commit<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, anyhow::Result<CommitResult>> {
         Box::pin(async move {
             let mut stake = self.stake_source.lock();
+            // Advance the stake clock first so this block's unbondings schedule
+            // against the right height and matured ones release (#660).
+            stake.advance_to_height(block.header.height);
             let mut sm = self.state_machine.lock();
             for cmd in &block.commands {
                 if StakeCommand::is_stake_payload(cmd) {
