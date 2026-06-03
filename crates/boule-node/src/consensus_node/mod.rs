@@ -80,7 +80,7 @@ use boule_consensus::pacemaker::Pacemaker;
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::pacemaker::timeout::ExponentialBackoff;
 use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
-use boule_consensus::replication::application::{Application, ValidatorUpdate};
+use boule_consensus::replication::application::{Application, ValidatorEffect, ValidatorUpdate};
 use boule_consensus::replication::block::BlockHash;
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::stake_source::BondedStakeLedger;
@@ -420,6 +420,16 @@ pub struct ConsensusNode {
     /// governance reconfig. Cleared once a reconfig boundary lands. Always
     /// empty for an application that does not drive membership (the reth EL).
     staged_validator_updates: Vec<ValidatorUpdate>,
+    /// Richer [`ValidatorEffect`](boule_consensus::replication::application::ValidatorEffect)s
+    /// the [`Application`] returned at its last `commit` (the
+    /// [`CommitResult`](boule_consensus::replication::application::CommitResult)'s
+    /// `effects`) — the execution-layer transaction channel (#727) — that have
+    /// not yet been materialised into block commands. Staged here at commit
+    /// and, when this node next builds a proposal as leader, minted into the
+    /// proposal via [`ConsensusNode::mint_staged_effects`] (which drains them).
+    /// Always empty for a backend that drives none of these (PoA, the reth EL
+    /// default).
+    staged_effects: Vec<ValidatorEffect>,
     /// When this node, as leader, last broadcast a proposal. Used to decide
     /// whether a fresh proposal must wait out [`Self::min_block_interval`].
     last_proposal_at: Option<tokio::time::Instant>,
@@ -757,6 +767,7 @@ impl ConsensusNode {
             min_block_interval: config.min_block_interval,
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             staged_validator_updates: Vec::new(),
+            staged_effects: Vec::new(),
             last_proposal_at: None,
             stashed_proposal: None,
             dropped_commands,
@@ -1209,6 +1220,7 @@ impl ConsensusNode {
             min_block_interval: config.min_block_interval,
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             staged_validator_updates: Vec::new(),
+            staged_effects: Vec::new(),
             last_proposal_at: None,
             stashed_proposal: None,
             dropped_commands,
@@ -10907,16 +10919,26 @@ mod tests {
         }
     }
 
-    /// An application that requests a batch of validator updates from its
-    /// first `commit` and nothing thereafter — the test stand-in for a
-    /// staking backend driving the validator set (#225 M5).
+    /// An application that requests a batch of validator updates (and,
+    /// optionally, richer [`ValidatorEffect`]s) from its first `commit` and
+    /// nothing thereafter — the test stand-in for a staking backend driving the
+    /// validator set (#225 M5) and the execution-layer transaction channel
+    /// (#727).
     struct StakingTestApp {
         pending: std::sync::Mutex<Option<Vec<ValidatorUpdate>>>,
+        pending_effects: std::sync::Mutex<Option<Vec<ValidatorEffect>>>,
     }
     impl StakingTestApp {
         fn new(updates: Vec<ValidatorUpdate>) -> Self {
             Self {
                 pending: std::sync::Mutex::new(Some(updates)),
+                pending_effects: std::sync::Mutex::new(None),
+            }
+        }
+        fn with_effects(effects: Vec<ValidatorEffect>) -> Self {
+            Self {
+                pending: std::sync::Mutex::new(None),
+                pending_effects: std::sync::Mutex::new(Some(effects)),
             }
         }
     }
@@ -10941,10 +10963,17 @@ mod tests {
             anyhow::Result<boule_consensus::replication::application::CommitResult>,
         > {
             let validator_updates = self.pending.lock().unwrap().take().unwrap_or_default();
+            let effects = self
+                .pending_effects
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_default();
             Box::pin(async move {
                 Ok(boule_consensus::replication::application::CommitResult {
                     validator_updates,
-                    app_data: None,
+                    effects,
+                    ..Default::default()
                 })
             })
         }
@@ -11039,6 +11068,119 @@ mod tests {
             node.staged_validator_updates.is_empty(),
             "the stage is cleared once the reconfig boundary commits",
         );
+    }
+
+    /// Build a tagged dual-signed rotation command with dummy signatures. The
+    /// effect materialiser only checks the rotation *tag* before minting
+    /// (cryptographic `verify` happens later at apply), so the signatures need
+    /// not be valid for these tests.
+    fn fake_rotation_payload(validator: NodeId, new_pubkey: NodeId, v_eff: View) -> bytes::Bytes {
+        use boule_consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+        DualSignedRotation {
+            payload: ValidatorKeyRotation {
+                validator,
+                new_pubkey,
+                v_eff,
+                new_bls_pubkey: None,
+                new_bls_pop: None,
+            },
+            sig_old: [0u8; 64],
+            sig_new: [0u8; 64],
+        }
+        .encode_command()
+    }
+
+    /// #727: a [`ValidatorEffect::KeyRotation`] the application returns from
+    /// `commit` is staged, then minted into the mempool as a rotation system
+    /// command on the next proposal this node builds as leader — the
+    /// execution-layer transaction channel reusing the deferred-materialisation
+    /// path. Unlike a staged validator update, the effect is *drained* on mint.
+    #[tokio::test]
+    async fn app_key_rotation_effect_is_staged_and_minted() {
+        use boule_consensus::validator_rotation::DualSignedRotation;
+
+        let node = make_node_with_retention(nid(1), 0);
+        let mempool = Arc::clone(&node.mempool);
+        let rotation = fake_rotation_payload(nid(2), nid(9), View(20));
+        let app = Arc::new(StakingTestApp::with_effects(vec![
+            ValidatorEffect::KeyRotation(rotation.clone()),
+        ]));
+        let mut node = node.with_application(app);
+
+        // 1. Commit a trigger block — the app returns the effect, staged.
+        node.commit_block(empty_block(genesis().hash(), 1, 1)).await;
+        assert_eq!(
+            node.staged_effects.len(),
+            1,
+            "the app's key-rotation effect is staged at commit",
+        );
+
+        // 2. As leader building at view 2, mint the staged effect.
+        node.mint_staged_effects(View(2));
+        assert!(
+            node.staged_effects.is_empty(),
+            "staged effects are drained on mint (re-emission is the EL's job)",
+        );
+
+        // 3. The mempool now carries the rotation command, byte-for-byte.
+        let proposed = mempool.propose(16);
+        let minted = proposed
+            .iter()
+            .find(|c| DualSignedRotation::is_rotation_payload(c))
+            .expect("a rotation command was minted into the mempool");
+        assert_eq!(
+            minted, &rotation,
+            "the minted command is the effect's payload"
+        );
+    }
+
+    /// #727: effect categories whose consensus apply path does not exist on
+    /// this branch yet (`EndpointUpdate` → #731/#546, `ParamUpdate` → #542) are
+    /// surfaced-and-dropped rather than minted — nothing reaches the mempool —
+    /// and the stage is still drained.
+    #[test]
+    fn unsupported_effect_categories_are_dropped_not_minted() {
+        let mut node = make_node(nid(1));
+        node.staged_effects = vec![
+            ValidatorEffect::EndpointUpdate(bytes::Bytes::from_static(b"ep")),
+            ValidatorEffect::ParamUpdate(bytes::Bytes::from_static(b"param")),
+        ];
+
+        node.mint_staged_effects(View(2));
+
+        assert!(
+            node.mempool.propose(16).is_empty(),
+            "an unsupported effect category mints no command",
+        );
+        assert!(
+            node.staged_effects.is_empty(),
+            "the stage is drained even when nothing is materialisable",
+        );
+    }
+
+    /// #727 defense-in-depth: a [`ValidatorEffect::KeyRotation`] whose payload
+    /// is not actually a rotation command is rejected, not minted — the effect
+    /// channel must not smuggle an arbitrary command in under a rotation label.
+    #[test]
+    fn key_rotation_effect_with_non_rotation_payload_is_rejected() {
+        use boule_consensus::validator_rotation::DualSignedRotation;
+
+        let mut node = make_node(nid(1));
+        node.staged_effects = vec![ValidatorEffect::KeyRotation(bytes::Bytes::from_static(
+            b"not-a-rotation",
+        ))];
+
+        node.mint_staged_effects(View(2));
+
+        assert!(
+            !node
+                .mempool
+                .propose(16)
+                .iter()
+                .any(|c| DualSignedRotation::is_rotation_payload(c)),
+            "a mis-tagged key-rotation payload is not minted",
+        );
+        assert!(node.staged_effects.is_empty(), "the stage is drained");
     }
 
     #[tokio::test]

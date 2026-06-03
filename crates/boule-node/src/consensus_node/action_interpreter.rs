@@ -1260,6 +1260,11 @@ impl ConsensusNode {
                     // the block this node is about to build carries it. A
                     // no-op unless updates are staged.
                     self.mint_staged_reconfig(view);
+                    // Same for the richer execution-layer transaction effects
+                    // (#727): mint any staged key-rotation/endpoint/param
+                    // effects into their system commands. A no-op unless
+                    // effects are staged (the reth EL default stages none).
+                    self.mint_staged_effects(view);
                     // #653: surface proposer + commit-info (the high_qc's
                     // signers and their weights) to the application.
                     let ctx = self.build_app_context(&high_qc);
