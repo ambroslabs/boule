@@ -495,6 +495,7 @@ pub fn apply_reconfig_commands_to_set_history(
     block: &Block,
     set_history: &mut ValidatorSetHistory,
     key_history: &mut ValidatorKeyHistory,
+    mut operator_key_history: Option<&mut OperatorKeyHistory>,
     scheme: SignatureSchemeChoice,
     min_v_eff_delay: View,
     chain_id: &ChainId,
@@ -555,10 +556,27 @@ pub fn apply_reconfig_commands_to_set_history(
         // Mirror new validators into key_history at the same v_eff.
         // Failures (collision with an existing pubkey) are dropped
         // silently — `from_set_history` would skip them too.
-        for member in new_members {
-            if !key_history.validators().any(|id| id == member) {
+        for member in &new_members {
+            if !key_history.validators().any(|id| id == *member) {
                 let pubkey = crate::validator_set::Pubkey::from_node_id(member.into_node_id());
                 let _ = key_history.add_validator(pubkey, cmd.v_eff);
+            }
+        }
+
+        // #549: register operator keys for newly-seated validators whose `adds`
+        // entry declared one — the operator-key analogue of the key_history
+        // mirror above. Only for members actually seated by this reconfig and
+        // not already in the operator history. Silent on failure, like the
+        // mirrors above.
+        if let Some(op_hist) = operator_key_history.as_deref_mut() {
+            for entry in &cmd.adds {
+                let Some(operator_pubkey) = entry.operator_pubkey else {
+                    continue;
+                };
+                let v_id = crate::validator_set::ValidatorId::from_genesis_pubkey(entry.node_id);
+                if new_members.contains(&v_id) && !op_hist.contains(&v_id) {
+                    let _ = op_hist.register(&v_id, cmd.v_eff, operator_pubkey);
+                }
             }
         }
     }
@@ -771,6 +789,7 @@ pub fn compute_post_block_commitment(
         block,
         &mut set,
         &mut key,
+        operator.as_mut(),
         scheme,
         min_v_eff_delay,
         chain_id,

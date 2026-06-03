@@ -9,7 +9,9 @@ use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::replication::block::Block;
 use boule_consensus::validator_set::ValidatorSet;
 
-use super::{ConsensusNode, STORAGE_KEY_VALIDATOR_HISTORY, TRACE_TARGET};
+use super::{
+    ConsensusNode, STORAGE_KEY_OPERATOR_KEY_HISTORY, STORAGE_KEY_VALIDATOR_HISTORY, TRACE_TARGET,
+};
 
 impl ConsensusNode {
     /// Scan `block.commands` for tagged `ReconfigCommand` payloads
@@ -36,9 +38,16 @@ impl ConsensusNode {
         // snapshot is `cfg(debug_assertions)`-gated so release builds
         // don't pay the clone.
         #[cfg(debug_assertions)]
-        let pre_state_for_parity = self.validator_history.clone();
+        let pre_state_for_parity = (
+            self.validator_history.clone(),
+            self.operator_key_history.clone(),
+        );
 
         let mut applied_any = false;
+        // #549: track operator-key registrations from reconfig adds separately
+        // — the operator-key history persists under its own key (and, unlike
+        // signing keys, is NOT re-derivable from the set, so it must be saved).
+        let mut operator_history_changed = false;
         for cmd_bytes in &block.commands {
             if !ReconfigCommand::is_reconfig_payload(cmd_bytes) {
                 continue;
@@ -184,6 +193,50 @@ impl ConsensusNode {
                 "reconfig_applied",
             );
             applied_any = true;
+
+            // #549: register operator keys for newly-seated validators whose
+            // `adds` entry declared one — the operator-key analogue of the
+            // signing-key mirror, but applied *live* (and persisted below)
+            // because operator keys aren't re-derivable from the set. Mirrors
+            // the same logic in `apply_reconfig_commands_to_set_history` so the
+            // live history matches the commitment/recovery rebuild.
+            for entry in &cmd.adds {
+                let Some(operator_pubkey) = entry.operator_pubkey else {
+                    continue;
+                };
+                let v_id =
+                    boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(entry.node_id);
+                if new_set.contains(&v_id)
+                    && !self.operator_key_history.contains(&v_id)
+                    && self
+                        .operator_key_history
+                        .register(&v_id, cmd.v_eff, operator_pubkey)
+                        .is_ok()
+                {
+                    operator_history_changed = true;
+                }
+            }
+        }
+
+        // #549: persist the operator-key history if a reconfig add registered
+        // an operator key (it cannot be rebuilt from genesis once mutated).
+        if operator_history_changed {
+            match postcard::to_stdvec(&self.operator_key_history.to_persisted()) {
+                Ok(bytes) => {
+                    if let Err(e) = self.storage.put(STORAGE_KEY_OPERATOR_KEY_HISTORY, &bytes) {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "operator_key_history_persist_failed",
+                        );
+                    }
+                }
+                Err(e) => tracing::error!(
+                    target: TRACE_TARGET,
+                    error = %e,
+                    "operator_key_history_encode_failed",
+                ),
+            }
         }
 
         // #254: durably persist the updated history once any boundary
@@ -236,7 +289,7 @@ impl ConsensusNode {
         // snapshot at the top of this method for context.
         #[cfg(debug_assertions)]
         {
-            let mut rebuilt = pre_state_for_parity;
+            let (mut rebuilt, mut rebuilt_operator) = pre_state_for_parity;
             let mut throwaway_key =
                 boule_consensus::validator_key_history::ValidatorKeyHistory::new(
                     self.validator_set.iter().copied(),
@@ -245,6 +298,7 @@ impl ConsensusNode {
                 block,
                 &mut rebuilt,
                 &mut throwaway_key,
+                Some(&mut rebuilt_operator),
                 self.signature_scheme,
                 self.min_v_eff_delay,
                 &self.chain_id,
@@ -253,6 +307,16 @@ impl ConsensusNode {
                 rebuilt.to_persisted(),
                 self.validator_history.to_persisted(),
                 "pure-rebuild reconfig path diverged from wrapper at height={} view={}",
+                block.header.height,
+                block.header.view,
+            );
+            // #549: unlike key_history, the live wrapper *does* register
+            // operator keys from reconfig adds (they aren't re-derivable), so
+            // the rebuild's operator history must match the live one.
+            debug_assert_eq!(
+                rebuilt_operator.to_persisted(),
+                self.operator_key_history.to_persisted(),
+                "pure-rebuild reconfig operator-key path diverged from wrapper at height={} view={}",
                 block.header.height,
                 block.header.view,
             );

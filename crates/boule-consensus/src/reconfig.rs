@@ -99,6 +99,19 @@ pub struct ValidatorEntry {
     /// Validation rejects `weight == 0` — the reconfig "remove" path
     /// is the canonical way to spell removal.
     pub weight: u64,
+    /// Optional operator key (#549) for the validator being admitted: the
+    /// cold-storage administrative key that can later rotate this validator's
+    /// signing key without the old key (recovery) or rotate itself. `None`
+    /// seats the validator with no operator key (no recovery path) — e.g. a
+    /// staking-driven add whose source carries no operator pubkey. Registered
+    /// in the operator-key history at `v_eff`, the same way `node_id` is
+    /// mirrored into the signing-key history. Ed25519 like the validator's own
+    /// NodeId; multi-sig is an operator-side choice (the protocol just verifies
+    /// whatever Ed25519 signature the operator later presents).
+    ///
+    /// Always serialized (postcard is schema-bound) — `None` adds one Option
+    /// discriminant byte, like `bls_pop`.
+    pub operator_pubkey: Option<NodeId>,
 }
 
 /// A weight-only adjustment for a currently-seated validator. Equivalent
@@ -176,6 +189,7 @@ impl ReconfigCommand {
                 addr,
                 bls_pop: None,
                 weight,
+                operator_pubkey: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -544,6 +558,7 @@ pub fn build_add_validator_payload(
     weight: u64,
     bls_pop_file: Option<&Path>,
     bls_key_file: Option<&Path>,
+    operator_pubkey: Option<NodeId>,
 ) -> anyhow::Result<Bytes> {
     if bls_pop_file.is_some() && bls_key_file.is_some() {
         anyhow::bail!(
@@ -623,6 +638,7 @@ pub fn build_add_validator_payload(
             addr,
             bls_pop,
             weight,
+            operator_pubkey,
         }],
         removes: vec![],
         changes: vec![],
@@ -734,6 +750,7 @@ mod tests {
             addr: addr(port),
             bls_pop: None,
             weight,
+            operator_pubkey: None,
         }
     }
 
@@ -1053,6 +1070,7 @@ mod tests {
             addr: addr(port),
             bls_pop: Some(pop),
             weight: 1,
+            operator_pubkey: None,
         }
     }
 
