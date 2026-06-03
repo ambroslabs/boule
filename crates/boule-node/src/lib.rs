@@ -7,6 +7,7 @@
 
 pub mod consensus_node;
 pub mod demo_staking;
+pub mod rotatable_signer;
 pub mod testnet;
 
 #[cfg(test)]
