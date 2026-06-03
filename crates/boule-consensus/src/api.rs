@@ -267,6 +267,8 @@ mod tests {
             state_divergence_detected: 0,
             proposal_command_rejections: 0,
             backpressure: crate::status::BackpressureStatus::default(),
+            delinquent_validators: Vec::new(),
+            cluster_participation_permille: None,
         }
     }
 

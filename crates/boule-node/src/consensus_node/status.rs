@@ -238,6 +238,14 @@ impl ConsensusNode {
                     .map(|l| l.counters().outbound_drops_total())
                     .unwrap_or(0),
             },
+            // #540: surface the liveness detector's verdicts.
+            delinquent_validators: self
+                .liveness_tracker
+                .delinquents()
+                .iter()
+                .map(|v| boule_transport_tcp::tls::node_id_to_base58(v.as_node_id()))
+                .collect(),
+            cluster_participation_permille: self.liveness_tracker.cluster_participation_permille(),
         }
     }
 }
