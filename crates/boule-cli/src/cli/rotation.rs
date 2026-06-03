@@ -24,6 +24,72 @@ pub(crate) enum RotationCmd {
     /// Build an operator-key self-rotation payload (#549): rotate a validator's
     /// own operator key, dual-signed by the old and new operator keys.
     ProposeOperatorKeyRotation(OperatorKeyRotationArgs),
+    /// Hot-rotate a *running* node's consensus signing key with no restart
+    /// (#707): POSTs to the node's `/admin/rotate-key` admin endpoint, which
+    /// mints/loads the new key, admits the dual-signed rotation tx, and
+    /// schedules the live swap at `v_eff`.
+    HotRotate(HotRotateArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct HotRotateArgs {
+    /// Base URL of the running node's HTTP API (where `/admin/rotate-key`
+    /// is served). Bind the API to a trusted interface — the endpoint is
+    /// unauthenticated.
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    api_url: String,
+    /// New consensus key backend: file or encrypted-file. The node mints
+    /// the key if absent.
+    #[arg(long, default_value = "file")]
+    new_key_backend: String,
+    /// Path (on the NODE's filesystem) for the new consensus key.
+    #[arg(long)]
+    new_key_path: Option<PathBuf>,
+    /// Env var (on the node) holding the new key's passphrase (encrypted-file).
+    #[arg(long)]
+    new_key_passphrase_env: Option<String>,
+    /// Effective view for the swap. Omit for a safe default; a too-close
+    /// value is rejected by the node.
+    #[arg(long = "v-eff")]
+    v_eff: Option<u64>,
+}
+
+pub(crate) async fn handle_hot_rotate(args: HotRotateArgs) -> anyhow::Result<()> {
+    use boule_node::admin_api::{RotateKeyRequest, RotateKeyResponse};
+
+    let req = RotateKeyRequest {
+        new_key_backend: args.new_key_backend,
+        new_key_path: args.new_key_path,
+        new_key_passphrase_env: args.new_key_passphrase_env,
+        v_eff: args.v_eff,
+    };
+    let url = format!("{}/admin/rotate-key", args.api_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("POST {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("rotate-key request rejected ({status}): {body}");
+    }
+    let receipt: RotateKeyResponse = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("decoding rotate-key response failed: {e}"))?;
+    println!("{}", serde_json::to_string_pretty(&receipt)?);
+    eprintln!(
+        "hot rotation scheduled: validator {} will sign under {} at v_eff {} (node view {})",
+        receipt.validator, receipt.new_pubkey, receipt.v_eff, receipt.current_view,
+    );
+    eprintln!(
+        "the rotation tx has been admitted to the node's mempool; it takes effect once committed \
+         and the boundary at v_eff {} is reached",
+        receipt.v_eff,
+    );
+    Ok(())
 }
 
 #[derive(Args)]
