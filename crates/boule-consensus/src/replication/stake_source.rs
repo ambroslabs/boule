@@ -73,6 +73,19 @@ pub trait StakeSource: Send + Sync {
     /// The default is a no-op for a source without an unbonding period.
     fn advance_to_height(&mut self, _height: Height) {}
 
+    /// Active (weight-bearing) bonded stake of `node_id`, or 0. Reward accrual
+    /// (#659a) reads this to settle a validator at its current stake before a
+    /// stake change. Default 0 for a source that does not expose balances.
+    fn stake_of(&self, _node_id: &NodeId) -> u64 {
+        0
+    }
+
+    /// Total active bonded stake across the set — the denominator for
+    /// stake-proportional reward accrual (#659a). Default 0.
+    fn total_stake(&self) -> u64 {
+        0
+    }
+
     /// Slash `node_id`'s entire bonded stake — the punitive zeroing applied on
     /// committed equivocation evidence (#658b), distinct in intent from a
     /// voluntary [`StakeOp::Unbond`]. Emits a `weight 0` [`ValidatorUpdate`]
@@ -212,6 +225,14 @@ impl StakeSource for BondedStakeLedger {
             queue.retain(|u| u.mature_at > height);
             !queue.is_empty()
         });
+    }
+
+    fn stake_of(&self, node_id: &NodeId) -> u64 {
+        self.stake.get(node_id).copied().unwrap_or(0)
+    }
+
+    fn total_stake(&self) -> u64 {
+        self.stake.values().copied().sum()
     }
 
     fn slash(&mut self, node_id: NodeId) {

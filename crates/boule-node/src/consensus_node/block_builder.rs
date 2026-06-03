@@ -12,6 +12,7 @@ use boule_consensus::hotstuff::step::BlockBuilder;
 use boule_consensus::replication::application::{Application, CommitResult};
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
+use boule_consensus::replication::reward_ledger::{RewardConfig, RewardLedger};
 use boule_consensus::replication::stake_source::StakeSource;
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::{Height, View};
@@ -60,6 +61,11 @@ pub struct MempoolBlockBuilder {
     /// `Box<dyn StakeSource>` so an EVM/Cosmos source (#655) can replace it
     /// without touching the builder. `Mutex` because `commit` is `&self`.
     stake_source: Mutex<Box<dyn StakeSource>>,
+    /// Lazy validator-reward accrual (#659a). Inert unless `reward_config` is
+    /// enabled — rewards are optional, so the default backend rewards nothing.
+    reward_ledger: Mutex<RewardLedger>,
+    /// Reward policy: per-block issuance + proposer bonus. All-zero disables.
+    reward_config: RewardConfig,
 }
 
 impl MempoolBlockBuilder {
@@ -80,7 +86,22 @@ impl MempoolBlockBuilder {
             dropped_commands,
             propose_limit,
             stake_source: Mutex::new(stake_source),
+            reward_ledger: Mutex::new(RewardLedger::new()),
+            reward_config: RewardConfig::default(),
         }
+    }
+
+    /// Enable implicit protocol rewards with `config` (#659a). Off by default.
+    pub fn with_reward_config(mut self, config: RewardConfig) -> Self {
+        self.reward_config = config;
+        self
+    }
+
+    /// Total claimable reward of `node_id` (settled + unsettled), reading the
+    /// validator's current stake from the source. For status / tests.
+    pub fn reward_balance_of(&self, node_id: &NodeId) -> u64 {
+        let stake = self.stake_source.lock().stake_of(node_id);
+        self.reward_ledger.lock().claimable(node_id, stake)
     }
 }
 
@@ -333,13 +354,32 @@ impl Application for MempoolBlockBuilder {
             // Advance the stake clock first so this block's unbondings schedule
             // against the right height and matured ones release (#660).
             stake.advance_to_height(block.header.height);
+            // #659a: accrue this block's reward over the active set + credit the
+            // proposer bonus (O(1); validators settle lazily on staking events).
+            if self.reward_config.is_enabled() {
+                self.reward_ledger.lock().accrue_block(
+                    block.header.proposer,
+                    self.reward_config.issuance_per_block,
+                    self.reward_config.proposer_bonus,
+                    stake.total_stake(),
+                );
+            }
             let mut sm = self.state_machine.lock();
             for cmd in &block.commands {
                 if StakeCommand::is_stake_payload(cmd) {
                     match StakeCommand::decode(cmd) {
                         // Route the stake op into the CL-native source; the
                         // resulting validator-set deltas are drained below.
-                        Ok(c) => stake.apply(c.node_id, c.op),
+                        Ok(c) => {
+                            // Settle the validator's accrued reward at its
+                            // current stake *before* the stake changes (#659a).
+                            if self.reward_config.is_enabled() {
+                                self.reward_ledger
+                                    .lock()
+                                    .settle(c.node_id, stake.stake_of(&c.node_id));
+                            }
+                            stake.apply(c.node_id, c.op);
+                        }
                         Err(e) => tracing::warn!(
                             target: TRACE_TARGET,
                             height = block.header.height.0,
@@ -500,5 +540,45 @@ mod tests {
         // also fails `apply` since it isn't a CounterCommand, which is the
         // pre-existing behaviour).
         assert!(dropped.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// #659a: with rewards enabled, a committed block credits the proposer's
+    /// bonus and accrues issuance stake-proportionally across the active set.
+    #[tokio::test]
+    async fn reward_accrual_credits_proposer_bonus_and_stake_proportional_issuance() {
+        use boule_consensus::replication::reward_ledger::RewardConfig;
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        let v1 = [1u8; 32]; // proposer + staker
+        let v2 = [2u8; 32]; // staker, never proposes here
+        let builder = MempoolBlockBuilder::new(
+            v1,
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(Mutex::new(
+                Box::new(CounterStateMachine::new()) as Box<dyn StateMachine>
+            )),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            64,
+            Box::new(BondedStakeLedger::seeded_from([(v1, 10), (v2, 10)])),
+        )
+        .with_reward_config(RewardConfig {
+            issuance_per_block: 100,
+            proposer_bonus: 5,
+        });
+
+        // One block, proposed by v1 (build stamps proposer = self_id).
+        let genesis = Block::genesis([0; 32], [0; 32]);
+        let qc = QuorumCertificate::new(0, genesis.hash(), 4);
+        let block = builder
+            .build(&genesis, View(1), &qc, &HashMap::new(), 0)
+            .expect("build");
+        assert_eq!(block.header.proposer, v1);
+        builder.commit(&block).await.expect("commit");
+
+        // Issuance 100 over total stake 20 → 50 each by share; v1 also gets the
+        // proposer bonus of 5.
+        assert_eq!(builder.reward_balance_of(&v1), 55);
+        assert_eq!(builder.reward_balance_of(&v2), 50);
     }
 }
