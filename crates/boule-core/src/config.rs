@@ -313,6 +313,18 @@ pub struct ConsensusConfig {
     /// [`ConsensusConfig::resolve_genesis_bls_keys`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validators_bls: Vec<ValidatorBlsEntry>,
+    /// Per-validator **operator-key** declarations (#549).
+    ///
+    /// The operator key is the cold-storage / multi-sig administrative key
+    /// that can rotate a validator's consensus *signing* key without the old
+    /// signing key — the recovery-from-loss path. Optional: a validator that
+    /// declares no operator key here simply cannot use operator-authorised
+    /// actions (it relies on dual-signed signing-key rotation, which needs
+    /// the old key). Each entry's `node_id` must reference a declared
+    /// validator; declared at most once. See
+    /// [`ConsensusConfig::resolve_genesis_operator_keys`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validators_operator_keys: Vec<ValidatorOperatorKeyEntry>,
     /// Number of committed blocks to retain in `kv.redb` below
     /// `last_committed`. Older committed blocks are deleted in the
     /// same atomic batch as each commit. `0` disables pruning entirely
@@ -367,6 +379,26 @@ pub struct ValidatorBlsEntry {
     pub bls_pubkey: String,
     /// 96-byte BLS12-381 PoP signature over `bls_pubkey`, lower-case hex.
     pub bls_pop: String,
+}
+
+/// One row of [`ConsensusConfig::validators_operator_keys`]: a genesis
+/// validator's operator key (#549). Cross-referenced with
+/// [`ConsensusConfig::validators`] by `node_id`.
+///
+/// Both fields are base58-encoded Ed25519 pubkeys (the operator key is an
+/// Ed25519 key like the validator's own NodeId — at high stake it SHOULD be
+/// a multi-sig / threshold key, but the protocol just verifies whatever
+/// Ed25519 signature the operator presents; the multi-sig scheme is an
+/// operator-side choice, #549). Parsed by
+/// [`ConsensusConfig::resolve_genesis_operator_keys`].
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ValidatorOperatorKeyEntry {
+    /// Base58-encoded NodeId of the validator. Must appear in
+    /// [`ConsensusConfig::validators`].
+    pub node_id: String,
+    /// Base58-encoded Ed25519 operator pubkey authorised to administer this
+    /// validator (rotate its signing key, etc.).
+    pub operator_pubkey: String,
 }
 
 impl ConsensusConfig {
@@ -487,6 +519,69 @@ impl ConsensusConfig {
                 Ok(out)
             }
         }
+    }
+
+    /// Parse and structurally validate the `validators_operator_keys` table
+    /// (#549), returning the `(validator_id, operator_pubkey)` pairs ready to
+    /// seed the genesis `OperatorKeyHistory` (in `boule-consensus`).
+    ///
+    /// The table is **optional and scheme-independent** (unlike
+    /// `validators_bls`): a validator may declare no operator key, in which
+    /// case it has no operator-recovery path. Each declared entry must
+    /// reference a validator in `validators` and appear at most once; both
+    /// fields must be valid base58 NodeIds. No cryptographic verification is
+    /// needed at genesis — the operator key is a plain pubkey, only used to
+    /// verify *later* operator-signed actions.
+    pub fn resolve_genesis_operator_keys(&self) -> anyhow::Result<Vec<(NodeId, NodeId)>> {
+        if self.validators_operator_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Resolve the declared validator set once for membership + dup checks.
+        let mut declared: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        for (idx, raw) in self.validators.iter().enumerate() {
+            let nid = base58_to_node_id(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "consensus.validators[{idx}] {raw:?} is not valid base58 NodeId: {e}",
+                )
+            })?;
+            declared.insert(nid);
+        }
+
+        let mut out = Vec::with_capacity(self.validators_operator_keys.len());
+        let mut seen: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        for (idx, entry) in self.validators_operator_keys.iter().enumerate() {
+            let nid = base58_to_node_id(&entry.node_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "consensus.validators_operator_keys[{idx}].node_id {:?} is not valid \
+                     base58 NodeId: {e}",
+                    entry.node_id,
+                )
+            })?;
+            if !declared.contains(&nid) {
+                anyhow::bail!(
+                    "consensus.validators_operator_keys[{idx}].node_id {:?} is not in \
+                     consensus.validators — every operator-key entry must reference a \
+                     declared validator.",
+                    entry.node_id,
+                );
+            }
+            if !seen.insert(nid) {
+                anyhow::bail!(
+                    "consensus.validators_operator_keys[{idx}].node_id {:?} appears more \
+                     than once; declare each validator's operator key at most once.",
+                    entry.node_id,
+                );
+            }
+            let operator_pubkey = base58_to_node_id(&entry.operator_pubkey).map_err(|e| {
+                anyhow::anyhow!(
+                    "consensus.validators_operator_keys[{idx}].operator_pubkey {:?} is not \
+                     valid base58 Ed25519 pubkey: {e}",
+                    entry.operator_pubkey,
+                )
+            })?;
+            out.push((nid, operator_pubkey));
+        }
+        Ok(out)
     }
 
     /// Cryptographically verify the genesis `validators_bls` PoPs
@@ -2741,6 +2836,104 @@ listen_addr = "127.0.0.1:8080"
         // the same chain_id must succeed (#410).
         cons.verify_genesis_bls_pops(&resolved, &ChainId::TEST)
             .expect("PoPs minted under ChainId::TEST must verify under ChainId::TEST");
+    }
+
+    /// #549: a `validators_operator_keys` table resolves to
+    /// `(validator_id, operator_pubkey)` pairs. It is optional and a *subset*
+    /// of validators may declare one.
+    #[test]
+    fn operator_keys_resolve_for_a_subset_of_validators() {
+        let v1 = node_id_to_base58(&[1u8; 32]);
+        let v2 = node_id_to_base58(&[2u8; 32]);
+        let op1 = node_id_to_base58(&[0x11u8; 32]);
+        let op2 = node_id_to_base58(&[0x22u8; 32]);
+        let s = format!(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["{v1}", "{v2}", "{v3}", "{v4}"]
+
+[[consensus.validators_operator_keys]]
+node_id = "{v1}"
+operator_pubkey = "{op1}"
+
+[[consensus.validators_operator_keys]]
+node_id = "{v2}"
+operator_pubkey = "{op2}"
+"#,
+            v3 = node_id_to_base58(&[3u8; 32]),
+            v4 = node_id_to_base58(&[4u8; 32]),
+        );
+        let cons = parse(&s).consensus.expect("consensus");
+        let resolved = cons.resolve_genesis_operator_keys().expect("resolve");
+        assert_eq!(
+            resolved,
+            vec![([1u8; 32], [0x11u8; 32]), ([2u8; 32], [0x22u8; 32])]
+        );
+    }
+
+    /// #549: an absent table resolves to empty (operator keys are optional).
+    #[test]
+    fn operator_keys_absent_resolves_empty() {
+        let v1 = node_id_to_base58(&[1u8; 32]);
+        let s = format!(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["{v1}"]
+"#,
+        );
+        let cons = parse(&s).consensus.expect("consensus");
+        assert!(cons.resolve_genesis_operator_keys().unwrap().is_empty());
+    }
+
+    /// #549: an operator-key entry referencing a non-validator is rejected,
+    /// and so is a duplicate validator entry.
+    #[test]
+    fn operator_keys_reject_unknown_validator_and_duplicates() {
+        let v1 = node_id_to_base58(&[1u8; 32]);
+        let stranger = node_id_to_base58(&[9u8; 32]);
+        let op = node_id_to_base58(&[0x11u8; 32]);
+
+        // Unknown validator.
+        let unknown = format!(
+            "[node]\nlisten_addr = \"127.0.0.1:7000\"\n[api]\nlisten_addr = \"127.0.0.1:8080\"\n\
+             [consensus]\nvalidators = [\"{v1}\"]\n\
+             [[consensus.validators_operator_keys]]\nnode_id = \"{stranger}\"\n\
+             operator_pubkey = \"{op}\"\n",
+        );
+        let err = parse(&unknown)
+            .consensus
+            .unwrap()
+            .resolve_genesis_operator_keys()
+            .unwrap_err();
+        assert!(err.to_string().contains("not in consensus.validators"));
+
+        // Duplicate validator entry.
+        let dup = format!(
+            "[node]\nlisten_addr = \"127.0.0.1:7000\"\n[api]\nlisten_addr = \"127.0.0.1:8080\"\n\
+             [consensus]\nvalidators = [\"{v1}\"]\n\
+             [[consensus.validators_operator_keys]]\nnode_id = \"{v1}\"\n\
+             operator_pubkey = \"{op}\"\n\
+             [[consensus.validators_operator_keys]]\nnode_id = \"{v1}\"\n\
+             operator_pubkey = \"{op}\"\n",
+        );
+        let err = parse(&dup)
+            .consensus
+            .unwrap()
+            .resolve_genesis_operator_keys()
+            .unwrap_err();
+        assert!(err.to_string().contains("more than once"));
     }
 
     /// Audit finding 7-2 (#410): a `validators_bls` table whose PoPs
