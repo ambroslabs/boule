@@ -55,11 +55,13 @@ pub enum MessageKind {
     BlockRangeRequest,
     /// `WireMessage::BlockRangeResponse` — postcard tag 11.
     BlockRangeResponse,
+    /// `WireMessage::EquivocationEvidence` — postcard tag 12 (#657b).
+    EquivocationEvidence,
 }
 
 impl MessageKind {
     /// Every kind, in declaration / postcard-tag order.
-    pub const ALL: [MessageKind; 12] = [
+    pub const ALL: [MessageKind; 13] = [
         MessageKind::Proposal,
         MessageKind::Vote,
         MessageKind::NewView,
@@ -72,6 +74,7 @@ impl MessageKind {
         MessageKind::SnapshotChunkResponse,
         MessageKind::BlockRangeRequest,
         MessageKind::BlockRangeResponse,
+        MessageKind::EquivocationEvidence,
     ];
 
     /// Map a [`WireMessage`](crate::wire::WireMessage)'s first postcard
@@ -92,6 +95,7 @@ impl MessageKind {
             9 => Self::SnapshotChunkResponse,
             10 => Self::BlockRangeRequest,
             11 => Self::BlockRangeResponse,
+            12 => Self::EquivocationEvidence,
             _ => return None,
         })
     }
@@ -120,6 +124,7 @@ impl RateLimitKind for MessageKind {
             Self::SnapshotChunkResponse => "SnapshotChunkResponse",
             Self::BlockRangeRequest => "BlockRangeRequest",
             Self::BlockRangeResponse => "BlockRangeResponse",
+            Self::EquivocationEvidence => "EquivocationEvidence",
         }
     }
 }
@@ -157,6 +162,7 @@ pub fn message_rate_limits(c: &P2pLimitsConfig) -> RateLimitsConfig {
             MessageKind::SnapshotChunkResponse => c.rate.snapshot_chunk_response_per_sec,
             MessageKind::BlockRangeRequest => c.rate.block_range_request_per_sec,
             MessageKind::BlockRangeResponse => c.rate.block_range_response_per_sec,
+            MessageKind::EquivocationEvidence => c.rate.equivocation_evidence_per_sec,
         }),
         bytes_per_sec: c.rate.bytes_per_sec,
         outbound_bytes_per_sec: c.rate.outbound_bytes_per_sec,
@@ -207,6 +213,10 @@ pub fn production_message_rate_limits() -> RateLimitsConfig {
             // without inviting a flood vector.
             MessageKind::BlockRangeRequest => 8.0,
             MessageKind::BlockRangeResponse => 8.0,
+            // Equivocation-evidence gossip (#657b): one proof per
+            // equivocator, so genuine traffic is tiny; 8/s caps a
+            // bogus-proof flood (each costs the receiver a verification).
+            MessageKind::EquivocationEvidence => 8.0,
         }),
         bytes_per_sec: 1024.0 * 1024.0,
         outbound_bytes_per_sec: 1024.0 * 1024.0,
@@ -292,6 +302,30 @@ mod tests {
         let bytes = postcard::to_allocvec(&resp).expect("encode");
         assert_eq!(bytes[0], 11, "BlockRangeResponse must serialize at tag 11");
 
+        let ev = WireMessage::EquivocationEvidence(crate::dispatch::EquivocationProof::DoubleVote(
+            Box::new(Signed {
+                payload: crate::hotstuff::qc::Vote {
+                    view: crate::View(0),
+                    block_hash: [0u8; 32],
+                },
+                signer: [0u8; 32],
+                sig: [0u8; 64],
+            }),
+            Box::new(Signed {
+                payload: crate::hotstuff::qc::Vote {
+                    view: crate::View(0),
+                    block_hash: [1u8; 32],
+                },
+                signer: [0u8; 32],
+                sig: [0u8; 64],
+            }),
+        ));
+        let bytes = postcard::to_allocvec(&ev).expect("encode");
+        assert_eq!(
+            bytes[0], 12,
+            "EquivocationEvidence must serialize at tag 12"
+        );
+
         for (tag, kind) in [
             (0, MessageKind::Proposal),
             (1, MessageKind::Vote),
@@ -305,12 +339,13 @@ mod tests {
             (9, MessageKind::SnapshotChunkResponse),
             (10, MessageKind::BlockRangeRequest),
             (11, MessageKind::BlockRangeResponse),
+            (12, MessageKind::EquivocationEvidence),
         ] {
             assert_eq!(MessageKind::from_wire_tag(tag), Some(kind));
             // index() must equal the postcard tag.
             assert_eq!(kind.index(), tag as usize);
         }
-        assert_eq!(MessageKind::from_wire_tag(12), None);
+        assert_eq!(MessageKind::from_wire_tag(13), None);
         assert_eq!(MessageKind::from_wire_tag(0xFF), None);
     }
 }

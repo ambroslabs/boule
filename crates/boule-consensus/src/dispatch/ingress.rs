@@ -173,6 +173,9 @@ pub fn ingress_wire_with_qc_verification(
         WireMessage::BlockRangeResponse(signed) => {
             ingress_block_range_response(signed, from, key_history, chain_id)
         }
+        WireMessage::EquivocationEvidence(proof) => {
+            ingress_equivocation_evidence(proof, history, key_history, chain_id)
+        }
     }
 }
 
@@ -483,4 +486,25 @@ pub fn ingress_snapshot_chunk_response(
         payload,
         from,
     }]
+}
+
+/// Verify a gossiped [`EquivocationProof`](super::EquivocationProof)
+/// independently (#657b) and, if it is real evidence, emit
+/// [`Dispatch::ReceiveEquivocationEvidence`] carrying the equivocator's stable
+/// id. The proof is self-authenticating, so the relaying peer is not trusted —
+/// only the proof's own envelopes are. Bogus evidence is rejected here so it
+/// never reaches the mempool or a block.
+pub fn ingress_equivocation_evidence(
+    proof: super::EquivocationProof,
+    history: &ValidatorSetHistory,
+    key_history: &ValidatorKeyHistory,
+    chain_id: &ChainId,
+) -> Result<Vec<Dispatch>, IngressError> {
+    match super::verify_equivocation_proof(&proof, history, key_history, chain_id) {
+        Ok(validator_id) => Ok(vec![Dispatch::ReceiveEquivocationEvidence {
+            proof,
+            validator_id,
+        }]),
+        Err(e) => Err(IngressError::InvalidEquivocationEvidence(e)),
+    }
 }

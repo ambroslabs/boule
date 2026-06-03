@@ -81,22 +81,23 @@ impl ConsensusNode {
     /// Pair the two conflicting signed votes the core just flagged into a
     /// verified [`EquivocationProof`]. A no-op if either envelope was not
     /// retained (GC'd, or a 3rd+ fork beyond the cap — the first conflict
-    /// already produced a proof).
+    /// already produced a proof). Returns the proof when it is *freshly*
+    /// minted, so the caller can gossip it (#657b); `None` otherwise.
     pub(super) fn build_vote_equivocation_proof(
         &mut self,
         voter: ValidatorId,
         view: View,
         block_a: BlockHash,
         block_b: BlockHash,
-    ) {
+    ) -> Option<EquivocationProof> {
         let (Some(a), Some(b)) = (
             self.seen_votes.get(&(view, voter, block_a)).cloned(),
             self.seen_votes.get(&(view, voter, block_b)).cloned(),
         ) else {
-            return;
+            return None;
         };
         let proof = EquivocationProof::DoubleVote(Box::new(a), Box::new(b));
-        self.record_equivocation_proof(proof, voter, view, "vote");
+        self.record_equivocation_proof(proof, voter, view, "vote")
     }
 
     /// Proposal-equivocation analogue of [`Self::build_vote_equivocation_proof`].
@@ -106,28 +107,62 @@ impl ConsensusNode {
         view: View,
         block_a: BlockHash,
         block_b: BlockHash,
-    ) {
+    ) -> Option<EquivocationProof> {
         let (Some(a), Some(b)) = (
             self.seen_proposals.get(&(view, leader, block_a)).cloned(),
             self.seen_proposals.get(&(view, leader, block_b)).cloned(),
         ) else {
-            return;
+            return None;
         };
         let proof = EquivocationProof::DoubleProposal(Box::new(a), Box::new(b));
-        self.record_equivocation_proof(proof, leader, view, "proposal");
+        self.record_equivocation_proof(proof, leader, view, "proposal")
     }
 
-    /// Self-verify the built proof and record it (count + WARN). The
-    /// verification is a safety self-check: a proof built from our own
+    /// Mint `proof` into the mempool for block inclusion (#657), at most once
+    /// per equivocator: a Byzantine validator equivocates every view, so
+    /// re-minting a fresh distinct-view proof each view would flood every
+    /// block. Skips too if the equivocator already has committed evidence
+    /// (post-restart the in-memory `evidence_minted` set is empty, but the
+    /// persisted registry still blocks re-minting). Returns `true` iff this
+    /// call freshly minted it. Shared by local detection and the gossip-receive
+    /// path (#657b).
+    pub(super) fn mint_equivocation_evidence(
+        &mut self,
+        proof: &EquivocationProof,
+        who: ValidatorId,
+    ) -> bool {
+        if self.evidence_minted.contains(&who) || self.committed_evidence.contains_key(&who) {
+            return false;
+        }
+        let payload = boule_consensus::equivocation_evidence::encode_evidence(proof);
+        match self.mempool.insert(payload) {
+            Ok(_) => {
+                self.evidence_minted.insert(who);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    error = %e,
+                    "evidence_mempool_insert_failed",
+                );
+                false
+            }
+        }
+    }
+
+    /// Self-verify the built proof, count it, and mint it for block inclusion.
+    /// The verification is a safety self-check: a proof built from our own
     /// retained, ingress-verified envelopes *must* pass the independent
     /// verifier (#656a); if it ever doesn't, that's a bug, not evidence.
+    /// Returns the proof when freshly minted so the caller can gossip it.
     fn record_equivocation_proof(
         &mut self,
         proof: EquivocationProof,
         who: ValidatorId,
         view: View,
         kind: &str,
-    ) {
+    ) -> Option<EquivocationProof> {
         match verify_equivocation_proof(
             &proof,
             &self.validator_history,
@@ -143,31 +178,11 @@ impl ConsensusNode {
                     view = view.0,
                     "consensus_equivocation_proof_built",
                 );
-                // #657: hand the proof to block inclusion by minting it as a
-                // tagged system tx into the mempool, so this node includes it
-                // when it next leads (and the commit-apply path records it).
-                // Mint at most once per equivocator: a Byzantine validator
-                // equivocates every view, so re-minting would flood the
-                // mempool with a fresh distinct-view proof each view. Skip too
-                // if it already has committed evidence (post-restart, the
-                // in-memory `evidence_minted` set is empty but the persisted
-                // registry still blocks re-minting).
-                if !self.evidence_minted.contains(&who)
-                    && !self.committed_evidence.contains_key(&who)
-                {
-                    let payload = boule_consensus::equivocation_evidence::encode_evidence(&proof);
-                    match self.mempool.insert(payload) {
-                        Ok(_) => {
-                            self.evidence_minted.insert(who);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: TRACE_TARGET,
-                                error = %e,
-                                "evidence_mempool_insert_failed",
-                            );
-                        }
-                    }
+                // Hand to block inclusion (and, on a fresh mint, to gossip).
+                if self.mint_equivocation_evidence(&proof, who) {
+                    Some(proof)
+                } else {
+                    None
                 }
             }
             other => {
@@ -178,6 +193,7 @@ impl ConsensusNode {
                     matched = ?other.map(|id| id == who),
                     "consensus_equivocation_proof_self_verify_failed",
                 );
+                None
             }
         }
     }

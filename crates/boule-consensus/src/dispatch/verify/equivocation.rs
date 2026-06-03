@@ -229,6 +229,50 @@ mod tests {
         );
     }
 
+    /// #657b: gossiped evidence that verifies emits a
+    /// `ReceiveEquivocationEvidence` dispatch carrying the equivocator's id.
+    #[test]
+    fn ingress_accepts_gossiped_evidence_and_emits_receive_dispatch() {
+        let s = fresh_signer();
+        let vs = vs_of(&[&s, &fresh_signer()]);
+        let (h, kh) = histories(&vs);
+        let proof = EquivocationProof::DoubleVote(vote(&s, 7, 1), vote(&s, 7, 2));
+        let dispatches =
+            crate::dispatch::ingress_equivocation_evidence(proof.clone(), &h, &kh, &ChainId::TEST)
+                .expect("valid gossiped evidence is accepted");
+        match dispatches.as_slice() {
+            [
+                crate::dispatch::Dispatch::ReceiveEquivocationEvidence {
+                    proof: p,
+                    validator_id,
+                },
+            ] => {
+                assert_eq!(*p, proof);
+                assert_eq!(*validator_id, vid(&s));
+            }
+            other => panic!("expected one ReceiveEquivocationEvidence, got {other:?}"),
+        }
+    }
+
+    /// #657b: bogus gossiped evidence is rejected at ingress (never reaches the
+    /// mempool) with the underlying verification reason.
+    #[test]
+    fn ingress_rejects_bogus_gossiped_evidence() {
+        let s = fresh_signer();
+        let vs = vs_of(&[&s]);
+        let (h, kh) = histories(&vs);
+        // Same block → not a conflict → not real evidence.
+        let proof = EquivocationProof::DoubleVote(vote(&s, 7, 1), vote(&s, 7, 1));
+        let err = crate::dispatch::ingress_equivocation_evidence(proof, &h, &kh, &ChainId::TEST)
+            .expect_err("bogus gossiped evidence is rejected");
+        assert!(matches!(
+            err,
+            crate::dispatch::IngressError::InvalidEquivocationEvidence(
+                EquivocationError::NotConflicting
+            )
+        ));
+    }
+
     #[test]
     fn rejects_same_block_as_not_conflicting() {
         // An honest validator re-sending its own vote must NEVER slash.

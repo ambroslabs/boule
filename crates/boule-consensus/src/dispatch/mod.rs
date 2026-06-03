@@ -62,18 +62,18 @@ pub mod verify;
 
 pub use egress::{
     egress_block_range_request, egress_block_range_response, egress_block_request,
-    egress_block_response, egress_consensus_msg_with_loopback, egress_safety,
-    egress_snapshot_chunk_request, egress_snapshot_chunk_response,
+    egress_block_response, egress_consensus_msg_with_loopback, egress_equivocation_evidence,
+    egress_safety, egress_snapshot_chunk_request, egress_snapshot_chunk_response,
     egress_snapshot_manifest_request, egress_snapshot_manifest_response,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::{ingress, ingress_wire};
 pub use ingress::{
     ingress_block_range_request, ingress_block_range_response, ingress_block_request,
-    ingress_block_response, ingress_new_view, ingress_proposal, ingress_snapshot_chunk_request,
-    ingress_snapshot_chunk_response, ingress_snapshot_manifest_request,
-    ingress_snapshot_manifest_response, ingress_timeout_vote, ingress_vote,
-    ingress_wire_with_qc_verification, ingress_with_qc_verification,
+    ingress_block_response, ingress_equivocation_evidence, ingress_new_view, ingress_proposal,
+    ingress_snapshot_chunk_request, ingress_snapshot_chunk_response,
+    ingress_snapshot_manifest_request, ingress_snapshot_manifest_response, ingress_timeout_vote,
+    ingress_vote, ingress_wire_with_qc_verification, ingress_with_qc_verification,
 };
 pub use verify::equivocation::{EquivocationError, EquivocationProof, verify_equivocation_proof};
 
@@ -207,6 +207,14 @@ pub enum Dispatch {
         blocks: Vec<crate::replication::block::Block>,
         from: NodeId,
     },
+    /// A peer gossiped equivocation evidence (#657b) that already passed
+    /// independent verification at ingress. `validator_id` is the
+    /// slashing-correct stable id the verifier resolved for the equivocator.
+    /// The integration layer mints it into its mempool for block inclusion.
+    ReceiveEquivocationEvidence {
+        proof: EquivocationProof,
+        validator_id: crate::validator_set::ValidatorId,
+    },
 }
 
 // ── Outbound ─────────────────────────────────────────────────────────────────
@@ -274,6 +282,11 @@ pub enum IngressError {
         claimed: [u8; 32],
         actual: [u8; 32],
     },
+    /// A gossiped [`WireMessage::EquivocationEvidence`](crate::wire::WireMessage::EquivocationEvidence)
+    /// did not verify as real evidence (#657b) — not a conflict, a bad
+    /// signature, an unknown/stale signer, or two different validators.
+    /// Rejected at ingress so bogus "evidence" never reaches the mempool.
+    InvalidEquivocationEvidence(EquivocationError),
 }
 
 impl std::fmt::Display for IngressError {
@@ -309,6 +322,9 @@ impl std::fmt::Display for IngressError {
                 hex::encode(claimed),
                 hex::encode(actual),
             ),
+            IngressError::InvalidEquivocationEvidence(e) => {
+                write!(f, "gossiped equivocation evidence did not verify: {e}")
+            }
         }
     }
 }
@@ -318,6 +334,7 @@ impl std::error::Error for IngressError {
         match self {
             IngressError::Decode(e) => Some(e),
             IngressError::InvalidSignature(e) => Some(e.as_ref()),
+            IngressError::InvalidEquivocationEvidence(e) => Some(e),
             IngressError::UnknownSigner(_)
             | IngressError::MalformedHighQc { .. }
             | IngressError::InvalidQcAggregate { .. }

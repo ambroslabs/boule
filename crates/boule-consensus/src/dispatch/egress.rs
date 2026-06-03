@@ -81,6 +81,15 @@ pub fn egress_block_request(hash: BlockHash, to: NodeId) -> Outbound {
     Outbound::SendTo { to, payload }
 }
 
+/// Encode gossiped equivocation evidence (#657b) as a `Broadcast` frame. The
+/// proof is self-authenticating, so nothing is signed here — the receiver
+/// re-verifies the proof itself at ingress.
+pub fn egress_equivocation_evidence(proof: super::EquivocationProof) -> Outbound {
+    let wire = WireMessage::EquivocationEvidence(proof);
+    let payload = codec::encode(&wire).expect("EquivocationEvidence encoding must not fail");
+    Outbound::Broadcast(payload)
+}
+
 /// Encode a [`BlockResponse`] as a `SendTo` outbound frame, signing
 /// the payload so a wrong-hash response is non-repudiable evidence
 /// (#434).
@@ -360,7 +369,8 @@ pub fn egress_consensus_msg_with_loopback(
         | WireMessage::SnapshotChunkRequest { .. }
         | WireMessage::SnapshotChunkResponse { .. }
         | WireMessage::BlockRangeRequest { .. }
-        | WireMessage::BlockRangeResponse(_) => {
+        | WireMessage::BlockRangeResponse(_)
+        | WireMessage::EquivocationEvidence(_) => {
             unreachable!("sign_consensus_msg always produces Proposal/Vote/NewView wire variants")
         }
     };

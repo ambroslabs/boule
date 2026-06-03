@@ -500,6 +500,17 @@ impl ConsensusNode {
                 )
                 .await?;
             }
+            Dispatch::ReceiveEquivocationEvidence {
+                proof,
+                validator_id,
+            } => {
+                // Gossip already verified the proof at ingress (#657b). Mint it
+                // into our mempool for block inclusion — guarded so a flood of
+                // copies, or evidence for an already-handled equivocator, is a
+                // no-op. The gossip overlay handles re-fanout, so we don't
+                // re-broadcast here.
+                self.mint_equivocation_evidence(&proof, validator_id);
+            }
         }
         Ok(())
     }
@@ -1162,8 +1173,21 @@ impl ConsensusNode {
                         "consensus_equivocation_detected",
                     );
                     // Pair the two conflicting signed votes we retained into a
-                    // non-repudiable, independently-verified proof (#656b).
-                    self.build_vote_equivocation_proof(voter, view, block_a, block_b);
+                    // non-repudiable, independently-verified proof (#656b), and
+                    // gossip it to peers (#657b) so a leader that did not
+                    // observe the equivocation can still include it in a block.
+                    if let Some(proof) =
+                        self.build_vote_equivocation_proof(voter, view, block_a, block_b)
+                    {
+                        let out = dispatch::egress_equivocation_evidence(proof);
+                        send_outbound(
+                            broadcaster,
+                            self.rate_limiter.as_deref(),
+                            &self.peers_connected,
+                            out,
+                        )
+                        .await;
+                    }
                 }
 
                 SafetyAction::ProposalEquivocationEvidence {
@@ -1189,7 +1213,18 @@ impl ConsensusNode {
                         block_b = ?block_b,
                         "consensus_proposal_equivocation_detected",
                     );
-                    self.build_proposal_equivocation_proof(leader, view, block_a, block_b);
+                    if let Some(proof) =
+                        self.build_proposal_equivocation_proof(leader, view, block_a, block_b)
+                    {
+                        let out = dispatch::egress_equivocation_evidence(proof);
+                        send_outbound(
+                            broadcaster,
+                            self.rate_limiter.as_deref(),
+                            &self.peers_connected,
+                            out,
+                        )
+                        .await;
+                    }
                 }
 
                 SafetyAction::BuildProposal {

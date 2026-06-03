@@ -895,6 +895,12 @@ pub struct P2pRateLimitsConfig {
     /// Steady-state inbound rate of `BlockRangeResponse` frames (#514).
     #[serde(default = "default_block_range_response_per_sec")]
     pub block_range_response_per_sec: f64,
+    /// Steady-state inbound rate of `EquivocationEvidence` gossip frames
+    /// (#657b). Evidence is rare (one proof per equivocator), so a low
+    /// ceiling both fits honest traffic and blunts a flood of bogus
+    /// proofs — each costs the receiver a verification.
+    #[serde(default = "default_equivocation_evidence_per_sec")]
+    pub equivocation_evidence_per_sec: f64,
     #[serde(default = "default_bytes_per_sec")]
     pub bytes_per_sec: f64,
     /// Per-peer outbound wire-bytes/sec ceiling (#553). Symmetric to
@@ -926,6 +932,7 @@ impl Default for P2pRateLimitsConfig {
             snapshot_chunk_response_per_sec: default_snapshot_chunk_response_per_sec(),
             block_range_request_per_sec: default_block_range_request_per_sec(),
             block_range_response_per_sec: default_block_range_response_per_sec(),
+            equivocation_evidence_per_sec: default_equivocation_evidence_per_sec(),
             bytes_per_sec: default_bytes_per_sec(),
             outbound_bytes_per_sec: default_outbound_bytes_per_sec(),
             burst_seconds: default_burst_seconds(),
@@ -997,6 +1004,9 @@ fn default_block_range_request_per_sec() -> f64 {
     8.0
 }
 fn default_block_range_response_per_sec() -> f64 {
+    8.0
+}
+fn default_equivocation_evidence_per_sec() -> f64 {
     8.0
 }
 fn default_bytes_per_sec() -> f64 {

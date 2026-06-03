@@ -206,6 +206,15 @@ pub enum WireMessage {
     /// non-repudiable evidence for slashing — same discipline as
     /// [`BlockResponsePayload`].
     BlockRangeResponse(Signed<BlockRangeResponsePayload>),
+    /// Gossip of equivocation evidence (#657b): a self-authenticating
+    /// [`EquivocationProof`](crate::dispatch::EquivocationProof) — two
+    /// conflicting signed messages from one validator at one view. Carries no
+    /// outer signature: the proof's own envelopes are the authentication, and
+    /// the receiver re-verifies via
+    /// [`verify_equivocation_proof`](crate::dispatch::verify_equivocation_proof)
+    /// independent of which peer relayed it. Lets a detector that is not the
+    /// current leader still get its evidence to one, for block inclusion.
+    EquivocationEvidence(crate::dispatch::EquivocationProof),
 }
 
 /// Serde adapter for `Option<BlsPartialSig>` — a 96-byte fixed array that
