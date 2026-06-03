@@ -7193,6 +7193,115 @@ mod tests {
         );
     }
 
+    /// #548: a reconfig that adds a validator carrying an `operator_pubkey`
+    /// commits AND applies only when accompanied by a valid inbound-consent
+    /// signature under the cluster's real chain_id. This drives the consent
+    /// verifier through the full cluster propose → vote → commit → apply
+    /// pipeline, not just the unit-level path.
+    ///
+    /// The observable proof of *application* (vs. mere inclusion) is the
+    /// header `validator_history_commitment`: it folds in the new boundary
+    /// the instant the reconfig applies, so it changes across the run. A
+    /// dropped reconfig (e.g. a consent signed under the wrong chain_id —
+    /// the #312 pitfall) would commit the payload but leave the commitment
+    /// constant. The new validator is seated but not spawned; the 4 present
+    /// of 5 still clear weighted quorum (3·4 > 2·5), so the cluster stays
+    /// live across the boundary.
+    #[tokio::test]
+    async fn cluster_commits_consented_validator_add_and_applies_it() {
+        use boule_consensus::View;
+        use boule_consensus::reconfig::{ReconfigCommand, ValidatorEntry};
+        use boule_consensus::reconfig_consent::ReconfigAddConsent;
+        use boule_core::crypto::signed::{ChainId, Signer};
+
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(3), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 2
+            })
+            .await;
+        assert!(warmed, "cluster failed to commit warm-up blocks");
+
+        // The validator being admitted (seated, not spawned) plus its
+        // cold-storage operator key. Both are fresh keypairs; the operator
+        // signs the inbound consent over the exact add terms.
+        let joiner = fresh_signer();
+        let operator = fresh_signer();
+        let v_eff: View = View(60);
+
+        // The cluster verifies the consent under its genesis-derived
+        // chain_id, NOT ChainId::TEST — signing under the wrong one makes
+        // the consent fail at apply and the reconfig is silently dropped
+        // (the #312 chain_id pitfall, now guarded by the assertion below).
+        let chain_id = ChainId::from_genesis_hash(cluster.genesis.hash());
+        let mut entry = ValidatorEntry {
+            node_id: joiner.node_id(),
+            addr: "127.0.0.1:9100".parse().unwrap(),
+            bls_pop: None,
+            weight: 1,
+            operator_pubkey: Some(operator.node_id()),
+            consent_sig: None,
+        };
+        let consent = ReconfigAddConsent::for_entry(&entry, v_eff).unwrap();
+        entry.consent_sig = Some(consent.sign(&operator, &chain_id).unwrap());
+
+        let payload = ReconfigCommand {
+            adds: vec![entry],
+            removes: vec![],
+            changes: vec![],
+            v_eff,
+        }
+        .encode();
+        for mp in &cluster.mempools {
+            let _ = mp.insert(payload.clone());
+        }
+
+        let crossed = cluster
+            .advance_and_yield_until(Duration::from_secs(10), |c| {
+                c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= v_eff.0 + 5
+            })
+            .await;
+        assert!(
+            crossed,
+            "cluster failed to commit past v_eff = {v_eff} within budget",
+        );
+
+        let committed = cluster.drain_commits();
+        assert_no_conflicts(&committed);
+
+        let reconfig_committed = committed.iter().any(|node_blocks| {
+            node_blocks.iter().any(|b| {
+                b.commands
+                    .iter()
+                    .any(|cmd| ReconfigCommand::is_reconfig_payload(cmd))
+            })
+        });
+        assert!(
+            reconfig_committed,
+            "expected the consented add to ride into a committed block",
+        );
+
+        // The application signal: the validator-history commitment folds in
+        // the new boundary the moment the reconfig applies, so it must take
+        // at least two distinct values across the run. If the consent had
+        // failed verification, the reconfig would be dropped at apply and
+        // the commitment would never move.
+        let mut commitments = std::collections::BTreeSet::new();
+        for node_blocks in &committed {
+            for b in node_blocks {
+                commitments.insert(b.header.validator_history_commitment);
+            }
+        }
+        assert!(
+            commitments.len() >= 2,
+            "validator_history_commitment never changed — the consented add \
+             committed but was not applied (consent verification failed at apply)",
+        );
+    }
+
     // ── #260: validator key rotation end-to-end ───────────────────────────
 
     /// 4-node cluster commits a [`DualSignedRotation`] for one of its

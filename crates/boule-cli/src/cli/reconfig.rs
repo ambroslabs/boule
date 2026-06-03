@@ -102,6 +102,12 @@ pub(crate) fn handle_add(args: ReconfigAddArgs) -> anyhow::Result<()> {
         args.bls_pop_file.as_deref(),
         args.bls_key_file.as_deref(),
         operator_pubkey,
+        // #548: inbound-consent signing from the CLI lands in a follow-up
+        // (a `reconfig consent-sign` subcommand + `--consent-sig` flag). For
+        // now an add naming an operator key must have its consent signature
+        // supplied programmatically; the commit-time verifier rejects an
+        // operator-keyed add with no valid consent.
+        None,
     )?;
     println!("{}", hex::encode(&payload));
     Ok(())
