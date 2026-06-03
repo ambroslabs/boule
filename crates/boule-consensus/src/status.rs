@@ -70,6 +70,17 @@ pub struct VoteBucketStatus {
     pub block_hash: String,
     pub signers: usize,
     pub quorum: usize,
+    /// Total voting weight of the signers so far (#473). On a uniformly
+    /// weighted chain this equals `signers`; on a stake-weighted chain it is
+    /// what the quorum predicate (`3*signer_weight > 2*total_weight`) actually
+    /// tallies, which the signer *count* can misrepresent.
+    #[serde(default)]
+    pub signer_weight: u128,
+    /// Voting weight needed to seal the QC — `floor(2*total_weight/3) + 1`
+    /// for the set authoritative at `view` (#473). The weighted analogue of
+    /// `quorum`; equals `quorum` at uniform weight.
+    #[serde(default)]
+    pub quorum_weight: u128,
 }
 
 /// Partial timeout certificate. Same "signers / quorum" shape as
@@ -80,6 +91,14 @@ pub struct TimeoutBucketStatus {
     pub view: View,
     pub signers: usize,
     pub quorum: usize,
+    /// Total voting weight of the timeout signers so far (#473) — see
+    /// [`VoteBucketStatus::signer_weight`].
+    #[serde(default)]
+    pub signer_weight: u128,
+    /// Voting weight needed to form the timeout certificate at `view` (#473)
+    /// — see [`VoteBucketStatus::quorum_weight`].
+    #[serde(default)]
+    pub quorum_weight: u128,
 }
 
 /// A proposal the safety core is holding onto while it waits for the
@@ -369,11 +388,15 @@ mod tests {
                 block_hash: "cc".repeat(32),
                 signers: 2,
                 quorum: 3,
+                signer_weight: 5,
+                quorum_weight: 7,
             }],
             timeout_buckets: vec![TimeoutBucketStatus {
                 view: View(159),
                 signers: 1,
                 quorum: 3,
+                signer_weight: 2,
+                quorum_weight: 7,
             }],
             parked_proposals: vec![ParkedProposalStatus {
                 block_hash: "dd".repeat(32),
