@@ -4,7 +4,10 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
 
-use boule_consensus::validator_rotation::{RotationProposeRequest, build_rotation_envelope};
+use boule_consensus::validator_rotation::{
+    OperatorRecoveryRequest, RotationProposeRequest, build_operator_recovery_envelope,
+    build_rotation_envelope,
+};
 use boule_core::identity::node_id_to_base58;
 
 use super::shared::resolve_config_path;
@@ -13,6 +16,10 @@ use super::shared::resolve_config_path;
 pub(crate) enum RotationCmd {
     /// Build a validator key-rotation payload, minting the new key(s).
     Propose(RotationProposeArgs),
+    /// Build an operator-signed signing-key recovery payload (#549): rotate a
+    /// validator's signing key authorised by its operator key, without the old
+    /// signing key — the recovery-from-loss path for a destroyed signing key.
+    ProposeOperatorRecovery(OperatorRecoveryArgs),
 }
 
 #[derive(Args)]
@@ -63,6 +70,75 @@ pub(crate) fn handle_propose(args: RotationProposeArgs) -> anyhow::Result<()> {
     eprintln!(
         "submit the hex above into a validator's mempool to propose the rotation \
          (no admin RPC yet; route is operator-specific)"
+    );
+    Ok(())
+}
+
+#[derive(Args)]
+pub(crate) struct OperatorRecoveryArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
+    config_path: Option<PathBuf>,
+    /// Base58 stable id of the validator being recovered (the signing key is
+    /// presumed lost, so it can't identify the validator itself).
+    #[arg(long)]
+    validator: String,
+    /// Operator key backend: file or encrypted-file. Must already exist.
+    #[arg(long)]
+    operator_key_backend: String,
+    /// Path to the operator key.
+    #[arg(long)]
+    operator_key_path: Option<PathBuf>,
+    /// Env var holding the operator key's passphrase (encrypted-file).
+    #[arg(long)]
+    operator_key_passphrase_env: Option<String>,
+    /// New consensus signing key backend: file or encrypted-file (minted).
+    #[arg(long)]
+    new_key_backend: String,
+    /// Path for the new consensus signing key.
+    #[arg(long)]
+    new_key_path: Option<PathBuf>,
+    /// Env var holding the new key's passphrase (encrypted-file).
+    #[arg(long)]
+    new_key_passphrase_env: Option<String>,
+    /// New BLS key backend (BLS chains; only `file` today).
+    #[arg(long)]
+    new_bls_key_backend: Option<String>,
+    /// Path for the new BLS key (BLS chains).
+    #[arg(long)]
+    new_bls_key_path: Option<PathBuf>,
+    /// View at and after which the recovery rotation takes effect.
+    #[arg(long = "v-eff")]
+    v_eff: u64,
+}
+
+pub(crate) fn handle_propose_operator_recovery(args: OperatorRecoveryArgs) -> anyhow::Result<()> {
+    let req = OperatorRecoveryRequest {
+        config_path: Some(resolve_config_path(args.config_path)?),
+        validator: Some(args.validator),
+        operator_key_backend: Some(args.operator_key_backend),
+        operator_key_path: args.operator_key_path,
+        operator_key_passphrase_env: args.operator_key_passphrase_env,
+        new_key_backend: Some(args.new_key_backend),
+        new_key_path: args.new_key_path,
+        new_key_passphrase_env: args.new_key_passphrase_env,
+        new_bls_key_backend: args.new_bls_key_backend,
+        new_bls_key_path: args.new_bls_key_path,
+        v_eff: Some(args.v_eff),
+    };
+    let outcome = build_operator_recovery_envelope(&req)?;
+    let bytes = outcome.envelope.encode_command();
+    println!("{}", hex::encode(&bytes));
+    eprintln!(
+        "operator-recovery built: validator={} new_pubkey={} v_eff={} bls_chain={}",
+        node_id_to_base58(&outcome.envelope.payload.validator),
+        node_id_to_base58(&outcome.envelope.payload.new_pubkey),
+        outcome.envelope.payload.v_eff.0,
+        outcome.bls_chain,
+    );
+    eprintln!(
+        "submit the hex above into a validator's mempool; it is authorised by the operator \
+         key and needs no old signing key (no admin RPC yet; route is operator-specific)"
     );
     Ok(())
 }
@@ -148,6 +224,134 @@ mod tests {
             pop = validator_bls_pop_hex,
         );
         std::fs::write(config_path, text).unwrap();
+    }
+
+    /// #549: end-to-end operator-recovery — a validator whose signing key is
+    /// "lost" recovers via its operator key. The minted envelope verifies
+    /// under the operator pubkey (not the old signing key) and the chain_id.
+    #[test]
+    fn operator_recovery_ed25519_builds_envelope_verifiable_under_operator_key() {
+        use boule_consensus::validator_rotation::{
+            OperatorRecoveryRequest, OperatorSignedRotation, build_operator_recovery_envelope,
+        };
+        use boule_core::crypto::signed::{NodeSigner, Signer as _};
+        use boule_core::identity::base58_to_node_id;
+
+        let dir = TempDir::new().unwrap();
+        // The validator's signing key (its base58 == stable id) and the
+        // operator key are both minted to disk.
+        let validator_key = dir.path().join("validator.key");
+        let validator_b58 = mint_validator_key(&validator_key);
+        let operator_key = dir.path().join("operator.key");
+        let operator_b58 = mint_validator_key(&operator_key);
+
+        // Config declares the operator key for the validator.
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[node]\n\
+                 listen_addr = \"127.0.0.1:7000\"\n\n\
+                 [node.identity]\n\
+                 backend = \"file\"\n\
+                 path = \"{vk}\"\n\n\
+                 [api]\n\
+                 listen_addr = \"127.0.0.1:8000\"\n\n\
+                 [consensus]\n\
+                 validators = [\"{val}\"]\n\
+                 signature_scheme = \"ed25519_collected\"\n\n\
+                 [[consensus.validators_operator_keys]]\n\
+                 node_id = \"{val}\"\n\
+                 operator_pubkey = \"{op}\"\n",
+                vk = validator_key.display(),
+                val = validator_b58,
+                op = operator_b58,
+            ),
+        )
+        .unwrap();
+
+        let new_key = dir.path().join("new.key");
+        let req = OperatorRecoveryRequest {
+            config_path: Some(config_path.clone()),
+            validator: Some(validator_b58.clone()),
+            operator_key_backend: Some("file".into()),
+            operator_key_path: Some(operator_key.clone()),
+            operator_key_passphrase_env: None,
+            new_key_backend: Some("file".into()),
+            new_key_path: Some(new_key.clone()),
+            new_key_passphrase_env: None,
+            new_bls_key_backend: None,
+            new_bls_key_path: None,
+            v_eff: Some(500),
+        };
+        let outcome = build_operator_recovery_envelope(&req).expect("recovery must succeed");
+        assert!(!outcome.bls_chain);
+        assert!(new_key.exists(), "new signing key must be minted");
+
+        let new_id =
+            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
+                path: new_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
+        let new_signer = NodeSigner::from_identity(&new_id).unwrap();
+        let validator_nid = base58_to_node_id(&validator_b58).unwrap();
+        let operator_nid = base58_to_node_id(&operator_b58).unwrap();
+        assert_eq!(outcome.envelope.payload.validator, validator_nid);
+        assert_eq!(outcome.envelope.payload.new_pubkey, new_signer.node_id());
+        assert_eq!(outcome.envelope.payload.v_eff.0, 500);
+
+        let cfg = boule_core::config::load(&config_path).unwrap();
+        let chain_id =
+            boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        // Verifies under the OPERATOR key — the authority — not the old key.
+        outcome
+            .envelope
+            .verify(&operator_nid, &chain_id)
+            .expect("envelope must verify under the operator key");
+
+        let bytes = outcome.envelope.encode_command();
+        assert!(OperatorSignedRotation::is_operator_rotation_payload(&bytes));
+    }
+
+    /// #549: recovery requires the operator key to actually exist — it is the
+    /// authority, never minted by the command. A missing operator key errors
+    /// (and does not mint the new key behind it).
+    #[test]
+    fn operator_recovery_errors_when_operator_key_missing() {
+        use boule_consensus::validator_rotation::{
+            OperatorRecoveryRequest, build_operator_recovery_envelope,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let validator_key = dir.path().join("validator.key");
+        let validator_b58 = mint_validator_key(&validator_key);
+        let config_path = dir.path().join("config.toml");
+        write_ed25519_chain_config(&config_path, &validator_key, &validator_b58);
+
+        let missing_operator = dir.path().join("nope-operator.key");
+        let new_key = dir.path().join("new.key");
+        let req = OperatorRecoveryRequest {
+            config_path: Some(config_path),
+            validator: Some(validator_b58),
+            operator_key_backend: Some("file".into()),
+            operator_key_path: Some(missing_operator),
+            operator_key_passphrase_env: None,
+            new_key_backend: Some("file".into()),
+            new_key_path: Some(new_key.clone()),
+            new_key_passphrase_env: None,
+            new_bls_key_backend: None,
+            new_bls_key_path: None,
+            v_eff: Some(500),
+        };
+        let err = build_operator_recovery_envelope(&req).unwrap_err();
+        assert!(
+            err.to_string().contains("operator key"),
+            "unexpected error: {err}",
+        );
     }
 
     #[test]
