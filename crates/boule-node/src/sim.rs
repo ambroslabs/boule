@@ -60,7 +60,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use tokio::sync::{mpsc, oneshot};
@@ -631,14 +631,14 @@ pub struct SimCluster {
     /// tasks. `kill_node` uses this map to dispatch `PeerDisconnected`
     /// to every survivor at kill time.
     ///
-    /// The outer `Arc<HashMap<…>>` is read-only — keys never change
-    /// once the cluster is built — but each value is wrapped in a
-    /// [`parking_lot::Mutex`] so [`SimCluster::restart_node_with_recover`]
-    /// can hot-swap a single node's `Sender` while the surviving
-    /// route tasks (which captured the same outer Arc at spawn time)
-    /// pick the new sender up on their next frame. Lock contention is
-    /// trivial under the sim's `current_thread + start_paused` model.
-    event_txs: Arc<HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>>>,
+    /// An `Arc<RwLock<HashMap<…>>>` shared with every route task. The map is
+    /// mutated under the write lock to hot-swap a single node's `Sender`
+    /// ([`SimCluster::restart_node_with_recover`]) or to insert a freshly
+    /// tail-spawned validator (#284); route tasks snapshot it under a brief
+    /// read lock per frame, so the change is picked up on their next frame.
+    /// Lock contention is trivial under the sim's `current_thread +
+    /// start_paused` model.
+    event_txs: Arc<RwLock<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>>,
     /// Per-node fire-once crashpoint slots, in `node_ids` order. The
     /// sim hands a clone of each slot into the consensus task's
     /// `CRASH_SLOT.scope(...)`; `arm_crashpoint(idx, name)` arms the
@@ -1201,15 +1201,15 @@ impl SimCluster {
         // single node's `Sender` while the surviving route tasks (which
         // captured the same outer Arc at spawn time) pick the new
         // sender up on their next frame.
-        let mut event_txs: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> = HashMap::new();
+        let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
         let mut event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
         for v in vs.iter() {
             let nid = v.into_node_id();
             let (tx, rx) = mpsc::channel(1024);
-            event_txs.insert(nid, Mutex::new(tx));
+            event_txs.insert(nid, tx);
             event_rxs.push((nid, rx));
         }
-        let event_txs = Arc::new(event_txs);
+        let event_txs = Arc::new(RwLock::new(event_txs));
 
         // Per-node runtime-mutable processing delay in microseconds
         // (#497). Each node has an `Arc<AtomicU64>` keyed by `NodeId`
@@ -1634,10 +1634,9 @@ impl SimCluster {
             if nid == killed {
                 continue;
             }
-            let Some(event_tx_slot) = self.event_txs.get(&nid) else {
+            let Some(event_tx) = self.event_txs.read().get(&nid).cloned() else {
                 continue;
             };
-            let event_tx = event_tx_slot.lock().clone();
             if event_tx
                 .try_send(ProtocolEvent::PeerDisconnected { node_id: killed })
                 .is_err()
@@ -1846,10 +1845,8 @@ impl SimCluster {
         }
         drained.sort_by_key(|t| (t.0, t.1));
         for (from, to, payload) in drained {
-            if let Some(slot) = self.event_txs.get(&to) {
-                let _ = slot
-                    .lock()
-                    .try_send(ProtocolEvent::Message { from, payload });
+            if let Some(tx) = self.event_txs.read().get(&to).cloned() {
+                let _ = tx.try_send(ProtocolEvent::Message { from, payload });
             }
         }
     }
@@ -2073,14 +2070,14 @@ impl SimCluster {
         self.controls.drop_predicates.lock().clear();
         self.controls.reorder.lock().clear();
 
-        let mut new_event_txs: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> = HashMap::new();
+        let mut new_event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
         let mut new_event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
         for &nid in &self.node_ids {
             let (tx, rx) = mpsc::channel::<ProtocolEvent>(1024);
-            new_event_txs.insert(nid, Mutex::new(tx));
+            new_event_txs.insert(nid, tx);
             new_event_rxs.push((nid, rx));
         }
-        let new_event_txs = Arc::new(new_event_txs);
+        let new_event_txs = Arc::new(RwLock::new(new_event_txs));
         // Replace the public-facing event_txs handle so any test that
         // dispatches via it after the restart hits the live nodes,
         // not the dead ones.
@@ -2343,9 +2340,7 @@ impl SimCluster {
         // tasks (which captured the same outer Arc) deliver into the
         // reborn node's mailbox on their next frame.
         let (new_event_tx, event_rx) = mpsc::channel::<ProtocolEvent>(1024);
-        if let Some(slot) = self.event_txs.get(&nid) {
-            *slot.lock() = new_event_tx;
-        }
+        self.event_txs.write().insert(nid, new_event_tx);
 
         // Step 4: build the reborn node and wire its outbound channel
         // through a fresh route task.
@@ -2557,7 +2552,7 @@ fn spawn_event_bridge(
 fn spawn_route_task(
     my_id: NodeId,
     mut send_rx: mpsc::Receiver<ProtocolOutbound>,
-    route_txs: Arc<HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>>>,
+    route_txs: Arc<RwLock<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>>,
     partitioned: Arc<Mutex<HashSet<NodeId>>>,
     link_cuts: Arc<Mutex<HashSet<LinkCut>>>,
     partition_blocks: Arc<Mutex<HashSet<LinkCut>>>,
@@ -2603,11 +2598,17 @@ fn spawn_route_task(
                 None => vec![outbound],
             };
 
+            // Snapshot the routing table under a brief read lock (senders
+            // are cheap Arc-backed clones), so the async sends below never
+            // hold the lock — and so a validator tail-spawned into the
+            // running cluster (#284) is picked up on the next frame.
+            let route_snapshot: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> =
+                route_txs.read().clone();
             for outbound in frames {
                 route_one_frame(
                     my_id,
                     outbound,
-                    &route_txs,
+                    &route_snapshot,
                     &partitioned,
                     &link_cuts,
                     &partition_blocks,
@@ -2630,7 +2631,7 @@ fn spawn_route_task(
 async fn route_one_frame(
     my_id: NodeId,
     outbound: ProtocolOutbound,
-    route_txs: &HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>>,
+    route_txs: &HashMap<NodeId, mpsc::Sender<ProtocolEvent>>,
     partitioned: &Mutex<HashSet<NodeId>>,
     link_cuts: &Mutex<HashSet<LinkCut>>,
     partition_blocks: &Mutex<HashSet<LinkCut>>,
@@ -2736,7 +2737,7 @@ async fn deliver_one(
     target: NodeId,
     payload: &Bytes,
     decoded: &Option<SimMessage>,
-    tx_slot: &Mutex<mpsc::Sender<ProtocolEvent>>,
+    tx: &mpsc::Sender<ProtocolEvent>,
     controls: &SelectiveControls,
     drop_active: bool,
     reorder_active: bool,
@@ -2768,11 +2769,9 @@ async fn deliver_one(
     };
 
     if let Some(payload) = to_send {
-        // Clone the sender out of the per-entry mutex so we never hold
-        // the lock across the async send. The
-        // `restart_node_with_recover` path swaps the inner sender;
-        // subsequent frames re-clone the new one.
-        let tx = tx_slot.lock().clone();
+        // `tx` is a sender cloned out of the routing snapshot the caller
+        // took under a brief read lock (see `spawn_route_task`), so no
+        // [`parking_lot`] guard is held across this async send.
         let _ = tx
             .send(ProtocolEvent::Message {
                 from: my_id,
@@ -2938,15 +2937,15 @@ impl SimCluster {
 
         // Per-node raw event channels — sim's route tasks deliver
         // `ProtocolEvent`s to the orchestrator's input here.
-        let mut event_txs: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> = HashMap::new();
+        let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
         let mut event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
         for v in vs.iter() {
             let nid = v.into_node_id();
             let (tx, rx) = mpsc::channel(1024);
-            event_txs.insert(nid, Mutex::new(tx));
+            event_txs.insert(nid, tx);
             event_rxs.push((nid, rx));
         }
-        let event_txs = Arc::new(event_txs);
+        let event_txs = Arc::new(RwLock::new(event_txs));
 
         // Resolve sorted-index ordering so we can map NodeId → topology
         // index. ValidatorSet sorts ascending; circulant_neighbors uses
@@ -3116,7 +3115,7 @@ impl SimCluster {
         // edges.
         for (i, neighbours) in topology.iter().enumerate() {
             let nid_i = node_ids[i];
-            let event_tx_i = event_txs[&nid_i].lock().clone();
+            let event_tx_i = event_txs.read()[&nid_i].clone();
             for &j in neighbours {
                 let nid_j = node_ids[j];
                 if event_tx_i
@@ -3252,7 +3251,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use parking_lot::Mutex;
+    use parking_lot::{Mutex, RwLock};
     use tokio::sync::mpsc;
     use tokio::task::yield_now;
 
@@ -3324,7 +3323,7 @@ mod tests {
         node_ids: Vec<NodeId>,
         send_txs: Vec<mpsc::Sender<ProtocolOutbound>>,
         event_rxs: Vec<mpsc::Receiver<ProtocolEvent>>,
-        event_txs: Arc<HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>>>,
+        event_txs: Arc<RwLock<HashMap<NodeId, mpsc::Sender<ProtocolEvent>>>>,
         dead_nodes: Arc<Mutex<HashSet<NodeId>>>,
         #[allow(dead_code)]
         partitioned: Arc<Mutex<HashSet<NodeId>>>,
@@ -3351,15 +3350,14 @@ mod tests {
             let partition_blocks = Arc::new(Mutex::new(HashSet::new()));
             let dead_nodes = Arc::new(Mutex::new(HashSet::new()));
 
-            let mut event_tx_map: HashMap<NodeId, Mutex<mpsc::Sender<ProtocolEvent>>> =
-                HashMap::new();
+            let mut event_tx_map: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
             let mut event_rxs: Vec<mpsc::Receiver<ProtocolEvent>> = Vec::new();
             for &nid in &node_ids {
                 let (tx, rx) = mpsc::channel(1024);
-                event_tx_map.insert(nid, Mutex::new(tx));
+                event_tx_map.insert(nid, tx);
                 event_rxs.push(rx);
             }
-            let event_txs = Arc::new(event_tx_map);
+            let event_txs = Arc::new(RwLock::new(event_tx_map));
 
             let mut send_txs = Vec::new();
             // BareRouting only exercises route-task plumbing (kill,
@@ -3411,8 +3409,7 @@ mod tests {
                 if nid == killed {
                     continue;
                 }
-                if let Some(event_tx_slot) = self.event_txs.get(&nid) {
-                    let event_tx = event_tx_slot.lock().clone();
+                if let Some(event_tx) = self.event_txs.read().get(&nid).cloned() {
                     let _ = event_tx.try_send(ProtocolEvent::PeerDisconnected { node_id: killed });
                 }
             }
@@ -6885,9 +6882,9 @@ mod tests {
 
         let event_tx = cluster
             .event_txs
+            .read()
             .get(&target_node)
             .expect("target_idx must have an event_tx slot")
-            .lock()
             .clone();
 
         const FLOOD_COUNT: usize = 64;
@@ -7030,9 +7027,9 @@ mod tests {
 
         let event_tx = cluster
             .event_txs
+            .read()
             .get(&target_node)
             .expect("target_idx must have an event_tx slot")
-            .lock()
             .clone();
 
         const FLOOD_COUNT: usize = 32;
