@@ -8,6 +8,7 @@
 pub mod consensus_node;
 pub mod demo_staking;
 pub mod rotatable_signer;
+pub mod rotation_handle;
 pub mod testnet;
 
 #[cfg(test)]
@@ -318,6 +319,12 @@ struct RunningConsensus {
     /// /mempool/submit` can admit transactions into the same pool the
     /// block builder draws from.
     mempool: Arc<dyn Mempool>,
+    /// #707: runtime hot-rotation trigger, retaining the live
+    /// `RotatableSigner` handle so an operator can rotate the consensus
+    /// signing key without restarting. Held here (rather than dropped into
+    /// the run-loop task) so an admin surface can reach it.
+    #[allow(dead_code)]
+    rotation: crate::rotation_handle::RotationHandle,
     /// Oneshot that gracefully stops the gossip overlay (the
     /// orchestrator + publisher + partial-mesh maintenance tasks).
     overlay_shutdown: Option<oneshot::Sender<()>>,
@@ -655,13 +662,26 @@ async fn start_consensus(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     // #312: sign through a RotatableSigner sharing the node's current-view
     // handle, so a committed signing-key rotation can take effect at its
-    // `v_eff` without restarting. Until runtime key-injection lands (the
-    // operator-side follow-up), no rotation is registered, so this is
-    // behaviourally identical to signing with the genesis key.
+    // `v_eff` without restarting. #707: the same `Arc<RotatableSigner>` is
+    // retained in a `RotationHandle` so an operator can trigger a hot
+    // rotation at runtime (build the dual-signed tx, admit it, schedule the
+    // swap) — without it, the wrapper is behaviourally identical to signing
+    // with the genesis key.
     let genesis_signer = Arc::clone(signer) as Arc<dyn boule_core::crypto::signed::Signer>;
-    let signer: Arc<dyn boule_core::crypto::signed::Signer> = Arc::new(
-        crate::rotatable_signer::RotatableSigner::new(genesis_signer, node.signing_view_handle()),
+    let signing_view = node.signing_view_handle();
+    let rotatable_signer = Arc::new(crate::rotatable_signer::RotatableSigner::new(
+        genesis_signer,
+        Arc::clone(&signing_view),
+    ));
+    let rotation = crate::rotation_handle::RotationHandle::new(
+        *self_id,
+        boule_consensus::genesis::derive_chain_id(cons_cfg)?,
+        cons_cfg.signature_scheme,
+        signing_view,
+        Arc::clone(&mempool),
+        Arc::clone(&rotatable_signer),
     );
+    let signer: Arc<dyn boule_core::crypto::signed::Signer> = rotatable_signer;
     let join = tokio::spawn(async move {
         node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
             .await
@@ -672,6 +692,7 @@ async fn start_consensus(
         consensus_shutdown: shutdown_tx,
         status_rx,
         mempool,
+        rotation,
         overlay_shutdown,
         overlay_joins,
     })
