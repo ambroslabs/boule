@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -637,6 +637,45 @@ pub fn build_add_validator_payload(
     operator_pubkey: Option<NodeId>,
     consent_sig: Option<[u8; 64]>,
 ) -> anyhow::Result<Bytes> {
+    let (entry, _chain_id) = resolve_add_entry(
+        config,
+        node_id,
+        addr,
+        weight,
+        bls_pop_file,
+        bls_key_file,
+        operator_pubkey,
+        consent_sig,
+    )?;
+    let cmd = ReconfigCommand {
+        adds: vec![entry],
+        removes: vec![],
+        changes: vec![],
+        v_eff,
+    };
+    Ok(cmd.encode())
+}
+
+/// Resolve a single add [`ValidatorEntry`] from CLI inputs: scheme
+/// cross-checks (#334), BLS proof-of-possession resolution + chain-bound
+/// verification (#410), and the chain_id (when `--config` is supplied).
+///
+/// Shared by [`build_add_validator_payload`] and
+/// [`build_add_consent_signature`] so the entry an operator signs inbound
+/// consent over (#548) is byte-identical to the one the add payload
+/// carries — there is one place that decides the entry's fields, so the
+/// signed terms and the committed terms cannot drift.
+#[allow(clippy::too_many_arguments)]
+fn resolve_add_entry(
+    config: Option<&boule_core::config::Config>,
+    node_id: NodeId,
+    addr: SocketAddr,
+    weight: u64,
+    bls_pop_file: Option<&Path>,
+    bls_key_file: Option<&Path>,
+    operator_pubkey: Option<NodeId>,
+    consent_sig: Option<[u8; 64]>,
+) -> anyhow::Result<(ValidatorEntry, Option<ChainId>)> {
     if bls_pop_file.is_some() && bls_key_file.is_some() {
         anyhow::bail!(
             "--bls-pop-file and --bls-key-file are mutually exclusive — pass one or the other.",
@@ -709,20 +748,99 @@ pub fn build_add_validator_payload(
         })?;
     }
 
-    let cmd = ReconfigCommand {
-        adds: vec![ValidatorEntry {
-            node_id,
-            addr,
-            bls_pop,
-            weight,
-            operator_pubkey,
-            consent_sig,
-        }],
-        removes: vec![],
-        changes: vec![],
-        v_eff,
+    let entry = ValidatorEntry {
+        node_id,
+        addr,
+        bls_pop,
+        weight,
+        operator_pubkey,
+        consent_sig,
     };
-    Ok(cmd.encode())
+    Ok((entry, cfg_chain_id))
+}
+
+/// CLI inputs for `reconfig consent-sign` (#548): the inbound operator's
+/// tool for producing the consent signature over an add's exact terms.
+#[derive(Debug, Default)]
+pub struct ReconfigConsentSignRequest {
+    pub config_path: Option<PathBuf>,
+    pub node_id: NodeId,
+    pub addr: Option<SocketAddr>,
+    pub weight: u64,
+    pub v_eff: u64,
+    pub bls_pop_file: Option<PathBuf>,
+    pub bls_key_file: Option<PathBuf>,
+    pub operator_key_backend: Option<String>,
+    pub operator_key_path: Option<PathBuf>,
+    pub operator_key_passphrase_env: Option<String>,
+}
+
+/// Produce an inbound-consent signature (#548) for a validator add, signed
+/// by the inbound validator's **operator key**. Returns the 64-byte
+/// signature and the operator pubkey it was signed under (which the CLI
+/// echoes so the submitter can confirm it matches the add's
+/// `--operator-pubkey`).
+///
+/// The signature binds the exact add terms (resolved via the same
+/// [`resolve_add_entry`] the payload builder uses) and the chain's
+/// genesis-derived chain_id, so it verifies at commit only against an add
+/// carrying identical terms on the same chain. The operator key must
+/// already exist — it is the authority, never minted here.
+pub fn build_add_consent_signature(
+    req: &ReconfigConsentSignRequest,
+) -> anyhow::Result<([u8; 64], NodeId)> {
+    use boule_core::crypto::signed::{NodeSigner, Signer as _};
+
+    let config_path = req.config_path.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("reconfig consent-sign requires --config (chain_id binds the consent)")
+    })?;
+    let addr = req
+        .addr
+        .ok_or_else(|| anyhow::anyhow!("reconfig consent-sign requires --addr"))?;
+    let operator_backend = req.operator_key_backend.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "reconfig consent-sign requires --operator-key-backend <file|encrypted-file>"
+        )
+    })?;
+    let v_eff = View(req.v_eff);
+
+    // Load the operator key — it must already exist (the inbound operator's
+    // cold-storage authority key, not minted here).
+    let operator_cfg = crate::validator_rotation::build_new_identity_config_for_rotation(
+        operator_backend,
+        req.operator_key_path.clone(),
+        req.operator_key_passphrase_env.clone(),
+    )?;
+    let operator_identity = boule_core::config::build_provider(&operator_cfg)?
+        .try_load()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no operator key found via the `{}` backend; consent is signed by the inbound \
+                 validator's operator key, which must already exist",
+                operator_cfg.backend_name(),
+            )
+        })?;
+    let operator_signer = NodeSigner::from_identity(&operator_identity)?;
+    let operator_pubkey = operator_signer.node_id();
+
+    let config = boule_core::config::load(config_path)?;
+    let (entry, chain_id) = resolve_add_entry(
+        Some(&config),
+        req.node_id,
+        addr,
+        req.weight,
+        req.bls_pop_file.as_deref(),
+        req.bls_key_file.as_deref(),
+        Some(operator_pubkey),
+        None,
+    )?;
+    let chain_id =
+        chain_id.expect("config supplied above, so resolve_add_entry returns the chain_id");
+
+    let consent = crate::reconfig_consent::ReconfigAddConsent::for_entry(&entry, v_eff)
+        .expect("operator_pubkey is Some, so for_entry returns Some");
+    let sig = consent.sign(&operator_signer, &chain_id)?;
+    Ok((sig, operator_pubkey))
 }
 
 #[cfg(test)]
@@ -1195,6 +1313,144 @@ mod tests {
         assert!(decoded.removes.is_empty());
         assert!(decoded.changes.is_empty());
         assert_eq!(decoded.v_eff, v_eff);
+    }
+
+    /// #548: end-to-end consent-sign — mint an operator key on disk, write a
+    /// minimal Ed25519 chain config, and produce a consent signature for an
+    /// add. The signature verifies against an entry built from the same
+    /// terms under the chain's derived chain_id, and the reported operator
+    /// pubkey matches the key on disk.
+    #[test]
+    fn build_add_consent_signature_round_trips_and_verifies() {
+        use crate::reconfig_consent::ReconfigAddConsent;
+        use boule_core::crypto::signed::{NodeSigner, Signer as _};
+
+        let dir = TempDir::new().unwrap();
+        // Mint the operator key file.
+        let operator_key = dir.path().join("operator.key");
+        let provider =
+            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
+                path: operator_key.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap();
+        let operator_identity = provider.load_or_init().unwrap();
+        let operator_pubkey = NodeSigner::from_identity(&operator_identity)
+            .unwrap()
+            .node_id();
+
+        // Minimal Ed25519 chain config — consent-sign needs only [consensus]
+        // for the chain_id; the added validator need not be in the set.
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[node]\n\
+             listen_addr = \"127.0.0.1:7000\"\n\n\
+             [node.identity]\n\
+             backend = \"file\"\n\
+             path = \"/dev/null\"\n\n\
+             [api]\n\
+             listen_addr = \"127.0.0.1:8000\"\n\n\
+             [consensus]\n\
+             validators = [\"11111111111111111111111111111111\"]\n\
+             signature_scheme = \"ed25519_collected\"\n",
+        )
+        .unwrap();
+
+        let node_id = nid(7);
+        let addr: SocketAddr = "127.0.0.1:7007".parse().unwrap();
+        let req = ReconfigConsentSignRequest {
+            config_path: Some(config_path.clone()),
+            node_id,
+            addr: Some(addr),
+            weight: 3,
+            v_eff: 60,
+            bls_pop_file: None,
+            bls_key_file: None,
+            operator_key_backend: Some("file".into()),
+            operator_key_path: Some(operator_key.clone()),
+            operator_key_passphrase_env: None,
+        };
+        let (sig, reported_operator) =
+            build_add_consent_signature(&req).expect("consent-sign must succeed");
+        assert_eq!(reported_operator, operator_pubkey);
+
+        // The signature verifies for an add carrying identical terms.
+        let cfg = boule_core::config::load(&config_path).unwrap();
+        let chain_id = crate::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        let entry = ValidatorEntry {
+            node_id,
+            addr,
+            bls_pop: None,
+            weight: 3,
+            operator_pubkey: Some(operator_pubkey),
+            consent_sig: Some(sig),
+        };
+        let consent = ReconfigAddConsent::for_entry(&entry, View(60)).unwrap();
+        assert_eq!(consent.verify(&sig, &chain_id), Ok(()));
+
+        // ...and a full add payload built with this consent passes validation.
+        let payload = build_add_validator_payload(
+            Some(&cfg),
+            node_id,
+            addr,
+            View(60),
+            3,
+            None,
+            None,
+            Some(operator_pubkey),
+            Some(sig),
+        )
+        .unwrap();
+        let cmd = ReconfigCommand::decode(&payload).unwrap();
+        // Validate under the *same* chain_id the consent was signed for
+        // (NOT the ChainId::TEST shim — the consent is chain-bound).
+        assert!(
+            cmd.validate_against_with_delay_and_scheme(
+                &floor_set(),
+                View(0),
+                MIN_V_EFF_DELAY,
+                SignatureSchemeChoice::Ed25519Collected,
+                &chain_id,
+            )
+            .is_ok()
+        );
+    }
+
+    /// consent-sign requires the operator key to already exist (it is the
+    /// authority, never minted here).
+    #[test]
+    fn build_add_consent_signature_errors_when_operator_key_missing() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[node]\n\
+             listen_addr = \"127.0.0.1:7000\"\n\n\
+             [node.identity]\n\
+             backend = \"file\"\n\
+             path = \"/dev/null\"\n\n\
+             [api]\n\
+             listen_addr = \"127.0.0.1:8000\"\n\n\
+             [consensus]\n\
+             validators = [\"11111111111111111111111111111111\"]\n\
+             signature_scheme = \"ed25519_collected\"\n",
+        )
+        .unwrap();
+        let req = ReconfigConsentSignRequest {
+            config_path: Some(config_path),
+            node_id: nid(7),
+            addr: Some("127.0.0.1:7007".parse().unwrap()),
+            weight: 1,
+            v_eff: 60,
+            bls_pop_file: None,
+            bls_key_file: None,
+            operator_key_backend: Some("file".into()),
+            operator_key_path: Some(dir.path().join("nope.key")),
+            operator_key_passphrase_env: None,
+        };
+        let err = build_add_consent_signature(&req).unwrap_err();
+        assert!(err.to_string().contains("operator key"), "{err}");
     }
 
     #[test]
