@@ -52,6 +52,7 @@ pub mod operator_key_history;
 pub mod pacemaker;
 pub mod rate_limit;
 pub mod reconfig;
+pub mod reconfig_consent;
 pub mod replication;
 pub mod snapshot_sync;
 pub mod status;
