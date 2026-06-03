@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 
 use crate::View;
 use crate::bls_key_history::BlsKeyHistory;
+use crate::operator_key_history::OperatorKeyHistory;
 use crate::replication::block::Block;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
@@ -136,6 +137,116 @@ pub fn apply_rotation_cancel_command(
         if let Some(bls) = bls_key_history {
             let _ =
                 bls.cancel_pending_rotation(stable.into_node_id(), cancelling_v_eff, commit_view);
+        }
+    }
+    Ok(true)
+}
+
+/// Why a committed operator-signed signing-key rotation (#549) did not apply.
+/// The block stays committed regardless — the caller logs and drops.
+#[derive(Debug)]
+pub enum OperatorRotationError {
+    /// The tagged payload did not decode.
+    Malformed(String),
+    /// The named validator is not in the key history.
+    UnknownValidator,
+    /// The validator has no operator key on file at the commit view, so no
+    /// operator could have authorised the rotation (operator keys are
+    /// optional — a validator without one has no recovery path).
+    NoOperatorKey,
+    /// A signature did not verify (`sig_operator` under the active operator
+    /// key, or `sig_new` under the new signing key).
+    Verify(crate::validator_rotation::RotationVerifyError),
+    /// The rotation's BLS fields are inconsistent with the chain's scheme.
+    Scheme(crate::validator_rotation::RotationStructuralError),
+    /// The key history rejected the rotation (unknown validator, non-monotone
+    /// `v_eff`, or a cross-validator key collision).
+    History(crate::validator_key_history::HistoryError),
+}
+
+impl std::fmt::Display for OperatorRotationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(e) => write!(f, "operator-rotation payload malformed: {e}"),
+            Self::UnknownValidator => {
+                f.write_str("operator-rotation references an unknown validator")
+            }
+            Self::NoOperatorKey => {
+                f.write_str("operator-rotation: validator has no operator key on file")
+            }
+            Self::Verify(e) => write!(f, "operator-rotation signature verification failed: {e}"),
+            Self::Scheme(e) => write!(f, "operator-rotation scheme-consistency failed: {e}"),
+            Self::History(e) => write!(f, "operator-rotation history apply failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OperatorRotationError {}
+
+/// Apply a single committed **operator-signed** signing-key rotation (#549) to
+/// the key histories, if `cmd_bytes` is one. The recovery-from-loss path: the
+/// authorising signature is the validator's operator key (active at
+/// `commit_view`), not its old signing key, so a validator whose signing key
+/// was destroyed can still rotate to a fresh one.
+///
+/// Shared by the production commit path and the recovery rebuild so both
+/// reproduce identical state — which the rotation-apply parity assert depends
+/// on. The committed effect on [`ValidatorKeyHistory`] is identical to a
+/// dual-signed rotation ([`ValidatorKeyHistory::apply_rotation`]); only the
+/// authorisation differs.
+///
+/// Returns `Ok(true)` if an operator rotation applied, `Ok(false)` if
+/// `cmd_bytes` is not an operator-rotation payload, and `Err` if it is one that
+/// failed validation.
+pub fn apply_operator_rotation_command(
+    key_history: &mut ValidatorKeyHistory,
+    bls_key_history: Option<&mut BlsKeyHistory>,
+    operator_key_history: &OperatorKeyHistory,
+    cmd_bytes: &[u8],
+    chain_id: &ChainId,
+    scheme: SignatureSchemeChoice,
+    commit_view: View,
+) -> Result<bool, OperatorRotationError> {
+    use crate::validator_rotation::OperatorSignedRotation;
+
+    if !OperatorSignedRotation::is_operator_rotation_payload(cmd_bytes) {
+        return Ok(false);
+    }
+    let env = OperatorSignedRotation::decode_command(cmd_bytes)
+        .map_err(|e| OperatorRotationError::Malformed(e.to_string()))?;
+
+    // Resolve the validator's stable id (the operator-key history is keyed by
+    // it). `payload.validator` is normally the stable id itself — a recovering
+    // validator references itself by the genesis pubkey, which never leaves the
+    // history — but any historical key resolves to the same stable id.
+    let validator_pk = Pubkey::from_node_id(env.payload.validator);
+    let stable = key_history
+        .validator_for(&validator_pk)
+        .ok_or(OperatorRotationError::UnknownValidator)?;
+
+    // The operator key active for this validator at the commit view authorises
+    // the rotation; `sig_operator` is checked against it.
+    let operator_pk = operator_key_history
+        .key_at(&stable, commit_view)
+        .ok_or(OperatorRotationError::NoOperatorKey)?;
+
+    env.verify(&operator_pk, chain_id)
+        .map_err(OperatorRotationError::Verify)?;
+
+    env.payload
+        .validate_scheme_consistency(scheme, chain_id)
+        .map_err(OperatorRotationError::Scheme)?;
+
+    key_history
+        .apply_rotation(&env.payload, commit_view)
+        .map_err(OperatorRotationError::History)?;
+
+    // BLS chains rotate both keys atomically (#358), mirroring the dual-signed
+    // path: best-effort, a BLS mismatch after the Ed25519 apply is not rolled
+    // back (the Ed25519 mutation already happened).
+    if scheme == SignatureSchemeChoice::BlsAggregated {
+        if let (Some(bls), Some(new_bls_pk)) = (bls_key_history, env.payload.new_bls_pubkey) {
+            let _ = bls.apply_rotation(stable.into_node_id(), env.payload.v_eff, new_bls_pk);
         }
     }
     Ok(true)
@@ -558,5 +669,153 @@ mod tests {
             h_none, h_some_empty,
             "Ed25519 chain (None) must hash differently from BLS chain with empty history",
         );
+    }
+
+    // ── apply_operator_rotation_command (#549) ─────────────────────────
+
+    use crate::validator_rotation::{OperatorSignedRotation, ValidatorKeyRotation};
+    use boule_core::crypto::signed::{ChainId, NodeSigner, Signer};
+
+    fn fresh_signer() -> NodeSigner {
+        use boule_core::identity::NodeIdentity;
+        use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
+        use zeroize::Zeroizing;
+        let kp = RcgenKeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let id = NodeIdentity {
+            pkcs8_der: Zeroizing::new(kp.serialize_der()),
+        };
+        NodeSigner::from_identity(&id).unwrap()
+    }
+
+    /// One validator (its genesis pubkey = stable id) with an operator key,
+    /// plus signers for a recovery rotation to `new`.
+    fn operator_recovery_fixture() -> (
+        ValidatorKeyHistory,
+        OperatorKeyHistory,
+        crate::validator_set::ValidatorId,
+        NodeSigner, // operator
+        NodeSigner, // new signing key
+    ) {
+        let validator = fresh_signer();
+        let operator = fresh_signer();
+        let new = fresh_signer();
+        let v_id = crate::validator_set::ValidatorId::from_genesis_pubkey(validator.node_id());
+        let keys = ValidatorKeyHistory::new(vec![v_id]);
+        let ops = OperatorKeyHistory::with_genesis([(v_id, operator.node_id())]);
+        (keys, ops, v_id, operator, new)
+    }
+
+    fn recovery_payload(
+        v_id: &crate::validator_set::ValidatorId,
+        new: &NodeSigner,
+    ) -> ValidatorKeyRotation {
+        ValidatorKeyRotation {
+            validator: v_id.into_node_id(),
+            new_pubkey: new.node_id(),
+            v_eff: View(10),
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        }
+    }
+
+    #[test]
+    fn operator_rotation_applies_with_a_valid_operator_signature() {
+        let (mut keys, ops, v_id, operator, new) = operator_recovery_fixture();
+        let env = OperatorSignedRotation::sign(
+            recovery_payload(&v_id, &new),
+            &operator,
+            &new,
+            &ChainId::TEST,
+        )
+        .unwrap();
+        let applied = apply_operator_rotation_command(
+            &mut keys,
+            None,
+            &ops,
+            &env.encode_command(),
+            &ChainId::TEST,
+            SignatureSchemeChoice::Ed25519Collected,
+            View(5),
+        )
+        .unwrap();
+        assert!(applied);
+        // The new signing key is active at v_eff; the genesis key before it.
+        assert_eq!(
+            keys.key_at(&v_id, View(10)),
+            Some(Pubkey::from_node_id(new.node_id()))
+        );
+        assert_eq!(
+            keys.key_at(&v_id, View(9)),
+            Some(Pubkey::from_node_id(v_id.into_node_id())),
+        );
+    }
+
+    #[test]
+    fn operator_rotation_rejects_a_signature_from_the_wrong_operator_key() {
+        let (mut keys, ops, v_id, _operator, new) = operator_recovery_fixture();
+        // Signed by an attacker key, not the validator's real operator key.
+        let attacker = fresh_signer();
+        let env = OperatorSignedRotation::sign(
+            recovery_payload(&v_id, &new),
+            &attacker,
+            &new,
+            &ChainId::TEST,
+        )
+        .unwrap();
+        let r = apply_operator_rotation_command(
+            &mut keys,
+            None,
+            &ops,
+            &env.encode_command(),
+            &ChainId::TEST,
+            SignatureSchemeChoice::Ed25519Collected,
+            View(5),
+        );
+        assert!(matches!(r, Err(OperatorRotationError::Verify(_))));
+        // The key history is unchanged — the forged recovery is a no-op.
+        assert_eq!(
+            keys.key_at(&v_id, View(10)),
+            Some(Pubkey::from_node_id(v_id.into_node_id())),
+        );
+    }
+
+    #[test]
+    fn operator_rotation_rejects_when_the_validator_has_no_operator_key() {
+        let (mut keys, _ops, v_id, operator, new) = operator_recovery_fixture();
+        let empty_ops = OperatorKeyHistory::new();
+        let env = OperatorSignedRotation::sign(
+            recovery_payload(&v_id, &new),
+            &operator,
+            &new,
+            &ChainId::TEST,
+        )
+        .unwrap();
+        let r = apply_operator_rotation_command(
+            &mut keys,
+            None,
+            &empty_ops,
+            &env.encode_command(),
+            &ChainId::TEST,
+            SignatureSchemeChoice::Ed25519Collected,
+            View(5),
+        );
+        assert!(matches!(r, Err(OperatorRotationError::NoOperatorKey)));
+    }
+
+    #[test]
+    fn apply_operator_rotation_command_ignores_non_operator_payloads() {
+        let (mut keys, ops, _v_id, _operator, _new) = operator_recovery_fixture();
+        // A garbage / non-operator-rotation command is a clean Ok(false).
+        let applied = apply_operator_rotation_command(
+            &mut keys,
+            None,
+            &ops,
+            b"not an operator rotation",
+            &ChainId::TEST,
+            SignatureSchemeChoice::Ed25519Collected,
+            View(5),
+        )
+        .unwrap();
+        assert!(!applied);
     }
 }
