@@ -354,6 +354,20 @@ pub struct ConsensusStatus {
     /// back-pressure paths. See [`BackpressureStatus`].
     #[serde(default)]
     pub backpressure: BackpressureStatus,
+    /// Liveness-fault detection (#540): base58 ids of validators whose
+    /// in-window credited-participation has fallen below the delinquency
+    /// floor (well under the ~66% Byzantine-censorship floor, so a
+    /// censored-but-honest validator never appears here). Observability
+    /// only — enforcement is a follow-up. Empty on a healthy cluster.
+    #[serde(default)]
+    pub delinquent_validators: Vec<String>,
+    /// Cluster-wide mean credited participation over the liveness window, in
+    /// permille (`None` before any votes are observed). Below ~666‰ is a
+    /// meta-signal that censorship has exceeded the Byzantine bound (> f
+    /// faulty actors or a coordinated network fault), not an individual
+    /// fault.
+    #[serde(default)]
+    pub cluster_participation_permille: Option<u64>,
 }
 
 /// How far on either side of `current_view` to include in the bucket
@@ -457,6 +471,8 @@ mod tests {
                 block_sync_serve_drops_total: 2,
                 p2p_egress_byte_drops_total: 13,
             },
+            delinquent_validators: Vec::new(),
+            cluster_participation_permille: None,
         }
     }
 
@@ -627,6 +643,8 @@ mod tests {
             state_divergence_detected: 0,
             proposal_command_rejections: 0,
             backpressure: BackpressureStatus::default(),
+            delinquent_validators: Vec::new(),
+            cluster_participation_permille: None,
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["current_view"], 0);
