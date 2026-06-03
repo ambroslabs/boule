@@ -21,7 +21,9 @@
 use std::collections::BTreeMap;
 
 use boule_consensus::View;
-use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, WeightChange};
+use boule_consensus::reconfig::{
+    MIN_V_EFF_DELAY, MIN_VALIDATOR_FLOOR, ReconfigCommand, WeightChange,
+};
 use boule_consensus::replication::application::ValidatorUpdate;
 use boule_consensus::validator_set::{ValidatorId, ValidatorSet};
 use boule_core::identity::NodeId;
@@ -50,7 +52,18 @@ impl ConsensusNode {
     /// that never commits is re-minted rather than lost; a batch with nothing
     /// actionable is dropped here so it does not re-attempt on every build.
     pub(super) fn mint_staged_reconfig(&mut self, view: View) {
-        if self.staged_validator_updates.is_empty() {
+        // #658a: an equivocator with committed evidence is jailed by removing
+        // it from the active set. Derive the removes from the persisted
+        // `committed_evidence` registry every proposal (rather than staging
+        // once at record time) so the jail is idempotent and survives a
+        // restart in the propose→commit window, and fold them into the same
+        // reconfig as any app-driven updates — the apply path allows only one
+        // boundary at a time, so they cannot ride separate commands.
+        let set_at = self.validator_history.set_at(view);
+        let current = set_at.for_view(view).clone();
+        let jail = self.jail_removes(&current);
+
+        if self.staged_validator_updates.is_empty() && jail.is_empty() {
             return;
         }
         // Respect the one-reconfig-at-a-time rule the apply path enforces:
@@ -79,10 +92,10 @@ impl ConsensusNode {
             return;
         };
 
-        let set_at = self.validator_history.set_at(view);
-        let current = set_at.for_view(view);
-        let Some(cmd) = staged_updates_to_reconfig(&self.staged_validator_updates, current, v_eff)
-        else {
+        // Merge app-staged updates with the jail removes into one batch.
+        let mut updates = self.staged_validator_updates.clone();
+        updates.extend(jail);
+        let Some(cmd) = staged_updates_to_reconfig(&updates, &current, v_eff) else {
             // Nothing actionable (e.g. only adds, which need an endpoint, or
             // updates targeting non-members). Drop the dead batch so it does
             // not re-attempt on every build; the application re-requests on a
@@ -98,7 +111,8 @@ impl ConsensusNode {
         // Leave the stage in place: it is cleared when the reconfig boundary
         // actually lands (see `apply_committed_reconfigs`), so if this block
         // never commits a later proposal re-mints the change rather than
-        // silently losing it.
+        // silently losing it. (Jail removes are re-derived from the persisted
+        // registry, so they need no staging.)
 
         match self.mempool.insert(cmd.encode()) {
             Ok(_) => tracing::info!(
@@ -115,6 +129,61 @@ impl ConsensusNode {
                 "mint_staged_reconfig_mempool_insert_failed",
             ),
         }
+    }
+
+    /// Jail removes (#658a): one weight-0 [`ValidatorUpdate`] per committed-
+    /// evidence equivocator that is still seated in `current`, capped so the
+    /// removals keep the active set at or above [`MIN_VALIDATOR_FLOOR`].
+    ///
+    /// The floor cap is essential: commit-time validation rejects the *entire*
+    /// reconfig if the result drops below the floor, which would take any
+    /// legit app updates down with it — so we never propose more removes than
+    /// the floor allows, accounting for app-staged removes already in flight.
+    /// When the floor blocks every jail, the equivocator stays seated and the
+    /// evidence record stands as off-chain accountability (the #457 caveat).
+    fn jail_removes(&self, current: &ValidatorSet) -> Vec<ValidatorUpdate> {
+        let mut seated: Vec<ValidatorId> = self
+            .committed_evidence
+            .keys()
+            .copied()
+            .filter(|v| current.contains(v))
+            .collect();
+        if seated.is_empty() {
+            return Vec::new();
+        }
+        seated.sort(); // deterministic order across nodes
+
+        // Removals already implied by app-staged weight-0 updates for seated
+        // validators reduce how many more the floor permits.
+        let app_removes = self
+            .staged_validator_updates
+            .iter()
+            .filter(|u| {
+                u.weight == 0 && current.contains(&ValidatorId::from_genesis_pubkey(u.node_id))
+            })
+            .count();
+        let budget = current
+            .len()
+            .saturating_sub(MIN_VALIDATOR_FLOOR)
+            .saturating_sub(app_removes);
+        if budget == 0 {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                seated_equivocators = seated.len(),
+                set_size = current.len(),
+                floor = MIN_VALIDATOR_FLOOR,
+                "jail_blocked_by_validator_floor",
+            );
+            return Vec::new();
+        }
+        seated.truncate(budget);
+        seated
+            .iter()
+            .map(|v| ValidatorUpdate {
+                node_id: *v.as_node_id(),
+                weight: 0,
+            })
+            .collect()
     }
 }
 
