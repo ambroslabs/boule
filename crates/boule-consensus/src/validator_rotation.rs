@@ -1029,6 +1029,197 @@ pub fn build_rotation_envelope(
     })
 }
 
+/// CLI inputs for `rotation propose-operator-recovery` (#549), populated by
+/// the binary's argument parser and consumed by
+/// [`build_operator_recovery_envelope`].
+#[derive(Debug, Default)]
+pub struct OperatorRecoveryRequest {
+    pub config_path: Option<PathBuf>,
+    /// Base58 stable id of the validator being recovered. Required because
+    /// the *signing* key is presumed lost, so it can't be loaded to identify
+    /// the validator; the operator supplies the (public, immutable) stable id.
+    pub validator: Option<String>,
+    /// Backend + path for the **operator key** (must already exist — it is the
+    /// cold-storage authority key, not minted here).
+    pub operator_key_backend: Option<String>,
+    pub operator_key_path: Option<PathBuf>,
+    pub operator_key_passphrase_env: Option<String>,
+    /// Backend + path for the fresh signing key to recover to (minted if
+    /// absent).
+    pub new_key_backend: Option<String>,
+    pub new_key_path: Option<PathBuf>,
+    pub new_key_passphrase_env: Option<String>,
+    pub new_bls_key_backend: Option<String>,
+    pub new_bls_key_path: Option<PathBuf>,
+    pub v_eff: Option<u64>,
+}
+
+/// Outcome of building an operator-signed recovery envelope.
+#[derive(Debug)]
+pub struct OperatorRecoveryOutcome {
+    pub envelope: OperatorSignedRotation,
+    pub bls_chain: bool,
+}
+
+/// Orchestration core of `rotation propose-operator-recovery` (#549) — the
+/// recovery-from-loss path. Resolves the validator's stable id from
+/// `req.validator`, loads the **operator key** (which authorises the rotation
+/// in place of the lost signing key), mints (or reloads) the new signing key
+/// (+ BLS key on BLS chains), and builds a chain-bound
+/// [`OperatorSignedRotation`]. Mirrors [`build_rotation_envelope`] but signs
+/// `sig_operator` with the operator key rather than `sig_old` with the (lost)
+/// current key.
+pub fn build_operator_recovery_envelope(
+    req: &OperatorRecoveryRequest,
+) -> anyhow::Result<OperatorRecoveryOutcome> {
+    use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
+    use boule_core::crypto::signed::NodeSigner;
+
+    let v_eff = View(req.v_eff.ok_or_else(|| {
+        anyhow::anyhow!("rotation propose-operator-recovery requires --v-eff <view>")
+    })?);
+    let new_backend = req.new_key_backend.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "rotation propose-operator-recovery requires --new-key-backend <file|encrypted-file>"
+        )
+    })?;
+    let operator_backend = req.operator_key_backend.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "rotation propose-operator-recovery requires --operator-key-backend \
+             <file|encrypted-file>"
+        )
+    })?;
+    let validator_b58 = req.validator.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "rotation propose-operator-recovery requires --validator <base58 stable id> \
+             (the signing key is presumed lost, so the validator can't be identified from it)"
+        )
+    })?;
+    let validator = boule_core::identity::base58_to_node_id(validator_b58).map_err(|e| {
+        anyhow::anyhow!("--validator {validator_b58:?} is not a base58 NodeId: {e}")
+    })?;
+
+    let config_path = req
+        .config_path
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("rotation propose-operator-recovery requires --config"))?;
+    let config = boule_core::config::load(config_path)?;
+    let cons = config.consensus.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--config {} has no [consensus] section; recovery requires the chain's \
+             signature_scheme + chain_id to bundle a chain-bound payload",
+            config_path.display(),
+        )
+    })?;
+    let chain_id = crate::genesis::derive_chain_id(cons)?;
+
+    // Same scheme/flag-presence checks as `build_rotation_envelope`, before
+    // touching disk.
+    match cons.signature_scheme {
+        SignatureSchemeChoice::BlsAggregated => {
+            if req.new_bls_key_backend.is_none() {
+                anyhow::bail!(
+                    "[consensus].signature_scheme = \"bls_aggregated\" but no \
+                     --new-bls-key-backend was supplied; BLS chains rotate both halves \
+                     atomically (#358)",
+                );
+            }
+        }
+        SignatureSchemeChoice::Ed25519Collected => {
+            if req.new_bls_key_backend.is_some() || req.new_bls_key_path.is_some() {
+                anyhow::bail!(
+                    "[consensus].signature_scheme = \"ed25519_collected\" but a \
+                     --new-bls-key-* flag was supplied; Ed25519 chains have no use for \
+                     BLS keys (remove the flag)",
+                );
+            }
+        }
+    }
+
+    // Load the operator key — it must already exist (cold-storage authority
+    // key, not minted here). Reuses the backend→config mapping but loads
+    // rather than provisions.
+    let operator_cfg = build_new_identity_config_for_rotation(
+        operator_backend,
+        req.operator_key_path.clone(),
+        req.operator_key_passphrase_env.clone(),
+    )?;
+    let operator_identity = boule_core::config::build_provider(&operator_cfg)?
+        .try_load()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no operator key found via the `{}` backend; the operator key must already \
+                 exist (it is the recovery authority, not minted here)",
+                operator_cfg.backend_name(),
+            )
+        })?;
+    let operator_signer = NodeSigner::from_identity(&operator_identity)?;
+
+    // Mint / reload the new signing key (the key being recovered to).
+    let new_id_cfg = build_new_identity_config_for_rotation(
+        new_backend,
+        req.new_key_path.clone(),
+        req.new_key_passphrase_env.clone(),
+    )?;
+    let new_provider = boule_core::config::build_provider(&new_id_cfg)?;
+    let new_identity = if new_provider.is_provisioning_capable() {
+        new_provider.load_or_init()?
+    } else {
+        new_provider.try_load()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "new key backend `{}` is read-only and no key is yet provisioned; \
+                 mint the key out-of-band first",
+                new_id_cfg.backend_name(),
+            )
+        })?
+    };
+    let new_signer = NodeSigner::from_identity(&new_identity)?;
+
+    // BLS half (same as rotation).
+    let bls_chain = matches!(cons.signature_scheme, SignatureSchemeChoice::BlsAggregated);
+    let (new_bls_pubkey, new_bls_pop) = if bls_chain {
+        let backend = req
+            .new_bls_key_backend
+            .as_deref()
+            .expect("BLS-flag presence verified above");
+        if backend != "file" {
+            anyhow::bail!("--new-bls-key-backend `{backend}` is not supported (only `file` today)",);
+        }
+        let bls_path = req.new_bls_key_path.clone().ok_or_else(|| {
+            anyhow::anyhow!("--new-bls-key-backend file requires --new-bls-key-path")
+        })?;
+        let bls_id = BlsKeyFile::new(bls_path).load_or_init()?;
+        let pop = BlsAggregated::sign_pop(&bls_id.secret, &chain_id)
+            .map_err(|e| anyhow::anyhow!("signing BLS PoP: {e:?}"))?;
+        (Some(bls_id.public), Some(pop))
+    } else {
+        (None, None)
+    };
+
+    let payload = ValidatorKeyRotation {
+        validator,
+        new_pubkey: new_signer.node_id(),
+        v_eff,
+        new_bls_pubkey,
+        new_bls_pop,
+    };
+    if payload.new_pubkey == payload.validator {
+        anyhow::bail!(
+            "new_pubkey equals the validator's stable id; pick a --new-key-path that is not \
+             the genesis key",
+        );
+    }
+    payload
+        .validate_scheme_consistency(cons.signature_scheme, &chain_id)
+        .map_err(|e| anyhow::anyhow!("recovery payload failed scheme-consistency check: {e}"))?;
+
+    let envelope = OperatorSignedRotation::sign(payload, &operator_signer, &new_signer, &chain_id)?;
+    Ok(OperatorRecoveryOutcome {
+        envelope,
+        bls_chain,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
