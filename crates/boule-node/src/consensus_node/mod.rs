@@ -121,13 +121,13 @@ pub use persistence::{
     LastCommitted, RECENT_QC_CACHE_CAPACITY, STORAGE_KEY_BLOCK_PREFIX, STORAGE_KEY_BLS_KEY_HISTORY,
     STORAGE_KEY_COMMITTED_EVIDENCE, STORAGE_KEY_HEIGHT_PREFIX, STORAGE_KEY_HIGH_QC,
     STORAGE_KEY_LAST_COMMITTED, STORAGE_KEY_LAST_TIMEOUT_VOTE, STORAGE_KEY_LAST_VOTED_VIEW,
-    STORAGE_KEY_LOCKED, STORAGE_KEY_PROPOSED_IN_VIEW, STORAGE_KEY_VALIDATOR_HISTORY,
-    STORAGE_KEY_VALIDATOR_KEY_HISTORY, block_storage_key, decode_block, decode_height_storage_key,
-    decode_high_qc, decode_last_committed, decode_last_timeout_vote, decode_locked,
-    decode_proposed_in_view, decode_voted_view, encode_block, encode_high_qc,
-    encode_last_committed, encode_last_timeout_vote, encode_locked, encode_proposed_in_view,
-    encode_voted_view, height_storage_key, load_block_from_storage, load_block_range_from_storage,
-    recover_state,
+    STORAGE_KEY_LOCKED, STORAGE_KEY_OPERATOR_KEY_HISTORY, STORAGE_KEY_PROPOSED_IN_VIEW,
+    STORAGE_KEY_VALIDATOR_HISTORY, STORAGE_KEY_VALIDATOR_KEY_HISTORY, block_storage_key,
+    decode_block, decode_height_storage_key, decode_high_qc, decode_last_committed,
+    decode_last_timeout_vote, decode_locked, decode_proposed_in_view, decode_voted_view,
+    encode_block, encode_high_qc, encode_last_committed, encode_last_timeout_vote, encode_locked,
+    encode_proposed_in_view, encode_voted_view, height_storage_key, load_block_from_storage,
+    load_block_range_from_storage, recover_state,
 };
 
 use persistence::RecentQcCache;
@@ -1114,14 +1114,26 @@ impl ConsensusNode {
             None => ValidatorKeyHistory::from_set_history(&validator_history),
         };
 
-        // #549: operator keys are immutable genesis config, so recover
-        // rebuilds the same history a fresh boot does — no persistence.
-        let operator_key_history = OperatorKeyHistory::with_genesis(
-            config
-                .operator_keys
-                .iter()
-                .map(|(v, op)| (ValidatorId::from_genesis_pubkey(*v), *op)),
-        );
+        // #549: load the persisted operator-key history (authoritative once an
+        // operator-key self-rotation has been flushed); fall back to the
+        // genesis seeding from config when no blob has been written yet.
+        let operator_key_history = match storage
+            .get(STORAGE_KEY_OPERATOR_KEY_HISTORY)
+            .context("read operator_key_history from storage")?
+        {
+            Some(raw) => {
+                let persisted: boule_consensus::operator_key_history::PersistedOperatorKeyHistory =
+                    postcard::from_bytes(&raw).context("decode persisted operator_key_history")?;
+                OperatorKeyHistory::from_persisted(persisted)
+                    .context("rebuild OperatorKeyHistory from persisted form")?
+            }
+            None => OperatorKeyHistory::with_genesis(
+                config
+                    .operator_keys
+                    .iter()
+                    .map(|(v, op)| (ValidatorId::from_genesis_pubkey(*v), *op)),
+            ),
+        };
 
         // #324: same derivation as `ConsensusNode::new` — recover paths
         // must produce the same `ChainId` as a fresh boot, since both
@@ -4475,6 +4487,56 @@ mod tests {
         assert_eq!(
             node.validator_key_history.key_at(&v_id, View(20)),
             Some(Pubkey::from_node_id(v_id.into_node_id())),
+        );
+    }
+
+    /// #549: an operator-key self-rotation in a committed block rotates the
+    /// validator's operator key (dual-signed old+new operator), persists the
+    /// new history, and the parity assert in `apply_committed_rotations`
+    /// confirms the live apply matches the rebuild. The post-commit
+    /// `verify_persisted_history_consistency` then rebuilds the operator
+    /// history from the chain and v2-checks it — exercising the recovery walk.
+    #[test]
+    fn operator_key_self_rotation_applies_persists_and_survives_recovery_check() {
+        use boule_consensus::validator_rotation::{
+            DualSignedOperatorRotation, OperatorKeyRotation,
+        };
+
+        let (mut node, operator, _new_signing, v_id) = node_with_operator_key();
+        let new_operator = fresh_signer();
+        let payload = OperatorKeyRotation {
+            validator: v_id.into_node_id(),
+            new_operator_pubkey: new_operator.node_id(),
+            v_eff: View(40),
+        };
+        let env =
+            DualSignedOperatorRotation::sign(payload, &operator, &new_operator, &node.chain_id)
+                .unwrap();
+        // Commit it at view 5 (well before v_eff). Must also pass the block's
+        // stamped commitment check on recovery — stamp the post-block v2 hash.
+        let mut block = block_with_commands(1, 5, vec![env.encode_command()]);
+        block.header.validator_history_commitment =
+            boule_consensus::history_commitment::compute_post_block_commitment(
+                &block,
+                &node.validator_history,
+                &node.validator_key_history,
+                node.bls_key_history.as_ref(),
+                Some(&node.operator_key_history),
+                &node.chain_id,
+                node.signature_scheme,
+                node.min_v_eff_delay,
+            );
+
+        node.apply_committed_rotations(&block); // parity assert fires here
+
+        // The operator key rotated at v_eff; the genesis operator key before it.
+        assert_eq!(
+            node.operator_key_history.key_at(&v_id, View(40)),
+            Some(new_operator.node_id())
+        );
+        assert_eq!(
+            node.operator_key_history.key_at(&v_id, View(39)),
+            Some(operator.node_id())
         );
     }
 

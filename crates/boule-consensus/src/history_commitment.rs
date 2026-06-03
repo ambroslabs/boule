@@ -582,7 +582,7 @@ pub fn apply_rotation_commands_to_histories(
     _set_history: &ValidatorSetHistory,
     key_history: &mut ValidatorKeyHistory,
     mut bls_key_history: Option<&mut BlsKeyHistory>,
-    operator_key_history: Option<&OperatorKeyHistory>,
+    operator_key_history: Option<&mut OperatorKeyHistory>,
     chain_id: &ChainId,
     scheme: SignatureSchemeChoice,
 ) {
@@ -689,17 +689,28 @@ pub fn apply_rotation_commands_to_histories(
     // operator-key history; with none available (no operator keys on this
     // chain) they are skipped, exactly as the live path drops them. Silent on
     // failure — the rebuild matches the (logging) production path's final state.
-    if let Some(operator_key_history) = operator_key_history {
+    if let Some(op) = operator_key_history.as_deref() {
         for cmd_bytes in &block.commands {
             let _ = apply_operator_rotation_command(
                 key_history,
                 bls_key_history.as_deref_mut(),
-                operator_key_history,
+                op,
                 cmd_bytes,
                 chain_id,
                 scheme,
                 block_view,
             );
+        }
+    }
+
+    // #549: operator-key self-rotations mutate the operator-key history. Run
+    // after the recovery rotations above (which read the *current* operator
+    // key) — a self-rotation's `v_eff` is in the future, so it never changes
+    // `key_at(commit_view)` for this block's recovery rotations regardless of
+    // order. Silent on failure, like the other rebuild loops.
+    if let Some(op) = operator_key_history {
+        for cmd_bytes in &block.commands {
+            let _ = apply_operator_key_rotation_command(op, cmd_bytes, chain_id, block_view);
         }
     }
 }
@@ -752,6 +763,10 @@ pub fn compute_post_block_commitment(
     let mut set = set_history.clone();
     let mut key = key_history.clone();
     let mut bls = bls_key_history.cloned();
+    // #549: fork the operator-key history too, so this block's operator-key
+    // self-rotations are reflected in the post-block hash without mutating the
+    // caller's history.
+    let mut operator = operator_key_history.cloned();
     apply_reconfig_commands_to_set_history(
         block,
         &mut set,
@@ -765,14 +780,11 @@ pub fn compute_post_block_commitment(
         &set,
         &mut key,
         bls.as_mut(),
-        operator_key_history,
+        operator.as_mut(),
         chain_id,
         scheme,
     );
-    // #549: v2 folds the operator-key history into the anti-rollback
-    // commitment. Operator keys are immutable in this slice, so the operator
-    // history is passed through unchanged (PR-next makes it mutable).
-    validator_history_commitment_v2(&set, &key, bls.as_ref(), operator_key_history)
+    validator_history_commitment_v2(&set, &key, bls.as_ref(), operator.as_ref())
 }
 
 #[cfg(test)]

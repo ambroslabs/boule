@@ -138,6 +138,13 @@ pub const STORAGE_KEY_VALIDATOR_KEY_HISTORY: &[u8] = b"consensus/validator_key_h
 /// because the rotations are reseeded from genesis only.
 pub const STORAGE_KEY_BLS_KEY_HISTORY: &[u8] = b"consensus/bls_key_history";
 
+/// Storage key for the persisted operator-key history (#549). Written after a
+/// commit-time operator-key self-rotation; read at startup. Operator keys are
+/// genesis-seeded but mutable (via self-rotation), so — like the validator and
+/// BLS key histories — they must persist: block pruning would erase the early
+/// self-rotation blocks needed to rebuild them from genesis.
+pub const STORAGE_KEY_OPERATOR_KEY_HISTORY: &[u8] = b"consensus/operator_key_history";
+
 /// Storage key for the committed-equivocation-evidence registry (#657).
 /// Written after every commit that records new evidence; read at startup
 /// so the "this validator already has committed evidence" dedup survives
@@ -576,6 +583,46 @@ pub(super) fn genesis_only_bls_seed(
         .expect("genesis-only BLS seed has valid invariants by construction")
 }
 
+/// The genesis (`v_eff = 0`) entries of `loaded`, as a fresh
+/// [`OperatorKeyHistory`](boule_consensus::operator_key_history::OperatorKeyHistory)
+/// (#549) — the seed the recovery walk replays operator-key self-rotations
+/// onto. Mirrors [`genesis_only_bls_seed`]: a validator with no genesis
+/// operator entry (none today, but forward-compatible with reconfig-added
+/// operator keys) is not seeded.
+pub(super) fn genesis_only_operator_seed(
+    loaded: &boule_consensus::operator_key_history::OperatorKeyHistory,
+) -> boule_consensus::operator_key_history::OperatorKeyHistory {
+    use boule_consensus::operator_key_history::{
+        OperatorKeyHistory, PersistedOperatorKeyEntry, PersistedOperatorKeyHistory,
+        PersistedOperatorValidator,
+    };
+    let persisted = loaded.to_persisted();
+    let genesis_only = PersistedOperatorKeyHistory {
+        validators: persisted
+            .validators
+            .into_iter()
+            .filter_map(|v| {
+                let mut v0_entries: Vec<PersistedOperatorKeyEntry> = v
+                    .entries
+                    .into_iter()
+                    .filter(|e| e.v_eff == View::ZERO)
+                    .collect();
+                if v0_entries.is_empty() {
+                    None
+                } else {
+                    v0_entries.truncate(1);
+                    Some(PersistedOperatorValidator {
+                        stable_id: v.stable_id,
+                        entries: v0_entries,
+                    })
+                }
+            })
+            .collect(),
+    };
+    OperatorKeyHistory::from_persisted(genesis_only)
+        .expect("genesis-only operator seed has valid invariants by construction")
+}
+
 impl ConsensusNode {
     /// Walk the persisted committed-block chain from genesis to the
     /// last-committed tip, rebuilding the validator histories from
@@ -781,6 +828,10 @@ impl ConsensusNode {
         // just constructed) against the genesis block's claim. If the
         // seed is wrong, the genesis-iteration check fires.
         let mut rebuilt_bls = self.bls_key_history.as_ref().map(genesis_only_bls_seed);
+        // #549: seed the operator-key history rebuild from its genesis entries
+        // and replay operator-key self-rotations onto it across the walk, the
+        // same way the BLS history is rebuilt.
+        let mut rebuilt_operator = genesis_only_operator_seed(&self.operator_key_history);
 
         for block in &chain {
             // #325 PR C semantics: each block's stamped commitment is
@@ -803,19 +854,18 @@ impl ConsensusNode {
                 &rebuilt_set,
                 &mut rebuilt_key,
                 rebuilt_bls.as_mut(),
-                Some(&self.operator_key_history),
+                Some(&mut rebuilt_operator),
                 &self.chain_id,
                 self.signature_scheme,
             );
             let claimed = block.header.validator_history_commitment;
-            // #549: v2 folds the operator-key history. Immutable in this slice,
-            // so the live genesis-seeded history is the right value at every
-            // height (PR-next rebuilds it from commands as it becomes mutable).
+            // #549: v2 folds the operator-key history, rebuilt incrementally
+            // from this block's operator-key self-rotations (above).
             let actual = validator_history_commitment_v2(
                 &rebuilt_set,
                 &rebuilt_key,
                 rebuilt_bls.as_ref(),
-                Some(&self.operator_key_history),
+                Some(&rebuilt_operator),
             );
             if claimed != actual {
                 anyhow::bail!(
