@@ -33,6 +33,7 @@ pub mod application;
 pub mod block;
 pub mod impls;
 pub mod mempool;
+pub mod reward_ledger;
 pub mod snapshot;
 pub mod stake_source;
 pub mod state_machine;
