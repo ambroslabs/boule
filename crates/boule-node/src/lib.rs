@@ -558,6 +558,8 @@ async fn start_consensus(
         operator_keys: cons_cfg
             .resolve_genesis_operator_keys()
             .context("validating genesis operator-key table")?,
+        // #546: per-validator endpoint-list cap.
+        max_endpoint_list_length: cons_cfg.max_endpoint_list_length,
     };
 
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
@@ -1040,6 +1042,7 @@ mod tests {
             application: None,
             propose_limit: 64,
             mempool_capacity: 1024,
+            max_endpoint_list_length: 8,
             timeout_base_ms: 200,
             timeout_max_ms: 10_000,
             storage_dir: None,

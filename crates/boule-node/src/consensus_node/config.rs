@@ -86,6 +86,11 @@ pub struct NodeConfigForConsensus {
     /// operator-recovery path. Resolved from
     /// [`ConsensusConfig::resolve_genesis_operator_keys`](boule_core::config::ConsensusConfig::resolve_genesis_operator_keys).
     pub operator_keys: Vec<(NodeId, NodeId)>,
+
+    /// Cap on a validator's published endpoint list (#546), from
+    /// [`ConsensusConfig::max_endpoint_list_length`](boule_core::config::ConsensusConfig::max_endpoint_list_length).
+    /// A consensus parameter identical across replicas.
+    pub max_endpoint_list_length: usize,
 }
 
 impl NodeConfigForConsensus {
@@ -120,6 +125,9 @@ impl NodeConfigForConsensus {
             weak_subjectivity_checkpoint: None,
             // Tests opt into operator keys explicitly; default is none.
             operator_keys: Vec::new(),
+            // A roomy default so tests publishing a handful of endpoints
+            // don't trip the cap.
+            max_endpoint_list_length: 8,
         }
     }
 }
