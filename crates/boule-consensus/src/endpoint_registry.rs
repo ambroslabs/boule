@@ -34,6 +34,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
@@ -333,6 +334,71 @@ fn dedup_check<'a>(ids: impl Iterator<Item = &'a NodeId>) -> Result<(), Endpoint
     Ok(())
 }
 
+/// CLI inputs for `boule endpoint {set,add,remove}` (#546): build a signed
+/// endpoint command from the node's config + an operator-supplied
+/// sequence number and operation.
+#[derive(Debug)]
+pub struct EndpointPublishRequest {
+    pub config_path: PathBuf,
+    pub seq: u64,
+    pub op: EndpointOp,
+}
+
+/// Build a [`SignedEndpointCommand`] for this node's validator, signed by
+/// its consensus key resolved from `--config` and bound to the chain_id —
+/// the payload-builder backing `boule endpoint {set,add,remove}` (mirrors
+/// [`crate::validator_rotation`]'s `build_rotation_envelope`). The operator
+/// pipes the printed hex into a validator's mempool, the same route as a
+/// reconfig / rotation tx.
+///
+/// `seq` must strictly exceed the validator's last-applied endpoint `seq`
+/// (the registry rejects a stale one at commit); the operator tracks it.
+pub fn build_endpoint_command(
+    req: &EndpointPublishRequest,
+) -> anyhow::Result<SignedEndpointCommand> {
+    let config = boule_core::config::load(&req.config_path)?;
+    let cons = config.consensus.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--config {} has no [consensus] section; an endpoint command binds to the \
+             chain's chain_id",
+            req.config_path.display(),
+        )
+    })?;
+    let chain_id = crate::genesis::derive_chain_id(cons)?;
+
+    // Resolve the validator signing key, mirroring `start` / rotation
+    // precedence: prefer `[node.validator_identity]`, else the network
+    // identity. It must already exist on disk.
+    let (id_cfg, slot) = match boule_core::config::resolve_validator_identity(&config.node) {
+        Some(cfg) => (cfg, "validator"),
+        None => match boule_core::config::resolve_identity(&config.node) {
+            Some(cfg) => (cfg, "network (legacy single-key)"),
+            None => anyhow::bail!(
+                "--config {} has no [node.validator_identity] or [node.identity]; publishing \
+                 endpoints needs the validator's consensus signing key",
+                req.config_path.display(),
+            ),
+        },
+    };
+    let identity = boule_core::config::build_provider(&id_cfg)?
+        .try_load()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no consensus key found via the {slot} `{}` backend; provision it via \
+                 `boule init` (or out-of-band) before publishing endpoints",
+                id_cfg.backend_name(),
+            )
+        })?;
+    let signer = boule_core::crypto::signed::NodeSigner::from_identity(&identity)?;
+
+    let payload = EndpointCommand {
+        validator: signer.node_id(),
+        seq: req.seq,
+        op: req.op.clone(),
+    };
+    Ok(SignedEndpointCommand::sign(payload, &signer, &chain_id))
+}
+
 /// Compact `Option`-free 64-byte signature codec (serde has no built-in
 /// array impl past length 32). Mirrors the helper in
 /// [`crate::validator_rotation`].
@@ -564,5 +630,61 @@ mod tests {
             .unwrap();
         assert_eq!(reg.endpoints_of(&a), &[entry(10, 9001)]);
         assert_eq!(reg.endpoints_of(&b), &[entry(20, 9002)]);
+    }
+
+    /// End-to-end CLI builder: mint a validator key + minimal config, build a
+    /// `Set` command, and confirm it is signed by that validator's key under
+    /// the config's derived chain_id.
+    #[test]
+    fn build_endpoint_command_signs_under_the_validator_key() {
+        use boule_core::crypto::signed::Signer as _;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("validator.key");
+        let provider =
+            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
+                path: key_path.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap();
+        let identity = provider.load_or_init().unwrap();
+        let validator = boule_core::crypto::signed::NodeSigner::from_identity(&identity)
+            .unwrap()
+            .node_id();
+        let validator_b58 = boule_core::identity::node_id_to_base58(&validator);
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[node]\n\
+                 listen_addr = \"127.0.0.1:7000\"\n\n\
+                 [node.identity]\n\
+                 backend = \"file\"\n\
+                 path = \"{key}\"\n\n\
+                 [api]\n\
+                 listen_addr = \"127.0.0.1:8000\"\n\n\
+                 [consensus]\n\
+                 validators = [\"{val}\"]\n\
+                 signature_scheme = \"ed25519_collected\"\n",
+                key = key_path.display(),
+                val = validator_b58,
+            ),
+        )
+        .unwrap();
+
+        let req = EndpointPublishRequest {
+            config_path: config_path.clone(),
+            seq: 1,
+            op: EndpointOp::Set(vec![entry(9, 9001)]),
+        };
+        let signed = build_endpoint_command(&req).expect("build must succeed");
+        assert_eq!(signed.payload.validator, validator);
+        assert_eq!(signed.payload.seq, 1);
+
+        let cfg = boule_core::config::load(&config_path).unwrap();
+        let chain_id = crate::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        assert_eq!(signed.verify(&validator, &chain_id), Ok(()));
     }
 }

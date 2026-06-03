@@ -4,6 +4,7 @@
 use clap::{Parser, Subcommand};
 
 mod config;
+mod endpoint;
 mod init;
 mod key;
 mod reconfig;
@@ -41,6 +42,9 @@ enum Command {
     /// Build validator key-rotation payloads (printed as hex).
     #[command(subcommand)]
     Rotation(rotation::RotationCmd),
+    /// Build validator endpoint-advertisement payloads (printed as hex).
+    #[command(subcommand)]
+    Endpoint(endpoint::EndpointCmd),
 }
 
 pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -69,5 +73,8 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Rotation(rotation::RotationCmd::HotRotate(a)) => {
             rotation::handle_hot_rotate(a).await
         }
+        Command::Endpoint(endpoint::EndpointCmd::Set(a)) => endpoint::handle_set(a),
+        Command::Endpoint(endpoint::EndpointCmd::Add(a)) => endpoint::handle_add(a),
+        Command::Endpoint(endpoint::EndpointCmd::Remove(a)) => endpoint::handle_remove(a),
     }
 }
