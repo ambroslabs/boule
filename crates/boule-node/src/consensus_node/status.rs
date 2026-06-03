@@ -7,7 +7,7 @@
 
 use std::sync::atomic::Ordering;
 
-use boule_consensus::hotstuff::qc::quorum_size;
+use boule_consensus::hotstuff::qc::{quorum_size, quorum_weight_threshold};
 use boule_consensus::pacemaker::Pacemaker;
 use boule_consensus::status::{
     BUCKET_VIEW_WINDOW, BackpressureStatus, CacheEvictionStatus, ConsensusStatus, LockedStatus,
@@ -94,11 +94,20 @@ impl ConsensusNode {
             .core
             .vote_buckets()
             .filter(|((view, _), _)| *view >= min_view && *view <= max_view)
-            .map(|((view, block_hash), qc)| VoteBucketStatus {
-                view: *view,
-                block_hash: hex::encode(block_hash),
-                signers: qc.signer_count(),
-                quorum,
+            .map(|((view, block_hash), qc)| {
+                // Weight units (#473) against the set authoritative at the
+                // bucket's view — the same set the QC's bitmap was formed over,
+                // so `signer_weight` matches its bitmap length.
+                let set_at = self.validator_history.set_at(*view);
+                let vs = set_at.for_view(*view);
+                VoteBucketStatus {
+                    view: *view,
+                    block_hash: hex::encode(block_hash),
+                    signers: qc.signer_count(),
+                    quorum,
+                    signer_weight: qc.signer_weight(vs),
+                    quorum_weight: quorum_weight_threshold(vs),
+                }
             })
             .collect();
         // Stable ordering keeps the JSON shape deterministic across
@@ -109,10 +118,17 @@ impl ConsensusNode {
             .timeout_buckets
             .iter()
             .filter(|(view, _)| **view >= min_view && **view <= max_view)
-            .map(|(view, bucket)| TimeoutBucketStatus {
-                view: *view,
-                signers: bucket.signers.len(),
-                quorum,
+            .map(|(view, bucket)| {
+                let set_at = self.validator_history.set_at(*view);
+                let vs = set_at.for_view(*view);
+                TimeoutBucketStatus {
+                    view: *view,
+                    signers: bucket.signers.len(),
+                    quorum,
+                    // The bucket already tracks signer weight (O(1) per insert).
+                    signer_weight: bucket.signer_weight,
+                    quorum_weight: quorum_weight_threshold(vs),
+                }
             })
             .collect();
         timeout_buckets.sort_by_key(|b| b.view);

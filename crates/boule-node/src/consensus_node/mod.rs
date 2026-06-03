@@ -1832,6 +1832,58 @@ mod tests {
         assert_eq!(status.backpressure.gossip_sink_overflow_total, 0);
     }
 
+    /// #473: status surfaces the weighted-quorum units (`signer_weight` /
+    /// `quorum_weight`), which the signer *count* misrepresents on a
+    /// non-uniformly-weighted chain.
+    #[test]
+    fn build_status_surfaces_signer_and_quorum_weight_on_buckets() {
+        use boule_consensus::hotstuff::qc::quorum_weight_threshold;
+        use boule_consensus::validator_set::ValidatorSet;
+
+        // Non-uniform weights so weight ≠ count (total 100 → threshold 67).
+        let vs = ValidatorSet::with_weights(vec![
+            (vid(1), 10),
+            (vid(2), 20),
+            (vid(3), 30),
+            (vid(4), 40),
+        ])
+        .unwrap();
+        let mut node = ConsensusNode::new(
+            nid(1),
+            test_config(vs.clone()),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Insert a timeout bucket at the current (in-window) view with one
+        // signer carrying weight 20.
+        let view = node.pacemaker.current_view();
+        node.timeout_buckets.insert(
+            view,
+            timeout_bucket::TimeoutBucket {
+                signers: std::collections::HashSet::from([*vid(2).as_node_id()]),
+                signer_weight: 20,
+                best_high_qc: None,
+            },
+        );
+
+        let status = node.build_status();
+        let tb = status
+            .timeout_buckets
+            .iter()
+            .find(|b| b.view == view)
+            .expect("the timeout bucket is surfaced");
+        assert_eq!(tb.signers, 1);
+        assert_eq!(tb.signer_weight, 20, "weight, not count");
+        assert_eq!(tb.quorum_weight, quorum_weight_threshold(&vs));
+        assert_ne!(
+            tb.signer_weight as usize, tb.signers,
+            "on a weighted chain the weight differs from the count",
+        );
+    }
+
     #[test]
     fn build_status_surfaces_wired_gossip_sink_overflow_counter() {
         // Wire a fresh counter, bump it, and assert build_status reads
