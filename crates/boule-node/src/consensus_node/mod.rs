@@ -4396,6 +4396,60 @@ mod tests {
         assert_eq!(reloaded.get(&eq_id), Some(&View(3)));
     }
 
+    /// #657b: evidence gossiped by a peer (a `ReceiveEquivocationEvidence`
+    /// dispatch — already verified at ingress) is minted into this node's
+    /// mempool for block inclusion, and a duplicate is a no-op.
+    #[tokio::test]
+    async fn gossiped_evidence_is_minted_into_the_mempool() {
+        use boule_consensus::dispatch::Dispatch;
+        use boule_consensus::equivocation_evidence::is_evidence_payload;
+
+        let (mut node, equivocator, eq_id) = node_with_equivocator();
+        let proof = double_vote_proof(&equivocator, &node.chain_id, 3, 0xAA, 0xBB);
+
+        let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
+        let (broadcaster, _rx) = make_test_broadcaster();
+        let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
+        let mut view_timer = ViewTimer::new(timer_tx);
+
+        node.apply_dispatch(
+            Dispatch::ReceiveEquivocationEvidence {
+                proof: proof.clone(),
+                validator_id: eq_id,
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .unwrap();
+        let minted = node.mempool.propose(16);
+        assert_eq!(
+            minted.iter().filter(|c| is_evidence_payload(c)).count(),
+            1,
+            "gossiped evidence must be minted into the mempool once",
+        );
+
+        // A duplicate receipt (gossip re-delivery) does not re-mint.
+        node.apply_dispatch(
+            Dispatch::ReceiveEquivocationEvidence {
+                proof,
+                validator_id: eq_id,
+            },
+            broadcaster.as_ref(),
+            &mut view_timer,
+            &signer,
+        )
+        .await
+        .unwrap();
+        let minted = node.mempool.propose(16);
+        assert_eq!(
+            minted.iter().filter(|c| is_evidence_payload(c)).count(),
+            1,
+            "duplicate gossiped evidence must not be re-minted",
+        );
+    }
+
     /// `Dispatch::ServeBlock` for an unknown hash returns
     /// `BlockResponse(None)` without erroring on storage. The peer's
     /// `block_sync_response_not_found` arm handles the negative case.
