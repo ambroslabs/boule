@@ -269,6 +269,29 @@ impl ConsensusNode {
         // reconfigs/rotations so the membership + key history the verifier
         // consults reflect changes committed in the same block.
         self.apply_committed_endpoints(&block);
+
+        // #540: feed the liveness detector this view's credited
+        // participation — the validators whose votes the committing QC
+        // folded in, against the membership at the block's view. Skip if the
+        // committing QC isn't cached (a block adopted via sync), so a missing
+        // QC never reads as cluster-wide silence. In-memory observability;
+        // not consensus state.
+        {
+            let view = block.header.view;
+            let qc = self.recent_qcs.lock().get(&block_hash).cloned();
+            if let Some(qc) = qc {
+                let set_at = self.validator_history.set_at(view);
+                let set = set_at.for_view(view);
+                let members: Vec<boule_consensus::validator_set::ValidatorId> =
+                    set.iter().copied().collect();
+                let credited: Vec<boule_consensus::validator_set::ValidatorId> = qc
+                    .signer_indices()
+                    .filter_map(|i| members.get(i).copied())
+                    .collect();
+                self.liveness_tracker.observe(&members, &credited);
+            }
+        }
+
         if let Some(notifier) = &self.commit_notifier {
             notifier.on_commit(&block, &block.header.state_commitment, block.header.view);
         }

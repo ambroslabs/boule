@@ -73,6 +73,7 @@ use boule_consensus::hotstuff::qc::{ConsensusMsg, VerifiedQc, genesis_qc_bls};
 use boule_consensus::hotstuff::step::{HotStuffCore, StateUpdate};
 use boule_consensus::hotstuff::{HotStuffState, QuorumCertificate, genesis_qc};
 use boule_consensus::limits::CacheEvictionCounters;
+use boule_consensus::liveness_tracker::LivenessTracker;
 use boule_consensus::operator_key_history::OperatorKeyHistory;
 use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::pacemaker::Pacemaker;
@@ -474,6 +475,13 @@ pub struct ConsensusNode {
     /// persisted + reloaded (under [`STORAGE_KEY_ENDPOINT_REGISTRY`]) rather
     /// than folded into the #325 anti-rollback commitment.
     endpoint_registry: EndpointRegistry,
+    /// Liveness-fault detector (#540): a rolling per-validator
+    /// credited-participation tracker fed each commit from the committing
+    /// QC's signers. In-memory observability only (not persisted, not in any
+    /// commitment) — it rebuilds over the next window after a restart, and
+    /// surfaces delinquents + the cluster participation signal in the status
+    /// snapshot. Enforcement is a follow-up.
+    liveness_tracker: LivenessTracker,
     /// Equivocators this node has already minted evidence into the mempool
     /// for this session (#657). A Byzantine validator equivocates on every
     /// view it participates in, so the detector would otherwise mint a fresh
@@ -759,6 +767,7 @@ impl ConsensusNode {
             equivocation_proofs_built: 0,
             committed_evidence: std::collections::BTreeMap::new(),
             endpoint_registry: EndpointRegistry::new(config.max_endpoint_list_length),
+            liveness_tracker: LivenessTracker::default(),
             evidence_minted: std::collections::HashSet::new(),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
@@ -1210,6 +1219,7 @@ impl ConsensusNode {
             equivocation_proofs_built: 0,
             committed_evidence,
             endpoint_registry,
+            liveness_tracker: LivenessTracker::default(),
             evidence_minted: std::collections::HashSet::new(),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
@@ -4718,6 +4728,38 @@ mod tests {
         // Seeded entries persist for recovery.
         let reloaded = ConsensusNode::load_endpoint_registry(node.storage.as_ref(), 8);
         assert_eq!(reloaded.endpoints_of(&added).len(), 1);
+    }
+
+    /// #540: a validator that stops being credited is flagged delinquent and
+    /// surfaced in the status snapshot.
+    #[test]
+    fn build_status_surfaces_liveness_delinquents() {
+        use boule_consensus::liveness_tracker::LIVENESS_MIN_SAMPLE_VIEWS;
+        use boule_consensus::validator_set::ValidatorId;
+
+        let node = make_node(nid(1));
+        let members: Vec<ValidatorId> = four_validators().iter().copied().collect();
+        let silent = ValidatorId::from_genesis_pubkey(nid(4));
+
+        // Feed enough committed-view observations (via the tracker the commit
+        // path drives) with nid(4) never credited to cross the sample floor.
+        let mut node = node;
+        for _ in 0..(LIVENESS_MIN_SAMPLE_VIEWS + 10) {
+            let credited: Vec<ValidatorId> =
+                members.iter().copied().filter(|m| *m != silent).collect();
+            node.liveness_tracker.observe(&members, &credited);
+        }
+
+        let status = node.build_status();
+        assert!(
+            status
+                .delinquent_validators
+                .contains(&node_id_to_base58(silent.as_node_id())),
+            "the silent validator must surface as delinquent: {:?}",
+            status.delinquent_validators,
+        );
+        // The healthy majority keeps the cluster signal well above the floor.
+        assert!(status.cluster_participation_permille.unwrap() >= 666);
     }
 
     /// A node whose validator `v` (a real signer) declares operator key
