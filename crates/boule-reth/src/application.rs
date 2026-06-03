@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use boule_consensus::hotstuff::QuorumCertificate;
 use boule_consensus::reconfig::ReconfigCommand;
 use boule_consensus::replication::application::{
-    AppContext, Application, CommitResult, IntegrationCapability, ValidatorUpdate,
+    AppContext, Application, CommitResult, IntegrationCapability, ValidatorEffect, ValidatorUpdate,
 };
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
@@ -43,8 +43,8 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
-use crate::staking;
 use crate::transport::EngineTransport;
+use crate::{rotation, staking};
 
 /// Max boule system txs to pull from the mempool into one proposal. Only a
 /// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
@@ -154,6 +154,49 @@ impl RethApplication {
             src.apply(node_id, op);
         }
         src.take_updates()
+    }
+
+    /// Read this block's rotation-predeploy events (#730) and turn each into a
+    /// [`ValidatorEffect::KeyRotation`] carrying the encoded rotation command.
+    /// Called only once the EL reports the block `VALID`, so its logs exist; a
+    /// failed `eth_getLogs` is logged and yields no effects (a transient RPC
+    /// error must not fail the commit — consensus commits regardless of the EL).
+    ///
+    /// Unlike staking (`derive_validator_updates`), there is no ledger to feed:
+    /// the rotation rides straight through to consensus, which verifies and
+    /// schedules it. The opaque command is *not* interpreted here — consensus
+    /// validates the tag and signatures when it materialises the effect.
+    ///
+    /// Read only on the normal per-block commit path: a rotation submitted in a
+    /// block the EL executed via background self-sync (#674) — skipped by
+    /// `commit` while `SYNCING` — is not backfilled here the way staking is,
+    /// since rotations have no re-anchored ledger to reconcile. A missed
+    /// rotation is recoverable (the submitter re-submits; `v_eff` is set ahead
+    /// of the lag), so backfilling rotations over self-synced gaps is a
+    /// follow-up, not a correctness requirement.
+    async fn derive_rotation_effects(&self, payload: &Value) -> Vec<ValidatorEffect> {
+        let Some(block_hash) = payload["blockHash"].as_str() else {
+            return Vec::new();
+        };
+        let logs = match self
+            .transport
+            .eth_rpc("eth_getLogs", rotation::logs_filter(block_hash))
+            .await
+        {
+            Ok(logs) => logs,
+            Err(e) => {
+                tracing::warn!(
+                    target: "boule::reth",
+                    error = %e,
+                    "eth_getLogs for rotation events failed; no rotation effects this block",
+                );
+                return Vec::new();
+            }
+        };
+        rotation::parse_rotation_logs(&logs)
+            .into_iter()
+            .map(ValidatorEffect::KeyRotation)
+            .collect()
     }
 
     /// Backfill the staking events of blocks the EL executed via background
@@ -469,8 +512,15 @@ impl Application for RethApplication {
             let validator_updates = self
                 .derive_validator_updates(&payload, block.header.height)
                 .await;
+            // Rotation predeploy events (#730): each carries an already-encoded,
+            // dual-signed rotation command submitted as an EVM tx. Surface them
+            // as KeyRotation effects; the integration layer re-materialises each
+            // into a block command where the existing rotation path verifies the
+            // signatures and schedules the v_eff swap.
+            let effects = self.derive_rotation_effects(&payload).await;
             Ok(CommitResult {
                 validator_updates,
+                effects,
                 ..Default::default()
             })
         })
@@ -498,13 +548,14 @@ impl Application for RethApplication {
 
     fn capabilities(&self) -> Vec<IntegrationCapability> {
         // The reth backend drives the validator set from on-chain staking logs
-        // (#655) and burns bonded stake on committed evidence (#658b); it does
-        // not (yet) drive key rotation, endpoint advertisement, parameter
-        // updates, or rewards through the seam (those are milestone-#4
-        // follow-ups — #730/#731/#542).
+        // (#655), burns bonded stake on committed evidence (#658b), and accepts
+        // key/operator rotations via the rotation predeploy (#730). It does not
+        // (yet) drive endpoint advertisement, parameter updates, or rewards
+        // through the seam (those are milestone-#4 follow-ups — #731/#542).
         vec![
             IntegrationCapability::Membership,
             IntegrationCapability::Slashing,
+            IntegrationCapability::KeyRotation,
         ]
     }
 
@@ -613,16 +664,18 @@ mod tests {
     }
 
     #[test]
-    fn declares_membership_and_slashing_capabilities() {
-        // #728: the reth backend drives the validator set (#655) and slashing
-        // (#658b), and declares exactly those — nothing it doesn't drive.
+    fn declares_membership_slashing_and_key_rotation_capabilities() {
+        // The reth backend drives the validator set (#655), slashing (#658b),
+        // and key rotation via the predeploy (#730) — and declares exactly
+        // those, nothing it doesn't drive.
         let app = make_app([0u8; 32]);
         let caps = app.capabilities();
         assert!(caps.contains(&IntegrationCapability::Membership));
         assert!(caps.contains(&IntegrationCapability::Slashing));
+        assert!(caps.contains(&IntegrationCapability::KeyRotation));
         assert!(!caps.contains(&IntegrationCapability::Rewards));
-        assert!(!caps.contains(&IntegrationCapability::KeyRotation));
-        assert_eq!(caps.len(), 2);
+        assert!(!caps.contains(&IntegrationCapability::EndpointAdvertisement));
+        assert_eq!(caps.len(), 3);
     }
 
     #[tokio::test]
@@ -721,6 +774,108 @@ mod tests {
             }],
             "a Withdraw of the full stake removes the validator (weight 0)",
         );
+    }
+
+    /// Test transport serving rotation-predeploy logs only for the rotation
+    /// `eth_getLogs` filter (keyed on the filter's `address`), so a commit's
+    /// staking read sees nothing and its rotation read sees the canned logs.
+    struct RotationTransport {
+        inner: FixtureTransport,
+        rotation_logs: Value,
+    }
+    impl EngineTransport for RotationTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, _method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+            let is_rotation = params[0]["address"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(rotation::ROTATION_ADDRESS));
+            let logs = if is_rotation {
+                self.rotation_logs.clone()
+            } else {
+                Value::Array(Vec::new())
+            };
+            Box::pin(async move { Ok(logs) })
+        }
+    }
+
+    /// ABI-encode a dynamic `bytes` value as the EVM lays it out in log data:
+    /// offset word (`0x20`), length word, then the right-padded payload.
+    fn abi_log_bytes(payload: &[u8]) -> String {
+        let mut data = Vec::new();
+        let mut off = [0u8; 32];
+        off[31] = 0x20;
+        data.extend_from_slice(&off);
+        let mut len = [0u8; 32];
+        len[24..32].copy_from_slice(&(payload.len() as u64).to_be_bytes());
+        data.extend_from_slice(&len);
+        data.extend_from_slice(payload);
+        data.extend(std::iter::repeat_n(0u8, (32 - payload.len() % 32) % 32));
+        format!("0x{}", hex::encode(data))
+    }
+
+    /// #730 end-to-end (reth side): a rotation-predeploy event in a committed
+    /// block surfaces as a `ValidatorEffect::KeyRotation` carrying the opaque
+    /// rotation command, which the integration layer then materialises. reth
+    /// does not interpret the command — it passes the bytes straight through.
+    #[tokio::test]
+    async fn commit_reads_rotation_logs_into_key_rotation_effects() {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        let cmd = b"OKROT-fake-encoded-dual-signed-rotation-command";
+        let rotation_logs = serde_json::json!([{
+            "topics": [rotation::ROTATION_TOPIC, format!("0x{}", "02".repeat(32))],
+            "data": abi_log_bytes(cmd),
+        }]);
+        let app = RethApplication::new(
+            Box::new(RotationTransport {
+                inner: FixtureTransport,
+                rotation_logs,
+            }),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::seeded_from([([2u8; 32], 1u64)])),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        );
+
+        let g = genesis();
+        let block = app
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
+            .await
+            .expect("build");
+        let result = app
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit");
+
+        assert!(
+            result.validator_updates.is_empty(),
+            "no staking logs at the rotation address",
+        );
+        assert_eq!(result.effects.len(), 1, "one rotation event → one effect");
+        match &result.effects[0] {
+            ValidatorEffect::KeyRotation(bytes) => {
+                assert_eq!(
+                    bytes.as_ref(),
+                    cmd.as_ref(),
+                    "the opaque command rides through"
+                );
+            }
+            other => panic!("expected KeyRotation, got {other:?}"),
+        }
     }
 
     /// The reth builder must carry a pending boule system tx (a minted

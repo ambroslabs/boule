@@ -33,6 +33,7 @@
 pub mod application;
 pub mod engine;
 pub mod jwt;
+pub mod rotation;
 pub mod staking;
 pub mod transport;
 
