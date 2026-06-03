@@ -112,6 +112,51 @@ pub struct ValidatorEntry {
     /// Always serialized (postcard is schema-bound) — `None` adds one Option
     /// discriminant byte, like `bls_pop`.
     pub operator_pubkey: Option<NodeId>,
+    /// Inbound-consent signature (#548): an **operator-key** signature over
+    /// the canonical [`ReconfigAddConsent`](crate::reconfig_consent::ReconfigAddConsent)
+    /// pre-image of this entry's terms (`node_id`, `addr`, `bls_pop`,
+    /// `weight`, `operator_pubkey`, and the command's `v_eff`).
+    ///
+    /// Required whenever `operator_pubkey` is `Some`: an add that names an
+    /// operator key must prove that operator consented to being seated on
+    /// these exact terms, so a leader cannot conscript an honest operator's
+    /// identity or alter the terms they agreed to.
+    /// [`ReconfigCommand::validate_against_with_delay_and_scheme`] rejects an
+    /// add with an `operator_pubkey` but a missing or invalid `consent_sig`. Adds
+    /// with no `operator_pubkey` carry `None` and stay unauthenticated (the
+    /// existing-committee-approval half of #548 is gossip-dependent and out
+    /// of scope).
+    ///
+    /// Serialized via [`serde_optional_sig`] so the 64-byte signature stays
+    /// a compact byte blob; `None` adds a single Option discriminant byte,
+    /// like `bls_pop` / `operator_pubkey`.
+    #[serde(with = "serde_optional_sig")]
+    pub consent_sig: Option<[u8; 64]>,
+}
+
+/// Serialize an `Option<[u8; 64]>` signature as an optional byte sequence
+/// rather than as an `Option` of 64 individually-serialized `u8`s (serde
+/// provides no built-in array impl past length 32). Mirrors the
+/// `serde_sig` helper in [`crate::validator_rotation`], wrapped in `Option`.
+mod serde_optional_sig {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S: Serializer>(sig: &Option<[u8; 64]>, s: S) -> Result<S::Ok, S::Error> {
+        let as_slice: Option<&[u8]> = sig.as_ref().map(|b| &b[..]);
+        serde::Serialize::serialize(&as_slice, s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 64]>, D::Error> {
+        let v: Option<Vec<u8>> = Option::<Vec<u8>>::deserialize(d)?;
+        match v {
+            None => Ok(None),
+            Some(bytes) => bytes
+                .as_slice()
+                .try_into()
+                .map(Some)
+                .map_err(|_| D::Error::custom("consent signature must be exactly 64 bytes")),
+        }
+    }
 }
 
 /// A weight-only adjustment for a currently-seated validator. Equivalent
@@ -190,6 +235,7 @@ impl ReconfigCommand {
                 bls_pop: None,
                 weight,
                 operator_pubkey: None,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -456,6 +502,36 @@ impl ReconfigCommand {
             }
         }
 
+        // #548 inbound consent: an add that names an operator key must
+        // carry a valid operator-key signature attesting the inbound
+        // validator consents to these exact terms. Both the live
+        // commit-apply path and the pure recovery-rebuild path call this
+        // one validator, so enforcing the check here keeps them in lockstep
+        // (#325 parity): a consent failure drops the reconfig identically on
+        // both sides. Keyless adds remain unauthenticated — the
+        // existing-committee-approval half of #548 is gossip-dependent and
+        // out of scope.
+        for entry in &self.adds {
+            if entry.operator_pubkey.is_none() {
+                continue;
+            }
+            let consent = crate::reconfig_consent::ReconfigAddConsent::for_entry(entry, self.v_eff)
+                .expect("operator_pubkey is Some, so for_entry returns Some");
+            let sig = entry.consent_sig.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "validator {} declares an operator key but carries no inbound-consent \
+                     signature (#548)",
+                    hex::encode(entry.node_id),
+                )
+            })?;
+            consent.verify(sig, chain_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "inbound-consent signature for validator {} is invalid: {e}",
+                    hex::encode(entry.node_id),
+                )
+            })?;
+        }
+
         // Build the (NodeId, weight) map. Start from the current set's
         // weights, drop removes, apply changes, append adds; sort by
         // NodeId for deterministic output.
@@ -559,6 +635,7 @@ pub fn build_add_validator_payload(
     bls_pop_file: Option<&Path>,
     bls_key_file: Option<&Path>,
     operator_pubkey: Option<NodeId>,
+    consent_sig: Option<[u8; 64]>,
 ) -> anyhow::Result<Bytes> {
     if bls_pop_file.is_some() && bls_key_file.is_some() {
         anyhow::bail!(
@@ -639,6 +716,7 @@ pub fn build_add_validator_payload(
             bls_pop,
             weight,
             operator_pubkey,
+            consent_sig,
         }],
         removes: vec![],
         changes: vec![],
@@ -751,7 +829,113 @@ mod tests {
             bls_pop: None,
             weight,
             operator_pubkey: None,
+            consent_sig: None,
         }
+    }
+
+    fn fresh_signer() -> boule_core::crypto::signed::NodeSigner {
+        use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
+        let kp = RcgenKeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let id = boule_core::identity::NodeIdentity {
+            pkcs8_der: zeroize::Zeroizing::new(kp.serialize_der()),
+        };
+        boule_core::crypto::signed::NodeSigner::from_identity(&id).unwrap()
+    }
+
+    /// An add entry for `nid(b)` carrying `operator`'s key plus a valid
+    /// inbound-consent signature over the entry's terms at `v_eff`, signed
+    /// under [`ChainId::TEST`] (what the `validate_against*` test shims use).
+    fn consented_entry(
+        b: u8,
+        port: u16,
+        operator: &boule_core::crypto::signed::NodeSigner,
+        v_eff: View,
+    ) -> ValidatorEntry {
+        use boule_core::crypto::signed::Signer;
+        let mut entry = ValidatorEntry {
+            node_id: nid(b),
+            addr: addr(port),
+            bls_pop: None,
+            weight: 1,
+            operator_pubkey: Some(operator.node_id()),
+            consent_sig: None,
+        };
+        let consent =
+            crate::reconfig_consent::ReconfigAddConsent::for_entry(&entry, v_eff).unwrap();
+        entry.consent_sig = Some(consent.sign(operator, &ChainId::TEST).unwrap());
+        entry
+    }
+
+    #[test]
+    fn add_with_operator_key_and_valid_consent_passes() {
+        let cur = floor_set();
+        let operator = fresh_signer();
+        let cmd = ReconfigCommand {
+            adds: vec![consented_entry(10, 7010, &operator, View(10))],
+            removes: vec![],
+            changes: vec![],
+            v_eff: View(10),
+        };
+        assert!(cmd.validate_against(&cur, 0).is_ok());
+    }
+
+    #[test]
+    fn add_with_operator_key_but_no_consent_is_rejected() {
+        let cur = floor_set();
+        let operator = fresh_signer();
+        use boule_core::crypto::signed::Signer;
+        let cmd = ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(10),
+                addr: addr(7010),
+                bls_pop: None,
+                weight: 1,
+                operator_pubkey: Some(operator.node_id()),
+                consent_sig: None,
+            }],
+            removes: vec![],
+            changes: vec![],
+            v_eff: View(10),
+        };
+        let err = cmd.validate_against(&cur, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("no inbound-consent signature"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn add_with_operator_key_and_tampered_terms_is_rejected() {
+        let cur = floor_set();
+        let operator = fresh_signer();
+        // Sign consent for weight 1, then bump the weight: the committed
+        // terms no longer match what the operator agreed to.
+        let mut entry = consented_entry(10, 7010, &operator, View(10));
+        entry.weight = 5;
+        let cmd = ReconfigCommand {
+            adds: vec![entry],
+            removes: vec![],
+            changes: vec![],
+            v_eff: View(10),
+        };
+        let err = cmd.validate_against(&cur, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("inbound-consent signature"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn add_without_operator_key_needs_no_consent() {
+        // The unauthenticated path is unchanged: a keyless add still passes.
+        let cur = floor_set();
+        let cmd = ReconfigCommand {
+            adds: vec![entry(10, 7010)],
+            removes: vec![],
+            changes: vec![],
+            v_eff: View(10),
+        };
+        assert!(cmd.validate_against(&cur, 0).is_ok());
     }
 
     fn floor_set() -> ValidatorSet {
@@ -1071,6 +1255,7 @@ mod tests {
             bls_pop: Some(pop),
             weight: 1,
             operator_pubkey: None,
+            consent_sig: None,
         }
     }
 

@@ -197,6 +197,7 @@ mod tests {
             bls_pop: None,
             weight: 7,
             operator_pubkey: Some(operator.node_id()),
+            consent_sig: None,
         }
     }
 
@@ -208,6 +209,7 @@ mod tests {
             bls_pop: None,
             weight: 1,
             operator_pubkey: None,
+            consent_sig: None,
         };
         assert!(ReconfigAddConsent::for_entry(&entry, View(100)).is_none());
     }

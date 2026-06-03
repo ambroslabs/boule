@@ -3679,7 +3679,9 @@ mod tests {
     #[test]
     fn reconfig_add_with_operator_key_registers_it_live() {
         use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, ValidatorEntry};
+        use boule_consensus::reconfig_consent::ReconfigAddConsent;
         use boule_consensus::validator_set::ValidatorId;
+        use boule_core::crypto::signed::Signer;
 
         let mut node = make_node(nid(1));
         assert!(
@@ -3689,15 +3691,24 @@ mod tests {
 
         let v_eff = MIN_V_EFF_DELAY + 3;
         let added = nid(5);
-        let operator = nid(0x9e);
+        // #548: an add naming an operator key must carry that operator's
+        // inbound-consent signature over the exact terms, or the reconfig is
+        // dropped at apply. Use a real operator keypair so the signature
+        // verifies.
+        let operator_signer = fresh_signer();
+        let operator = operator_signer.node_id();
+        let mut entry = ValidatorEntry {
+            node_id: added,
+            addr: "127.0.0.1:9005".parse().unwrap(),
+            bls_pop: None,
+            operator_pubkey: Some(operator),
+            weight: 1,
+            consent_sig: None,
+        };
+        let consent = ReconfigAddConsent::for_entry(&entry, v_eff).unwrap();
+        entry.consent_sig = Some(consent.sign(&operator_signer, &node.chain_id).unwrap());
         let cmd = ReconfigCommand {
-            adds: vec![ValidatorEntry {
-                node_id: added,
-                addr: "127.0.0.1:9005".parse().unwrap(),
-                bls_pop: None,
-                operator_pubkey: Some(operator),
-                weight: 1,
-            }],
+            adds: vec![entry],
             removes: vec![],
             changes: vec![],
             v_eff,
@@ -3738,6 +3749,7 @@ mod tests {
                 bls_pop: None,
                 operator_pubkey: None,
                 weight: 1,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -3796,6 +3808,7 @@ mod tests {
             bls_pop: None,
             operator_pubkey: None,
             weight: 1,
+            consent_sig: None,
         };
         let block = block_with_reconfig(1, 0, nid(1), cmd);
         node.apply_commit(block);
@@ -3819,6 +3832,7 @@ mod tests {
                 bls_pop: None,
                 operator_pubkey: None,
                 weight: 1,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -3844,6 +3858,7 @@ mod tests {
                 bls_pop: None,
                 operator_pubkey: None,
                 weight: 1,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -3856,6 +3871,7 @@ mod tests {
                 bls_pop: None,
                 operator_pubkey: None,
                 weight: 1,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -3931,6 +3947,7 @@ mod tests {
                 bls_pop: None,
                 operator_pubkey: None,
                 weight: 1,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -4173,6 +4190,7 @@ mod tests {
                 bls_pop: None,
                 operator_pubkey: None,
                 weight: 1,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -9998,6 +10016,7 @@ mod tests {
                 bls_pop: None,
                 operator_pubkey: None,
                 weight: 1,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
@@ -10101,6 +10120,7 @@ mod tests {
                 bls_pop: None,
                 operator_pubkey: None,
                 weight: 1,
+                consent_sig: None,
             }],
             removes: vec![],
             changes: vec![],
