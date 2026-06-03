@@ -128,8 +128,9 @@ impl ConsensusNode {
 
     /// Persist the endpoint registry. Logged-and-dropped on error (the
     /// in-memory registry stays authoritative for this session; the next
-    /// applying commit re-attempts the flush).
-    fn persist_endpoint_registry(&self) {
+    /// applying commit re-attempts the flush). `pub(super)` so the reconfig
+    /// apply path can re-persist after GC'ing a removed validator's entries.
+    pub(super) fn persist_endpoint_registry(&self) {
         match postcard::to_stdvec(&self.endpoint_registry) {
             Ok(bytes) => {
                 if let Err(e) = self.storage.put(STORAGE_KEY_ENDPOINT_REGISTRY, &bytes) {

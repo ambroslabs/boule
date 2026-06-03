@@ -48,6 +48,9 @@ impl ConsensusNode {
         // — the operator-key history persists under its own key (and, unlike
         // signing keys, is NOT re-derivable from the set, so it must be saved).
         let mut operator_history_changed = false;
+        // #546: track endpoint-registry GC (a removed validator's entries
+        // dropped) so we re-persist the registry once if anything changed.
+        let mut endpoint_registry_changed = false;
         for cmd_bytes in &block.commands {
             if !ReconfigCommand::is_reconfig_payload(cmd_bytes) {
                 continue;
@@ -216,6 +219,21 @@ impl ConsensusNode {
                     operator_history_changed = true;
                 }
             }
+
+            // #546: GC the endpoint entries of validators this reconfig
+            // removes, so the registry doesn't grow without bound across
+            // membership churn. Done at the reconfig's commit (slightly
+            // ahead of the removal's `v_eff`): endpoint entries are
+            // non-binding discovery hints, so dropping a soon-to-leave
+            // validator's hints a few views early just falls its peers back
+            // to the gossip overlay — harmless. (Precise `v_eff + k` timing
+            // remains the #546 refinement.) `forget` is a no-op for a
+            // validator with no published entries.
+            for removed in &cmd.removes {
+                if self.endpoint_registry.forget(removed) {
+                    endpoint_registry_changed = true;
+                }
+            }
         }
 
         // #549: persist the operator-key history if a reconfig add registered
@@ -237,6 +255,14 @@ impl ConsensusNode {
                     "operator_key_history_encode_failed",
                 ),
             }
+        }
+
+        // #546: re-persist the endpoint registry if a removed validator's
+        // entries were GC'd. The registry lives outside the #325
+        // anti-rollback commitment, so this is a plain persist (no
+        // commitment/rebuild interaction).
+        if endpoint_registry_changed {
+            self.persist_endpoint_registry();
         }
 
         // #254: durably persist the updated history once any boundary

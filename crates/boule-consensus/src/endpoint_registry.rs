@@ -272,10 +272,11 @@ impl EndpointRegistry {
     }
 
     /// Drop a validator's entire endpoint state — used when a validator is
-    /// removed from the set (GC at `v_eff + k`, #546 lifecycle). A no-op if
-    /// absent.
-    pub fn forget(&mut self, validator: &NodeId) {
-        self.by_validator.remove(validator);
+    /// removed from the set (#546 lifecycle). Returns `true` if the validator
+    /// had state that was removed, `false` if it was absent (a no-op), so the
+    /// caller can decide whether a re-persist is warranted.
+    pub fn forget(&mut self, validator: &NodeId) -> bool {
+        self.by_validator.remove(validator).is_some()
     }
 
     /// Apply a (already signature-verified) command. Enforces the monotone
