@@ -857,6 +857,15 @@ impl ConsensusNode {
     /// its [`Application`] here at startup. The counter's mempool and
     /// state machine constructed by `new`/`recover` are then unused.
     pub fn with_application(mut self, app: Arc<dyn Application>) -> Self {
+        // Surface the integration capabilities this backend declares (#728) so
+        // the execution-layer transaction surface it drives — and, by omission,
+        // the hooks it leaves to consensus — is visible rather than silent.
+        let caps = app.capabilities();
+        tracing::info!(
+            target: TRACE_TARGET,
+            capabilities = ?caps,
+            "application_wired",
+        );
         self.app = app;
         self
     }

@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use boule_consensus::hotstuff::QuorumCertificate;
 use boule_consensus::reconfig::ReconfigCommand;
 use boule_consensus::replication::application::{
-    AppContext, Application, CommitResult, ValidatorUpdate,
+    AppContext, Application, CommitResult, IntegrationCapability, ValidatorUpdate,
 };
 use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::replication::mempool::Mempool;
@@ -496,6 +496,18 @@ impl Application for RethApplication {
         self.stake_source.lock().slash(node_id);
     }
 
+    fn capabilities(&self) -> Vec<IntegrationCapability> {
+        // The reth backend drives the validator set from on-chain staking logs
+        // (#655) and burns bonded stake on committed evidence (#658b); it does
+        // not (yet) drive key rotation, endpoint advertisement, parameter
+        // updates, or rewards through the seam (those are milestone-#4
+        // follow-ups — #730/#731/#542).
+        vec![
+            IntegrationCapability::Membership,
+            IntegrationCapability::Slashing,
+        ]
+    }
+
     fn executed_height(&self) -> Option<Height> {
         // reth's executed frontier: the last committed block whose payload the
         // EL reported VALID. Lags the consensus committed height while the EL
@@ -598,6 +610,19 @@ mod tests {
         assert_eq!(block.commands.len(), 1);
         let payload: Value = serde_json::from_slice(&block.commands[0]).unwrap();
         assert_eq!(payload["blockHash"], BLOCK1);
+    }
+
+    #[test]
+    fn declares_membership_and_slashing_capabilities() {
+        // #728: the reth backend drives the validator set (#655) and slashing
+        // (#658b), and declares exactly those — nothing it doesn't drive.
+        let app = make_app([0u8; 32]);
+        let caps = app.capabilities();
+        assert!(caps.contains(&IntegrationCapability::Membership));
+        assert!(caps.contains(&IntegrationCapability::Slashing));
+        assert!(!caps.contains(&IntegrationCapability::Rewards));
+        assert!(!caps.contains(&IntegrationCapability::KeyRotation));
+        assert_eq!(caps.len(), 2);
     }
 
     #[tokio::test]
