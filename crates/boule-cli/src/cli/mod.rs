@@ -66,5 +66,8 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Rotation(rotation::RotationCmd::ProposeOperatorKeyRotation(a)) => {
             rotation::handle_propose_operator_key_rotation(a)
         }
+        Command::Rotation(rotation::RotationCmd::HotRotate(a)) => {
+            rotation::handle_hot_rotate(a).await
+        }
     }
 }

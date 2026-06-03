@@ -5,6 +5,7 @@
 //! tests and the `start` subcommand share one definition of "what a
 //! running node looks like".
 
+pub mod admin_api;
 pub mod consensus_node;
 pub mod demo_staking;
 pub mod rotatable_signer;
@@ -248,7 +249,8 @@ pub async fn run(
         if let Some(rc) = consensus_runtime.as_ref() {
             app = app
                 .merge(boule_consensus::api::router(rc.status_rx.clone()))
-                .merge(boule_consensus::api::submit_router(Arc::clone(&rc.mempool)));
+                .merge(boule_consensus::api::submit_router(Arc::clone(&rc.mempool)))
+                .merge(crate::admin_api::router(Arc::clone(&rc.rotation)));
         }
         tokio::spawn(async move {
             info!("HTTP API listening on {api_actual_addr}");
@@ -321,10 +323,9 @@ struct RunningConsensus {
     mempool: Arc<dyn Mempool>,
     /// #707: runtime hot-rotation trigger, retaining the live
     /// `RotatableSigner` handle so an operator can rotate the consensus
-    /// signing key without restarting. Held here (rather than dropped into
-    /// the run-loop task) so an admin surface can reach it.
-    #[allow(dead_code)]
-    rotation: crate::rotation_handle::RotationHandle,
+    /// signing key without restarting. Shared with the `POST
+    /// /admin/rotate-key` admin router (see [`crate::admin_api`]).
+    rotation: Arc<crate::rotation_handle::RotationHandle>,
     /// Oneshot that gracefully stops the gossip overlay (the
     /// orchestrator + publisher + partial-mesh maintenance tasks).
     overlay_shutdown: Option<oneshot::Sender<()>>,
@@ -673,14 +674,14 @@ async fn start_consensus(
         genesis_signer,
         Arc::clone(&signing_view),
     ));
-    let rotation = crate::rotation_handle::RotationHandle::new(
+    let rotation = Arc::new(crate::rotation_handle::RotationHandle::new(
         *self_id,
         boule_consensus::genesis::derive_chain_id(cons_cfg)?,
         cons_cfg.signature_scheme,
         signing_view,
         Arc::clone(&mempool),
         Arc::clone(&rotatable_signer),
-    );
+    ));
     let signer: Arc<dyn boule_core::crypto::signed::Signer> = rotatable_signer;
     let join = tokio::spawn(async move {
         node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
