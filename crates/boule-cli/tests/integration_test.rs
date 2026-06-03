@@ -319,14 +319,25 @@ async fn test_four_node_full_mesh_is_stable_under_simultaneous_dials() {
         .map(|d| d.path().join("node.key").to_str().unwrap().to_owned())
         .collect();
 
-    // Phase 1: discover every node's address concurrently. The previous
-    // sequential loop paid per-node spawn + bind + shutdown latency four
-    // times in a row.
+    // Phase 1: discover every node's identity concurrently. The port phase 1
+    // binds is discarded — phase 2 uses a freshly *reserved* port (below), so
+    // no address is freed for a concurrent shard test to grab in between.
     let discovered: Vec<DiscoveryInfo> =
         futures_util::future::join_all(key_paths.iter().map(|p| launch_once_for_discovery(p)))
             .await;
-    let p2p_addrs: Vec<String> = discovered.iter().map(|d| d.p2p_addr.clone()).collect();
     let node_ids: Vec<String> = discovered.iter().map(|d| d.node_id.clone()).collect();
+
+    // Reserve a fresh P2P port per node and HOLD it through peer-list
+    // construction, so the seconds-long window that made re-binding a
+    // phase-1-freed port flaky (#678/#680) is gone: each reservation is
+    // released only in the same breath as its node spawns.
+    let reservations: Vec<std::net::TcpListener> = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("reserve a P2P port"))
+        .collect();
+    let p2p_addrs: Vec<String> = reservations
+        .iter()
+        .map(|l| l.local_addr().unwrap().to_string())
+        .collect();
 
     // Phase 2: relaunch every node concurrently with the full peer list.
     let peer_lists: Vec<Vec<PeerDesc<'_>>> = (0..N)
@@ -340,10 +351,11 @@ async fn test_four_node_full_mesh_is_stable_under_simultaneous_dials() {
                 .collect()
         })
         .collect();
-    let guards: Vec<NodeGuard> = futures_util::future::join_all(
-        (0..N).map(|i| spawn_node_fixed_port(&key_paths[i], &p2p_addrs[i], &peer_lists[i])),
-    )
-    .await;
+    let guards: Vec<NodeGuard> =
+        futures_util::future::join_all(reservations.into_iter().enumerate().map(
+            |(i, reservation)| spawn_node_fixed_port(&key_paths[i], reservation, &peer_lists[i]),
+        ))
+        .await;
 
     let ready_timeout = Duration::from_secs(10);
     futures_util::future::join_all(guards.iter().map(|g| wait_until_ready(g, ready_timeout))).await;
@@ -456,14 +468,26 @@ async fn launch_once_for_discovery(key_path: &str) -> DiscoveryInfo {
     info
 }
 
-/// Spawn a node whose P2P listener binds to `fixed_p2p_addr` (so phase 2
-/// reuses the address phase 1 discovered) and whose `[[peers]]` list is
-/// set from `peers`. The API listener still uses port 0.
+/// Spawn a node whose P2P listener binds the port `reservation` is holding,
+/// and whose `[[peers]]` list is set from `peers`. The API listener still uses
+/// port 0.
+///
+/// `reservation` is a `TcpListener` the caller bound on `127.0.0.1:0` and has
+/// held continuously since phase 1 — so the port could not be grabbed by a
+/// concurrent test during discovery + config construction (the seconds-long
+/// window that made re-binding a phase-1-freed port flaky, #678/#680). It is
+/// released here only at the last moment, in the same breath as the node
+/// spawn, leaving just this node's own startup→bind as the residual race (which
+/// the reap-and-retry loop absorbs).
 async fn spawn_node_fixed_port(
     key_path: &str,
-    fixed_p2p_addr: &str,
+    reservation: std::net::TcpListener,
     peers: &[PeerDesc<'_>],
 ) -> NodeGuard {
+    let fixed_p2p_addr = reservation
+        .local_addr()
+        .expect("reservation has a local address")
+        .to_string();
     let addr_file = NamedTempFile::new().unwrap();
     let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
 
@@ -495,20 +519,23 @@ async fn spawn_node_fixed_port(
             .spawn()
             .expect("failed to spawn node binary")
     };
+    // `run_init` above only generated the key — it never bound the port, so the
+    // reservation held it throughout. Release it and spawn the node in the same
+    // breath, so the only window in which the port is free is this node's own
+    // startup → bind, not the whole discovery phase.
+    drop(reservation);
     let mut child = spawn_child();
 
     // 30s headroom for a spawned binary to bind + write addr_file under
     // CI's oversubscribed parallelism (#303). This is the phase-2
     // concurrent spawn fan-out, the worst case for startup contention.
     //
-    // The P2P listener binds a *fixed* port rediscovered in phase 1. Between
-    // phase 1 freeing that ephemeral port (SIGKILL) and this bind, another
-    // concurrent test in the shard can transiently be assigned the same port
-    // by the OS, so the node exits immediately with `EADDRINUSE` (#678). When
-    // the child exits before publishing its addr file, re-spawn it on the
-    // same port: the squatter is another short-lived test bind that releases
-    // the port well within the deadline, and once we win the bind the running
-    // node holds it.
+    // The reservation closed the seconds-long window that made this flaky
+    // (#678/#680), but a foreign port-0 bind can still, very rarely, land on
+    // the just-released port during the node's startup. If the child exits
+    // before publishing its addr file (an `EADDRINUSE` on bind), reap and
+    // re-spawn on the same port — once we win the bind the running node holds
+    // it.
     let deadline = Instant::now() + Duration::from_secs(30);
     let addrs = loop {
         if Instant::now() > deadline {
@@ -548,35 +575,23 @@ async fn spawn_node_fixed_port(
     }
 }
 
-/// Regression for #678: `spawn_node_fixed_port` must survive the
-/// phase-2 `EADDRINUSE` bind race. Hold the target P2P port with a
-/// listener (standing in for the concurrent test that transiently grabbed
-/// the phase-1-freed port), start the node against it, then release the
-/// port and assert the node still binds it and comes up within the
-/// deadline — i.e. the helper re-spawned across the failed bind(s).
+/// Regression for #678/#680: phase 2 binds a *reserved* port — one the test
+/// has held continuously since phase 1 — so a concurrent test cannot grab it
+/// in the discovery→bind window. The node binds exactly the reserved port and
+/// comes up, with the reservation released only at spawn time (inside
+/// `spawn_node_fixed_port`).
 #[tokio::test]
-async fn phase_two_node_recovers_from_transient_port_squatter() {
-    // Reserve a concrete port and keep squatting it so the node's first
-    // bind attempts fail with EADDRINUSE.
-    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let p2p_addr = squatter.local_addr().unwrap().to_string();
+async fn phase_two_node_binds_its_reserved_port() {
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let p2p_addr = reservation.local_addr().unwrap().to_string();
 
     let key_dir = tempfile::tempdir().unwrap();
     let key_path = key_dir.path().join("node.key").to_str().unwrap().to_owned();
 
-    // Release the port ~800ms in, after the node has failed to bind at
-    // least once and re-spawned, so the test exercises the retry path.
-    let release = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        drop(squatter);
-    });
+    let guard = spawn_node_fixed_port(&key_path, reservation, &[]).await;
 
-    let guard = spawn_node_fixed_port(&key_path, &p2p_addr, &[]).await;
-    release.await.unwrap();
-
-    // The node bound the previously-squatted fixed port. `key_dir` and
-    // `guard` live to the end of scope, keeping the key file and the node
-    // process alive for the assertion.
+    // The node bound the exact reserved port. `key_dir` and `guard` live to
+    // the end of scope, keeping the key file and node process alive.
     assert_eq!(guard.p2p_addr, p2p_addr);
 }
 
