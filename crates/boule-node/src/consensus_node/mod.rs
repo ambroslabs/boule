@@ -4606,6 +4606,64 @@ mod tests {
         );
     }
 
+    /// #546 GC: when a reconfig removes a validator, its published endpoint
+    /// entries are dropped (so the registry doesn't grow without bound).
+    #[test]
+    fn reconfig_remove_gcs_the_validators_endpoints() {
+        use boule_consensus::endpoint_registry::EndpointOp;
+        use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand};
+        use boule_consensus::validator_set::{ValidatorId, ValidatorSet};
+
+        // A 5-validator set with `signer` as a real member at index 0, so
+        // removing it leaves 4 (>= MIN_VALIDATOR_FLOOR) and the reconfig is
+        // accepted.
+        let signer = fresh_signer();
+        let svid = ValidatorId::from_genesis_pubkey(signer.node_id());
+        let vs = ValidatorSet::new(vec![svid, vid(2), vid(3), vid(4), vid(5)]);
+        let mut node = ConsensusNode::new(
+            signer.node_id(),
+            test_config(vs),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+
+        // Publish endpoints for the member.
+        let publish = signed_endpoint(
+            &signer,
+            signer.node_id(),
+            1,
+            EndpointOp::Set(vec![endpoint_entry(9, 9001)]),
+            &node.chain_id,
+        );
+        node.apply_committed_endpoints(&block_with_commands(1, 0, vec![publish]));
+        assert_eq!(
+            node.endpoint_registry.endpoints_of(&signer.node_id()),
+            &[endpoint_entry(9, 9001)]
+        );
+
+        // A reconfig removing that validator commits; its endpoints are GC'd.
+        let v_eff = MIN_V_EFF_DELAY + 3;
+        let reconfig = ReconfigCommand {
+            adds: vec![],
+            removes: vec![signer.node_id()],
+            changes: vec![],
+            v_eff,
+        }
+        .encode();
+        node.apply_committed_reconfigs(&block_with_commands(2, 1, vec![reconfig]));
+        assert!(
+            node.endpoint_registry
+                .endpoints_of(&signer.node_id())
+                .is_empty(),
+            "a removed validator's endpoint entries must be GC'd"
+        );
+        // The GC persisted: a reload sees the empty state too.
+        let reloaded = ConsensusNode::load_endpoint_registry(node.storage.as_ref(), 8);
+        assert!(reloaded.endpoints_of(&signer.node_id()).is_empty());
+    }
+
     /// A node whose validator `v` (a real signer) declares operator key
     /// `operator` at genesis, plus a fresh `new` signer to recover to.
     fn node_with_operator_key() -> (ConsensusNode, NodeSigner, NodeSigner, ValidatorId) {
