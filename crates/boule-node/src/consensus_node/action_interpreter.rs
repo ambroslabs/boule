@@ -1062,6 +1062,7 @@ impl ConsensusNode {
                     {
                         let rejected = block.commands.iter().find_map(|cmd| {
                             if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
+                                || boule_consensus::validator_rotation::DualSignedRotationCancel::is_cancel_payload(cmd)
                                 || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
                                 // Equivocation-evidence system txs (#657) are
                                 // consensus-layer, validated at commit — skip

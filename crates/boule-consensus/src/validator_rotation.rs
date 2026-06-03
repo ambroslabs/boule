@@ -22,6 +22,33 @@
 //! in `consensus::node::ConsensusNode::apply_committed_rotations`
 //! (#260) and reads via [`DualSignedRotation::is_rotation_payload`] +
 //! [`DualSignedRotation::decode_command`].
+//!
+//! # Cancelling a pending rotation (#317)
+//!
+//! A rotation does not take effect at commit — it becomes active at a
+//! future `v_eff` (at least [`V_EFF_MIN_DELAY`] views out). That gap is
+//! a window in which an operator who mis-rotated (wrong key, premature
+//! announcement, suspected compromise of the *new* key before it goes
+//! live) can retract the rotation before any QC is ever signed under it.
+//! [`DualSignedRotationCancel`] (tagged [`ROTATION_CANCEL_TAG`]) is that
+//! retraction. Like the rotation itself it is dual-signed, proving control
+//! of both keys at cancel time:
+//!
+//! - `sig_old` — the validator's *current* (pre-rotation) consensus key,
+//!   i.e. the key active at the cancel's commit view.
+//! - `sig_new` — the *pending* rotation's `new_pubkey`.
+//!
+//! The pending new key is **not** carried in the cancel payload: it is
+//! recovered from the key history (the validator's most-recent entry),
+//! so a cancel can only target a rotation the chain already recorded.
+//! Only the *last* pending rotation is cancellable, and only while it is
+//! still in the future (`cancelling_v_eff > commit_view`); a rotation that
+//! has already taken effect cannot be undone this way (rotate again
+//! instead). Application removes the pending key-history entry, restoring
+//! the pre-rotation timeline — see
+//! [`crate::history_commitment::apply_rotation_cancel_command`], the
+//! helper shared by the live commit path and the recovery rebuild so both
+//! reproduce identical state.
 
 use std::path::PathBuf;
 
@@ -43,6 +70,11 @@ use boule_core::identity::NodeId;
 ///
 /// [`RECONFIG_TAG`]: crate::reconfig::RECONFIG_TAG
 pub const ROTATION_TAG: &[u8; 6] = b"VKROT\0";
+
+/// Magic prefix tagging a `Block.commands` entry as a rotation-cancel payload
+/// ([`DualSignedRotationCancel`], #317) — retracting a committed-but-not-yet-
+/// effective rotation before its `v_eff`.
+pub const ROTATION_CANCEL_TAG: &[u8; 6] = b"VKCAN\0";
 
 /// Minimum gap between the view in which a rotation is committed and its
 /// effective view, matching the convention established by validator-set
@@ -381,6 +413,107 @@ impl DualSignedRotation {
             .map_err(|_| RotationVerifyError::InvalidOldSignature)?;
 
         UnparsedPublicKey::new(&ED25519, &self.payload.new_pubkey as &[u8])
+            .verify(&bytes, &self.sig_new)
+            .map_err(|_| RotationVerifyError::InvalidNewSignature)?;
+
+        Ok(())
+    }
+}
+
+/// The retraction payload for a committed-but-not-yet-effective rotation
+/// (#317): names the validator and the `v_eff` of the pending rotation being
+/// cancelled. The new pubkey is *not* carried — the consumer recovers it from
+/// the pending entry in [`crate::validator_key_history::ValidatorKeyHistory`],
+/// the same trusted source `sig_new` is checked against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorRotationCancel {
+    pub validator: NodeId,
+    pub cancelling_v_eff: View,
+}
+
+impl SignedMessage for ValidatorRotationCancel {
+    const DOMAIN: &'static str = "boule.consensus.validator_rotation_cancel.v1";
+}
+
+/// A [`ValidatorRotationCancel`] carrying both the current-key and pending-new-
+/// key signatures over its canonical pre-image — the same self-attestation
+/// property as [`DualSignedRotation`]: only the operator who holds *both* keys
+/// (and therefore proposed the rotation) can retract it. A compromise of just
+/// the old key cannot cancel a rotation to a key the operator legitimately
+/// provisioned, and vice-versa.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DualSignedRotationCancel {
+    pub payload: ValidatorRotationCancel,
+    #[serde(with = "serde_sig")]
+    pub sig_old: [u8; 64],
+    #[serde(with = "serde_sig")]
+    pub sig_new: [u8; 64],
+}
+
+impl DualSignedRotationCancel {
+    /// Encode as a tagged byte sequence for a `Block.commands` slot:
+    /// [`ROTATION_CANCEL_TAG`] || `postcard(self)`.
+    pub fn encode_command(&self) -> Bytes {
+        let body = postcard::to_stdvec(self)
+            .expect("postcard encoding of DualSignedRotationCancel cannot fail");
+        let mut out = Vec::with_capacity(ROTATION_CANCEL_TAG.len() + body.len());
+        out.extend_from_slice(ROTATION_CANCEL_TAG);
+        out.extend_from_slice(&body);
+        Bytes::from(out)
+    }
+
+    /// True iff `bytes` carries the [`ROTATION_CANCEL_TAG`] prefix.
+    pub fn is_cancel_payload(bytes: &[u8]) -> bool {
+        bytes.starts_with(ROTATION_CANCEL_TAG)
+    }
+
+    /// Decode a tagged rotation-cancel command. Errors if the tag is absent or
+    /// the body is malformed.
+    pub fn decode_command(bytes: &[u8]) -> Result<Self> {
+        let body = bytes
+            .strip_prefix(ROTATION_CANCEL_TAG.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("missing rotation-cancel tag prefix"))?;
+        postcard::from_bytes(body)
+            .map_err(|e| anyhow::anyhow!("malformed DualSignedRotationCancel: {e}"))
+    }
+
+    /// Sign a cancel with the validator's current key and the pending
+    /// rotation's new key (both over the same domain-separated pre-image).
+    pub fn sign(
+        payload: ValidatorRotationCancel,
+        current: &dyn Signer,
+        new: &dyn Signer,
+        chain_id: &ChainId,
+    ) -> Result<Self> {
+        let bytes = preimage::<ValidatorRotationCancel>(&payload, chain_id)?;
+        let sig_old = current.sign(&bytes);
+        let sig_new = new.sign(&bytes);
+        Ok(Self {
+            payload,
+            sig_old,
+            sig_new,
+        })
+    }
+
+    /// Verify both signatures: `sig_old` under `current_pubkey` (the
+    /// validator's currently-active consensus key at the cancel's commit view)
+    /// and `sig_new` under `pending_new_pubkey` (the key the pending rotation
+    /// would have installed, recovered from the key history). Reuses
+    /// [`RotationVerifyError`] — the failure modes are identical.
+    pub fn verify(
+        &self,
+        current_pubkey: &NodeId,
+        pending_new_pubkey: &NodeId,
+        chain_id: &ChainId,
+    ) -> Result<(), RotationVerifyError> {
+        let bytes = preimage::<ValidatorRotationCancel>(&self.payload, chain_id)
+            .map_err(|e| RotationVerifyError::Preimage(e.to_string()))?;
+
+        UnparsedPublicKey::new(&ED25519, current_pubkey as &[u8])
+            .verify(&bytes, &self.sig_old)
+            .map_err(|_| RotationVerifyError::InvalidOldSignature)?;
+
+        UnparsedPublicKey::new(&ED25519, pending_new_pubkey as &[u8])
             .verify(&bytes, &self.sig_new)
             .map_err(|_| RotationVerifyError::InvalidNewSignature)?;
 
@@ -1320,5 +1453,208 @@ mod tests {
         let bytes = postcard::to_stdvec(&p).unwrap();
         let back: ValidatorKeyRotation = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(back, p);
+    }
+
+    // ── rotation cancel (#317) ────────────────────────────────────────────
+
+    /// A valid `DualSignedRotationCancel` signed by `current` (the validator's
+    /// active key) and `new` (the pending rotation's key).
+    fn valid_cancel() -> (DualSignedRotationCancel, NodeId, NodeId) {
+        let current = fresh_signer();
+        let new = fresh_signer();
+        let payload = ValidatorRotationCancel {
+            validator: current.node_id(),
+            cancelling_v_eff: View(100),
+        };
+        let c = DualSignedRotationCancel::sign(payload, &current, &new, &ChainId::TEST).unwrap();
+        (c, current.node_id(), new.node_id())
+    }
+
+    #[test]
+    fn cancel_verify_accepts_a_valid_dual_signed_cancel() {
+        let (c, current, new) = valid_cancel();
+        c.verify(&current, &new, &ChainId::TEST).unwrap();
+    }
+
+    #[test]
+    fn cancel_verify_rejects_when_sig_old_is_zeroed() {
+        let (mut c, current, new) = valid_cancel();
+        c.sig_old = [0u8; 64];
+        assert_eq!(
+            c.verify(&current, &new, &ChainId::TEST),
+            Err(RotationVerifyError::InvalidOldSignature),
+        );
+    }
+
+    #[test]
+    fn cancel_verify_rejects_when_sig_new_is_zeroed() {
+        let (mut c, current, new) = valid_cancel();
+        c.sig_new = [0u8; 64];
+        assert_eq!(
+            c.verify(&current, &new, &ChainId::TEST),
+            Err(RotationVerifyError::InvalidNewSignature),
+        );
+    }
+
+    #[test]
+    fn cancel_verify_is_chain_scoped() {
+        let (c, current, new) = valid_cancel();
+        // A cancel signed for the test chain must not verify under another.
+        assert!(
+            c.verify(&current, &new, &ChainId::from_genesis_hash([9u8; 32]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cancel_encode_decode_roundtrips_and_tag_is_distinct() {
+        let (c, _, _) = valid_cancel();
+        let bytes = c.encode_command();
+        assert!(DualSignedRotationCancel::is_cancel_payload(&bytes));
+        // The cancel tag is not mistaken for a rotation payload, and vice-versa.
+        assert!(!DualSignedRotationCancel::is_cancel_payload(ROTATION_TAG));
+        assert!(!DualSignedRotation::is_rotation_payload(&bytes));
+        assert_eq!(DualSignedRotationCancel::decode_command(&bytes).unwrap(), c);
+    }
+
+    #[test]
+    fn cancel_payload_has_stable_domain_string() {
+        assert_eq!(
+            ValidatorRotationCancel::DOMAIN,
+            "boule.consensus.validator_rotation_cancel.v1",
+        );
+    }
+
+    /// End-to-end through the shared commit-apply helper (#317): a real signed
+    /// cancel of a pending rotation restores the pre-rotation key history.
+    #[test]
+    fn apply_cancel_command_removes_a_pending_rotation_end_to_end() {
+        use crate::history_commitment::{RotationCancelError, apply_rotation_cancel_command};
+        use crate::validator_key_history::ValidatorKeyHistory;
+        use crate::validator_set::ValidatorId;
+        use boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected;
+
+        let current = fresh_signer();
+        let new = fresh_signer();
+        let mut kh = ValidatorKeyHistory::new([
+            ValidatorId::from_genesis_pubkey(current.node_id()),
+            ValidatorId::from_genesis_pubkey(fresh_signer().node_id()),
+        ]);
+        let pre = kh.to_persisted();
+
+        // Pending rotation current → new at v_eff 100, committed at view 50.
+        kh.apply_rotation(
+            &ValidatorKeyRotation {
+                validator: current.node_id(),
+                new_pubkey: new.node_id(),
+                v_eff: View(100),
+                new_bls_pubkey: None,
+                new_bls_pop: None,
+            },
+            View(50),
+        )
+        .unwrap();
+
+        let cmd = DualSignedRotationCancel::sign(
+            ValidatorRotationCancel {
+                validator: current.node_id(),
+                cancelling_v_eff: View(100),
+            },
+            &current,
+            &new,
+            &ChainId::TEST,
+        )
+        .unwrap()
+        .encode_command();
+
+        // Apply at commit view 75 (before v_eff 100) → cancelled + restored.
+        let applied = apply_rotation_cancel_command(
+            &mut kh,
+            None,
+            &cmd,
+            &ChainId::TEST,
+            Ed25519Collected,
+            View(75),
+        )
+        .unwrap();
+        assert!(applied);
+        assert_eq!(
+            kh.to_persisted(),
+            pre,
+            "cancel restored the pre-rotation history"
+        );
+
+        // Re-applying the same cancel (no longer pending) is a clean error.
+        assert!(matches!(
+            apply_rotation_cancel_command(
+                &mut kh,
+                None,
+                &cmd,
+                &ChainId::TEST,
+                Ed25519Collected,
+                View(75)
+            ),
+            Err(RotationCancelError::NoPendingRotation),
+        ));
+    }
+
+    /// A cancel whose `sig_new` was made by a key other than the pending
+    /// rotation's target is rejected, and the rotation is left pending.
+    #[test]
+    fn apply_cancel_command_rejects_a_forged_signature() {
+        use crate::history_commitment::{RotationCancelError, apply_rotation_cancel_command};
+        use crate::validator_key_history::ValidatorKeyHistory;
+        use crate::validator_set::ValidatorId;
+        use boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected;
+
+        let current = fresh_signer();
+        let new = fresh_signer();
+        let imposter = fresh_signer();
+        let mut kh = ValidatorKeyHistory::new([
+            ValidatorId::from_genesis_pubkey(current.node_id()),
+            ValidatorId::from_genesis_pubkey(fresh_signer().node_id()),
+        ]);
+        kh.apply_rotation(
+            &ValidatorKeyRotation {
+                validator: current.node_id(),
+                new_pubkey: new.node_id(),
+                v_eff: View(100),
+                new_bls_pubkey: None,
+                new_bls_pop: None,
+            },
+            View(50),
+        )
+        .unwrap();
+        let pending = kh.to_persisted();
+
+        // Sign with `current` + `imposter` instead of `new` → sig_new is wrong.
+        let cmd = DualSignedRotationCancel::sign(
+            ValidatorRotationCancel {
+                validator: current.node_id(),
+                cancelling_v_eff: View(100),
+            },
+            &current,
+            &imposter,
+            &ChainId::TEST,
+        )
+        .unwrap()
+        .encode_command();
+
+        assert!(matches!(
+            apply_rotation_cancel_command(
+                &mut kh,
+                None,
+                &cmd,
+                &ChainId::TEST,
+                Ed25519Collected,
+                View(75)
+            ),
+            Err(RotationCancelError::Verify(_)),
+        ));
+        assert_eq!(
+            kh.to_persisted(),
+            pending,
+            "a forged cancel leaves the rotation pending",
+        );
     }
 }

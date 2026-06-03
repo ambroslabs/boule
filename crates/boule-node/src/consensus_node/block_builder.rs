@@ -215,6 +215,9 @@ impl BlockBuilder for MempoolBlockBuilder {
             // untouched. Order-preserving via `retain`.
             commands.retain(|cmd| {
                 if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
+                    // Rotation-cancel system txs (#317): validated + applied at
+                    // commit, like the rotation they retract.
+                    || boule_consensus::validator_rotation::DualSignedRotationCancel::is_cancel_payload(cmd)
                     || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
                     // Equivocation-evidence system txs (#657): self-authenticating
                     // proofs validated + recorded at commit, like reconfig/rotation.

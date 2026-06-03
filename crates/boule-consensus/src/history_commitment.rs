@@ -44,9 +44,102 @@ use crate::bls_key_history::BlsKeyHistory;
 use crate::replication::block::Block;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
-use crate::validator_set::ValidatorSet;
+use crate::validator_set::{Pubkey, ValidatorSet};
 use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
 use boule_core::crypto::signed::ChainId;
+
+/// Why a committed rotation-cancel (#317) did not apply. The block stays
+/// committed regardless — the caller logs and drops.
+#[derive(Debug)]
+pub enum RotationCancelError {
+    /// The tagged payload did not decode.
+    Malformed(String),
+    /// The named validator is not in the key history.
+    UnknownValidator,
+    /// No most-recent pending (not-yet-effective) rotation matches the named
+    /// `cancelling_v_eff` — nothing to cancel, or it has already taken effect.
+    NoPendingRotation,
+    /// A signature did not verify (`sig_old` under the current key or `sig_new`
+    /// under the pending rotation's new key).
+    Verify(crate::validator_rotation::RotationVerifyError),
+    /// The key history rejected the removal.
+    History(crate::validator_key_history::HistoryError),
+}
+
+impl std::fmt::Display for RotationCancelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(e) => write!(f, "rotation-cancel payload malformed: {e}"),
+            Self::UnknownValidator => {
+                f.write_str("rotation-cancel references an unknown validator")
+            }
+            Self::NoPendingRotation => {
+                f.write_str("no pending rotation matches the cancel's v_eff")
+            }
+            Self::Verify(e) => write!(f, "rotation-cancel signature verification failed: {e}"),
+            Self::History(e) => write!(f, "rotation-cancel history removal failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for RotationCancelError {}
+
+/// Apply a single committed rotation-cancel command (#317) to the key
+/// histories, if `cmd_bytes` is one. Shared by the production commit path and
+/// the recovery rebuild so both reproduce identical state — which the
+/// rotation-apply parity assert depends on.
+///
+/// Returns `Ok(true)` if a cancel applied, `Ok(false)` if `cmd_bytes` is not a
+/// cancel payload, and `Err` if it is a cancel that failed validation.
+pub fn apply_rotation_cancel_command(
+    key_history: &mut ValidatorKeyHistory,
+    bls_key_history: Option<&mut BlsKeyHistory>,
+    cmd_bytes: &[u8],
+    chain_id: &ChainId,
+    scheme: SignatureSchemeChoice,
+    commit_view: View,
+) -> Result<bool, RotationCancelError> {
+    use crate::validator_rotation::DualSignedRotationCancel;
+
+    if !DualSignedRotationCancel::is_cancel_payload(cmd_bytes) {
+        return Ok(false);
+    }
+    let cancel = DualSignedRotationCancel::decode_command(cmd_bytes)
+        .map_err(|e| RotationCancelError::Malformed(e.to_string()))?;
+    let validator_pk = Pubkey::from_node_id(cancel.payload.validator);
+    let cancelling_v_eff = cancel.payload.cancelling_v_eff;
+
+    // The pending rotation's new key — its presence confirms a not-yet-
+    // effective rotation at `cancelling_v_eff`; `sig_new` is checked against it.
+    let pending_new = key_history
+        .pending_rotation_new_key(&validator_pk, cancelling_v_eff, commit_view)
+        .ok_or(RotationCancelError::NoPendingRotation)?;
+    // The validator's currently-active key (pre-rotation, since the pending
+    // rotation's v_eff is still in the future); `sig_old` is checked against it.
+    let stable = key_history
+        .validator_for(&validator_pk)
+        .ok_or(RotationCancelError::UnknownValidator)?;
+    let current_key = key_history
+        .key_at(&stable, commit_view)
+        .ok_or(RotationCancelError::UnknownValidator)?;
+
+    cancel
+        .verify(current_key.as_node_id(), pending_new.as_node_id(), chain_id)
+        .map_err(RotationCancelError::Verify)?;
+
+    key_history
+        .cancel_pending_rotation(&validator_pk, cancelling_v_eff, commit_view)
+        .map_err(RotationCancelError::History)?;
+    // Mirror into the BLS history on BLS chains (best-effort, like the rotation
+    // apply: a BLS mismatch after the Ed25519 cancel is not rolled back).
+    if scheme == SignatureSchemeChoice::BlsAggregated {
+        if let Some(bls) = bls_key_history {
+            let _ =
+                bls.cancel_pending_rotation(stable.into_node_id(), cancelling_v_eff, commit_view);
+        }
+    }
+    Ok(true)
+}
 
 /// Domain tag mixed into the leading bytes of the v1 commitment. Bumped
 /// alongside the function name on any future shape change.
@@ -315,6 +408,21 @@ pub fn apply_rotation_commands_to_histories(
                 new_bls_pk,
             );
         }
+    }
+
+    // #317: process any rotation-cancel commands after the rotations. A cancel
+    // always targets a rotation from an earlier block, so this block's
+    // rotations and cancels never alias. Silent on failure — the rebuild must
+    // reach the same final state the (logging) production path did.
+    for cmd_bytes in &block.commands {
+        let _ = apply_rotation_cancel_command(
+            key_history,
+            bls_key_history.as_deref_mut(),
+            cmd_bytes,
+            chain_id,
+            scheme,
+            block_view,
+        );
     }
 }
 

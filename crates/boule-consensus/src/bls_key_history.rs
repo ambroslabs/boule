@@ -86,6 +86,10 @@ pub enum BlsHistoryError {
     /// Mirrors `ValidatorKeyHistory`'s monotonic-`v_eff` rule so old
     /// QCs always have a unique pubkey-at-view answer.
     VeffNotStrictlyIncreasing { last_v_eff: View, v_eff: View },
+    /// A rotation-cancel (#317) named a `v_eff` that is not this validator's
+    /// most-recent pending (not-yet-effective) BLS rotation. Mirrors
+    /// `ValidatorKeyHistory::NoPendingRotationToCancel`.
+    NoPendingRotationToCancel { stable_id: NodeId, v_eff: View },
 }
 
 /// Returned by [`BlsKeyHistory::pubkeys_for_set`] when a validator in
@@ -126,6 +130,11 @@ impl std::fmt::Display for BlsHistoryError {
             Self::VeffNotStrictlyIncreasing { last_v_eff, v_eff } => write!(
                 f,
                 "BLS rotation v_eff {v_eff} must be strictly > last v_eff {last_v_eff}",
+            ),
+            Self::NoPendingRotationToCancel { stable_id, v_eff } => write!(
+                f,
+                "no pending BLS rotation at v_eff {v_eff} to cancel for validator {}",
+                hex::encode(stable_id),
             ),
         }
     }
@@ -204,6 +213,34 @@ impl BlsKeyHistory {
             v_eff,
             bls_pubkey: new_bls_pubkey,
         });
+        Ok(())
+    }
+
+    /// Cancel the validator's most-recent pending BLS rotation (#317) — the
+    /// mirror of
+    /// [`ValidatorKeyHistory::cancel_pending_rotation`](crate::validator_key_history::ValidatorKeyHistory::cancel_pending_rotation),
+    /// removing the
+    /// last entry iff it is exactly the named, not-yet-effective rotation.
+    pub fn cancel_pending_rotation(
+        &mut self,
+        stable_id: NodeId,
+        cancelling_v_eff: View,
+        commit_view: View,
+    ) -> Result<(), BlsHistoryError> {
+        let entries = self
+            .by_stable_id
+            .get_mut(&stable_id)
+            .ok_or(BlsHistoryError::UnknownValidator { stable_id })?;
+        let last = entries
+            .last()
+            .expect("by_stable_id never holds an empty Vec");
+        if last.v_eff != cancelling_v_eff || cancelling_v_eff <= commit_view {
+            return Err(BlsHistoryError::NoPendingRotationToCancel {
+                stable_id,
+                v_eff: cancelling_v_eff,
+            });
+        }
+        entries.pop();
         Ok(())
     }
 
