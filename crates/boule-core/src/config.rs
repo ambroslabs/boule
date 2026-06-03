@@ -262,6 +262,13 @@ pub struct ConsensusConfig {
     /// that project into `boule_consensus::limits::CacheLimits`.
     #[serde(default = "default_mempool_capacity")]
     pub mempool_capacity: usize,
+    /// Cap on the number of entries a single validator may publish in its
+    /// on-chain endpoint list (#546). A consensus parameter — identical
+    /// across replicas — bounding the cluster-amplified-flood attack
+    /// surface (a Byzantine validator publishing many bogus
+    /// `(network_id, address)` pairs). Live updates are tracked by #542.
+    #[serde(default = "default_max_endpoint_list_length")]
+    pub max_endpoint_list_length: usize,
     /// View-timer base duration in milliseconds.
     #[serde(default = "default_timeout_base_ms")]
     pub timeout_base_ms: u64,
@@ -756,6 +763,10 @@ fn default_block_sync_max_attempts() -> u32 {
 
 fn default_mempool_capacity() -> usize {
     1024
+}
+
+fn default_max_endpoint_list_length() -> usize {
+    8
 }
 
 /// Caps a single postcard frame on the consensus wire protocol (4 MiB).
