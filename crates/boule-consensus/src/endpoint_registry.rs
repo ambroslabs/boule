@@ -246,6 +246,14 @@ impl EndpointRegistry {
         }
     }
 
+    /// Override the list-length cap — used on recovery to apply the
+    /// deployment's current `max_endpoint_list_length` to a registry loaded
+    /// from storage (the cap is a consensus param, identical across
+    /// replicas; it governs future `apply` calls, not stored state).
+    pub fn set_max_len(&mut self, max_len: usize) {
+        self.max_len = max_len;
+    }
+
     /// The validator's currently-published entries (empty if none).
     pub fn endpoints_of(&self, validator: &NodeId) -> &[EndpointEntry] {
         self.by_validator

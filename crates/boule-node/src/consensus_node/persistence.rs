@@ -154,6 +154,15 @@ pub const STORAGE_KEY_OPERATOR_KEY_HISTORY: &[u8] = b"consensus/operator_key_his
 /// input a later slashing pass (#658) consumes.
 pub const STORAGE_KEY_COMMITTED_EVIDENCE: &[u8] = b"consensus/committed_evidence";
 
+/// Storage key for the persisted validator endpoint registry (#546).
+/// Written after every commit that applied an endpoint command; read at
+/// startup. The endpoint list is a discovery hint, not safety-critical, so
+/// (unlike the validator/key histories) it is NOT folded into the #325
+/// anti-rollback commitment — it is simply persisted and reloaded, never
+/// re-derived against the committed chain. Persisting it (rather than
+/// rebuilding from blocks) is what lets it survive block pruning.
+pub const STORAGE_KEY_ENDPOINT_REGISTRY: &[u8] = b"consensus/endpoint_registry";
+
 /// Bound on [`ConsensusNode::recent_qcs`]. The cache only needs to
 /// retain the QC for the most recently-committed block (so the
 /// snapshot creation hook can find it); a small buffer absorbs

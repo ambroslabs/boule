@@ -68,6 +68,7 @@ use boule_consensus::block_sync_retry_timer::{
     DEFAULT_MAX_DELAY as BLOCK_SYNC_RETRY_MAX_DELAY, next_delay as next_retry_delay,
 };
 use boule_consensus::dispatch::{self, Outbound};
+use boule_consensus::endpoint_registry::EndpointRegistry;
 use boule_consensus::hotstuff::qc::{ConsensusMsg, VerifiedQc, genesis_qc_bls};
 use boule_consensus::hotstuff::step::{HotStuffCore, StateUpdate};
 use boule_consensus::hotstuff::{HotStuffState, QuorumCertificate, genesis_qc};
@@ -102,6 +103,7 @@ mod block_builder;
 mod block_sync;
 mod commit;
 mod config;
+mod endpoint_apply;
 mod equivocation;
 mod evidence_apply;
 mod persistence;
@@ -119,15 +121,15 @@ pub use boule_consensus::wire::{
 pub use config::NodeConfigForConsensus;
 pub use persistence::{
     LastCommitted, RECENT_QC_CACHE_CAPACITY, STORAGE_KEY_BLOCK_PREFIX, STORAGE_KEY_BLS_KEY_HISTORY,
-    STORAGE_KEY_COMMITTED_EVIDENCE, STORAGE_KEY_HEIGHT_PREFIX, STORAGE_KEY_HIGH_QC,
-    STORAGE_KEY_LAST_COMMITTED, STORAGE_KEY_LAST_TIMEOUT_VOTE, STORAGE_KEY_LAST_VOTED_VIEW,
-    STORAGE_KEY_LOCKED, STORAGE_KEY_OPERATOR_KEY_HISTORY, STORAGE_KEY_PROPOSED_IN_VIEW,
-    STORAGE_KEY_VALIDATOR_HISTORY, STORAGE_KEY_VALIDATOR_KEY_HISTORY, block_storage_key,
-    decode_block, decode_height_storage_key, decode_high_qc, decode_last_committed,
-    decode_last_timeout_vote, decode_locked, decode_proposed_in_view, decode_voted_view,
-    encode_block, encode_high_qc, encode_last_committed, encode_last_timeout_vote, encode_locked,
-    encode_proposed_in_view, encode_voted_view, height_storage_key, load_block_from_storage,
-    load_block_range_from_storage, recover_state,
+    STORAGE_KEY_COMMITTED_EVIDENCE, STORAGE_KEY_ENDPOINT_REGISTRY, STORAGE_KEY_HEIGHT_PREFIX,
+    STORAGE_KEY_HIGH_QC, STORAGE_KEY_LAST_COMMITTED, STORAGE_KEY_LAST_TIMEOUT_VOTE,
+    STORAGE_KEY_LAST_VOTED_VIEW, STORAGE_KEY_LOCKED, STORAGE_KEY_OPERATOR_KEY_HISTORY,
+    STORAGE_KEY_PROPOSED_IN_VIEW, STORAGE_KEY_VALIDATOR_HISTORY, STORAGE_KEY_VALIDATOR_KEY_HISTORY,
+    block_storage_key, decode_block, decode_height_storage_key, decode_high_qc,
+    decode_last_committed, decode_last_timeout_vote, decode_locked, decode_proposed_in_view,
+    decode_voted_view, encode_block, encode_high_qc, encode_last_committed,
+    encode_last_timeout_vote, encode_locked, encode_proposed_in_view, encode_voted_view,
+    height_storage_key, load_block_from_storage, load_block_range_from_storage, recover_state,
 };
 
 use persistence::RecentQcCache;
@@ -465,6 +467,13 @@ pub struct ConsensusNode {
     /// consumes. Persisted under [`STORAGE_KEY_COMMITTED_EVIDENCE`] and
     /// reloaded at [`ConsensusNode::recover`].
     committed_evidence: std::collections::BTreeMap<ValidatorId, View>,
+    /// Validator endpoint-advertisement registry (#546): validator → its
+    /// published `(network_id, network_address)` discovery hints. Built by
+    /// applying committed [`SignedEndpointCommand`](boule_consensus::endpoint_registry::SignedEndpointCommand)
+    /// system txs. A discovery optimization, not safety-critical — so it is
+    /// persisted + reloaded (under [`STORAGE_KEY_ENDPOINT_REGISTRY`]) rather
+    /// than folded into the #325 anti-rollback commitment.
+    endpoint_registry: EndpointRegistry,
     /// Equivocators this node has already minted evidence into the mempool
     /// for this session (#657). A Byzantine validator equivocates on every
     /// view it participates in, so the detector would otherwise mint a fresh
@@ -749,6 +758,7 @@ impl ConsensusNode {
             seen_proposals: equivocation::SeenProposals::new(),
             equivocation_proofs_built: 0,
             committed_evidence: std::collections::BTreeMap::new(),
+            endpoint_registry: EndpointRegistry::new(config.max_endpoint_list_length),
             evidence_minted: std::collections::HashSet::new(),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
@@ -1152,6 +1162,11 @@ impl ConsensusNode {
         // exactly-once dedup survives restarts (and block pruning). Absent /
         // malformed blob → empty registry (logged inside the helper).
         let committed_evidence = Self::load_committed_evidence(storage.as_ref());
+        // #546: reload the endpoint registry (persisted, not re-derived —
+        // it is a discovery hint outside the anti-rollback commitment),
+        // applying the deployment's current list-length cap.
+        let endpoint_registry =
+            Self::load_endpoint_registry(storage.as_ref(), config.max_endpoint_list_length);
 
         Ok(Self {
             self_id,
@@ -1194,6 +1209,7 @@ impl ConsensusNode {
             seen_proposals: equivocation::SeenProposals::new(),
             equivocation_proofs_built: 0,
             committed_evidence,
+            endpoint_registry,
             evidence_minted: std::collections::HashSet::new(),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
@@ -4492,6 +4508,102 @@ mod tests {
             timestamp: 0,
         };
         Block { header, commands }
+    }
+
+    // ── #546: endpoint-advertisement commit-time apply ───────────────────
+
+    fn endpoint_entry(net: u8, port: u16) -> boule_consensus::endpoint_registry::EndpointEntry {
+        boule_consensus::endpoint_registry::EndpointEntry {
+            network_id: nid(net),
+            network_address: format!("10.0.0.{net}:{port}").parse().unwrap(),
+        }
+    }
+
+    fn signed_endpoint(
+        signer: &NodeSigner,
+        validator: NodeId,
+        seq: u64,
+        op: boule_consensus::endpoint_registry::EndpointOp,
+        chain_id: &boule_core::crypto::signed::ChainId,
+    ) -> bytes::Bytes {
+        use boule_consensus::endpoint_registry::{EndpointCommand, SignedEndpointCommand};
+        let payload = EndpointCommand { validator, seq, op };
+        SignedEndpointCommand::sign(payload, signer, chain_id).encode_command()
+    }
+
+    /// A seated validator publishes its endpoints; the command commits, the
+    /// registry reflects it, and the state persists for recovery.
+    #[test]
+    fn endpoint_command_from_member_applies_and_persists() {
+        use boule_consensus::endpoint_registry::EndpointOp;
+        let signer = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&signer, 0);
+        let validator = signer.node_id();
+
+        let cmd = signed_endpoint(
+            &signer,
+            validator,
+            1,
+            EndpointOp::Set(vec![endpoint_entry(9, 9001)]),
+            &node.chain_id,
+        );
+        node.apply_committed_endpoints(&block_with_commands(1, 0, vec![cmd]));
+
+        assert_eq!(
+            node.endpoint_registry.endpoints_of(&validator),
+            &[endpoint_entry(9, 9001)]
+        );
+        // Persisted: a reload from the same storage sees it.
+        let reloaded = ConsensusNode::load_endpoint_registry(node.storage.as_ref(), 8);
+        assert_eq!(
+            reloaded.endpoints_of(&validator),
+            &[endpoint_entry(9, 9001)]
+        );
+    }
+
+    /// A command signed by a key other than the validator's active key is
+    /// dropped — the registry is unchanged.
+    #[test]
+    fn endpoint_command_with_wrong_signature_is_dropped() {
+        use boule_consensus::endpoint_registry::EndpointOp;
+        let signer = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&signer, 0);
+        let validator = signer.node_id();
+        let impostor = fresh_signer();
+
+        // Names the real member but is signed by an unrelated key.
+        let cmd = signed_endpoint(
+            &impostor,
+            validator,
+            1,
+            EndpointOp::Set(vec![endpoint_entry(9, 9001)]),
+            &node.chain_id,
+        );
+        node.apply_committed_endpoints(&block_with_commands(1, 0, vec![cmd]));
+        assert!(node.endpoint_registry.endpoints_of(&validator).is_empty());
+    }
+
+    /// A command naming a non-member validator is dropped.
+    #[test]
+    fn endpoint_command_from_non_member_is_dropped() {
+        use boule_consensus::endpoint_registry::EndpointOp;
+        let signer = fresh_signer();
+        let (mut node, _vs) = make_node_with_signer(&signer, 0);
+        let outsider = fresh_signer();
+
+        let cmd = signed_endpoint(
+            &outsider,
+            outsider.node_id(),
+            1,
+            EndpointOp::Set(vec![endpoint_entry(9, 9001)]),
+            &node.chain_id,
+        );
+        node.apply_committed_endpoints(&block_with_commands(1, 0, vec![cmd]));
+        assert!(
+            node.endpoint_registry
+                .endpoints_of(&outsider.node_id())
+                .is_empty()
+        );
     }
 
     /// A node whose validator `v` (a real signer) declares operator key

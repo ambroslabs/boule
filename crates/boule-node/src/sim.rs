@@ -1290,6 +1290,7 @@ impl SimCluster {
                 min_block_interval: Duration::ZERO,
                 weak_subjectivity_checkpoint: None,
                 operator_keys: Vec::new(),
+                max_endpoint_list_length: 8,
             };
 
             let sm: Arc<Mutex<Box<dyn StateMachine>>> = state_machines
@@ -2114,6 +2115,7 @@ impl SimCluster {
                 min_block_interval: Duration::ZERO,
                 weak_subjectivity_checkpoint: None,
                 operator_keys: Vec::new(),
+                max_endpoint_list_length: 8,
             };
             // Fresh state machine and mempool — the previous session's
             // state machine doesn't survive a process restart in
@@ -2361,6 +2363,7 @@ impl SimCluster {
             min_block_interval: Duration::ZERO,
             weak_subjectivity_checkpoint: None,
             operator_keys: Vec::new(),
+            max_endpoint_list_length: 8,
         };
         let sm: Arc<Mutex<Box<dyn StateMachine>>> =
             Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
@@ -2998,6 +3001,7 @@ impl SimCluster {
                 min_block_interval: Duration::ZERO,
                 weak_subjectivity_checkpoint: None,
                 operator_keys: Vec::new(),
+                max_endpoint_list_length: 8,
             };
             let sm: Arc<Mutex<Box<dyn StateMachine>>> =
                 Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
