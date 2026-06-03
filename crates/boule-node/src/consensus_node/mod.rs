@@ -4450,6 +4450,59 @@ mod tests {
         );
     }
 
+    /// #658a: a committed-evidence equivocator still seated in the active set
+    /// is jailed — the next proposal this node mints carries a reconfig
+    /// removing it (N=5, so the removal stays at the floor).
+    #[test]
+    fn committed_evidence_mints_a_jail_reconfig_removing_the_equivocator() {
+        use boule_consensus::reconfig::ReconfigCommand;
+
+        let vs = ValidatorSet::new(vec![vid(1), vid(2), vid(3), vid(4), vid(5)]);
+        let mut node = ConsensusNode::new(
+            nid(1),
+            test_config(vs),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+        node.committed_evidence.insert(vid(3), View(2));
+
+        node.mint_staged_reconfig(View(10));
+
+        let reconfig = node
+            .mempool
+            .propose(16)
+            .iter()
+            .find(|c| ReconfigCommand::is_reconfig_payload(c))
+            .map(|c| ReconfigCommand::decode(c).unwrap())
+            .expect("a jail reconfig must be minted");
+        assert_eq!(reconfig.removes, vec![*vid(3).as_node_id()]);
+        assert!(reconfig.changes.is_empty());
+    }
+
+    /// #658a: when removing the equivocator would drop the active set below
+    /// `MIN_VALIDATOR_FLOOR`, the jail is blocked (N=4 → 3 < 4) — no reconfig
+    /// is minted and the evidence record stands as off-chain accountability.
+    #[test]
+    fn jail_is_blocked_by_the_validator_floor() {
+        use boule_consensus::reconfig::ReconfigCommand;
+
+        let mut node = make_node(nid(1)); // four_validators()
+        node.committed_evidence.insert(vid(2), View(2));
+
+        node.mint_staged_reconfig(View(10));
+
+        assert!(
+            !node
+                .mempool
+                .propose(16)
+                .iter()
+                .any(|c| ReconfigCommand::is_reconfig_payload(c)),
+            "no jail reconfig may be minted when removal would breach the floor",
+        );
+    }
+
     /// `Dispatch::ServeBlock` for an unknown hash returns
     /// `BlockResponse(None)` without erroring on storage. The peer's
     /// `block_sync_response_not_found` arm handles the negative case.

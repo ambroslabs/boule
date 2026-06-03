@@ -2029,4 +2029,57 @@ mod tests {
             }
         });
     }
+
+    /// #658a end-to-end (the issue's "Done when"): a twin-vote equivocator in
+    /// an N=5 cluster is detected, its evidence commits, and the honest
+    /// replicas jail it — a committed block carries a reconfig removing the
+    /// equivocator from the active set, with cluster liveness preserved across
+    /// the membership change. N=5 so the removal stays at MIN_VALIDATOR_FLOOR.
+    #[test]
+    fn twin_vote_equivocator_is_jailed_via_committed_reconfig() {
+        use boule_consensus::reconfig::ReconfigCommand;
+
+        run_paused(|| async move {
+            let n = 5;
+            let victim = 0usize;
+            let mut adversaries: Vec<Option<Arc<dyn Adversary>>> = (0..n).map(|_| None).collect();
+            adversaries[victim] = Some(build_adversary(AdvKind::TwinVote));
+            let mut cluster =
+                SimCluster::spawn_with_adversaries(n, Duration::from_millis(50), adversaries).await;
+            let equivocator = cluster.node_ids[victim];
+
+            // Advance in chunks, draining commits, until a committed block
+            // carries a reconfig removing the equivocator (detect → evidence
+            // commit → jail mint on an honest leader → jail commit).
+            let mut jailed = false;
+            let mut all_committed: Vec<Vec<Block>> = (0..n).map(|_| Vec::new()).collect();
+            'outer: for _ in 0..20 {
+                cluster.advance_and_yield(Duration::from_millis(500)).await;
+                let drained = cluster.drain_commits();
+                for (i, blocks) in drained.into_iter().enumerate() {
+                    for b in &blocks {
+                        for cmd in &b.commands {
+                            if ReconfigCommand::is_reconfig_payload(cmd)
+                                && ReconfigCommand::decode(cmd)
+                                    .map(|rc| rc.removes.contains(&equivocator))
+                                    .unwrap_or(false)
+                            {
+                                jailed = true;
+                            }
+                        }
+                    }
+                    all_committed[i].extend(blocks);
+                }
+                if jailed {
+                    break 'outer;
+                }
+            }
+
+            assert_no_conflicts(&all_committed);
+            assert!(
+                jailed,
+                "the equivocator must be jailed via a committed reconfig removing it",
+            );
+        });
+    }
 }
