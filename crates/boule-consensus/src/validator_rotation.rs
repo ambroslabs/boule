@@ -1220,6 +1220,132 @@ pub fn build_operator_recovery_envelope(
     })
 }
 
+/// CLI inputs for `rotation propose-operator-key-rotation` (#549), populated by
+/// the binary's argument parser and consumed by
+/// [`build_operator_key_rotation_envelope`].
+#[derive(Debug, Default)]
+pub struct OperatorKeyRotationRequest {
+    pub config_path: Option<PathBuf>,
+    /// Base58 stable id of the validator whose operator key is rotating.
+    pub validator: Option<String>,
+    /// Backend + path for the **current** operator key (must already exist).
+    pub old_operator_key_backend: Option<String>,
+    pub old_operator_key_path: Option<PathBuf>,
+    pub old_operator_key_passphrase_env: Option<String>,
+    /// Backend + path for the **new** operator key (minted if absent).
+    pub new_operator_key_backend: Option<String>,
+    pub new_operator_key_path: Option<PathBuf>,
+    pub new_operator_key_passphrase_env: Option<String>,
+    pub v_eff: Option<u64>,
+}
+
+/// Outcome of building an operator-key self-rotation envelope.
+#[derive(Debug)]
+pub struct OperatorKeyRotationOutcome {
+    pub envelope: DualSignedOperatorRotation,
+}
+
+/// Orchestration core of `rotation propose-operator-key-rotation` (#549) — a
+/// validator rotating its own operator key. Loads the **current** operator key
+/// (authorising, `sig_old`), mints (or reloads) the **new** operator key
+/// (`sig_new`), and builds a chain-bound [`DualSignedOperatorRotation`].
+/// Operator keys are Ed25519 only, so there is no signing-key or BLS half —
+/// this is simpler than [`build_operator_recovery_envelope`].
+pub fn build_operator_key_rotation_envelope(
+    req: &OperatorKeyRotationRequest,
+) -> anyhow::Result<OperatorKeyRotationOutcome> {
+    use boule_core::crypto::signed::NodeSigner;
+
+    let v_eff = View(req.v_eff.ok_or_else(|| {
+        anyhow::anyhow!("rotation propose-operator-key-rotation requires --v-eff <view>")
+    })?);
+    let old_backend = req.old_operator_key_backend.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "rotation propose-operator-key-rotation requires --old-operator-key-backend \
+             <file|encrypted-file>"
+        )
+    })?;
+    let new_backend = req.new_operator_key_backend.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "rotation propose-operator-key-rotation requires --new-operator-key-backend \
+             <file|encrypted-file>"
+        )
+    })?;
+    let validator_b58 = req.validator.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "rotation propose-operator-key-rotation requires --validator <base58 stable id>"
+        )
+    })?;
+    let validator = boule_core::identity::base58_to_node_id(validator_b58).map_err(|e| {
+        anyhow::anyhow!("--validator {validator_b58:?} is not a base58 NodeId: {e}")
+    })?;
+
+    let config_path = req.config_path.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("rotation propose-operator-key-rotation requires --config")
+    })?;
+    let config = boule_core::config::load(config_path)?;
+    let cons = config.consensus.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--config {} has no [consensus] section; operator-key rotation requires the \
+             chain's chain_id to bundle a chain-bound payload",
+            config_path.display(),
+        )
+    })?;
+    let chain_id = crate::genesis::derive_chain_id(cons)?;
+
+    // Load the current operator key — must already exist (it authorises).
+    let old_cfg = build_new_identity_config_for_rotation(
+        old_backend,
+        req.old_operator_key_path.clone(),
+        req.old_operator_key_passphrase_env.clone(),
+    )?;
+    let old_identity = boule_core::config::build_provider(&old_cfg)?
+        .try_load()?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no current operator key found via the `{}` backend; the current operator key \
+                 must already exist (it authorises the rotation)",
+                old_cfg.backend_name(),
+            )
+        })?;
+    let old_signer = NodeSigner::from_identity(&old_identity)?;
+
+    // Mint / reload the new operator key.
+    let new_cfg = build_new_identity_config_for_rotation(
+        new_backend,
+        req.new_operator_key_path.clone(),
+        req.new_operator_key_passphrase_env.clone(),
+    )?;
+    let new_provider = boule_core::config::build_provider(&new_cfg)?;
+    let new_identity = if new_provider.is_provisioning_capable() {
+        new_provider.load_or_init()?
+    } else {
+        new_provider.try_load()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "new operator key backend `{}` is read-only and no key is yet provisioned; \
+                 mint the key out-of-band first",
+                new_cfg.backend_name(),
+            )
+        })?
+    };
+    let new_signer = NodeSigner::from_identity(&new_identity)?;
+
+    if new_signer.node_id() == old_signer.node_id() {
+        anyhow::bail!(
+            "new operator key equals the current operator key; pick a --new-operator-key-path \
+             that is not the current key",
+        );
+    }
+
+    let payload = OperatorKeyRotation {
+        validator,
+        new_operator_pubkey: new_signer.node_id(),
+        v_eff,
+    };
+    let envelope = DualSignedOperatorRotation::sign(payload, &old_signer, &new_signer, &chain_id)?;
+    Ok(OperatorKeyRotationOutcome { envelope })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use clap::{Args, Subcommand};
 
 use boule_consensus::validator_rotation::{
-    OperatorRecoveryRequest, RotationProposeRequest, build_operator_recovery_envelope,
+    OperatorKeyRotationRequest, OperatorRecoveryRequest, RotationProposeRequest,
+    build_operator_key_rotation_envelope, build_operator_recovery_envelope,
     build_rotation_envelope,
 };
 use boule_core::identity::node_id_to_base58;
@@ -20,6 +21,9 @@ pub(crate) enum RotationCmd {
     /// validator's signing key authorised by its operator key, without the old
     /// signing key — the recovery-from-loss path for a destroyed signing key.
     ProposeOperatorRecovery(OperatorRecoveryArgs),
+    /// Build an operator-key self-rotation payload (#549): rotate a validator's
+    /// own operator key, dual-signed by the old and new operator keys.
+    ProposeOperatorKeyRotation(OperatorKeyRotationArgs),
 }
 
 #[derive(Args)]
@@ -139,6 +143,67 @@ pub(crate) fn handle_propose_operator_recovery(args: OperatorRecoveryArgs) -> an
     eprintln!(
         "submit the hex above into a validator's mempool; it is authorised by the operator \
          key and needs no old signing key (no admin RPC yet; route is operator-specific)"
+    );
+    Ok(())
+}
+
+#[derive(Args)]
+pub(crate) struct OperatorKeyRotationArgs {
+    /// Config file path (default: platform-specific location).
+    #[arg(short = 'c', long = "config")]
+    config_path: Option<PathBuf>,
+    /// Base58 stable id of the validator whose operator key is rotating.
+    #[arg(long)]
+    validator: String,
+    /// Current operator key backend: file or encrypted-file. Must already exist.
+    #[arg(long)]
+    old_operator_key_backend: String,
+    /// Path to the current operator key.
+    #[arg(long)]
+    old_operator_key_path: Option<PathBuf>,
+    /// Env var holding the current operator key's passphrase (encrypted-file).
+    #[arg(long)]
+    old_operator_key_passphrase_env: Option<String>,
+    /// New operator key backend: file or encrypted-file (minted if absent).
+    #[arg(long)]
+    new_operator_key_backend: String,
+    /// Path for the new operator key.
+    #[arg(long)]
+    new_operator_key_path: Option<PathBuf>,
+    /// Env var holding the new operator key's passphrase (encrypted-file).
+    #[arg(long)]
+    new_operator_key_passphrase_env: Option<String>,
+    /// View at and after which the operator-key rotation takes effect.
+    #[arg(long = "v-eff")]
+    v_eff: u64,
+}
+
+pub(crate) fn handle_propose_operator_key_rotation(
+    args: OperatorKeyRotationArgs,
+) -> anyhow::Result<()> {
+    let req = OperatorKeyRotationRequest {
+        config_path: Some(resolve_config_path(args.config_path)?),
+        validator: Some(args.validator),
+        old_operator_key_backend: Some(args.old_operator_key_backend),
+        old_operator_key_path: args.old_operator_key_path,
+        old_operator_key_passphrase_env: args.old_operator_key_passphrase_env,
+        new_operator_key_backend: Some(args.new_operator_key_backend),
+        new_operator_key_path: args.new_operator_key_path,
+        new_operator_key_passphrase_env: args.new_operator_key_passphrase_env,
+        v_eff: Some(args.v_eff),
+    };
+    let outcome = build_operator_key_rotation_envelope(&req)?;
+    let bytes = outcome.envelope.encode_command();
+    println!("{}", hex::encode(&bytes));
+    eprintln!(
+        "operator-key rotation built: validator={} new_operator_pubkey={} v_eff={}",
+        node_id_to_base58(&outcome.envelope.payload.validator),
+        node_id_to_base58(&outcome.envelope.payload.new_operator_pubkey),
+        outcome.envelope.payload.v_eff.0,
+    );
+    eprintln!(
+        "submit the hex above into a validator's mempool to rotate the operator key \
+         (no admin RPC yet; route is operator-specific)"
     );
     Ok(())
 }
@@ -350,6 +415,129 @@ mod tests {
         let err = build_operator_recovery_envelope(&req).unwrap_err();
         assert!(
             err.to_string().contains("operator key"),
+            "unexpected error: {err}",
+        );
+    }
+
+    /// #549: end-to-end operator-key self-rotation — the minted envelope is
+    /// dual-signed (old + new operator keys) and verifies under the CURRENT
+    /// operator key + chain_id.
+    #[test]
+    fn operator_key_rotation_builds_envelope_verifiable_under_current_operator_key() {
+        use boule_consensus::validator_rotation::{
+            DualSignedOperatorRotation, OperatorKeyRotationRequest,
+            build_operator_key_rotation_envelope,
+        };
+        use boule_core::crypto::signed::{NodeSigner, Signer as _};
+        use boule_core::identity::base58_to_node_id;
+
+        let dir = TempDir::new().unwrap();
+        let validator_key = dir.path().join("validator.key");
+        let validator_b58 = mint_validator_key(&validator_key);
+        let old_operator = dir.path().join("old-operator.key");
+        let old_op_b58 = mint_validator_key(&old_operator);
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[node]\n\
+                 listen_addr = \"127.0.0.1:7000\"\n\n\
+                 [node.identity]\n\
+                 backend = \"file\"\n\
+                 path = \"{vk}\"\n\n\
+                 [api]\n\
+                 listen_addr = \"127.0.0.1:8000\"\n\n\
+                 [consensus]\n\
+                 validators = [\"{val}\"]\n\
+                 signature_scheme = \"ed25519_collected\"\n\n\
+                 [[consensus.validators_operator_keys]]\n\
+                 node_id = \"{val}\"\n\
+                 operator_pubkey = \"{op}\"\n",
+                vk = validator_key.display(),
+                val = validator_b58,
+                op = old_op_b58,
+            ),
+        )
+        .unwrap();
+
+        let new_operator = dir.path().join("new-operator.key");
+        let req = OperatorKeyRotationRequest {
+            config_path: Some(config_path.clone()),
+            validator: Some(validator_b58.clone()),
+            old_operator_key_backend: Some("file".into()),
+            old_operator_key_path: Some(old_operator.clone()),
+            old_operator_key_passphrase_env: None,
+            new_operator_key_backend: Some("file".into()),
+            new_operator_key_path: Some(new_operator.clone()),
+            new_operator_key_passphrase_env: None,
+            v_eff: Some(500),
+        };
+        let outcome = build_operator_key_rotation_envelope(&req).expect("must succeed");
+        assert!(new_operator.exists(), "new operator key must be minted");
+
+        let new_id =
+            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
+                path: new_operator.clone(),
+                allow_insecure_perms: false,
+            })
+            .unwrap()
+            .try_load()
+            .unwrap()
+            .unwrap();
+        let new_signer = NodeSigner::from_identity(&new_id).unwrap();
+        let validator_nid = base58_to_node_id(&validator_b58).unwrap();
+        let old_op_nid = base58_to_node_id(&old_op_b58).unwrap();
+        assert_eq!(outcome.envelope.payload.validator, validator_nid);
+        assert_eq!(
+            outcome.envelope.payload.new_operator_pubkey,
+            new_signer.node_id()
+        );
+        assert_eq!(outcome.envelope.payload.v_eff.0, 500);
+
+        let cfg = boule_core::config::load(&config_path).unwrap();
+        let chain_id =
+            boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        // Verifies under the CURRENT operator key (the authorising key).
+        outcome
+            .envelope
+            .verify(&old_op_nid, &chain_id)
+            .expect("envelope must verify under the current operator key");
+
+        let bytes = outcome.envelope.encode_command();
+        assert!(DualSignedOperatorRotation::is_operator_key_rotation_payload(&bytes));
+    }
+
+    /// #549: operator-key rotation requires the *current* operator key to exist
+    /// (it authorises). A missing current key errors.
+    #[test]
+    fn operator_key_rotation_errors_when_current_operator_key_missing() {
+        use boule_consensus::validator_rotation::{
+            OperatorKeyRotationRequest, build_operator_key_rotation_envelope,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let validator_key = dir.path().join("validator.key");
+        let validator_b58 = mint_validator_key(&validator_key);
+        let config_path = dir.path().join("config.toml");
+        write_ed25519_chain_config(&config_path, &validator_key, &validator_b58);
+
+        let missing_old = dir.path().join("nope-old.key");
+        let new_op = dir.path().join("new-operator.key");
+        let req = OperatorKeyRotationRequest {
+            config_path: Some(config_path),
+            validator: Some(validator_b58),
+            old_operator_key_backend: Some("file".into()),
+            old_operator_key_path: Some(missing_old),
+            old_operator_key_passphrase_env: None,
+            new_operator_key_backend: Some("file".into()),
+            new_operator_key_path: Some(new_op),
+            new_operator_key_passphrase_env: None,
+            v_eff: Some(500),
+        };
+        let err = build_operator_key_rotation_envelope(&req).unwrap_err();
+        assert!(
+            err.to_string().contains("current operator key"),
             "unexpected error: {err}",
         );
     }
