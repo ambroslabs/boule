@@ -118,30 +118,36 @@ impl RethApplication {
     /// reports the payload `VALID`, so its logs are available. A failed
     /// `eth_getLogs` is logged and yields no updates — a transient RPC error
     /// must not fail the commit (consensus commits regardless of the EL).
-    async fn derive_validator_updates(&self, payload: &Value) -> Vec<ValidatorUpdate> {
-        let Some(block_hash) = payload["blockHash"].as_str() else {
-            return Vec::new();
+    async fn derive_validator_updates(
+        &self,
+        payload: &Value,
+        height: Height,
+    ) -> Vec<ValidatorUpdate> {
+        // Read this block's staking events (empty on any failure — the height
+        // still advances so unbondings mature, #660).
+        let ops = match payload["blockHash"].as_str() {
+            Some(block_hash) => match self
+                .transport
+                .eth_rpc("eth_getLogs", staking::logs_filter(block_hash))
+                .await
+            {
+                Ok(logs) => staking::parse_stake_logs(&logs),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "boule::reth",
+                        error = %e,
+                        "eth_getLogs for staking events failed; no staking ops this block",
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
         };
-        let logs = match self
-            .transport
-            .eth_rpc("eth_getLogs", staking::logs_filter(block_hash))
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    target: "boule::reth",
-                    error = %e,
-                    "eth_getLogs for staking events failed; no validator updates this block",
-                );
-                return Vec::new();
-            }
-        };
-        let ops = staking::parse_stake_logs(&logs);
-        if ops.is_empty() {
-            return Vec::new();
-        }
         let mut src = self.stake_source.lock();
+        // Advance the ledger clock first (releases matured unbondings, #660),
+        // then apply this block's ops so their unbonding release is scheduled
+        // relative to this height.
+        src.advance_to_height(height);
         for (node_id, op) in ops {
             src.apply(node_id, op);
         }
@@ -363,7 +369,9 @@ impl Application for RethApplication {
             // it are now readable. Read them (#655) and feed the CL-native
             // stake ledger; the resulting deltas become validator_updates the
             // integration layer materialises into a reconfig (#652).
-            let validator_updates = self.derive_validator_updates(&payload).await;
+            let validator_updates = self
+                .derive_validator_updates(&payload, block.header.height)
+                .await;
             Ok(CommitResult {
                 validator_updates,
                 app_data: None,
