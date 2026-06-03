@@ -195,6 +195,9 @@ impl BlockBuilder for MempoolBlockBuilder {
             commands.retain(|cmd| {
                 if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
                     || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
+                    // Equivocation-evidence system txs (#657): self-authenticating
+                    // proofs validated + recorded at commit, like reconfig/rotation.
+                    || boule_consensus::equivocation_evidence::is_evidence_payload(cmd)
                     // App-level stake commands (the demo backend) are
                     // includable by the application even though the counter
                     // SM doesn't decode them; `commit` turns them into

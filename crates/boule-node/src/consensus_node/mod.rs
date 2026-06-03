@@ -85,7 +85,7 @@ use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_history::ValidatorSetHistory;
 use boule_consensus::validator_key_history::ValidatorKeyHistory;
-use boule_consensus::validator_set::ValidatorSet;
+use boule_consensus::validator_set::{ValidatorId, ValidatorSet};
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
 use boule_core::crypto::signed::{ChainId, Signer};
@@ -101,6 +101,7 @@ mod block_sync;
 mod commit;
 mod config;
 mod equivocation;
+mod evidence_apply;
 mod persistence;
 mod reconfig_apply;
 mod rotation_apply;
@@ -116,14 +117,15 @@ pub use boule_consensus::wire::{
 pub use config::NodeConfigForConsensus;
 pub use persistence::{
     LastCommitted, RECENT_QC_CACHE_CAPACITY, STORAGE_KEY_BLOCK_PREFIX, STORAGE_KEY_BLS_KEY_HISTORY,
-    STORAGE_KEY_HEIGHT_PREFIX, STORAGE_KEY_HIGH_QC, STORAGE_KEY_LAST_COMMITTED,
-    STORAGE_KEY_LAST_TIMEOUT_VOTE, STORAGE_KEY_LAST_VOTED_VIEW, STORAGE_KEY_LOCKED,
-    STORAGE_KEY_PROPOSED_IN_VIEW, STORAGE_KEY_VALIDATOR_HISTORY, STORAGE_KEY_VALIDATOR_KEY_HISTORY,
-    block_storage_key, decode_block, decode_height_storage_key, decode_high_qc,
-    decode_last_committed, decode_last_timeout_vote, decode_locked, decode_proposed_in_view,
-    decode_voted_view, encode_block, encode_high_qc, encode_last_committed,
-    encode_last_timeout_vote, encode_locked, encode_proposed_in_view, encode_voted_view,
-    height_storage_key, load_block_from_storage, load_block_range_from_storage, recover_state,
+    STORAGE_KEY_COMMITTED_EVIDENCE, STORAGE_KEY_HEIGHT_PREFIX, STORAGE_KEY_HIGH_QC,
+    STORAGE_KEY_LAST_COMMITTED, STORAGE_KEY_LAST_TIMEOUT_VOTE, STORAGE_KEY_LAST_VOTED_VIEW,
+    STORAGE_KEY_LOCKED, STORAGE_KEY_PROPOSED_IN_VIEW, STORAGE_KEY_VALIDATOR_HISTORY,
+    STORAGE_KEY_VALIDATOR_KEY_HISTORY, block_storage_key, decode_block, decode_height_storage_key,
+    decode_high_qc, decode_last_committed, decode_last_timeout_vote, decode_locked,
+    decode_proposed_in_view, decode_voted_view, encode_block, encode_high_qc,
+    encode_last_committed, encode_last_timeout_vote, encode_locked, encode_proposed_in_view,
+    encode_voted_view, height_storage_key, load_block_from_storage, load_block_range_from_storage,
+    recover_state,
 };
 
 use persistence::RecentQcCache;
@@ -440,6 +442,23 @@ pub struct ConsensusNode {
     /// Count of equivocation proofs built and self-verified (#656b). Surfaced
     /// under [`ConsensusStatus::equivocation_proofs_built`].
     equivocation_proofs_built: u64,
+    /// Committed-equivocation-evidence registry (#657): the equivocator's
+    /// stable `ValidatorId` → the view it equivocated at, recorded once when
+    /// an evidence system tx first commits for that validator. Drives
+    /// exactly-once handling (re-included evidence for an already-recorded
+    /// validator is a no-op) and is the input a later slashing pass (#658)
+    /// consumes. Persisted under [`STORAGE_KEY_COMMITTED_EVIDENCE`] and
+    /// reloaded at [`ConsensusNode::recover`].
+    committed_evidence: std::collections::BTreeMap<ValidatorId, View>,
+    /// Equivocators this node has already minted evidence into the mempool
+    /// for this session (#657). A Byzantine validator equivocates on every
+    /// view it participates in, so the detector would otherwise mint a fresh
+    /// (distinct-view) proof every view and flood the mempool / every
+    /// proposed block — one proof per equivocator suffices to slash it.
+    /// In-memory only (not persisted): on restart, [`Self::committed_evidence`]
+    /// still blocks re-minting for an already-recorded equivocator, and an
+    /// un-committed proof is cheap to re-mint once.
+    evidence_minted: std::collections::HashSet<ValidatorId>,
     /// Cumulative count of state-machine divergences detected at vote
     /// time (#599): a proposed block's deferred committed state root,
     /// anchored at a height this node has committed, disagreed with this
@@ -705,6 +724,8 @@ impl ConsensusNode {
             seen_votes: equivocation::SeenVotes::new(),
             seen_proposals: equivocation::SeenProposals::new(),
             equivocation_proofs_built: 0,
+            committed_evidence: std::collections::BTreeMap::new(),
+            evidence_minted: std::collections::HashSet::new(),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
             proposal_command_rejections: Arc::new(AtomicU64::new(0)),
@@ -1081,6 +1102,12 @@ impl ConsensusNode {
         // must produce the same `ChainId` as a fresh boot, since both
         // share the same genesis bytes.
         let chain_id = ChainId::from_genesis_hash(config.genesis.hash());
+
+        // #657: reload the committed-equivocation-evidence registry so the
+        // exactly-once dedup survives restarts (and block pruning). Absent /
+        // malformed blob → empty registry (logged inside the helper).
+        let committed_evidence = Self::load_committed_evidence(storage.as_ref());
+
         Ok(Self {
             self_id,
             core,
@@ -1119,6 +1146,8 @@ impl ConsensusNode {
             seen_votes: equivocation::SeenVotes::new(),
             seen_proposals: equivocation::SeenProposals::new(),
             equivocation_proofs_built: 0,
+            committed_evidence,
+            evidence_minted: std::collections::HashSet::new(),
             state_divergence_detected: Arc::new(AtomicU64::new(0)),
             vote_divergence_check_enabled: true,
             proposal_command_rejections: Arc::new(AtomicU64::new(0)),
@@ -4217,6 +4246,154 @@ mod tests {
             "a verified equivocation proof must be built from the two signed votes",
         );
         assert_eq!(node.build_status().equivocation_proofs_built, 1);
+    }
+
+    /// Build a node whose validator set seats a real signer (the equivocator)
+    /// at `vid(2)..vid(4)`, returning `(node, equivocator_signer, eq_id)`.
+    fn node_with_equivocator() -> (ConsensusNode, NodeSigner, ValidatorId) {
+        let equivocator = fresh_signer();
+        let eq_id = ValidatorId::from_genesis_pubkey(equivocator.node_id());
+        let vs = ValidatorSet::new(vec![eq_id, vid(2), vid(3), vid(4)]);
+        let node = ConsensusNode::new(
+            nid(2),
+            test_config(vs),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        );
+        (node, equivocator, eq_id)
+    }
+
+    /// A `DoubleVote` proof at `view` for blocks `block_a`/`block_b`, signed
+    /// by `signer` under `chain_id`.
+    fn double_vote_proof(
+        signer: &NodeSigner,
+        chain_id: &boule_core::crypto::signed::ChainId,
+        view: u64,
+        block_a: u8,
+        block_b: u8,
+    ) -> boule_consensus::dispatch::EquivocationProof {
+        use boule_consensus::hotstuff::qc::Vote;
+        use boule_core::crypto::signed::Signed;
+        let sign = |block: u8| {
+            Box::new(
+                Signed::sign(
+                    Vote {
+                        view: View(view),
+                        block_hash: [block; 32],
+                    },
+                    signer,
+                    chain_id,
+                )
+                .unwrap(),
+            )
+        };
+        boule_consensus::dispatch::EquivocationProof::DoubleVote(sign(block_a), sign(block_b))
+    }
+
+    /// A committed block at `view` carrying `commands` (no structural
+    /// validation — the apply path only reads view/height/commands).
+    fn block_with_commands(height: u64, view: u64, commands: Vec<bytes::Bytes>) -> Block {
+        let header = boule_consensus::replication::block::BlockHeader {
+            parent_hash: genesis().hash(),
+            height: Height(height),
+            view: View(view),
+            proposer: nid(1),
+            state_commitment: [0u8; 32],
+            commands_commitment: boule_consensus::replication::block::Block::commands_commitment(
+                &commands,
+            ),
+            validator_history_commitment: [0; 32],
+            committed_height: Height::ZERO,
+            committed_state_root: [0; 32],
+            timestamp: 0,
+        };
+        Block { header, commands }
+    }
+
+    /// #657: a valid evidence system tx in a committed block records the
+    /// equivocator in the registry exactly once — a second copy (same
+    /// validator) is a no-op.
+    #[test]
+    fn committed_evidence_records_valid_evidence_exactly_once() {
+        use boule_consensus::equivocation_evidence::encode_evidence;
+
+        let (mut node, equivocator, eq_id) = node_with_equivocator();
+        let proof = double_vote_proof(&equivocator, &node.chain_id, 3, 0xAA, 0xBB);
+        let evidence_tx = encode_evidence(&proof);
+
+        // Block at view 10 includes the evidence for the view-3 equivocation.
+        let block = block_with_commands(1, 10, vec![evidence_tx.clone()]);
+        node.apply_committed_evidence(&block);
+        assert_eq!(node.committed_evidence.get(&eq_id), Some(&View(3)));
+        assert_eq!(node.build_status().equivocation_evidence_committed, 1);
+
+        // The same evidence committed again (e.g. re-proposed by another
+        // node) is a no-op: still exactly one record.
+        let block2 = block_with_commands(2, 11, vec![evidence_tx]);
+        node.apply_committed_evidence(&block2);
+        assert_eq!(node.build_status().equivocation_evidence_committed, 1);
+    }
+
+    /// #657: stale, future-dated, and garbage evidence are all dropped
+    /// (logged, no-op) — never recorded.
+    #[test]
+    fn committed_evidence_rejects_stale_future_and_garbage() {
+        use boule_consensus::equivocation_evidence::{
+            EVIDENCE_TAG, MAX_EVIDENCE_AGE_VIEWS, encode_evidence,
+        };
+
+        // Stale: the equivocation is older than the age window.
+        let (mut node, equivocator, _eq_id) = node_with_equivocator();
+        let stale = double_vote_proof(&equivocator, &node.chain_id, 1, 0xAA, 0xBB);
+        let block = block_with_commands(
+            1,
+            1 + MAX_EVIDENCE_AGE_VIEWS + 1,
+            vec![encode_evidence(&stale)],
+        );
+        node.apply_committed_evidence(&block);
+        assert_eq!(node.build_status().equivocation_evidence_committed, 0);
+
+        // Future: evidence claims a view after the committing block.
+        let future = double_vote_proof(&equivocator, &node.chain_id, 50, 0xAA, 0xBB);
+        let block = block_with_commands(1, 10, vec![encode_evidence(&future)]);
+        node.apply_committed_evidence(&block);
+        assert_eq!(node.build_status().equivocation_evidence_committed, 0);
+
+        // Garbage: a correctly-tagged payload with an undecodable body.
+        let mut garbage = EVIDENCE_TAG.to_vec();
+        garbage.extend_from_slice(b"not a proof");
+        let block = block_with_commands(1, 10, vec![bytes::Bytes::from(garbage)]);
+        node.apply_committed_evidence(&block);
+        assert_eq!(node.build_status().equivocation_evidence_committed, 0);
+    }
+
+    /// #657: the committed-evidence registry is persisted, so a recovering
+    /// node reloads it (exactly-once survives restart + block pruning).
+    #[test]
+    fn committed_evidence_persists_for_recovery() {
+        use boule_consensus::equivocation_evidence::encode_evidence;
+
+        let equivocator = fresh_signer();
+        let eq_id = ValidatorId::from_genesis_pubkey(equivocator.node_id());
+        let vs = ValidatorSet::new(vec![eq_id, vid(2), vid(3), vid(4)]);
+        let storage: Arc<dyn boule_core::storage::Storage> = Arc::new(MemoryStorage::new());
+        let mut node = ConsensusNode::new(
+            nid(2),
+            test_config(vs),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let proof = double_vote_proof(&equivocator, &node.chain_id, 3, 0xAA, 0xBB);
+        let block = block_with_commands(1, 10, vec![encode_evidence(&proof)]);
+        node.apply_committed_evidence(&block);
+
+        // The blob a recovering node would read reproduces the registry.
+        let reloaded = ConsensusNode::load_committed_evidence(storage.as_ref());
+        assert_eq!(reloaded.get(&eq_id), Some(&View(3)));
     }
 
     /// `Dispatch::ServeBlock` for an unknown hash returns

@@ -263,6 +263,7 @@ mod tests {
             equivocations_detected: 0,
             proposal_equivocations_detected: 0,
             equivocation_proofs_built: 0,
+            equivocation_evidence_committed: 0,
             state_divergence_detected: 0,
             proposal_command_rejections: 0,
             backpressure: crate::status::BackpressureStatus::default(),

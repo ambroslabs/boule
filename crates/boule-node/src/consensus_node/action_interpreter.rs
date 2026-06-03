@@ -1052,6 +1052,12 @@ impl ConsensusNode {
                         let rejected = block.commands.iter().find_map(|cmd| {
                             if boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(cmd)
                                 || boule_consensus::reconfig::ReconfigCommand::is_reconfig_payload(cmd)
+                                // Equivocation-evidence system txs (#657) are
+                                // consensus-layer, validated at commit — skip
+                                // them here exactly as the builder does, else
+                                // honest voters abstain on every evidence block
+                                // and the chain wedges.
+                                || boule_consensus::equivocation_evidence::is_evidence_payload(cmd)
                             {
                                 return None;
                             }

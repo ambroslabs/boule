@@ -198,6 +198,7 @@ impl ConsensusNode {
                 .proposal_equivocations_detected
                 .load(Ordering::Relaxed),
             equivocation_proofs_built: self.equivocation_proofs_built,
+            equivocation_evidence_committed: self.committed_evidence.len() as u64,
             state_divergence_detected: self.state_divergence_detected.load(Ordering::Relaxed),
             proposal_command_rejections: self.proposal_command_rejections.load(Ordering::Relaxed),
             backpressure: BackpressureStatus {
