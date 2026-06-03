@@ -56,6 +56,9 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Reconfig(reconfig::ReconfigCmd::ChangeWeight(a)) => {
             reconfig::handle_change_weight(a)
         }
+        Command::Reconfig(reconfig::ReconfigCmd::ConsentSign(a)) => {
+            reconfig::handle_consent_sign(a)
+        }
         Command::Rotation(rotation::RotationCmd::Propose(a)) => rotation::handle_propose(a),
         Command::Rotation(rotation::RotationCmd::ProposeOperatorRecovery(a)) => {
             rotation::handle_propose_operator_recovery(a)
