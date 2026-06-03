@@ -307,6 +307,13 @@ impl Application for MempoolBlockBuilder {
         Box::pin(async move { built })
     }
 
+    /// #658b: zero the equivocator's bonded stake in the CL-native ledger.
+    /// The resulting `weight 0` delta is drained by the next `commit`'s
+    /// `take_updates`, merging with the jail-remove (#658a) in the reconfig.
+    fn slash(&self, node_id: NodeId) {
+        self.stake_source.lock().slash(node_id);
+    }
+
     /// The counter application's commit is in-process: lock the shared
     /// state machine and apply the committed block's commands. A failed
     /// `apply` is a no-op per the [`StateMachine`] contract — it is logged

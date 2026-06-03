@@ -4503,6 +4503,88 @@ mod tests {
         );
     }
 
+    /// #658b: when committed evidence first records an equivocator, the
+    /// integration layer slashes it through the application's `slash` hook
+    /// (the economic half — a stake-backed app zeroes its bonded balance).
+    #[test]
+    fn committed_evidence_slashes_the_equivocator_via_the_app() {
+        use boule_consensus::equivocation_evidence::encode_evidence;
+
+        /// Records the validators the integration layer asks to slash.
+        struct SlashSpyApp {
+            slashed: Arc<std::sync::Mutex<Vec<NodeId>>>,
+        }
+        impl Application for SlashSpyApp {
+            fn build_proposal<'a>(
+                &'a self,
+                _parent: &'a Block,
+                _view: View,
+                _high_qc: &'a boule_consensus::hotstuff::QuorumCertificate,
+                _pending: &'a HashMap<BlockHash, Block>,
+                _ts: u64,
+            ) -> boule_core::clock::BoxFuture<'a, anyhow::Result<Block>> {
+                Box::pin(async { anyhow::bail!("SlashSpyApp does not build") })
+            }
+            fn commit<'a>(
+                &'a self,
+                _block: &'a Block,
+            ) -> boule_core::clock::BoxFuture<
+                'a,
+                anyhow::Result<boule_consensus::replication::application::CommitResult>,
+            > {
+                Box::pin(async {
+                    Ok(boule_consensus::replication::application::CommitResult::default())
+                })
+            }
+            fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn state_commitment(&self) -> [u8; 32] {
+                [0u8; 32]
+            }
+            fn snapshot(&self) -> bytes::Bytes {
+                bytes::Bytes::new()
+            }
+            fn restore(&self, _snap: &[u8]) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn slash(&self, node_id: NodeId) {
+                self.slashed.lock().unwrap().push(node_id);
+            }
+        }
+
+        let equivocator = fresh_signer();
+        let eq_id = ValidatorId::from_genesis_pubkey(equivocator.node_id());
+        let vs = ValidatorSet::new(vec![eq_id, vid(2), vid(3), vid(4)]);
+        let slashed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut node = ConsensusNode::new(
+            nid(2),
+            test_config(vs),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::new(MemoryStorage::new()),
+            Arc::new(MemoryWal::new()),
+        )
+        .with_application(Arc::new(SlashSpyApp {
+            slashed: slashed.clone(),
+        }));
+
+        let proof = double_vote_proof(&equivocator, &node.chain_id, 3, 0xAA, 0xBB);
+        let block = block_with_commands(1, 10, vec![encode_evidence(&proof)]);
+        node.apply_committed_evidence(&block);
+
+        assert_eq!(
+            slashed.lock().unwrap().as_slice(),
+            &[equivocator.node_id()],
+            "the equivocator must be slashed exactly once via the app hook",
+        );
+
+        // A second copy of the same evidence (already recorded) does not
+        // re-slash.
+        node.apply_committed_evidence(&block);
+        assert_eq!(slashed.lock().unwrap().len(), 1);
+    }
+
     /// `Dispatch::ServeBlock` for an unknown hash returns
     /// `BlockResponse(None)` without erroring on storage. The peer's
     /// `block_sync_response_not_found` arm handles the negative case.

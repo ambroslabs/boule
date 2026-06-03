@@ -383,6 +383,14 @@ impl Application for RethApplication {
         Ok(())
     }
 
+    /// #658b: zero the equivocator's bonded stake in the CL-native ledger
+    /// (the authoritative balance; `Staking.sol` is a pure event emitter).
+    /// The `weight 0` delta is drained by the next `commit`'s `take_updates`
+    /// and merges with the jail-remove (#658a) through the reconfig path.
+    fn slash(&self, node_id: NodeId) {
+        self.stake_source.lock().slash(node_id);
+    }
+
     fn executed_height(&self) -> Option<Height> {
         // reth's executed frontier: the last committed block whose payload the
         // EL reported VALID. Lags the consensus committed height while the EL
