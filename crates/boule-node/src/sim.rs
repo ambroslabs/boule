@@ -5599,6 +5599,38 @@ mod tests {
     /// each property actually uses to satisfy its predicate.
     const PHASE_CAP: Duration = Duration::from_millis(1_500);
 
+    /// One step in a composed fault/membership trace (#285). Replayed
+    /// against a live `SimCluster` with conservative guards (see
+    /// `proptest_composed_partition_reconfig_trace`): events that can't
+    /// safely apply in the current state are skipped, so every generated
+    /// sequence is a valid scenario.
+    #[derive(Debug, Clone)]
+    enum TraceEvent {
+        /// Advance simulated time until the cluster commits a few more blocks.
+        Advance,
+        /// Partition off a single node (a minority `f = 1`), leaving the
+        /// majority with quorum. No-op if already partitioned.
+        PartitionMinority,
+        /// Heal any active partition.
+        Heal,
+        /// Remove a current validator (only while healthy, no reconfig
+        /// pending, and the post-remove set stays ≥ `MIN_VALIDATOR_FLOOR`).
+        RemoveValidator,
+        /// Tail-spawn + add a validator (only while healthy and no reconfig
+        /// pending).
+        AddValidator,
+    }
+
+    fn trace_event_strategy() -> impl Strategy<Value = TraceEvent> {
+        prop_oneof![
+            3 => Just(TraceEvent::Advance),
+            2 => Just(TraceEvent::PartitionMinority),
+            2 => Just(TraceEvent::Heal),
+            1 => Just(TraceEvent::RemoveValidator),
+            1 => Just(TraceEvent::AddValidator),
+        ]
+    }
+
     proptest! {
         // 6 cases per property is enough to randomise victims /
         // splits / flip rates while keeping wall-clock comfortably
@@ -6263,6 +6295,163 @@ mod tests {
                      (target={target} new_weight={new_weight})",
                 );
 
+                Ok(())
+            })?;
+        }
+
+        /// **#285 — composed fault + membership trace.** Replay a random
+        /// sequence of partition / heal / reconfig(remove) / reconfig(add) /
+        /// advance events against one cluster, checking the universal
+        /// invariants hold across the *whole* interleaved trace — not just
+        /// each fault in isolation. Reconfig adds (tail-spawn, #284) are
+        /// included now that the simulator can grow a running cluster.
+        ///
+        /// Conservative guards keep every generated sequence a valid
+        /// scenario: partitions are minority-only (`f = 1`, majority keeps
+        /// quorum); reconfigs fire only while healthy, one at a time, and
+        /// never drop the set below `MIN_VALIDATOR_FLOOR`; each reconfig's
+        /// `v_eff` is computed relative to the *current* height (a fixed
+        /// value would land in the past once the trace has advanced) and is
+        /// driven fully past its boundary before the next. Safety
+        /// (`assert_no_conflicts`) must hold throughout; liveness is checked
+        /// at the end on a healed cluster.
+        #[test]
+        fn proptest_composed_partition_reconfig_trace(
+            events in prop::collection::vec(trace_event_strategy(), 1..=6),
+        ) {
+            use boule_consensus::View;
+            use boule_consensus::reconfig::{ReconfigCommand, ValidatorEntry};
+
+            run_paused(|| async move {
+                let mut cluster = SimCluster::spawn(5, Duration::from_millis(50)).await;
+                let warmed = cluster
+                    .advance_and_yield_until(PHASE_CAP, |c| {
+                        c.peek_commit_heights().iter().min().copied().unwrap_or(0) >= 1
+                    })
+                    .await;
+                prop_assert!(warmed, "composed: warm-up produced no commit");
+
+                // Current committee size + the member node-ids (genesis 5 to
+                // start); `partitioned` gates reconfigs to healthy windows.
+                let mut member_count: usize = 5;
+                let mut members: Vec<NodeId> = cluster.node_ids.clone();
+                let mut partitioned = false;
+
+                let max_height = |c: &mut SimCluster| -> u64 {
+                    c.peek_commit_heights().iter().max().copied().unwrap_or(0)
+                };
+
+                for ev in events {
+                    match ev {
+                        TraceEvent::Advance => {
+                            let base = max_height(&mut cluster);
+                            // Best-effort: a live partition may stall the
+                            // drain. Safety is the invariant; end-of-trace
+                            // liveness runs on a healed cluster.
+                            let _ = cluster
+                                .advance_and_yield_until(PHASE_CAP, |c| max_height(c) >= base + 2)
+                                .await;
+                        }
+                        TraceEvent::PartitionMinority => {
+                            if !partitioned && member_count >= 4 {
+                                // Cluster node 0 alone is a minority (f=1);
+                                // the rest retain quorum.
+                                cluster.partition_into_two(&[0]);
+                                partitioned = true;
+                            }
+                        }
+                        TraceEvent::Heal => {
+                            if partitioned {
+                                cluster.heal_partition();
+                                partitioned = false;
+                                let base = cluster
+                                    .peek_commit_heights()
+                                    .iter()
+                                    .min()
+                                    .copied()
+                                    .unwrap_or(0);
+                                let _ = cluster
+                                    .advance_and_yield_until(PHASE_CAP, |c| {
+                                        c.peek_commit_heights().iter().min().copied().unwrap_or(0)
+                                            > base
+                                    })
+                                    .await;
+                            }
+                        }
+                        TraceEvent::RemoveValidator => {
+                            if !partitioned && member_count > 4 {
+                                let removed = *members.last().expect("members non-empty");
+                                let v_eff = View(max_height(&mut cluster) + 12);
+                                let cmd = ReconfigCommand {
+                                    adds: vec![],
+                                    removes: vec![removed],
+                                    changes: vec![],
+                                    v_eff,
+                                };
+                                for mp in &cluster.mempools {
+                                    let _ = mp.insert(cmd.encode());
+                                }
+                                let crossed = cluster
+                                    .advance_and_yield_until(Duration::from_secs(8), |c| {
+                                        max_height(c) >= v_eff.0 + 3
+                                    })
+                                    .await;
+                                prop_assert!(crossed, "composed: remove failed to cross v_eff");
+                                members.pop();
+                                member_count -= 1;
+                            }
+                        }
+                        TraceEvent::AddValidator => {
+                            if !partitioned {
+                                let (joiner, _mp) = cluster.spawn_validator_into();
+                                let v_eff = View(max_height(&mut cluster) + 12);
+                                let cmd = ReconfigCommand {
+                                    adds: vec![ValidatorEntry {
+                                        node_id: joiner,
+                                        addr: "127.0.0.1:9100".parse().unwrap(),
+                                        bls_pop: None,
+                                        weight: 1,
+                                        operator_pubkey: None,
+                                        consent_sig: None,
+                                        initial_endpoints: vec![],
+                                    }],
+                                    removes: vec![],
+                                    changes: vec![],
+                                    v_eff,
+                                };
+                                for mp in &cluster.mempools {
+                                    let _ = mp.insert(cmd.encode());
+                                }
+                                // Drive past v_eff. Use the surviving committee's
+                                // max height (the fresh joiner starts at 0 and is
+                                // still syncing).
+                                let crossed = cluster
+                                    .advance_and_yield_until(Duration::from_secs(12), |c| {
+                                        max_height(c) >= v_eff.0 + 3
+                                    })
+                                    .await;
+                                prop_assert!(crossed, "composed: add failed to cross v_eff");
+                                members.push(joiner);
+                                member_count += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Heal any lingering partition, then assert the cluster still
+                // makes progress (liveness) and committed no conflicts
+                // (safety) across the whole trace.
+                if partitioned {
+                    cluster.heal_partition();
+                }
+                let base = max_height(&mut cluster);
+                let progressed = cluster
+                    .advance_and_yield_until(Duration::from_secs(8), |c| max_height(c) > base)
+                    .await;
+                prop_assert!(progressed, "composed: no progress after the trace");
+
+                let committed = cluster.drain_commits();
+                assert_no_conflicts(&committed);
                 Ok(())
             })?;
         }
