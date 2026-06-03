@@ -49,6 +49,21 @@ pub fn logs_filter(block_hash: &str) -> Value {
     }])
 }
 
+/// The `eth_getLogs` filter selecting one block's staking events *by EVM
+/// block number* rather than hash. Used to backfill the staking events of
+/// blocks the EL executed via background self-sync that `commit` skipped
+/// while the EL was `SYNCING` (#674): on catch-up we know only each skipped
+/// block's boule height (→ its canonical EVM number), not its hash.
+pub fn logs_filter_by_number(number: u64) -> Value {
+    let block = format!("0x{number:x}");
+    json!([{
+        "fromBlock": block,
+        "toBlock": block,
+        "address": STAKING_ADDRESS,
+        "topics": [[DEPOSIT_TOPIC, WITHDRAW_TOPIC]],
+    }])
+}
+
 /// Parse an `eth_getLogs` result (an array of staking-predeploy log objects)
 /// into `(node_id, StakeOp)` pairs in log order. A `Deposit` becomes a
 /// [`StakeOp::Bond`], a `Withdraw` a [`StakeOp::Unbond`]; `node_id` is the

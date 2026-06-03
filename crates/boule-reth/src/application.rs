@@ -156,6 +156,81 @@ impl RethApplication {
         src.take_updates()
     }
 
+    /// Backfill the staking events of blocks the EL executed via background
+    /// self-sync (snap/full, #631) that `commit` skipped while the EL was
+    /// `SYNCING` (#674).
+    ///
+    /// When the EL reports `VALID` for a block whose height is more than one
+    /// past the committed frontier, every block in the gap
+    /// `(prev_height, height)` was executed by the EL out-of-band — not through
+    /// `commit`, which returned early while `SYNCING` — so its predeploy
+    /// staking events were never read and the CL stake ledger would silently
+    /// drift from EL state (the root self-heals via `recover_frontier`, but the
+    /// ledger has no such re-anchor).
+    ///
+    /// Each skipped block's events are read *by canonical EVM number* — its
+    /// hash is unknown on this path — and applied **at the block's own height**,
+    /// exactly as the normal per-block path would, so a node that caught up via
+    /// self-sync reaches the byte-identical ledger of one that committed every
+    /// block in order (unbonding maturity is height-relative, #660). This
+    /// relies on the one-EVM-block-per-committed-boule-block invariant: EVM
+    /// block number advances 1:1 with boule height, so the block at boule
+    /// height `h` has EVM number `current_number - (height - h)`.
+    ///
+    /// Applies ops to the ledger but does not drain updates — the caller's
+    /// [`Self::derive_validator_updates`] for the current block drains the gap's
+    /// and the current block's deltas together.
+    async fn backfill_self_synced_gap(&self, payload: &Value, prev_height: Height, height: Height) {
+        // No gap: the frontier advanced by exactly one block (the common path).
+        if height.0 <= prev_height.0 + 1 {
+            return;
+        }
+        let Some(current_number) = payload["blockNumber"]
+            .as_str()
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        else {
+            tracing::warn!(
+                target: "boule::reth",
+                "self-sync backfill: current payload has no parseable blockNumber; \
+                 skipping staking reconcile over the gap",
+            );
+            return;
+        };
+        tracing::info!(
+            target: "boule::reth",
+            from = prev_height.0 + 1,
+            to = height.0 - 1,
+            "self-sync backfill: reconciling staking over EL self-synced gap",
+        );
+        // Skipped boule heights, oldest first, applied at their own height.
+        for h in (prev_height.0 + 1)..height.0 {
+            let evm_number = current_number - (height.0 - h);
+            let ops = match self
+                .transport
+                .eth_rpc("eth_getLogs", staking::logs_filter_by_number(evm_number))
+                .await
+            {
+                Ok(logs) => staking::parse_stake_logs(&logs),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "boule::reth",
+                        height = h,
+                        evm_number,
+                        error = %e,
+                        "self-sync backfill: eth_getLogs failed; staking events for \
+                         this skipped block are lost",
+                    );
+                    Vec::new()
+                }
+            };
+            let mut src = self.stake_source.lock();
+            src.advance_to_height(Height(h));
+            for (node_id, op) in ops {
+                src.apply(node_id, op);
+            }
+        }
+    }
+
     /// Reconcile the committed frontier with reality on restart. `new` starts at
     /// `(0, genesis_root)`, but on a restart reth (its own persistent DB) is
     /// already at the finalized head while consensus recovers its committed
@@ -348,10 +423,22 @@ impl Application for RethApplication {
             let (_, status) = self.engine().commit_block(&payload).await?;
             match status {
                 ElStatus::Valid => {
-                    // The EL executed it — advance the committed frontier.
-                    let mut c = self.committed.lock();
-                    c.height = block.header.height;
-                    c.state_root = new_root;
+                    // The EL executed it — advance the committed frontier,
+                    // capturing the previous frontier height first so we can
+                    // tell whether the EL just self-synced past a gap (#674).
+                    let prev_height = {
+                        let mut c = self.committed.lock();
+                        let prev = c.height;
+                        c.height = block.header.height;
+                        c.state_root = new_root;
+                        prev
+                    };
+                    // #674: if the frontier jumped by more than one block, the
+                    // EL executed the in-between blocks via background self-sync
+                    // (not through `commit`); read their staking events now so
+                    // the CL stake ledger doesn't drift from EL state.
+                    self.backfill_self_synced_gap(&payload, prev_height, block.header.height)
+                        .await;
                 }
                 ElStatus::Syncing => {
                     // The EL doesn't have this block's parent yet; commit_block
@@ -933,6 +1020,136 @@ mod tests {
         // Frontier held at the last executed block, not advanced to 10.
         assert_eq!(app.committed.lock().height, Height(5));
         assert_eq!(app.state_commitment(), [0x55; 32]);
+    }
+
+    /// #674: when the EL reports VALID for a block whose height jumps past the
+    /// committed frontier by more than one (it self-synced the in-between
+    /// blocks via snap/full sync, never replaying them through `commit`), the
+    /// staking events of those skipped blocks are backfilled — read by EVM
+    /// number and applied at their own height — so the CL stake ledger does not
+    /// silently drift from EL state.
+    #[tokio::test]
+    async fn commit_backfills_staking_over_an_el_self_synced_gap() {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        fn payload_with_number(block_hash: &str, number: u64) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "blockHash": block_hash,
+                    "blockNumber": format!("0x{number:x}"),
+                    "stateRoot": format!("0x{}", "11".repeat(32)),
+                    "timestamp": "0x1",
+                }))
+                .unwrap(),
+            )
+        }
+
+        const VALIDATOR_A: [u8; 32] = [0x0a; 32]; // genesis-staked, withdraws in block 3
+        const VALIDATOR_C: [u8; 32] = [0x0c; 32]; // deposits in skipped block 1
+        const BLOCK3_HASH: &str = "0x3c";
+
+        // Transport: engine_* report VALID so `commit` advances the frontier;
+        // `eth_getLogs` serves per-block staking events — by EVM number for the
+        // self-synced gap blocks, by hash for the current block.
+        struct GapStakingTransport;
+        impl EngineTransport for GapStakingTransport {
+            fn call(
+                &self,
+                method: &str,
+                _params: Value,
+                _tag: &str,
+            ) -> BoxFuture<'_, Result<Value>> {
+                let v = match method {
+                    "engine_newPayloadV3" => serde_json::json!({ "status": "VALID" }),
+                    "engine_forkchoiceUpdatedV3" => {
+                        serde_json::json!({ "payloadStatus": { "status": "VALID" } })
+                    }
+                    other => panic!("unexpected engine method {other}"),
+                };
+                Box::pin(async move { Ok(v) })
+            }
+            fn eth_rpc(&self, _method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+                let filter = &params[0];
+                let logs = if filter["fromBlock"] == serde_json::json!("0x1") {
+                    // Skipped block 1: validator C deposits 7.
+                    serde_json::json!([{
+                        "topics": [staking::DEPOSIT_TOPIC, format!("0x{}", "0c".repeat(32))],
+                        "data": format!("0x{:064x}", 7u64),
+                    }])
+                } else if filter["blockHash"] == serde_json::json!(BLOCK3_HASH) {
+                    // Current block 3: validator A withdraws its full stake.
+                    serde_json::json!([{
+                        "topics": [staking::WITHDRAW_TOPIC, format!("0x{}", "0a".repeat(32))],
+                        "data": format!("0x{:064x}", 1u64),
+                    }])
+                } else {
+                    // Skipped block 2 (fromBlock 0x2) and anything else: no events.
+                    serde_json::json!([])
+                };
+                Box::pin(async move { Ok(logs) })
+            }
+        }
+
+        let app = RethApplication::new(
+            Box::new(GapStakingTransport),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::seeded_from([(VALIDATOR_A, 1u64)])),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        );
+
+        // Frontier starts at genesis (0). The EL self-synced blocks 1 and 2 in
+        // the background; now it executes block 3 (height jumps 0 → 3).
+        let block3 = {
+            let commands = vec![payload_with_number(BLOCK3_HASH, 3)];
+            Block {
+                header: BlockHeader {
+                    parent_hash: [0u8; 32],
+                    height: Height(3),
+                    view: View(3),
+                    proposer: [1u8; 32],
+                    state_commitment: [0u8; 32],
+                    commands_commitment: Block::commands_commitment(&commands),
+                    validator_history_commitment: [0u8; 32],
+                    committed_height: Height(0),
+                    committed_state_root: [0u8; 32],
+                    timestamp: 1,
+                },
+                commands,
+            }
+        };
+
+        let result = app
+            .commit(&AppContext::default(), &block3)
+            .await
+            .expect("commit");
+
+        // Frontier advanced to 3.
+        assert_eq!(app.committed.lock().height, Height(3));
+        // The gap block 1's deposit (C, weight 7) is NOT lost, and the current
+        // block 3's withdraw (A → weight 0) also rides this commit.
+        let mut got = result.validator_updates.clone();
+        got.sort_by_key(|u| u.node_id);
+        assert_eq!(
+            got,
+            vec![
+                ValidatorUpdate {
+                    node_id: VALIDATOR_A,
+                    weight: 0,
+                },
+                ValidatorUpdate {
+                    node_id: VALIDATOR_C,
+                    weight: 7,
+                },
+            ],
+            "the self-synced gap's staking event (C +7) is backfilled alongside \
+             the current block's (A removed)",
+        );
     }
 
     #[tokio::test]
