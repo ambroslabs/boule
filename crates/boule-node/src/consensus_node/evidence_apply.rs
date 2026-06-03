@@ -112,6 +112,13 @@ impl ConsensusNode {
                 committed_view = block_view.0,
                 "consensus_equivocation_evidence_committed",
             );
+            // #658b: slash the equivocator's bonded stake. The membership
+            // removal is the consensus-layer jail (#658a, derived from this
+            // same registry); this is the economic half — an app that owns a
+            // stake ledger zeroes the bonded balance, and the resulting
+            // weight-0 delta merges with the jail-remove on the next commit.
+            // No-op for a tokenless application.
+            self.app.slash(who.into_node_id());
         }
 
         if recorded_any {

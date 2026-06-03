@@ -166,6 +166,19 @@ pub trait Application: Send + Sync {
         None
     }
 
+    /// Slash the validator `node_id` — the economic half of the
+    /// equivocation penalty (#658b), called by the integration layer when
+    /// committed evidence first records that validator. An application that
+    /// owns a stake ledger zeroes the validator's bonded stake (a capital
+    /// burn that also keeps the ledger consistent with the consensus-layer
+    /// jail #658a applies via the reconfig path); the resulting `weight 0`
+    /// delta rides the next [`Self::commit`]'s [`CommitResult`].
+    ///
+    /// The default is a no-op: a tokenless application has no stake, and the
+    /// *membership* consequence is the consensus-layer jail (#658a / #457),
+    /// which runs regardless of this hook.
+    fn slash(&self, _node_id: NodeId) {}
+
     // ── Synchronous state queries ──────────────────────────────────────
     //
     // These mirror the same-named [`StateMachine`] methods and are the

@@ -45,6 +45,17 @@ pub trait StakeSource: Send + Sync {
     /// deltas (a new voting weight, or `weight 0` to remove) the
     /// application returns as `CommitResult::validator_updates`.
     fn take_updates(&mut self) -> Vec<ValidatorUpdate>;
+
+    /// Slash `node_id`'s entire bonded stake — the punitive zeroing applied on
+    /// committed equivocation evidence (#658b), distinct in intent from a
+    /// voluntary [`StakeOp::Unbond`]. Emits a `weight 0` [`ValidatorUpdate`]
+    /// (drained by the next [`Self::take_updates`]), keeping the stake ledger
+    /// consistent with the membership jail (#658a) and burning the equivocator's
+    /// bonded capital. The default zeroes the balance via an unbond of the full
+    /// amount; a source with real custody would forfeit rather than return it.
+    fn slash(&mut self, node_id: NodeId) {
+        self.apply(node_id, StakeOp::Unbond { amount: u64::MAX });
+    }
 }
 
 /// CL-native [`StakeSource`]: an in-process ledger mapping each validator
@@ -162,5 +173,25 @@ mod tests {
         l.apply([5u8; 32], StakeOp::Unbond { amount: 100 });
         assert_eq!(l.take_updates()[0].weight, 0);
         assert_eq!(l.stake_of(&[5u8; 32]), 0);
+    }
+
+    #[test]
+    fn slash_zeroes_the_stake_and_emits_a_removal() {
+        // #658b: slashing burns the entire bonded balance regardless of size,
+        // emitting the weight-0 removal signal.
+        let mut l = BondedStakeLedger::seeded_from([([6u8; 32], 1_000)]);
+        l.slash([6u8; 32]);
+        assert_eq!(l.stake_of(&[6u8; 32]), 0);
+        let u = l.take_updates();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].node_id, [6u8; 32]);
+        assert_eq!(u[0].weight, 0);
+    }
+
+    #[test]
+    fn slash_of_an_unstaked_validator_is_a_no_op() {
+        let mut l = BondedStakeLedger::seeded_from([([7u8; 32], 5)]);
+        l.slash([8u8; 32]); // never staked
+        assert!(l.take_updates().is_empty());
     }
 }
