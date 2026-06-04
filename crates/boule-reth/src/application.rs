@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::transport::EngineTransport;
-use crate::{endpoint, rotation, staking};
+use crate::{endpoint, param, rotation, staking};
 
 /// Max boule system txs to pull from the mempool into one proposal. Only a
 /// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
@@ -224,6 +224,21 @@ impl RethApplication {
             endpoint::parse_endpoint_logs,
             ValidatorEffect::EndpointUpdate,
             "endpoint",
+        )
+        .await
+    }
+
+    /// This block's parameter-update-predeploy effects (#542 producer).
+    async fn derive_param_effects(&self, payload: &Value) -> Vec<ValidatorEffect> {
+        let Some(block_hash) = payload["blockHash"].as_str() else {
+            return Vec::new();
+        };
+        self.derive_predeploy_effects(
+            block_hash,
+            param::logs_filter(block_hash),
+            param::parse_param_logs,
+            ValidatorEffect::ParamUpdate,
+            "param",
         )
         .await
     }
@@ -459,6 +474,9 @@ impl Application for RethApplication {
                     // Endpoint-advertisement system txs (#731): the endpoint
                     // read path mints these; validated + applied at commit.
                     || boule_consensus::endpoint_registry::SignedEndpointCommand::is_endpoint_payload(&cmd)
+                    // Consensus-parameter-update system txs (#542): the param
+                    // read path mints these; validated + scheduled at commit.
+                    || boule_consensus::consensus_params::ConsensusParamUpdate::is_param_update_payload(&cmd)
                 {
                     commands.push(cmd);
                 }
@@ -544,14 +562,16 @@ impl Application for RethApplication {
             let validator_updates = self
                 .derive_validator_updates(&payload, block.header.height)
                 .await;
-            // Submission-predeploy events: each carries an already-signed
-            // consensus command submitted as an EVM tx, surfaced as a
-            // ValidatorEffect the integration layer re-materialises into a block
-            // command (consensus verifies signatures + schedules at commit).
+            // Submission-predeploy events: each carries an encoded consensus
+            // command submitted as an EVM tx, surfaced as a ValidatorEffect the
+            // integration layer re-materialises into a block command (consensus
+            // validates it — signatures and/or v_eff — at commit).
             //   - rotation (#730) -> KeyRotation
             //   - endpoint (#731) -> EndpointUpdate
+            //   - param    (#542) -> ParamUpdate
             let mut effects = self.derive_rotation_effects(&payload).await;
             effects.extend(self.derive_endpoint_effects(&payload).await);
+            effects.extend(self.derive_param_effects(&payload).await);
             Ok(CommitResult {
                 validator_updates,
                 effects,
@@ -582,16 +602,16 @@ impl Application for RethApplication {
 
     fn capabilities(&self) -> Vec<IntegrationCapability> {
         // The reth backend drives the validator set from on-chain staking logs
-        // (#655), burns bonded stake on committed evidence (#658b), accepts
-        // key/operator rotations via the rotation predeploy (#730), and accepts
-        // endpoint advertisements via the endpoint predeploy (#731). It does not
-        // (yet) drive parameter updates or rewards through the seam (those are
-        // milestone-#4 follow-ups — #542 producer / rewards).
+        // (#655), burns bonded stake on committed evidence (#658b), and accepts
+        // key/operator rotations (#730), endpoint advertisements (#731), and
+        // live parameter updates (#542) via their predeploys. It does not (yet)
+        // drive rewards through the seam (a milestone-#4 follow-up).
         vec![
             IntegrationCapability::Membership,
             IntegrationCapability::Slashing,
             IntegrationCapability::KeyRotation,
             IntegrationCapability::EndpointAdvertisement,
+            IntegrationCapability::ParameterUpdates,
         ]
     }
 
@@ -702,17 +722,17 @@ mod tests {
     #[test]
     fn declares_the_capabilities_it_drives() {
         // The reth backend drives the validator set (#655), slashing (#658b),
-        // key rotation (#730), and endpoint advertisement (#731) — and declares
-        // exactly those, nothing it doesn't drive.
+        // key rotation (#730), endpoint advertisement (#731), and parameter
+        // updates (#542) — and declares exactly those, nothing it doesn't drive.
         let app = make_app([0u8; 32]);
         let caps = app.capabilities();
         assert!(caps.contains(&IntegrationCapability::Membership));
         assert!(caps.contains(&IntegrationCapability::Slashing));
         assert!(caps.contains(&IntegrationCapability::KeyRotation));
         assert!(caps.contains(&IntegrationCapability::EndpointAdvertisement));
+        assert!(caps.contains(&IntegrationCapability::ParameterUpdates));
         assert!(!caps.contains(&IntegrationCapability::Rewards));
-        assert!(!caps.contains(&IntegrationCapability::ParameterUpdates));
-        assert_eq!(caps.len(), 4);
+        assert_eq!(caps.len(), 5);
     }
 
     #[tokio::test]
@@ -998,6 +1018,89 @@ mod tests {
                 );
             }
             other => panic!("expected EndpointUpdate, got {other:?}"),
+        }
+    }
+
+    /// Test transport serving param-predeploy logs only for the param
+    /// `eth_getLogs` filter (keyed on the filter's `address`).
+    struct ParamTransport {
+        inner: FixtureTransport,
+        param_logs: Value,
+    }
+    impl EngineTransport for ParamTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, _method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+            let is_param = params[0]["address"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(param::PARAM_ADDRESS));
+            let logs = if is_param {
+                self.param_logs.clone()
+            } else {
+                Value::Array(Vec::new())
+            };
+            Box::pin(async move { Ok(logs) })
+        }
+    }
+
+    /// #542 end-to-end (reth side): a param-predeploy event in a committed block
+    /// surfaces as a `ValidatorEffect::ParamUpdate` carrying the opaque
+    /// param-update command. The event has no indexed validator, so its topics
+    /// are just `[topic0]`. reth passes the bytes straight through.
+    #[tokio::test]
+    async fn commit_reads_param_logs_into_param_effects() {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        let cmd = b"CPARM-fake-encoded-consensus-param-update";
+        let param_logs = serde_json::json!([{
+            "topics": [param::PARAM_TOPIC],
+            "data": abi_log_bytes(cmd),
+        }]);
+        let app = RethApplication::new(
+            Box::new(ParamTransport {
+                inner: FixtureTransport,
+                param_logs,
+            }),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::seeded_from([([2u8; 32], 1u64)])),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        );
+
+        let g = genesis();
+        let block = app
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
+            .await
+            .expect("build");
+        let result = app
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit");
+
+        assert!(result.validator_updates.is_empty());
+        assert_eq!(result.effects.len(), 1, "one param event → one effect");
+        match &result.effects[0] {
+            ValidatorEffect::ParamUpdate(bytes) => {
+                assert_eq!(
+                    bytes.as_ref(),
+                    cmd.as_ref(),
+                    "the opaque command rides through"
+                );
+            }
+            other => panic!("expected ParamUpdate, got {other:?}"),
         }
     }
 

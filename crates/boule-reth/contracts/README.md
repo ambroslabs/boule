@@ -125,3 +125,51 @@ python3 -c "import solcx; solcx.install_solc('0.8.24'); \
 Paste the `bin-runtime` hex (prefixed with `0x`) into the predeploy account's
 `code` field in `genesis.json`. If the contract changes, update both the
 bytecode and the constants in `src/endpoint.rs`.
+
+## `Param.sol` — live consensus-parameter-update predeploy (#542 producer)
+
+The EVM-native submission path for live consensus-parameter updates (#542) on
+the reth backend (milestone #4). A consensus parameter is changed by sending an
+EVM transaction to `submitParam(bytes paramCommand)`, where `paramCommand` is
+the encoded boule `ConsensusParamUpdate` (`ConsensusParamUpdate::encode()`). The
+contract is a pure event emitter; boule reads the `ParamSubmitted` event from
+each committed block (via `eth_getLogs`), turns it into a
+`ValidatorEffect::ParamUpdate` on the widened `CommitResult` (#727), and
+re-materialises the command into a block — where the existing param path (#542)
+validates the `v_eff` delay and schedules the change at its view boundary so
+every replica adopts the new value at the same view. The
+`ConsensusParamHistory` apply mechanism is unchanged; only the submission path
+moves onto the EVM.
+
+> [!NOTE]
+> Unlike `Rotation.sol` / `Endpoint.sol`, a parameter update is not tied to a
+> single validator, so the event carries **no indexed `validator`**.
+>
+> **Authorization is an open #542 follow-up:** who may change a consensus
+> parameter (a governance multisig, a validator-quorum signature) is
+> deliberately unresolved. This predeploy emits whatever is submitted; the only
+> consensus-side guard today is the `v_eff` delay floor. The first wired
+> parameter (`min_block_interval`) is leader-local and harmless, bounding the
+> risk until authorization lands.
+
+| | |
+|---|---|
+| Address | `0x0000000000000000000000000000000000000b11` |
+| `ParamSubmitted(bytes)` topic0 | `0x27d1e5d546bb0a37e323040c28412ac11a38a95061bbe56c3f95d635f8826a0b` |
+| `submitParam(bytes)` selector | `0x18433fc7` |
+
+These identifiers are mirrored as constants in `src/param.rs`; unit tests pin
+the address, topic, and selector to the genesis account's bytecode.
+
+### Reproducing the bytecode
+
+Same toolchain as `Staking.sol` above (**solc 0.8.24**, `bin-runtime`):
+
+```sh
+python3 -c "import solcx; solcx.install_solc('0.8.24'); \
+  print(solcx.compile_files(['contracts/Param.sol'], output_values=['bin-runtime'], solc_version='0.8.24'))"
+```
+
+Paste the `bin-runtime` hex (prefixed with `0x`) into the predeploy account's
+`code` field in `genesis.json`. If the contract changes, update both the
+bytecode and the constants in `src/param.rs`.
