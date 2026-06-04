@@ -83,20 +83,39 @@ impl<'a> RethEngine<'a> {
     /// greater than the parent's (EVM requires strictly increasing block
     /// times). `build_wait` lets reth's async build pull pool txs in before
     /// `getPayload` (pass `Duration::ZERO` in tests / for a fixture transport).
+    ///
+    /// `registry_payload` is the **A1 EL-applied registry write set** (#781):
+    /// the hex-encoded `(keys, weights, settledView)` boule consensus computed
+    /// for this block ([`RegistryPayload::to_attribute_hex`]). When non-empty it
+    /// is sent as the custom `registryPayload` payload attribute; the custom EL
+    /// (`boule-reth-node`) transcribes it into the sealed header `extra_data`
+    /// and applies the writes as system calls so every replica mirrors the
+    /// identical registry state. An empty string omits the attribute entirely, so
+    /// a stock reth (which ignores unknown attribute fields) and the custom EL
+    /// both build a plain block — the common case.
+    ///
+    /// [`RegistryPayload::to_attribute_hex`]: crate::registry_payload::RegistryPayload::to_attribute_hex
     pub async fn build_block(
         &self,
         head_hash: &str,
         evm_timestamp: u64,
         build_wait: Duration,
+        registry_payload: &str,
     ) -> Result<BuiltBlock> {
         let z = zero32();
-        let attrs = json!({
+        let mut attrs = json!({
             "timestamp": format!("0x{evm_timestamp:x}"),
             "prevRandao": z,
             "suggestedFeeRecipient": self.fee_recipient,
             "withdrawals": [],
             "parentBeaconBlockRoot": z,
         });
+        // A1 (#781): carry boule's registry write set to the custom EL as the
+        // `registryPayload` attribute. Only when non-empty — an empty write set
+        // leaves a plain block (and keeps the attribute absent for stock reth).
+        if !registry_payload.is_empty() {
+            attrs["registryPayload"] = json!(registry_payload);
+        }
         let fcs = forkchoice(head_hash);
         let started = self
             .transport
@@ -264,7 +283,7 @@ mod tests {
     #[tokio::test]
     async fn build_block_parses_payload_and_state_root() {
         let built = engine()
-            .build_block(GENESIS, 1, Duration::ZERO)
+            .build_block(GENESIS, 1, Duration::ZERO, "")
             .await
             .expect("build");
         assert_eq!(built.block_number, 1);
@@ -286,9 +305,72 @@ mod tests {
     #[tokio::test]
     async fn build_then_commit_threads_the_payload_through() {
         let eng = engine();
-        let built = eng.build_block(GENESIS, 0, Duration::ZERO).await.unwrap();
+        let built = eng
+            .build_block(GENESIS, 0, Duration::ZERO, "")
+            .await
+            .unwrap();
         let (committed, _) = eng.commit_block(&built.execution_payload).await.unwrap();
         assert_eq!(committed, built.block_hash);
+    }
+
+    /// A transport that records the params of the first `forkchoiceUpdatedV3`
+    /// (the build-path fcU-with-attrs) and otherwise serves the golden fixtures,
+    /// so we can assert exactly what attributes the build path sends.
+    struct CapturingTransport {
+        inner: crate::testing::FixtureTransport,
+        fcu_attrs: std::sync::Arc<parking_lot::Mutex<Option<Value>>>,
+    }
+
+    impl EngineTransport for CapturingTransport {
+        fn call(
+            &self,
+            method: &str,
+            params: Value,
+            tag: &str,
+        ) -> boule_core::clock::BoxFuture<'_, Result<Value>> {
+            if method == "engine_forkchoiceUpdatedV3" && tag == "01-fcu-attrs" {
+                *self.fcu_attrs.lock() = Some(params[1].clone());
+            }
+            self.inner.call(method, params, tag)
+        }
+    }
+
+    #[tokio::test]
+    async fn build_block_carries_registry_payload_attribute_when_non_empty() {
+        let fcu_attrs = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let t = CapturingTransport {
+            inner: crate::testing::FixtureTransport,
+            fcu_attrs: fcu_attrs.clone(),
+        };
+        let eng = RethEngine::new(&t, "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        let hex = "0x424c52310101000000000001e2400000000000000000"; // settled_view=123456
+        eng.build_block(GENESIS, 1, Duration::ZERO, hex)
+            .await
+            .expect("build");
+        let attrs = fcu_attrs.lock().clone().expect("fcU(attrs) was sent");
+        assert_eq!(
+            attrs["registryPayload"].as_str(),
+            Some(hex),
+            "the registryPayload attribute carries the leader's encoded write set verbatim",
+        );
+    }
+
+    #[tokio::test]
+    async fn build_block_omits_registry_payload_attribute_when_empty() {
+        let fcu_attrs = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let t = CapturingTransport {
+            inner: crate::testing::FixtureTransport,
+            fcu_attrs: fcu_attrs.clone(),
+        };
+        let eng = RethEngine::new(&t, "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+        eng.build_block(GENESIS, 1, Duration::ZERO, "")
+            .await
+            .expect("build");
+        let attrs = fcu_attrs.lock().clone().expect("fcU(attrs) was sent");
+        assert!(
+            attrs.get("registryPayload").is_none(),
+            "an empty write set sends no registryPayload attribute (a plain block)",
+        );
     }
 
     /// A transport whose `newPayloadV3`/`forkchoiceUpdatedV3` return `SYNCING`,
