@@ -183,3 +183,32 @@ python3 -c "import solcx; solcx.install_solc('0.8.24'); \
 Paste the `bin-runtime` hex (prefixed with `0x`) into the predeploy account's
 `code` field in `genesis.json`. If the contract changes, update both the
 bytecode and the constants in `src/param.rs`.
+
+## `Registry.sol` — validator BLS-key registry (#732a)
+
+The EVM-readable mirror of boule's per-validator BLS key history. Unlike the
+submission predeploys (which boule reads via `eth_getLogs`), the registry is
+read **in the EVM** by the in-EVM slashing precompile (#732b) via `SLOAD` —
+`keyAt(bytes32 validator, uint64 view)` returns the BLS pubkey whose `vEff` is
+the greatest `<= view` (the settled, lag-free historical lookup). `recordKey`
+appends a monotone `(vEff, key)` entry. It is a **mirror**: consensus stays
+authoritative for the validator set; see `docs/validator-registry-and-slashing.md`.
+
+> [!NOTE]
+> MVP: `recordKey` is unauthenticated (the same follow-up `Staking.withdraw`
+> carries). Hardening (#732): verify the rotation's dual BLS signature via the
+> EIP-2537 precompiles before recording. Populating the registry from committed
+> rotations, and the slashing precompile that reads it, are the next #732 steps.
+
+| | |
+|---|---|
+| Address | `0x0000000000000000000000000000000000000b12` |
+| `KeyRecorded(bytes32,uint64,bytes)` topic0 | `0x6a8fd2a0f1d9cf8a45c363bc1be9d77d28519827b041057dce545b44ff9680dd` |
+| `keyAt(bytes32,uint64)` selector | `0x3a9e358a` |
+| `recordKey(bytes32,uint64,bytes)` selector | `0x824b9802` |
+| `historyLength(bytes32)` selector | `0x43905859` |
+
+Mirrored as constants in `src/registry.rs`; unit tests pin them to the generated
+bytecode. The contract's storage logic is validated against a **live reth** by
+the manual harness `test/registry.mjs` (see its header) — `recordKey`/`keyAt`
+exercised on a real EVM, since the genesis-pin Rust tests can't run the EVM.
