@@ -263,7 +263,7 @@ pub struct AppContext {
 /// a static set); a PoS backend declares [`Self::Membership`] and usually
 /// [`Self::Slashing`]; only a PoS-with-rewards backend declares
 /// [`Self::Rewards`] — rewards are never forced. See
-/// `docs/el-transaction-integration.md` for the full capability catalog
+/// `docs/transaction-integration-surface.md` for the full capability catalog
 /// (signal consumed, effect emitted, consensus-native residue, and the
 /// required-vs-optional matrix per authority model).
 ///
@@ -415,7 +415,7 @@ pub trait Application: Send + Sync {
     /// declarative: the integration layer logs it when the application is wired
     /// so the integration surface a backend covers (and, by omission, the
     /// hooks it leaves to consensus) is visible rather than silent. See
-    /// `docs/el-transaction-integration.md`.
+    /// `docs/transaction-integration-surface.md`.
     ///
     /// The default is empty — a PoA / genesis-fixed-set backend, and the reth
     /// EL default, drive nothing and let consensus run with a static set.
