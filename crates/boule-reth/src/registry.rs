@@ -9,15 +9,25 @@
 //! (`docs/validator-registry-and-slashing.md`) relies on.
 //!
 //! Unlike the submission predeploys (staking/rotation/endpoint/param), the
-//! registry is read **in the EVM** (by the slashing predeploy via `SLOAD`), not
-//! by boule via `eth_getLogs` — so this module carries the on-chain identifiers
-//! (mirrored as constants and pinned to the genesis bytecode by the tests
-//! below) plus the **genesis-seed** half of the write path (#732 step 2):
+//! registry is read **in the EVM** (by the slashing precompile via `SLOAD`, and
+//! by #729's tally / #746's auth via `weightOf`/`totalWeight`), not by boule via
+//! `eth_getLogs` — so this module carries the on-chain identifiers (mirrored as
+//! constants and pinned to the genesis bytecode by the tests below) plus the
+//! **genesis-seed** half of the write path (#732 steps 2 + 4):
 //! [`genesis_seed_storage`] derives the `alloc[Registry].storage` words that
-//! pre-populate the genesis validators' keys — the EVM analogue of
-//! `BlsKeyHistory::with_genesis`. The *rotation* half of the write path is
-//! handled boule-side (rotations are postcard-encoded and not decodable in
-//! Solidity — see `docs/validator-registry-and-slashing.md` "The write path").
+//! pre-populate the genesis validators' keys **and current weights** — the EVM
+//! analogue of `BlsKeyHistory::with_genesis` plus the genesis validator set's
+//! weights. The *rotation* half of the key write path is handled boule-side
+//! (rotations are postcard-encoded and not decodable in Solidity — see
+//! `docs/validator-registry-and-slashing.md` "The write path").
+//!
+//! The **weight** model (#732 step 4) differs from the key history: the key API
+//! is a *history* (`keyAt(validator, view)`) because slashing looks up settled
+//! *past* views, but weight's consumers need the **currently seated** weight, so
+//! it is a single current value — `weightOf(validator)` plus a running
+//! `totalWeight()` accumulator (a consumer derives a quorum threshold from it
+//! without enumerating validators). [`record_weight_calldata`] encodes the
+//! WRITER-gated `recordWeight` the proposer submits on a seated-weight change.
 //!
 //! The contract's storage logic is exercised against a live reth (see the PR /
 //! `Registry.sol` doc): `recordKey` appends a monotone `(vEff, key)` entry and
@@ -42,6 +52,18 @@ pub const RECORD_KEY_SELECTOR: [u8; 4] = [0x82, 0x4b, 0x98, 0x02];
 /// 4-byte selector of `historyLength(bytes32)`.
 pub const HISTORY_LENGTH_SELECTOR: [u8; 4] = [0x43, 0x90, 0x58, 0x59];
 
+/// 4-byte selector of `recordWeight(bytes32,uint64)` (the WRITER-gated weight
+/// write the proposer submits on a seated-weight change, #732 step 4).
+pub const RECORD_WEIGHT_SELECTOR: [u8; 4] = [0x3a, 0x8d, 0xa0, 0xf9];
+
+/// 4-byte selector of `weightOf(bytes32)` (the current-weight read #729's tally
+/// and #746's auth call).
+pub const WEIGHT_OF_SELECTOR: [u8; 4] = [0x4c, 0x10, 0x8d, 0x6d];
+
+/// 4-byte selector of `totalWeight()` (the running weight-sum read, the
+/// auto-generated getter for the public `totalWeight` scalar).
+pub const TOTAL_WEIGHT_SELECTOR: [u8; 4] = [0x96, 0xc8, 0x2e, 0x57];
+
 /// Declaration slot of the registry's `mapping(bytes32 => KeyEntry[]) history`
 /// — the single state variable in `Registry.sol`, so it occupies slot `0`.
 const HISTORY_MAPPING_SLOT: u64 = 0;
@@ -50,6 +72,15 @@ const HISTORY_MAPPING_SLOT: u64 = 0;
 /// packed array storage: one slot for `vEff` (a `uint64` does not pack with the
 /// following dynamic `bytes`), one for the `key` length/pointer header.
 const KEY_ENTRY_SLOTS: u64 = 2;
+
+/// Declaration slot of the registry's `mapping(bytes32 => uint64) weight` — the
+/// second state variable in `Registry.sol`, so it occupies slot `1`.
+const WEIGHT_MAPPING_SLOT: u64 = 1;
+
+/// Declaration slot of the registry's `uint64 totalWeight` scalar — the third
+/// state variable, so it occupies slot `2` (a standalone `uint64`, right-aligned
+/// in its own slot).
+const TOTAL_WEIGHT_SLOT: u64 = 2;
 
 use boule_consensus::View;
 use boule_consensus::validator_rotation::{DualSignedRotation, OperatorSignedRotation};
@@ -154,6 +185,24 @@ pub fn record_key_calldata(rk: &RecordKey) -> alloy_primitives::Bytes {
     alloy_primitives::Bytes::from(out)
 }
 
+/// ABI-encode the `recordWeight(bytes32 validator, uint64 newWeight)` calldata:
+/// the 4-byte selector followed by the two static head words (`validator(32) ‖
+/// newWeight(left-padded to 32)`). Both arguments are static, so there is no
+/// dynamic tail. Mirrors [`record_key_calldata`]; consumed by the proposer
+/// write-path (`RethApplication::commit`) to mirror a seated-weight change into
+/// the `Registry` predeploy.
+pub fn record_weight_calldata(validator: &NodeId, weight: u64) -> alloy_primitives::Bytes {
+    let mut out = Vec::with_capacity(4 + 32 * 2);
+    out.extend_from_slice(&RECORD_WEIGHT_SELECTOR);
+    // head[0]: validator (bytes32, already 32 bytes).
+    out.extend_from_slice(validator);
+    // head[1]: newWeight (uint64), right-aligned in a 32-byte word.
+    let mut w_word = [0u8; 32];
+    w_word[24..].copy_from_slice(&weight.to_be_bytes());
+    out.extend_from_slice(&w_word);
+    alloy_primitives::Bytes::from(out)
+}
+
 /// keccak256 of `bytes`.
 fn keccak256(bytes: &[u8]) -> [u8; 32] {
     use sha3::{Digest, Keccak256};
@@ -184,15 +233,20 @@ fn slot_add(slot: &[u8; 32], delta: u64) -> [u8; 32] {
 type StorageEntry = ([u8; 32], [u8; 32]);
 
 /// Compute the `alloc[Registry].storage` entries that seed the genesis
-/// validators' BLS keys into the registry predeploy — the EVM analogue of
-/// `BlsKeyHistory::with_genesis`.
+/// validators' BLS keys **and current weights** into the registry predeploy —
+/// the EVM analogue of `BlsKeyHistory::with_genesis` plus the consensus genesis
+/// validator set's weights (the same `(NodeId, weight)` set that seeds
+/// `BondedStakeLedger`).
 ///
-/// Each genesis validator gets a one-element history `[(vEff: 0, key128)]`,
-/// exactly as `with_genesis` seeds consensus-side at `View::ZERO`. The resulting
-/// map is what would be merged into the `alloc` entry at [`REGISTRY_ADDRESS`] in
-/// a *deployment-specific* genesis (the committed `genesis.template.json`
-/// carries no validator keys — they are per-deployment), so a live reth answers
-/// `keyAt(validator, V) == key128` from block zero without any transaction.
+/// Each genesis validator gets a one-element key history `[(vEff: 0, key128)]`
+/// (exactly as `with_genesis` seeds consensus-side at `View::ZERO`) and a
+/// `weightOf(validator) == weight` entry; the accumulated `totalWeight` scalar
+/// is seeded to the sum of all genesis weights. The resulting map is what would
+/// be merged into the `alloc` entry at [`REGISTRY_ADDRESS`] in a
+/// *deployment-specific* genesis (the committed `genesis.template.json` carries
+/// no validator keys/weights — they are per-deployment), so a live reth answers
+/// `keyAt(validator, V) == key128`, `weightOf(validator) == weight`, and
+/// `totalWeight() == Σ weight` from block zero without any transaction.
 ///
 /// The input key is boule's **48-byte compressed** `min-pk` G1 pubkey; it is
 /// converted here, inside the helper, to the **128-byte EIP-2537 uncompressed**
@@ -202,9 +256,10 @@ type StorageEntry = ([u8; 32], [u8; 32]);
 /// slashable from block zero and a caller cannot get the on-chain format wrong.
 /// Errors if any input pubkey is not a valid compressed G1 point.
 ///
-/// ## Storage-slot layout (Solidity `mapping(bytes32 => KeyEntry[])` at slot 0)
+/// ## Storage-slot layout
 ///
-/// For `history[validator]`:
+/// For the key history (`mapping(bytes32 => KeyEntry[]) history` at slot 0),
+/// `history[validator]`:
 /// - `arraySlot = keccak256(validator ‖ uint256(0))` holds the array **length**.
 /// - element `i` lives at `dataBase = keccak256(arraySlot)` offset by
 ///   `i * KEY_ENTRY_SLOTS`:
@@ -214,19 +269,55 @@ type StorageEntry = ([u8; 32], [u8; 32]);
 ///     the bytes themselves start at `keccak256(headerSlot)`, one 32-byte slot
 ///     at a time (128 bytes → 4 slots, exact, no padding).
 ///
-/// All genesis entries are `vEff = 0` so each validator's array length is `1`.
+/// For the weight surface:
+/// - `weight[validator]` (`mapping(bytes32 => uint64)` at slot 1) lives at
+///   `keccak256(validator ‖ uint256(1))`, the `uint64` right-aligned.
+/// - `totalWeight` (`uint64` at slot 2) lives at slot `2` directly, the sum of
+///   all genesis weights right-aligned. Omitted when no genesis weights are
+///   non-zero (a zero scalar is the EVM default, so seeding it would be a
+///   redundant word).
+///
+/// All genesis key entries are `vEff = 0` so each validator's array length is
+/// `1`.
 pub fn genesis_seed_storage(
-    genesis: impl IntoIterator<Item = (NodeId, BlsPublicKey)>,
+    genesis: impl IntoIterator<Item = (NodeId, BlsPublicKey, u64)>,
 ) -> Result<Vec<StorageEntry>, BlsKeyError> {
     let mut out = Vec::new();
-    for (validator, key) in genesis {
+    let mut total_weight: u64 = 0;
+    for (validator, key, weight) in genesis {
         let key128 = bls_pubkey_to_eip2537_g1(&key)?;
         out.extend(validator_history_storage(
             &validator,
             &[(View::ZERO, &key128)],
         ));
+        out.push(weight_storage(&validator, weight));
+        total_weight = total_weight
+            .checked_add(weight)
+            .expect("genesis totalWeight overflowed u64");
+    }
+    // Seed the `totalWeight` scalar only when non-zero (zero is the EVM default).
+    if total_weight != 0 {
+        let mut slot = [0u8; 32];
+        slot[24..].copy_from_slice(&TOTAL_WEIGHT_SLOT.to_be_bytes());
+        let mut value = [0u8; 32];
+        value[24..].copy_from_slice(&total_weight.to_be_bytes());
+        out.push((slot, value));
     }
     Ok(out)
+}
+
+/// The single `(slot, value)` storage write seeding `weight[validator] = weight`
+/// (`mapping(bytes32 => uint64)` at [`WEIGHT_MAPPING_SLOT`]): the slot is
+/// `keccak256(validator ‖ uint256(1))`, the `uint64` value right-aligned in the
+/// 32-byte word.
+fn weight_storage(validator: &NodeId, weight: u64) -> StorageEntry {
+    let mut key_preimage = [0u8; 64];
+    key_preimage[..32].copy_from_slice(validator);
+    key_preimage[32 + 24..].copy_from_slice(&WEIGHT_MAPPING_SLOT.to_be_bytes());
+    let slot = keccak256(&key_preimage);
+    let mut value = [0u8; 32];
+    value[24..].copy_from_slice(&weight.to_be_bytes());
+    (slot, value)
 }
 
 /// Storage entries for one validator's `(vEff, key)` history (entries must be
@@ -280,7 +371,7 @@ fn validator_history_storage(validator: &NodeId, entries: &[(View, &[u8])]) -> V
 /// `alloc[Registry].storage` field (`"0x<slot>": "0x<value>"`, both 32-byte
 /// hex) — the form `reth`'s genesis loader and the genesis-pin tests expect.
 pub fn genesis_seed_storage_json(
-    genesis: impl IntoIterator<Item = (NodeId, BlsPublicKey)>,
+    genesis: impl IntoIterator<Item = (NodeId, BlsPublicKey, u64)>,
 ) -> Result<serde_json::Map<String, serde_json::Value>, BlsKeyError> {
     let mut map = serde_json::Map::new();
     for (slot, value) in genesis_seed_storage(genesis)? {
@@ -328,6 +419,9 @@ mod tests {
             ("keyAt", KEY_AT_SELECTOR),
             ("recordKey", RECORD_KEY_SELECTOR),
             ("historyLength", HISTORY_LENGTH_SELECTOR),
+            ("recordWeight", RECORD_WEIGHT_SELECTOR),
+            ("weightOf", WEIGHT_OF_SELECTOR),
+            ("totalWeight", TOTAL_WEIGHT_SELECTOR),
         ] {
             assert!(
                 code.contains(&hex::encode(sel)),
@@ -389,14 +483,30 @@ mod tests {
         "0x0000000000000000000000000000000000000000000000000000000000000101";
     const REG_SEED_CHUNK_BASE: &str =
         "0xc25886be15ecb57b4bb548a15123446d24bef1a38ef876e5a3e3e7a43ae2cd9a";
+    // Weight surface for the same validator (0xaa*32, weight = 7): the
+    // `weight[validator]` slot is keccak256(validator ‖ uint256(1)), and the
+    // `totalWeight` scalar lives at slot 2 directly. Captured from a live reth
+    // via `eth_getStorageAt` (see `contracts/test/registry-seed.mjs`).
+    const REG_SEED_WEIGHT_SLOT: &str =
+        "0xf6b7fe0f1a55e2604fc4254cf20b9c366ac0209ebfd964e094a76dc63887a919";
+    const REG_SEED_WEIGHT_VALUE: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000007";
+    const REG_SEED_TOTAL_WEIGHT_SLOT: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000002";
+    const REG_SEED_TOTAL_WEIGHT_VALUE: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000007";
 
-    /// The seed for one validator writes exactly the seven storage words the
-    /// layout requires: array length, `vEff`, the `bytes` long-form header, and
-    /// the four key-data chunks. (128 bytes → 4 chunks.)
+    /// The seed for one validator writes the seven key words the layout requires
+    /// (array length, `vEff`, the `bytes` long-form header, four key-data
+    /// chunks), plus one `weight` word and one `totalWeight` word — nine total.
     #[test]
-    fn one_validator_writes_seven_words() {
-        let seed = genesis_seed_storage([(val(0xaa), seed_key())]).unwrap();
-        assert_eq!(seed.len(), 7, "len + vEff + header + 4 data chunks");
+    fn one_validator_writes_nine_words() {
+        let seed = genesis_seed_storage([(val(0xaa), seed_key(), 7)]).unwrap();
+        assert_eq!(
+            seed.len(),
+            9,
+            "7 key words + weight + totalWeight (len + vEff + header + 4 chunks)",
+        );
     }
 
     /// Pins the full slot/value derivation for one genesis validator
@@ -408,7 +518,7 @@ mod tests {
     /// *values* are the 128-byte key split into four 32-byte words.
     #[test]
     fn slot_derivation_matches_live_reth_ground_truth() {
-        let seed = genesis_seed_storage([(val(0xaa), seed_key())]).unwrap();
+        let seed = genesis_seed_storage([(val(0xaa), seed_key(), 7)]).unwrap();
         let key128 = bls_pubkey_to_eip2537_g1(&seed_key()).unwrap();
 
         // Expected non-chunk slots from a live reth (`registry-seed.mjs`).
@@ -418,6 +528,15 @@ mod tests {
             (
                 slot_hex(REG_SEED_HEADER_SLOT),
                 val_hex(REG_SEED_HEADER_VALUE),
+            ),
+            // Weight surface: weight[0xaa] == 7 and totalWeight == 7.
+            (
+                slot_hex(REG_SEED_WEIGHT_SLOT),
+                val_hex(REG_SEED_WEIGHT_VALUE),
+            ),
+            (
+                slot_hex(REG_SEED_TOTAL_WEIGHT_SLOT),
+                val_hex(REG_SEED_TOTAL_WEIGHT_VALUE),
             ),
         ];
         // The four key chunks live at consecutive slots from CHUNK_BASE, each
@@ -443,7 +562,14 @@ mod tests {
             );
         }
 
-        assert_eq!(seed.len(), 7);
+        assert_eq!(seed.len(), 9);
+        // weight[validator] == 7 word present.
+        let mut weight_word = [0u8; 32];
+        weight_word[31] = 7;
+        assert!(
+            seed.iter().filter(|(_, v)| *v == weight_word).count() >= 1,
+            "weight word == 7 present",
+        );
         // Array length word == 1 (single genesis entry).
         let mut len_word = [0u8; 32];
         len_word[31] = 1;
@@ -490,20 +616,37 @@ mod tests {
         out
     }
 
-    /// Two genesis validators are independent: 14 words, each validator's slots
-    /// distinct (different keccak buckets), and the JSON renders both.
+    /// Two genesis validators are independent: 17 words (7 key + 1 weight each =
+    /// 16, plus the one shared `totalWeight` scalar), each validator's slots
+    /// distinct (different keccak buckets), `totalWeight == sum`, JSON renders all.
     #[test]
     fn two_validators_are_independent() {
         let seed =
-            genesis_seed_storage([(val(0x01), bls_pk(0xa1)), (val(0x02), bls_pk(0xa2))]).unwrap();
-        assert_eq!(seed.len(), 14, "7 words each, no slot collisions");
+            genesis_seed_storage([(val(0x01), bls_pk(0xa1), 3), (val(0x02), bls_pk(0xa2), 5)])
+                .unwrap();
+        assert_eq!(
+            seed.len(),
+            17,
+            "8 words each + 1 shared totalWeight, no collisions"
+        );
         let slots: std::collections::HashSet<_> = seed.iter().map(|(s, _)| *s).collect();
-        assert_eq!(slots.len(), 14, "all fourteen slots distinct");
+        assert_eq!(slots.len(), 17, "all seventeen slots distinct");
+        // totalWeight scalar (slot 2) == 3 + 5 = 8.
+        let mut total_slot = [0u8; 32];
+        total_slot[31] = 2;
+        let total = seed
+            .iter()
+            .find(|(s, _)| *s == total_slot)
+            .map(|(_, v)| *v)
+            .expect("totalWeight slot present");
+        let mut want_total = [0u8; 32];
+        want_total[31] = 8;
+        assert_eq!(total, want_total, "totalWeight == 3 + 5");
 
         let json =
-            genesis_seed_storage_json([(val(0x01), bls_pk(0xa1)), (val(0x02), bls_pk(0xa2))])
+            genesis_seed_storage_json([(val(0x01), bls_pk(0xa1), 3), (val(0x02), bls_pk(0xa2), 5)])
                 .unwrap();
-        assert_eq!(json.len(), 14);
+        assert_eq!(json.len(), 17);
         for (k, v) in &json {
             assert!(k.starts_with("0x") && k.len() == 66, "32-byte hex slot key");
             assert!(
@@ -519,7 +662,7 @@ mod tests {
     #[test]
     fn seed_stores_128_byte_eip2537_key() {
         let key = bls_pk(0x5c);
-        let seed = genesis_seed_storage([(val(0xcd), key)]).unwrap();
+        let seed = genesis_seed_storage([(val(0xcd), key, 1)]).unwrap();
         let key128 = bls_pubkey_to_eip2537_g1(&key).unwrap();
 
         // The header encodes length 128 (long form 2*128+1).
@@ -542,7 +685,7 @@ mod tests {
     /// seed an unslashable validator.
     #[test]
     fn seed_rejects_invalid_pubkey() {
-        assert!(genesis_seed_storage([(val(0x01), [0xFF; 48])]).is_err());
+        assert!(genesis_seed_storage([(val(0x01), [0xFF; 48], 1)]).is_err());
     }
 
     use boule_consensus::validator_rotation::{
@@ -688,6 +831,38 @@ mod tests {
         // tail: the 128-byte key verbatim.
         assert_eq!(&cd[132..132 + 128], &key128);
         assert_eq!(cd.len(), 4 + 32 * 3 + 32 + 128, "exact calldata length");
+    }
+
+    /// `record_weight_calldata` lays out `recordWeight(bytes32,uint64)` exactly:
+    /// selector, validator, then the left-padded `newWeight` — two static head
+    /// words, no dynamic tail.
+    #[test]
+    fn record_weight_calldata_layout() {
+        let cd = record_weight_calldata(&[0xCD; 32], 0x9abc_u64);
+
+        assert_eq!(&cd[0..4], &RECORD_WEIGHT_SELECTOR, "selector");
+        assert_eq!(&cd[4..36], &[0xCD; 32], "validator word");
+        // newWeight right-aligned in head[1].
+        let mut w_word = [0u8; 32];
+        w_word[24..].copy_from_slice(&0x9abc_u64.to_be_bytes());
+        assert_eq!(&cd[36..68], &w_word, "newWeight word");
+        assert!(cd[36..60].iter().all(|b| *b == 0), "weight high bytes zero");
+        assert_eq!(
+            cd.len(),
+            4 + 32 * 2,
+            "exact calldata length (no dynamic tail)"
+        );
+    }
+
+    /// `recordWeight(validator, 0)` (a removal) still encodes a full zero weight
+    /// word — the calldata is fixed-width regardless of the value.
+    #[test]
+    fn record_weight_calldata_zero_weight() {
+        let cd = record_weight_calldata(&[0x01; 32], 0);
+        assert_eq!(&cd[0..4], &RECORD_WEIGHT_SELECTOR);
+        assert_eq!(&cd[4..36], &[0x01; 32]);
+        assert!(cd[36..68].iter().all(|b| *b == 0), "weight word all zero");
+        assert_eq!(cd.len(), 4 + 32 * 2);
     }
 
     /// The address helper parses to the same fixed predeploy address as the

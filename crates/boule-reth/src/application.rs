@@ -318,6 +318,57 @@ impl RethApplication {
         }
     }
 
+    /// #732 step 4 — the registry **weight** write path. Mirror each seated
+    /// validator-weight change this block produced into the `Registry` predeploy
+    /// (`recordWeight`) so the on-chain weight surface stays current. This is the
+    /// value #729's stake-weighted governance tally and #746's param-update
+    /// authorization read.
+    ///
+    /// **Proposer-only**, exactly like [`Self::record_rotated_keys`]: only the
+    /// committed block's proposer submits the system txs, so one node — not all N
+    /// — authors them. `updates` is the per-block weight delta the staking /
+    /// slashing read path computed ([`Self::derive_validator_updates`]); the
+    /// `StakeSource` emits a [`ValidatorUpdate`] only when a validator's weight
+    /// actually changed, so every entry here is a genuine change and a redundant
+    /// same-weight write is already avoided upstream. `recordWeight` overwrites
+    /// the validator's weight and adjusts the on-chain `totalWeight` by the delta
+    /// (old→new), so a removal (`weight == 0`) drains its share.
+    ///
+    /// A no-op same-weight write would be harmless (the contract does not reject
+    /// it), but submitting one wastes a system tx, so we only submit the changes
+    /// `updates` carries. A failed submission is logged, never fatal — consensus
+    /// commits regardless of the EL, and the next change re-syncs the surface.
+    async fn record_validator_weights(&self, updates: &[ValidatorUpdate]) {
+        if updates.is_empty() {
+            return;
+        }
+        // Submit sequentially (awaiting each) so reth's pool reflects the prior
+        // tx and the next system-account nonce is fresh — same discipline as
+        // `record_rotated_keys`.
+        for u in updates {
+            let calldata = registry::record_weight_calldata(&u.node_id, u.weight);
+            match self
+                .submit_system_call(registry::registry_address(), calldata)
+                .await
+            {
+                Ok(hash) => tracing::info!(
+                    target: "boule::reth",
+                    validator = %hex::encode(u.node_id),
+                    weight = u.weight,
+                    tx = %hash,
+                    "registry write: submitted recordWeight for seated-weight change",
+                ),
+                Err(e) => tracing::warn!(
+                    target: "boule::reth",
+                    error = %e,
+                    validator = %hex::encode(u.node_id),
+                    weight = u.weight,
+                    "registry write: recordWeight submission failed (re-synced on next change)",
+                ),
+            }
+        }
+    }
+
     /// This block's endpoint-predeploy effects (#731).
     async fn derive_endpoint_effects(&self, payload: &Value) -> Vec<ValidatorEffect> {
         let Some(block_hash) = payload["blockHash"].as_str() else {
@@ -756,8 +807,14 @@ impl Application for RethApplication {
             // single node — not all N — authors the system tx. Idempotent
             // regardless (the monotone `vEff` guard reverts duplicates), so a
             // re-proposed block or a restart never corrupts the registry.
+            // #732 step 4: the same proposer also mirrors this block's seated
+            // validator-weight changes into the Registry (`recordWeight`) — the
+            // on-chain weight surface #729's tally and #746's auth read. Each
+            // `validator_updates` entry is a genuine weight change (the
+            // StakeSource only emits changed validators), so no redundant write.
             if ctx.proposer == self.self_id {
                 self.record_rotated_keys(&effects).await;
+                self.record_validator_weights(&validator_updates).await;
             }
             effects.extend(self.derive_endpoint_effects(&payload).await);
             effects.extend(self.derive_param_effects(&payload).await);
@@ -2135,6 +2192,188 @@ mod tests {
         assert!(
             sent.lock().is_empty(),
             "a non-proposer must not author a recordKey",
+        );
+    }
+
+    // ── #732 step 4: proposer-only registry *weight* write path ────────────
+
+    /// Transport for the weight-write tests: engine fixtures (so `commit`
+    /// reaches VALID), a canned staking log at the staking predeploy address
+    /// (empty elsewhere) so `derive_validator_updates` produces a weight change,
+    /// `eth_chainId` / `eth_getTransactionCount` for the system-tx nonce path,
+    /// and **records** every `send_raw_transaction` so a test can assert whether
+    /// a `recordWeight` was authored.
+    struct WeightWriteTransport {
+        inner: FixtureTransport,
+        staking_logs: Value,
+        sent: Arc<Mutex<Vec<Bytes>>>,
+    }
+    impl EngineTransport for WeightWriteTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+            if method == "eth_chainId" {
+                return Box::pin(async move { Ok(Value::String("0x539".into())) }); // 1337
+            }
+            let is_staking = params[0]["address"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(staking::STAKING_ADDRESS));
+            let logs = if is_staking {
+                self.staking_logs.clone()
+            } else {
+                Value::Array(Vec::new())
+            };
+            Box::pin(async move { Ok(logs) })
+        }
+        fn eth_get_transaction_count(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
+            Box::pin(async move { Ok(0) })
+        }
+        fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
+            self.sent.lock().push(raw);
+            Box::pin(async move { Ok(Value::String(format!("0x{}", "22".repeat(32)))) })
+        }
+    }
+
+    fn weight_app(
+        self_id: NodeId,
+        staking_logs: Value,
+        genesis_stake: Vec<(NodeId, u64)>,
+        sent: Arc<Mutex<Vec<Bytes>>>,
+    ) -> RethApplication {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+        RethApplication::new(
+            Box::new(WeightWriteTransport {
+                inner: FixtureTransport,
+                staking_logs,
+                sent,
+            }),
+            self_id,
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::seeded_from(genesis_stake)),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        )
+    }
+
+    /// When this node is the committed block's proposer and the block carries a
+    /// seated-weight change (here a Withdraw that drops the validator to weight
+    /// 0), it authors exactly one `recordWeight(validator, newWeight)` system tx
+    /// addressed to the Registry, with the new (absolute) weight right-aligned.
+    #[tokio::test]
+    async fn proposer_commit_submits_a_recordweight_for_a_weight_change() {
+        use alloy_consensus::TxEnvelope;
+        use alloy_eips::eip2718::Decodable2718;
+
+        let self_id = [1u8; 32];
+        let node = [2u8; 32];
+        // A Withdraw of the full genesis stake (3) → weight 0 (a removal).
+        let staking_logs = serde_json::json!([{
+            "topics": [staking::WITHDRAW_TOPIC, format!("0x{}", "02".repeat(32))],
+            "data": format!("0x{:064x}", 3u64),
+        }]);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let app = weight_app(self_id, staking_logs, vec![(node, 3u64)], Arc::clone(&sent));
+
+        let g = genesis();
+        let ctx = AppContext {
+            proposer: self_id,
+            ..Default::default()
+        };
+        let block = app
+            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        let result = app.commit(&ctx, &block).await.expect("commit");
+        assert_eq!(
+            result.validator_updates,
+            vec![ValidatorUpdate {
+                node_id: node,
+                weight: 0,
+            }],
+            "the full Withdraw removes the validator (weight 0)",
+        );
+
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 1, "exactly one recordWeight system tx authored");
+        let env = TxEnvelope::decode_2718(&mut sent[0].as_ref()).expect("typed tx");
+        let tx = match &env {
+            TxEnvelope::Eip1559(s) => s.tx(),
+            other => panic!("expected EIP-1559, got {other:?}"),
+        };
+        assert_eq!(
+            tx.to,
+            alloy_primitives::TxKind::Call(registry::registry_address()),
+            "addressed to the Registry predeploy",
+        );
+        let cd = tx.input.as_ref();
+        assert_eq!(
+            &cd[0..4],
+            &registry::RECORD_WEIGHT_SELECTOR,
+            "recordWeight selector",
+        );
+        assert_eq!(&cd[4..36], &node, "validator id");
+        assert!(cd[36..68].iter().all(|b| *b == 0), "newWeight == 0 word");
+        assert_eq!(cd.len(), 4 + 32 * 2, "recordWeight has no dynamic tail");
+    }
+
+    /// A non-proposer commit computes the same weight change but writes
+    /// **nothing** — only the proposer authors the `recordWeight` tx.
+    #[tokio::test]
+    async fn non_proposer_commit_submits_no_recordweight() {
+        let self_id = [1u8; 32];
+        let node = [2u8; 32];
+        let staking_logs = serde_json::json!([{
+            "topics": [staking::WITHDRAW_TOPIC, format!("0x{}", "02".repeat(32))],
+            "data": format!("0x{:064x}", 3u64),
+        }]);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let app = weight_app(self_id, staking_logs, vec![(node, 3u64)], Arc::clone(&sent));
+
+        let g = genesis();
+        let ctx = AppContext {
+            proposer: [9u8; 32],
+            ..Default::default()
+        };
+        let block = app
+            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        let result = app.commit(&ctx, &block).await.expect("commit");
+        assert_eq!(result.validator_updates.len(), 1, "weight change computed");
+        assert!(
+            sent.lock().is_empty(),
+            "a non-proposer must not author a recordWeight",
+        );
+    }
+
+    /// A commit with no seated-weight change authors no `recordWeight` — the
+    /// proposer only writes genuine deltas (the StakeSource emits none).
+    #[tokio::test]
+    async fn proposer_commit_with_no_weight_change_writes_nothing() {
+        let self_id = [1u8; 32];
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        // No staking logs ⇒ no weight delta.
+        let app = weight_app(self_id, Value::Array(Vec::new()), vec![], Arc::clone(&sent));
+
+        let g = genesis();
+        let ctx = AppContext {
+            proposer: self_id,
+            ..Default::default()
+        };
+        let block = app
+            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        let result = app.commit(&ctx, &block).await.expect("commit");
+        assert!(result.validator_updates.is_empty(), "no weight change");
+        assert!(
+            sent.lock().is_empty(),
+            "no recordWeight when nothing changed",
         );
     }
 }

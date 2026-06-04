@@ -23,6 +23,20 @@ contract Registry {
 
     mapping(bytes32 => KeyEntry[]) private history;
 
+    /// Per-validator **current** voting weight (#732 step 4) — the EVM-readable
+    /// mirror of the validator's currently-seated consensus weight. `0` means
+    /// not seated / removed. Unlike the key history above (a *historical*
+    /// `keyAt(validator, view)` the slashing precompile reads for settled past
+    /// views), weight is modelled as a single current value: the consumers
+    /// (#729's stake-weighted governance tally, #746's param-update auth) need
+    /// the **currently seated** weight, never a per-view lookup.
+    mapping(bytes32 => uint64) private weight;
+
+    /// Running sum of every seated validator's [`weight`], maintained by
+    /// [`recordWeight`] so a consumer can derive a quorum threshold
+    /// (e.g. ⌊2·totalWeight/3⌋ + 1) without enumerating the validator set.
+    uint64 public totalWeight;
+
     /// The only account allowed to call [`recordKey`]: boule's **system
     /// account** (`SYSTEM_ACCOUNT_ADDRESS` in `src/system_account.rs`). The
     /// proposer signs every legitimate `recordKey` tx from this address (#756),
@@ -35,6 +49,10 @@ contract Registry {
 
     /// A validator's BLS key became active from `vEff`.
     event KeyRecorded(bytes32 indexed validator, uint64 vEff, bytes key);
+
+    /// `validator`'s current weight was set to `newWeight` (the prior value was
+    /// `oldWeight`); `totalWeight` moved by `newWeight - oldWeight`.
+    event WeightRecorded(bytes32 indexed validator, uint64 oldWeight, uint64 newWeight);
 
     /// Record `key` as `validator`'s BLS pubkey active from view `vEff`.
     /// Append-only; `vEff` must strictly exceed the validator's last entry, so
@@ -70,5 +88,32 @@ contract Registry {
     /// The number of key entries recorded for `validator`.
     function historyLength(bytes32 validator) external view returns (uint256) {
         return history[validator].length;
+    }
+
+    /// Set `validator`'s **current** seated weight to `newWeight`, overwriting
+    /// any prior value, and adjust [`totalWeight`] by the delta (old → new).
+    /// `newWeight == 0` removes the validator (its share leaves `totalWeight`).
+    ///
+    /// **Access-controlled:** only [`WRITER`] (boule's system account) may
+    /// record weights — the same gate as [`recordKey`]. The proposer signs a
+    /// `recordWeight` tx from that account whenever consensus seats a new
+    /// weight for a validator (#732 step 4), so no other caller can skew the
+    /// on-chain weight surface #729/#746 read. A no-op same-weight write is
+    /// harmless (it emits and leaves `totalWeight` unchanged); the proposer
+    /// skips it, but the contract does not reject it.
+    function recordWeight(bytes32 validator, uint64 newWeight) external {
+        require(msg.sender == WRITER, "unauthorized");
+        uint64 oldWeight = weight[validator];
+        weight[validator] = newWeight;
+        // totalWeight += newWeight - oldWeight, in two non-overflowing steps so
+        // the running sum stays exact whether the weight rose or fell.
+        totalWeight = totalWeight - oldWeight + newWeight;
+        emit WeightRecorded(validator, oldWeight, newWeight);
+    }
+
+    /// `validator`'s current seated weight (`0` if unseated / removed) — the
+    /// value #729's tally and #746's auth read.
+    function weightOf(bytes32 validator) external view returns (uint64) {
+        return weight[validator];
     }
 }
