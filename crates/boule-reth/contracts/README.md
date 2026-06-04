@@ -260,3 +260,63 @@ equivocation vectors from boule's blst (`gen_slashing_vectors`).
 > `docs/validator-registry-and-slashing.md`) is **not yet enforced** here — it
 > depends on the registry write path (the next #732 step) that records the
 > EVM-block↔view mapping. Until then `keyAt` is trusted as settled.
+
+## `Governance.sol` — governance-reconfiguration predeploy (#729)
+
+The EVM-native approval path for validator-set membership changes (a *reconfig*)
+on the reth backend (milestone #4). It supersedes the committee-approval half of
+#548. Each seated validator approves a reconfig by sending an ordinary EVM
+transaction to `approve(bytes32 proposalId, bytes reconfigCommand, uint64
+quorum)`, where `proposalId` is the (boule-chosen) hash of the encoded reconfig
+command and `reconfigCommand` is the **already-encoded** boule reconfig command.
+The contract tallies *distinct approvers* per `proposalId` and, when the tally
+first reaches `quorum`, emits `Approved(proposalId, reconfigCommand)` **exactly
+once**. boule reads the `Approved` event from each committed block (via
+`eth_getLogs`), turns it into a `ValidatorEffect` on the widened `CommitResult`
+(#727), and re-materialises the carried command into a block — where the existing
+reconfig path validates and schedules the membership change at a view boundary.
+Approvals ride the ordinary EVM mempool/gossip, replacing the consensus-side
+signature-accumulation + bespoke tx-gossip approach.
+
+> [!NOTE]
+> The EVM never interprets `reconfigCommand`; consensus validates it at commit.
+> Binding `proposalId` to the command hash means any approver disagreeing on the
+> command produces a different id and so a separate tally.
+>
+> **MVP weight model — one-validator-one-vote.** The tally counts *distinct
+> approving addresses*, not stake weight: there is no on-chain queryable
+> validator-weight source today (`Staking.sol` is a pure event emitter whose
+> balances live consensus-side in `BondedStakeLedger`; `Registry.sol` mirrors
+> BLS keys, not weight), so inventing one here would duplicate state. `quorum`
+> is a count of validators, fixed by the first approver for a `proposalId`.
+> Stake-weighting the tally and restricting `approve` to seated validators is the
+> same follow-up the sibling predeploys carry; consensus still validates the
+> carried command, bounding the exposure of an over-counted tally.
+
+| | |
+|---|---|
+| Address | `0x0000000000000000000000000000000000000b14` |
+| `Approved(bytes32,bytes)` topic0 | `0xd686e9e9eda221dfab37aa6cae405e85e661ed8e45cbe791790ed38093d85b75` |
+| `approve(bytes32,bytes,uint64)` selector | `0x410fa955` |
+| `approvals(bytes32)` selector | `0xbf7c2131` |
+| `isApproved(bytes32)` selector | `0x48aefc32` |
+
+These identifiers are mirrored as constants in `src/governance.rs`; unit tests
+pin the address, topic, and selectors to the genesis account's bytecode. The
+contract's approval-tally logic is validated against a **live reth** by the
+manual harness `test/governance.mjs` (see its header): below-quorum approvals
+emit nothing, crossing quorum emits `Approved` exactly once, and a
+double-approval by the same validator does not double-count.
+
+### Reproducing the bytecode
+
+Same toolchain as `Staking.sol` above (**solc 0.8.24**, `bin-runtime`):
+
+```sh
+python3 -c "import solcx; solcx.install_solc('0.8.24'); \
+  print(solcx.compile_files(['contracts/Governance.sol'], output_values=['bin-runtime'], solc_version='0.8.24'))"
+```
+
+Paste the `bin-runtime` hex (prefixed with `0x`) into the predeploy account's
+`code` field in `genesis.json`. If the contract changes, update both the
+bytecode and the constants in `src/governance.rs`.
