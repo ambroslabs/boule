@@ -369,10 +369,23 @@ pub trait Application: Send + Sync {
     /// re-proposes). It is **not** a fault for the local node — the offending
     /// block is the proposer's.
     ///
+    /// `parent` is the proposed `block`'s parent (resolved by the integration
+    /// layer from the safety core's pending blocks), or `None` when the voter
+    /// does not yet hold it. The reth backend uses it for the #797 weight
+    /// **receipt-inclusion proof**: a weight delta riding this block's
+    /// `extra_data` was derived from the *parent's* EVM execution, so the
+    /// parent's execution payload carries the `receiptsRoot` the carried proof is
+    /// verified against — without re-executing anything. An application that does
+    /// not need the parent ignores it.
+    ///
     /// The default is `Ok(())`: an application with nothing proposer-authored to
     /// re-derive (the counter app, a PoA backend) accepts every safety-valid
     /// proposal, exactly as before this hook existed.
-    fn validate_proposal<'a>(&'a self, _block: &'a Block) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn validate_proposal<'a>(
+        &'a self,
+        _block: &'a Block,
+        _parent: Option<&'a Block>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
     }
 

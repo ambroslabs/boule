@@ -14,6 +14,11 @@ possible, the conclusion (**it is not** — only a receipt/MPT inclusion proof
 works), and the concrete **option-1 design** for that heavier path, so the
 heavy build is a deliberate decision rather than an accident.
 
+> **Status: BUILT.** Option 1 (the receipt-inclusion proof) is now implemented —
+> see [Implementation](#implementation-what-was-built) at the end. The common
+> 1-block-lag forged weight is **rejected at vote time**; the precise
+> prevented-vs-detected split the build settled on is recorded there.
+
 ## TL;DR
 
 - **The registry weight in `extra_data` is the same `ValidatorUpdate` quantity
@@ -204,3 +209,81 @@ only for the rare case where the source block isn't on the voter's held chain.
 Pull `alloy-rlp` + `alloy-trie` (already in the workspace's lockfile via the EL)
 rather than hand-rolling the MPT verifier, gated behind `cargo deny`. Until then,
 weights remain **detect-after-final**, which #798 already surfaces loudly.
+
+## Implementation (what was built)
+
+Option 1 with the **(1a) parent-chain `receiptsRoot` anchor** is implemented in
+`crates/boule-reth/src/weight_proof.rs`, wired into the #798 vote-time hook.
+
+### Pieces
+
+- **Deps:** `alloy-trie` (`proof::verify_proof` verifier + `HashBuilder` /
+  `ProofRetainer` builder), `alloy-rlp`, `nybbles` — all already in the
+  workspace lockfile via the EL tree, so `cargo deny` is unaffected. The receipt
+  is reconstructed into alloy's `ReceiptEnvelope` (explicit field parse, not
+  serde-flatten) so its `encoded_2718()` is the exact trie-leaf bytes; a unit
+  test (`our_trie_root_matches_alloy_for_each_index`) pins our hand-built trie
+  root to alloy's canonical `ordered_trie_root_encoded`, so the proof anchors to
+  the real `receiptsRoot`.
+- **Carrier:** a **dedicated boule block command** tagged `WPR1`
+  (`WeightProofSet`), *not* the registry `extra_data`. The EL still applies only
+  the bare write set, so the cross-crate registry codec stays byte-pinned; the
+  command is covered by `commands_commitment` and ignored by the EL and every
+  `apply_committed_*` path (none recognise the tag).
+- **Leader** (`build_proposal`): when the block's `extra_data` carries weight
+  deltas, fetch the parent EVM block's receipts (`eth_getBlockReceipts`), build a
+  receipt-inclusion proof per delta, attach the `WeightProofSet` command.
+  Best-effort: a receipt-fetch failure logs and omits the proof (the delta then
+  falls to commit detection) rather than failing the proposal.
+- **Voter** (`validate_proposal` → `validate_weight_proofs` →
+  `WeightProofSet::verify_against_parent`): the hook now also receives the
+  **parent block** (resolved by the integration layer from the safety core's
+  pending blocks), reads its execution-payload `receiptsRoot`, verifies each
+  carried proof against it, and re-derives each delta from the proven log.
+
+### The prevented-vs-detected split the build settled on
+
+Re-deriving the *exact absolute* seated weight at vote time needs ledger state
+(prior balance + #660 unbonding maturity) a lagging voter may not hold, so the
+verifier deliberately uses **only the proof + the proven log**, with **no
+voter-side ledger state** — this is what keeps it lag-independent (no
+honest-rejects-honest). With that constraint the sound, vote-time-**prevented**
+guarantees are:
+
+1. **Existence + node binding.** Every weight delta MUST carry a valid MPT
+   inclusion proof of ≥1 staking/slashing log **for that exact `node_id`** in the
+   parent's `receiptsRoot`. No proof / invalid proof / wrong-node proof → reject.
+   This is the core #797 attack closed: a leader can't invent a weight from
+   nothing (the fabricated-`Slashed` framing of an honest validator, or a
+   governance/param-swinging weight — neither has a real log to prove). To stop a
+   leader mixing one real proof with an unbacked forgery, **if the block carries
+   any parent-anchored proof, every claimed weight must be parent-anchored.**
+2. **`Slashed` pins weight 0.** A delta backed by a proven `Slashed` must claim
+   weight `0`; a non-zero claim → reject.
+3. **Deposit floor.** A pure-`Deposit` delta's absolute weight is
+   `prior + Σdeposits ≥ Σdeposits > 0`, so a claim below the proven deposit sum
+   (or `0`) → reject.
+4. **Amount binding.** A carried proof whose own asserted weight disagrees with
+   the `extra_data` claim for that node → reject.
+
+**Detected-at-commit (not vote-time-pinnable), documented honestly:**
+
+- The **exact post-`Withdraw` amount** (`prior − amount`) — `prior` is ledger
+  state. The proof still binds the delta to a *real `Withdraw` for the claimed
+  node* at vote time; the precise value is left to
+  `detect_weight_extra_data_divergence`.
+- The **self-synced-gap source** (#674): when the EL self-synced past the source
+  block so it isn't the immediate parent, the proof doesn't anchor to the
+  parent's `receiptsRoot`. Rather than reject an honest leader, an
+  *un*-anchored-only proof set defers to commit detection. The common
+  1-block-lag path is unaffected and remains prevented.
+
+### Tests (the bar)
+
+`weight_proof.rs` and `application.rs` cover: an honest 1-block-lag deposit
+validates with its proof; a forged weight with **no** receipt proof is rejected
+at vote time; a proof of a **different amount** is rejected; a sub-deposit-floor
+claim is rejected; `Slashed` must claim 0; a tampered proof under the real root
+is rejected; the no-parent case defers; and the codec round-trips. The
+cross-crate registry codec determinism pin (`registry_payload.rs`) is untouched
+and still passes.

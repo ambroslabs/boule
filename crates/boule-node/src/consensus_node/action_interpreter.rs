@@ -165,7 +165,18 @@ impl ConsensusNode {
                 // app) is unaffected.
                 if let SafetyEvent::ProposalReceived(signed) = &ev {
                     let block = &signed.inner().payload.block;
-                    if let Err(e) = self.app.validate_proposal(block).await {
+                    // Resolve the parent the voter already holds (the #797 weight
+                    // proof anchors to the parent's execution-payload
+                    // `receiptsRoot`). It lives in the safety core's pending
+                    // blocks under the proposal's `parent_hash`; `None` if not yet
+                    // held (the proof path then defers to commit-time detection).
+                    let parent = self
+                        .core
+                        .state()
+                        .pending_blocks
+                        .get(&block.header.parent_hash)
+                        .cloned();
+                    if let Err(e) = self.app.validate_proposal(block, parent.as_ref()).await {
                         tracing::warn!(
                             target: TRACE_TARGET,
                             view = block.header.view.0,

@@ -227,26 +227,26 @@ impl RethApplication {
     ///   time and **validated here**.
     /// - **`weights`** — derived from the seated-weight deltas of a *prior*
     ///   block's **execution** (staking/slashing events), carried with a
-    ///   one-block lag via [`Self::pending_weights`], which is mutated only at
-    ///   [`Self::commit`] once the EL reports the relevant block `VALID`. A
-    ///   voter on block N may not yet have executed the block whose deltas N's
-    ///   weights mirror (or its EL may still be `SYNCING`), so its
-    ///   `pending_weights` is **not guaranteed** to match the leader's at build
-    ///   time. We therefore do **not** re-derive-and-reject weights here (that
-    ///   would risk honest validators rejecting an honest leader's correct
-    ///   weights purely from an execution-lag skew, a liveness hole). Weight
-    ///   integrity is instead enforced at **commit** by
-    ///   [`Self::detect_weight_extra_data_divergence`], which — once this node
-    ///   has itself executed and re-derived the expected weights — compares them
-    ///   to the committed block's `extra_data` and logs a hard
-    ///   `BFT-SAFETY-VIOLATION` on mismatch. This is **detect-after-final**, not
-    ///   vote-time prevention: see that method and #797's residual note.
+    ///   one-block lag via [`Self::pending_weights`]. A voter cannot re-derive
+    ///   these from its own (execution-lagged) buffers without risking an
+    ///   honest-rejects-honest liveness hole, so #797 instead makes each weight
+    ///   delta **self-proving**: the leader carries a Merkle-Patricia
+    ///   **receipt-inclusion proof** of the backing `Deposit`/`Withdraw`/
+    ///   `Slashed` log against the *parent* block's `receiptsRoot` (the 1-block-
+    ///   lag source), and [`Self::validate_weight_proofs`] verifies it here —
+    ///   refusing to vote on a forged or inconsistent weight, with **no voter-
+    ///   side ledger state** (so it is lag-independent). See
+    ///   [`crate::weight_proof`] for the precise vote-time-*prevented* set
+    ///   (forged-from-nothing, wrong-node, slash-pins-zero, deposit-floor) vs.
+    ///   the residual *detected*-at-commit cases (the exact post-`Withdraw`
+    ///   amount; a self-synced-gap source the voter can't anchor), which
+    ///   [`Self::detect_weight_extra_data_divergence`] still surfaces loudly.
     ///
-    /// So after this fix: forged **keys** and **settledView** are *prevented*
-    /// (never voted for, never committed); a forged **weight** is *detected*
-    /// (and loudly surfaced) at commit but, given the genuine execution lag, is
-    /// not yet vote-time-rejected.
-    fn validate_registry_extra_data(&self, block: &Block) -> Result<()> {
+    /// So after this fix: forged **keys**, **settledView**, and (for the common
+    /// 1-block-lag path) **weights** are *prevented* — never voted for, never
+    /// committed; only the few non-vote-time-verifiable weight cases above fall
+    /// back to commit-time detection.
+    fn validate_registry_extra_data(&self, block: &Block, parent: Option<&Block>) -> Result<()> {
         // Pull the proposal's EVM execution payload (always the first command)
         // and decode the registry write set the leader stamped into its
         // `extra_data`. A genesis/empty block carries no command and nothing to
@@ -292,9 +292,77 @@ impl RethApplication {
             );
         }
 
-        // Weights are deliberately NOT rejected here — see the method doc on the
-        // execution-lag residual; commit-time detection covers them.
+        // #797 weights — vote-time prevention via the leader-carried receipt
+        // inclusion proof. A weight delta riding this block's `extra_data` was
+        // derived from the PARENT block's EVM execution (its staking/slashing
+        // logs), so the parent's execution payload carries the `receiptsRoot` the
+        // carried proof verifies against — without re-executing anything. The
+        // proof set rides a dedicated weight-proof block command (see
+        // `weight_proof`); we decode it, then check every claimed weight is
+        // backed by a parent-anchored receipt proof for that node and consistent
+        // with the proven log(s). See `WeightProofSet::verify_against_parent` for
+        // exactly what is prevented (forged-from-nothing, wrong-node, slash-pins-
+        // zero, deposit-floor) vs. deferred to commit detection (the exact post-
+        // Withdraw amount; the self-synced-gap source).
+        let proposed_weights = proposed
+            .as_ref()
+            .map(|p| p.weights.clone())
+            .unwrap_or_default();
+        self.validate_weight_proofs(block, parent, &proposed_weights)?;
         Ok(())
+    }
+
+    /// #797 weights — verify the leader-carried receipt-inclusion proofs for this
+    /// block's `extra_data` weight deltas against the **parent block's
+    /// `receiptsRoot`** (the 1-block-lag anchor), refusing to vote on a forged or
+    /// inconsistent weight. `proposed_weights` is the `(node_id, weight)` set the
+    /// proposal's `extra_data` carries.
+    ///
+    /// Falls back to commit-time detection (accepts at vote time) when the voter
+    /// cannot anchor: it doesn't hold the parent, the parent has no parseable
+    /// `receiptsRoot`, or the source isn't the immediate parent (self-synced gap,
+    /// #674). The common 1-block-lag path is fully prevented; see
+    /// [`crate::weight_proof`] for the precise split.
+    fn validate_weight_proofs(
+        &self,
+        block: &Block,
+        parent: Option<&Block>,
+        proposed_weights: &[(NodeId, u64)],
+    ) -> Result<()> {
+        // Nothing to prove — a plain or settled-only block.
+        if proposed_weights.is_empty() {
+            return Ok(());
+        }
+        // Decode the carried weight-proof command, if any (a dedicated block
+        // command tagged `WPR1`; the EL and every commit path ignore it).
+        let proof_set = block
+            .commands
+            .iter()
+            .find(|c| crate::weight_proof::WeightProofSet::is_weight_proof_command(c))
+            .and_then(|c| crate::weight_proof::WeightProofSet::decode(c))
+            .unwrap_or_default();
+
+        // Anchor: the parent's execution-payload `receiptsRoot`. Without the
+        // parent (or a parseable root) we cannot verify at vote time — defer to
+        // commit-time detection rather than reject an honest leader.
+        let Some(parent) = parent else {
+            tracing::debug!(
+                target: "boule::reth",
+                height = block.header.height.0,
+                "weight proof: parent not held at vote time; deferring weight check to commit (#797)",
+            );
+            return Ok(());
+        };
+        let Some(parent_root) = parent_receipts_root(parent) else {
+            tracing::debug!(
+                target: "boule::reth",
+                height = block.header.height.0,
+                "weight proof: parent carries no receiptsRoot; deferring to commit (#797)",
+            );
+            return Ok(());
+        };
+
+        proof_set.verify_against_parent(proposed_weights, parent_root)
     }
 
     /// #797 (weight residual) — commit-time detection of a forged seated-weight
@@ -785,6 +853,18 @@ fn state_root_of(payload: &Value) -> Result<[u8; 32]> {
     root_from_hex(payload["stateRoot"].as_str().context("payload stateRoot")?)
 }
 
+/// The `receiptsRoot` of a block's EVM execution payload (#797 weight-proof
+/// anchor), or `None` for a block with no command / no parseable root. The
+/// `receiptsRoot` is part of the execution payload reth built, so it is
+/// committed by the block's `state_commitment`/`commands_commitment` and every
+/// honest replica holds the same value for a given block.
+fn parent_receipts_root(parent: &Block) -> Option<[u8; 32]> {
+    let cmd = parent.commands.first()?;
+    let payload: Value = serde_json::from_slice(cmd).ok()?;
+    let root_hex = payload["receiptsRoot"].as_str()?;
+    root_from_hex(root_hex).ok()
+}
+
 /// Decode the boule registry write set an execution `payload` carries in its
 /// `extraData`, or `None` for a plain (non-boule, default `extra_data`) block —
 /// the same decode [`RethApplication::reconcile_pending_weights`] runs. Used by
@@ -955,6 +1035,49 @@ impl Application for RethApplication {
                     commands.push(cmd);
                 }
             }
+
+            // #797 weight proofs: if this block carries any seated-weight delta
+            // in its `extra_data`, attach a receipt-inclusion proof of the
+            // backing staking/slashing log against the PARENT block's
+            // `receiptsRoot` (the 1-block-lag source — the parent's execution
+            // emitted the log this delta mirrors). Voters verify it at vote time
+            // (`validate_weight_proofs`) and refuse to vote on a forged weight.
+            // Rides a dedicated weight-proof block command, ignored by the EL and
+            // every commit path. Best-effort on the build side: a receipt-fetch
+            // failure logs and skips the proof (the voter then defers that delta
+            // to commit-time detection) rather than failing the proposal.
+            if !registry_payload.weights.is_empty() {
+                match self
+                    .transport
+                    .eth_rpc("eth_getBlockReceipts", serde_json::json!([parent_evm_hash]))
+                    .await
+                {
+                    Ok(receipts) => {
+                        match crate::weight_proof::WeightProofSet::generate(
+                            &registry_payload.weights,
+                            &receipts,
+                        ) {
+                            Ok(set) if !set.is_empty() => {
+                                commands.push(Bytes::from(set.encode()));
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                target: "boule::reth",
+                                error = %e,
+                                "weight proof: failed to build receipt proofs; \
+                                 weights deferred to commit-time detection (#797)",
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "boule::reth",
+                        error = %e,
+                        "weight proof: eth_getBlockReceipts(parent) failed; \
+                         weights deferred to commit-time detection (#797)",
+                    ),
+                }
+            }
+
             let commands_commitment = Block::commands_commitment(&commands);
 
             Ok(Block {
@@ -1108,8 +1231,12 @@ impl Application for RethApplication {
         })
     }
 
-    fn validate_proposal<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { self.validate_registry_extra_data(block) })
+    fn validate_proposal<'a>(
+        &'a self,
+        block: &'a Block,
+        parent: Option<&'a Block>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.validate_registry_extra_data(block, parent) })
     }
 
     fn check(&self, cmd: &[u8]) -> Result<()> {
@@ -2670,7 +2797,7 @@ mod tests {
         let block = proposed_block(view, &forged.encode(), vec![]);
 
         let err = app
-            .validate_proposal(&block)
+            .validate_proposal(&block, None)
             .await
             .expect_err("a forged recordKey with no authorizing command must be rejected");
         assert!(
@@ -2701,7 +2828,7 @@ mod tests {
         };
         let block = proposed_block(view, &honest.encode(), vec![cmd]);
 
-        app.validate_proposal(&block)
+        app.validate_proposal(&block, None)
             .await
             .expect("an honest leader's matching extra_data validates");
     }
@@ -2724,7 +2851,7 @@ mod tests {
         let block = proposed_block(view, &forged.encode(), vec![]);
 
         let err = app
-            .validate_proposal(&block)
+            .validate_proposal(&block, None)
             .await
             .expect_err("a settledView ahead of the conservative frontier must be rejected");
         assert!(
@@ -2742,9 +2869,158 @@ mod tests {
         // A view at/under the margin → expected settledView is `None`, so the
         // honest extra_data is empty (a non-boule blob).
         let block = proposed_block(View(1), b"reth/v2.2.0/linux", vec![]);
-        app.validate_proposal(&block)
+        app.validate_proposal(&block, None)
             .await
             .expect("a plain block with default extra_data validates");
+    }
+
+    // ── #797 weights: vote-time prevention via the receipt-inclusion proof ────
+
+    /// A reth-shaped `Deposit` receipt object for `node` and `amount` (one item
+    /// of an `eth_getBlockReceipts` array).
+    fn deposit_receipt_json(node: u8, amount: u64) -> Value {
+        serde_json::json!({
+            "type": "0x2",
+            "status": "0x1",
+            "cumulativeGasUsed": "0x5208",
+            "logs": [{
+                "address": staking::STAKING_ADDRESS,
+                "topics": [
+                    staking::DEPOSIT_TOPIC,
+                    format!("0x{}", format!("{node:02x}").repeat(32)),
+                ],
+                "data": format!("0x{amount:064x}"),
+            }],
+        })
+    }
+
+    /// A committed **parent** block whose execution payload carries the real
+    /// `receiptsRoot` of `receipts` — the 1-block-lag anchor the proof verifies
+    /// against.
+    fn parent_block_with_receipts(receipts: &Value) -> Block {
+        let root = crate::weight_proof::testing_receipts_root(receipts);
+        let payload = serde_json::json!({
+            "blockHash": BLOCK1,
+            "receiptsRoot": format!("0x{}", hex::encode(root)),
+        });
+        let commands = vec![Bytes::from(serde_json::to_vec(&payload).unwrap())];
+        let commands_commitment = Block::commands_commitment(&commands);
+        Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                height: Height(0),
+                view: View(0),
+                proposer: [9u8; 32],
+                state_commitment: [0u8; 32],
+                commands_commitment,
+                validator_history_commitment: [0u8; 32],
+                committed_height: Height(0),
+                committed_state_root: [0u8; 32],
+                timestamp: 0,
+            },
+            commands,
+        }
+    }
+
+    /// A proposed weight-carrying block: `extra_data` claims `weights`, and the
+    /// block carries the matching weight-proof command built from `receipts`.
+    fn weight_proposed_block(view: View, weights: &[(NodeId, u64)], receipts: &Value) -> Block {
+        let extra =
+            crate::registry_payload::RegistryPayload::new(vec![], &to_updates(weights), None);
+        let proof = crate::weight_proof::WeightProofSet::generate(weights, receipts).unwrap();
+        proposed_block(view, &extra.encode(), vec![Bytes::from(proof.encode())])
+    }
+
+    fn to_updates(weights: &[(NodeId, u64)]) -> Vec<ValidatorUpdate> {
+        weights
+            .iter()
+            .map(|&(node_id, weight)| ValidatorUpdate { node_id, weight })
+            .collect()
+    }
+
+    /// **The weight exploit bar — honest 1-block-lag block validates.** A
+    /// Deposit of 5 for an honest validator in the parent block; the proposal
+    /// carries the matching weight + a valid receipt proof, and
+    /// `validate_proposal` ACCEPTS it.
+    #[tokio::test]
+    async fn validate_proposal_accepts_honest_weight_with_proof() {
+        let app = make_app([0u8; 32]);
+        let node = [7u8; 32];
+        let receipts = serde_json::json!([deposit_receipt_json(7, 5)]);
+        let parent = parent_block_with_receipts(&receipts);
+        let block = weight_proposed_block(View(1), &[(node, 5)], &receipts);
+
+        app.validate_proposal(&block, Some(&parent))
+            .await
+            .expect("an honest weight with a valid parent-anchored proof validates");
+    }
+
+    /// **The weight exploit bar — a forged weight is rejected at vote time.** A
+    /// Byzantine leader claims weight 5 for a validator that has NO staking log
+    /// in the parent block, alongside an honest proven weight. The unbacked
+    /// forgery has no receipt proof, so `validate_proposal` REFUSES to vote.
+    #[tokio::test]
+    async fn validate_proposal_rejects_forged_weight_without_proof() {
+        let app = make_app([0u8; 32]);
+        let honest = [7u8; 32];
+        let forged = [9u8; 32];
+        // Only node 7 has a Deposit; node 9 is forged.
+        let receipts = serde_json::json!([deposit_receipt_json(7, 5)]);
+        let parent = parent_block_with_receipts(&receipts);
+        // extra_data claims both; the proof set can only back node 7.
+        let weights = vec![(honest, 5u64), (forged, 5u64)];
+        let block = weight_proposed_block(View(1), &weights, &receipts);
+
+        let err = app
+            .validate_proposal(&block, Some(&parent))
+            .await
+            .expect_err("a forged weight with no receipt proof must be rejected at vote time");
+        assert!(
+            err.to_string().contains("no parent-anchored receipt proof"),
+            "rejected for the right reason: {err}",
+        );
+    }
+
+    /// **A weight whose proof proves a different amount is rejected.** The proof
+    /// asserts the real Deposit of 5, but `extra_data` claims 99 for the same
+    /// node — a forged amount, refused at vote time.
+    #[tokio::test]
+    async fn validate_proposal_rejects_forged_weight_amount() {
+        let app = make_app([0u8; 32]);
+        let node = [7u8; 32];
+        let receipts = serde_json::json!([deposit_receipt_json(7, 5)]);
+        let parent = parent_block_with_receipts(&receipts);
+        // The proof set is built honestly for weight 5…
+        let proof = crate::weight_proof::WeightProofSet::generate(&[(node, 5)], &receipts).unwrap();
+        // …but the extra_data claims 99 for the same node.
+        let extra =
+            crate::registry_payload::RegistryPayload::new(vec![], &to_updates(&[(node, 99)]), None);
+        let block = proposed_block(View(1), &extra.encode(), vec![Bytes::from(proof.encode())]);
+
+        let err = app
+            .validate_proposal(&block, Some(&parent))
+            .await
+            .expect_err("a proof of a different amount must be rejected");
+        assert!(
+            err.to_string()
+                .contains("claims weight 5 but extra_data carries 99"),
+            "rejected for the right reason: {err}",
+        );
+    }
+
+    /// When the voter does not hold the parent (or it has no receiptsRoot), the
+    /// weight check defers to commit-time detection rather than rejecting — no
+    /// honest-rejects-honest from a missing anchor.
+    #[tokio::test]
+    async fn validate_proposal_defers_weights_without_parent() {
+        let app = make_app([0u8; 32]);
+        let node = [7u8; 32];
+        let receipts = serde_json::json!([deposit_receipt_json(7, 5)]);
+        let block = weight_proposed_block(View(1), &[(node, 5)], &receipts);
+        // No parent held → defer (accept at vote time).
+        app.validate_proposal(&block, None)
+            .await
+            .expect("a weight block with no held parent defers to commit detection");
     }
 
     /// The #797 weight residual: a forged seated-weight delta in a committed
