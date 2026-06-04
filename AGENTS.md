@@ -28,6 +28,10 @@ cargo test --locked
 cargo deny check
 ```
 
+## Generated artifacts
+
+- Never commit compiled bytecode or other build artifacts (e.g. EVM predeploy bytecode in `genesis.json`) — generate them from source (the `.sol` files) at build time.
+
 ## Tests
 
 - Hard ceiling: **≤ 15s wall per test** on a default GitHub runner. Time new tests with `--test-threads=1`.
