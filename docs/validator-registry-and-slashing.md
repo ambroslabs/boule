@@ -192,11 +192,22 @@ and false for a tampered message — confirmed on a live reth via
 `contracts/test/blsverify.mjs` against the blst vectors. So the crypto core of
 the slashing precompile is done.
 
-The isolated remaining work for step 3 is the **predeploy wrapper** around
-`BlsVerify`: read `Registry.keyAt(validator, view)`, reconstruct the two signed
-vote pre-images from the equivocation proof (the consensus vote-message format),
-check same-`view`/different-`block_hash`, `BlsVerify.verify` both, and on success
-slash via `Staking` + emit `Slashed`. boule then reads `Slashed` (the #655 path).
+**Update — the predeploy wrapper is now built** (`contracts/Slashing.sol`,
+deployed as the genesis predeploy at `0x…b13`). It inherits `BlsVerify`, reads
+`Registry.keyAt(validator, view)`, reconstructs the two `preimage::<Vote>`
+signing messages from the equivocation proof (`chain_id ‖ u32_be(len(DST)) ‖ DST
+‖ varint(view) ‖ block_hash`), checks same-`view`/different-`block_hash`,
+verifies both signatures, and on success emits `Slashed`. Validated against a
+**live reth** (`contracts/test/slashing.mjs`) with ground-truth equivocation
+vectors from boule's blst (`gen_slashing_vectors`): a valid double-sign emits
+`Slashed`, while a same-block proof or a signature that doesn't match its block
+reverts. It only *verifies + signals* — `chainId` is caller-supplied but a wrong
+value can't forge a slash (the pre-image won't verify).
+
+Remaining for #732: **boule's read/apply of `Slashed`** (the #655 `eth_getLogs`
+path → `StakeSource` → jail, step 4 below) and the registry **write path** that
+records committed rotations plus the `settledFrontier` gate (step 2). The
+predeploy trusts `keyAt` as settled until that frontier lands.
 
 ## The write path (#732 step 2) — what was built, and why rotations don't decode in-EVM
 

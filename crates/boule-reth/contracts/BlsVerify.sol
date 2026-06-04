@@ -122,6 +122,17 @@ contract BlsVerify {
         bytes calldata sig,
         bytes calldata negG1Gen
     ) external view returns (bool) {
+        return _verify(pubkey, message, sig, negG1Gen);
+    }
+
+    /// Memory-argument verify, callable by inheriting contracts (the slashing
+    /// predeploy reconstructs the vote pre-image in memory).
+    function _verify(
+        bytes memory pubkey,
+        bytes memory message,
+        bytes memory sig,
+        bytes memory negG1Gen
+    ) internal view returns (bool) {
         bytes memory h = hashToG2(message);
         // PAIRING_CHECK([pubkey, H], [-G1gen, sig]) == 1
         bytes memory input = abi.encodePacked(pubkey, h, negG1Gen, sig);
