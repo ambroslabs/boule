@@ -10,12 +10,15 @@
 //! transcribes the attribute into the sealed header `extra_data` and applies the
 //! writes as system calls (the same path every replica's `newPayloadV4` runs), so
 //! a passing run proves the carrier + codec + EL-applier all agree with boule's
-//! population bytes. (A full boule-node↔EL cluster e2e is Phase 5.)
+//! population bytes. For the **two-instance** determinism proof (proposer builds,
+//! a second EL verifies, both converge on identical `0x…0b12` storage) see
+//! `drive-custom-el-2inst` / `drive-custom-el-2inst.sh` (#793/#785, Phase 5).
 //!
-//! Run against a live custom EL started by `EL=custom run-reth.sh` (Engine API on
-//! :8551 with the given JWT, public RPC on :8545), with the `Registry` deployed
-//! at [`REGISTRY_ADDR`] (the EL writes there — see `boule-reth-node`'s
-//! `registry::REGISTRY_ADDRESS`). Exits non-zero on any mismatch.
+//! Run against a live custom EL (Engine API on :8551 with the given JWT, public
+//! RPC on :8545; e.g. via `drive-custom-el.sh`), with the `Registry` deployed at
+//! the canonical [`REGISTRY_ADDR`] (the EL writes there — see `boule-reth-node`'s
+//! `registry::REGISTRY_ADDRESS`, fixed to `0x…0b12` in #793). Exits non-zero on
+//! any mismatch.
 //!
 //! ```text
 //! drive-custom-el <jwt.hex>
@@ -31,10 +34,12 @@ use boule_reth::{HttpTransport, RethEngine};
 use serde_json::json;
 use std::time::Duration;
 
-/// The Registry address the **custom EL** writes to (mirror of
-/// `boule_reth_node::registry::REGISTRY_ADDRESS`). The drive genesis deploys the
-/// Registry code here so the EL's system calls hit real contract code.
-const REGISTRY_ADDR: &str = "0x00000000000000000000000000000000000b0011";
+/// The canonical Registry predeploy address — the single address the EL writes
+/// to (`boule_reth_node::registry::REGISTRY_ADDRESS`) AND the one boule's
+/// genesis seeds and slashing / governance / `keyAt` / `weightOf` /
+/// `settledView` read (`boule_reth::registry::REGISTRY_ADDRESS`). Reading back
+/// here proves the EL's writes land where the rest of boule looks (#793).
+const REGISTRY_ADDR: &str = boule_reth::registry::REGISTRY_ADDRESS;
 
 /// `keyAt(bytes32,uint64)` selector (= `boule_reth::registry::KEY_AT_SELECTOR`).
 const KEY_AT: [u8; 4] = [0x3a, 0x9e, 0x35, 0x8a];
@@ -114,19 +119,21 @@ async fn main() -> Result<()> {
         &format!("settledView() == {} (got {got_settled_u64})", settled.0),
     )?;
 
-    // ── Scenario 2: a FULL payload (key + weight + settled), carrying a
-    //    >32-byte `extra_data`. This is the #791 regression target: alloy's
-    //    ExecutionPayload→block conversion (used by the verify-path
-    //    `newPayloadV4`) hardcodes MAXIMUM_EXTRA_DATA_SIZE = 32, which #791's
-    //    custom `convert_payload_to_block` (in boule-reth-node) now routes around.
-    //    So build AND verify must BOTH accept it, and the EL must apply
-    //    recordKey + recordWeight + recordSettled from the carried bytes. This is
-    //    now a HARD assertion (it was a soft "expected gap" before #791). ────────
+    // ── Scenario 2: a FULL payload (key rotation + weight change + settled view)
+    //    — the A1 Phase-5 deliverable (#793). The carried extra_data exceeds the
+    //    Ethereum 32-byte cap, which the *build* path already relaxes (the custom
+    //    ConsensusBuilder) and the *verify* path now relaxes too (the custom
+    //    `convert_payload_to_block` in boule-reth-node, widened to MAX_EXTRA_DATA).
+    //    So this MUST pass build AND newPayloadV4, and keyAt/weightOf/settledView
+    //    read back from the CANONICAL Registry (0x…0b12) must reflect all three
+    //    writes — proving the EL's writes land where slashing/governance read. A
+    //    failure here fails the whole proof (no longer an "expected gap"). ────────
     let validator: NodeId = [0x42; 32];
     let v_eff = View::new(15);
     let key128: [u8; 128] = std::array::from_fn(|i| (i as u8).wrapping_mul(3).wrapping_add(1));
     let weight_validator: NodeId = [0x77; 32];
     let weight = 4242u64;
+    let settled2 = View::new(11);
     let p2 = RegistryPayload::new(
         vec![RecordKey {
             validator,
@@ -137,7 +144,7 @@ async fn main() -> Result<()> {
             node_id: weight_validator,
             weight,
         }],
-        Some(View::new(11)),
+        Some(settled2),
     );
     let attr2 = p2.to_attribute_hex();
     eprintln!(
@@ -148,13 +155,23 @@ async fn main() -> Result<()> {
     let b2 = engine
         .build_block(&parent2, 2, Duration::from_millis(500), &attr2)
         .await
-        .context("build_block on the custom EL (scenario 2, >32-byte extra_data)")?;
-    let (c2, s2) = engine.commit_block(&b2.execution_payload).await.context(
-        "commit_block (newPayloadV4 + fcU) for the >32-byte payload — \
-             #791 should now accept it on the verify path",
-    )?;
+        .context("build_block (full payload) on the custom EL")?;
+    eprintln!(
+        "[scenario 2] built EVM block {} ({})",
+        b2.block_number, b2.block_hash
+    );
+    let (c2, s2) = engine
+        .commit_block(&b2.execution_payload)
+        .await
+        .context("commit_block (full payload, newPayloadV4 + fcU)")?;
     eprintln!("[scenario 2] committed {c2} status={s2:?}");
-    // The EL applied recordKey from extra_data on the verify path: read it back.
+    check(
+        s2 == boule_reth::engine::ElStatus::Valid,
+        "full payload accepted by newPayloadV4 (status VALID)",
+    )?;
+
+    // keyAt(validator, v_eff) == the 128-byte key, read from the canonical
+    // Registry (0x…0b12) — the address slashing's keyAt lookup uses.
     let mut kcd = KEY_AT.to_vec();
     kcd.extend_from_slice(&validator);
     kcd.extend_from_slice(&left_pad32(&v_eff.0.to_be_bytes()));
@@ -162,28 +179,34 @@ async fn main() -> Result<()> {
     let len = u64::from_be_bytes(got_k[32 + 24..64].try_into().unwrap()) as usize;
     check(
         got_k[64..64 + len] == key128,
-        "keyAt(0x42..) == the 128-byte key we passed",
+        "keyAt(0x42..) == the 128-byte key we passed (at 0x…0b12)",
     )?;
-    // recordWeight (the #791 Part B write) applied too.
+
+    // weightOf(validator) == the weight, read from the canonical Registry.
     let mut wcd = WEIGHT_OF.to_vec();
     wcd.extend_from_slice(&weight_validator);
     let got_w = eth_call_at(&t, wcd, "latest").await?;
     let got_w_u64 = u64::from_be_bytes(got_w[24..32].try_into().unwrap());
     check(
         got_w_u64 == weight,
-        &format!("weightOf(0x77..) == {weight} (got {got_w_u64})"),
+        &format!("weightOf(0x77..) == {weight} (got {got_w_u64}) (at 0x…0b12)"),
     )?;
-    // recordSettled applied from the same payload.
+
+    // settledView() advanced to the full payload's settled view.
     let got_settled2 = eth_call_at(&t, SETTLED_VIEW.to_vec(), "latest").await?;
     let got_settled2_u64 = u64::from_be_bytes(got_settled2[24..32].try_into().unwrap());
     check(
-        got_settled2_u64 == 11,
-        &format!("settledView() == 11 (got {got_settled2_u64})"),
+        got_settled2_u64 == settled2.0,
+        &format!(
+            "settledView() == {} (got {got_settled2_u64}) (at 0x…0b12)",
+            settled2.0
+        ),
     )?;
 
     eprintln!(
         "\nA1 LIVE-EL PROOF: scenario 1 (settled-only) AND scenario 2 (key + weight + \
-         settled, >32-byte extra_data) PASSED end to end — #791 verify-cap fix confirmed."
+         settled, full payload) PASSED end to end — all reads from the canonical \
+         Registry at {REGISTRY_ADDR}."
     );
     Ok(())
 }
