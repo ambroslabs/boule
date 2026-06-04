@@ -197,6 +197,21 @@ impl ConsensusNode {
             );
             applied_any = true;
 
+            // #729: if the reconfig that just landed *is* this node's staged
+            // governance reconfig, clear the stage so the next proposal does not
+            // re-mint it. Match by command equality (its `v_eff`-bound consent
+            // makes the committed bytes identical to the staged ones) so that a
+            // *staking* reconfig landing does not clear a still-pending
+            // governance one.
+            if self.staged_governance_reconfig.as_ref() == Some(&cmd) {
+                self.staged_governance_reconfig = None;
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    v_eff = cmd.v_eff.0,
+                    "governance_reconfig_landed_stage_cleared",
+                );
+            }
+
             // #549: register operator keys for newly-seated validators whose
             // `adds` entry declared one — the operator-key analogue of the
             // signing-key mirror, but applied *live* (and persisted below)
@@ -304,13 +319,13 @@ impl ConsensusNode {
         // just reset to whatever state was durably written before the
         // last successful flush.
         if applied_any {
-            // A reconfig boundary landed, so any app-driven validator
-            // updates this node had staged are now materialised (this is
-            // where a minted ReconfigCommand takes effect). Clear the stage
-            // so the next proposal does not re-mint them. A governance
-            // reconfig committing also clears the stage — app-driven and
-            // governance reconfigs racing is out of scope for now; the
-            // application re-requests on a future commit if needed.
+            // A reconfig boundary landed, so any app-driven (staking) validator
+            // updates this node had staged are now materialised (this is where a
+            // minted ReconfigCommand takes effect). Clear the stage so the next
+            // proposal does not re-mint them. (A staged *governance* reconfig
+            // #729 is cleared separately, above, only when its own command lands
+            // — so a staking reconfig landing does not drop a still-pending
+            // governance one, and the two serialise across boundaries.)
             self.staged_validator_updates.clear();
 
             let persisted = self.validator_history.to_persisted();
