@@ -25,6 +25,8 @@ hex        = "0.4"
 base64     = "0.22"
 hmac       = "0.12"
 sha2       = "0.10"
+# keccak256 for deriving Solidity storage slots (the genesis registry seed).
+sha3       = "0.10"
 
 [build-dependencies]
 # `build.rs` generates genesis.json from genesis.template.json + the compiled
