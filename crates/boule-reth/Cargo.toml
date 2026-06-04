@@ -26,5 +26,10 @@ base64     = "0.22"
 hmac       = "0.12"
 sha2       = "0.10"
 
+[build-dependencies]
+# `build.rs` generates genesis.json from genesis.template.json + the compiled
+# contracts/*.sol; preserve_order keeps the template's key order in the output.
+serde_json = { version = "1", features = ["preserve_order"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

@@ -1,0 +1,15 @@
+name: Install solc
+description: >
+  Install the pinned solc 0.8.24 so boule-reth's build.rs can compile the EVM
+  predeploy contracts. The genesis predeploy bytecode is generated from source
+  at build time, never committed — see AGENTS.md "Generated artifacts".
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        sudo curl -fsSL -o /usr/local/bin/solc \
+          https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux
+        sudo chmod +x /usr/local/bin/solc
+        solc --version
