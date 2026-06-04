@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::transport::EngineTransport;
-use crate::{endpoint, param, rotation, slashing, staking};
+use crate::{endpoint, governance, param, rotation, slashing, staking};
 
 /// Max boule system txs to pull from the mempool into one proposal. Only a
 /// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
@@ -271,6 +271,25 @@ impl RethApplication {
             param::parse_param_logs,
             ValidatorEffect::ParamUpdate,
             "param",
+        )
+        .await
+    }
+
+    /// This block's governance-predeploy effects (#729): each `Approved` event
+    /// carries the encoded reconfig command for an approved membership change,
+    /// surfaced as a `ValidatorEffect::Reconfig`. reth never interprets the
+    /// command — consensus validates the membership change and schedules it at a
+    /// view boundary when it re-materialises the effect.
+    async fn derive_governance_effects(&self, payload: &Value) -> Vec<ValidatorEffect> {
+        let Some(block_hash) = payload["blockHash"].as_str() else {
+            return Vec::new();
+        };
+        self.derive_predeploy_effects(
+            block_hash,
+            governance::logs_filter(block_hash),
+            governance::parse_approved_logs,
+            ValidatorEffect::Reconfig,
+            "governance",
         )
         .await
     }
@@ -600,12 +619,14 @@ impl Application for RethApplication {
             // command submitted as an EVM tx, surfaced as a ValidatorEffect the
             // integration layer re-materialises into a block command (consensus
             // validates it — signatures and/or v_eff — at commit).
-            //   - rotation (#730) -> KeyRotation
-            //   - endpoint (#731) -> EndpointUpdate
-            //   - param    (#542) -> ParamUpdate
+            //   - rotation   (#730) -> KeyRotation
+            //   - endpoint   (#731) -> EndpointUpdate
+            //   - param      (#542) -> ParamUpdate
+            //   - governance (#729) -> Reconfig
             let mut effects = self.derive_rotation_effects(&payload).await;
             effects.extend(self.derive_endpoint_effects(&payload).await);
             effects.extend(self.derive_param_effects(&payload).await);
+            effects.extend(self.derive_governance_effects(&payload).await);
             Ok(CommitResult {
                 validator_updates,
                 effects,
@@ -1224,6 +1245,93 @@ mod tests {
                 );
             }
             other => panic!("expected ParamUpdate, got {other:?}"),
+        }
+    }
+
+    /// Test transport serving governance-predeploy logs only for the governance
+    /// `eth_getLogs` filter (keyed on the filter's `address`).
+    struct GovernanceTransport {
+        inner: FixtureTransport,
+        governance_logs: Value,
+    }
+    impl EngineTransport for GovernanceTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, _method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+            let is_governance = params[0]["address"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(governance::GOVERNANCE_ADDRESS));
+            let logs = if is_governance {
+                self.governance_logs.clone()
+            } else {
+                Value::Array(Vec::new())
+            };
+            Box::pin(async move { Ok(logs) })
+        }
+    }
+
+    /// #729 end-to-end (reth side): a governance `Approved` event in a committed
+    /// block surfaces as a `ValidatorEffect::Reconfig` carrying the opaque
+    /// reconfig command. The event indexes `proposalId` in `topics[1]` and
+    /// carries the command in `data`. reth passes the bytes straight through —
+    /// consensus validates the membership change when it materialises the effect.
+    #[tokio::test]
+    async fn commit_reads_governance_logs_into_reconfig_effects() {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        let cmd = b"RECFG-fake-encoded-validator-set-reconfig-command";
+        let governance_logs = serde_json::json!([{
+            "topics": [governance::APPROVED_TOPIC, format!("0x{}", "07".repeat(32))],
+            "data": abi_log_bytes(cmd),
+        }]);
+        let app = RethApplication::new(
+            Box::new(GovernanceTransport {
+                inner: FixtureTransport,
+                governance_logs,
+            }),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::seeded_from([([2u8; 32], 1u64)])),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        );
+
+        let g = genesis();
+        let block = app
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
+            .await
+            .expect("build");
+        let result = app
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit");
+
+        assert!(
+            result.validator_updates.is_empty(),
+            "no staking logs at the governance address",
+        );
+        assert_eq!(result.effects.len(), 1, "one Approved event → one effect");
+        match &result.effects[0] {
+            ValidatorEffect::Reconfig(bytes) => {
+                assert_eq!(
+                    bytes.as_ref(),
+                    cmd.as_ref(),
+                    "the opaque reconfig command rides through"
+                );
+            }
+            other => panic!("expected Reconfig, got {other:?}"),
         }
     }
 
