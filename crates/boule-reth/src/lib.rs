@@ -43,14 +43,7 @@ pub mod registry_payload;
 pub mod rotation;
 pub mod slashing;
 pub mod staking;
-pub mod system_account;
 pub mod transport;
-
-/// Multi-node simulation of the proposer EVM-write path (#766): proposer
-/// rotation, shared system-account nonce, and restart idempotency, exercised
-/// through a recording mock [`transport::EngineTransport`].
-#[cfg(test)]
-mod write_path_multinode_test;
 
 pub use application::RethApplication;
 pub use engine::{BuiltBlock, RethEngine, root_from_hex};

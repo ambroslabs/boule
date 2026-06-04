@@ -7,7 +7,6 @@
 
 use anyhow::{Context, Result, bail};
 use boule_core::clock::BoxFuture;
-use bytes::Bytes;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,44 +30,6 @@ pub trait EngineTransport: Send + Sync {
     fn eth_rpc(&self, method: &str, _params: Value) -> BoxFuture<'_, Result<Value>> {
         let method = method.to_string();
         Box::pin(async move { bail!("eth_* RPC unsupported by this transport: {method}") })
-    }
-
-    /// Submit a signed raw EVM transaction to reth's pool
-    /// (`eth_sendRawTransaction`), returning the transaction hash. The entry
-    /// point for the #732 registry write path: boule authors a system tx (see
-    /// [`crate::system_account`]) and pushes it here. The default errors; only
-    /// the live [`HttpTransport`] (and test fixtures) override it.
-    fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
-        let _ = raw;
-        Box::pin(async move { bail!("send_raw_transaction unsupported by this transport") })
-    }
-
-    /// The account's transaction count at the `pending` tag
-    /// (`eth_getTransactionCount`), i.e. the next nonce to use for a new tx.
-    /// Used by the system-tx builder to nonce a fresh system call. The default
-    /// errors; only the live [`HttpTransport`] (and test fixtures) override it.
-    fn eth_get_transaction_count(&self, address: &str) -> BoxFuture<'_, Result<u64>> {
-        let address = address.to_string();
-        Box::pin(async move {
-            bail!("eth_getTransactionCount unsupported by this transport: {address}")
-        })
-    }
-
-    /// The account's transaction count at the `latest` tag
-    /// (`eth_getTransactionCount`), i.e. the number of txs from `address` that
-    /// have actually **executed** in canonical state (excludes still-pending
-    /// pool txs). The settled-frontier gate (#767) reads this to confirm the
-    /// system account's registry writes have cleared the execution lag before
-    /// it advances the slashing predeploy's `settledView`: only when the
-    /// executed nonce has caught up to the pending nonce are there no
-    /// in-flight `recordKey` writes that could leave `keyAt` stale at the
-    /// frontier. The default errors; only the live [`HttpTransport`] (and test
-    /// fixtures) override it.
-    fn eth_get_transaction_count_executed(&self, address: &str) -> BoxFuture<'_, Result<u64>> {
-        let address = address.to_string();
-        Box::pin(async move {
-            bail!("eth_getTransactionCount(latest) unsupported by this transport: {address}")
-        })
     }
 }
 
@@ -133,52 +94,6 @@ impl EngineTransport for HttpTransport {
     fn eth_rpc(&self, method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
         let method = method.to_string();
         Box::pin(async move { self.rpc(&self.eth_url, &method, params, false).await })
-    }
-
-    fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
-        let hex = format!("0x{}", hex::encode(&raw));
-        Box::pin(async move {
-            self.rpc(&self.eth_url, "eth_sendRawTransaction", json!([hex]), false)
-                .await
-        })
-    }
-
-    fn eth_get_transaction_count(&self, address: &str) -> BoxFuture<'_, Result<u64>> {
-        let address = address.to_string();
-        Box::pin(async move {
-            let result = self
-                .rpc(
-                    &self.eth_url,
-                    "eth_getTransactionCount",
-                    json!([address, "pending"]),
-                    false,
-                )
-                .await?;
-            let hex = result
-                .as_str()
-                .context("eth_getTransactionCount result is a hex quantity")?;
-            u64::from_str_radix(hex.trim_start_matches("0x"), 16)
-                .context("eth_getTransactionCount result not hex")
-        })
-    }
-
-    fn eth_get_transaction_count_executed(&self, address: &str) -> BoxFuture<'_, Result<u64>> {
-        let address = address.to_string();
-        Box::pin(async move {
-            let result = self
-                .rpc(
-                    &self.eth_url,
-                    "eth_getTransactionCount",
-                    json!([address, "latest"]),
-                    false,
-                )
-                .await?;
-            let hex = result
-                .as_str()
-                .context("eth_getTransactionCount(latest) result is a hex quantity")?;
-            u64::from_str_radix(hex.trim_start_matches("0x"), 16)
-                .context("eth_getTransactionCount(latest) result not hex")
-        })
     }
 
     fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {

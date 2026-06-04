@@ -31,8 +31,9 @@ use alloy_primitives::{Address, B256, Bytes, address};
 use alloy_sol_types::{SolCall, sol};
 
 /// EL-only system caller (no private key) — the EIP-4788 / withdrawals model.
-/// The Registry predeploy gates its writers on this address (see
-/// `contracts/Registry.sol`, the `SYSTEM`/`WRITER` change in Phase 2).
+/// The Registry predeploy gates its writers on this address: after A1 Phase 3
+/// (#783) it is the SOLE authorized writer (the legacy `WRITER` EOA was removed —
+/// see `contracts/Registry.sol`).
 pub const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
 
 /// The canonical boule `Registry` predeploy address — the **single** address

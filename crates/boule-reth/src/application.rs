@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::transport::EngineTransport;
-use crate::{endpoint, governance, param, registry, rotation, slashing, staking, system_account};
+use crate::{endpoint, governance, param, registry, rotation, slashing, staking};
 
 /// Max boule system txs to pull from the mempool into one proposal. Only a
 /// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
@@ -81,8 +81,8 @@ pub struct RethApplication {
     /// (#791 Part B). Weight changes come from a block's *execution* logs, so
     /// they are only known after `commit` — too late for that block's own
     /// `extra_data`. They are therefore staged here at `commit` and carried in
-    /// the **next** block's `registryPayload` (the same one-block lag the legacy
-    /// `recordWeight` tx path has). `commit` reconciles the buffer against each
+    /// the **next** block's `registryPayload` (an intrinsic one-block lag of
+    /// deriving the delta from execution). `commit` reconciles the buffer against each
     /// committed block's `extra_data` (decoding the weights it already mirrored)
     /// so nothing is carried twice and nothing leaks across leader rotation.
     /// Keyed by validator so a later delta for the same validator supersedes an
@@ -126,17 +126,24 @@ impl RethApplication {
         RethEngine::new(&*self.transport, self.fee_recipient.clone())
     }
 
-    /// Compute the A1 EL-applied registry write set (#781) the leader carries to
-    /// the custom EL on the build attributes for the block at `view`.
+    /// Compute the A1 EL-applied registry write set (#781/#783) the leader
+    /// carries to the custom EL on the build attributes for the block at `view`.
     ///
-    /// Sourced from boule's authoritative consensus state, mirroring exactly what
-    /// the legacy tx-write path in [`Self::commit`] would record:
+    /// This is the **sole** registry write path: the EL applies the carried set
+    /// as `recordKey`/`recordWeight`/`recordSettled` system calls at the block
+    /// boundary on every replica. Sourced from boule's authoritative consensus
+    /// state:
     ///
     /// - **`settledView`** — [`registry::conservative_settled_view`]`(view)`, the
-    ///   same conservative frontier (#767) `record_settled_view` advances to. The
-    ///   primary, near-always-present field; on the common no-rotation block it is
-    ///   the *only* one, keeping the carried `extra_data` to a handful of bytes.
-    ///   `None` below the margin (genesis frontier is already 0).
+    ///   conservative frontier (#767) held [`registry::SETTLED_VIEW_MARGIN`]
+    ///   views behind the committed view. The primary, near-always-present field;
+    ///   on the common no-rotation block it is the *only* one, keeping the carried
+    ///   `extra_data` to a handful of bytes. `None` below the margin (genesis
+    ///   frontier is already 0). The margin remains as harmless defense: a
+    ///   rotation effective at view `V` commits its `recordKey` in the SAME block
+    ///   the EL applies it, but `settledView` never reaches `V` until `MARGIN`
+    ///   views later, so the slashing predeploy never reads ahead of a recorded
+    ///   key by construction.
     /// - **`keys`** — the BLS-key rotations this block materializes: each
     ///   rotation system tx the leader is including (`system_cmds`, the same
     ///   commands it pulls into the block) decoded via
@@ -148,11 +155,12 @@ impl RethApplication {
     ///   *execution* logs, so it is only known after that block's `commit` — too
     ///   late for its own `extra_data`. We therefore stage each block's deltas in
     ///   [`Self::pending_weights`] at `commit` and carry the pending set in the
-    ///   **next** block's payload here (the same one-block lag the legacy
-    ///   `recordWeight` tx path has). Snapshotting (not draining) the buffer keeps
-    ///   the build idempotent if the proposal is skipped; `commit` is what clears a
-    ///   delta, once it sees a committed block's `extra_data` already mirrored it.
-    ///   In a consensus-canonical order (by validator id, via the `BTreeMap`).
+    ///   **next** block's payload here (an intrinsic one-block lag of deriving the
+    ///   delta from execution, not the retired tx path). Snapshotting (not
+    ///   draining) the buffer keeps the build idempotent if the proposal is
+    ///   skipped; `commit` is what clears a delta, once it sees a committed block's
+    ///   `extra_data` already mirrored it. In a consensus-canonical order (by
+    ///   validator id, via the `BTreeMap`).
     ///
     /// Determinism across replicas does not depend on this sourcing: the EL reads
     /// the write set from the *sealed header* `extra_data` on every node's verify
@@ -359,245 +367,6 @@ impl RethApplication {
             "rotation",
         )
         .await
-    }
-
-    /// #732 step 2 — the registry **write** path. For each committed key
-    /// rotation in `effects` that swaps the validator's BLS key, write the new
-    /// key into the `Registry` predeploy (`recordKey`) so the on-chain registry
-    /// faithfully mirrors what consensus applied and the slashing predeploy's
-    /// `keyAt` lookup is correct for post-genesis rotations.
-    ///
-    /// **Proposer-only.** Called solely when this node proposed the committed
-    /// block (`ctx.proposer == self_id`): exactly one node submits the system
-    /// tx, avoiding N redundant pool submissions per rotation. The write is
-    /// idempotent regardless — `Registry.recordKey` requires a strictly
-    /// increasing `vEff`, so a duplicate (re-proposed across views, or after a
-    /// restart) simply reverts harmlessly in the EVM.
-    ///
-    /// The new key is converted from boule's 48-byte compressed min-pk G1 to the
-    /// **128-byte EIP-2537 uncompressed** form `Registry.keyAt` must return for
-    /// `Slashing.sol` (`bls_pubkey_to_eip2537_g1`); a malformed rotation is
-    /// logged and skipped (it must never fail the commit — consensus commits
-    /// regardless of the EL).
-    ///
-    /// `recordKey`'s writes are unauthenticated in this MVP (anyone with the
-    /// system key can author them); contract-side access control gating
-    /// `recordKey` to the system account is the explicit next step (see
-    /// `Registry.sol` / [`crate::system_account`]).
-    async fn record_rotated_keys(&self, effects: &[ValidatorEffect]) {
-        // Collect the (validator, vEff, key128) writes this block's rotations
-        // imply, skipping non-BLS rotations and logging (never failing on) a
-        // malformed command.
-        let mut writes = Vec::new();
-        for effect in effects {
-            let ValidatorEffect::KeyRotation(cmd) = effect else {
-                continue;
-            };
-            match registry::record_key_for_rotation(cmd) {
-                Ok(Some(rk)) => writes.push(rk),
-                Ok(None) => {} // not a BLS-key rotation — nothing to mirror
-                Err(e) => tracing::warn!(
-                    target: "boule::reth",
-                    error = %e,
-                    "registry write: undecodable rotation command; skipping recordKey",
-                ),
-            }
-        }
-        if writes.is_empty() {
-            return;
-        }
-        // Submit each recordKey as a system tx. `submit_system_call` fetches the
-        // system account's *pending* nonce per call; submitting sequentially
-        // (awaiting each) lets reth's pool reflect the prior tx so the next
-        // nonce is fresh. A single rotation per block is the common case.
-        for rk in &writes {
-            let calldata = registry::record_key_calldata(rk);
-            match self
-                .submit_system_call(registry::registry_address(), calldata)
-                .await
-            {
-                Ok(hash) => tracing::info!(
-                    target: "boule::reth",
-                    validator = %hex::encode(rk.validator),
-                    v_eff = rk.v_eff.0,
-                    tx = %hash,
-                    "registry write: submitted recordKey for rotated BLS key",
-                ),
-                Err(e) => tracing::warn!(
-                    target: "boule::reth",
-                    error = %e,
-                    validator = %hex::encode(rk.validator),
-                    v_eff = rk.v_eff.0,
-                    "registry write: recordKey submission failed (idempotent — retried next time)",
-                ),
-            }
-        }
-    }
-
-    /// #732 step 4 — the registry **weight** write path. Mirror each seated
-    /// validator-weight change this block produced into the `Registry` predeploy
-    /// (`recordWeight`) so the on-chain weight surface stays current. This is the
-    /// value #729's stake-weighted governance tally and #746's param-update
-    /// authorization read.
-    ///
-    /// **Proposer-only**, exactly like [`Self::record_rotated_keys`]: only the
-    /// committed block's proposer submits the system txs, so one node — not all N
-    /// — authors them. `updates` is the per-block weight delta the staking /
-    /// slashing read path computed ([`Self::derive_validator_updates`]); the
-    /// `StakeSource` emits a [`ValidatorUpdate`] only when a validator's weight
-    /// actually changed, so every entry here is a genuine change and a redundant
-    /// same-weight write is already avoided upstream. `recordWeight` overwrites
-    /// the validator's weight and adjusts the on-chain `totalWeight` by the delta
-    /// (old→new), so a removal (`weight == 0`) drains its share.
-    ///
-    /// A no-op same-weight write would be harmless (the contract does not reject
-    /// it), but submitting one wastes a system tx, so we only submit the changes
-    /// `updates` carries. A failed submission is logged, never fatal — consensus
-    /// commits regardless of the EL, and the next change re-syncs the surface.
-    async fn record_validator_weights(&self, updates: &[ValidatorUpdate]) {
-        if updates.is_empty() {
-            return;
-        }
-        // Submit sequentially (awaiting each) so reth's pool reflects the prior
-        // tx and the next system-account nonce is fresh — same discipline as
-        // `record_rotated_keys`.
-        for u in updates {
-            let calldata = registry::record_weight_calldata(&u.node_id, u.weight);
-            match self
-                .submit_system_call(registry::registry_address(), calldata)
-                .await
-            {
-                Ok(hash) => tracing::info!(
-                    target: "boule::reth",
-                    validator = %hex::encode(u.node_id),
-                    weight = u.weight,
-                    tx = %hash,
-                    "registry write: submitted recordWeight for seated-weight change",
-                ),
-                Err(e) => tracing::warn!(
-                    target: "boule::reth",
-                    error = %e,
-                    validator = %hex::encode(u.node_id),
-                    weight = u.weight,
-                    "registry write: recordWeight submission failed (re-synced on next change)",
-                ),
-            }
-        }
-    }
-
-    /// #732/#767 settled-frontier gate — **conservatively** advance the
-    /// `Registry`'s `settledView` so the slashing predeploy can safely gate
-    /// proofs (`view <= settledView`) without ever reading a key the registry
-    /// has not yet recorded in executed EVM state.
-    ///
-    /// **Why this is not `recordSettled(committed_view)`.** `keyAt(validator,
-    /// view)` is only trustworthy once *every* rotation with `vEff <= view` has
-    /// **executed** in EVM state. But a rotation's `recordKey` is an async
-    /// system tx that executes some blocks after its commit (the #674 EL
-    /// self-sync lag), and `recordSettled` is the same kind of lagged tx — and
-    /// the shared system account is written by *different* proposers across
-    /// views, so there is no nonce-ordering that guarantees a view-`V` rotation's
-    /// `recordKey` executes before a later proposer's `recordSettled(V)`.
-    /// Advancing the frontier to the bare committed view could therefore let a
-    /// slashing proof verify against a **stale** pre-rotation key. So we make the
-    /// frontier conservative on **two** independent axes (prefer a false-negative
-    /// — the watcher resubmits once it settles — over ever slashing on a stale
-    /// key; #767):
-    ///
-    /// 1. **Execution confirmation.** Advance only once this node's own pending
-    ///    registry writes have *executed*: the system account's `latest`
-    ///    (executed) nonce has caught up to its `pending` nonce, so there is no
-    ///    in-flight `recordKey` that could leave `keyAt` stale. If writes are
-    ///    still in flight, hold the frontier — a later commit re-advances it.
-    /// 2. **A view margin.** Even with (1), target
-    ///    `committed_view − `[`SETTLED_VIEW_MARGIN`] (not the committed view),
-    ///    held `>= MIN_V_EFF_DELAY` views back so a rotation effective at the
-    ///    frontier has had ample committed views for its `recordKey` to clear.
-    ///
-    /// **Proposer-only**, exactly like [`Self::record_rotated_keys`]: only the
-    /// committed block's proposer submits the system tx. Submitted *after* this
-    /// block's `recordKey`s (the caller orders it last). `recordSettled` clamps
-    /// monotonically, so a replayed/older view is a harmless no-op; a failed
-    /// submission is logged, never fatal (consensus commits regardless of the
-    /// EL, and the next commit re-advances the frontier).
-    ///
-    /// [`SETTLED_VIEW_MARGIN`]: crate::registry::SETTLED_VIEW_MARGIN
-    async fn record_settled_view(&self, committed_view: View) {
-        let target = registry::conservative_settled_view(committed_view);
-        if target.0 == 0 {
-            // Below the margin: nothing is settleable yet (the genesis frontier
-            // is already 0). Skip the no-op write.
-            return;
-        }
-        // Axis 1 — execution confirmation. Only advance the frontier once this
-        // node's system-account writes have *executed* (no `recordKey` still
-        // pending in the pool), so the registry's `keyAt` is caught up to at
-        // least every rotation we have already submitted. If a registry-write tx
-        // is still in flight, hold the frontier this commit and re-advance later.
-        match self.system_account_writes_settled().await {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::info!(
-                    target: "boule::reth",
-                    target_view = target.0,
-                    "registry write: recordSettled held — system-account writes still \
-                     in flight (frontier re-advanced once they execute)",
-                );
-                return;
-            }
-            Err(e) => {
-                // Couldn't confirm execution — be conservative and hold the
-                // frontier rather than risk advancing past an unexecuted write.
-                tracing::warn!(
-                    target: "boule::reth",
-                    error = %e,
-                    target_view = target.0,
-                    "registry write: recordSettled held — could not confirm system-account \
-                     writes executed (frontier re-advanced when confirmable)",
-                );
-                return;
-            }
-        }
-        let calldata = registry::record_settled_calldata(target);
-        match self
-            .submit_system_call(registry::registry_address(), calldata)
-            .await
-        {
-            Ok(hash) => tracing::info!(
-                target: "boule::reth",
-                target_view = target.0,
-                committed_view = committed_view.0,
-                tx = %hash,
-                "registry write: submitted recordSettled (advanced conservative settled frontier)",
-            ),
-            Err(e) => tracing::warn!(
-                target: "boule::reth",
-                error = %e,
-                target_view = target.0,
-                "registry write: recordSettled submission failed (re-advanced next commit)",
-            ),
-        }
-    }
-
-    /// Whether the system account has **no in-flight** registry writes: its
-    /// executed (`latest`) nonce has caught up to its pending nonce. The
-    /// settled-frontier advance gates on this (#767) so it never moves
-    /// `settledView` past a view whose `recordKey` is still pending in the pool
-    /// (which would leave the slashing predeploy's `keyAt` stale at the
-    /// frontier). `pending == executed` means every authored `recordKey` /
-    /// `recordWeight` has already executed in canonical EVM state.
-    async fn system_account_writes_settled(&self) -> Result<bool> {
-        let pending = self
-            .transport
-            .eth_get_transaction_count(system_account::SYSTEM_ACCOUNT_ADDRESS)
-            .await
-            .context("fetching the system account's pending nonce")?;
-        let executed = self
-            .transport
-            .eth_get_transaction_count_executed(system_account::SYSTEM_ACCOUNT_ADDRESS)
-            .await
-            .context("fetching the system account's executed nonce")?;
-        Ok(executed >= pending)
     }
 
     /// This block's endpoint-predeploy effects (#731).
@@ -863,60 +632,6 @@ impl RethApplication {
             }
         }
     }
-
-    /// The EVM chain id, read once from reth (`eth_chainId`). Needed to bind a
-    /// system tx's signature to this deployment's chain (EIP-155 replay
-    /// protection). Reading it from reth (rather than threading the genesis
-    /// `chainId` through) keeps the system-tx path self-contained.
-    async fn evm_chain_id(&self) -> Result<u64> {
-        let result = self
-            .transport
-            .eth_rpc("eth_chainId", Value::Null)
-            .await
-            .context("querying reth chain id")?;
-        let hex = result
-            .as_str()
-            .context("eth_chainId result is a hex quantity")?;
-        u64::from_str_radix(hex.trim_start_matches("0x"), 16).context("eth_chainId result not hex")
-    }
-
-    /// Build, sign, and submit a system EVM transaction calling `(to,
-    /// calldata)` from the system account ([`crate::system_account`]) — the
-    /// #732 registry write path's submission primitive. Fetches the EVM chain
-    /// id and the system account's pending nonce via the transport, signs an
-    /// EIP-1559 tx, and pushes it to reth's pool with `eth_sendRawTransaction`,
-    /// returning the transaction hash.
-    ///
-    /// This is the *capability* only: callers (e.g. recording a rotated key via
-    /// `Registry.recordKey`) are a follow-up, as is access control on the
-    /// `recordKey` side. See the module-level MVP caveat in
-    /// [`crate::system_account`].
-    pub async fn submit_system_call(
-        &self,
-        to: alloy_primitives::Address,
-        calldata: alloy_primitives::Bytes,
-    ) -> Result<String> {
-        let chain_id = self.evm_chain_id().await?;
-        let nonce = self
-            .transport
-            .eth_get_transaction_count(system_account::SYSTEM_ACCOUNT_ADDRESS)
-            .await
-            .context("fetching the system account's pending nonce")?;
-        let raw = system_account::build_system_call(chain_id, nonce, to, calldata)
-            .context("building the signed system tx")?;
-        let result = self
-            .transport
-            // `build_system_call` returns alloy's `Bytes`; the transport takes
-            // the workspace's `bytes::Bytes` — convert at the seam.
-            .send_raw_transaction(raw.0)
-            .await
-            .context("submitting the system tx")?;
-        let hash = result
-            .as_str()
-            .context("eth_sendRawTransaction returns the tx hash")?
-            .to_string();
-        Ok(hash)
-    }
 }
 
 /// Extract the 32-byte post-state root from an execution payload.
@@ -1005,7 +720,7 @@ impl Application for RethApplication {
                     }
                 }
             }
-            // A1 EL-applied registry writes (#781): the leader computes the
+            // A1 EL-applied registry writes (#781/#783): the leader computes the
             // authoritative `(keys, weights, settledView)` write set for this
             // block and hands it to the custom EL on the build attributes. The
             // EL transcribes it into the sealed header `extra_data` and applies
@@ -1013,11 +728,10 @@ impl Application for RethApplication {
             // replica mirrors the identical registry state from the propagated
             // block (no proposer trust — see #777). The pulled-in rotation system
             // txs (`reconfig_cmds` below) feed the key writes; the settled view is
-            // the conservative frontier the tx path also computes. Empty for the
-            // common no-rotation block, which keeps `extra_data` (and the header)
-            // small. This runs alongside the legacy tx-write path in `commit`
-            // (the Registry's dual-writer accepts both); the tx path is removed in
-            // Phase 3.
+            // the conservative frontier. Empty for the common no-rotation block,
+            // which keeps `extra_data` (and the header) small. This is the SOLE
+            // registry write path — the legacy proposer-signed tx-write path in
+            // `commit` was removed in Phase 3 (#783).
             let reconfig_cmds = self.mempool.propose(SYSTEM_TX_LIMIT);
             let registry_payload = self.registry_payload_for_build(view, &reconfig_cmds);
             let built = engine
@@ -1088,7 +802,7 @@ impl Application for RethApplication {
 
     fn commit<'a>(
         &'a self,
-        ctx: &'a AppContext,
+        _ctx: &'a AppContext,
         block: &'a Block,
     ) -> BoxFuture<'a, Result<CommitResult>> {
         Box::pin(async move {
@@ -1178,37 +892,24 @@ impl Application for RethApplication {
             //   - param      (#542) -> ParamUpdate
             //   - governance (#729) -> Reconfig
             let mut effects = self.derive_rotation_effects(&payload).await;
-            // #732 step 2: only the committed block's proposer mirrors its
-            // rotated BLS keys into the on-chain Registry (`recordKey`), so a
-            // single node — not all N — authors the system tx. Idempotent
-            // regardless (the monotone `vEff` guard reverts duplicates), so a
-            // re-proposed block or a restart never corrupts the registry.
-            // #732 step 4: the same proposer also mirrors this block's seated
-            // validator-weight changes into the Registry (`recordWeight`) — the
-            // on-chain weight surface #729's tally and #746's auth read. Each
-            // `validator_updates` entry is a genuine weight change (the
-            // StakeSource only emits changed validators), so no redundant write.
-            // #732/#767 settled-frontier: after mirroring this block's rotated
-            // keys, *conservatively* advance the Registry's `settledView` (held
-            // a margin behind the committed view and gated on this node's
-            // registry writes having executed) so the slashing predeploy never
-            // accepts a proof for a view whose rotation's `recordKey` has not yet
-            // executed in EVM state (which would leave `keyAt` stale). Called
-            // last, after this block's `recordKey`s are submitted.
-            if ctx.proposer == self.self_id {
-                self.record_rotated_keys(&effects).await;
-                self.record_validator_weights(&validator_updates).await;
-                self.record_settled_view(block.header.view).await;
-            }
+            // A1 (#777/#783): the registry writes (`recordKey`/`recordWeight`/
+            // `recordSettled`) are applied by the custom EL as system calls from
+            // the block's `registryPayload` attribute (built in `build_proposal`
+            // via `registry_payload_for_build`), so every replica mirrors the
+            // identical registry state deterministically — there is no
+            // proposer-authored transaction write path here anymore (the legacy
+            // `record_rotated_keys`/`record_validator_weights`/`record_settled_view`
+            // tx hooks were removed in Phase 3). `commit` only derives the
+            // validator-set effects below; the EL is the sole registry writer.
             effects.extend(self.derive_endpoint_effects(&payload).await);
             effects.extend(self.derive_param_effects(&payload).await);
             effects.extend(self.derive_governance_effects(&payload).await);
             // #772: prepend the self-synced gap's submission effects (ascending
             // by height) ahead of this block's, so the materialised effect
             // sequence is byte-identical to a node that executed every block in
-            // order. The gap rotations' `recordKey` registry writes already
-            // executed in the EL during self-sync, so they are NOT re-recorded
-            // here (only this block's `effects` feed `record_rotated_keys`).
+            // order. The gap rotations' `recordKey` registry writes were already
+            // applied by the EL during self-sync, so this node's `effects` only
+            // re-materialise the validator-set changes.
             if !gap_effects.is_empty() {
                 gap_effects.extend(effects);
                 effects = gap_effects;
@@ -2564,238 +2265,15 @@ mod tests {
         assert!(err.to_string().contains("still syncing"));
     }
 
-    // ── #732 step 2: proposer-only registry write path ─────────────────────
+    // ── seated-weight deltas flow through the EL `registryPayload` ──────────
 
-    /// Transport for the registry-write tests: serves the engine fixtures (so
-    /// `commit` reaches VALID), a canned rotation log for `eth_getLogs` at the
-    /// rotation predeploy (empty elsewhere), `eth_chainId` / `eth_getTransactionCount`
-    /// for the system-tx nonce path, and **records** every `send_raw_transaction`
-    /// so a test can assert whether a `recordKey` was authored.
-    struct RegistryWriteTransport {
-        inner: FixtureTransport,
-        rotation_logs: Value,
-        sent: Arc<Mutex<Vec<Bytes>>>,
-    }
-    impl EngineTransport for RegistryWriteTransport {
-        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
-            self.inner.call(method, params, tag)
-        }
-        fn eth_rpc(&self, method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
-            // `eth_chainId` is served as a plain quantity; `eth_getLogs` is keyed
-            // on the filter address (rotation logs only at the rotation predeploy).
-            if method == "eth_chainId" {
-                return Box::pin(async move { Ok(Value::String("0x539".into())) }); // 1337
-            }
-            let is_rotation = params[0]["address"]
-                .as_str()
-                .is_some_and(|a| a.eq_ignore_ascii_case(rotation::ROTATION_ADDRESS));
-            let logs = if is_rotation {
-                self.rotation_logs.clone()
-            } else {
-                Value::Array(Vec::new())
-            };
-            Box::pin(async move { Ok(logs) })
-        }
-        fn eth_get_transaction_count(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
-            Box::pin(async move { Ok(0) })
-        }
-        fn eth_get_transaction_count_executed(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
-            // pending == executed: no in-flight registry writes, so the
-            // settled-frontier advance is not held by the #767 execution gate.
-            Box::pin(async move { Ok(0) })
-        }
-        fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
-            self.sent.lock().push(raw);
-            Box::pin(async move { Ok(Value::String(format!("0x{}", "11".repeat(32)))) })
-        }
-    }
-
-    /// A real `DualSignedRotation` command carrying a new BLS key, ABI-laid-out
-    /// in a rotation log's `data` (signatures zeroed — the read path passes the
-    /// bytes through opaquely; `record_key_for_rotation` only decodes).
-    fn bls_rotation_log() -> (Value, boule_core::crypto::sig_scheme::BlsPublicKey) {
-        use boule_consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
-        use boule_core::crypto::sig_scheme::BlsAggregated;
-        let pk = BlsAggregated::keygen(&[0x9a; 32]).unwrap().1;
-        let cmd = DualSignedRotation {
-            payload: ValidatorKeyRotation {
-                validator: [0x42; 32],
-                new_pubkey: [0xCC; 32],
-                v_eff: View(42),
-                new_bls_pubkey: Some(pk),
-                new_bls_pop: None,
-            },
-            sig_old: [0u8; 64],
-            sig_new: [0u8; 64],
-        }
-        .encode_command();
-        let logs = serde_json::json!([{
-            "topics": [rotation::ROTATION_TOPIC, format!("0x{}", "42".repeat(32))],
-            "data": abi_log_bytes(&cmd),
-        }]);
-        (logs, pk)
-    }
-
-    fn app_with_recording(
-        self_id: NodeId,
-        rotation_logs: Value,
-        sent: Arc<Mutex<Vec<Bytes>>>,
-    ) -> RethApplication {
-        use boule_consensus::replication::stake_source::BondedStakeLedger;
-        RethApplication::new(
-            Box::new(RegistryWriteTransport {
-                inner: FixtureTransport,
-                rotation_logs,
-                sent,
-            }),
-            self_id,
-            FEE,
-            RETH_GENESIS,
-            [0u8; 32],
-            Duration::ZERO,
-            Box::new(BondedStakeLedger::empty()),
-            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
-                64,
-            )),
-        )
-    }
-
-    /// When this node is the committed block's proposer, a committed BLS-key
-    /// rotation writes the new key into the Registry: exactly one `recordKey`
-    /// system tx is authored, and it decodes to `recordKey(validator, vEff, key)`
-    /// with the key in 128-byte EIP-2537 form.
-    #[tokio::test]
-    async fn proposer_commit_submits_a_recordkey_for_a_bls_rotation() {
-        use alloy_consensus::TxEnvelope;
-        use alloy_eips::eip2718::Decodable2718;
-
-        let self_id = [1u8; 32];
-        let (rotation_logs, pk) = bls_rotation_log();
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let app = app_with_recording(self_id, rotation_logs, Arc::clone(&sent));
-
-        let g = genesis();
-        // commit `ctx.proposer == self_id` ⇒ this node mirrors the rotation.
-        let ctx = AppContext {
-            proposer: self_id,
-            ..Default::default()
-        };
-        // Commit at a view above the conservative margin so the settled frontier
-        // actually advances (#767): below the margin the advance is skipped.
-        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
-        let block = app
-            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
-            .await
-            .expect("build");
-        let result = app.commit(&ctx, &block).await.expect("commit");
-        assert_eq!(result.effects.len(), 1, "one rotation effect surfaced");
-
-        let sent = sent.lock();
-        // The proposer authors two system txs: the recordKey (first) and the
-        // per-commit recordSettled frontier advance (#732/#767, last).
-        assert_eq!(
-            sent.len(),
-            2,
-            "recordKey + recordSettled system txs authored",
-        );
-
-        // Decode the first authored tx and check its calldata is the expected
-        // recordKey(validator, vEff, key128).
-        let env = TxEnvelope::decode_2718(&mut sent[0].as_ref()).expect("typed tx");
-        let tx = match &env {
-            TxEnvelope::Eip1559(s) => s.tx(),
-            other => panic!("expected EIP-1559, got {other:?}"),
-        };
-        assert_eq!(
-            tx.to,
-            alloy_primitives::TxKind::Call(registry::registry_address()),
-            "addressed to the Registry predeploy",
-        );
-        let cd = tx.input.as_ref();
-        assert_eq!(
-            &cd[0..4],
-            &registry::RECORD_KEY_SELECTOR,
-            "recordKey selector"
-        );
-        assert_eq!(&cd[4..36], &[0x42u8; 32], "validator id");
-        let mut v_word = [0u8; 32];
-        v_word[24..].copy_from_slice(&42u64.to_be_bytes());
-        assert_eq!(&cd[36..68], &v_word, "vEff == 42");
-        // The key is the 128-byte EIP-2537 form of the rotated pubkey.
-        let want_key = boule_core::crypto::sig_scheme::bls_pubkey_to_eip2537_g1(&pk).unwrap();
-        assert_eq!(&cd[132..132 + 128], &want_key, "EIP-2537 128-byte key");
-
-        // The second tx is recordSettled(conservative view): the committed view
-        // less the #767 margin, not the committed view itself.
-        let env2 = TxEnvelope::decode_2718(&mut sent[1].as_ref()).expect("typed tx");
-        let tx2 = match &env2 {
-            TxEnvelope::Eip1559(s) => s.tx(),
-            other => panic!("expected EIP-1559, got {other:?}"),
-        };
-        assert_eq!(
-            tx2.to,
-            alloy_primitives::TxKind::Call(registry::registry_address()),
-            "recordSettled addressed to the Registry predeploy",
-        );
-        let cd2 = tx2.input.as_ref();
-        assert_eq!(
-            &cd2[0..4],
-            &registry::RECORD_SETTLED_SELECTOR,
-            "recordSettled selector",
-        );
-        let want = registry::conservative_settled_view(block.header.view).0;
-        let mut view_word = [0u8; 32];
-        view_word[24..].copy_from_slice(&want.to_be_bytes());
-        assert_eq!(
-            &cd2[4..36],
-            &view_word,
-            "recordSettled(committed_view - SETTLED_VIEW_MARGIN)",
-        );
-    }
-
-    /// A non-proposer commit reads the same rotation effect but writes **nothing**
-    /// — only the proposer authors the system tx (no N-fold redundant pool spam).
-    #[tokio::test]
-    async fn non_proposer_commit_submits_nothing() {
-        let self_id = [1u8; 32];
-        let (rotation_logs, _) = bls_rotation_log();
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let app = app_with_recording(self_id, rotation_logs, Arc::clone(&sent));
-
-        let g = genesis();
-        // ctx.proposer is some *other* node, not self_id.
-        let ctx = AppContext {
-            proposer: [9u8; 32],
-            ..Default::default()
-        };
-        let block = app
-            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
-            .await
-            .expect("build");
-        let result = app.commit(&ctx, &block).await.expect("commit");
-        assert_eq!(
-            result.effects.len(),
-            1,
-            "the rotation effect still surfaces"
-        );
-        assert!(
-            sent.lock().is_empty(),
-            "a non-proposer must not author a recordKey",
-        );
-    }
-
-    // ── #732 step 4: proposer-only registry *weight* write path ────────────
-
-    /// Transport for the weight-write tests: engine fixtures (so `commit`
-    /// reaches VALID), a canned staking log at the staking predeploy address
-    /// (empty elsewhere) so `derive_validator_updates` produces a weight change,
-    /// `eth_chainId` / `eth_getTransactionCount` for the system-tx nonce path,
-    /// and **records** every `send_raw_transaction` so a test can assert whether
-    /// a `recordWeight` was authored.
+    /// Transport for the EL-payload weight tests: engine fixtures (so `commit`
+    /// reaches VALID) and a canned staking log at the staking predeploy address
+    /// (empty elsewhere) so `derive_validator_updates` produces a weight change
+    /// the build then carries in the next block's `registryPayload`.
     struct WeightWriteTransport {
         inner: FixtureTransport,
         staking_logs: Value,
-        sent: Arc<Mutex<Vec<Bytes>>>,
     }
     impl EngineTransport for WeightWriteTransport {
         fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
@@ -2815,31 +2293,18 @@ mod tests {
             };
             Box::pin(async move { Ok(logs) })
         }
-        fn eth_get_transaction_count(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
-            Box::pin(async move { Ok(0) })
-        }
-        fn eth_get_transaction_count_executed(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
-            // pending == executed: no in-flight registry writes (#767 gate open).
-            Box::pin(async move { Ok(0) })
-        }
-        fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
-            self.sent.lock().push(raw);
-            Box::pin(async move { Ok(Value::String(format!("0x{}", "22".repeat(32)))) })
-        }
     }
 
     fn weight_app(
         self_id: NodeId,
         staking_logs: Value,
         genesis_stake: Vec<(NodeId, u64)>,
-        sent: Arc<Mutex<Vec<Bytes>>>,
     ) -> RethApplication {
         use boule_consensus::replication::stake_source::BondedStakeLedger;
         RethApplication::new(
             Box::new(WeightWriteTransport {
                 inner: FixtureTransport,
                 staking_logs,
-                sent,
             }),
             self_id,
             FEE,
@@ -2852,170 +2317,6 @@ mod tests {
             )),
         )
     }
-
-    /// When this node is the committed block's proposer and the block carries a
-    /// seated-weight change (here a Withdraw that drops the validator to weight
-    /// 0), it authors exactly one `recordWeight(validator, newWeight)` system tx
-    /// addressed to the Registry, with the new (absolute) weight right-aligned.
-    #[tokio::test]
-    async fn proposer_commit_submits_a_recordweight_for_a_weight_change() {
-        use alloy_consensus::TxEnvelope;
-        use alloy_eips::eip2718::Decodable2718;
-
-        let self_id = [1u8; 32];
-        let node = [2u8; 32];
-        // A Withdraw of the full genesis stake (3) → weight 0 (a removal).
-        let staking_logs = serde_json::json!([{
-            "topics": [staking::WITHDRAW_TOPIC, format!("0x{}", "02".repeat(32))],
-            "data": format!("0x{:064x}", 3u64),
-        }]);
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let app = weight_app(self_id, staking_logs, vec![(node, 3u64)], Arc::clone(&sent));
-
-        let g = genesis();
-        let ctx = AppContext {
-            proposer: self_id,
-            ..Default::default()
-        };
-        // Commit above the conservative margin so the frontier advances (#767).
-        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
-        let block = app
-            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
-            .await
-            .expect("build");
-        let result = app.commit(&ctx, &block).await.expect("commit");
-        assert_eq!(
-            result.validator_updates,
-            vec![ValidatorUpdate {
-                node_id: node,
-                weight: 0,
-            }],
-            "the full Withdraw removes the validator (weight 0)",
-        );
-
-        let sent = sent.lock();
-        // recordWeight (first) + the per-commit recordSettled frontier advance.
-        assert_eq!(
-            sent.len(),
-            2,
-            "recordWeight + recordSettled system txs authored",
-        );
-        let env = TxEnvelope::decode_2718(&mut sent[0].as_ref()).expect("typed tx");
-        let tx = match &env {
-            TxEnvelope::Eip1559(s) => s.tx(),
-            other => panic!("expected EIP-1559, got {other:?}"),
-        };
-        assert_eq!(
-            tx.to,
-            alloy_primitives::TxKind::Call(registry::registry_address()),
-            "addressed to the Registry predeploy",
-        );
-        let cd = tx.input.as_ref();
-        assert_eq!(
-            &cd[0..4],
-            &registry::RECORD_WEIGHT_SELECTOR,
-            "recordWeight selector",
-        );
-        assert_eq!(&cd[4..36], &node, "validator id");
-        assert!(cd[36..68].iter().all(|b| *b == 0), "newWeight == 0 word");
-        assert_eq!(cd.len(), 4 + 32 * 2, "recordWeight has no dynamic tail");
-
-        // The trailing tx is recordSettled(view) for the committed view (#732).
-        let env2 = TxEnvelope::decode_2718(&mut sent[1].as_ref()).expect("typed tx");
-        let cd2 = match &env2 {
-            TxEnvelope::Eip1559(s) => s.tx().input.as_ref().to_vec(),
-            other => panic!("expected EIP-1559, got {other:?}"),
-        };
-        assert_eq!(
-            &cd2[0..4],
-            &registry::RECORD_SETTLED_SELECTOR,
-            "recordSettled selector",
-        );
-    }
-
-    /// A non-proposer commit computes the same weight change but writes
-    /// **nothing** — only the proposer authors the `recordWeight` tx.
-    #[tokio::test]
-    async fn non_proposer_commit_submits_no_recordweight() {
-        let self_id = [1u8; 32];
-        let node = [2u8; 32];
-        let staking_logs = serde_json::json!([{
-            "topics": [staking::WITHDRAW_TOPIC, format!("0x{}", "02".repeat(32))],
-            "data": format!("0x{:064x}", 3u64),
-        }]);
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let app = weight_app(self_id, staking_logs, vec![(node, 3u64)], Arc::clone(&sent));
-
-        let g = genesis();
-        let ctx = AppContext {
-            proposer: [9u8; 32],
-            ..Default::default()
-        };
-        let block = app
-            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
-            .await
-            .expect("build");
-        let result = app.commit(&ctx, &block).await.expect("commit");
-        assert_eq!(result.validator_updates.len(), 1, "weight change computed");
-        assert!(
-            sent.lock().is_empty(),
-            "a non-proposer must not author a recordWeight",
-        );
-    }
-
-    /// A commit with no seated-weight change and no rotation authors no
-    /// `recordWeight`/`recordKey` — but the proposer still advances the settled
-    /// frontier every commit, so the one and only system tx is `recordSettled`.
-    #[tokio::test]
-    async fn proposer_commit_with_no_change_writes_only_record_settled() {
-        use alloy_consensus::TxEnvelope;
-        use alloy_eips::eip2718::Decodable2718;
-
-        let self_id = [1u8; 32];
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        // No staking logs ⇒ no weight delta; no rotation logs ⇒ no recordKey.
-        let app = weight_app(self_id, Value::Array(Vec::new()), vec![], Arc::clone(&sent));
-
-        let g = genesis();
-        let ctx = AppContext {
-            proposer: self_id,
-            ..Default::default()
-        };
-        // Above the conservative margin so the frontier advance fires (#767).
-        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
-        let block = app
-            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
-            .await
-            .expect("build");
-        let result = app.commit(&ctx, &block).await.expect("commit");
-        assert!(result.validator_updates.is_empty(), "no weight change");
-
-        let sent = sent.lock();
-        assert_eq!(
-            sent.len(),
-            1,
-            "only the per-commit recordSettled frontier advance",
-        );
-        let env = TxEnvelope::decode_2718(&mut sent[0].as_ref()).expect("typed tx");
-        let cd = match &env {
-            TxEnvelope::Eip1559(s) => s.tx().input.as_ref().to_vec(),
-            other => panic!("expected EIP-1559, got {other:?}"),
-        };
-        assert_eq!(
-            &cd[0..4],
-            &registry::RECORD_SETTLED_SELECTOR,
-            "the lone system tx is recordSettled",
-        );
-        let want = registry::conservative_settled_view(block.header.view).0;
-        let mut view_word = [0u8; 32];
-        view_word[24..].copy_from_slice(&want.to_be_bytes());
-        assert_eq!(
-            &cd[4..36],
-            &view_word,
-            "recordSettled(committed_view - SETTLED_VIEW_MARGIN)",
-        );
-    }
-
     // ── #791 Part B: seated weights flow through the EL `extra_data` ─────────
 
     /// A seated-weight change committed in block N is **staged** and carried in
@@ -3031,8 +2332,7 @@ mod tests {
             "topics": [staking::WITHDRAW_TOPIC, format!("0x{}", "02".repeat(32))],
             "data": format!("0x{:064x}", 3u64),
         }]);
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let app = weight_app(self_id, staking_logs, vec![(node, 3u64)], Arc::clone(&sent));
+        let app = weight_app(self_id, staking_logs, vec![(node, 3u64)]);
 
         let g = genesis();
         let ctx = AppContext {
@@ -3070,12 +2370,7 @@ mod tests {
     fn reconcile_drops_only_the_weights_a_committed_block_mirrored() {
         let self_id = [1u8; 32];
         let kept = [7u8; 32];
-        let app = weight_app(
-            self_id,
-            Value::Array(Vec::new()),
-            vec![],
-            Arc::new(Mutex::new(Vec::new())),
-        );
+        let app = weight_app(self_id, Value::Array(Vec::new()), vec![]);
         // Stage two pending deltas as if two prior blocks produced them.
         {
             let mut p = app.pending_weights.lock();
@@ -3100,106 +2395,5 @@ mod tests {
         let p = app.pending_weights.lock();
         assert_eq!(p.get(&[2u8; 32]), None, "mirrored delta dropped");
         assert_eq!(p.get(&kept), Some(&5), "un-mirrored delta retained");
-    }
-
-    /// #767 — below the conservative margin nothing is settleable, so the
-    /// proposer authors **no** recordSettled (the frontier stays at the genesis
-    /// 0). A commit at view 1 (< SETTLED_VIEW_MARGIN) writes nothing.
-    #[tokio::test]
-    async fn proposer_commit_below_margin_writes_no_record_settled() {
-        let self_id = [1u8; 32];
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let app = weight_app(self_id, Value::Array(Vec::new()), vec![], Arc::clone(&sent));
-
-        let g = genesis();
-        let ctx = AppContext {
-            proposer: self_id,
-            ..Default::default()
-        };
-        // View 1 is below the margin → conservative_settled_view == 0 → skipped.
-        let block = app
-            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
-            .await
-            .expect("build");
-        app.commit(&ctx, &block).await.expect("commit");
-        assert!(
-            sent.lock().is_empty(),
-            "no recordSettled below the conservative margin",
-        );
-    }
-
-    /// #767 execution gate — when the system account has **in-flight** registry
-    /// writes (its pending nonce is ahead of its executed nonce), the proposer
-    /// holds the settled frontier and authors no recordSettled, even above the
-    /// margin: advancing then could leave `keyAt` stale for a not-yet-executed
-    /// `recordKey`.
-    #[tokio::test]
-    async fn proposer_holds_settled_frontier_while_writes_in_flight() {
-        let self_id = [1u8; 32];
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let app = RethApplication::new(
-            Box::new(InFlightWritesTransport {
-                inner: FixtureTransport,
-                sent: Arc::clone(&sent),
-            }),
-            self_id,
-            FEE,
-            RETH_GENESIS,
-            [0u8; 32],
-            Duration::ZERO,
-            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
-            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
-                64,
-            )),
-        );
-
-        let g = genesis();
-        let ctx = AppContext {
-            proposer: self_id,
-            ..Default::default()
-        };
-        // Above the margin, so only the execution gate can hold the advance.
-        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
-        let block = app
-            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
-            .await
-            .expect("build");
-        app.commit(&ctx, &block).await.expect("commit");
-        assert!(
-            sent.lock().is_empty(),
-            "recordSettled held while system-account writes are still pending (#767)",
-        );
-    }
-
-    /// Transport modelling a system account with an in-flight registry write:
-    /// `pending` nonce (5) is ahead of the `latest`/executed nonce (3). No
-    /// staking/rotation logs, so the only thing a proposer commit could write is
-    /// recordSettled — which the #767 execution gate must hold.
-    struct InFlightWritesTransport {
-        inner: FixtureTransport,
-        sent: Arc<Mutex<Vec<Bytes>>>,
-    }
-    impl EngineTransport for InFlightWritesTransport {
-        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
-            self.inner.call(method, params, tag)
-        }
-        fn eth_rpc(&self, method: &str, _params: Value) -> BoxFuture<'_, Result<Value>> {
-            if method == "eth_chainId" {
-                return Box::pin(async move { Ok(Value::String("0x539".into())) });
-            }
-            Box::pin(async move { Ok(Value::Array(Vec::new())) })
-        }
-        fn eth_get_transaction_count(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
-            Box::pin(async move { Ok(5) }) // pending ahead of executed
-        }
-        fn eth_get_transaction_count_executed(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
-            Box::pin(async move { Ok(3) }) // executed lags pending → writes in flight
-        }
-        fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
-            // Record so an accidental recordSettled submission is observable
-            // (the test asserts none is authored while writes are in flight).
-            self.sent.lock().push(raw);
-            Box::pin(async move { Ok(Value::String(format!("0x{}", "33".repeat(32)))) })
-        }
     }
 }

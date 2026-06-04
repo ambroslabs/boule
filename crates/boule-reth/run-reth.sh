@@ -4,21 +4,28 @@
 # block production (boule drives it via the Engine API).
 #
 # Two backends, selected by EL=:
-#   EL=stock  (default) — stock `reth` v2.2.0+ on PATH. The tx-write path (#732)
-#                         records the Registry via signed system txs.
-#   EL=custom           — the A1 custom node `boule-reth-node` (#777/#781), which
+#   EL=custom (default) — the A1 custom node `boule-reth-node` (#777/#781), which
 #                         applies recordKey/recordWeight/recordSettled as system
 #                         calls from the per-block `registryPayload` attribute
 #                         (EL-applied writes; no tx). Built from the standalone
-#                         `crates/boule-reth-node` workspace. The boule node must
-#                         send the custom `registryPayload` build attribute —
-#                         see RethEngine::build_block (#781).
+#                         `crates/boule-reth-node` workspace. The boule node sends
+#                         the custom `registryPayload` build attribute — see
+#                         RethEngine::build_block (#781). This is the SOLE
+#                         registry write path since A1 Phase 3 (#783) retired the
+#                         proposer-signed transaction write path, so the custom EL
+#                         is the default backend.
+#   EL=stock            — stock `reth` v2.2.0+ on PATH. Drives EVM execution, but
+#                         being unmodified it does NOT apply the registry system
+#                         calls — so on a stock EL the Registry (keyAt/weightOf/
+#                         settledView) stays at its genesis seed. Use only for a
+#                         plain EVM smoke test, not the validator-registry path.
 #
-# Requires reth v2.2.0+ on PATH (v2.2.0 activates Prague — validated). Generates
-# jwt.hex and genesis.json on first run.
+# Requires reth v2.2.0+ on PATH (v2.2.0 activates Prague — validated; also the
+# binary the custom EL is pinned to). Generates jwt.hex and genesis.json on first
+# run.
 set -euo pipefail
 
-EL="${EL:-stock}"
+EL="${EL:-custom}"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 DATADIR="${DATADIR:-/tmp/reth-boule-data}"
