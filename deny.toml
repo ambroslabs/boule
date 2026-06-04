@@ -4,6 +4,13 @@ all-features = false
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # `paste` (proc-macro, pulled in transitively by alloy-primitives) is
+    # flagged unmaintained, not vulnerable — a build-time token-pasting macro
+    # with no runtime surface. No maintained drop-in replacement is wired
+    # through the alloy stack yet, so accept it until alloy drops it.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
@@ -16,6 +23,9 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "CC0-1.0",
+    # `foldhash` (via alloy-primitives' hash maps) is Zlib — an OSI-approved,
+    # FSF-free permissive license.
+    "Zlib",
 ]
 
 [sources]

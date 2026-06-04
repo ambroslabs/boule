@@ -41,6 +41,7 @@ pub mod registry;
 pub mod rotation;
 pub mod slashing;
 pub mod staking;
+pub mod system_account;
 pub mod transport;
 
 pub use application::RethApplication;

@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::transport::EngineTransport;
-use crate::{endpoint, governance, param, rotation, slashing, staking};
+use crate::{endpoint, governance, param, rotation, slashing, staking, system_account};
 
 /// Max boule system txs to pull from the mempool into one proposal. Only a
 /// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
@@ -403,6 +403,60 @@ impl RethApplication {
                 Ok((hash, ts))
             }
         }
+    }
+
+    /// The EVM chain id, read once from reth (`eth_chainId`). Needed to bind a
+    /// system tx's signature to this deployment's chain (EIP-155 replay
+    /// protection). Reading it from reth (rather than threading the genesis
+    /// `chainId` through) keeps the system-tx path self-contained.
+    async fn evm_chain_id(&self) -> Result<u64> {
+        let result = self
+            .transport
+            .eth_rpc("eth_chainId", Value::Null)
+            .await
+            .context("querying reth chain id")?;
+        let hex = result
+            .as_str()
+            .context("eth_chainId result is a hex quantity")?;
+        u64::from_str_radix(hex.trim_start_matches("0x"), 16).context("eth_chainId result not hex")
+    }
+
+    /// Build, sign, and submit a system EVM transaction calling `(to,
+    /// calldata)` from the system account ([`crate::system_account`]) — the
+    /// #732 registry write path's submission primitive. Fetches the EVM chain
+    /// id and the system account's pending nonce via the transport, signs an
+    /// EIP-1559 tx, and pushes it to reth's pool with `eth_sendRawTransaction`,
+    /// returning the transaction hash.
+    ///
+    /// This is the *capability* only: callers (e.g. recording a rotated key via
+    /// `Registry.recordKey`) are a follow-up, as is access control on the
+    /// `recordKey` side. See the module-level MVP caveat in
+    /// [`crate::system_account`].
+    pub async fn submit_system_call(
+        &self,
+        to: alloy_primitives::Address,
+        calldata: alloy_primitives::Bytes,
+    ) -> Result<String> {
+        let chain_id = self.evm_chain_id().await?;
+        let nonce = self
+            .transport
+            .eth_get_transaction_count(system_account::SYSTEM_ACCOUNT_ADDRESS)
+            .await
+            .context("fetching the system account's pending nonce")?;
+        let raw = system_account::build_system_call(chain_id, nonce, to, calldata)
+            .context("building the signed system tx")?;
+        let result = self
+            .transport
+            // `build_system_call` returns alloy's `Bytes`; the transport takes
+            // the workspace's `bytes::Bytes` — convert at the seam.
+            .send_raw_transaction(raw.0)
+            .await
+            .context("submitting the system tx")?;
+        let hash = result
+            .as_str()
+            .context("eth_sendRawTransaction returns the tx hash")?
+            .to_string();
+        Ok(hash)
     }
 }
 
