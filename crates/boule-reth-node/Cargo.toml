@@ -1,0 +1,61 @@
+# boule-reth-node — the custom reth execution-layer node (Option A, #777).
+#
+# This is a STANDALONE workspace, deliberately NOT a member of boule's root
+# workspace (it is in the root `exclude` list). Rationale: it depends on
+# `reth-ethereum` (the reth SDK) via a git tag, which pulls in reth's enormous
+# dependency tree (hundreds of crates). Keeping it in its own workspace with its
+# own Cargo.lock means boule's main `cargo build` / `clippy` / `test` / `deny`
+# never compile or resolve reth — the heavy tree is fully isolated. See the PR
+# body / Phase 4 for the CI integration decision.
+#
+# Build prerequisites on a fresh box (reth's mdbx-sys runs bindgen via libclang
+# with no resource-dir headers; solc is needed if you regenerate genesis):
+#   export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/15/include"
+#   cargo build --jobs 3   # a reth-SDK binary is ~6min + a huge dep tree
+[workspace]
+resolver = "2"
+members = ["."]
+
+[package]
+name = "boule-reth-node"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Custom reth execution-layer node for boule: applies the registry writes (recordKey/recordWeight/recordSettled) as deterministic system calls at the block boundary, fed by a custom extra_data channel (Option A, #777)."
+
+[[bin]]
+name = "boule-reth-node"
+path = "src/main.rs"
+
+[dependencies]
+# reth as a LIBRARY (no source fork): pinned to the v2.2.0 tag, matching the
+# local `reth` binary (commit 88505c7) and the Phase-0 spike.
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0", features = [
+    "node",
+    "node-api",
+    "evm",
+    "cli",
+] }
+
+# Payload-builder crates the custom payload builder + engine validator need.
+# Same repo/tag as reth-ethereum (no fork): the custom builder transcribes the
+# registry payload into `extra_data` by calling `default_ethereum_payload`.
+reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0" }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0" }
+reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0" }
+
+# alloy-evm carries `EthBlockExecutionCtx` and the block-executor traits; pin to
+# the exact version reth v2.2.0 resolves (0.34.0).
+alloy-evm = "0.34.0"
+alloy-sol-types = "1.5.6"
+alloy-primitives = "1"
+# NOTE: do NOT depend on `alloy-rpc-types-engine` directly — reth v2.2.0 pins its
+# own version (2.0.5), and a second copy here causes "multiple versions of crate
+# alloy_rpc_types_engine" trait mismatches. We use reth's re-export
+# (`reth_ethereum::rpc::types::engine`) so it is the SAME crate instance.
+
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
+eyre = "0.6"

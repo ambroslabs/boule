@@ -1,0 +1,268 @@
+//! The custom `ConfigureEvm` + `BlockExecutor` that applies boule's registry
+//! writes as **system calls** at the block boundary.
+//!
+//! Adapted from the Phase-0 spike (`~/code/reth-a1-spike/.../boule-a1-spike`)
+//! and reth's `examples/custom-beacon-withdrawals`. The Phase-0 spike applied a
+//! single `recordSettled`; this applies the full `(keys, weights, settledView)`
+//! decoded from `extra_data` (see [`crate::registry`]).
+//!
+//! The two traits that matter, both of which build the
+//! `EthBlockExecutionCtx` the executor reads `extra_data` from:
+//! - [`ConfigureEvm`] — the **build** path (`context_for_next_block`).
+//! - [`ConfigureEngineEvm`] — the **verify** path (`context_for_payload`, run on
+//!   `newPayloadV4`). Implementing only `ConfigureEvm` is the classic trap; the
+//!   verify path is where every non-proposing replica reproduces the write.
+
+use std::{fmt::Display, sync::Arc};
+
+use alloy_evm::{
+    EthEvm, EthEvmFactory, EvmFactory,
+    block::{BlockExecutorFactory, ExecutableTx, GasOutput},
+    eth::{EthBlockExecutionCtx, EthBlockExecutor, EthTxResult},
+    precompiles::PrecompilesMap,
+};
+use reth_ethereum::{
+    Block, Receipt, TransactionSigned, TxType,
+    chainspec::ChainSpec,
+    evm::{
+        EthBlockAssembler, EthEvmConfig, RethReceiptBuilder,
+        primitives::{
+            Evm, EvmEnv, EvmEnvFor, ExecutionCtxFor, InspectorFor, NextBlockEnvAttributes,
+            OnStateHook,
+            block::StateDB,
+            execute::{BlockExecutionError, BlockExecutor, InternalBlockExecutionError},
+        },
+        revm::{DatabaseCommit, context::TxEnv, primitives::hardfork::SpecId},
+    },
+    node::api::{ConfigureEngineEvm, ConfigureEvm, ExecutableTxIterator},
+    primitives::{Header, SealedBlock, SealedHeader},
+    provider::BlockExecutionResult,
+    rpc::types::engine::ExecutionData,
+};
+
+use crate::registry::{
+    REGISTRY_ADDRESS, RegistryPayload, SYSTEM_ADDRESS, record_key_calldata,
+    record_settled_calldata, record_weight_calldata,
+};
+
+/// The custom EVM config: delegates everything to the stock Ethereum config
+/// except that it wraps each block executor to apply the registry writes.
+#[derive(Debug, Clone)]
+pub struct CustomEvmConfig {
+    inner: EthEvmConfig,
+}
+
+impl CustomEvmConfig {
+    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        Self {
+            inner: EthEvmConfig::new(chain_spec),
+        }
+    }
+}
+
+impl BlockExecutorFactory for CustomEvmConfig {
+    type EvmFactory = EthEvmFactory;
+    type ExecutionCtx<'a> = EthBlockExecutionCtx<'a>;
+    type Transaction = TransactionSigned;
+    type Receipt = Receipt;
+    type TxExecutionResult = EthTxResult<<EthEvmFactory as EvmFactory>::HaltReason, TxType>;
+    type Executor<'a, DB: StateDB, I: InspectorFor<Self, DB>> =
+        CustomBlockExecutor<'a, EthEvm<DB, I, PrecompilesMap>>;
+
+    fn evm_factory(&self) -> &Self::EvmFactory {
+        self.inner.evm_factory()
+    }
+
+    fn create_executor<'a, DB, I>(
+        &'a self,
+        evm: EthEvm<DB, I, PrecompilesMap>,
+        ctx: EthBlockExecutionCtx<'a>,
+    ) -> Self::Executor<'a, DB, I>
+    where
+        DB: StateDB,
+        I: InspectorFor<Self, DB>,
+    {
+        // Decode the registry payload from the SAME `extra_data` on both the
+        // build path (`context_for_next_block`) and the verify path
+        // (`context_for_payload`) — this is the determinism guarantee.
+        let payload = RegistryPayload::decode(ctx.extra_data.as_ref());
+        CustomBlockExecutor {
+            payload,
+            inner: EthBlockExecutor::new(
+                evm,
+                ctx,
+                self.inner.chain_spec(),
+                self.inner.executor_factory.receipt_builder(),
+            ),
+        }
+    }
+}
+
+impl ConfigureEvm for CustomEvmConfig {
+    type Primitives = <EthEvmConfig as ConfigureEvm>::Primitives;
+    type Error = <EthEvmConfig as ConfigureEvm>::Error;
+    type NextBlockEnvCtx = <EthEvmConfig as ConfigureEvm>::NextBlockEnvCtx;
+    type BlockExecutorFactory = Self;
+    type BlockAssembler = EthBlockAssembler<ChainSpec>;
+
+    fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
+        self
+    }
+
+    fn block_assembler(&self) -> &Self::BlockAssembler {
+        self.inner.block_assembler()
+    }
+
+    fn evm_env(&self, header: &Header) -> Result<EvmEnv<SpecId>, Self::Error> {
+        self.inner.evm_env(header)
+    }
+
+    fn next_evm_env(
+        &self,
+        parent: &Header,
+        attributes: &NextBlockEnvAttributes,
+    ) -> Result<EvmEnv<SpecId>, Self::Error> {
+        self.inner.next_evm_env(parent, attributes)
+    }
+
+    fn context_for_block<'a>(
+        &self,
+        block: &'a SealedBlock<Block>,
+    ) -> Result<EthBlockExecutionCtx<'a>, Self::Error> {
+        self.inner.context_for_block(block)
+    }
+
+    fn context_for_next_block(
+        &self,
+        parent: &SealedHeader,
+        attributes: Self::NextBlockEnvCtx,
+    ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
+        self.inner.context_for_next_block(parent, attributes)
+    }
+}
+
+impl ConfigureEngineEvm<ExecutionData> for CustomEvmConfig {
+    fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
+        self.inner.evm_env_for_payload(payload)
+    }
+
+    fn context_for_payload<'a>(
+        &self,
+        payload: &'a ExecutionData,
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+        // Sources `extra_data` straight from the SEALED block — the same bytes
+        // the build path wrote — so the executor decodes the identical payload.
+        self.inner.context_for_payload(payload)
+    }
+
+    fn tx_iterator_for_payload(
+        &self,
+        payload: &ExecutionData,
+    ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        self.inner.tx_iterator_for_payload(payload)
+    }
+}
+
+/// The per-block executor: applies the registry writes pre-execution, then
+/// delegates the tx loop and finalization to the stock Ethereum executor.
+pub struct CustomBlockExecutor<'a, Evm> {
+    /// Registry writes decoded from `extra_data` (`None` for a non-boule block).
+    payload: Option<RegistryPayload>,
+    inner: EthBlockExecutor<'a, Evm, &'a Arc<ChainSpec>, &'a RethReceiptBuilder>,
+}
+
+impl<E> BlockExecutor for CustomBlockExecutor<'_, E>
+where
+    E: Evm<DB: StateDB, Tx = TxEnv>,
+{
+    type Transaction = TransactionSigned;
+    type Receipt = Receipt;
+    type Evm = E;
+    type Result = EthTxResult<E::HaltReason, TxType>;
+
+    fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
+        // Apply registry writes PRE-execution (the EIP-4788 slot): they are pure
+        // consensus-derived mirrors, independent of the block's transactions.
+        // Apply order is fixed (keys, then weights, then settled) and identical
+        // on every replica, so the resulting state is byte-identical.
+        if let Some(payload) = self.payload.take() {
+            apply_registry_writes(&payload, self.inner.evm_mut())?;
+        }
+        self.inner.apply_pre_execution_changes()
+    }
+
+    fn receipts(&self) -> &[Self::Receipt] {
+        self.inner.receipts()
+    }
+
+    fn execute_transaction_without_commit(
+        &mut self,
+        tx: impl ExecutableTx<Self>,
+    ) -> Result<Self::Result, BlockExecutionError> {
+        self.inner.execute_transaction_without_commit(tx)
+    }
+
+    fn commit_transaction(&mut self, output: Self::Result) -> GasOutput {
+        self.inner.commit_transaction(output)
+    }
+
+    fn finish(self) -> Result<(Self::Evm, BlockExecutionResult<Receipt>), BlockExecutionError> {
+        self.inner.finish()
+    }
+
+    fn set_state_hook(&mut self, hook: Option<Box<dyn OnStateHook>>) {
+        self.inner.set_state_hook(hook)
+    }
+
+    fn evm_mut(&mut self) -> &mut Self::Evm {
+        self.inner.evm_mut()
+    }
+
+    fn evm(&self) -> &Self::Evm {
+        self.inner.evm()
+    }
+}
+
+/// Apply the full registry write set as `SYSTEM`-caller system calls to the
+/// Registry predeploy: every `recordKey`, then every `recordWeight`, then
+/// `recordSettled` if present. Each is structurally identical to reth's
+/// EIP-4788/withdrawals system calls.
+pub fn apply_registry_writes(
+    payload: &RegistryPayload,
+    evm: &mut impl Evm<Error: Display, DB: DatabaseCommit>,
+) -> Result<(), BlockExecutionError> {
+    for k in &payload.keys {
+        system_call(evm, record_key_calldata(k), "recordKey")?;
+    }
+    for w in &payload.weights {
+        system_call(evm, record_weight_calldata(w), "recordWeight")?;
+    }
+    if let Some(view) = payload.settled_view {
+        system_call(evm, record_settled_calldata(view), "recordSettled")?;
+    }
+    Ok(())
+}
+
+/// Run one `SYSTEM_ADDRESS -> REGISTRY_ADDRESS` system call and commit its state
+/// delta, scrubbing the transient system-caller account so it does not perturb
+/// the state root (the same hygiene reth's withdrawals example performs).
+fn system_call(
+    evm: &mut impl Evm<Error: Display, DB: DatabaseCommit>,
+    calldata: Vec<u8>,
+    what: &str,
+) -> Result<(), BlockExecutionError> {
+    let mut state =
+        match evm.transact_system_call(SYSTEM_ADDRESS, REGISTRY_ADDRESS, calldata.into()) {
+            Ok(res) => res.state,
+            Err(e) => {
+                return Err(BlockExecutionError::Internal(
+                    InternalBlockExecutionError::Other(
+                        format!("{what} system call reverted: {e}").into(),
+                    ),
+                ));
+            }
+        };
+    state.remove(&SYSTEM_ADDRESS);
+    evm.db_mut().commit(state);
+    Ok(())
+}
