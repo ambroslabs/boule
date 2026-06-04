@@ -34,6 +34,7 @@ pub mod application;
 pub mod endpoint;
 pub mod engine;
 pub mod jwt;
+pub mod param;
 pub mod predeploy_log;
 pub mod rotation;
 pub mod staking;
