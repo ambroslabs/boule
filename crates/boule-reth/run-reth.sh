@@ -25,11 +25,20 @@ if [ ! -f "$DIR/genesis.json" ]; then
   (cd "$DIR/../.." && cargo build -p boule-reth >/dev/null)
 fi
 
+# Seed the genesis Registry with dev validator weights (#765) so the chain has a
+# working weighted-quorum surface (weightOf/totalWeight) from block zero — no
+# recordWeight tx. N dev validators (default 4), weights 1..=N. This wraps the
+# generated genesis.json (predeploy code) with the per-validator seed words.
+N="${N:-4}"
+SEEDED="${SEEDED:-$DIR/genesis.seeded.json}"
+echo "seeding genesis Registry with $N dev validator weights -> $SEEDED"
+(cd "$DIR/../.." && cargo run -q -p boule-reth --bin gen-genesis -- "$N" "$SEEDED")
+
 # Fresh datadir each run keeps the spike reproducible (genesis at height 0).
 rm -rf "$DATADIR"
 
 exec reth node \
-  --chain "$DIR/genesis.json" \
+  --chain "$SEEDED" \
   --datadir "$DATADIR" \
   --authrpc.addr 127.0.0.1 --authrpc.port 8551 --authrpc.jwtsecret "$JWT" \
   --http --http.addr 127.0.0.1 --http.port 8545 \
