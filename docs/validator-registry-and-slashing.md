@@ -115,6 +115,65 @@ rejects (the watcher resubmits once it settles). This is exactly the boundary
 #726 names: **historical key state is settled, so verification can move to the
 EL; only the live path can't.**
 
+## The EL-lag invariant (#767) — why the frontier is conservative
+
+The settled-frontier gate is only safe if, by the time `settledView` reaches a
+view `V`, **every rotation with `vEff <= V` has executed in EVM state** (so
+`keyAt(validator, V)` returns the post-rotation key). The first cut (#732)
+advanced `settledView` to the *bare committed view* `C` each commit, arguing it
+was **exact**: every rotation is future-dated (`vEff >= commit_view +
+MIN_V_EFF_DELAY`), so a rotation effective at `V` was *committed* at a view
+strictly before `V`, hence "already recorded" by the time `C >= V` commits.
+
+**That argument has a hole.** "Recorded" means *executed in EVM state*, but the
+`recordKey` that records a rotation is an **async system transaction**: the
+proposer submits it to reth's pool at commit, and it executes some blocks later
+(the #674 EL self-sync lag). Worse, `recordSettled(C)` is the *same* kind of
+lagged tx, and three independent effects break any "it's already recorded"
+guarantee:
+
+1. **Cross-proposer nonce races.** The `recordKey` for a rotation with `vEff = V`
+   is submitted by the proposer of the *earlier* view where it committed;
+   `recordSettled(V)` (eventually) by a *later* view's proposer. Both write the
+   **shared** system account, each fetching its `pending` nonce independently.
+   Nothing forces the earlier `recordKey` to take a lower nonce — or to land in
+   an earlier EVM block — than the later `recordSettled`. A slow or partitioned
+   earlier proposer can leave its `recordKey` pending while `recordSettled`
+   executes.
+2. **Dropped / never-confirmed writes.** Submissions log on failure and rely on
+   idempotent resubmission "next time", but the original `recordSettled` advanced
+   *unconditionally*, so a dropped `recordKey` did not hold the frontier back.
+3. **`recordSettled` is itself lagged**, so even a single honest proposer's
+   "`recordKey` then `recordSettled`" ordering only holds *within its own nonce
+   stream* — not across the rotation's originating proposer.
+
+In all three the precompile could read a **stale pre-rotation key** at the
+frontier and verify a proof against the wrong key — slashing the wrong
+signature. A fixed view-margin alone cannot fix this (the async lag is unbounded
+under failures), so #767 makes the frontier conservative on **two** axes,
+preferring a false-negative (the watcher resubmits once it settles) over ever
+slashing on a stale key:
+
+- **Execution confirmation (the load-bearing gate).** The proposer advances the
+  frontier only once the system account has **no in-flight registry writes** —
+  its `latest` (executed) nonce has caught up to its `pending` nonce. Because the
+  system account is shared, this is a *global* check: if *any* proposer's
+  `recordKey` is still pending, every proposer holds the frontier. So
+  `settledView` never moves past a view whose `recordKey` has not executed,
+  closing all three races by construction. (`RethApplication::record_settled_view`
+  → `system_account_writes_settled`.)
+- **A view margin (defense-in-depth).** Even with the gate, the proposer targets
+  `committed_view − SETTLED_VIEW_MARGIN` (`registry::SETTLED_VIEW_MARGIN`), held
+  `>= MIN_V_EFF_DELAY` views behind the committed view. The
+  `settled_view_margin_clears_v_eff_delay` unit test is **load-bearing**: it
+  fails the build if `SETTLED_VIEW_MARGIN` is ever set below `MIN_V_EFF_DELAY`
+  (`crate::reconfig`), the exact invariant #767 asks to assert — a rotation
+  effective at the frontier was committed at least that many views earlier, so
+  its `recordKey` has had ample committed views to clear.
+
+`recordSettled` still clamps monotonically and is idempotent, so a held commit
+simply re-advances the frontier on a later commit once the writes execute.
+
 ## (b) The slashing precompile (what (a) enables)
 
 A `Slashing` predeploy, on a **Prague** chain (so EIP-2537 BLS12-381 precompiles
@@ -308,17 +367,13 @@ at/below `settledFrontier`.
 - **Storage layout for a dynamic per-validator history** in Solidity storage
   (mapping of validator → dynamic array) and its genesis pre-population — the
   genesis-storage encoding is the fiddliest part.
-- **`settledFrontier` derivation in-EVM** — *resolved (#732).* The registry
-  holds an explicit `settledView` checkpoint (slot 3), advanced by the proposer
-  each commit via the WRITER-gated `recordSettled(viewNum)` with the
-  just-committed view; `Slashing.submitEquivocation` reverts (`"view not
-  settled"`) unless `view <= settledView`. It is **exact, not conservative**:
-  every rotation is future-dated (`vEff > commitView`, `V_EFF_MIN_DELAY >= 2`),
-  so a rotation effective at view `V` was committed — and therefore recorded —
-  at a view strictly before `V`; once view `C` commits, every rotation with
-  `vEff <= C` is already recorded, making `C` the highest fully-recorded view.
-  (The committed-block-height = executed-view 1:1 mapping, #674, is what lets the
-  proposer pass the view it just committed.)
+- **`settledFrontier` derivation in-EVM** — *resolved (#732), corrected (#767).*
+  The registry holds an explicit `settledView` checkpoint (slot 3), advanced by
+  the proposer each commit via the WRITER-gated `recordSettled(viewNum)`;
+  `Slashing.submitEquivocation` reverts (`"view not settled"`) unless
+  `view <= settledView`. It advances the frontier **conservatively**, not to the
+  bare committed view — see "The EL-lag invariant" below for why the original
+  "exact" claim was unsafe and how #767 makes it lag-free.
 - **Slash magnitude / partial slashing** — full burn (today's #658b) vs. a
   fraction; an economic-policy decision orthogonal to the mechanism.
 - **Stake reads for #729's governance tally** — the same registry should expose

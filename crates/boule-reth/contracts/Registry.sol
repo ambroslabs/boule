@@ -49,13 +49,19 @@ contract Registry {
     /// "consistency / lag contract" in
     /// `docs/validator-registry-and-slashing.md`).
     ///
-    /// The proposer advances it via [`recordSettled`] on every commit, passing
-    /// the just-committed view: because every rotation is future-dated
-    /// (`vEff > commitView`, `V_EFF_MIN_DELAY >= 2`), a rotation effective at any
-    /// view `V` was committed — and therefore recorded — at a view strictly
-    /// before `V`. So once view `C` has committed, every rotation with
-    /// `vEff <= C` is already recorded, making `C` an **exact** (not
-    /// conservative) settled frontier.
+    /// The proposer advances it via [`recordSettled`] each commit — but
+    /// **conservatively**, never to the bare committed view. A rotation's
+    /// `recordKey` write and `recordSettled` itself are both async system txs
+    /// that execute *some blocks after* their commit (the #674 EL lag), and the
+    /// shared system account is written by different proposers across views, so
+    /// there is no ordering that guarantees a view-`V` rotation's `recordKey`
+    /// executes before a later `recordSettled(V)`. Advancing to the committed
+    /// view could therefore expose a **stale** pre-rotation key at the frontier.
+    /// boule instead targets `committedView − SETTLED_VIEW_MARGIN`
+    /// (`MARGIN >= MIN_V_EFF_DELAY`) and only after confirming its system-account
+    /// registry writes have *executed* (#767, `src/registry.rs` +
+    /// `src/application.rs`). The frontier is thus lag-free by construction;
+    /// see `docs/validator-registry-and-slashing.md`, "The EL-lag invariant".
     uint64 public settledView;
 
     /// The only account allowed to call [`recordKey`]: boule's **system
@@ -141,11 +147,13 @@ contract Registry {
         return weight[validator];
     }
 
-    /// Advance the [`settledView`] frontier to `viewNum` (the just-committed
-    /// view the proposer passes each commit). Monotone non-decreasing: a
-    /// `viewNum` not greater than the current frontier is ignored (idempotent, so a
-    /// re-proposed or replayed commit is harmless), never reverting — the
-    /// proposer submits unconditionally and the contract clamps.
+    /// Advance the [`settledView`] frontier to `viewNum` (the **conservative**
+    /// settled view the proposer passes each commit — `committedView −
+    /// SETTLED_VIEW_MARGIN`, gated on executed registry writes; #767, never the
+    /// bare committed view). Monotone non-decreasing: a `viewNum` not greater
+    /// than the current frontier is ignored (idempotent, so a re-proposed or
+    /// replayed commit is harmless), never reverting — the proposer submits and
+    /// the contract clamps.
     ///
     /// **Access-controlled:** only [`WRITER`] (boule's system account) may
     /// advance the frontier — the same gate as [`recordKey`] / [`recordWeight`].

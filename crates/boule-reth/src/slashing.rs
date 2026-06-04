@@ -4,9 +4,13 @@
 //! predeploy at [`SLASHING_ADDRESS`], verifies a validator equivocation proof
 //! **in the EVM** and, on success, emits [`Slashed`](SLASHED_TOPIC). A watcher
 //! submits two `Vote`s for the same view but different blocks; the predeploy
-//! first gates on the registry's **settled frontier** (#732 — only accept a
+//! first gates on the registry's **settled frontier** (#732/#767 — only accept a
 //! proof for `view <= Registry.settledView()`, so it never verifies against a
-//! key the registry has not yet recorded; see [`SETTLED_VIEW_SELECTOR`]), then
+//! key the registry has not yet recorded *in executed EVM state*; the proposer
+//! advances that frontier conservatively, a margin behind the committed view and
+//! only once its registry writes have executed, so the gate is lag-free by
+//! construction; see [`SETTLED_VIEW_SELECTOR`] and
+//! [`registry::SETTLED_VIEW_MARGIN`](crate::registry::SETTLED_VIEW_MARGIN)), then
 //! reads the validator's BLS key from the registry (#732a `keyAt`), reconstructs
 //! both `preimage::<Vote>` signing messages, and verifies both signatures via
 //! the Prague EIP-2537 precompiles (see `contracts/BlsVerify.sol`).

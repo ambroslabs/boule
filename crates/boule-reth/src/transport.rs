@@ -53,6 +53,23 @@ pub trait EngineTransport: Send + Sync {
             bail!("eth_getTransactionCount unsupported by this transport: {address}")
         })
     }
+
+    /// The account's transaction count at the `latest` tag
+    /// (`eth_getTransactionCount`), i.e. the number of txs from `address` that
+    /// have actually **executed** in canonical state (excludes still-pending
+    /// pool txs). The settled-frontier gate (#767) reads this to confirm the
+    /// system account's registry writes have cleared the execution lag before
+    /// it advances the slashing predeploy's `settledView`: only when the
+    /// executed nonce has caught up to the pending nonce are there no
+    /// in-flight `recordKey` writes that could leave `keyAt` stale at the
+    /// frontier. The default errors; only the live [`HttpTransport`] (and test
+    /// fixtures) override it.
+    fn eth_get_transaction_count_executed(&self, address: &str) -> BoxFuture<'_, Result<u64>> {
+        let address = address.to_string();
+        Box::pin(async move {
+            bail!("eth_getTransactionCount(latest) unsupported by this transport: {address}")
+        })
+    }
 }
 
 /// Live transport over reth's two ports: authenticated Engine API (`:8551`,
@@ -142,6 +159,25 @@ impl EngineTransport for HttpTransport {
                 .context("eth_getTransactionCount result is a hex quantity")?;
             u64::from_str_radix(hex.trim_start_matches("0x"), 16)
                 .context("eth_getTransactionCount result not hex")
+        })
+    }
+
+    fn eth_get_transaction_count_executed(&self, address: &str) -> BoxFuture<'_, Result<u64>> {
+        let address = address.to_string();
+        Box::pin(async move {
+            let result = self
+                .rpc(
+                    &self.eth_url,
+                    "eth_getTransactionCount",
+                    json!([address, "latest"]),
+                    false,
+                )
+                .await?;
+            let hex = result
+                .as_str()
+                .context("eth_getTransactionCount(latest) result is a hex quantity")?;
+            u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+                .context("eth_getTransactionCount(latest) result not hex")
         })
     }
 

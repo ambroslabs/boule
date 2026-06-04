@@ -369,42 +369,119 @@ impl RethApplication {
         }
     }
 
-    /// #732 settled-frontier gate — advance the `Registry`'s `settledView` to
-    /// the just-committed `view` (`recordSettled`) so the slashing predeploy can
-    /// safely gate proofs (`view <= settledView`).
+    /// #732/#767 settled-frontier gate — **conservatively** advance the
+    /// `Registry`'s `settledView` so the slashing predeploy can safely gate
+    /// proofs (`view <= settledView`) without ever reading a key the registry
+    /// has not yet recorded in executed EVM state.
+    ///
+    /// **Why this is not `recordSettled(committed_view)`.** `keyAt(validator,
+    /// view)` is only trustworthy once *every* rotation with `vEff <= view` has
+    /// **executed** in EVM state. But a rotation's `recordKey` is an async
+    /// system tx that executes some blocks after its commit (the #674 EL
+    /// self-sync lag), and `recordSettled` is the same kind of lagged tx — and
+    /// the shared system account is written by *different* proposers across
+    /// views, so there is no nonce-ordering that guarantees a view-`V` rotation's
+    /// `recordKey` executes before a later proposer's `recordSettled(V)`.
+    /// Advancing the frontier to the bare committed view could therefore let a
+    /// slashing proof verify against a **stale** pre-rotation key. So we make the
+    /// frontier conservative on **two** independent axes (prefer a false-negative
+    /// — the watcher resubmits once it settles — over ever slashing on a stale
+    /// key; #767):
+    ///
+    /// 1. **Execution confirmation.** Advance only once this node's own pending
+    ///    registry writes have *executed*: the system account's `latest`
+    ///    (executed) nonce has caught up to its `pending` nonce, so there is no
+    ///    in-flight `recordKey` that could leave `keyAt` stale. If writes are
+    ///    still in flight, hold the frontier — a later commit re-advances it.
+    /// 2. **A view margin.** Even with (1), target
+    ///    `committed_view − `[`SETTLED_VIEW_MARGIN`] (not the committed view),
+    ///    held `>= MIN_V_EFF_DELAY` views back so a rotation effective at the
+    ///    frontier has had ample committed views for its `recordKey` to clear.
     ///
     /// **Proposer-only**, exactly like [`Self::record_rotated_keys`]: only the
     /// committed block's proposer submits the system tx. Submitted *after* this
-    /// block's `recordKey`s (the caller orders it last), so by the time the
-    /// frontier reaches a view, every rotation effective at or before it is
-    /// already recorded — making `view` an **exact** settled frontier. This is
-    /// safe because every rotation is future-dated (`vEff > commitView`,
-    /// `V_EFF_MIN_DELAY >= 2`): a rotation effective at view `V` was committed,
-    /// and therefore recorded, at a view strictly before `V`.
+    /// block's `recordKey`s (the caller orders it last). `recordSettled` clamps
+    /// monotonically, so a replayed/older view is a harmless no-op; a failed
+    /// submission is logged, never fatal (consensus commits regardless of the
+    /// EL, and the next commit re-advances the frontier).
     ///
-    /// `recordSettled` clamps monotonically, so a replayed/older view is a
-    /// harmless no-op; a failed submission is logged, never fatal (consensus
-    /// commits regardless of the EL, and the next commit re-advances the
-    /// frontier).
-    async fn record_settled_view(&self, view: View) {
-        let calldata = registry::record_settled_calldata(view);
+    /// [`SETTLED_VIEW_MARGIN`]: crate::registry::SETTLED_VIEW_MARGIN
+    async fn record_settled_view(&self, committed_view: View) {
+        let target = registry::conservative_settled_view(committed_view);
+        if target.0 == 0 {
+            // Below the margin: nothing is settleable yet (the genesis frontier
+            // is already 0). Skip the no-op write.
+            return;
+        }
+        // Axis 1 — execution confirmation. Only advance the frontier once this
+        // node's system-account writes have *executed* (no `recordKey` still
+        // pending in the pool), so the registry's `keyAt` is caught up to at
+        // least every rotation we have already submitted. If a registry-write tx
+        // is still in flight, hold the frontier this commit and re-advance later.
+        match self.system_account_writes_settled().await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    target: "boule::reth",
+                    target_view = target.0,
+                    "registry write: recordSettled held — system-account writes still \
+                     in flight (frontier re-advanced once they execute)",
+                );
+                return;
+            }
+            Err(e) => {
+                // Couldn't confirm execution — be conservative and hold the
+                // frontier rather than risk advancing past an unexecuted write.
+                tracing::warn!(
+                    target: "boule::reth",
+                    error = %e,
+                    target_view = target.0,
+                    "registry write: recordSettled held — could not confirm system-account \
+                     writes executed (frontier re-advanced when confirmable)",
+                );
+                return;
+            }
+        }
+        let calldata = registry::record_settled_calldata(target);
         match self
             .submit_system_call(registry::registry_address(), calldata)
             .await
         {
             Ok(hash) => tracing::info!(
                 target: "boule::reth",
-                view = view.0,
+                target_view = target.0,
+                committed_view = committed_view.0,
                 tx = %hash,
-                "registry write: submitted recordSettled (advanced settled frontier)",
+                "registry write: submitted recordSettled (advanced conservative settled frontier)",
             ),
             Err(e) => tracing::warn!(
                 target: "boule::reth",
                 error = %e,
-                view = view.0,
+                target_view = target.0,
                 "registry write: recordSettled submission failed (re-advanced next commit)",
             ),
         }
+    }
+
+    /// Whether the system account has **no in-flight** registry writes: its
+    /// executed (`latest`) nonce has caught up to its pending nonce. The
+    /// settled-frontier advance gates on this (#767) so it never moves
+    /// `settledView` past a view whose `recordKey` is still pending in the pool
+    /// (which would leave the slashing predeploy's `keyAt` stale at the
+    /// frontier). `pending == executed` means every authored `recordKey` /
+    /// `recordWeight` has already executed in canonical EVM state.
+    async fn system_account_writes_settled(&self) -> Result<bool> {
+        let pending = self
+            .transport
+            .eth_get_transaction_count(system_account::SYSTEM_ACCOUNT_ADDRESS)
+            .await
+            .context("fetching the system account's pending nonce")?;
+        let executed = self
+            .transport
+            .eth_get_transaction_count_executed(system_account::SYSTEM_ACCOUNT_ADDRESS)
+            .await
+            .context("fetching the system account's executed nonce")?;
+        Ok(executed >= pending)
     }
 
     /// This block's endpoint-predeploy effects (#731).
@@ -850,11 +927,13 @@ impl Application for RethApplication {
             // on-chain weight surface #729's tally and #746's auth read. Each
             // `validator_updates` entry is a genuine weight change (the
             // StakeSource only emits changed validators), so no redundant write.
-            // #732 settled-frontier: after mirroring this block's rotated keys,
-            // advance the Registry's `settledView` to the committed view so the
-            // slashing predeploy accepts proofs for any view at/below it
-            // (`recordSettled` last, so every recorded rotation precedes the
-            // frontier reaching its `vEff`).
+            // #732/#767 settled-frontier: after mirroring this block's rotated
+            // keys, *conservatively* advance the Registry's `settledView` (held
+            // a margin behind the committed view and gated on this node's
+            // registry writes having executed) so the slashing predeploy never
+            // accepts a proof for a view whose rotation's `recordKey` has not yet
+            // executed in EVM state (which would leave `keyAt` stale). Called
+            // last, after this block's `recordKey`s are submitted.
             if ctx.proposer == self.self_id {
                 self.record_rotated_keys(&effects).await;
                 self.record_validator_weights(&validator_updates).await;
@@ -2095,6 +2174,11 @@ mod tests {
         fn eth_get_transaction_count(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
             Box::pin(async move { Ok(0) })
         }
+        fn eth_get_transaction_count_executed(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
+            // pending == executed: no in-flight registry writes, so the
+            // settled-frontier advance is not held by the #767 execution gate.
+            Box::pin(async move { Ok(0) })
+        }
         fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
             self.sent.lock().push(raw);
             Box::pin(async move { Ok(Value::String(format!("0x{}", "11".repeat(32)))) })
@@ -2171,8 +2255,11 @@ mod tests {
             proposer: self_id,
             ..Default::default()
         };
+        // Commit at a view above the conservative margin so the settled frontier
+        // actually advances (#767): below the margin the advance is skipped.
+        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
         let block = app
-            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
             .await
             .expect("build");
         let result = app.commit(&ctx, &block).await.expect("commit");
@@ -2180,7 +2267,7 @@ mod tests {
 
         let sent = sent.lock();
         // The proposer authors two system txs: the recordKey (first) and the
-        // per-commit recordSettled frontier advance (#732, last).
+        // per-commit recordSettled frontier advance (#732/#767, last).
         assert_eq!(
             sent.len(),
             2,
@@ -2213,8 +2300,8 @@ mod tests {
         let want_key = boule_core::crypto::sig_scheme::bls_pubkey_to_eip2537_g1(&pk).unwrap();
         assert_eq!(&cd[132..132 + 128], &want_key, "EIP-2537 128-byte key");
 
-        // The second tx is recordSettled(view) for the committed view (1),
-        // advancing the slashing predeploy's settled frontier (#732).
+        // The second tx is recordSettled(conservative view): the committed view
+        // less the #767 margin, not the committed view itself.
         let env2 = TxEnvelope::decode_2718(&mut sent[1].as_ref()).expect("typed tx");
         let tx2 = match &env2 {
             TxEnvelope::Eip1559(s) => s.tx(),
@@ -2231,9 +2318,14 @@ mod tests {
             &registry::RECORD_SETTLED_SELECTOR,
             "recordSettled selector",
         );
+        let want = registry::conservative_settled_view(block.header.view).0;
         let mut view_word = [0u8; 32];
-        view_word[24..].copy_from_slice(&block.header.view.0.to_be_bytes());
-        assert_eq!(&cd2[4..36], &view_word, "recordSettled(view == committed)");
+        view_word[24..].copy_from_slice(&want.to_be_bytes());
+        assert_eq!(
+            &cd2[4..36],
+            &view_word,
+            "recordSettled(committed_view - SETTLED_VIEW_MARGIN)",
+        );
     }
 
     /// A non-proposer commit reads the same rotation effect but writes **nothing**
@@ -2301,6 +2393,10 @@ mod tests {
         fn eth_get_transaction_count(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
             Box::pin(async move { Ok(0) })
         }
+        fn eth_get_transaction_count_executed(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
+            // pending == executed: no in-flight registry writes (#767 gate open).
+            Box::pin(async move { Ok(0) })
+        }
         fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
             self.sent.lock().push(raw);
             Box::pin(async move { Ok(Value::String(format!("0x{}", "22".repeat(32)))) })
@@ -2356,8 +2452,10 @@ mod tests {
             proposer: self_id,
             ..Default::default()
         };
+        // Commit above the conservative margin so the frontier advances (#767).
+        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
         let block = app
-            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
             .await
             .expect("build");
         let result = app.commit(&ctx, &block).await.expect("commit");
@@ -2458,8 +2556,10 @@ mod tests {
             proposer: self_id,
             ..Default::default()
         };
+        // Above the conservative margin so the frontier advance fires (#767).
+        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
         let block = app
-            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
             .await
             .expect("build");
         let result = app.commit(&ctx, &block).await.expect("commit");
@@ -2481,8 +2581,114 @@ mod tests {
             &registry::RECORD_SETTLED_SELECTOR,
             "the lone system tx is recordSettled",
         );
+        let want = registry::conservative_settled_view(block.header.view).0;
         let mut view_word = [0u8; 32];
-        view_word[24..].copy_from_slice(&block.header.view.0.to_be_bytes());
-        assert_eq!(&cd[4..36], &view_word, "recordSettled(view == committed)");
+        view_word[24..].copy_from_slice(&want.to_be_bytes());
+        assert_eq!(
+            &cd[4..36],
+            &view_word,
+            "recordSettled(committed_view - SETTLED_VIEW_MARGIN)",
+        );
+    }
+
+    /// #767 — below the conservative margin nothing is settleable, so the
+    /// proposer authors **no** recordSettled (the frontier stays at the genesis
+    /// 0). A commit at view 1 (< SETTLED_VIEW_MARGIN) writes nothing.
+    #[tokio::test]
+    async fn proposer_commit_below_margin_writes_no_record_settled() {
+        let self_id = [1u8; 32];
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let app = weight_app(self_id, Value::Array(Vec::new()), vec![], Arc::clone(&sent));
+
+        let g = genesis();
+        let ctx = AppContext {
+            proposer: self_id,
+            ..Default::default()
+        };
+        // View 1 is below the margin → conservative_settled_view == 0 → skipped.
+        let block = app
+            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        app.commit(&ctx, &block).await.expect("commit");
+        assert!(
+            sent.lock().is_empty(),
+            "no recordSettled below the conservative margin",
+        );
+    }
+
+    /// #767 execution gate — when the system account has **in-flight** registry
+    /// writes (its pending nonce is ahead of its executed nonce), the proposer
+    /// holds the settled frontier and authors no recordSettled, even above the
+    /// margin: advancing then could leave `keyAt` stale for a not-yet-executed
+    /// `recordKey`.
+    #[tokio::test]
+    async fn proposer_holds_settled_frontier_while_writes_in_flight() {
+        let self_id = [1u8; 32];
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let app = RethApplication::new(
+            Box::new(InFlightWritesTransport {
+                inner: FixtureTransport,
+                sent: Arc::clone(&sent),
+            }),
+            self_id,
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        );
+
+        let g = genesis();
+        let ctx = AppContext {
+            proposer: self_id,
+            ..Default::default()
+        };
+        // Above the margin, so only the execution gate can hold the advance.
+        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
+        let block = app
+            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        app.commit(&ctx, &block).await.expect("commit");
+        assert!(
+            sent.lock().is_empty(),
+            "recordSettled held while system-account writes are still pending (#767)",
+        );
+    }
+
+    /// Transport modelling a system account with an in-flight registry write:
+    /// `pending` nonce (5) is ahead of the `latest`/executed nonce (3). No
+    /// staking/rotation logs, so the only thing a proposer commit could write is
+    /// recordSettled — which the #767 execution gate must hold.
+    struct InFlightWritesTransport {
+        inner: FixtureTransport,
+        sent: Arc<Mutex<Vec<Bytes>>>,
+    }
+    impl EngineTransport for InFlightWritesTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, method: &str, _params: Value) -> BoxFuture<'_, Result<Value>> {
+            if method == "eth_chainId" {
+                return Box::pin(async move { Ok(Value::String("0x539".into())) });
+            }
+            Box::pin(async move { Ok(Value::Array(Vec::new())) })
+        }
+        fn eth_get_transaction_count(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
+            Box::pin(async move { Ok(5) }) // pending ahead of executed
+        }
+        fn eth_get_transaction_count_executed(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
+            Box::pin(async move { Ok(3) }) // executed lags pending → writes in flight
+        }
+        fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
+            // Record so an accidental recordSettled submission is observable
+            // (the test asserts none is authored while writes are in flight).
+            self.sent.lock().push(raw);
+            Box::pin(async move { Ok(Value::String(format!("0x{}", "33".repeat(32)))) })
+        }
     }
 }
