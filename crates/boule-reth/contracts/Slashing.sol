@@ -25,6 +25,8 @@ contract Slashing is BlsVerify {
     address constant REGISTRY = address(0x0000000000000000000000000000000000000B12);
     /// `keyAt(bytes32,uint64)` selector.
     bytes4 constant KEY_AT = 0x3a9e358a;
+    /// `settledView()` selector — the registry's settled-frontier getter (#732).
+    bytes4 constant SETTLED_VIEW = 0x7a686ef2;
     /// Vote signing domain tag (boule `SignedMessage` for `Vote`).
     bytes constant VOTE_DOMAIN = "boule.hotstuff.vote.v1";
     /// -G1_generator in EIP-2537 G1 form (a fixed BLS12-381 constant).
@@ -68,10 +70,21 @@ contract Slashing is BlsVerify {
         return abi.decode(r, (bytes));
     }
 
+    /// The registry's **settled frontier**: the highest view all of whose key
+    /// rotations the registry has recorded. A proof is only safe to verify when
+    /// its `view <= settledView`; at/above it `keyAt` may return a stale key
+    /// because the proposer write-path runs with execution lag.
+    function _settledView() private view returns (uint64) {
+        (bool ok, bytes memory r) = REGISTRY.staticcall(abi.encodeWithSelector(SETTLED_VIEW));
+        require(ok, "registry call failed");
+        return abi.decode(r, (uint64));
+    }
+
     /// Submit proof that `validator` double-signed at `view`: `sigA` over the
     /// vote for `blockA` and `sigB` over the vote for `blockB`, both under
     /// `chainId`. Reverts unless it is a genuine equivocation (distinct blocks,
-    /// both signatures valid under the registry key). On success emits `Slashed`.
+    /// the view is at/below the registry's settled frontier, and both signatures
+    /// valid under the registry key). On success emits `Slashed`.
     ///
     /// `chainId` is supplied by the caller; a wrong value yields a pre-image
     /// that won't verify, so it cannot forge a slash — it must be the
@@ -87,6 +100,13 @@ contract Slashing is BlsVerify {
     ) external {
         require(chainId.length == 32, "chainId");
         require(blockA != blockB, "not an equivocation: same block");
+
+        // Settled-frontier gate (#732): only accept a proof for a view the
+        // registry has fully recorded. At/above the frontier a rotation with
+        // `vEff <= view_` may still be unrecorded, so `keyAt` could return a
+        // stale key and slashing could verify wrongly — reject and let the
+        // watcher resubmit once the registry catches up.
+        require(view_ <= _settledView(), "view not settled");
 
         bytes memory key = _keyAt(validator, view_);
         require(key.length == 128, "no registry key at view");
