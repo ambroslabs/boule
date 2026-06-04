@@ -4,6 +4,9 @@
 //! predeploy at [`SLASHING_ADDRESS`], verifies a validator equivocation proof
 //! **in the EVM** and, on success, emits [`Slashed`](SLASHED_TOPIC). A watcher
 //! submits two `Vote`s for the same view but different blocks; the predeploy
+//! first gates on the registry's **settled frontier** (#732 — only accept a
+//! proof for `view <= Registry.settledView()`, so it never verifies against a
+//! key the registry has not yet recorded; see [`SETTLED_VIEW_SELECTOR`]), then
 //! reads the validator's BLS key from the registry (#732a `keyAt`), reconstructs
 //! both `preimage::<Vote>` signing messages, and verifies both signatures via
 //! the Prague EIP-2537 precompiles (see `contracts/BlsVerify.sol`).
@@ -48,6 +51,16 @@ pub const SLASHED_TOPIC: &str =
 /// `submitEquivocation(bytes32,bytes,uint64,bytes32,bytes,bytes32,bytes)` — the
 /// proof-submission entrypoint a watcher calls.
 pub const SUBMIT_EQUIVOCATION_SELECTOR: [u8; 4] = [0xa3, 0x9f, 0xe9, 0xc0];
+
+/// 4-byte selector of the registry's `settledView()` getter, which the slashing
+/// predeploy `staticcall`s to gate a proof on the **settled frontier** (#732):
+/// `submitEquivocation` reverts (`"view not settled"`) unless
+/// `view <= Registry.settledView()`, so it never verifies against a key the
+/// registry has not yet recorded. Mirrors [`registry::SETTLED_VIEW_SELECTOR`];
+/// pinned to the predeploy bytecode by the genesis test below.
+///
+/// [`registry::SETTLED_VIEW_SELECTOR`]: crate::registry::SETTLED_VIEW_SELECTOR
+pub const SETTLED_VIEW_SELECTOR: [u8; 4] = [0x7a, 0x68, 0x6e, 0xf2];
 
 /// The `eth_getLogs` filter selecting one committed block's `Slashed` events:
 /// the predeploy address, the block by hash, and the `Slashed` topic. Mirrors
@@ -129,6 +142,25 @@ mod tests {
         assert!(
             code.contains(&hex::encode(SUBMIT_EQUIVOCATION_SELECTOR)),
             "submitEquivocation selector must appear in the dispatcher",
+        );
+        // The settled-frontier gate (#732) staticcalls Registry.settledView();
+        // its selector must be embedded as the staticcall calldata constant.
+        assert!(
+            code.contains(&hex::encode(SETTLED_VIEW_SELECTOR)),
+            "settledView() selector must appear (the settled-frontier gate calls it)",
+        );
+    }
+
+    /// The Rust [`SETTLED_VIEW_SELECTOR`] mirror must equal the registry's own
+    /// `settledView()` selector — they are the same on-chain getter, so a drift
+    /// would mean the slashing gate calls a different function than the registry
+    /// exposes.
+    #[test]
+    fn settled_view_selector_matches_registry() {
+        assert_eq!(
+            SETTLED_VIEW_SELECTOR,
+            crate::registry::SETTLED_VIEW_SELECTOR,
+            "slashing's settledView selector must match the registry's",
         );
     }
 

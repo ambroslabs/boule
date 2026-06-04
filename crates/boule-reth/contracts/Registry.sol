@@ -37,6 +37,27 @@ contract Registry {
     /// (e.g. ⌊2·totalWeight/3⌋ + 1) without enumerating the validator set.
     uint64 public totalWeight;
 
+    /// The **settled frontier** (#732): the highest consensus view all of whose
+    /// key rotations the registry has fully recorded. [`keyAt`] is authoritative
+    /// for any `view <= settledView`; at/above it a rotation with
+    /// `vEff <= view` may still be unrecorded (the proposer write-path runs with
+    /// execution lag), so [`keyAt`] could return a **stale** key.
+    ///
+    /// The slashing predeploy (`Slashing.sol`) reads this and accepts an
+    /// equivocation proof for `view` only when `view <= settledView` — so it
+    /// never verifies against a key the registry has not yet caught up to (the
+    /// "consistency / lag contract" in
+    /// `docs/validator-registry-and-slashing.md`).
+    ///
+    /// The proposer advances it via [`recordSettled`] on every commit, passing
+    /// the just-committed view: because every rotation is future-dated
+    /// (`vEff > commitView`, `V_EFF_MIN_DELAY >= 2`), a rotation effective at any
+    /// view `V` was committed — and therefore recorded — at a view strictly
+    /// before `V`. So once view `C` has committed, every rotation with
+    /// `vEff <= C` is already recorded, making `C` an **exact** (not
+    /// conservative) settled frontier.
+    uint64 public settledView;
+
     /// The only account allowed to call [`recordKey`]: boule's **system
     /// account** (`SYSTEM_ACCOUNT_ADDRESS` in `src/system_account.rs`). The
     /// proposer signs every legitimate `recordKey` tx from this address (#756),
@@ -53,6 +74,9 @@ contract Registry {
     /// `validator`'s current weight was set to `newWeight` (the prior value was
     /// `oldWeight`); `totalWeight` moved by `newWeight - oldWeight`.
     event WeightRecorded(bytes32 indexed validator, uint64 oldWeight, uint64 newWeight);
+
+    /// The settled frontier advanced from `oldView` to `newView`.
+    event SettledRecorded(uint64 oldView, uint64 newView);
 
     /// Record `key` as `validator`'s BLS pubkey active from view `vEff`.
     /// Append-only; `vEff` must strictly exceed the validator's last entry, so
@@ -115,5 +139,26 @@ contract Registry {
     /// value #729's tally and #746's auth read.
     function weightOf(bytes32 validator) external view returns (uint64) {
         return weight[validator];
+    }
+
+    /// Advance the [`settledView`] frontier to `viewNum` (the just-committed
+    /// view the proposer passes each commit). Monotone non-decreasing: a
+    /// `viewNum` not greater than the current frontier is ignored (idempotent, so a
+    /// re-proposed or replayed commit is harmless), never reverting — the
+    /// proposer submits unconditionally and the contract clamps.
+    ///
+    /// **Access-controlled:** only [`WRITER`] (boule's system account) may
+    /// advance the frontier — the same gate as [`recordKey`] / [`recordWeight`].
+    /// This is essential: the frontier is the slashing predeploy's safety gate,
+    /// so an arbitrary caller advancing it past the registry's actual key
+    /// coverage would let a proof verify against a stale key.
+    function recordSettled(uint64 viewNum) external {
+        require(msg.sender == WRITER, "unauthorized");
+        if (viewNum <= settledView) {
+            return;
+        }
+        uint64 old = settledView;
+        settledView = viewNum;
+        emit SettledRecorded(old, viewNum);
     }
 }

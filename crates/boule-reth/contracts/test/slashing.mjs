@@ -51,9 +51,18 @@ const systemWallet = new ethers.Wallet(SYSTEM_PK, provider);
 const reg = new ethers.Contract(REGISTRY, [
   "function recordKey(bytes32,uint64,bytes) external",
   "function keyAt(bytes32,uint64) view returns (bytes)",
+  "function recordSettled(uint64) external",
+  "function settledView() view returns (uint64)",
 ], systemWallet);
 await (await reg.recordKey(validator, view, pubkey)).wait();
 assert(await reg.keyAt(validator, view) === pubkey, "registry keyAt == recorded pubkey");
+
+// Settled-frontier gate (#732): the slashing predeploy only accepts a proof for
+// `view <= settledView`. Advance the frontier *to exactly `view`* so the proof
+// below (at the frontier) passes, while a proof for `view + 1` (above it) is
+// rejected. recordSettled is WRITER-gated, so the SYSTEM account submits it.
+await (await reg.recordSettled(view)).wait();
+assert((await reg.settledView()) === view, "settledView advanced to the proof view");
 
 // 2. the slashing predeploy at its fixed genesis address.
 const sl = new ethers.Contract(SLASHING, [
@@ -72,6 +81,25 @@ assert(await reverts(() => sl.submitEquivocation(validator, chainId, view, block
   "same-block (not an equivocation) reverts");
 assert(await reverts(() => sl.submitEquivocation(validator, chainId, view, blockA, sigB, blockB, sigA)),
   "swapped sigs (don't match blocks) revert");
+
+// 5. settled-frontier gate (#732): a proof for a view ABOVE the frontier must
+//    revert with "view not settled" — even though the registry HAS a key there
+//    (we record one at view+1 first), proving the gate, not a missing key, is
+//    what rejects it. The watcher resubmits once recordSettled advances.
+const above = view + 1n;
+await (await reg.recordKey(validator, above, pubkey)).wait(); // key exists at view+1
+assert((await sl.submitEquivocation(validator, chainId, above, blockA, sigA, blockB, sigB)
+  .then(() => false, (e) => String(e).includes("view not settled"))),
+  "view above settledFrontier reverts with 'view not settled'");
+
+// 6. once the frontier advances to cover it, the same above-frontier view is
+//    accepted (the gate is the only thing that was blocking it).
+await (await reg.recordSettled(above)).wait();
+// NOTE: sigA/sigB are over `view`, not `above`, so this would fail signature
+// verification — we only assert the gate no longer reverts with "view not settled".
+assert(!(await sl.submitEquivocation(validator, chainId, above, blockA, sigA, blockB, sigB)
+  .then(() => false, (e) => String(e).includes("view not settled"))),
+  "after recordSettled(view+1), the frontier no longer rejects view+1");
 
 console.log("ALL SLASHING EVM TESTS PASSED");
 
