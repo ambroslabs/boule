@@ -215,7 +215,12 @@ echo "── (A) depositing stake for $NID (weight change) ──"
 reg_read "$NID_HEX" 0
 W_BEFORE=$WEIGHTOF; TW_BEFORE=$TOTALWEIGHT
 echo "   weightOf(before)=$W_BEFORE  totalWeight(before)=$TW_BEFORE"
-DEPOSIT_WEI=750000
+# Tiny (1:1 wei↔weight) so the genesis dev validators' seeded weights (Σ=10)
+# still dominate totalWeight — the part-(a) governance tally below must be able
+# to cross ⅔ on the EL-written dev weights, so totalWeight must stay < 15
+# (10*3 > totalWeight*2). The live validator's seeded consensus weight (1) plus
+# this deposit keep totalWeight at ~12.
+DEPOSIT_WEI=1
 TXH=$("$OPS" deposit "$NID_HEX" "$DEPOSIT_WEI" 2>"$WORK/dep.err")
 if [ -z "$TXH" ]; then fail "deposit: el-e2e-ops deposit failed: $(cat "$WORK/dep.err")"; else echo "   deposit tx = $TXH"; fi
 
@@ -278,6 +283,123 @@ if [ "$SV_FINAL" -gt 0 ]; then
   pass "settledView: EL-applied recordSettled advanced the frontier to $SV_FINAL"
 else
   fail "settledView: frontier never advanced (still 0)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
+# PART (a): the CONSUMERS — slashing + governance read the EL-WRITTEN registry
+# ════════════════════════════════════════════════════════════════════════════
+# These exercise the read side of A1: the registry's keyAt/weightOf were written
+# by the EL (genesis-seeded the dev validator set at vEff=0, then EL-mirrored as
+# the chain runs). We drive the Slashing and Governance predeploys against those
+# EL-written values and confirm they verify/tally correctly.
+#
+# The genesis dev validator set (gen-genesis 4): NodeId=[i+1;32], BLS key from
+# seed (i+1), weight (i+1). totalWeight base = 1+2+3+4 = 10. Their keys live in
+# the registry at vEff=0 (settled from genesis), so keyAt/weightOf below are the
+# EL-written values, not anything this script wrote.
+devnode() { python3 -c "print('0x' + ('%02x' % $1) * 32)"; }                  # [i+1;32] hex
+(cd "$ROOT" && cargo build -q -p boule-consensus --bin gen-equivocation --jobs 3)
+EQUIV="$ROOT/target/debug/gen-equivocation"
+
+echo
+echo "════════════════ PART (a.1) SLASHING vs EL-WRITTEN KEY ════════════════"
+# Slash genesis dev validator #2 (1-indexed): seed=2, NodeId=[2;32], weight 2.
+# Its BLS key is EL/genesis-written at vEff=0; settledView>=0, so a proof at
+# view 0 passes the frontier gate and verifies against the EL-written key.
+SL_SEED=2
+SL_NODE=$(devnode $SL_SEED)
+SL_VIEW=0
+echo "── (a.1) forging an equivocation for dev validator $SL_NODE (seed $SL_SEED) at view $SL_VIEW ──"
+# Confirm keyAt(validator, view) is the 128-byte EL-written key the predeploy reads.
+reg_read "$SL_NODE" "$SL_VIEW"
+echo "   EL-written keyAt($SL_NODE, $SL_VIEW) len=${KEYATLEN}B  weightOf=$WEIGHTOF"
+[ "$KEYATLEN" = 128 ] || fail "slashing: dev validator has no 128B EL-written key at view $SL_VIEW"
+
+eval "$("$EQUIV" --seed "$SL_SEED" --validator "${SL_NODE#0x}" --view "$SL_VIEW" \
+  | sed 's/^/EQ_/')"
+# EQ_VALIDATOR / EQ_CHAINID / EQ_VIEW / EQ_BLOCKA / EQ_BLOCKB / EQ_SIGA / EQ_SIGB
+echo "── (a.1) submitting submitEquivocation -> Slashing predeploy ──"
+SL_OUT=$("$OPS" submit-equivocation "$EQ_VALIDATOR" "$EQ_CHAINID" "$EQ_VIEW" \
+  "$EQ_BLOCKA" "$EQ_SIGA" "$EQ_BLOCKB" "$EQ_SIGB" 2>"$WORK/sl.err" || true)
+echo "$SL_OUT" | sed 's/^/   /'; cat "$WORK/sl.err" | sed 's/^/   (err) /'
+SL_STATUS=$(echo "$SL_OUT" | grep -oP 'STATUS=\K\d' || echo 0)
+SL_SLASHED=$(echo "$SL_OUT" | grep -oP 'SLASHED=\K\d' || echo 0)
+if [ "$SL_STATUS" = 1 ] && [ "$SL_SLASHED" = 1 ]; then
+  pass "slashing: submitEquivocation verified against the EL-written key and emitted Slashed"
+else
+  fail "slashing: expected a Slashed event (STATUS=$SL_STATUS SLASHED=$SL_SLASHED)"
+fi
+
+# settledView gate (negative): a proof for a view ABOVE the settled frontier must
+# revert ("view not settled") — even though keyAt has a key there (vEff=0 covers
+# all views), the gate, not a missing key, rejects it. Proves the EL-written
+# frontier gates slashing.
+reg_read "$SL_NODE" 0; ABOVE=$(( SETTLEDVIEW + 1000000 ))
+echo "── (a.1) settledView gate: submitting a proof ABOVE the frontier (view=$ABOVE > settledView=$SETTLEDVIEW) ──"
+eval "$("$EQUIV" --seed "$SL_SEED" --validator "${SL_NODE#0x}" --view "$ABOVE" | sed 's/^/AB_/')"
+AB_OUT=$("$OPS" submit-equivocation "$AB_VALIDATOR" "$AB_CHAINID" "$AB_VIEW" \
+  "$AB_BLOCKA" "$AB_SIGA" "$AB_BLOCKB" "$AB_SIGB" 2>/dev/null || true)
+echo "$AB_OUT" | sed 's/^/   /'
+AB_STATUS=$(echo "$AB_OUT" | grep -oP 'STATUS=\K\d' || echo 0)
+AB_SLASHED=$(echo "$AB_OUT" | grep -oP 'SLASHED=\K\d' || echo 0)
+if [ "$AB_STATUS" = 0 ] && [ "$AB_SLASHED" = 0 ]; then
+  pass "slashing settledView gate: an above-frontier proof reverted (no Slashed)"
+else
+  fail "slashing settledView gate: above-frontier proof should have reverted (STATUS=$AB_STATUS SLASHED=$AB_SLASHED)"
+fi
+
+echo
+echo "════════════════ PART (a.2) GOVERNANCE TALLIES EL WEIGHTS ════════════════"
+# Drive a BLS-signed governance approval to the ⅔ supermajority of the EL-written
+# totalWeight, using the genesis dev validators' EL-written weights AND keys.
+# We add dev validators (descending weight) until the EL-weighted tally crosses
+# ⅔, asserting Approved emits EXACTLY when weight*3 > totalWeight*2 on the
+# EL-written weights — i.e. the contract read the EL weight surface.
+reg_read "$SL_NODE" 0; TW=$TOTALWEIGHT
+echo "── EL-written totalWeight = $TW (dev base 10 + live deposit weight) ──"
+# Fresh proposalId per run; the reconfig command is opaque to the EVM. boule
+# binds proposalId = keccak256(command) (el-e2e-ops computes it).
+CMD="0x$(printf 'RECFG-a1p5-%s' "$(date +%s%N)" | xxd -p | tr -d '\n')"
+PROPID=$("$OPS" keccak256 "$CMD")
+echo "   proposalId = $PROPID  command(${#CMD} hex)"
+
+# Dev validators in DESCENDING weight: VD(4), VC(3), VB(2), VA(1).
+declare -a GV_SEED=(4 3 2 1)
+ACC=0; CROSSED=0; GOV_FAIL=0
+for s in "${GV_SEED[@]}"; do
+  node=$(devnode "$s")
+  reg_read "$node" 0; w=$WEIGHTOF
+  # The validator signs the CONTRACT's own digest (binds chainId + contract).
+  # Sign with the SAME dev-validator key the Registry holds (IKM=[seed,0,…]) via
+  # gen-equivocation --digest — NOT bls-sign, whose ikm.fill(seed) is a different
+  # key that would fail the in-EVM BlsVerify against the EL-written registry key.
+  DG=$("$OPS" gov-digest "$PROPID" "${node#0x}")
+  SIG=$("$EQUIV" --seed "$s" --digest "$DG" | grep -oP '^SIG=\K\S+')
+  out=$("$OPS" gov-approve "$PROPID" "$CMD" "${node#0x}" "0x$SIG" 2>"$WORK/gov.err" || true)
+  st=$(echo "$out" | grep -oP 'STATUS=\K\d' || echo 0)
+  appr=$(echo "$out" | grep -oP 'APPROVED=\K\d' || echo 0)
+  tally=$(echo "$out" | grep -oP 'approvals=\K\d+' || echo 0)
+  ACC=$(( ACC + w ))
+  # ⅔: weight*3 > totalWeight*2.
+  if [ $(( ACC * 3 )) -gt $(( TW * 2 )) ]; then expect_cross=1; else expect_cross=0; fi
+  echo "   approve seed=$s weight=$w -> STATUS=$st tally=$tally APPROVED=$appr (cum=$ACC, expect_crossed=$expect_cross)"
+  [ "$st" = 1 ] || { fail "governance: approve(seed=$s) tx failed: $(cat "$WORK/gov.err")"; GOV_FAIL=1; }
+  [ "$tally" = "$ACC" ] || { fail "governance: tally=$tally != cumulative EL weight $ACC (tally did not read EL weights)"; GOV_FAIL=1; }
+  if [ "$expect_cross" = 1 ] && [ "$CROSSED" = 0 ]; then
+    [ "$appr" = 1 ] && CROSSED=1 || { fail "governance: Approved did not emit at the ⅔ crossing (cum=$ACC, TW=$TW)"; GOV_FAIL=1; }
+    break
+  else
+    [ "$appr" = 0 ] || { fail "governance: Approved emitted BELOW ⅔ (cum=$ACC, TW=$TW)"; GOV_FAIL=1; }
+  fi
+done
+reg_read "$SL_NODE" 0
+GS=$("$OPS" gov-state "$PROPID")
+echo "   final gov-state: $(echo "$GS" | tr '\n' ' ')"
+GS_APPROVED=$(echo "$GS" | grep -oP 'isApproved=\K\d')
+if [ "$GOV_FAIL" = 0 ] && [ "$CROSSED" = 1 ] && [ "$GS_APPROVED" = 1 ]; then
+  pass "governance: ⅔ tally over the EL-written weights emitted Approved with the exact command"
+else
+  fail "governance: did not cross ⅔ / Approved (crossed=$CROSSED isApproved=$GS_APPROVED)"
 fi
 
 echo
