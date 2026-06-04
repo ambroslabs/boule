@@ -64,35 +64,26 @@ contract Registry {
     /// see `docs/validator-registry-and-slashing.md`, "The EL-lag invariant".
     uint64 public settledView;
 
-    /// The EOA writer: boule's **system account** (`SYSTEM_ACCOUNT_ADDRESS` in
-    /// `src/system_account.rs`). The proposer signs every `recordKey` tx from
-    /// this address (#756) on the legacy **transaction** write path. Genesis-
-    /// seeded keys are written directly into `alloc` storage, not via
-    /// `recordKey`, so they are unaffected by this gate.
-    ///
-    /// **Transitional dual-writer.** boule is moving the registry writes off the
-    /// proposer-signed tx path and onto an **EL-applied system call** (Option A,
-    /// #777/#781/#782): the custom execution layer applies `recordKey` /
-    /// `recordWeight` / `recordSettled` deterministically at the block boundary
-    /// from a `SYSTEM`-address caller (EIP-4788 style; no key, no nonce, no
-    /// proposer trust — the only way `recordWeight` is integrity-correct). Until
-    /// the legacy tx path is retired (Phase 3), BOTH callers are accepted: the
-    /// new keyless [`SYSTEM`] caller and the legacy [`WRITER`] EOA. Any other
-    /// sender reverts, so the registry stays a trustworthy slashing key-source.
-    address constant WRITER = 0x2Ae00C96484267e0ed8937426F497404A93aB526;
-
     /// The keyless **system caller** the execution layer uses for EL-applied
-    /// registry writes (Option A). Mirrors EIP-4788's system address and
+    /// registry writes (Option A, #777). Mirrors EIP-4788's system address and
     /// `SYSTEM_ADDRESS` in `boule-reth-node`'s `registry.rs`. No private key
-    /// exists for it, so only the EL itself (running an identical computation on
-    /// every replica) can write as this caller.
+    /// exists for it, so only the EL itself — running an identical computation on
+    /// every replica, applying `recordKey` / `recordWeight` / `recordSettled`
+    /// deterministically at the block boundary from the per-block
+    /// `registryPayload` (no key, no nonce, no proposer trust — the only way
+    /// `recordWeight` is integrity-correct) — can write as this caller.
+    ///
+    /// The EL is the **sole** registry writer: the legacy proposer-signed
+    /// transaction write path (a funded `WRITER` EOA) was retired in A1 Phase 3
+    /// (#783). Genesis-seeded keys/weights are written directly into `alloc`
+    /// storage, not via these functions, so they are unaffected by this gate.
     address constant SYSTEM = 0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE;
 
-    /// Reverts unless the caller is an authorized registry writer — the keyless
-    /// EL [`SYSTEM`] caller (Option A) or the legacy proposer-signed [`WRITER`]
-    /// EOA (transitional; retired in Phase 3).
+    /// Reverts unless the caller is the keyless EL [`SYSTEM`] caller (Option A) —
+    /// the sole authorized registry writer. Any other sender reverts, so the
+    /// registry stays a trustworthy slashing key-source.
     modifier onlyWriter() {
-        require(msg.sender == SYSTEM || msg.sender == WRITER, "unauthorized");
+        require(msg.sender == SYSTEM, "unauthorized");
         _;
     }
 

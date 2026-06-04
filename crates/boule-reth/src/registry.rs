@@ -26,8 +26,9 @@
 //! *past* views, but weight's consumers need the **currently seated** weight, so
 //! it is a single current value — `weightOf(validator)` plus a running
 //! `totalWeight()` accumulator (a consumer derives a quorum threshold from it
-//! without enumerating validators). [`record_weight_calldata`] encodes the
-//! WRITER-gated `recordWeight` the proposer submits on a seated-weight change.
+//! without enumerating validators). The custom EL applies `recordWeight` on a
+//! seated-weight change as a `SYSTEM`-caller system call from the per-block
+//! `registryPayload` (A1, #777/#783) — there is no proposer-signed tx write path.
 //!
 //! The contract's storage logic is exercised against a live reth (see the PR /
 //! `Registry.sol` doc): `recordKey` appends a monotone `(vEff, key)` entry and
@@ -52,8 +53,8 @@ pub const RECORD_KEY_SELECTOR: [u8; 4] = [0x82, 0x4b, 0x98, 0x02];
 /// 4-byte selector of `historyLength(bytes32)`.
 pub const HISTORY_LENGTH_SELECTOR: [u8; 4] = [0x43, 0x90, 0x58, 0x59];
 
-/// 4-byte selector of `recordWeight(bytes32,uint64)` (the WRITER-gated weight
-/// write the proposer submits on a seated-weight change, #732 step 4).
+/// 4-byte selector of `recordWeight(bytes32,uint64)` (the SYSTEM-gated weight
+/// write the custom EL applies on a seated-weight change, #732 step 4 / #783).
 pub const RECORD_WEIGHT_SELECTOR: [u8; 4] = [0x3a, 0x8d, 0xa0, 0xf9];
 
 /// 4-byte selector of `weightOf(bytes32)` (the current-weight read #729's tally
@@ -69,8 +70,8 @@ pub const TOTAL_WEIGHT_SELECTOR: [u8; 4] = [0x96, 0xc8, 0x2e, 0x57];
 /// public `settledView` scalar).
 pub const SETTLED_VIEW_SELECTOR: [u8; 4] = [0x7a, 0x68, 0x6e, 0xf2];
 
-/// 4-byte selector of `recordSettled(uint64)` (the WRITER-gated settled-frontier
-/// advance the proposer submits each commit, #732).
+/// 4-byte selector of `recordSettled(uint64)` (the SYSTEM-gated settled-frontier
+/// advance the custom EL applies each commit, #732 / #783).
 pub const RECORD_SETTLED_SELECTOR: [u8; 4] = [0x09, 0x28, 0x83, 0x44];
 
 /// `keccak256("SettledRecorded(uint64,uint64)")` — topic0 of the
@@ -104,28 +105,23 @@ const TOTAL_WEIGHT_SLOT: u64 = 2;
 #[allow(dead_code)]
 const SETTLED_VIEW_SLOT: u64 = 3;
 
-/// Conservative margin (in views) the proposer keeps between the just-committed
-/// view and the settled frontier it advances `Registry.settledView` to (#767).
+/// Conservative margin (in views) kept between the just-committed view and the
+/// settled frontier carried in the build `registryPayload` (#767).
 ///
 /// The slashing predeploy only verifies a proof for `view <= settledView`, and
 /// `keyAt(validator, view)` is trustworthy there **only if every rotation with
-/// `vEff <= view` has already executed in EVM state**. A rotation's
-/// `recordKey` tx is submitted by the proposer at commit and *executes some
-/// blocks later* (the #674 EL self-sync lag); `recordSettled` is the same kind
-/// of lagged, async system tx. So a naive `recordSettled(committed_view)` could
-/// advance the frontier to a view whose rotation's `recordKey` has not yet
-/// executed — letting a slashing proof verify against a **stale** pre-rotation
-/// key. (See `docs/validator-registry-and-slashing.md`, "The EL-lag invariant".)
-///
-/// Holding the frontier `SETTLED_VIEW_MARGIN` views behind the committed view —
-/// **on top of** the execution-confirmation gate the proposer applies before
-/// advancing — is defense-in-depth: a rotation effective at the frontier view
-/// `V` was *committed* at least [`MIN_V_EFF_DELAY`] views earlier
-/// (`vEff >= commit_view + MIN_V_EFF_DELAY`), so by the time the frontier
-/// reaches `V` its `recordKey` has had `>= MARGIN` further committed views to
-/// clear the lag. The margin is tied to `MIN_V_EFF_DELAY` by the
-/// `settled_view_margin_clears_v_eff_delay` assertion below: it must never be
-/// set below the v_eff delay, or the frontier could outrun rotation recording.
+/// `vEff <= view` has already been recorded in EVM state**. With A1 (#783) the
+/// custom EL applies a rotation's `recordKey` and the block's `recordSettled`
+/// **atomically in the same block** the rotation commits — so unlike the retired
+/// async tx path there is no execution lag to outrun. The margin nonetheless
+/// stays as harmless defense-in-depth: a rotation effective at frontier view `V`
+/// was *committed* at least [`MIN_V_EFF_DELAY`] views earlier
+/// (`vEff >= commit_view + MIN_V_EFF_DELAY`), and `settledView` only reaches `V`
+/// `MARGIN` views after `V` commits, so its `recordKey` is long applied by then.
+/// The margin is tied to `MIN_V_EFF_DELAY` by the
+/// `settled_view_margin_clears_v_eff_delay` assertion below: it must never be set
+/// below the v_eff delay, keeping the frontier conservative by construction.
+/// (See `docs/validator-registry-and-slashing.md`, "The EL-lag invariant".)
 ///
 /// [`MIN_V_EFF_DELAY`]: boule_consensus::reconfig::MIN_V_EFF_DELAY
 pub const SETTLED_VIEW_MARGIN: u64 = boule_consensus::reconfig::MIN_V_EFF_DELAY.0;
@@ -133,10 +129,10 @@ pub const SETTLED_VIEW_MARGIN: u64 = boule_consensus::reconfig::MIN_V_EFF_DELAY.
 /// **Load-bearing compile-time safety assertion (#767).** The conservative
 /// settled-view margin must never be set below the rotation `v_eff` delay
 /// ([`MIN_V_EFF_DELAY`](boule_consensus::reconfig::MIN_V_EFF_DELAY)). If it were,
-/// the proposer could advance `Registry.settledView` to a view whose rotation's
-/// `recordKey` may not yet have executed — letting the slashing predeploy verify
-/// a proof against a **stale** pre-rotation key. A change to either constant that
-/// violates the bound fails the build here, before it can ship.
+/// `Registry.settledView` could advance to a view whose rotation's `recordKey`
+/// was not yet recorded — letting the slashing predeploy verify a proof against a
+/// **stale** pre-rotation key. A change to either constant that violates the
+/// bound fails the build here, before it can ship.
 const _: () = assert!(
     SETTLED_VIEW_MARGIN >= boule_consensus::reconfig::MIN_V_EFF_DELAY.0,
     "SETTLED_VIEW_MARGIN must be >= MIN_V_EFF_DELAY so the settled frontier never \
@@ -148,20 +144,11 @@ use boule_consensus::validator_rotation::{DualSignedRotation, OperatorSignedRota
 use boule_core::crypto::sig_scheme::{BlsKeyError, BlsPublicKey, bls_pubkey_to_eip2537_g1};
 use boule_core::identity::NodeId;
 
-/// `REGISTRY_ADDRESS` as an alloy [`Address`](alloy_primitives::Address), for
-/// [`submit_system_call`] (the `to` of every `recordKey` system tx).
-///
-/// [`submit_system_call`]: crate::application::RethApplication::submit_system_call
-pub fn registry_address() -> alloy_primitives::Address {
-    REGISTRY_ADDRESS
-        .parse()
-        .expect("REGISTRY_ADDRESS is a valid 20-byte address")
-}
-
 /// The `(validator, vEff, key128)` a single `recordKey` call writes: the 32-byte
 /// on-chain validator id, the effective view, and the validator's BLS pubkey in
 /// the registry's **128-byte EIP-2537 uncompressed G1** form. Produced by
-/// [`record_key_for_rotation`], consumed by [`record_key_calldata`].
+/// [`record_key_for_rotation`], carried in the build `registryPayload` and
+/// applied by the custom EL as a `recordKey` system call (#777/#783).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordKey {
     /// The validator's stable 32-byte on-chain id (its boule [`NodeId`], used
@@ -217,77 +204,16 @@ pub fn record_key_for_rotation(cmd: &[u8]) -> anyhow::Result<Option<RecordKey>> 
     }))
 }
 
-/// ABI-encode the `recordKey(bytes32 validator, uint64 vEff, bytes key)`
-/// calldata for `rk`: the 4-byte selector followed by the ABI head/tail.
-///
-/// Layout (`recordKey(bytes32,uint64,bytes)`): `selector ‖ validator(32) ‖
-/// vEff(left-padded to 32) ‖ offset(0x60) ‖ len(0x80=128) ‖ key(128)`. The
-/// `bytes` argument is dynamic, so its data (length + payload) is appended after
-/// the three head words and the head carries the offset to it.
-pub fn record_key_calldata(rk: &RecordKey) -> alloy_primitives::Bytes {
-    let mut out = Vec::with_capacity(4 + 32 * 4 + 128);
-    out.extend_from_slice(&RECORD_KEY_SELECTOR);
-    // head[0]: validator (bytes32, already 32 bytes).
-    out.extend_from_slice(&rk.validator);
-    // head[1]: vEff (uint64), right-aligned in a 32-byte word.
-    let mut v_word = [0u8; 32];
-    v_word[24..].copy_from_slice(&rk.v_eff.0.to_be_bytes());
-    out.extend_from_slice(&v_word);
-    // head[2]: offset to the dynamic `bytes` tail = 3 words = 0x60.
-    let mut off = [0u8; 32];
-    off[31] = 0x60;
-    out.extend_from_slice(&off);
-    // tail: length (128 = 0x80) then the 128-byte key (already a multiple of 32,
-    // no padding needed).
-    let mut len = [0u8; 32];
-    len[31] = 0x80;
-    out.extend_from_slice(&len);
-    out.extend_from_slice(&rk.key128);
-    alloy_primitives::Bytes::from(out)
-}
-
-/// ABI-encode the `recordWeight(bytes32 validator, uint64 newWeight)` calldata:
-/// the 4-byte selector followed by the two static head words (`validator(32) ‖
-/// newWeight(left-padded to 32)`). Both arguments are static, so there is no
-/// dynamic tail. Mirrors [`record_key_calldata`]; consumed by the proposer
-/// write-path (`RethApplication::commit`) to mirror a seated-weight change into
-/// the `Registry` predeploy.
-pub fn record_weight_calldata(validator: &NodeId, weight: u64) -> alloy_primitives::Bytes {
-    let mut out = Vec::with_capacity(4 + 32 * 2);
-    out.extend_from_slice(&RECORD_WEIGHT_SELECTOR);
-    // head[0]: validator (bytes32, already 32 bytes).
-    out.extend_from_slice(validator);
-    // head[1]: newWeight (uint64), right-aligned in a 32-byte word.
-    let mut w_word = [0u8; 32];
-    w_word[24..].copy_from_slice(&weight.to_be_bytes());
-    out.extend_from_slice(&w_word);
-    alloy_primitives::Bytes::from(out)
-}
-
 /// The conservative settled-frontier view to advance `Registry.settledView` to
 /// at the commit of `committed_view` (#767): `committed_view −
 /// `[`SETTLED_VIEW_MARGIN`]`, saturating at view 0. Never the committed view
 /// itself — see [`SETTLED_VIEW_MARGIN`] for why the frontier is held
-/// conservatively behind the committed view rather than advanced to it (the EL
-/// execution lag).
+/// conservatively behind the committed view. The custom EL applies this view as
+/// a `recordSettled` system call from the build `registryPayload` (#783); the
+/// margin remains as harmless defense (a rotation's `recordKey` is applied in the
+/// same block it commits, well before `settledView` reaches its `vEff`).
 pub fn conservative_settled_view(committed_view: View) -> View {
     View(committed_view.0.saturating_sub(SETTLED_VIEW_MARGIN))
-}
-
-/// ABI-encode the `recordSettled(uint64 viewNum)` calldata: the 4-byte selector
-/// followed by the single left-padded `viewNum` word. The proposer submits this
-/// each commit with the conservative settled view
-/// ([`conservative_settled_view`]) to advance the registry's settled frontier
-/// (#732/#767) — the gate the slashing predeploy reads. The contract clamps
-/// monotonically, so a stale/replayed `viewNum` is a harmless no-op.
-pub fn record_settled_calldata(view: View) -> alloy_primitives::Bytes {
-    let mut out = Vec::with_capacity(4 + 32);
-    out.extend_from_slice(&RECORD_SETTLED_SELECTOR);
-    // head[0]: viewNum (uint64), right-aligned in a 32-byte word.
-    let mut v_word = [0u8; 32];
-    v_word[24..].copy_from_slice(&view.0.to_be_bytes());
-    out.extend_from_slice(&v_word);
-    alloy_primitives::Bytes::from(out)
 }
 
 /// keccak256 of `bytes`.
@@ -523,25 +449,32 @@ mod tests {
         }
     }
 
-    /// `recordKey`'s access-control gate (`require(msg.sender == WRITER)`) must
-    /// name boule's **system account** — the `from` of every legitimate
-    /// `recordKey` system tx (#756). Pins the contract's `WRITER` constant to
-    /// `SYSTEM_ACCOUNT_ADDRESS` via the generated bytecode: solc compiles the
-    /// 20-byte writer address as a PUSH20 operand, so if `WRITER` ever drifts
-    /// from the signer the proposer uses, the registry would reject every real
-    /// write and this fails.
+    /// `onlyWriter`'s access-control gate (`require(msg.sender == SYSTEM)`) must
+    /// name the keyless EL **system caller** (EIP-4788-style `0xff…fe`), the sole
+    /// authorized registry writer after A1 Phase 3 (#783). Pins the contract's
+    /// `SYSTEM` constant via the generated bytecode (solc compiles the 20-byte
+    /// address as a PUSH20 operand) AND asserts the retired legacy `WRITER` EOA
+    /// (`0x2Ae0…`) no longer appears, so the tx-write gate is genuinely gone.
     #[test]
-    fn writer_in_genesis_bytecode_is_the_system_account() {
-        use crate::system_account::SYSTEM_ACCOUNT_ADDRESS;
+    fn only_writer_gate_is_the_el_system_caller() {
+        // The keyless EL system caller (Registry.sol `SYSTEM`, EIP-4788's
+        // address). Mirrors boule_reth_node::registry::SYSTEM_ADDRESS.
+        const SYSTEM_CALLER: &str = "fffffffffffffffffffffffffffffffffffffffe";
+        // The retired legacy proposer-signed WRITER EOA (removed in #783).
+        const RETIRED_WRITER: &str = "2ae00c96484267e0ed8937426f497404a93ab526";
         let g: serde_json::Value =
             serde_json::from_str(include_str!("../genesis.json")).expect("genesis.json parses");
-        let code = g["alloc"][REGISTRY_ADDRESS]["code"].as_str().unwrap();
-        let writer = SYSTEM_ACCOUNT_ADDRESS
-            .trim_start_matches("0x")
+        let code = g["alloc"][REGISTRY_ADDRESS]["code"]
+            .as_str()
+            .unwrap()
             .to_ascii_lowercase();
         assert!(
-            code.to_ascii_lowercase().contains(&writer),
-            "the system account address must appear in recordKey's WRITER gate",
+            code.contains(SYSTEM_CALLER),
+            "the EL SYSTEM caller address must appear in onlyWriter's gate",
+        );
+        assert!(
+            !code.contains(RETIRED_WRITER),
+            "the retired legacy WRITER EOA must NOT appear — the tx-write gate is gone (#783)",
         );
     }
 
@@ -892,99 +825,6 @@ mod tests {
         assert_eq!(record_key_for_rotation(b"not-a-rotation").unwrap(), None);
     }
 
-    /// `record_key_calldata` lays out `recordKey(bytes32,uint64,bytes)` exactly:
-    /// selector, validator, left-padded vEff, the `0x60` offset to the dynamic
-    /// `bytes`, its `0x80` (128) length, then the 128-byte key. Decodes back to
-    /// the inputs.
-    #[test]
-    fn record_key_calldata_round_trips() {
-        let key128 = bls_pubkey_to_eip2537_g1(&bls_pk(0x9a)).unwrap();
-        let rk = RecordKey {
-            validator: [0xAB; 32],
-            v_eff: View::new(0x1234),
-            key128,
-        };
-        let cd = record_key_calldata(&rk);
-
-        assert_eq!(&cd[0..4], &RECORD_KEY_SELECTOR, "selector");
-        assert_eq!(&cd[4..36], &[0xAB; 32], "validator word");
-        // vEff right-aligned in head[1].
-        let mut v_word = [0u8; 32];
-        v_word[24..].copy_from_slice(&0x1234u64.to_be_bytes());
-        assert_eq!(&cd[36..68], &v_word, "vEff word");
-        // head[2]: offset to the bytes tail == 0x60.
-        assert_eq!(cd[99], 0x60, "dynamic-bytes offset");
-        assert!(cd[68..99].iter().all(|b| *b == 0), "offset high bytes zero");
-        // tail: length 0x80 (128).
-        assert_eq!(cd[131], 0x80, "key length == 128");
-        assert!(
-            cd[100..131].iter().all(|b| *b == 0),
-            "length high bytes zero"
-        );
-        // tail: the 128-byte key verbatim.
-        assert_eq!(&cd[132..132 + 128], &key128);
-        assert_eq!(cd.len(), 4 + 32 * 3 + 32 + 128, "exact calldata length");
-    }
-
-    /// `record_weight_calldata` lays out `recordWeight(bytes32,uint64)` exactly:
-    /// selector, validator, then the left-padded `newWeight` — two static head
-    /// words, no dynamic tail.
-    #[test]
-    fn record_weight_calldata_layout() {
-        let cd = record_weight_calldata(&[0xCD; 32], 0x9abc_u64);
-
-        assert_eq!(&cd[0..4], &RECORD_WEIGHT_SELECTOR, "selector");
-        assert_eq!(&cd[4..36], &[0xCD; 32], "validator word");
-        // newWeight right-aligned in head[1].
-        let mut w_word = [0u8; 32];
-        w_word[24..].copy_from_slice(&0x9abc_u64.to_be_bytes());
-        assert_eq!(&cd[36..68], &w_word, "newWeight word");
-        assert!(cd[36..60].iter().all(|b| *b == 0), "weight high bytes zero");
-        assert_eq!(
-            cd.len(),
-            4 + 32 * 2,
-            "exact calldata length (no dynamic tail)"
-        );
-    }
-
-    /// `recordWeight(validator, 0)` (a removal) still encodes a full zero weight
-    /// word — the calldata is fixed-width regardless of the value.
-    #[test]
-    fn record_weight_calldata_zero_weight() {
-        let cd = record_weight_calldata(&[0x01; 32], 0);
-        assert_eq!(&cd[0..4], &RECORD_WEIGHT_SELECTOR);
-        assert_eq!(&cd[4..36], &[0x01; 32]);
-        assert!(cd[36..68].iter().all(|b| *b == 0), "weight word all zero");
-        assert_eq!(cd.len(), 4 + 32 * 2);
-    }
-
-    /// `record_settled_calldata` lays out `recordSettled(uint64)` exactly:
-    /// selector then the single left-padded `viewNum` word.
-    #[test]
-    fn record_settled_calldata_layout() {
-        let cd = record_settled_calldata(View::new(0x1234_5678));
-        assert_eq!(&cd[0..4], &RECORD_SETTLED_SELECTOR, "selector");
-        let mut v_word = [0u8; 32];
-        v_word[24..].copy_from_slice(&0x1234_5678u64.to_be_bytes());
-        assert_eq!(&cd[4..36], &v_word, "viewNum word");
-        assert!(cd[4..28].iter().all(|b| *b == 0), "view high bytes zero");
-        assert_eq!(
-            cd.len(),
-            4 + 32,
-            "exact calldata length (single static arg)"
-        );
-    }
-
-    /// `recordSettled(0)` (genesis frontier) still encodes a full zero word —
-    /// fixed-width regardless of the value.
-    #[test]
-    fn record_settled_calldata_zero_view() {
-        let cd = record_settled_calldata(View::ZERO);
-        assert_eq!(&cd[0..4], &RECORD_SETTLED_SELECTOR);
-        assert!(cd[4..36].iter().all(|b| *b == 0), "view word all zero");
-        assert_eq!(cd.len(), 4 + 32);
-    }
-
     /// The #767 margin clears the rotation `v_eff` delay. The *compile-time*
     /// guarantee is the module-level `const _: () = assert!(…)`; this runtime
     /// test documents the bound and reads `MIN_V_EFF_DELAY` through a binding so
@@ -1015,18 +855,6 @@ mod tests {
         assert_eq!(
             conservative_settled_view(View(100)),
             View(100 - SETTLED_VIEW_MARGIN)
-        );
-    }
-
-    /// The address helper parses to the same fixed predeploy address as the
-    /// string constant.
-    #[test]
-    fn registry_address_helper_matches_constant() {
-        assert_eq!(
-            registry_address(),
-            REGISTRY_ADDRESS
-                .parse::<alloy_primitives::Address>()
-                .unwrap(),
         );
     }
 }
