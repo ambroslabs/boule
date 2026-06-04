@@ -114,14 +114,14 @@ async fn main() -> Result<()> {
         &format!("settledView() == {} (got {got_settled_u64})", settled.0),
     )?;
 
-    // ── Scenario 2: a FULL payload (key + weight + settled). This exercises the
-    //    recordKey/recordWeight appliers, but the carried extra_data exceeds 32
-    //    bytes — and alloy's ExecutionPayload→block conversion (used by the
-    //    verify-path `newPayloadV4`) hardcodes MAXIMUM_EXTRA_DATA_SIZE = 32,
-    //    independent of #788's relaxed EthBeaconConsensus cap. So the verify path
-    //    rejects it (a real EL-side gap in #788's encoding option (a), NOT the
-    //    boule population glue). We report the outcome honestly rather than fail
-    //    the whole proof. ──────────────────────────────────────────────────────
+    // ── Scenario 2: a FULL payload (key + weight + settled), carrying a
+    //    >32-byte `extra_data`. This is the #791 regression target: alloy's
+    //    ExecutionPayload→block conversion (used by the verify-path
+    //    `newPayloadV4`) hardcodes MAXIMUM_EXTRA_DATA_SIZE = 32, which #791's
+    //    custom `convert_payload_to_block` (in boule-reth-node) now routes around.
+    //    So build AND verify must BOTH accept it, and the EL must apply
+    //    recordKey + recordWeight + recordSettled from the carried bytes. This is
+    //    now a HARD assertion (it was a soft "expected gap" before #791). ────────
     let validator: NodeId = [0x42; 32];
     let v_eff = View::new(15);
     let key128: [u8; 128] = std::array::from_fn(|i| (i as u8).wrapping_mul(3).wrapping_add(1));
@@ -145,43 +145,46 @@ async fn main() -> Result<()> {
         attr2.len() / 2 - 1
     );
     let parent2 = built.block_hash.clone();
-    match engine
+    let b2 = engine
         .build_block(&parent2, 2, Duration::from_millis(500), &attr2)
         .await
-    {
-        Ok(b2) => match engine.commit_block(&b2.execution_payload).await {
-            Ok((c2, s2)) => {
-                eprintln!("[scenario 2] committed {c2} status={s2:?}");
-                // If it ever lands (EL gap fixed), assert the key + weight too.
-                let mut kcd = KEY_AT.to_vec();
-                kcd.extend_from_slice(&validator);
-                kcd.extend_from_slice(&left_pad32(&v_eff.0.to_be_bytes()));
-                let got_k = eth_call_at(&t, kcd, "latest").await?;
-                let len = u64::from_be_bytes(got_k[32 + 24..64].try_into().unwrap()) as usize;
-                check(
-                    got_k[64..64 + len] == key128,
-                    "keyAt(0x42..) == the 128-byte key we passed",
-                )?;
-                let mut wcd = WEIGHT_OF.to_vec();
-                wcd.extend_from_slice(&weight_validator);
-                let got_w = eth_call_at(&t, wcd, "latest").await?;
-                let got_w_u64 = u64::from_be_bytes(got_w[24..32].try_into().unwrap());
-                check(
-                    got_w_u64 == weight,
-                    &format!("weightOf(0x77..) == {weight} (got {got_w_u64})"),
-                )?;
-            }
-            Err(e) => eprintln!(
-                "[scenario 2] EXPECTED GAP — verify path rejected the >32-byte payload: {e}\n\
-                 (alloy ExecutionPayload→block caps extra_data at 32; #788 follow-up — \
-                 carry a 32-byte commitment, or patch the conversion. Boule's population \
-                 + ingress + build are correct.)"
-            ),
-        },
-        Err(e) => eprintln!("[scenario 2] build rejected the >32-byte payload: {e}"),
-    }
+        .context("build_block on the custom EL (scenario 2, >32-byte extra_data)")?;
+    let (c2, s2) = engine.commit_block(&b2.execution_payload).await.context(
+        "commit_block (newPayloadV4 + fcU) for the >32-byte payload — \
+             #791 should now accept it on the verify path",
+    )?;
+    eprintln!("[scenario 2] committed {c2} status={s2:?}");
+    // The EL applied recordKey from extra_data on the verify path: read it back.
+    let mut kcd = KEY_AT.to_vec();
+    kcd.extend_from_slice(&validator);
+    kcd.extend_from_slice(&left_pad32(&v_eff.0.to_be_bytes()));
+    let got_k = eth_call_at(&t, kcd, "latest").await?;
+    let len = u64::from_be_bytes(got_k[32 + 24..64].try_into().unwrap()) as usize;
+    check(
+        got_k[64..64 + len] == key128,
+        "keyAt(0x42..) == the 128-byte key we passed",
+    )?;
+    // recordWeight (the #791 Part B write) applied too.
+    let mut wcd = WEIGHT_OF.to_vec();
+    wcd.extend_from_slice(&weight_validator);
+    let got_w = eth_call_at(&t, wcd, "latest").await?;
+    let got_w_u64 = u64::from_be_bytes(got_w[24..32].try_into().unwrap());
+    check(
+        got_w_u64 == weight,
+        &format!("weightOf(0x77..) == {weight} (got {got_w_u64})"),
+    )?;
+    // recordSettled applied from the same payload.
+    let got_settled2 = eth_call_at(&t, SETTLED_VIEW.to_vec(), "latest").await?;
+    let got_settled2_u64 = u64::from_be_bytes(got_settled2[24..32].try_into().unwrap());
+    check(
+        got_settled2_u64 == 11,
+        &format!("settledView() == 11 (got {got_settled2_u64})"),
+    )?;
 
-    eprintln!("\nA1 LIVE-EL PROOF: scenario 1 (the common settled-only block) PASSED end to end.");
+    eprintln!(
+        "\nA1 LIVE-EL PROOF: scenario 1 (settled-only) AND scenario 2 (key + weight + \
+         settled, >32-byte extra_data) PASSED end to end — #791 verify-cap fix confirmed."
+    );
     Ok(())
 }
 

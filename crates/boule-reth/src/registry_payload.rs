@@ -151,6 +151,94 @@ impl RegistryPayload {
             format!("0x{}", hex::encode(self.encode()))
         }
     }
+
+    /// Decode a sealed block's `extra_data` back into the write set it carried —
+    /// the inverse of [`encode`](Self::encode), mirroring
+    /// `boule_reth_node::registry::RegistryPayload::decode` byte-for-byte. Returns
+    /// [`None`] for any blob that is not a well-formed boule registry payload
+    /// (wrong magic, wrong version, truncated, or trailing garbage), exactly as
+    /// the EL no-ops a non-boule block.
+    ///
+    /// boule uses this to learn which seated-weight deltas a *committed* block
+    /// already mirrored through the EL, so it can drop them from the pending-weight
+    /// buffer (Part B of #791): the build path carries pending deltas in
+    /// `extra_data`, and `commit` reconciles against the committed block's
+    /// `extra_data` so no delta is carried twice and none leaks. (`keys`/
+    /// `settled_view` are reconstructed for completeness but boule only consults
+    /// the weights.)
+    pub fn decode(extra_data: &[u8]) -> Option<Self> {
+        let mut c = Cursor::new(extra_data);
+        if c.take(4)? != MAGIC {
+            return None;
+        }
+        if c.take(1)?[0] != VERSION {
+            return None;
+        }
+        let flags = c.take(1)?[0];
+
+        let settled_view = if flags & 0b0000_0001 != 0 {
+            Some(View::new(u64::from_be_bytes(c.take(8)?.try_into().ok()?)))
+        } else {
+            None
+        };
+
+        let key_count = u32::from_be_bytes(c.take(4)?.try_into().ok()?) as usize;
+        let mut keys = Vec::with_capacity(key_count);
+        for _ in 0..key_count {
+            let validator: NodeId = c.take(32)?.try_into().ok()?;
+            let v_eff = View::new(u64::from_be_bytes(c.take(8)?.try_into().ok()?));
+            let key128: [u8; BLS_KEY_LEN] = c.take(BLS_KEY_LEN)?.try_into().ok()?;
+            keys.push(RecordKey {
+                validator,
+                v_eff,
+                key128,
+            });
+        }
+
+        let weight_count = u32::from_be_bytes(c.take(4)?.try_into().ok()?) as usize;
+        let mut weights = Vec::with_capacity(weight_count);
+        for _ in 0..weight_count {
+            let validator: NodeId = c.take(32)?.try_into().ok()?;
+            let weight = u64::from_be_bytes(c.take(8)?.try_into().ok()?);
+            weights.push((validator, weight));
+        }
+
+        // Reject trailing garbage so encode/decode is exactly bijective.
+        if !c.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            keys,
+            weights,
+            settled_view,
+        })
+    }
+}
+
+/// A minimal forward-only byte cursor for [`RegistryPayload::decode`] (no extra
+/// dep), mirroring the EL decoder's cursor.
+struct Cursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    /// Take exactly `n` bytes, or [`None`] if fewer remain (truncated input).
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let slice = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(slice)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pos >= self.buf.len()
+    }
 }
 
 #[cfg(test)]
@@ -300,5 +388,45 @@ mod tests {
             "424c52310101000000000001e2400000000000000000",
         );
         assert_eq!(a.encode().len(), 22);
+    }
+
+    /// `decode` is the exact inverse of `encode` for a full payload — the
+    /// reconciliation Part B relies on (commit decodes a committed block's
+    /// `extra_data` to drop the weights it already mirrored).
+    #[test]
+    fn decode_roundtrips_full_payload() {
+        let p = RegistryPayload::new(
+            vec![rk(0x11, 7, 0xAB), rk(0x22, 9, 0xCD)],
+            &[vu(0x11, 100), vu(0x33, 0)],
+            Some(View::new(42)),
+        );
+        assert_eq!(RegistryPayload::decode(&p.encode()), Some(p));
+    }
+
+    /// Empty, settled-only, and weights-only payloads all round-trip.
+    #[test]
+    fn decode_roundtrips_edge_payloads() {
+        for p in [
+            RegistryPayload {
+                settled_view: Some(View::new(5)),
+                ..Default::default()
+            },
+            RegistryPayload::new(vec![], &[vu(0x0a, 7), vu(0x0b, 0)], None),
+            RegistryPayload::new(vec![rk(0x01, 3, 0x07)], &[], None),
+        ] {
+            assert_eq!(RegistryPayload::decode(&p.encode()), Some(p));
+        }
+    }
+
+    /// A non-boule / malformed `extra_data` decodes to `None` (a clean no-op),
+    /// matching the EL decoder so reconciliation drops nothing for a plain block.
+    #[test]
+    fn decode_rejects_non_boule_and_malformed() {
+        assert_eq!(RegistryPayload::decode(b"reth/v2.2.0/linux"), None);
+        assert_eq!(RegistryPayload::decode(&[]), None);
+        assert_eq!(RegistryPayload::decode(b"BLR1"), None); // truncated
+        let mut bytes = RegistryPayload::new(vec![], &[vu(1, 1)], None).encode();
+        bytes.push(0xFF); // trailing garbage
+        assert_eq!(RegistryPayload::decode(&bytes), None);
     }
 }
