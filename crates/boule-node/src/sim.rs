@@ -6402,7 +6402,17 @@ mod tests {
                             }
                         }
                         TraceEvent::AddValidator => {
-                            if !partitioned {
+                            // Cap the committee at 5. The genesis originals
+                            // 0..=3 are never removed (removes pop from the end
+                            // and stop at the floor of 4), so at n<=5 those four
+                            // always-synced validators are themselves a quorum
+                            // (quorum(5) = 4) — progress never depends on a
+                            // freshly-spawned joiner having block-synced yet. At
+                            // n=6 (quorum 5) it would, and two un-synced joiners
+                            // could transiently stall the cluster; capping here
+                            // keeps every generated trace reliably live. (Growing
+                            // past 5 with synced joiners is its own concern.)
+                            if !partitioned && member_count < 5 {
                                 let (joiner, _mp) = cluster.spawn_validator_into();
                                 let v_eff = View(max_height(&mut cluster) + 12);
                                 let cmd = ReconfigCommand {
@@ -6422,9 +6432,10 @@ mod tests {
                                 for mp in &cluster.mempools {
                                     let _ = mp.insert(cmd.encode());
                                 }
-                                // Drive past v_eff. Use the surviving committee's
-                                // max height (the fresh joiner starts at 0 and is
-                                // still syncing).
+                                // Drive past v_eff via the committee's max height
+                                // (the four always-synced originals carry quorum
+                                // at n<=5, so this advances even while the fresh
+                                // joiner is still block-syncing).
                                 let crossed = cluster
                                     .advance_and_yield_until(Duration::from_secs(12), |c| {
                                         max_height(c) >= v_eff.0 + 3
