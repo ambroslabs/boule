@@ -11,8 +11,10 @@ pragma solidity ^0.8.24;
 /// (`docs/validator-registry-and-slashing.md`) relies on. It is a **mirror**:
 /// consensus stays authoritative; nothing here drives the validator set.
 ///
-/// `key` is the validator's 48-byte BLS12-381 G1 pubkey (boule's `min-pk`
-/// variant). `vEff` is the consensus view from which that key is active.
+/// `key` is the validator's BLS12-381 G1 pubkey in the **128-byte EIP-2537
+/// uncompressed** form the slashing predeploy (`Slashing.sol`) requires
+/// (`key.length == 128`). `vEff` is the consensus view from which that key is
+/// active.
 contract Registry {
     struct KeyEntry {
         uint64 vEff;
@@ -20,6 +22,16 @@ contract Registry {
     }
 
     mapping(bytes32 => KeyEntry[]) private history;
+
+    /// The only account allowed to call [`recordKey`]: boule's **system
+    /// account** (`SYSTEM_ACCOUNT_ADDRESS` in `src/system_account.rs`). The
+    /// proposer signs every legitimate `recordKey` tx from this address (#756),
+    /// so gating on `msg.sender == WRITER` makes the registry a trustworthy
+    /// slashing key-source: no other account can pollute a validator's key
+    /// history (which could otherwise block a legitimate slash). Genesis-seeded
+    /// keys are written directly into `alloc` storage, not via `recordKey`, so
+    /// they are unaffected by this gate.
+    address constant WRITER = 0x2Ae00C96484267e0ed8937426F497404A93aB526;
 
     /// A validator's BLS key became active from `vEff`.
     event KeyRecorded(bytes32 indexed validator, uint64 vEff, bytes key);
@@ -29,14 +41,13 @@ contract Registry {
     /// each validator's history is a monotone `(vEff, key)` list — the same
     /// shape as the consensus `BlsKeyHistory` it mirrors.
     ///
-    /// **MVP caveat — writes are unauthenticated.** The caller is trusted, the
-    /// same follow-up `Staking.withdraw` carries. Hardening (#732): verify the
-    /// rotation's dual BLS signature via the EIP-2537 precompiles before
-    /// recording, so the registry holds only keys from validator-authorised
-    /// rotations and cannot be polluted to block a legitimate slash. The
-    /// slashing precompile only reads *settled* past views, which bounds the
-    /// exposure until that lands.
+    /// **Access-controlled:** only [`WRITER`] (boule's system account) may
+    /// record keys. The proposer signs `recordKey` txs from that account on
+    /// commit (#756); any other sender reverts. This keeps the registry a
+    /// trustworthy slashing key-source — the keys it holds came from boule's
+    /// authoritative consensus path, not an arbitrary caller.
     function recordKey(bytes32 validator, uint64 vEff, bytes calldata key) external {
+        require(msg.sender == WRITER, "unauthorized");
         KeyEntry[] storage h = history[validator];
         require(h.length == 0 || vEff > h[h.length - 1].vEff, "vEff not increasing");
         h.push(KeyEntry(vEff, key));

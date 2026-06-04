@@ -21,8 +21,12 @@ import { ethers } from "ethers";
 import { readFileSync } from "fs";
 
 const RPC = process.env.RPC ?? "http://127.0.0.1:8545";
-// reth --dev funds this account (the standard dev key).
+// reth --dev funds this account (the standard dev key) — used to call the
+// permissionless Slashing predeploy.
 const PK = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+// boule's SYSTEM account — the only account `Registry.recordKey` accepts (its
+// WRITER; see src/system_account.rs). The registry write below must come from it.
+const SYSTEM_PK = "0x5005ce11b0017e5750575e11acc011710123456789abcdef0123456789abcdef";
 const REGISTRY = "0x0000000000000000000000000000000000000b12"; // #732a registry predeploy
 const SLASHING = "0x0000000000000000000000000000000000000b13"; // #732b slashing predeploy
 
@@ -37,14 +41,17 @@ const blockA = h("SL_BLOCKA"), blockB = h("SL_BLOCKB");
 const sigA = h("SL_SIGA"), sigB = h("SL_SIGB");
 const pubkey = h("SL_PUBKEY");
 
-const wallet = new ethers.Wallet(PK, new ethers.JsonRpcProvider(RPC));
+const provider = new ethers.JsonRpcProvider(RPC);
+const wallet = new ethers.Wallet(PK, provider);
+const systemWallet = new ethers.Wallet(SYSTEM_PK, provider);
 
 // 1. record the validator's BLS key in the Registry at this view (so the
-//    slashing predeploy's `keyAt(validator, view)` returns it).
+//    slashing predeploy's `keyAt(validator, view)` returns it). recordKey is
+//    access-controlled, so it must be signed by the SYSTEM account (the WRITER).
 const reg = new ethers.Contract(REGISTRY, [
   "function recordKey(bytes32,uint64,bytes) external",
   "function keyAt(bytes32,uint64) view returns (bytes)",
-], wallet);
+], systemWallet);
 await (await reg.recordKey(validator, view, pubkey)).wait();
 assert(await reg.keyAt(validator, view) === pubkey, "registry keyAt == recorded pubkey");
 
