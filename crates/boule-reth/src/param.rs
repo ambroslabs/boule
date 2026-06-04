@@ -19,13 +19,24 @@
 //! the new value at the same view.
 //!
 //! The `ParamSubmitted(bytes)` event shape/topic and the `ConsensusParamHistory`
-//! apply mechanism are **unchanged** by #746 — only the *gating* moved: a single
-//! unauthenticated `submitParam` no longer emits; authorization is now an
-//! upstream weighted quorum. Unlike rotation/endpoint, the event carries no
-//! indexed `validator` (the vote-time `validator` arg is not part of the emitted
-//! command). The `validator` arg is caller-supplied (the same dumb-carrier caveat
-//! as the sibling predeploys): exposure is bounded because the carried command is
-//! consensus-validated and the `v_eff` floor stays as defense-in-depth.
+//! apply mechanism are **unchanged** by #746/#764 — only the *gating* moved: a
+//! single unauthenticated `submitParam` no longer emits; authorization is now an
+//! upstream weighted quorum, **authenticated** in #764. Unlike rotation/endpoint,
+//! the event carries no indexed `validator` (the vote-time `validator` arg is not
+//! part of the emitted command).
+//!
+//! ## #764: the forged-quorum hole and its fix
+//!
+//! The earlier gate checked only `weightOf(validator) > 0`, so — param ids being
+//! public — a single actor could `approve` once per real validator id and forge a
+//! ⅔ supermajority `ParamSubmitted` that consensus then applied. #764 closes this:
+//! each approval must carry the validator's own **BLS signature** over
+//! `keccak256(abi.encode(AUTH_DOMAIN, chainId, contract, proposalId,
+//! validator))` (a distinct `AUTH_DOMAIN` from governance), verified in-EVM
+//! against `Registry.keyAt(validator, settledView())`. Naming a validator you
+//! don't control no longer counts. The authenticated in-EVM tally is the
+//! authority; consensus still validates the carried command's `v_eff` floor /
+//! well-formedness as before, but need not re-run the quorum.
 //!
 //! These constants are the authoritative identifiers and match the compiled
 //! runtime bytecode embedded in `genesis.json`; the tests below pin the
@@ -45,9 +56,26 @@ pub const PARAM_ADDRESS: &str = "0x0000000000000000000000000000000000000b11";
 /// the read/apply path stays compatible — only the gating moved upstream (#746).
 pub const PARAM_TOPIC: &str = "0x27d1e5d546bb0a37e323040c28412ac11a38a95061bbe56c3f95d635f8826a0b";
 
-/// 4-byte selector of `approve(bytes32,bytes,bytes32)` — a validator's weighted
-/// approval of a parameter update (#746).
-pub const APPROVE_SELECTOR: [u8; 4] = [0x80, 0x30, 0x9c, 0x0a];
+/// 4-byte selector of `approve(bytes32,bytes,bytes32,bytes)` — a validator's
+/// **authenticated** weighted approval of a parameter update (#746 + #764). The
+/// fourth arg is the validator's BLS signature (EIP-2537 G2, 256 bytes) over the
+/// approval digest, verified in-EVM via `BlsVerify` against `Registry.keyAt(
+/// validator, settledView())` before the weight is accrued.
+pub const APPROVE_SELECTOR: [u8; 4] = [0x8e, 0x4a, 0x23, 0xcb];
+
+/// 4-byte selector of `approveDigest(bytes32 proposalId, bytes32 validator)` —
+/// the view helper returning the 32-byte digest a validator must BLS-sign (#764):
+/// `keccak256(abi.encode(AUTH_DOMAIN, chainId, contract, proposalId, validator))`.
+pub const APPROVE_DIGEST_SELECTOR: [u8; 4] = [0x73, 0x87, 0x53, 0xb8];
+
+/// `keccak256("BOULE_PARAM_APPROVE_V1")` — the parameter approval-signing domain
+/// tag (#764). Embedded as `AUTH_DOMAIN` in `Param.sol`; distinct from the
+/// governance domain so a governance approval signature can never be replayed as
+/// a param approval (and vice versa).
+pub const AUTH_DOMAIN: [u8; 32] = [
+    0xfa, 0x56, 0x6b, 0x51, 0xe8, 0xb3, 0xf0, 0xea, 0x73, 0xbb, 0x6b, 0xd0, 0xa5, 0x60, 0x40, 0x63,
+    0x46, 0x97, 0xf7, 0xad, 0x06, 0xbd, 0xed, 0xc3, 0xe6, 0x70, 0x75, 0x9f, 0xbf, 0x84, 0xc6, 0xcd,
+];
 
 /// 4-byte selector of `approvals(bytes32)` (the running accrued-weight tally).
 pub const APPROVALS_SELECTOR: [u8; 4] = [0xbf, 0x7c, 0x21, 0x31];
@@ -125,6 +153,7 @@ mod tests {
         );
         for (name, sel) in [
             ("approve", APPROVE_SELECTOR),
+            ("approveDigest", APPROVE_DIGEST_SELECTOR),
             ("approvals", APPROVALS_SELECTOR),
             ("isApproved", IS_APPROVED_SELECTOR),
         ] {
@@ -133,11 +162,22 @@ mod tests {
                 "{name} selector must appear in the dispatcher",
             );
         }
-        // The weighted-quorum gate staticcalls the Registry's weight surface;
-        // those selectors must appear as PUSH4 operands in the staticcall path.
+        // #764: the approval-signing domain tag must be the PUSH32 operand the
+        // contract embeds, so the digest the contract checks matches what an
+        // off-chain signer reconstructs from `AUTH_DOMAIN`.
+        assert!(
+            code.to_ascii_lowercase()
+                .contains(&hex::encode(AUTH_DOMAIN)),
+            "AUTH_DOMAIN must appear as the PUSH32 operand in the bytecode",
+        );
+        // The weighted-quorum gate staticcalls the Registry's weight surface, and
+        // the #764 auth staticcalls its key surface; all four selectors must appear
+        // as PUSH4 operands in the staticcall paths.
         for (name, sel) in [
             ("weightOf", crate::registry::WEIGHT_OF_SELECTOR),
             ("totalWeight", crate::registry::TOTAL_WEIGHT_SELECTOR),
+            ("keyAt", crate::registry::KEY_AT_SELECTOR),
+            ("settledView", crate::registry::SETTLED_VIEW_SELECTOR),
         ] {
             assert!(
                 code.contains(&hex::encode(sel)),
