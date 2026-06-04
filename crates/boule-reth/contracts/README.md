@@ -1,5 +1,15 @@
 # boule-reth contracts
 
+> **Bytecode is generated, never committed.** `build.rs` compiles each `.sol`
+> here with the pinned **solc 0.8.24** and writes their runtime bytecode into a
+> generated (git-ignored) `../genesis.json`, assembled from
+> `../genesis.template.json`. The `.sol` files are the single source of truth;
+> editing one and rebuilding regenerates the genesis (see AGENTS.md "Generated
+> artifacts"). The per-contract identifier tables below (address / event topic /
+> selector) are mirrored as constants in `src/*.rs` and pinned to the generated
+> bytecode by unit tests. The "Reproducing the bytecode" snippets are how to
+> inspect a contract's bytecode by hand; you no longer paste it anywhere.
+
 ## `Staking.sol` — validator-staking predeploy (#655)
 
 The EVM-native interface for validator staking on the reth backend. Users

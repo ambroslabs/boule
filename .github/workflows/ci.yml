@@ -67,6 +67,8 @@ jobs:
       - if: needs.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
       - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/install-solc
+      - if: needs.changes.outputs.rust == 'true'
         run: cargo clippy --all-targets -- -D warnings
       # Optional cargo features are off by default, so the line above never
       # compiles the feature-gated code. Lint the `reth` backend explicitly
@@ -101,6 +103,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - if: needs.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/install-solc
       - if: needs.changes.outputs.rust == 'true'
         name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
@@ -138,5 +142,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - if: needs.changes.outputs.rust == 'true'
         uses: Swatinem/rust-cache@v2
+      - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/install-solc
       - if: needs.changes.outputs.rust == 'true'
         run: cargo doc --workspace --no-deps --document-private-items

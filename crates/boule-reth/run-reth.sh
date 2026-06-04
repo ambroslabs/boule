@@ -3,8 +3,8 @@
 # Prague-at-genesis chainspec, Engine API on :8551 (JWT), public eth RPC on
 # :8545, no internal block production (boule drives it via the Engine API).
 #
-# Requires a reth on PATH that activates Prague (pin updated from v2.2.0 — see
-# PRAGUE-MIGRATION.md). Generates jwt.hex on first run.
+# Requires reth v2.2.0+ on PATH (v2.2.0 activates Prague — validated). Generates
+# jwt.hex and genesis.json on first run.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -14,6 +14,15 @@ JWT="${JWT:-$DIR/jwt.hex}"
 if [ ! -f "$JWT" ]; then
   echo "generating JWT secret at $JWT"
   openssl rand -hex 32 > "$JWT"
+fi
+
+# genesis.json is generated (not committed): boule-reth's build.rs compiles the
+# predeploy contracts/*.sol with solc into genesis.template.json. Build the
+# crate once if the generated file isn't present yet (needs solc — see
+# AGENTS.md "Generated artifacts").
+if [ ! -f "$DIR/genesis.json" ]; then
+  echo "generating genesis.json (compiling predeploy contracts)..."
+  (cd "$DIR/../.." && cargo build -p boule-reth >/dev/null)
 fi
 
 # Fresh datadir each run keeps the spike reproducible (genesis at height 0).
