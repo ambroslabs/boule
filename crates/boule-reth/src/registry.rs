@@ -104,6 +104,45 @@ const TOTAL_WEIGHT_SLOT: u64 = 2;
 #[allow(dead_code)]
 const SETTLED_VIEW_SLOT: u64 = 3;
 
+/// Conservative margin (in views) the proposer keeps between the just-committed
+/// view and the settled frontier it advances `Registry.settledView` to (#767).
+///
+/// The slashing predeploy only verifies a proof for `view <= settledView`, and
+/// `keyAt(validator, view)` is trustworthy there **only if every rotation with
+/// `vEff <= view` has already executed in EVM state**. A rotation's
+/// `recordKey` tx is submitted by the proposer at commit and *executes some
+/// blocks later* (the #674 EL self-sync lag); `recordSettled` is the same kind
+/// of lagged, async system tx. So a naive `recordSettled(committed_view)` could
+/// advance the frontier to a view whose rotation's `recordKey` has not yet
+/// executed — letting a slashing proof verify against a **stale** pre-rotation
+/// key. (See `docs/validator-registry-and-slashing.md`, "The EL-lag invariant".)
+///
+/// Holding the frontier `SETTLED_VIEW_MARGIN` views behind the committed view —
+/// **on top of** the execution-confirmation gate the proposer applies before
+/// advancing — is defense-in-depth: a rotation effective at the frontier view
+/// `V` was *committed* at least [`MIN_V_EFF_DELAY`] views earlier
+/// (`vEff >= commit_view + MIN_V_EFF_DELAY`), so by the time the frontier
+/// reaches `V` its `recordKey` has had `>= MARGIN` further committed views to
+/// clear the lag. The margin is tied to `MIN_V_EFF_DELAY` by the
+/// `settled_view_margin_clears_v_eff_delay` assertion below: it must never be
+/// set below the v_eff delay, or the frontier could outrun rotation recording.
+///
+/// [`MIN_V_EFF_DELAY`]: boule_consensus::reconfig::MIN_V_EFF_DELAY
+pub const SETTLED_VIEW_MARGIN: u64 = boule_consensus::reconfig::MIN_V_EFF_DELAY.0;
+
+/// **Load-bearing compile-time safety assertion (#767).** The conservative
+/// settled-view margin must never be set below the rotation `v_eff` delay
+/// ([`MIN_V_EFF_DELAY`](boule_consensus::reconfig::MIN_V_EFF_DELAY)). If it were,
+/// the proposer could advance `Registry.settledView` to a view whose rotation's
+/// `recordKey` may not yet have executed — letting the slashing predeploy verify
+/// a proof against a **stale** pre-rotation key. A change to either constant that
+/// violates the bound fails the build here, before it can ship.
+const _: () = assert!(
+    SETTLED_VIEW_MARGIN >= boule_consensus::reconfig::MIN_V_EFF_DELAY.0,
+    "SETTLED_VIEW_MARGIN must be >= MIN_V_EFF_DELAY so the settled frontier never \
+     outruns rotation recording (#767)",
+);
+
 use boule_consensus::View;
 use boule_consensus::validator_rotation::{DualSignedRotation, OperatorSignedRotation};
 use boule_core::crypto::sig_scheme::{BlsKeyError, BlsPublicKey, bls_pubkey_to_eip2537_g1};
@@ -225,10 +264,21 @@ pub fn record_weight_calldata(validator: &NodeId, weight: u64) -> alloy_primitiv
     alloy_primitives::Bytes::from(out)
 }
 
+/// The conservative settled-frontier view to advance `Registry.settledView` to
+/// at the commit of `committed_view` (#767): `committed_view −
+/// `[`SETTLED_VIEW_MARGIN`]`, saturating at view 0. Never the committed view
+/// itself — see [`SETTLED_VIEW_MARGIN`] for why the frontier is held
+/// conservatively behind the committed view rather than advanced to it (the EL
+/// execution lag).
+pub fn conservative_settled_view(committed_view: View) -> View {
+    View(committed_view.0.saturating_sub(SETTLED_VIEW_MARGIN))
+}
+
 /// ABI-encode the `recordSettled(uint64 viewNum)` calldata: the 4-byte selector
 /// followed by the single left-padded `viewNum` word. The proposer submits this
-/// each commit with the just-committed view to advance the registry's settled
-/// frontier (#732) — the gate the slashing predeploy reads. The contract clamps
+/// each commit with the conservative settled view
+/// ([`conservative_settled_view`]) to advance the registry's settled frontier
+/// (#732/#767) — the gate the slashing predeploy reads. The contract clamps
 /// monotonically, so a stale/replayed `viewNum` is a harmless no-op.
 pub fn record_settled_calldata(view: View) -> alloy_primitives::Bytes {
     let mut out = Vec::with_capacity(4 + 32);
@@ -933,6 +983,39 @@ mod tests {
         assert_eq!(&cd[0..4], &RECORD_SETTLED_SELECTOR);
         assert!(cd[4..36].iter().all(|b| *b == 0), "view word all zero");
         assert_eq!(cd.len(), 4 + 32);
+    }
+
+    /// The #767 margin clears the rotation `v_eff` delay. The *compile-time*
+    /// guarantee is the module-level `const _: () = assert!(…)`; this runtime
+    /// test documents the bound and reads `MIN_V_EFF_DELAY` through a binding so
+    /// it is not a constant assertion (clippy), giving a named, greppable check.
+    #[test]
+    fn settled_view_margin_clears_v_eff_delay() {
+        let v_eff_delay = boule_consensus::reconfig::MIN_V_EFF_DELAY.0;
+        assert!(
+            SETTLED_VIEW_MARGIN >= v_eff_delay,
+            "SETTLED_VIEW_MARGIN ({SETTLED_VIEW_MARGIN}) must be >= MIN_V_EFF_DELAY \
+             ({v_eff_delay}) so the settled frontier never outruns rotation recording (#767)",
+        );
+    }
+
+    /// The conservative settled view is the committed view less the margin,
+    /// saturating at 0 for the first few (un-settleable) views.
+    #[test]
+    fn conservative_settled_view_subtracts_the_margin() {
+        // Below the margin: nothing is settled yet (saturates at 0).
+        for v in 0..=SETTLED_VIEW_MARGIN {
+            assert_eq!(conservative_settled_view(View(v)), View(0));
+        }
+        // At and above the margin: committed_view - margin.
+        assert_eq!(
+            conservative_settled_view(View(SETTLED_VIEW_MARGIN + 1)),
+            View(1),
+        );
+        assert_eq!(
+            conservative_settled_view(View(100)),
+            View(100 - SETTLED_VIEW_MARGIN)
+        );
     }
 
     /// The address helper parses to the same fixed predeploy address as the
