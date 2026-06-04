@@ -77,6 +77,22 @@ pub fn logs_filter(block_hash: &str) -> Value {
     }])
 }
 
+/// The `eth_getLogs` filter selecting one block's `Slashed` events *by EVM
+/// block number* rather than hash. Used to backfill the slashing events of
+/// blocks the EL self-synced past (cf. [`crate::staking::logs_filter_by_number`]):
+/// on catch-up we know only each skipped block's boule height (→ its canonical
+/// EVM number), not its hash. A dropped `Slashed` over a gap would leave the
+/// equivocator unslashed on the self-synced node, diverging the validator set.
+pub fn logs_filter_by_number(number: u64) -> Value {
+    let block = format!("0x{number:x}");
+    json!([{
+        "fromBlock": block,
+        "toBlock": block,
+        "address": SLASHING_ADDRESS,
+        "topics": [SLASHED_TOPIC],
+    }])
+}
+
 /// Parse an `eth_getLogs` result (an array of slashing-predeploy log objects)
 /// into the equivocators' [`NodeId`]s, in log order — one per `Slashed` event.
 ///

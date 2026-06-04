@@ -200,12 +200,16 @@ impl RethApplication {
     /// failed `eth_getLogs` is logged and yields no effects (a transient RPC
     /// error must not fail the commit — consensus commits regardless of the EL).
     ///
-    /// Read only on the normal per-block commit path: a command submitted in a
-    /// block the EL executed via background self-sync (#674) — skipped by
-    /// `commit` while `SYNCING` — is not backfilled here the way staking is,
-    /// since these effects have no re-anchored ledger to reconcile. A missed
-    /// submission is recoverable (the submitter re-submits), so backfilling over
-    /// self-synced gaps is a follow-up, not a correctness requirement.
+    /// Backfilled over EL self-synced gaps (#674) too, by EVM block number,
+    /// exactly as staking is — see [`Self::backfill_self_synced_gap`]. This **is**
+    /// a correctness requirement, not best-effort recovery (#772): a governance
+    /// `Approved` is emitted **once per proposal** (a one-shot guard — there is no
+    /// re-submit), so a `Reconfig`/rotation/endpoint/param effect dropped because
+    /// `commit` self-synced past its block would never re-emit, and some replicas
+    /// would apply the membership change while others did not → **silent
+    /// validator-set divergence** (a safety split). A node that self-syncs past a
+    /// gap must derive the byte-identical effect sequence as one that executed
+    /// every block in order.
     async fn derive_predeploy_effects(
         &self,
         block_hash: &str,
@@ -533,34 +537,49 @@ impl RethApplication {
         .await
     }
 
-    /// Backfill the staking events of blocks the EL executed via background
-    /// self-sync (snap/full, #631) that `commit` skipped while the EL was
-    /// `SYNCING` (#674).
+    /// Backfill **every validator-affecting predeploy event** of the blocks the
+    /// EL executed via background self-sync (snap/full, #631) that `commit`
+    /// skipped while the EL was `SYNCING` (#674): staking + slashing (the stake
+    /// ledger) **and** the rotation/endpoint/param/governance submission effects
+    /// (#772).
     ///
     /// When the EL reports `VALID` for a block whose height is more than one
     /// past the committed frontier, every block in the gap
     /// `(prev_height, height)` was executed by the EL out-of-band — not through
-    /// `commit`, which returned early while `SYNCING` — so its predeploy
-    /// staking events were never read and the CL stake ledger would silently
-    /// drift from EL state (the root self-heals via `recover_frontier`, but the
-    /// ledger has no such re-anchor).
+    /// `commit`, which returned early while `SYNCING` — so its predeploy events
+    /// were never read. For the stake ledger that means it would silently drift
+    /// from EL state; for the submission effects (rotation/endpoint/param/
+    /// governance) it means committed, **one-shot** membership changes would be
+    /// dropped on this node but applied on a node that executed the block →
+    /// silent validator-set divergence (#772). The root self-heals via
+    /// `recover_frontier`, but neither the ledger nor these effects have such a
+    /// re-anchor — they must be reconciled here.
     ///
-    /// Each skipped block's events are read *by canonical EVM number* — its
-    /// hash is unknown on this path — and applied **at the block's own height**,
+    /// Each skipped block's events are read *by canonical EVM number* — its hash
+    /// is unknown on this path — and applied **at the block's own height**,
     /// exactly as the normal per-block path would, so a node that caught up via
-    /// self-sync reaches the byte-identical ledger of one that committed every
-    /// block in order (unbonding maturity is height-relative, #660). This
-    /// relies on the one-EVM-block-per-committed-boule-block invariant: EVM
-    /// block number advances 1:1 with boule height, so the block at boule
-    /// height `h` has EVM number `current_number - (height - h)`.
+    /// self-sync reaches the byte-identical ledger and the same effect sequence
+    /// as one that committed every block in order (unbonding maturity is
+    /// height-relative, #660). This relies on the
+    /// one-EVM-block-per-committed-boule-block invariant: EVM block number
+    /// advances 1:1 with boule height, so the block at boule height `h` has EVM
+    /// number `current_number - (height - h)`.
     ///
-    /// Applies ops to the ledger but does not drain updates — the caller's
-    /// [`Self::derive_validator_updates`] for the current block drains the gap's
-    /// and the current block's deltas together.
-    async fn backfill_self_synced_gap(&self, payload: &Value, prev_height: Height, height: Height) {
+    /// Applies staking/slashing ops to the ledger but does not drain updates —
+    /// the caller's [`Self::derive_validator_updates`] for the current block
+    /// drains the gap's and the current block's deltas together. Returns the
+    /// gap's submission effects in ascending block order; the caller prepends
+    /// them to the current block's effects so the materialised effect sequence
+    /// is the same one a fully-executing node produced.
+    async fn backfill_self_synced_gap(
+        &self,
+        payload: &Value,
+        prev_height: Height,
+        height: Height,
+    ) -> Vec<ValidatorEffect> {
         // No gap: the frontier advanced by exactly one block (the common path).
         if height.0 <= prev_height.0 + 1 {
-            return;
+            return Vec::new();
         }
         let Some(current_number) = payload["blockNumber"]
             .as_str()
@@ -569,19 +588,24 @@ impl RethApplication {
             tracing::warn!(
                 target: "boule::reth",
                 "self-sync backfill: current payload has no parseable blockNumber; \
-                 skipping staking reconcile over the gap",
+                 skipping reconcile over the gap",
             );
-            return;
+            return Vec::new();
         };
         tracing::info!(
             target: "boule::reth",
             from = prev_height.0 + 1,
             to = height.0 - 1,
-            "self-sync backfill: reconciling staking over EL self-synced gap",
+            "self-sync backfill: reconciling staking/slashing + submission effects over \
+             EL self-synced gap",
         );
-        // Skipped boule heights, oldest first, applied at their own height.
+        let mut gap_effects = Vec::new();
+        // Skipped boule heights, oldest first, applied/derived at their own
+        // height so the effect order matches the per-block path exactly.
         for h in (prev_height.0 + 1)..height.0 {
             let evm_number = current_number - (height.0 - h);
+            // Staking + slashing → the CL stake ledger (drained by the current
+            // block's derive_validator_updates, alongside this block's deltas).
             let ops = match self
                 .transport
                 .eth_rpc("eth_getLogs", staking::logs_filter_by_number(evm_number))
@@ -600,12 +624,96 @@ impl RethApplication {
                     Vec::new()
                 }
             };
-            let mut src = self.stake_source.lock();
-            src.advance_to_height(Height(h));
-            for (node_id, op) in ops {
-                src.apply(node_id, op);
+            let slashed = match self
+                .transport
+                .eth_rpc("eth_getLogs", slashing::logs_filter_by_number(evm_number))
+                .await
+            {
+                Ok(logs) => slashing::parse_slashed_logs(&logs),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "boule::reth",
+                        height = h,
+                        evm_number,
+                        error = %e,
+                        "self-sync backfill: eth_getLogs failed; slashing events for \
+                         this skipped block are lost",
+                    );
+                    Vec::new()
+                }
+            };
+            {
+                let mut src = self.stake_source.lock();
+                // Advance the ledger clock first (matures unbondings), then
+                // apply this block's ops and slashes — same order, at the same
+                // height, as the per-block derive_validator_updates path (#660).
+                src.advance_to_height(Height(h));
+                for (node_id, op) in ops {
+                    src.apply(node_id, op);
+                }
+                for node_id in slashed {
+                    src.slash(node_id);
+                }
             }
+            // Submission effects (rotation/endpoint/param/governance) → one-shot
+            // ValidatorEffects that have no re-submit, so they MUST be backfilled
+            // (#772). Read by EVM number; the filter embeds it (block_hash unused).
+            gap_effects.extend(self.derive_gap_predeploy_effects(evm_number).await);
         }
+        gap_effects
+    }
+
+    /// Derive one self-synced gap block's submission-predeploy effects by EVM
+    /// block number (#772 backfill). Mirrors the per-block
+    /// `derive_{rotation,endpoint,param,governance}_effects` order so a
+    /// self-synced node produces the byte-identical effect sequence as one that
+    /// executed the block via the normal commit path. Read by number, not hash —
+    /// the gap block's hash is unknown on the self-sync path.
+    async fn derive_gap_predeploy_effects(&self, evm_number: u64) -> Vec<ValidatorEffect> {
+        // `derive_predeploy_effects` ignores its block_hash arg (the filter
+        // already embeds the selection), so the *_logs_filter_by_number variant
+        // slots straight in. Order matches the current-block path in `commit`:
+        // rotation, endpoint, param, governance.
+        let mut effects = self
+            .derive_predeploy_effects(
+                "",
+                rotation::logs_filter_by_number(evm_number),
+                rotation::parse_rotation_logs,
+                ValidatorEffect::KeyRotation,
+                "rotation (gap backfill)",
+            )
+            .await;
+        effects.extend(
+            self.derive_predeploy_effects(
+                "",
+                endpoint::logs_filter_by_number(evm_number),
+                endpoint::parse_endpoint_logs,
+                ValidatorEffect::EndpointUpdate,
+                "endpoint (gap backfill)",
+            )
+            .await,
+        );
+        effects.extend(
+            self.derive_predeploy_effects(
+                "",
+                param::logs_filter_by_number(evm_number),
+                param::parse_param_logs,
+                ValidatorEffect::ParamUpdate,
+                "param (gap backfill)",
+            )
+            .await,
+        );
+        effects.extend(
+            self.derive_predeploy_effects(
+                "",
+                governance::logs_filter_by_number(evm_number),
+                governance::parse_approved_logs,
+                ValidatorEffect::Reconfig,
+                "governance (gap backfill)",
+            )
+            .await,
+        );
+        effects
     }
 
     /// Reconcile the committed frontier with reality on restart. `new` starts at
@@ -860,6 +968,11 @@ impl Application for RethApplication {
                 .context("committed block command is not a JSON execution payload")?;
             let new_root = state_root_of(&payload)?;
             let (_, status) = self.engine().commit_block(&payload).await?;
+            // Submission effects derived from blocks the EL self-synced past
+            // (#772). Empty unless this commit closed a gap; prepended to the
+            // current block's effects below so the materialised order is the
+            // same one a fully-executing node produced (ascending by height).
+            let mut gap_effects: Vec<ValidatorEffect>;
             match status {
                 ElStatus::Valid => {
                     // The EL executed it — advance the committed frontier,
@@ -872,11 +985,18 @@ impl Application for RethApplication {
                         c.state_root = new_root;
                         prev
                     };
-                    // #674: if the frontier jumped by more than one block, the
-                    // EL executed the in-between blocks via background self-sync
-                    // (not through `commit`); read their staking events now so
-                    // the CL stake ledger doesn't drift from EL state.
-                    self.backfill_self_synced_gap(&payload, prev_height, block.header.height)
+                    // #674/#772: if the frontier jumped by more than one block,
+                    // the EL executed the in-between blocks via background
+                    // self-sync (not through `commit`). Read their staking +
+                    // slashing events now so the CL stake ledger doesn't drift
+                    // from EL state, and derive their one-shot submission effects
+                    // (rotation/endpoint/param/governance) so a self-synced node
+                    // applies the byte-identical effect sequence as one that
+                    // executed every block — otherwise a committed, non-re-emitted
+                    // governance Approved would land on some replicas and not
+                    // others, silently splitting the validator set (#772).
+                    gap_effects = self
+                        .backfill_self_synced_gap(&payload, prev_height, block.header.height)
                         .await;
                 }
                 ElStatus::Syncing => {
@@ -942,6 +1062,16 @@ impl Application for RethApplication {
             effects.extend(self.derive_endpoint_effects(&payload).await);
             effects.extend(self.derive_param_effects(&payload).await);
             effects.extend(self.derive_governance_effects(&payload).await);
+            // #772: prepend the self-synced gap's submission effects (ascending
+            // by height) ahead of this block's, so the materialised effect
+            // sequence is byte-identical to a node that executed every block in
+            // order. The gap rotations' `recordKey` registry writes already
+            // executed in the EL during self-sync, so they are NOT re-recorded
+            // here (only this block's `effects` feed `record_rotated_keys`).
+            if !gap_effects.is_empty() {
+                gap_effects.extend(effects);
+                effects = gap_effects;
+            }
             Ok(CommitResult {
                 validator_updates,
                 effects,
@@ -2103,6 +2233,160 @@ mod tests {
             ],
             "the self-synced gap's staking event (C +7) is backfilled alongside \
              the current block's (A removed)",
+        );
+    }
+
+    /// #772: a governance `Approved` (and a rotation) is a **one-shot** effect —
+    /// emitted once per proposal, never re-submitted. If the block carrying it
+    /// falls in an EL self-sync gap, the effect must still be derived/applied, or
+    /// some replicas apply the membership change and others do not → silent
+    /// validator-set divergence. This asserts a node that self-syncs **past** a
+    /// gap block carrying an `Approved` + a rotation produces the byte-identical
+    /// effect sequence as a node that executed every block in order.
+    #[tokio::test]
+    async fn commit_backfills_one_shot_effects_over_an_el_self_synced_gap() {
+        use crate::predeploy_log::test_support::{abi_log_bytes, topic_node};
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        fn payload_with_number(block_hash: &str, number: u64) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "blockHash": block_hash,
+                    "blockNumber": format!("0x{number:x}"),
+                    "stateRoot": format!("0x{}", "11".repeat(32)),
+                    "timestamp": "0x1",
+                }))
+                .unwrap(),
+            )
+        }
+
+        // Opaque command payloads the predeploy logs carry (reth never decodes
+        // them — they ride through as the effect's bytes).
+        const RECONFIG_CMD: &[u8] = b"reconfig-command-for-an-approved-membership-change";
+        const ROTATION_CMD: &[u8] = b"dual-signed-rotation-command";
+
+        // Block 2 (in the self-synced gap) carries a governance Approved + a
+        // rotation; block 1 and the current block 3 carry nothing. The gap
+        // block's logs are served *by EVM number*; the current block by hash.
+        const BLOCK3_HASH: &str = "0x3c";
+        struct GapEffectsTransport;
+        impl EngineTransport for GapEffectsTransport {
+            fn call(
+                &self,
+                method: &str,
+                _params: Value,
+                _tag: &str,
+            ) -> BoxFuture<'_, Result<Value>> {
+                let v = match method {
+                    "engine_newPayloadV4" => serde_json::json!({ "status": "VALID" }),
+                    "engine_forkchoiceUpdatedV3" => {
+                        serde_json::json!({ "payloadStatus": { "status": "VALID" } })
+                    }
+                    other => panic!("unexpected engine method {other}"),
+                };
+                Box::pin(async move { Ok(v) })
+            }
+            fn eth_rpc(&self, _method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+                let filter = &params[0];
+                let addr = filter["address"].as_str().unwrap_or_default().to_string();
+                // The gap block carrying the one-shot effects: EVM number 0x2,
+                // selected either by-number (gap backfill) or by-hash (per-block
+                // path, used by the no-gap reference node below).
+                let is_gap_block = filter["fromBlock"] == serde_json::json!("0x2")
+                    || filter["blockHash"] == serde_json::json!("0xb2");
+                let logs = if is_gap_block
+                    && addr.eq_ignore_ascii_case(governance::GOVERNANCE_ADDRESS)
+                {
+                    serde_json::json!([{
+                        "topics": [governance::APPROVED_TOPIC, topic_node(0xab)],
+                        "data": abi_log_bytes(RECONFIG_CMD),
+                    }])
+                } else if is_gap_block && addr.eq_ignore_ascii_case(rotation::ROTATION_ADDRESS) {
+                    serde_json::json!([{
+                        "topics": [rotation::ROTATION_TOPIC, topic_node(0x42)],
+                        "data": abi_log_bytes(ROTATION_CMD),
+                    }])
+                } else {
+                    serde_json::json!([])
+                };
+                Box::pin(async move { Ok(logs) })
+            }
+        }
+
+        fn make() -> RethApplication {
+            RethApplication::new(
+                Box::new(GapEffectsTransport),
+                [1u8; 32],
+                FEE,
+                RETH_GENESIS,
+                [0u8; 32],
+                Duration::ZERO,
+                Box::new(BondedStakeLedger::empty()),
+                std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                    64,
+                )),
+            )
+        }
+
+        fn block_at(hash: &str, number: u64, height: u64) -> Block {
+            let commands = vec![payload_with_number(hash, number)];
+            Block {
+                header: BlockHeader {
+                    parent_hash: [0u8; 32],
+                    height: Height(height),
+                    view: View(height),
+                    proposer: [9u8; 32], // not self → no proposer-only registry writes
+                    state_commitment: [0u8; 32],
+                    commands_commitment: Block::commands_commitment(&commands),
+                    validator_history_commitment: [0u8; 32],
+                    committed_height: Height(0),
+                    committed_state_root: [0u8; 32],
+                    timestamp: 1,
+                },
+                commands,
+            }
+        }
+
+        // (a) Self-synced node: the EL executed blocks 1 and 2 in the background;
+        // now it executes block 3, so the frontier jumps 0 → 3 and the gap
+        // (blocks 1, 2) is backfilled. Block 2's one-shot effects must appear.
+        let synced = make();
+        let gap_result = synced
+            .commit(&AppContext::default(), &block_at(BLOCK3_HASH, 3, 3))
+            .await
+            .expect("commit");
+        assert_eq!(synced.committed.lock().height, Height(3));
+
+        // (b) Reference node: executes every block in order. Block 2 (by hash
+        // 0xb2) carries the same one-shot effects via the normal per-block path.
+        let stepwise = make();
+        stepwise
+            .commit(&AppContext::default(), &block_at("0xb1", 1, 1))
+            .await
+            .expect("commit b1");
+        let ref_block2 = stepwise
+            .commit(&AppContext::default(), &block_at("0xb2", 2, 2))
+            .await
+            .expect("commit b2");
+        stepwise
+            .commit(&AppContext::default(), &block_at(BLOCK3_HASH, 3, 3))
+            .await
+            .expect("commit b3");
+
+        // The one-shot effects the executing node derived for block 2 must be
+        // byte-identical to what the self-synced node backfilled for the gap.
+        let expected = vec![
+            ValidatorEffect::KeyRotation(Bytes::from(ROTATION_CMD)),
+            ValidatorEffect::Reconfig(Bytes::from(RECONFIG_CMD)),
+        ];
+        assert_eq!(
+            ref_block2.effects, expected,
+            "sanity: the per-block path derives the rotation + reconfig from block 2",
+        );
+        assert_eq!(
+            gap_result.effects, expected,
+            "the self-synced node must backfill block 2's one-shot rotation + \
+             governance Approved (else silent validator-set divergence, #772)",
         );
     }
 
