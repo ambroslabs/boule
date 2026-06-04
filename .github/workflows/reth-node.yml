@@ -1,0 +1,98 @@
+name: Reth EL node
+
+# Build/test the custom reth execution-layer node (crates/boule-reth-node, the
+# Option A registry writer — #777). That crate is a STANDALONE workspace,
+# deliberately excluded from boule's root workspace (its `reth-ethereum` SDK
+# pulls in hundreds of crates), so the main CI (ci.yml) never compiles it. This
+# dedicated job keeps it from bit-rotting.
+#
+# It is heavy (a reth-SDK build is ~6 min + a large dep tree), so it does NOT
+# run on every PR: it is gated to changes under crates/boule-reth-node/** (plus
+# this workflow), pushes to main touching those paths, and manual dispatch.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/boule-reth-node/**'
+      - '.github/workflows/reth-node.yml'
+  pull_request:
+    paths:
+      - 'crates/boule-reth-node/**'
+      - '.github/workflows/reth-node.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# A new push to the same ref supersedes an in-flight run — this build is slow,
+# don't pile them up.
+concurrency:
+  group: reth-node-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reth-node:
+    name: Build + test (standalone workspace)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Everything runs inside the standalone workspace; it has its own
+        # Cargo.toml / Cargo.lock / deny.toml separate from the repo root.
+        working-directory: crates/boule-reth-node
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSRV is 1.93 (edition 2024); `stable` is well past that. rustfmt+clippy
+      # come from the default profile.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # reth's mdbx-sys runs bindgen via libclang, which needs the C compiler's
+      # resource-dir headers (e.g. stdarg.h). Install clang + libclang and point
+      # bindgen at the installed gcc's include dir. The gcc major version is
+      # derived at runtime so this doesn't pin to a specific runner image's gcc.
+      - name: Install clang/bindgen prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+          gcc_inc=$(ls -d /usr/lib/gcc/x86_64-linux-gnu/*/include | sort -V | tail -1)
+          echo "Using gcc include dir: $gcc_inc"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$gcc_inc" >> "$GITHUB_ENV"
+
+      # The reth tree is enormous; cache the registry/git sources and the build
+      # output, keyed on this crate's own Cargo.lock so a reth bump invalidates
+      # it. (rust-cache keys on the root workspace, so it's used here with an
+      # explicit workspace path + key prefix for the standalone tree.)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/boule-reth-node
+          prefix-key: reth-node
+          # A flaky test shouldn't throw away the expensive reth build cache.
+          cache-on-failure: true
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Doctests
+        run: cargo test --locked --doc
+
+      # The standalone tree has its own dep graph (reth/alloy/revm) and its own
+      # deny.toml (the root deny job never sees it). cargo-deny resolves the
+      # lockfile itself, so this is cheap and doesn't need the build. Uses the
+      # same action as the root `deny` job for consistency; point it at this
+      # workspace's manifest + config.
+      # cargo-deny auto-loads the deny.toml next to the manifest, so no explicit
+      # --config is needed.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: crates/boule-reth-node/Cargo.toml
+          arguments: --all-features
