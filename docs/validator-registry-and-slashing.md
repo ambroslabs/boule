@@ -209,6 +209,100 @@ path → `StakeSource` → jail, step 4 below) and the registry **write path** t
 records committed rotations plus the `settledFrontier` gate (step 2). The
 predeploy trusts `keyAt` as settled until that frontier lands.
 
+## The write path (#732 step 2) — what was built, and why rotations don't decode in-EVM
+
+Step 2 ("populate the registry automatically so it mirrors consensus") splits
+into the two writes the registry takes: **genesis** and **rotations**. They have
+very different feasibility, so they are handled differently.
+
+### Genesis seed — done, validated on a live reth
+
+The genesis validators' keys are written directly into the registry predeploy's
+**genesis storage** (`alloc[Registry].storage`), the EVM analogue of
+`BlsKeyHistory::with_genesis`. `registry::genesis_seed_storage` derives the
+`(slot -> value)` words for a `mapping(bytes32 => KeyEntry[])` (each genesis
+validator a one-element `[(vEff: 0, key)]` history) and
+`genesis_seed_storage_json` renders them for an `alloc[…b12].storage` block.
+
+The storage-slot layout (the doc's "fiddliest part") is:
+
+- `history` is the contract's only state variable → declaration slot `0`.
+- `history[validator]` array: `arraySlot = keccak256(validator ‖ uint256(0))`
+  holds the **length**; elements start at `dataBase = keccak256(arraySlot)`.
+- A `KeyEntry { uint64 vEff; bytes key; }` occupies **2 slots** (the `uint64`
+  does not pack with the trailing dynamic `bytes`): element `i` is
+  `vEff` at `dataBase + 2i`, `key` header at `dataBase + 2i + 1`.
+- A 48-byte BLS key exceeds 31 bytes → the `bytes` **long form**: the header slot
+  holds `2*len + 1` (= 97), and the bytes live at `keccak256(headerSlot)`, one
+  32-byte slot at a time (48 bytes → 2 slots, the second right-padded).
+
+Validated end-to-end against reth v2.2.0 (`contracts/test/registry-seed.mjs`):
+a genesis seeded for `(validator = 0xaa*32, key = 0x11*48, vEff = 0)` returns the
+exact derived words from `eth_getStorageAt`, and the contract reads its own
+seeded storage as a valid history — `historyLength == 1`, `keyAt(v, 0)` and
+`keyAt(v, 5)` both return the seeded key. The Rust slot derivation is pinned to
+those live-reth ground-truth words in a unit test.
+
+Note: the committed `genesis.template.json` carries **no** validator keys — they
+are per-deployment, so the seed is produced by the (future) deployment-specific
+genesis builder calling `genesis_seed_storage`, exactly as consensus calls
+`BlsKeyHistory::with_genesis` with the deployment's genesis set. The pin test
+uses a synthetic vector, not template state.
+
+### Rotations — NOT decoded in Solidity (deliberate). Recommended: boule-side recording.
+
+The original plan (b) was to extend `Rotation.submitRotation` so the predeploy
+*also* decodes `(vEff, newBlsKey)` from the carried `rotationCommand` and calls
+`Registry.recordKey`. **Investigated and rejected as impractical.** The command
+is `ROTATION_TAG ‖ postcard(DualSignedRotation)` — a **postcard** binary
+encoding (`boule-consensus/src/validator_rotation.rs::encode_command`), and
+postcard is hostile to in-EVM decoding:
+
+- `vEff` (`View(u64)`) is a **LEB128 varint** of *data-dependent length*
+  (1–10 bytes). Every field after it sits at a variable offset, so there are no
+  constant calldata slices — Solidity would need a hand-rolled varint loop that
+  re-bases all downstream offsets.
+- `new_bls_pubkey` is `Option<&[u8]>` (`serde_optional_bls_pubkey` serializes the
+  48 bytes *as a slice*): an `Option` tag byte (0x00/0x01) **plus a varint length
+  prefix**, not a fixed 48-byte field — another varint and another branch.
+- `new_pubkey` (the Ed25519 half) precedes the BLS field, and both signatures
+  (`sig_old`, `sig_new`, each a length-prefixed 64-byte slice) follow it, so the
+  parser must walk the whole structure to reach the BLS key.
+
+Decoding non-self-describing varint-framed postcard in Solidity is expensive,
+brittle, and would **couple the contract to postcard's internal wire format** —
+a layer the rotation predeploy is explicitly designed to treat as opaque
+("consensus validates it; the EVM never interprets it"). It also re-implements,
+unverified, parsing that boule already does correctly. So path (A) is not taken.
+
+**Recommended rotation→registry recording (in priority order):**
+
+1. **boule-side recording (recommended).** boule already decodes every committed
+   rotation (`DualSignedRotation::decode_command`) to drive its own
+   `BlsKeyHistory`. At that same point — where it has the verified
+   `(validator, v_eff, new_bls_pubkey)` in hand — it submits a
+   `Registry.recordKey(validator, v_eff, key)` transaction (or, cleaner, the EL
+   applies it as part of executing the rotation effect). This keeps the *single
+   authoritative decoder* (consensus) as the only thing that parses the command,
+   makes the registry a strict function of what consensus already accepted, and
+   needs **no** Solidity decode. The MVP `recordKey` is unauthenticated, so a
+   plain external call suffices; the #732 hardening (verify the dual signature
+   in-EVM before recording) can be layered on later via the same `BlsVerify`
+   path the slashing precompile uses.
+
+2. **A dedicated `Registry.recordRotation(validator, vEff, key)` entrypoint** the
+   rotation flow calls with *already-decoded* fields (decode happens boule-side,
+   as in 1). Functionally identical to calling `recordKey`; only worth a separate
+   selector if recording should carry rotation-specific authorization distinct
+   from the generic `recordKey`. For the MVP, `recordKey` is sufficient.
+
+3. **In-Solidity decode inside `submitRotation`** — rejected, per above.
+
+Either of (1)/(2) preserves the "Mirror, not inversion" and consistency/lag
+contract above: the write is driven by the *same* committed submission consensus
+consumes, future-dated to `v_eff`, and the slashing precompile only trusts views
+at/below `settledFrontier`.
+
 ## Open questions
 
 - **Storage layout for a dynamic per-validator history** in Solidity storage
