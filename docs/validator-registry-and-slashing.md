@@ -308,8 +308,17 @@ at/below `settledFrontier`.
 - **Storage layout for a dynamic per-validator history** in Solidity storage
   (mapping of validator → dynamic array) and its genesis pre-population — the
   genesis-storage encoding is the fiddliest part.
-- **`settledFrontier` derivation in-EVM** — cleanest source (registry's own EVM
-  block height vs. an explicit checkpoint the rotation flow advances).
+- **`settledFrontier` derivation in-EVM** — *resolved (#732).* The registry
+  holds an explicit `settledView` checkpoint (slot 3), advanced by the proposer
+  each commit via the WRITER-gated `recordSettled(viewNum)` with the
+  just-committed view; `Slashing.submitEquivocation` reverts (`"view not
+  settled"`) unless `view <= settledView`. It is **exact, not conservative**:
+  every rotation is future-dated (`vEff > commitView`, `V_EFF_MIN_DELAY >= 2`),
+  so a rotation effective at view `V` was committed — and therefore recorded —
+  at a view strictly before `V`; once view `C` commits, every rotation with
+  `vEff <= C` is already recorded, making `C` the highest fully-recorded view.
+  (The committed-block-height = executed-view 1:1 mapping, #674, is what lets the
+  proposer pass the view it just committed.)
 - **Slash magnitude / partial slashing** — full burn (today's #658b) vs. a
   fraction; an economic-policy decision orthogonal to the mechanism.
 - **Stake reads for #729's governance tally** — the same registry should expose

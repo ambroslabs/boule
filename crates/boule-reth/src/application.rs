@@ -369,6 +369,44 @@ impl RethApplication {
         }
     }
 
+    /// #732 settled-frontier gate — advance the `Registry`'s `settledView` to
+    /// the just-committed `view` (`recordSettled`) so the slashing predeploy can
+    /// safely gate proofs (`view <= settledView`).
+    ///
+    /// **Proposer-only**, exactly like [`Self::record_rotated_keys`]: only the
+    /// committed block's proposer submits the system tx. Submitted *after* this
+    /// block's `recordKey`s (the caller orders it last), so by the time the
+    /// frontier reaches a view, every rotation effective at or before it is
+    /// already recorded — making `view` an **exact** settled frontier. This is
+    /// safe because every rotation is future-dated (`vEff > commitView`,
+    /// `V_EFF_MIN_DELAY >= 2`): a rotation effective at view `V` was committed,
+    /// and therefore recorded, at a view strictly before `V`.
+    ///
+    /// `recordSettled` clamps monotonically, so a replayed/older view is a
+    /// harmless no-op; a failed submission is logged, never fatal (consensus
+    /// commits regardless of the EL, and the next commit re-advances the
+    /// frontier).
+    async fn record_settled_view(&self, view: View) {
+        let calldata = registry::record_settled_calldata(view);
+        match self
+            .submit_system_call(registry::registry_address(), calldata)
+            .await
+        {
+            Ok(hash) => tracing::info!(
+                target: "boule::reth",
+                view = view.0,
+                tx = %hash,
+                "registry write: submitted recordSettled (advanced settled frontier)",
+            ),
+            Err(e) => tracing::warn!(
+                target: "boule::reth",
+                error = %e,
+                view = view.0,
+                "registry write: recordSettled submission failed (re-advanced next commit)",
+            ),
+        }
+    }
+
     /// This block's endpoint-predeploy effects (#731).
     async fn derive_endpoint_effects(&self, payload: &Value) -> Vec<ValidatorEffect> {
         let Some(block_hash) = payload["blockHash"].as_str() else {
@@ -812,9 +850,15 @@ impl Application for RethApplication {
             // on-chain weight surface #729's tally and #746's auth read. Each
             // `validator_updates` entry is a genuine weight change (the
             // StakeSource only emits changed validators), so no redundant write.
+            // #732 settled-frontier: after mirroring this block's rotated keys,
+            // advance the Registry's `settledView` to the committed view so the
+            // slashing predeploy accepts proofs for any view at/below it
+            // (`recordSettled` last, so every recorded rotation precedes the
+            // frontier reaching its `vEff`).
             if ctx.proposer == self.self_id {
                 self.record_rotated_keys(&effects).await;
                 self.record_validator_weights(&validator_updates).await;
+                self.record_settled_view(block.header.view).await;
             }
             effects.extend(self.derive_endpoint_effects(&payload).await);
             effects.extend(self.derive_param_effects(&payload).await);
@@ -2135,9 +2179,15 @@ mod tests {
         assert_eq!(result.effects.len(), 1, "one rotation effect surfaced");
 
         let sent = sent.lock();
-        assert_eq!(sent.len(), 1, "exactly one recordKey system tx authored");
+        // The proposer authors two system txs: the recordKey (first) and the
+        // per-commit recordSettled frontier advance (#732, last).
+        assert_eq!(
+            sent.len(),
+            2,
+            "recordKey + recordSettled system txs authored",
+        );
 
-        // Decode the authored tx and check its calldata is the expected
+        // Decode the first authored tx and check its calldata is the expected
         // recordKey(validator, vEff, key128).
         let env = TxEnvelope::decode_2718(&mut sent[0].as_ref()).expect("typed tx");
         let tx = match &env {
@@ -2162,6 +2212,28 @@ mod tests {
         // The key is the 128-byte EIP-2537 form of the rotated pubkey.
         let want_key = boule_core::crypto::sig_scheme::bls_pubkey_to_eip2537_g1(&pk).unwrap();
         assert_eq!(&cd[132..132 + 128], &want_key, "EIP-2537 128-byte key");
+
+        // The second tx is recordSettled(view) for the committed view (1),
+        // advancing the slashing predeploy's settled frontier (#732).
+        let env2 = TxEnvelope::decode_2718(&mut sent[1].as_ref()).expect("typed tx");
+        let tx2 = match &env2 {
+            TxEnvelope::Eip1559(s) => s.tx(),
+            other => panic!("expected EIP-1559, got {other:?}"),
+        };
+        assert_eq!(
+            tx2.to,
+            alloy_primitives::TxKind::Call(registry::registry_address()),
+            "recordSettled addressed to the Registry predeploy",
+        );
+        let cd2 = tx2.input.as_ref();
+        assert_eq!(
+            &cd2[0..4],
+            &registry::RECORD_SETTLED_SELECTOR,
+            "recordSettled selector",
+        );
+        let mut view_word = [0u8; 32];
+        view_word[24..].copy_from_slice(&block.header.view.0.to_be_bytes());
+        assert_eq!(&cd2[4..36], &view_word, "recordSettled(view == committed)");
     }
 
     /// A non-proposer commit reads the same rotation effect but writes **nothing**
@@ -2299,7 +2371,12 @@ mod tests {
         );
 
         let sent = sent.lock();
-        assert_eq!(sent.len(), 1, "exactly one recordWeight system tx authored");
+        // recordWeight (first) + the per-commit recordSettled frontier advance.
+        assert_eq!(
+            sent.len(),
+            2,
+            "recordWeight + recordSettled system txs authored",
+        );
         let env = TxEnvelope::decode_2718(&mut sent[0].as_ref()).expect("typed tx");
         let tx = match &env {
             TxEnvelope::Eip1559(s) => s.tx(),
@@ -2319,6 +2396,18 @@ mod tests {
         assert_eq!(&cd[4..36], &node, "validator id");
         assert!(cd[36..68].iter().all(|b| *b == 0), "newWeight == 0 word");
         assert_eq!(cd.len(), 4 + 32 * 2, "recordWeight has no dynamic tail");
+
+        // The trailing tx is recordSettled(view) for the committed view (#732).
+        let env2 = TxEnvelope::decode_2718(&mut sent[1].as_ref()).expect("typed tx");
+        let cd2 = match &env2 {
+            TxEnvelope::Eip1559(s) => s.tx().input.as_ref().to_vec(),
+            other => panic!("expected EIP-1559, got {other:?}"),
+        };
+        assert_eq!(
+            &cd2[0..4],
+            &registry::RECORD_SETTLED_SELECTOR,
+            "recordSettled selector",
+        );
     }
 
     /// A non-proposer commit computes the same weight change but writes
@@ -2351,13 +2440,17 @@ mod tests {
         );
     }
 
-    /// A commit with no seated-weight change authors no `recordWeight` — the
-    /// proposer only writes genuine deltas (the StakeSource emits none).
+    /// A commit with no seated-weight change and no rotation authors no
+    /// `recordWeight`/`recordKey` — but the proposer still advances the settled
+    /// frontier every commit, so the one and only system tx is `recordSettled`.
     #[tokio::test]
-    async fn proposer_commit_with_no_weight_change_writes_nothing() {
+    async fn proposer_commit_with_no_change_writes_only_record_settled() {
+        use alloy_consensus::TxEnvelope;
+        use alloy_eips::eip2718::Decodable2718;
+
         let self_id = [1u8; 32];
         let sent = Arc::new(Mutex::new(Vec::new()));
-        // No staking logs ⇒ no weight delta.
+        // No staking logs ⇒ no weight delta; no rotation logs ⇒ no recordKey.
         let app = weight_app(self_id, Value::Array(Vec::new()), vec![], Arc::clone(&sent));
 
         let g = genesis();
@@ -2371,9 +2464,25 @@ mod tests {
             .expect("build");
         let result = app.commit(&ctx, &block).await.expect("commit");
         assert!(result.validator_updates.is_empty(), "no weight change");
-        assert!(
-            sent.lock().is_empty(),
-            "no recordWeight when nothing changed",
+
+        let sent = sent.lock();
+        assert_eq!(
+            sent.len(),
+            1,
+            "only the per-commit recordSettled frontier advance",
         );
+        let env = TxEnvelope::decode_2718(&mut sent[0].as_ref()).expect("typed tx");
+        let cd = match &env {
+            TxEnvelope::Eip1559(s) => s.tx().input.as_ref().to_vec(),
+            other => panic!("expected EIP-1559, got {other:?}"),
+        };
+        assert_eq!(
+            &cd[0..4],
+            &registry::RECORD_SETTLED_SELECTOR,
+            "the lone system tx is recordSettled",
+        );
+        let mut view_word = [0u8; 32];
+        view_word[24..].copy_from_slice(&block.header.view.0.to_be_bytes());
+        assert_eq!(&cd[4..36], &view_word, "recordSettled(view == committed)");
     }
 }

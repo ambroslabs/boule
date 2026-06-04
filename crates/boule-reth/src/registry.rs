@@ -64,6 +64,20 @@ pub const WEIGHT_OF_SELECTOR: [u8; 4] = [0x4c, 0x10, 0x8d, 0x6d];
 /// auto-generated getter for the public `totalWeight` scalar).
 pub const TOTAL_WEIGHT_SELECTOR: [u8; 4] = [0x96, 0xc8, 0x2e, 0x57];
 
+/// 4-byte selector of `settledView()` (the settled-frontier read the slashing
+/// predeploy calls to gate proofs, #732 — the auto-generated getter for the
+/// public `settledView` scalar).
+pub const SETTLED_VIEW_SELECTOR: [u8; 4] = [0x7a, 0x68, 0x6e, 0xf2];
+
+/// 4-byte selector of `recordSettled(uint64)` (the WRITER-gated settled-frontier
+/// advance the proposer submits each commit, #732).
+pub const RECORD_SETTLED_SELECTOR: [u8; 4] = [0x09, 0x28, 0x83, 0x44];
+
+/// `keccak256("SettledRecorded(uint64,uint64)")` — topic0 of the
+/// `SettledRecorded` event, emitted by `recordSettled` when the frontier moves.
+pub const SETTLED_RECORDED_TOPIC: &str =
+    "0x899ac1f88bca8ba6419098a7c22870b9f9adc8c9c05890572117effa742e5eb6";
+
 /// Declaration slot of the registry's `mapping(bytes32 => KeyEntry[]) history`
 /// — the single state variable in `Registry.sol`, so it occupies slot `0`.
 const HISTORY_MAPPING_SLOT: u64 = 0;
@@ -81,6 +95,14 @@ const WEIGHT_MAPPING_SLOT: u64 = 1;
 /// state variable, so it occupies slot `2` (a standalone `uint64`, right-aligned
 /// in its own slot).
 const TOTAL_WEIGHT_SLOT: u64 = 2;
+
+/// Declaration slot of the registry's `uint64 settledView` scalar (#732) — the
+/// fourth state variable, so it occupies slot `3`. Not genesis-seeded: a fresh
+/// chain's frontier is `0` (the EVM default) and only advances once the
+/// proposer commits its first view via `recordSettled`. (A genesis chain's keys
+/// are all `vEff = 0`, so `settledView = 0` already covers the genesis set.)
+#[allow(dead_code)]
+const SETTLED_VIEW_SLOT: u64 = 3;
 
 use boule_consensus::View;
 use boule_consensus::validator_rotation::{DualSignedRotation, OperatorSignedRotation};
@@ -200,6 +222,21 @@ pub fn record_weight_calldata(validator: &NodeId, weight: u64) -> alloy_primitiv
     let mut w_word = [0u8; 32];
     w_word[24..].copy_from_slice(&weight.to_be_bytes());
     out.extend_from_slice(&w_word);
+    alloy_primitives::Bytes::from(out)
+}
+
+/// ABI-encode the `recordSettled(uint64 viewNum)` calldata: the 4-byte selector
+/// followed by the single left-padded `viewNum` word. The proposer submits this
+/// each commit with the just-committed view to advance the registry's settled
+/// frontier (#732) — the gate the slashing predeploy reads. The contract clamps
+/// monotonically, so a stale/replayed `viewNum` is a harmless no-op.
+pub fn record_settled_calldata(view: View) -> alloy_primitives::Bytes {
+    let mut out = Vec::with_capacity(4 + 32);
+    out.extend_from_slice(&RECORD_SETTLED_SELECTOR);
+    // head[0]: viewNum (uint64), right-aligned in a 32-byte word.
+    let mut v_word = [0u8; 32];
+    v_word[24..].copy_from_slice(&view.0.to_be_bytes());
+    out.extend_from_slice(&v_word);
     alloy_primitives::Bytes::from(out)
 }
 
@@ -415,6 +452,10 @@ mod tests {
             code.contains(KEY_RECORDED_TOPIC.trim_start_matches("0x")),
             "KeyRecorded event topic must appear as the PUSH32 operand",
         );
+        assert!(
+            code.contains(SETTLED_RECORDED_TOPIC.trim_start_matches("0x")),
+            "SettledRecorded event topic must appear as the PUSH32 operand",
+        );
         for (name, sel) in [
             ("keyAt", KEY_AT_SELECTOR),
             ("recordKey", RECORD_KEY_SELECTOR),
@@ -422,6 +463,8 @@ mod tests {
             ("recordWeight", RECORD_WEIGHT_SELECTOR),
             ("weightOf", WEIGHT_OF_SELECTOR),
             ("totalWeight", TOTAL_WEIGHT_SELECTOR),
+            ("settledView", SETTLED_VIEW_SELECTOR),
+            ("recordSettled", RECORD_SETTLED_SELECTOR),
         ] {
             assert!(
                 code.contains(&hex::encode(sel)),
@@ -863,6 +906,33 @@ mod tests {
         assert_eq!(&cd[4..36], &[0x01; 32]);
         assert!(cd[36..68].iter().all(|b| *b == 0), "weight word all zero");
         assert_eq!(cd.len(), 4 + 32 * 2);
+    }
+
+    /// `record_settled_calldata` lays out `recordSettled(uint64)` exactly:
+    /// selector then the single left-padded `viewNum` word.
+    #[test]
+    fn record_settled_calldata_layout() {
+        let cd = record_settled_calldata(View::new(0x1234_5678));
+        assert_eq!(&cd[0..4], &RECORD_SETTLED_SELECTOR, "selector");
+        let mut v_word = [0u8; 32];
+        v_word[24..].copy_from_slice(&0x1234_5678u64.to_be_bytes());
+        assert_eq!(&cd[4..36], &v_word, "viewNum word");
+        assert!(cd[4..28].iter().all(|b| *b == 0), "view high bytes zero");
+        assert_eq!(
+            cd.len(),
+            4 + 32,
+            "exact calldata length (single static arg)"
+        );
+    }
+
+    /// `recordSettled(0)` (genesis frontier) still encodes a full zero word —
+    /// fixed-width regardless of the value.
+    #[test]
+    fn record_settled_calldata_zero_view() {
+        let cd = record_settled_calldata(View::ZERO);
+        assert_eq!(&cd[0..4], &RECORD_SETTLED_SELECTOR);
+        assert!(cd[4..36].iter().all(|b| *b == 0), "view word all zero");
+        assert_eq!(cd.len(), 4 + 32);
     }
 
     /// The address helper parses to the same fixed predeploy address as the
