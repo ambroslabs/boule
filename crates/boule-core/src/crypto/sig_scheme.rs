@@ -704,6 +704,105 @@ mod tests {
 
     use crate::crypto::signed::{NodeSigner, Signer};
 
+    // Ground-truth vector generator for the EIP-2537 BLS slashing precompile
+    // (#732b). Emits a real boule BLS signature plus its verify inputs —
+    // pubkey (G1), the hash-to-curve point H (G2), the signature (G2), and
+    // -G1_generator — in **EIP-2537 uncompressed** encoding (each Fp coord
+    // 16-byte-zero-padded to 64; Fp2 as c0||c1 via `.fp[0]`/`.fp[1]`, the
+    // ordering that bit a naive blst `serialize()` conversion). These vectors
+    // were used to confirm that the EIP-2537 pairing precompile validates a
+    // boule signature on a live reth — `e(pubkey,H)·e(-G1gen,sig) == 1` returns
+    // true — which is the core of the slashing precompile. `#[ignore]` so it
+    // doesn't run in CI; regenerate with:
+    //   cargo test -p boule-core gen_eip2537_vectors -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn gen_eip2537_vectors() {
+        use blst::min_pk::SecretKey;
+        use blst::{
+            BLST_ERROR, blst_bendian_from_fp, blst_fp, blst_hash_to_g2, blst_p1, blst_p1_affine,
+            blst_p1_cneg, blst_p1_deserialize, blst_p1_generator, blst_p1_to_affine, blst_p2,
+            blst_p2_affine, blst_p2_deserialize, blst_p2_to_affine,
+        };
+
+        fn hx(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        fn fp64(fp: &blst_fp) -> [u8; 64] {
+            let mut be = [0u8; 48];
+            unsafe { blst_bendian_from_fp(be.as_mut_ptr(), fp) };
+            let mut out = [0u8; 64];
+            out[16..].copy_from_slice(&be); // EIP-2537: 16 zero pad + 48-byte Fp
+            out
+        }
+        fn g1(a: &blst_p1_affine) -> Vec<u8> {
+            [fp64(&a.x), fp64(&a.y)].concat()
+        }
+        fn g2(a: &blst_p2_affine) -> Vec<u8> {
+            // EIP-2537 Fp2 order is (c0, c1) == (.fp[0], .fp[1]).
+            [
+                fp64(&a.x.fp[0]),
+                fp64(&a.x.fp[1]),
+                fp64(&a.y.fp[0]),
+                fp64(&a.y.fp[1]),
+            ]
+            .concat()
+        }
+
+        let sk = SecretKey::key_gen(&[7u8; 32], &[]).unwrap();
+        let pk = sk.sk_to_pk();
+        let msg: &[u8] = b"equivocation: same view, conflicting block hashes";
+        let dst = BlsAggregated::DST;
+        let sig = sk.sign(msg, dst, &[]);
+        assert_eq!(
+            sig.verify(true, msg, dst, &[], &pk, true),
+            BLST_ERROR::BLST_SUCCESS,
+            "blst self-check"
+        );
+
+        let mut h = blst_p2::default();
+        let mut h_aff = blst_p2_affine::default();
+        let mut pk_aff = blst_p1_affine::default();
+        let mut sig_aff = blst_p2_affine::default();
+        let pk_bytes = pk.serialize();
+        let sig_bytes = sig.serialize();
+        unsafe {
+            blst_hash_to_g2(
+                &mut h,
+                msg.as_ptr(),
+                msg.len(),
+                dst.as_ptr(),
+                dst.len(),
+                std::ptr::null(),
+                0,
+            );
+            blst_p2_to_affine(&mut h_aff, &h);
+            assert_eq!(
+                blst_p1_deserialize(&mut pk_aff, pk_bytes.as_ptr()),
+                BLST_ERROR::BLST_SUCCESS
+            );
+            assert_eq!(
+                blst_p2_deserialize(&mut sig_aff, sig_bytes.as_ptr()),
+                BLST_ERROR::BLST_SUCCESS
+            );
+        }
+
+        // -G1_generator (for the pairing equation e(pk,H)*e(-G1gen,sig)==1).
+        let mut neg_aff = blst_p1_affine::default();
+        unsafe {
+            let mut neg: blst_p1 = *blst_p1_generator();
+            blst_p1_cneg(&mut neg, true);
+            blst_p1_to_affine(&mut neg_aff, &neg);
+        }
+
+        println!("VEC_MSG={}", hx(msg));
+        println!("VEC_DST={}", hx(dst));
+        println!("VEC_PUBKEY_G1={}", hx(&g1(&pk_aff)));
+        println!("VEC_HMSG_G2={}", hx(&g2(&h_aff)));
+        println!("VEC_SIG_G2={}", hx(&g2(&sig_aff)));
+        println!("VEC_NEG_G1GEN={}", hx(&g1(&neg_aff)));
+    }
+
     // ── SignerBitmap ─────────────────────────────────────────────
 
     #[test]
