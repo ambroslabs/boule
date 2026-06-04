@@ -521,6 +521,50 @@ fn pop_preimage(chain_id: &ChainId, pubkey: &BlsPublicKey) -> [u8; 32 + 48] {
     out
 }
 
+/// Convert a 48-byte compressed `min-pk` G1 pubkey ([`BlsPublicKey`]) into its
+/// **128-byte EIP-2537 uncompressed** G1 encoding: `x ‖ y`, each Fp coordinate
+/// big-endian and left-zero-padded from 48 to 64 bytes (16 zero bytes + 48-byte
+/// Fp).
+///
+/// This is the on-chain form the slashing predeploy (`Slashing.sol`) and the
+/// BLS12-381 G1 precompiles consume: `Registry.keyAt` must return exactly this
+/// 128-byte layout, so the #732 registry write path converts a rotated key with
+/// this before `recordKey`. Factored here (next to the blst-backed signing) so
+/// the EVM-facing crate and the slashing/QC test vectors
+/// (`gen_slashing_vectors` / `gen_eip2537_vectors`) share one encoding rather
+/// than each reimplementing the blst FFI dance.
+///
+/// Errors if `pubkey` is not a valid compressed G1 point (it is round-tripped
+/// through blst `deserialize`, which validates the subgroup/encoding).
+pub fn bls_pubkey_to_eip2537_g1(pubkey: &BlsPublicKey) -> Result<[u8; 128], BlsKeyError> {
+    use blst::{BLST_ERROR, blst_bendian_from_fp, blst_fp, blst_p1_affine, blst_p1_deserialize};
+
+    // EIP-2537 Fp: 48-byte big-endian coordinate left-padded to 64 bytes.
+    fn fp64(fp: &blst_fp) -> [u8; 64] {
+        let mut be = [0u8; 48];
+        unsafe { blst_bendian_from_fp(be.as_mut_ptr(), fp) };
+        let mut out = [0u8; 64];
+        out[16..].copy_from_slice(&be);
+        out
+    }
+
+    // Decompress 48-byte compressed -> 96-byte uncompressed, then to affine.
+    let uncompressed = blst::min_pk::PublicKey::from_bytes(pubkey)
+        .map_err(BlsKeyError::Blst)?
+        .serialize();
+    let mut aff = blst_p1_affine::default();
+    // SAFETY: `uncompressed` is a valid 96-byte serialization produced by blst
+    // just above, so `blst_p1_deserialize` reads exactly that buffer.
+    let err = unsafe { blst_p1_deserialize(&mut aff, uncompressed.as_ptr()) };
+    if err != BLST_ERROR::BLST_SUCCESS {
+        return Err(BlsKeyError::Blst(err));
+    }
+    let mut out = [0u8; 128];
+    out[..64].copy_from_slice(&fp64(&aff.x));
+    out[64..].copy_from_slice(&fp64(&aff.y));
+    Ok(out)
+}
+
 /// Proof-of-possession (PoP) bundle for a BLS validator pubkey.
 /// Carries the pubkey explicitly so the wire shape is self-describing:
 /// the PoP can be verified independently of the surrounding tx.
@@ -703,6 +747,35 @@ mod tests {
     use zeroize::Zeroizing;
 
     use crate::crypto::signed::{NodeSigner, Signer};
+
+    /// [`bls_pubkey_to_eip2537_g1`] must reproduce the **exact** 128-byte
+    /// EIP-2537 G1 encoding the slashing test vectors carry (`SL_PUBKEY` from
+    /// `boule_consensus::hotstuff::qc::gen_slashing_vectors`, the pubkey of
+    /// `keygen(&[0x9a; 32])`). Pinning the public helper to that ground truth
+    /// guarantees the #732 registry write path records a key in precisely the
+    /// form `Slashing.sol`'s `keyAt` requires (`key.length == 128`).
+    #[test]
+    fn eip2537_g1_matches_slashing_ground_truth() {
+        let (_, pk) = BlsAggregated::keygen(&[0x9a; 32]).unwrap();
+        let got = bls_pubkey_to_eip2537_g1(&pk).unwrap();
+        // Ground truth from `gen_slashing_vectors` (`SL_PUBKEY`).
+        let want = "\
+00000000000000000000000000000000056d20bb7bf8e8d5013333796f901ed1\
+6cb97e0a64926665b47ed99e53a49d959c440f70d76cbb663543373f30d5d4aa\
+0000000000000000000000000000000003ac6089db289c61c5e2b20935b02eac\
+901edc4f81f10edd60832c3fc14b92f1f038a06e71a1541a681b9e7757e4f2f7";
+        assert_eq!(hex::encode(got), want);
+        // Structural: 16-byte zero pad before each 48-byte Fp coordinate.
+        assert!(got[..16].iter().all(|b| *b == 0), "x Fp zero-padded");
+        assert!(got[64..80].iter().all(|b| *b == 0), "y Fp zero-padded");
+    }
+
+    /// A malformed (non-curve) compressed pubkey is rejected rather than
+    /// silently producing garbage 128 bytes.
+    #[test]
+    fn eip2537_g1_rejects_a_bad_pubkey() {
+        assert!(bls_pubkey_to_eip2537_g1(&[0xFF; 48]).is_err());
+    }
 
     // Ground-truth vector generator for the EIP-2537 BLS slashing precompile
     // (#732b). Emits a real boule BLS signature plus its verify inputs —

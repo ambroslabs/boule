@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::transport::EngineTransport;
-use crate::{endpoint, governance, param, rotation, slashing, staking, system_account};
+use crate::{endpoint, governance, param, registry, rotation, slashing, staking, system_account};
 
 /// Max boule system txs to pull from the mempool into one proposal. Only a
 /// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
@@ -243,6 +243,79 @@ impl RethApplication {
             "rotation",
         )
         .await
+    }
+
+    /// #732 step 2 — the registry **write** path. For each committed key
+    /// rotation in `effects` that swaps the validator's BLS key, write the new
+    /// key into the `Registry` predeploy (`recordKey`) so the on-chain registry
+    /// faithfully mirrors what consensus applied and the slashing predeploy's
+    /// `keyAt` lookup is correct for post-genesis rotations.
+    ///
+    /// **Proposer-only.** Called solely when this node proposed the committed
+    /// block (`ctx.proposer == self_id`): exactly one node submits the system
+    /// tx, avoiding N redundant pool submissions per rotation. The write is
+    /// idempotent regardless — `Registry.recordKey` requires a strictly
+    /// increasing `vEff`, so a duplicate (re-proposed across views, or after a
+    /// restart) simply reverts harmlessly in the EVM.
+    ///
+    /// The new key is converted from boule's 48-byte compressed min-pk G1 to the
+    /// **128-byte EIP-2537 uncompressed** form `Registry.keyAt` must return for
+    /// `Slashing.sol` (`bls_pubkey_to_eip2537_g1`); a malformed rotation is
+    /// logged and skipped (it must never fail the commit — consensus commits
+    /// regardless of the EL).
+    ///
+    /// `recordKey`'s writes are unauthenticated in this MVP (anyone with the
+    /// system key can author them); contract-side access control gating
+    /// `recordKey` to the system account is the explicit next step (see
+    /// `Registry.sol` / [`crate::system_account`]).
+    async fn record_rotated_keys(&self, effects: &[ValidatorEffect]) {
+        // Collect the (validator, vEff, key128) writes this block's rotations
+        // imply, skipping non-BLS rotations and logging (never failing on) a
+        // malformed command.
+        let mut writes = Vec::new();
+        for effect in effects {
+            let ValidatorEffect::KeyRotation(cmd) = effect else {
+                continue;
+            };
+            match registry::record_key_for_rotation(cmd) {
+                Ok(Some(rk)) => writes.push(rk),
+                Ok(None) => {} // not a BLS-key rotation — nothing to mirror
+                Err(e) => tracing::warn!(
+                    target: "boule::reth",
+                    error = %e,
+                    "registry write: undecodable rotation command; skipping recordKey",
+                ),
+            }
+        }
+        if writes.is_empty() {
+            return;
+        }
+        // Submit each recordKey as a system tx. `submit_system_call` fetches the
+        // system account's *pending* nonce per call; submitting sequentially
+        // (awaiting each) lets reth's pool reflect the prior tx so the next
+        // nonce is fresh. A single rotation per block is the common case.
+        for rk in &writes {
+            let calldata = registry::record_key_calldata(rk);
+            match self
+                .submit_system_call(registry::registry_address(), calldata)
+                .await
+            {
+                Ok(hash) => tracing::info!(
+                    target: "boule::reth",
+                    validator = %hex::encode(rk.validator),
+                    v_eff = rk.v_eff.0,
+                    tx = %hash,
+                    "registry write: submitted recordKey for rotated BLS key",
+                ),
+                Err(e) => tracing::warn!(
+                    target: "boule::reth",
+                    error = %e,
+                    validator = %hex::encode(rk.validator),
+                    v_eff = rk.v_eff.0,
+                    "registry write: recordKey submission failed (idempotent — retried next time)",
+                ),
+            }
+        }
     }
 
     /// This block's endpoint-predeploy effects (#731).
@@ -609,7 +682,7 @@ impl Application for RethApplication {
 
     fn commit<'a>(
         &'a self,
-        _ctx: &'a AppContext,
+        ctx: &'a AppContext,
         block: &'a Block,
     ) -> BoxFuture<'a, Result<CommitResult>> {
         Box::pin(async move {
@@ -678,6 +751,14 @@ impl Application for RethApplication {
             //   - param      (#542) -> ParamUpdate
             //   - governance (#729) -> Reconfig
             let mut effects = self.derive_rotation_effects(&payload).await;
+            // #732 step 2: only the committed block's proposer mirrors its
+            // rotated BLS keys into the on-chain Registry (`recordKey`), so a
+            // single node — not all N — authors the system tx. Idempotent
+            // regardless (the monotone `vEff` guard reverts duplicates), so a
+            // re-proposed block or a restart never corrupts the registry.
+            if ctx.proposer == self.self_id {
+                self.record_rotated_keys(&effects).await;
+            }
             effects.extend(self.derive_endpoint_effects(&payload).await);
             effects.extend(self.derive_param_effects(&payload).await);
             effects.extend(self.derive_governance_effects(&payload).await);
@@ -1876,5 +1957,184 @@ mod tests {
             .await
             .expect_err("build must skip while the EL is syncing");
         assert!(err.to_string().contains("still syncing"));
+    }
+
+    // ── #732 step 2: proposer-only registry write path ─────────────────────
+
+    /// Transport for the registry-write tests: serves the engine fixtures (so
+    /// `commit` reaches VALID), a canned rotation log for `eth_getLogs` at the
+    /// rotation predeploy (empty elsewhere), `eth_chainId` / `eth_getTransactionCount`
+    /// for the system-tx nonce path, and **records** every `send_raw_transaction`
+    /// so a test can assert whether a `recordKey` was authored.
+    struct RegistryWriteTransport {
+        inner: FixtureTransport,
+        rotation_logs: Value,
+        sent: Arc<Mutex<Vec<Bytes>>>,
+    }
+    impl EngineTransport for RegistryWriteTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+            // `eth_chainId` is served as a plain quantity; `eth_getLogs` is keyed
+            // on the filter address (rotation logs only at the rotation predeploy).
+            if method == "eth_chainId" {
+                return Box::pin(async move { Ok(Value::String("0x539".into())) }); // 1337
+            }
+            let is_rotation = params[0]["address"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(rotation::ROTATION_ADDRESS));
+            let logs = if is_rotation {
+                self.rotation_logs.clone()
+            } else {
+                Value::Array(Vec::new())
+            };
+            Box::pin(async move { Ok(logs) })
+        }
+        fn eth_get_transaction_count(&self, _address: &str) -> BoxFuture<'_, Result<u64>> {
+            Box::pin(async move { Ok(0) })
+        }
+        fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, Result<Value>> {
+            self.sent.lock().push(raw);
+            Box::pin(async move { Ok(Value::String(format!("0x{}", "11".repeat(32)))) })
+        }
+    }
+
+    /// A real `DualSignedRotation` command carrying a new BLS key, ABI-laid-out
+    /// in a rotation log's `data` (signatures zeroed — the read path passes the
+    /// bytes through opaquely; `record_key_for_rotation` only decodes).
+    fn bls_rotation_log() -> (Value, boule_core::crypto::sig_scheme::BlsPublicKey) {
+        use boule_consensus::validator_rotation::{DualSignedRotation, ValidatorKeyRotation};
+        use boule_core::crypto::sig_scheme::BlsAggregated;
+        let pk = BlsAggregated::keygen(&[0x9a; 32]).unwrap().1;
+        let cmd = DualSignedRotation {
+            payload: ValidatorKeyRotation {
+                validator: [0x42; 32],
+                new_pubkey: [0xCC; 32],
+                v_eff: View(42),
+                new_bls_pubkey: Some(pk),
+                new_bls_pop: None,
+            },
+            sig_old: [0u8; 64],
+            sig_new: [0u8; 64],
+        }
+        .encode_command();
+        let logs = serde_json::json!([{
+            "topics": [rotation::ROTATION_TOPIC, format!("0x{}", "42".repeat(32))],
+            "data": abi_log_bytes(&cmd),
+        }]);
+        (logs, pk)
+    }
+
+    fn app_with_recording(
+        self_id: NodeId,
+        rotation_logs: Value,
+        sent: Arc<Mutex<Vec<Bytes>>>,
+    ) -> RethApplication {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+        RethApplication::new(
+            Box::new(RegistryWriteTransport {
+                inner: FixtureTransport,
+                rotation_logs,
+                sent,
+            }),
+            self_id,
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::empty()),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        )
+    }
+
+    /// When this node is the committed block's proposer, a committed BLS-key
+    /// rotation writes the new key into the Registry: exactly one `recordKey`
+    /// system tx is authored, and it decodes to `recordKey(validator, vEff, key)`
+    /// with the key in 128-byte EIP-2537 form.
+    #[tokio::test]
+    async fn proposer_commit_submits_a_recordkey_for_a_bls_rotation() {
+        use alloy_consensus::TxEnvelope;
+        use alloy_eips::eip2718::Decodable2718;
+
+        let self_id = [1u8; 32];
+        let (rotation_logs, pk) = bls_rotation_log();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let app = app_with_recording(self_id, rotation_logs, Arc::clone(&sent));
+
+        let g = genesis();
+        // commit `ctx.proposer == self_id` ⇒ this node mirrors the rotation.
+        let ctx = AppContext {
+            proposer: self_id,
+            ..Default::default()
+        };
+        let block = app
+            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        let result = app.commit(&ctx, &block).await.expect("commit");
+        assert_eq!(result.effects.len(), 1, "one rotation effect surfaced");
+
+        let sent = sent.lock();
+        assert_eq!(sent.len(), 1, "exactly one recordKey system tx authored");
+
+        // Decode the authored tx and check its calldata is the expected
+        // recordKey(validator, vEff, key128).
+        let env = TxEnvelope::decode_2718(&mut sent[0].as_ref()).expect("typed tx");
+        let tx = match &env {
+            TxEnvelope::Eip1559(s) => s.tx(),
+            other => panic!("expected EIP-1559, got {other:?}"),
+        };
+        assert_eq!(
+            tx.to,
+            alloy_primitives::TxKind::Call(registry::registry_address()),
+            "addressed to the Registry predeploy",
+        );
+        let cd = tx.input.as_ref();
+        assert_eq!(
+            &cd[0..4],
+            &registry::RECORD_KEY_SELECTOR,
+            "recordKey selector"
+        );
+        assert_eq!(&cd[4..36], &[0x42u8; 32], "validator id");
+        let mut v_word = [0u8; 32];
+        v_word[24..].copy_from_slice(&42u64.to_be_bytes());
+        assert_eq!(&cd[36..68], &v_word, "vEff == 42");
+        // The key is the 128-byte EIP-2537 form of the rotated pubkey.
+        let want_key = boule_core::crypto::sig_scheme::bls_pubkey_to_eip2537_g1(&pk).unwrap();
+        assert_eq!(&cd[132..132 + 128], &want_key, "EIP-2537 128-byte key");
+    }
+
+    /// A non-proposer commit reads the same rotation effect but writes **nothing**
+    /// — only the proposer authors the system tx (no N-fold redundant pool spam).
+    #[tokio::test]
+    async fn non_proposer_commit_submits_nothing() {
+        let self_id = [1u8; 32];
+        let (rotation_logs, _) = bls_rotation_log();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let app = app_with_recording(self_id, rotation_logs, Arc::clone(&sent));
+
+        let g = genesis();
+        // ctx.proposer is some *other* node, not self_id.
+        let ctx = AppContext {
+            proposer: [9u8; 32],
+            ..Default::default()
+        };
+        let block = app
+            .build_proposal(&ctx, &g, View(1), &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        let result = app.commit(&ctx, &block).await.expect("commit");
+        assert_eq!(
+            result.effects.len(),
+            1,
+            "the rotation effect still surfaces"
+        );
+        assert!(
+            sent.lock().is_empty(),
+            "a non-proposer must not author a recordKey",
+        );
     }
 }

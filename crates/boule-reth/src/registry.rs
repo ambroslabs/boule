@@ -52,8 +52,107 @@ const HISTORY_MAPPING_SLOT: u64 = 0;
 const KEY_ENTRY_SLOTS: u64 = 2;
 
 use boule_consensus::View;
-use boule_core::crypto::sig_scheme::BlsPublicKey;
+use boule_consensus::validator_rotation::{DualSignedRotation, OperatorSignedRotation};
+use boule_core::crypto::sig_scheme::{BlsPublicKey, bls_pubkey_to_eip2537_g1};
 use boule_core::identity::NodeId;
+
+/// `REGISTRY_ADDRESS` as an alloy [`Address`](alloy_primitives::Address), for
+/// [`submit_system_call`] (the `to` of every `recordKey` system tx).
+///
+/// [`submit_system_call`]: crate::application::RethApplication::submit_system_call
+pub fn registry_address() -> alloy_primitives::Address {
+    REGISTRY_ADDRESS
+        .parse()
+        .expect("REGISTRY_ADDRESS is a valid 20-byte address")
+}
+
+/// The `(validator, vEff, key128)` a single `recordKey` call writes: the 32-byte
+/// on-chain validator id, the effective view, and the validator's BLS pubkey in
+/// the registry's **128-byte EIP-2537 uncompressed G1** form. Produced by
+/// [`record_key_for_rotation`], consumed by [`record_key_calldata`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordKey {
+    /// The validator's stable 32-byte on-chain id (its boule [`NodeId`], used
+    /// verbatim as the registry/staking `bytes32` key).
+    pub validator: NodeId,
+    /// The view from which `key` is the validator's active BLS key.
+    pub v_eff: View,
+    /// The new BLS pubkey, EIP-2537 uncompressed G1 (128 bytes) — exactly what
+    /// `Registry.keyAt` must return for `Slashing.sol` (`key.length == 128`).
+    pub key128: [u8; 128],
+}
+
+/// Decode a committed `KeyRotation` effect's opaque command bytes into the
+/// [`RecordKey`] the registry write path must mirror — or `None` when the
+/// rotation does **not** change the validator's BLS key, so nothing should be
+/// written.
+///
+/// The [`ValidatorEffect::KeyRotation`](boule_consensus::replication::application::ValidatorEffect::KeyRotation)
+/// channel carries one of four rotation envelopes (see `is_rotation_command` in
+/// the integration layer). Only the two that swap the **signing/BLS** key under
+/// a [`ValidatorKeyRotation`](boule_consensus::validator_rotation::ValidatorKeyRotation)
+/// payload can carry a new BLS pubkey:
+/// [`DualSignedRotation`] and [`OperatorSignedRotation`]. The cancel and the
+/// operator-*key* rotation touch no BLS key, so they yield `None`. A
+/// BLS-bearing rotation whose `new_bls_pubkey` is `None` (an Ed25519-only chain)
+/// also yields `None` — there is no BLS key to record.
+///
+/// reth never trusts these bytes for membership (consensus re-verifies the
+/// signatures when it re-materialises the effect); here they are read only to
+/// **mirror** the already-committed key into EVM storage, so a decode failure is
+/// surfaced to the caller (which logs and skips, never failing the commit).
+pub fn record_key_for_rotation(cmd: &[u8]) -> anyhow::Result<Option<RecordKey>> {
+    // Pull the shared `ValidatorKeyRotation` payload out of whichever
+    // BLS-bearing envelope this is; the other two variants carry no BLS key.
+    let payload = if DualSignedRotation::is_rotation_payload(cmd) {
+        DualSignedRotation::decode_command(cmd)?.payload
+    } else if OperatorSignedRotation::is_operator_rotation_payload(cmd) {
+        OperatorSignedRotation::decode_command(cmd)?.payload
+    } else {
+        // Cancel / operator-key rotation: no BLS-key change to mirror.
+        return Ok(None);
+    };
+    let Some(bls) = payload.new_bls_pubkey else {
+        // Ed25519-only chain: the rotation carries no BLS key.
+        return Ok(None);
+    };
+    let key128 = bls_pubkey_to_eip2537_g1(&bls)
+        .map_err(|e| anyhow::anyhow!("rotated BLS pubkey is not a valid G1 point: {e}"))?;
+    Ok(Some(RecordKey {
+        validator: payload.validator,
+        v_eff: payload.v_eff,
+        key128,
+    }))
+}
+
+/// ABI-encode the `recordKey(bytes32 validator, uint64 vEff, bytes key)`
+/// calldata for `rk`: the 4-byte selector followed by the ABI head/tail.
+///
+/// Layout (`recordKey(bytes32,uint64,bytes)`): `selector ‖ validator(32) ‖
+/// vEff(left-padded to 32) ‖ offset(0x60) ‖ len(0x80=128) ‖ key(128)`. The
+/// `bytes` argument is dynamic, so its data (length + payload) is appended after
+/// the three head words and the head carries the offset to it.
+pub fn record_key_calldata(rk: &RecordKey) -> alloy_primitives::Bytes {
+    let mut out = Vec::with_capacity(4 + 32 * 4 + 128);
+    out.extend_from_slice(&RECORD_KEY_SELECTOR);
+    // head[0]: validator (bytes32, already 32 bytes).
+    out.extend_from_slice(&rk.validator);
+    // head[1]: vEff (uint64), right-aligned in a 32-byte word.
+    let mut v_word = [0u8; 32];
+    v_word[24..].copy_from_slice(&rk.v_eff.0.to_be_bytes());
+    out.extend_from_slice(&v_word);
+    // head[2]: offset to the dynamic `bytes` tail = 3 words = 0x60.
+    let mut off = [0u8; 32];
+    off[31] = 0x60;
+    out.extend_from_slice(&off);
+    // tail: length (128 = 0x80) then the 128-byte key (already a multiple of 32,
+    // no padding needed).
+    let mut len = [0u8; 32];
+    len[31] = 0x80;
+    out.extend_from_slice(&len);
+    out.extend_from_slice(&rk.key128);
+    alloy_primitives::Bytes::from(out)
+}
 
 /// keccak256 of `bytes`.
 fn keccak256(bytes: &[u8]) -> [u8; 32] {
@@ -345,5 +444,162 @@ mod tests {
                 "32-byte hex value",
             );
         }
+    }
+
+    use boule_consensus::validator_rotation::{
+        DualSignedRotationCancel, ValidatorKeyRotation, ValidatorRotationCancel,
+    };
+    use boule_core::crypto::sig_scheme::BlsAggregated;
+
+    fn bls_pk(seed: u8) -> BlsPublicKey {
+        let mut ikm = [0u8; 32];
+        ikm[0] = seed;
+        BlsAggregated::keygen(&ikm).expect("test BLS keygen").1
+    }
+
+    /// A real `DualSignedRotation` (signatures left zeroed — `recordKey`'s
+    /// decode path never verifies them) carrying a new BLS pubkey decodes into
+    /// the matching `RecordKey`: same validator id and `vEff`, and the key in
+    /// 128-byte EIP-2537 form.
+    #[test]
+    fn dual_signed_bls_rotation_decodes_to_a_record_key() {
+        let pk = bls_pk(0x9a);
+        let payload = ValidatorKeyRotation {
+            validator: [0x42; 32],
+            new_pubkey: [0xCC; 32],
+            v_eff: View::new(42),
+            new_bls_pubkey: Some(pk),
+            new_bls_pop: None,
+        };
+        let cmd = DualSignedRotation {
+            payload,
+            sig_old: [0u8; 64],
+            sig_new: [0u8; 64],
+        }
+        .encode_command();
+
+        let rk = record_key_for_rotation(&cmd)
+            .expect("decodes")
+            .expect("carries a BLS key");
+        assert_eq!(rk.validator, [0x42; 32]);
+        assert_eq!(rk.v_eff, View::new(42));
+        assert_eq!(rk.key128, bls_pubkey_to_eip2537_g1(&pk).unwrap());
+    }
+
+    /// An operator-signed rotation (recovery path) carrying a BLS key also
+    /// yields a `RecordKey` — it swaps the same signing/BLS key under operator
+    /// authority.
+    #[test]
+    fn operator_signed_bls_rotation_decodes_to_a_record_key() {
+        let pk = bls_pk(0x33);
+        let payload = ValidatorKeyRotation {
+            validator: [0x07; 32],
+            new_pubkey: [0xDD; 32],
+            v_eff: View::new(9),
+            new_bls_pubkey: Some(pk),
+            new_bls_pop: None,
+        };
+        let cmd = OperatorSignedRotation {
+            payload,
+            sig_operator: [0u8; 64],
+            sig_new: [0u8; 64],
+        }
+        .encode_command();
+
+        let rk = record_key_for_rotation(&cmd).expect("decodes").unwrap();
+        assert_eq!(rk.validator, [0x07; 32]);
+        assert_eq!(rk.v_eff, View::new(9));
+        assert_eq!(rk.key128, bls_pubkey_to_eip2537_g1(&pk).unwrap());
+    }
+
+    /// A BLS-bearing rotation with `new_bls_pubkey == None` (an Ed25519-only
+    /// chain) writes nothing — there is no BLS key to mirror.
+    #[test]
+    fn ed25519_only_rotation_yields_no_record_key() {
+        let payload = ValidatorKeyRotation {
+            validator: [0x11; 32],
+            new_pubkey: [0x22; 32],
+            v_eff: View::new(3),
+            new_bls_pubkey: None,
+            new_bls_pop: None,
+        };
+        let cmd = DualSignedRotation {
+            payload,
+            sig_old: [0u8; 64],
+            sig_new: [0u8; 64],
+        }
+        .encode_command();
+        assert_eq!(record_key_for_rotation(&cmd).unwrap(), None);
+    }
+
+    /// A rotation-cancel command carries no BLS-key change, so it writes
+    /// nothing.
+    #[test]
+    fn rotation_cancel_yields_no_record_key() {
+        let cmd = DualSignedRotationCancel {
+            payload: ValidatorRotationCancel {
+                validator: [0x11; 32],
+                cancelling_v_eff: View::new(7),
+            },
+            sig_old: [0u8; 64],
+            sig_new: [0u8; 64],
+        }
+        .encode_command();
+        assert_eq!(record_key_for_rotation(&cmd).unwrap(), None);
+    }
+
+    /// A non-rotation byte string is rejected as undecodable rather than
+    /// silently writing nothing — the caller logs and skips it.
+    #[test]
+    fn non_rotation_bytes_are_not_a_record_key() {
+        // No rotation tag prefix at all -> treated as "no BLS rotation" (None),
+        // since none of the BLS-bearing tags match.
+        assert_eq!(record_key_for_rotation(b"not-a-rotation").unwrap(), None);
+    }
+
+    /// `record_key_calldata` lays out `recordKey(bytes32,uint64,bytes)` exactly:
+    /// selector, validator, left-padded vEff, the `0x60` offset to the dynamic
+    /// `bytes`, its `0x80` (128) length, then the 128-byte key. Decodes back to
+    /// the inputs.
+    #[test]
+    fn record_key_calldata_round_trips() {
+        let key128 = bls_pubkey_to_eip2537_g1(&bls_pk(0x9a)).unwrap();
+        let rk = RecordKey {
+            validator: [0xAB; 32],
+            v_eff: View::new(0x1234),
+            key128,
+        };
+        let cd = record_key_calldata(&rk);
+
+        assert_eq!(&cd[0..4], &RECORD_KEY_SELECTOR, "selector");
+        assert_eq!(&cd[4..36], &[0xAB; 32], "validator word");
+        // vEff right-aligned in head[1].
+        let mut v_word = [0u8; 32];
+        v_word[24..].copy_from_slice(&0x1234u64.to_be_bytes());
+        assert_eq!(&cd[36..68], &v_word, "vEff word");
+        // head[2]: offset to the bytes tail == 0x60.
+        assert_eq!(cd[99], 0x60, "dynamic-bytes offset");
+        assert!(cd[68..99].iter().all(|b| *b == 0), "offset high bytes zero");
+        // tail: length 0x80 (128).
+        assert_eq!(cd[131], 0x80, "key length == 128");
+        assert!(
+            cd[100..131].iter().all(|b| *b == 0),
+            "length high bytes zero"
+        );
+        // tail: the 128-byte key verbatim.
+        assert_eq!(&cd[132..132 + 128], &key128);
+        assert_eq!(cd.len(), 4 + 32 * 3 + 32 + 128, "exact calldata length");
+    }
+
+    /// The address helper parses to the same fixed predeploy address as the
+    /// string constant.
+    #[test]
+    fn registry_address_helper_matches_constant() {
+        assert_eq!(
+            registry_address(),
+            REGISTRY_ADDRESS
+                .parse::<alloy_primitives::Address>()
+                .unwrap(),
+        );
     }
 }
