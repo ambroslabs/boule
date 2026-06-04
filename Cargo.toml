@@ -10,7 +10,12 @@ members = [
 ]
 # `fuzz` is intentionally excluded: it hosts nightly-only `cargo-fuzz`
 # targets and must not be pulled into the stable workspace build.
-exclude = ["fuzz"]
+#
+# `crates/boule-reth-node` is its OWN standalone workspace (Option A custom EL,
+# #777). It is excluded here so its heavy `reth-ethereum` SDK dependency tree
+# (hundreds of crates) never enters boule's main build / Cargo.lock / CI. Build
+# it from its own directory with `--jobs 3`; see its Cargo.toml header.
+exclude = ["fuzz", "crates/boule-reth-node"]
 
 [workspace.package]
 version = "0.1.0"

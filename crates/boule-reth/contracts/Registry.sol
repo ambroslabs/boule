@@ -64,15 +64,37 @@ contract Registry {
     /// see `docs/validator-registry-and-slashing.md`, "The EL-lag invariant".
     uint64 public settledView;
 
-    /// The only account allowed to call [`recordKey`]: boule's **system
-    /// account** (`SYSTEM_ACCOUNT_ADDRESS` in `src/system_account.rs`). The
-    /// proposer signs every legitimate `recordKey` tx from this address (#756),
-    /// so gating on `msg.sender == WRITER` makes the registry a trustworthy
-    /// slashing key-source: no other account can pollute a validator's key
-    /// history (which could otherwise block a legitimate slash). Genesis-seeded
-    /// keys are written directly into `alloc` storage, not via `recordKey`, so
-    /// they are unaffected by this gate.
+    /// The EOA writer: boule's **system account** (`SYSTEM_ACCOUNT_ADDRESS` in
+    /// `src/system_account.rs`). The proposer signs every `recordKey` tx from
+    /// this address (#756) on the legacy **transaction** write path. Genesis-
+    /// seeded keys are written directly into `alloc` storage, not via
+    /// `recordKey`, so they are unaffected by this gate.
+    ///
+    /// **Transitional dual-writer.** boule is moving the registry writes off the
+    /// proposer-signed tx path and onto an **EL-applied system call** (Option A,
+    /// #777/#781/#782): the custom execution layer applies `recordKey` /
+    /// `recordWeight` / `recordSettled` deterministically at the block boundary
+    /// from a `SYSTEM`-address caller (EIP-4788 style; no key, no nonce, no
+    /// proposer trust — the only way `recordWeight` is integrity-correct). Until
+    /// the legacy tx path is retired (Phase 3), BOTH callers are accepted: the
+    /// new keyless [`SYSTEM`] caller and the legacy [`WRITER`] EOA. Any other
+    /// sender reverts, so the registry stays a trustworthy slashing key-source.
     address constant WRITER = 0x2Ae00C96484267e0ed8937426F497404A93aB526;
+
+    /// The keyless **system caller** the execution layer uses for EL-applied
+    /// registry writes (Option A). Mirrors EIP-4788's system address and
+    /// `SYSTEM_ADDRESS` in `boule-reth-node`'s `registry.rs`. No private key
+    /// exists for it, so only the EL itself (running an identical computation on
+    /// every replica) can write as this caller.
+    address constant SYSTEM = 0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE;
+
+    /// Reverts unless the caller is an authorized registry writer — the keyless
+    /// EL [`SYSTEM`] caller (Option A) or the legacy proposer-signed [`WRITER`]
+    /// EOA (transitional; retired in Phase 3).
+    modifier onlyWriter() {
+        require(msg.sender == SYSTEM || msg.sender == WRITER, "unauthorized");
+        _;
+    }
 
     /// A validator's BLS key became active from `vEff`.
     event KeyRecorded(bytes32 indexed validator, uint64 vEff, bytes key);
@@ -89,13 +111,13 @@ contract Registry {
     /// each validator's history is a monotone `(vEff, key)` list — the same
     /// shape as the consensus `BlsKeyHistory` it mirrors.
     ///
-    /// **Access-controlled:** only [`WRITER`] (boule's system account) may
-    /// record keys. The proposer signs `recordKey` txs from that account on
-    /// commit (#756); any other sender reverts. This keeps the registry a
-    /// trustworthy slashing key-source — the keys it holds came from boule's
-    /// authoritative consensus path, not an arbitrary caller.
-    function recordKey(bytes32 validator, uint64 vEff, bytes calldata key) external {
-        require(msg.sender == WRITER, "unauthorized");
+    /// **Access-controlled ([`onlyWriter`]):** the keyless EL [`SYSTEM`] caller
+    /// (Option A, the EL-applied write path) or the legacy [`WRITER`] EOA (the
+    /// transitional proposer-signed tx path, #756); any other sender reverts.
+    /// This keeps the registry a trustworthy slashing key-source — the keys it
+    /// holds came from boule's authoritative consensus path, not an arbitrary
+    /// caller.
+    function recordKey(bytes32 validator, uint64 vEff, bytes calldata key) external onlyWriter {
         KeyEntry[] storage h = history[validator];
         require(h.length == 0 || vEff > h[h.length - 1].vEff, "vEff not increasing");
         h.push(KeyEntry(vEff, key));
@@ -124,15 +146,15 @@ contract Registry {
     /// any prior value, and adjust [`totalWeight`] by the delta (old → new).
     /// `newWeight == 0` removes the validator (its share leaves `totalWeight`).
     ///
-    /// **Access-controlled:** only [`WRITER`] (boule's system account) may
-    /// record weights — the same gate as [`recordKey`]. The proposer signs a
-    /// `recordWeight` tx from that account whenever consensus seats a new
-    /// weight for a validator (#732 step 4), so no other caller can skew the
-    /// on-chain weight surface #729/#746 read. A no-op same-weight write is
+    /// **Access-controlled ([`onlyWriter`]):** the EL [`SYSTEM`] caller or the
+    /// legacy [`WRITER`] EOA — the same gate as [`recordKey`]. With Option A the
+    /// EL applies `recordWeight` deterministically from the consensus-authoritative
+    /// weight (the only path that is integrity-correct, since weight is signed by
+    /// no single party; see #777), so no caller can skew the on-chain weight
+    /// surface #729/#746 read. A no-op same-weight write is
     /// harmless (it emits and leaves `totalWeight` unchanged); the proposer
     /// skips it, but the contract does not reject it.
-    function recordWeight(bytes32 validator, uint64 newWeight) external {
-        require(msg.sender == WRITER, "unauthorized");
+    function recordWeight(bytes32 validator, uint64 newWeight) external onlyWriter {
         uint64 oldWeight = weight[validator];
         weight[validator] = newWeight;
         // totalWeight += newWeight - oldWeight, in two non-overflowing steps so
@@ -155,13 +177,12 @@ contract Registry {
     /// replayed commit is harmless), never reverting — the proposer submits and
     /// the contract clamps.
     ///
-    /// **Access-controlled:** only [`WRITER`] (boule's system account) may
-    /// advance the frontier — the same gate as [`recordKey`] / [`recordWeight`].
+    /// **Access-controlled ([`onlyWriter`]):** the EL [`SYSTEM`] caller or the
+    /// legacy [`WRITER`] EOA — the same gate as [`recordKey`] / [`recordWeight`].
     /// This is essential: the frontier is the slashing predeploy's safety gate,
     /// so an arbitrary caller advancing it past the registry's actual key
     /// coverage would let a proof verify against a stale key.
-    function recordSettled(uint64 viewNum) external {
-        require(msg.sender == WRITER, "unauthorized");
+    function recordSettled(uint64 viewNum) external onlyWriter {
         if (viewNum <= settledView) {
             return;
         }
