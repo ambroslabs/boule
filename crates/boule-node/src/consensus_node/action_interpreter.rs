@@ -150,6 +150,34 @@ impl ConsensusNode {
                     // (i.e. the parent is missing).
                     multi_block_gap_proposer = Some((proposer, proposal_height));
                 }
+                // #797 vote-time integrity gate. Before the safety core is
+                // allowed to emit a `Vote` for a proposed block, give the
+                // application a chance to re-derive the proposer-authored,
+                // EL-applied write set (`extra_data`) from its own consensus
+                // state and reject a forgery. On `Err` we drop the proposal
+                // *without* stepping it into the safety core — so no vote is
+                // cast and a forged `extra_data` never reaches the BFT quorum
+                // — yet we leave `proposed_in_view` unset so a later honest
+                // leader re-proposes (a refused proposal is the proposer's
+                // fault, not ours). Runs only on `ProposalReceived`; all other
+                // safety events skip it. The default `validate_proposal` is
+                // `Ok(())`, so a backend with nothing to re-derive (the counter
+                // app) is unaffected.
+                if let SafetyEvent::ProposalReceived(signed) = &ev {
+                    let block = &signed.inner().payload.block;
+                    if let Err(e) = self.app.validate_proposal(block).await {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            view = block.header.view.0,
+                            height = block.header.height.0,
+                            proposer = %hex::encode(block.header.proposer),
+                            error = %e,
+                            "rejecting proposal: application could not validate its \
+                             proposer-authored write set; not voting (#797)",
+                        );
+                        return Ok(());
+                    }
+                }
                 let actions = self.step_safety(ev);
                 let safety_emitted_request_block = actions
                     .iter()
