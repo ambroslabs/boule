@@ -33,6 +33,7 @@
 pub mod application;
 pub mod endpoint;
 pub mod engine;
+pub mod genesis;
 pub mod governance;
 pub mod jwt;
 pub mod param;
@@ -46,6 +47,10 @@ pub mod transport;
 
 pub use application::RethApplication;
 pub use engine::{BuiltBlock, RethEngine, root_from_hex};
+pub use genesis::{
+    GenesisValidator, build_dev_genesis, build_seeded_genesis, dev_genesis_validators,
+    seed_registry_genesis,
+};
 pub use transport::{
     EngineTransport, HttpTransport, fetch_finalized_head, fetch_genesis, peer_reths,
 };
