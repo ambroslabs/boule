@@ -203,6 +203,70 @@ impl ConsensusParamHistory {
         self.boundaries.push((v_eff, params));
         Ok(())
     }
+
+    /// Snapshot the history into its serializable wire form for durable
+    /// persistence (#746). The genesis params and every committed `v_eff`
+    /// boundary are included, so a fresh node restores the full parameter
+    /// schedule from a single blob — exactly how
+    /// [`ValidatorSetHistory::to_persisted`](crate::validator_history::ValidatorSetHistory::to_persisted)
+    /// snapshots the validator schedule.
+    pub fn to_persisted(&self) -> PersistedConsensusParamHistory {
+        PersistedConsensusParamHistory {
+            genesis: self.genesis,
+            boundaries: self
+                .boundaries
+                .iter()
+                .map(|(v_eff, params)| PersistedParamBoundary {
+                    v_eff: *v_eff,
+                    params: *params,
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuild a history from its persisted form (#746). Boundaries are
+    /// re-inserted through [`Self::insert_boundary`], so the same
+    /// strictly-increasing-`v_eff` invariant is re-validated on load; a
+    /// corrupted blob whose boundaries are out of order is rejected and the
+    /// caller falls back to a from-config genesis-only history. Mirrors
+    /// [`ValidatorSetHistory::from_persisted`](crate::validator_history::ValidatorSetHistory::from_persisted).
+    pub fn from_persisted(persisted: PersistedConsensusParamHistory) -> anyhow::Result<Self> {
+        let mut history = Self::new(persisted.genesis);
+        for boundary in persisted.boundaries {
+            history.insert_boundary(boundary.v_eff, boundary.params)?;
+        }
+        Ok(history)
+    }
+}
+
+/// One scheduled `(v_eff, params)` boundary in the persisted (wire) form of a
+/// [`ConsensusParamHistory`]. The full resolved [`ConsensusParams`] are stored
+/// at each boundary (rather than a diff against the previous one), trading a
+/// few bytes for recovery simplicity — the same shape choice
+/// [`PersistedBoundary`](crate::validator_history::PersistedBoundary) makes for
+/// the validator schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedParamBoundary {
+    /// The view at and after which `params` is authoritative.
+    pub v_eff: View,
+    /// The resolved parameters active at and after `v_eff`.
+    pub params: ConsensusParams,
+}
+
+/// Serializable snapshot of a [`ConsensusParamHistory`] (#746), encoded via
+/// postcard at storage-write time and restored at startup. Carries the genesis
+/// params plus every committed boundary in ascending `v_eff` order.
+///
+/// New live params extend [`ConsensusParams`]; an old payload that does not
+/// decode under the new layout is ignored at recovery (the caller falls back to
+/// a from-config genesis-only history), the same forward-compat discipline the
+/// validator history uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedConsensusParamHistory {
+    /// The genesis params (those active before any boundary activates).
+    pub genesis: ConsensusParams,
+    /// Committed `v_eff` boundaries in ascending order.
+    pub boundaries: Vec<PersistedParamBoundary>,
 }
 
 #[cfg(test)]
@@ -281,6 +345,55 @@ mod tests {
         assert_eq!(h.at(View::new(19)), params(200), "between boundaries");
         assert_eq!(h.at(View::new(25)), params(300), "after second boundary");
         assert_eq!(h.latest(), params(300));
+    }
+
+    #[test]
+    fn persisted_history_roundtrips_genesis_and_boundaries() {
+        let mut h = ConsensusParamHistory::new(params(100));
+        h.insert_boundary(View::new(10), params(200)).unwrap();
+        h.insert_boundary(View::new(20), params(300)).unwrap();
+
+        // postcard round-trip through the persisted wire form.
+        let persisted = h.to_persisted();
+        let bytes = postcard::to_stdvec(&persisted).unwrap();
+        let decoded: PersistedConsensusParamHistory = postcard::from_bytes(&bytes).unwrap();
+        let restored = ConsensusParamHistory::from_persisted(decoded).unwrap();
+
+        assert_eq!(restored, h, "restored history equals the original");
+        // Active params resolve identically across the restore.
+        assert_eq!(restored.at(View::new(9)), params(100));
+        assert_eq!(restored.at(View::new(10)), params(200));
+        assert_eq!(restored.at(View::new(25)), params(300));
+        assert_eq!(restored.latest(), params(300));
+    }
+
+    #[test]
+    fn from_persisted_rejects_out_of_order_boundaries() {
+        let bad = PersistedConsensusParamHistory {
+            genesis: params(100),
+            boundaries: vec![
+                PersistedParamBoundary {
+                    v_eff: View::new(20),
+                    params: params(200),
+                },
+                PersistedParamBoundary {
+                    v_eff: View::new(10),
+                    params: params(300),
+                },
+            ],
+        };
+        assert!(
+            ConsensusParamHistory::from_persisted(bad).is_err(),
+            "non-increasing v_eff in the persisted blob is rejected on load",
+        );
+    }
+
+    #[test]
+    fn from_persisted_with_no_boundaries_is_genesis_only() {
+        let persisted = ConsensusParamHistory::new(params(42)).to_persisted();
+        let restored = ConsensusParamHistory::from_persisted(persisted).unwrap();
+        assert_eq!(restored, ConsensusParamHistory::new(params(42)));
+        assert_eq!(restored.at(View::new(1000)), params(42));
     }
 
     #[test]
