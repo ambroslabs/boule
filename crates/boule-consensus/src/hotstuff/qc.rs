@@ -976,6 +976,112 @@ mod tests {
         BlsAggregated::keygen(&ikm).unwrap()
     }
 
+    // Ground-truth vectors for the EVM slashing predeploy (#732b): one validator
+    // double-signs two `Vote`s at the same view (an equivocation), each over the
+    // production pre-image `preimage::<Vote>(vote, chain_id)`. Emits everything
+    // `Slashing.sol` needs to reconstruct + verify, in EIP-2537 uncompressed
+    // encoding. `#[ignore]`; run:
+    //   cargo test -p boule-consensus gen_slashing_vectors -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn gen_slashing_vectors() {
+        use blst::min_pk::{PublicKey, Signature};
+        use blst::{
+            BLST_ERROR, blst_bendian_from_fp, blst_fp, blst_p1, blst_p1_affine, blst_p1_cneg,
+            blst_p1_deserialize, blst_p1_generator, blst_p1_to_affine, blst_p2_affine,
+            blst_p2_deserialize,
+        };
+        use boule_core::crypto::signed::{ChainId, preimage};
+
+        fn hx(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        fn fp64(fp: &blst_fp) -> [u8; 64] {
+            let mut be = [0u8; 48];
+            unsafe { blst_bendian_from_fp(be.as_mut_ptr(), fp) };
+            let mut out = [0u8; 64];
+            out[16..].copy_from_slice(&be);
+            out
+        }
+        fn g1(a: &blst_p1_affine) -> Vec<u8> {
+            [fp64(&a.x), fp64(&a.y)].concat()
+        }
+        fn g2(a: &blst_p2_affine) -> Vec<u8> {
+            [
+                fp64(&a.x.fp[0]),
+                fp64(&a.x.fp[1]),
+                fp64(&a.y.fp[0]),
+                fp64(&a.y.fp[1]),
+            ]
+            .concat()
+        }
+        fn pk_g1(pk: &BlsPublicKey) -> Vec<u8> {
+            let mut aff = blst_p1_affine::default();
+            let un = PublicKey::from_bytes(pk).unwrap().serialize();
+            unsafe {
+                assert_eq!(
+                    blst_p1_deserialize(&mut aff, un.as_ptr()),
+                    BLST_ERROR::BLST_SUCCESS
+                )
+            };
+            g1(&aff)
+        }
+        fn sig_g2(sig: &[u8; 96]) -> Vec<u8> {
+            let mut aff = blst_p2_affine::default();
+            let un = Signature::from_bytes(sig).unwrap().serialize();
+            unsafe {
+                assert_eq!(
+                    blst_p2_deserialize(&mut aff, un.as_ptr()),
+                    BLST_ERROR::BLST_SUCCESS
+                )
+            };
+            g2(&aff)
+        }
+
+        let (sk, pk) = bls_keypair(0x9a);
+        let chain = ChainId::TEST;
+        let view = View(42);
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        let pre_a = preimage::<Vote>(
+            &Vote {
+                view,
+                block_hash: a,
+            },
+            &chain,
+        )
+        .unwrap();
+        let pre_b = preimage::<Vote>(
+            &Vote {
+                view,
+                block_hash: b,
+            },
+            &chain,
+        )
+        .unwrap();
+        let sig_a = BlsAggregated::sign_partial(&sk, &pre_a).unwrap();
+        let sig_b = BlsAggregated::sign_partial(&sk, &pre_b).unwrap();
+
+        let mut neg_aff = blst_p1_affine::default();
+        unsafe {
+            let mut neg: blst_p1 = *blst_p1_generator();
+            blst_p1_cneg(&mut neg, true);
+            blst_p1_to_affine(&mut neg_aff, &neg);
+        }
+
+        // The registry keys by the validator's stable NodeId, independent of the
+        // BLS key; any bytes32 stands in for the test.
+        println!("SL_VALIDATOR={}", hx(&[0x42u8; 32]));
+        println!("SL_CHAINID={}", hx(chain.as_bytes()));
+        println!("SL_VIEW={}", view.0);
+        println!("SL_BLOCKA={}", hx(&a));
+        println!("SL_BLOCKB={}", hx(&b));
+        println!("SL_PUBKEY={}", hx(&pk_g1(&pk)));
+        println!("SL_SIGA={}", hx(&sig_g2(&sig_a)));
+        println!("SL_SIGB={}", hx(&sig_g2(&sig_b)));
+        println!("SL_NEGGEN={}", hx(&g1(&neg_aff)));
+    }
+
     #[test]
     fn bls_qc_starts_empty_and_passes_well_formed() {
         let vs = four_validators();

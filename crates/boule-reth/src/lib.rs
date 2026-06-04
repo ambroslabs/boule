@@ -38,6 +38,7 @@ pub mod param;
 pub mod predeploy_log;
 pub mod registry;
 pub mod rotation;
+pub mod slashing;
 pub mod staking;
 pub mod transport;
 

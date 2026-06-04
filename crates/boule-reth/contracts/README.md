@@ -212,3 +212,51 @@ Mirrored as constants in `src/registry.rs`; unit tests pin them to the generated
 bytecode. The contract's storage logic is validated against a **live reth** by
 the manual harness `test/registry.mjs` (see its header) — `recordKey`/`keyAt`
 exercised on a real EVM, since the genesis-pin Rust tests can't run the EVM.
+
+## `BlsVerify.sol` — in-EVM BLS signature verification (#732b)
+
+A base contract (not a predeploy), inherited by `Slashing.sol`. Verifies a boule
+`min-pk` BLS signature **in the EVM** using the Prague EIP-2537 BLS12-381
+precompiles plus SHA-256/MODEXP: `verify(pubkey, message, sig, -G1gen)` checks
+`e(pubkey, H)·e(-G1gen, sig) == 1` via the pairing precompile (`0x0f`), where
+`H = hash_to_curve(message)` is computed in Solidity (RFC 9380
+`expand_message_xmd` over SHA-256 → MODEXP-reduce → `2× MAP_FP2_TO_G2` →
+`G2ADD`) so it does not trust a caller-supplied curve point. Confirmed against
+boule's own blst (the in-Solidity `H` is byte-identical to blst's, and a real
+signature verifies while a tampered one is rejected) — see `test/blsverify.mjs`
+and `docs/validator-registry-and-slashing.md`.
+
+## `Slashing.sol` — equivocation-slashing predeploy (#732b)
+
+A watcher submits proof that a validator double-signed at one view — two `Vote`s
+with the same `view` but different `block_hash` —
+via `submitEquivocation(validator, chainId, view, blockA, sigA, blockB, sigB)`.
+The predeploy reads the validator's BLS key from the registry (#732a `keyAt`),
+reconstructs both `preimage::<Vote>` signing messages, `BlsVerify`-checks both
+signatures (inheriting `BlsVerify.sol`), and on a genuine equivocation (distinct
+blocks, both signatures valid) emits `Slashed`. A same-block proof, or a
+signature that does not match its block, reverts.
+
+It only **verifies + signals**; the penalty stays consensus-authoritative
+(#654). boule reads `Slashed` from each committed block (the #655/#730
+`eth_getLogs` pattern, the next #732 step) and applies it through its
+`StakeSource` → jail (#658). `chainId` is caller-supplied but a wrong value
+yields a pre-image that won't verify, so it cannot forge a slash.
+
+| | |
+|---|---|
+| Address | `0x0000000000000000000000000000000000000b13` |
+| `Slashed(bytes32,uint64,bytes32,bytes32)` topic0 | `0xaa027002e2293d2bdf5dfdb36085da833212945f22a1bc33658aab00be192988` |
+| `submitEquivocation(bytes32,bytes,uint64,bytes32,bytes,bytes32,bytes)` selector | `0xa39fe9c0` |
+
+Mirrored as constants in `src/slashing.rs`; unit tests pin them to the generated
+bytecode. The full verify + emit path is validated against a **live reth** by the
+manual harness `test/slashing.mjs` (see its header), with ground-truth
+equivocation vectors from boule's blst (`gen_slashing_vectors`).
+
+> [!NOTE]
+> The design's `settledFrontier` gate (only accept a proof for a view whose key
+> history the registry has fully recorded; see
+> `docs/validator-registry-and-slashing.md`) is **not yet enforced** here — it
+> depends on the registry write path (the next #732 step) that records the
+> EVM-block↔view mapping. Until then `keyAt` is trusted as settled.
