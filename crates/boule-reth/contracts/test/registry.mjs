@@ -26,6 +26,9 @@ const ABI = [
   "function recordKey(bytes32 validator, uint64 vEff, bytes key) external",
   "function keyAt(bytes32 validator, uint64 viewNum) external view returns (bytes)",
   "function historyLength(bytes32 validator) external view returns (uint256)",
+  "function recordWeight(bytes32 validator, uint64 newWeight) external",
+  "function weightOf(bytes32 validator) external view returns (uint64)",
+  "function totalWeight() external view returns (uint64)",
 ];
 
 const provider = new ethers.JsonRpcProvider(RPC);
@@ -62,5 +65,41 @@ let reverted = false;
 try { await (await reg.recordKey(V, 10, k1)).wait(); } catch { reverted = true; }
 check(reverted, "recordKey with non-increasing vEff reverts");
 check((await reg.historyLength(V)) === 2n, "history unchanged after the reverted write");
+
+// --- Weight surface (#732 step 4) ---------------------------------------
+const W1 = "0x" + "c1".repeat(32);
+const W2 = "0x" + "c2".repeat(32);
+const total0 = await reg.totalWeight();
+
+// Access control: a non-system caller cannot write a weight.
+check(await reverts(() => regAsFaucet.recordWeight(W1, 100n)),
+  "recordWeight from a non-system account reverts (unauthorized)");
+check((await reg.weightOf(W1)) === 0n, "weightOf(W1) still 0 after the reverted write");
+check((await reg.totalWeight()) === total0, "totalWeight unchanged after the reverted write");
+
+// System account sets a weight; totalWeight moves by the full amount.
+await (await reg.recordWeight(W1, 100n)).wait();
+check((await reg.weightOf(W1)) === 100n, "weightOf(W1) == 100 after seat");
+check((await reg.totalWeight()) === total0 + 100n, "totalWeight += 100");
+
+// A second validator accumulates into totalWeight.
+await (await reg.recordWeight(W2, 30n)).wait();
+check((await reg.weightOf(W2)) === 30n, "weightOf(W2) == 30");
+check((await reg.totalWeight()) === total0 + 130n, "totalWeight == base + 100 + 30");
+
+// Raising W1's weight moves totalWeight by the positive delta only.
+await (await reg.recordWeight(W1, 150n)).wait();
+check((await reg.weightOf(W1)) === 150n, "weightOf(W1) == 150 after raise");
+check((await reg.totalWeight()) === total0 + 180n, "totalWeight += (150-100) delta");
+
+// Lowering W1's weight moves totalWeight by the negative delta.
+await (await reg.recordWeight(W1, 40n)).wait();
+check((await reg.weightOf(W1)) === 40n, "weightOf(W1) == 40 after lower");
+check((await reg.totalWeight()) === total0 + 70n, "totalWeight -= (150-40) delta");
+
+// Removal (weight 0) drains W1's share from totalWeight.
+await (await reg.recordWeight(W1, 0n)).wait();
+check((await reg.weightOf(W1)) === 0n, "weightOf(W1) == 0 after removal");
+check((await reg.totalWeight()) === total0 + 30n, "totalWeight back to base + W2 only");
 
 console.log("ALL REGISTRY EVM TESTS PASSED");
