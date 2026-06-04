@@ -1216,6 +1216,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer",
  "alloy-signer-local",
+ "alloy-sol-types",
  "anyhow",
  "base64",
  "boule-consensus",
