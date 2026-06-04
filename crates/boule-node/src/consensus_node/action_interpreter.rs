@@ -1077,6 +1077,10 @@ impl ConsensusNode {
                                 // consensus-layer, validated + scheduled at
                                 // commit — skip the SM check here as above.
                                 || boule_consensus::consensus_params::ConsensusParamUpdate::is_param_update_payload(cmd)
+                                // Endpoint-advertisement system txs (#546/#731):
+                                // consensus-layer, validated + applied at commit
+                                // — skip the SM check here as above.
+                                || boule_consensus::endpoint_registry::SignedEndpointCommand::is_endpoint_payload(cmd)
                             {
                                 return None;
                             }

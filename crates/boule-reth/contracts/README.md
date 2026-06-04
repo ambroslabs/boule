@@ -83,3 +83,45 @@ python3 -c "import solcx; solcx.install_solc('0.8.24'); \
 Paste the `bin-runtime` hex (prefixed with `0x`) into the predeploy account's
 `code` field in `genesis.json`. If the contract changes, update both the
 bytecode and the constants in `src/rotation.rs`.
+
+## `Endpoint.sol` — validator endpoint-advertisement predeploy (#731)
+
+The EVM-native submission path for validator endpoint advertisement (#546) on
+the reth backend (milestone #4). A validator publishes or updates its
+consensus-traffic endpoints by sending an ordinary EVM transaction to
+`submitEndpoint(bytes32 validator, bytes endpointCommand)`, where
+`endpointCommand` is the **already-signed** boule endpoint command
+(`SignedEndpointCommand::encode_command()`). The contract is a pure event
+emitter; boule reads the `EndpointSubmitted` event from each committed block
+(via `eth_getLogs`), turns it into a `ValidatorEffect::EndpointUpdate` on the
+widened `CommitResult` (#727), and re-materialises the command into a block —
+where the existing endpoint path (#546) verifies the validator's signature and
+the strictly-monotone `seq`, then applies it to the `EndpointRegistry`. The
+registry + apply mechanism is unchanged; only the submission path moves onto the
+EVM, replacing the bespoke endpoint mempool tx. Optional, discovery-hint only.
+
+> [!NOTE]
+> The EVM never interprets `endpointCommand`; consensus validates it at commit.
+> Same dumb-carrier pattern as `Rotation.sol`.
+
+| | |
+|---|---|
+| Address | `0x0000000000000000000000000000000000000b10` |
+| `EndpointSubmitted(bytes32,bytes)` topic0 | `0x26a38d91fc47b4cd0e93f73c87346a4236d696ffe5a241f95c33fc2670d28349` |
+| `submitEndpoint(bytes32,bytes)` selector | `0x18d88438` |
+
+These identifiers are mirrored as constants in `src/endpoint.rs`; unit tests
+pin the address, topic, and selector to the genesis account's bytecode.
+
+### Reproducing the bytecode
+
+Same toolchain as `Staking.sol` above (**solc 0.8.24**, `bin-runtime`):
+
+```sh
+python3 -c "import solcx; solcx.install_solc('0.8.24'); \
+  print(solcx.compile_files(['contracts/Endpoint.sol'], output_values=['bin-runtime'], solc_version='0.8.24'))"
+```
+
+Paste the `bin-runtime` hex (prefixed with `0x`) into the predeploy account's
+`code` field in `genesis.json`. If the contract changes, update both the
+bytecode and the constants in `src/endpoint.rs`.
