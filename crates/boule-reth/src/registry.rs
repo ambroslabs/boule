@@ -53,7 +53,7 @@ const KEY_ENTRY_SLOTS: u64 = 2;
 
 use boule_consensus::View;
 use boule_consensus::validator_rotation::{DualSignedRotation, OperatorSignedRotation};
-use boule_core::crypto::sig_scheme::{BlsPublicKey, bls_pubkey_to_eip2537_g1};
+use boule_core::crypto::sig_scheme::{BlsKeyError, BlsPublicKey, bls_pubkey_to_eip2537_g1};
 use boule_core::identity::NodeId;
 
 /// `REGISTRY_ADDRESS` as an alloy [`Address`](alloy_primitives::Address), for
@@ -187,12 +187,20 @@ type StorageEntry = ([u8; 32], [u8; 32]);
 /// validators' BLS keys into the registry predeploy — the EVM analogue of
 /// `BlsKeyHistory::with_genesis`.
 ///
-/// Each genesis validator gets a one-element history `[(vEff: 0, key)]`, exactly
-/// as `with_genesis` seeds consensus-side at `View::ZERO`. The resulting map is
-/// what would be merged into the `alloc` entry at [`REGISTRY_ADDRESS`] in a
-/// *deployment-specific* genesis (the committed `genesis.template.json` carries
-/// no validator keys — they are per-deployment), so a live reth answers
-/// `keyAt(validator, V) == key` from block zero without any transaction.
+/// Each genesis validator gets a one-element history `[(vEff: 0, key128)]`,
+/// exactly as `with_genesis` seeds consensus-side at `View::ZERO`. The resulting
+/// map is what would be merged into the `alloc` entry at [`REGISTRY_ADDRESS`] in
+/// a *deployment-specific* genesis (the committed `genesis.template.json`
+/// carries no validator keys — they are per-deployment), so a live reth answers
+/// `keyAt(validator, V) == key128` from block zero without any transaction.
+///
+/// The input key is boule's **48-byte compressed** `min-pk` G1 pubkey; it is
+/// converted here, inside the helper, to the **128-byte EIP-2537 uncompressed**
+/// form via [`bls_pubkey_to_eip2537_g1`] before it is stored — exactly what the
+/// slashing predeploy (`Slashing.sol`, `key.length == 128`) requires. Doing the
+/// conversion here (rather than at the call site) means genesis validators are
+/// slashable from block zero and a caller cannot get the on-chain format wrong.
+/// Errors if any input pubkey is not a valid compressed G1 point.
 ///
 /// ## Storage-slot layout (Solidity `mapping(bytes32 => KeyEntry[])` at slot 0)
 ///
@@ -201,30 +209,33 @@ type StorageEntry = ([u8; 32], [u8; 32]);
 /// - element `i` lives at `dataBase = keccak256(arraySlot)` offset by
 ///   `i * KEY_ENTRY_SLOTS`:
 ///   - `+0`: `vEff` (`uint64`, right-aligned in the 32-byte slot).
-///   - `+1`: the `key` `bytes` header. A 48-byte BLS key exceeds 31 bytes, so
-///     it uses the **long form**: this slot holds `2 * len + 1`, and the bytes
-///     themselves start at `keccak256(headerSlot)`, one 32-byte slot at a time
-///     (48 bytes → 2 slots, the second right-padded with zeros).
+///   - `+1`: the `key` `bytes` header. A 128-byte EIP-2537 key exceeds 31
+///     bytes, so it uses the **long form**: this slot holds `2 * len + 1`, and
+///     the bytes themselves start at `keccak256(headerSlot)`, one 32-byte slot
+///     at a time (128 bytes → 4 slots, exact, no padding).
 ///
 /// All genesis entries are `vEff = 0` so each validator's array length is `1`.
 pub fn genesis_seed_storage(
     genesis: impl IntoIterator<Item = (NodeId, BlsPublicKey)>,
-) -> Vec<StorageEntry> {
+) -> Result<Vec<StorageEntry>, BlsKeyError> {
     let mut out = Vec::new();
     for (validator, key) in genesis {
-        out.extend(validator_history_storage(&validator, &[(View::ZERO, key)]));
+        let key128 = bls_pubkey_to_eip2537_g1(&key)?;
+        out.extend(validator_history_storage(
+            &validator,
+            &[(View::ZERO, &key128)],
+        ));
     }
-    out
+    Ok(out)
 }
 
 /// Storage entries for one validator's `(vEff, key)` history (entries must be
-/// vEff-ascending, matching the contract's monotonicity invariant). Factored
-/// out of [`genesis_seed_storage`] so the slot math is exercised on its own and
-/// reusable for non-genesis seeds (e.g. a reconfig add).
-fn validator_history_storage(
-    validator: &NodeId,
-    entries: &[(View, BlsPublicKey)],
-) -> Vec<StorageEntry> {
+/// vEff-ascending, matching the contract's monotonicity invariant). The `key`
+/// is the already-encoded on-chain `bytes` (128-byte EIP-2537 for genesis
+/// seeds). Factored out of [`genesis_seed_storage`] so the slot math is
+/// exercised on its own and reusable for non-genesis seeds (e.g. a reconfig
+/// add).
+fn validator_history_storage(validator: &NodeId, entries: &[(View, &[u8])]) -> Vec<StorageEntry> {
     let mut out = Vec::new();
 
     // arraySlot = keccak256(validator ‖ uint256(mappingSlot))
@@ -270,15 +281,15 @@ fn validator_history_storage(
 /// hex) — the form `reth`'s genesis loader and the genesis-pin tests expect.
 pub fn genesis_seed_storage_json(
     genesis: impl IntoIterator<Item = (NodeId, BlsPublicKey)>,
-) -> serde_json::Map<String, serde_json::Value> {
+) -> Result<serde_json::Map<String, serde_json::Value>, BlsKeyError> {
     let mut map = serde_json::Map::new();
-    for (slot, value) in genesis_seed_storage(genesis) {
+    for (slot, value) in genesis_seed_storage(genesis)? {
         map.insert(
             format!("0x{}", hex::encode(slot)),
             serde_json::Value::String(format!("0x{}", hex::encode(value))),
         );
     }
-    map
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -325,16 +336,44 @@ mod tests {
         }
     }
 
+    /// `recordKey`'s access-control gate (`require(msg.sender == WRITER)`) must
+    /// name boule's **system account** — the `from` of every legitimate
+    /// `recordKey` system tx (#756). Pins the contract's `WRITER` constant to
+    /// `SYSTEM_ACCOUNT_ADDRESS` via the generated bytecode: solc compiles the
+    /// 20-byte writer address as a PUSH20 operand, so if `WRITER` ever drifts
+    /// from the signer the proposer uses, the registry would reject every real
+    /// write and this fails.
+    #[test]
+    fn writer_in_genesis_bytecode_is_the_system_account() {
+        use crate::system_account::SYSTEM_ACCOUNT_ADDRESS;
+        let g: serde_json::Value =
+            serde_json::from_str(include_str!("../genesis.json")).expect("genesis.json parses");
+        let code = g["alloc"][REGISTRY_ADDRESS]["code"].as_str().unwrap();
+        let writer = SYSTEM_ACCOUNT_ADDRESS
+            .trim_start_matches("0x")
+            .to_ascii_lowercase();
+        assert!(
+            code.to_ascii_lowercase().contains(&writer),
+            "the system account address must appear in recordKey's WRITER gate",
+        );
+    }
+
     fn val(b: u8) -> NodeId {
         [b; 32]
     }
-    fn key(b: u8) -> BlsPublicKey {
-        [b; 48]
+
+    /// The fixed BLS pubkey the seed ground-truth below was captured for:
+    /// `bls_pk(0x11)`, whose 128-byte EIP-2537 form is what genesis stores. A
+    /// fixed real key (not arbitrary bytes) is required because the seed helper
+    /// now validates+converts the compressed pubkey to G1.
+    fn seed_key() -> BlsPublicKey {
+        bls_pk(0x11)
     }
 
     // Ground-truth storage words for the genesis seed of
-    // validator = 0xaa*32, key = 0x11*48, vEff = 0 — captured from a live reth
-    // via `eth_getStorageAt` (see `contracts/test/registry-seed.mjs`).
+    // validator = 0xaa*32, key = bls_pk(0x11) (stored as its 128-byte EIP-2537
+    // G1 form), vEff = 0 — captured from a live reth via `eth_getStorageAt`
+    // (see `contracts/test/registry-seed.mjs`). 128 bytes → 4 data chunks.
     const REG_SEED_ARRAY_SLOT: &str =
         "0xd4e804f1354b8536b910364132804434559ef187d3b44e1868ebcf9bee54434b";
     const REG_SEED_LEN_VALUE: &str =
@@ -345,60 +384,66 @@ mod tests {
         "0x0000000000000000000000000000000000000000000000000000000000000000";
     const REG_SEED_HEADER_SLOT: &str =
         "0x58fe01d67c0d3b0bdcb10eb4c6d3db43abdb90eae559ad453ab2251865a9f3be";
+    // 2*128+1 = 257 = 0x101.
     const REG_SEED_HEADER_VALUE: &str =
-        "0x0000000000000000000000000000000000000000000000000000000000000061";
-    const REG_SEED_CHUNK0_SLOT: &str =
+        "0x0000000000000000000000000000000000000000000000000000000000000101";
+    const REG_SEED_CHUNK_BASE: &str =
         "0xc25886be15ecb57b4bb548a15123446d24bef1a38ef876e5a3e3e7a43ae2cd9a";
-    const REG_SEED_CHUNK0_VALUE: &str =
-        "0x1111111111111111111111111111111111111111111111111111111111111111";
-    const REG_SEED_CHUNK1_SLOT: &str =
-        "0xc25886be15ecb57b4bb548a15123446d24bef1a38ef876e5a3e3e7a43ae2cd9b";
-    const REG_SEED_CHUNK1_VALUE: &str =
-        "0x1111111111111111111111111111111100000000000000000000000000000000";
 
-    /// The seed for one validator writes exactly the five storage words the
+    /// The seed for one validator writes exactly the seven storage words the
     /// layout requires: array length, `vEff`, the `bytes` long-form header, and
-    /// the two key-data chunks. (48 bytes → 2 chunks.)
+    /// the four key-data chunks. (128 bytes → 4 chunks.)
     #[test]
-    fn one_validator_writes_five_words() {
-        let seed = genesis_seed_storage([(val(0xaa), key(0x11))]);
-        assert_eq!(seed.len(), 5, "len + vEff + header + 2 data chunks");
+    fn one_validator_writes_seven_words() {
+        let seed = genesis_seed_storage([(val(0xaa), seed_key())]).unwrap();
+        assert_eq!(seed.len(), 7, "len + vEff + header + 4 data chunks");
     }
 
     /// Pins the full slot/value derivation for one genesis validator
-    /// (validator = `0xaa*32`, key = `0x11*48`, vEff = 0). The expected
-    /// `(slot, value)` words below are the ground truth observed on a **live
-    /// reth** via `eth_getStorageAt` after seeding this exact entry into
+    /// (validator = `0xaa*32`, key = `bls_pk(0x11)` stored as its 128-byte
+    /// EIP-2537 form, vEff = 0). The slot words are ground truth observed on a
+    /// **live reth** via `eth_getStorageAt` after seeding this exact entry into
     /// `alloc[Registry].storage` (see `contracts/test/registry-seed.mjs`), so if
-    /// the slot math drifts from Solidity's actual layout this fails.
+    /// the slot math drifts from Solidity's actual layout this fails. The chunk
+    /// *values* are the 128-byte key split into four 32-byte words.
     #[test]
     fn slot_derivation_matches_live_reth_ground_truth() {
-        let seed = genesis_seed_storage([(val(0xaa), key(0x11))]);
-        // Ground truth from a live reth (`registry-seed.mjs`): the exact
-        // `(slot -> value)` words `eth_getStorageAt` returns for this entry.
-        let want: &[(&str, &str)] = &[
-            (REG_SEED_ARRAY_SLOT, REG_SEED_LEN_VALUE),
-            (REG_SEED_VEFF_SLOT, REG_SEED_VEFF_VALUE),
-            (REG_SEED_HEADER_SLOT, REG_SEED_HEADER_VALUE),
-            (REG_SEED_CHUNK0_SLOT, REG_SEED_CHUNK0_VALUE),
-            (REG_SEED_CHUNK1_SLOT, REG_SEED_CHUNK1_VALUE),
+        let seed = genesis_seed_storage([(val(0xaa), seed_key())]).unwrap();
+        let key128 = bls_pubkey_to_eip2537_g1(&seed_key()).unwrap();
+
+        // Expected non-chunk slots from a live reth (`registry-seed.mjs`).
+        let mut want: Vec<(String, String)> = vec![
+            (slot_hex(REG_SEED_ARRAY_SLOT), val_hex(REG_SEED_LEN_VALUE)),
+            (slot_hex(REG_SEED_VEFF_SLOT), val_hex(REG_SEED_VEFF_VALUE)),
+            (
+                slot_hex(REG_SEED_HEADER_SLOT),
+                val_hex(REG_SEED_HEADER_VALUE),
+            ),
         ];
+        // The four key chunks live at consecutive slots from CHUNK_BASE, each
+        // holding 32 bytes of the 128-byte key (exact, no padding).
+        let chunk_base = hex_to_32(REG_SEED_CHUNK_BASE);
+        for (j, chunk) in key128.chunks(32).enumerate() {
+            want.push((
+                hex::encode(slot_add(&chunk_base, j as u64)),
+                hex::encode(chunk),
+            ));
+        }
+
         let got: std::collections::HashMap<String, String> = seed
             .iter()
             .map(|(s, v)| (hex::encode(s), hex::encode(v)))
             .collect();
         assert_eq!(got.len(), want.len(), "exactly the expected words");
-        for (slot, value) in want {
-            let slot = slot.trim_start_matches("0x");
-            let value = value.trim_start_matches("0x");
+        for (slot, value) in &want {
             assert_eq!(
                 got.get(slot).map(String::as_str),
-                Some(value),
+                Some(value.as_str()),
                 "slot {slot} must equal the live-reth value",
             );
         }
 
-        assert_eq!(seed.len(), 5);
+        assert_eq!(seed.len(), 7);
         // Array length word == 1 (single genesis entry).
         let mut len_word = [0u8; 32];
         len_word[31] = 1;
@@ -411,32 +456,54 @@ mod tests {
             seed.iter().any(|(_, v)| *v == [0u8; 32]),
             "vEff == 0 word present",
         );
-        // bytes long-form header: 2*48+1 = 97 = 0x61 in the low byte.
+        // bytes long-form header: 2*128+1 = 257 = 0x0101.
         assert!(
             seed.iter()
-                .any(|(_, v)| v[31] == 0x61 && v[..31].iter().all(|b| *b == 0)),
-            "bytes long-form header (2*48+1) present",
+                .any(|(_, v)| v[30] == 0x01 && v[31] == 0x01 && v[..30].iter().all(|b| *b == 0)),
+            "bytes long-form header (2*128+1 = 0x0101) present",
         );
-        // The two key chunks: 0x11*32, then 0x11*16 ‖ zero*16.
-        let mut chunk0 = [0u8; 32];
-        chunk0.fill(0x11);
-        let mut chunk1 = [0u8; 32];
-        chunk1[..16].fill(0x11);
-        assert!(seed.iter().any(|(_, v)| *v == chunk0), "key chunk0 present");
-        assert!(seed.iter().any(|(_, v)| *v == chunk1), "key chunk1 present");
+        // The four chunks reassemble the exact 128-byte key.
+        let mut chunks: Vec<(usize, [u8; 32])> = key128
+            .chunks(32)
+            .enumerate()
+            .map(|(j, c)| {
+                let mut w = [0u8; 32];
+                w.copy_from_slice(c);
+                (j, w)
+            })
+            .collect();
+        chunks.sort_by_key(|(j, _)| *j);
+        for (j, w) in chunks {
+            assert!(seed.iter().any(|(_, v)| *v == w), "key chunk {j} present",);
+        }
     }
 
-    /// Two genesis validators are independent: 10 words, each validator's slots
+    fn slot_hex(s: &str) -> String {
+        s.trim_start_matches("0x").to_string()
+    }
+    fn val_hex(s: &str) -> String {
+        s.trim_start_matches("0x").to_string()
+    }
+    fn hex_to_32(s: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        hex::decode_to_slice(s.trim_start_matches("0x"), &mut out).expect("32-byte hex");
+        out
+    }
+
+    /// Two genesis validators are independent: 14 words, each validator's slots
     /// distinct (different keccak buckets), and the JSON renders both.
     #[test]
     fn two_validators_are_independent() {
-        let seed = genesis_seed_storage([(val(0x01), key(0xa1)), (val(0x02), key(0xa2))]);
-        assert_eq!(seed.len(), 10, "5 words each, no slot collisions");
+        let seed =
+            genesis_seed_storage([(val(0x01), bls_pk(0xa1)), (val(0x02), bls_pk(0xa2))]).unwrap();
+        assert_eq!(seed.len(), 14, "7 words each, no slot collisions");
         let slots: std::collections::HashSet<_> = seed.iter().map(|(s, _)| *s).collect();
-        assert_eq!(slots.len(), 10, "all ten slots distinct");
+        assert_eq!(slots.len(), 14, "all fourteen slots distinct");
 
-        let json = genesis_seed_storage_json([(val(0x01), key(0xa1)), (val(0x02), key(0xa2))]);
-        assert_eq!(json.len(), 10);
+        let json =
+            genesis_seed_storage_json([(val(0x01), bls_pk(0xa1)), (val(0x02), bls_pk(0xa2))])
+                .unwrap();
+        assert_eq!(json.len(), 14);
         for (k, v) in &json {
             assert!(k.starts_with("0x") && k.len() == 66, "32-byte hex slot key");
             assert!(
@@ -444,6 +511,38 @@ mod tests {
                 "32-byte hex value",
             );
         }
+    }
+
+    /// The seeded entry stores the **128-byte EIP-2537** form of the input
+    /// compressed pubkey (so genesis validators are slashable from block zero):
+    /// reassembling the chunk words equals `bls_pubkey_to_eip2537_g1(key)`.
+    #[test]
+    fn seed_stores_128_byte_eip2537_key() {
+        let key = bls_pk(0x5c);
+        let seed = genesis_seed_storage([(val(0xcd), key)]).unwrap();
+        let key128 = bls_pubkey_to_eip2537_g1(&key).unwrap();
+
+        // The header encodes length 128 (long form 2*128+1).
+        assert!(
+            seed.iter()
+                .any(|(_, v)| v[30] == 0x01 && v[31] == 0x01 && v[..30].iter().all(|b| *b == 0)),
+            "header encodes a 128-byte key",
+        );
+        // The four 32-byte chunk words concatenate back to the 128-byte key.
+        for chunk in key128.chunks(32) {
+            assert!(
+                seed.iter().any(|(_, v)| v.as_slice() == chunk),
+                "each 32-byte slice of the 128-byte key is stored verbatim",
+            );
+        }
+    }
+
+    /// An invalid compressed pubkey (not a G1 point) makes the seed helper
+    /// error rather than store a malformed key — a caller cannot accidentally
+    /// seed an unslashable validator.
+    #[test]
+    fn seed_rejects_invalid_pubkey() {
+        assert!(genesis_seed_storage([(val(0x01), [0xFF; 48])]).is_err());
     }
 
     use boule_consensus::validator_rotation::{
