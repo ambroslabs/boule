@@ -27,6 +27,14 @@ hmac       = "0.12"
 sha2       = "0.10"
 # keccak256 for deriving Solidity storage slots (the genesis registry seed).
 sha3       = "0.10"
+# alloy: build/sign EIP-1559 system txs and recover their sender (#732 write
+# path). `k256` enables sender recovery from a signature (used by the unit
+# tests and any future verification path).
+alloy-consensus    = { version = "2", features = ["k256"] }
+alloy-primitives   = "1"
+alloy-signer       = "2"
+alloy-signer-local = "2"
+alloy-eips         = "2"
 
 [build-dependencies]
 # `build.rs` generates genesis.json from genesis.template.json + the compiled

@@ -41,6 +41,9 @@
     "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266": {
       "balance": "0xd3c21bcecceda1000000"
     },
+    "0x2Ae00C96484267e0ed8937426F497404A93aB526": {
+      "balance": "0xd3c21bcecceda1000000"
+    },
     "0x0000000000000000000000000000000000000b0e": {
       "balance": "0x0",
       "contract": "Staking"
