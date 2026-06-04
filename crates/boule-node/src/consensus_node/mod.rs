@@ -11168,15 +11168,14 @@ mod tests {
         );
     }
 
-    /// An `EndpointUpdate` (no effect-materialiser producer yet, #731) is
-    /// surfaced-and-dropped, and a `ParamUpdate` carrying a non-param payload is
-    /// rejected (defense-in-depth) — neither reaches the mempool, and the stage
-    /// is still drained.
+    /// Defense-in-depth: effects whose carried payload does not match their
+    /// declared category (an `EndpointUpdate` / `ParamUpdate` carrying junk) are
+    /// rejected — neither reaches the mempool, and the stage is still drained.
     #[test]
-    fn unsupported_or_malformed_effects_are_dropped_not_minted() {
+    fn malformed_effects_are_rejected_not_minted() {
         let mut node = make_node(nid(1));
         node.staged_effects = vec![
-            ValidatorEffect::EndpointUpdate(bytes::Bytes::from_static(b"ep")),
+            ValidatorEffect::EndpointUpdate(bytes::Bytes::from_static(b"not-an-endpoint")),
             ValidatorEffect::ParamUpdate(bytes::Bytes::from_static(b"not-a-param")),
         ];
 
@@ -11184,12 +11183,48 @@ mod tests {
 
         assert!(
             node.mempool.propose(16).is_empty(),
-            "an unsupported / malformed effect mints no command",
+            "a payload that doesn't match its declared category mints no command",
         );
         assert!(
             node.staged_effects.is_empty(),
             "the stage is drained even when nothing is materialisable",
         );
+    }
+
+    /// #731: an `EndpointUpdate` effect carrying a well-formed
+    /// `SignedEndpointCommand` is materialised — minted into the mempool as a
+    /// tagged endpoint command (and drained), so the leader carries it into the
+    /// next block (where #546 verifies + applies it).
+    #[test]
+    fn endpoint_update_effect_is_minted_into_the_mempool() {
+        use boule_consensus::endpoint_registry::{
+            EndpointCommand, EndpointOp, SignedEndpointCommand,
+        };
+
+        let mut node = make_node(nid(1));
+        // The materialiser only checks the ENDPT tag; the signature is verified
+        // later at apply, so a dummy sig is fine for the mint path.
+        let signed = SignedEndpointCommand {
+            payload: EndpointCommand {
+                validator: nid(2),
+                seq: 1,
+                op: EndpointOp::Set(vec![]),
+            },
+            sig: [0u8; 64],
+        };
+        let encoded = signed.encode_command();
+        node.staged_effects = vec![ValidatorEffect::EndpointUpdate(encoded.clone())];
+
+        node.mint_staged_effects(View(2));
+
+        let minted = node
+            .mempool
+            .propose(16)
+            .into_iter()
+            .find(|c| SignedEndpointCommand::is_endpoint_payload(c))
+            .expect("an endpoint command was minted");
+        assert_eq!(minted, encoded);
+        assert!(node.staged_effects.is_empty(), "the stage is drained");
     }
 
     /// #542: a `ParamUpdate` effect carrying a well-formed ConsensusParamUpdate

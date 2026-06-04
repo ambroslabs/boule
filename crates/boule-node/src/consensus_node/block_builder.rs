@@ -239,6 +239,9 @@ impl BlockBuilder for MempoolBlockBuilder {
                     // Consensus-parameter-update system txs (#542): validated +
                     // scheduled at commit, like reconfig/rotation.
                     || boule_consensus::consensus_params::ConsensusParamUpdate::is_param_update_payload(cmd)
+                    // Endpoint-advertisement system txs (#546/#731): validated +
+                    // applied at commit, like reconfig/rotation.
+                    || boule_consensus::endpoint_registry::SignedEndpointCommand::is_endpoint_payload(cmd)
                     // App-level stake commands (the demo backend) are
                     // includable by the application even though the counter
                     // SM doesn't decode them; `commit` turns them into

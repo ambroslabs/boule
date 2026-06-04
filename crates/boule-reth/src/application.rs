@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::transport::EngineTransport;
-use crate::{rotation, staking};
+use crate::{endpoint, rotation, staking};
 
 /// Max boule system txs to pull from the mempool into one proposal. Only a
 /// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
@@ -156,47 +156,76 @@ impl RethApplication {
         src.take_updates()
     }
 
-    /// Read this block's rotation-predeploy events (#730) and turn each into a
-    /// [`ValidatorEffect::KeyRotation`] carrying the encoded rotation command.
+    /// Read this block's submission-predeploy events for one category and turn
+    /// each into a [`ValidatorEffect`]. Shared by the rotation (#730) and
+    /// endpoint (#731) read paths: each predeploy carries an already-signed
+    /// consensus command as the log's dynamic `bytes`, which rides straight
+    /// through to consensus — the opaque command is *not* interpreted here;
+    /// consensus validates the tag and signatures when it materialises the
+    /// effect.
+    ///
     /// Called only once the EL reports the block `VALID`, so its logs exist; a
     /// failed `eth_getLogs` is logged and yields no effects (a transient RPC
     /// error must not fail the commit — consensus commits regardless of the EL).
     ///
-    /// Unlike staking (`derive_validator_updates`), there is no ledger to feed:
-    /// the rotation rides straight through to consensus, which verifies and
-    /// schedules it. The opaque command is *not* interpreted here — consensus
-    /// validates the tag and signatures when it materialises the effect.
-    ///
-    /// Read only on the normal per-block commit path: a rotation submitted in a
+    /// Read only on the normal per-block commit path: a command submitted in a
     /// block the EL executed via background self-sync (#674) — skipped by
     /// `commit` while `SYNCING` — is not backfilled here the way staking is,
-    /// since rotations have no re-anchored ledger to reconcile. A missed
-    /// rotation is recoverable (the submitter re-submits; `v_eff` is set ahead
-    /// of the lag), so backfilling rotations over self-synced gaps is a
-    /// follow-up, not a correctness requirement.
-    async fn derive_rotation_effects(&self, payload: &Value) -> Vec<ValidatorEffect> {
-        let Some(block_hash) = payload["blockHash"].as_str() else {
-            return Vec::new();
-        };
-        let logs = match self
-            .transport
-            .eth_rpc("eth_getLogs", rotation::logs_filter(block_hash))
-            .await
-        {
+    /// since these effects have no re-anchored ledger to reconcile. A missed
+    /// submission is recoverable (the submitter re-submits), so backfilling over
+    /// self-synced gaps is a follow-up, not a correctness requirement.
+    async fn derive_predeploy_effects(
+        &self,
+        block_hash: &str,
+        filter: Value,
+        parse: fn(&Value) -> Vec<bytes::Bytes>,
+        wrap: fn(bytes::Bytes) -> ValidatorEffect,
+        kind: &str,
+    ) -> Vec<ValidatorEffect> {
+        let _ = block_hash; // the filter already embeds it; kept for symmetry
+        let logs = match self.transport.eth_rpc("eth_getLogs", filter).await {
             Ok(logs) => logs,
             Err(e) => {
                 tracing::warn!(
                     target: "boule::reth",
                     error = %e,
-                    "eth_getLogs for rotation events failed; no rotation effects this block",
+                    kind,
+                    "eth_getLogs for predeploy events failed; no effects this block",
                 );
                 return Vec::new();
             }
         };
-        rotation::parse_rotation_logs(&logs)
-            .into_iter()
-            .map(ValidatorEffect::KeyRotation)
-            .collect()
+        parse(&logs).into_iter().map(wrap).collect()
+    }
+
+    /// This block's rotation-predeploy effects (#730).
+    async fn derive_rotation_effects(&self, payload: &Value) -> Vec<ValidatorEffect> {
+        let Some(block_hash) = payload["blockHash"].as_str() else {
+            return Vec::new();
+        };
+        self.derive_predeploy_effects(
+            block_hash,
+            rotation::logs_filter(block_hash),
+            rotation::parse_rotation_logs,
+            ValidatorEffect::KeyRotation,
+            "rotation",
+        )
+        .await
+    }
+
+    /// This block's endpoint-predeploy effects (#731).
+    async fn derive_endpoint_effects(&self, payload: &Value) -> Vec<ValidatorEffect> {
+        let Some(block_hash) = payload["blockHash"].as_str() else {
+            return Vec::new();
+        };
+        self.derive_predeploy_effects(
+            block_hash,
+            endpoint::logs_filter(block_hash),
+            endpoint::parse_endpoint_logs,
+            ValidatorEffect::EndpointUpdate,
+            "endpoint",
+        )
+        .await
     }
 
     /// Backfill the staking events of blocks the EL executed via background
@@ -427,6 +456,9 @@ impl Application for RethApplication {
                     // Equivocation-evidence system txs (#657): same rationale —
                     // no other path onto the reth backend; validated at commit.
                     || boule_consensus::equivocation_evidence::is_evidence_payload(&cmd)
+                    // Endpoint-advertisement system txs (#731): the endpoint
+                    // read path mints these; validated + applied at commit.
+                    || boule_consensus::endpoint_registry::SignedEndpointCommand::is_endpoint_payload(&cmd)
                 {
                     commands.push(cmd);
                 }
@@ -512,12 +544,14 @@ impl Application for RethApplication {
             let validator_updates = self
                 .derive_validator_updates(&payload, block.header.height)
                 .await;
-            // Rotation predeploy events (#730): each carries an already-encoded,
-            // dual-signed rotation command submitted as an EVM tx. Surface them
-            // as KeyRotation effects; the integration layer re-materialises each
-            // into a block command where the existing rotation path verifies the
-            // signatures and schedules the v_eff swap.
-            let effects = self.derive_rotation_effects(&payload).await;
+            // Submission-predeploy events: each carries an already-signed
+            // consensus command submitted as an EVM tx, surfaced as a
+            // ValidatorEffect the integration layer re-materialises into a block
+            // command (consensus verifies signatures + schedules at commit).
+            //   - rotation (#730) -> KeyRotation
+            //   - endpoint (#731) -> EndpointUpdate
+            let mut effects = self.derive_rotation_effects(&payload).await;
+            effects.extend(self.derive_endpoint_effects(&payload).await);
             Ok(CommitResult {
                 validator_updates,
                 effects,
@@ -548,14 +582,16 @@ impl Application for RethApplication {
 
     fn capabilities(&self) -> Vec<IntegrationCapability> {
         // The reth backend drives the validator set from on-chain staking logs
-        // (#655), burns bonded stake on committed evidence (#658b), and accepts
-        // key/operator rotations via the rotation predeploy (#730). It does not
-        // (yet) drive endpoint advertisement, parameter updates, or rewards
-        // through the seam (those are milestone-#4 follow-ups — #731/#542).
+        // (#655), burns bonded stake on committed evidence (#658b), accepts
+        // key/operator rotations via the rotation predeploy (#730), and accepts
+        // endpoint advertisements via the endpoint predeploy (#731). It does not
+        // (yet) drive parameter updates or rewards through the seam (those are
+        // milestone-#4 follow-ups — #542 producer / rewards).
         vec![
             IntegrationCapability::Membership,
             IntegrationCapability::Slashing,
             IntegrationCapability::KeyRotation,
+            IntegrationCapability::EndpointAdvertisement,
         ]
     }
 
@@ -664,18 +700,19 @@ mod tests {
     }
 
     #[test]
-    fn declares_membership_slashing_and_key_rotation_capabilities() {
+    fn declares_the_capabilities_it_drives() {
         // The reth backend drives the validator set (#655), slashing (#658b),
-        // and key rotation via the predeploy (#730) — and declares exactly
-        // those, nothing it doesn't drive.
+        // key rotation (#730), and endpoint advertisement (#731) — and declares
+        // exactly those, nothing it doesn't drive.
         let app = make_app([0u8; 32]);
         let caps = app.capabilities();
         assert!(caps.contains(&IntegrationCapability::Membership));
         assert!(caps.contains(&IntegrationCapability::Slashing));
         assert!(caps.contains(&IntegrationCapability::KeyRotation));
+        assert!(caps.contains(&IntegrationCapability::EndpointAdvertisement));
         assert!(!caps.contains(&IntegrationCapability::Rewards));
-        assert!(!caps.contains(&IntegrationCapability::EndpointAdvertisement));
-        assert_eq!(caps.len(), 3);
+        assert!(!caps.contains(&IntegrationCapability::ParameterUpdates));
+        assert_eq!(caps.len(), 4);
     }
 
     #[tokio::test]
@@ -875,6 +912,92 @@ mod tests {
                 );
             }
             other => panic!("expected KeyRotation, got {other:?}"),
+        }
+    }
+
+    /// Test transport serving endpoint-predeploy logs only for the endpoint
+    /// `eth_getLogs` filter (keyed on the filter's `address`).
+    struct EndpointTransport {
+        inner: FixtureTransport,
+        endpoint_logs: Value,
+    }
+    impl EngineTransport for EndpointTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, _method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+            let is_endpoint = params[0]["address"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(endpoint::ENDPOINT_ADDRESS));
+            let logs = if is_endpoint {
+                self.endpoint_logs.clone()
+            } else {
+                Value::Array(Vec::new())
+            };
+            Box::pin(async move { Ok(logs) })
+        }
+    }
+
+    /// #731 end-to-end (reth side): an endpoint-predeploy event in a committed
+    /// block surfaces as a `ValidatorEffect::EndpointUpdate` carrying the opaque
+    /// endpoint command, which the integration layer then materialises. reth
+    /// does not interpret the command — it passes the bytes straight through.
+    #[tokio::test]
+    async fn commit_reads_endpoint_logs_into_endpoint_effects() {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        let cmd = b"ENDPT-fake-encoded-signed-endpoint-command";
+        let endpoint_logs = serde_json::json!([{
+            "topics": [endpoint::ENDPOINT_TOPIC, format!("0x{}", "02".repeat(32))],
+            "data": abi_log_bytes(cmd),
+        }]);
+        let app = RethApplication::new(
+            Box::new(EndpointTransport {
+                inner: FixtureTransport,
+                endpoint_logs,
+            }),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::seeded_from([([2u8; 32], 1u64)])),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        );
+
+        let g = genesis();
+        let block = app
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
+            .await
+            .expect("build");
+        let result = app
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit");
+
+        assert!(
+            result.validator_updates.is_empty(),
+            "no staking logs at the endpoint address",
+        );
+        assert_eq!(result.effects.len(), 1, "one endpoint event → one effect");
+        match &result.effects[0] {
+            ValidatorEffect::EndpointUpdate(bytes) => {
+                assert_eq!(
+                    bytes.as_ref(),
+                    cmd.as_ref(),
+                    "the opaque command rides through"
+                );
+            }
+            other => panic!("expected EndpointUpdate, got {other:?}"),
         }
     }
 

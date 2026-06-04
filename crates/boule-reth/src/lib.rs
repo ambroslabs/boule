@@ -31,8 +31,10 @@
 //! follow-up.
 
 pub mod application;
+pub mod endpoint;
 pub mod engine;
 pub mod jwt;
+pub mod predeploy_log;
 pub mod rotation;
 pub mod staking;
 pub mod transport;

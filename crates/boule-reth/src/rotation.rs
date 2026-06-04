@@ -60,71 +60,13 @@ pub fn logs_filter_by_number(number: u64) -> Value {
     }])
 }
 
-/// Parse an `eth_getLogs` result (an array of rotation-predeploy log objects)
-/// into the encoded rotation-command bytes carried by each, in log order.
-///
-/// The `rotationCommand` argument is a non-indexed dynamic `bytes`, so it lives
-/// in the log `data` ABI-encoded as `offset(32) || length(32) || bytes(padded)`.
-/// Logs that don't match the expected topic or whose data is malformed are
-/// skipped — consensus still validates each returned command (tag + signatures)
-/// before acting on it, so a junk log is harmless here.
+/// Parse an `eth_getLogs` result into the encoded rotation-command bytes
+/// carried by each matching log, in log order — a thin wrapper over the shared
+/// [`parse_command_logs`](crate::predeploy_log::parse_command_logs) keyed on
+/// [`ROTATION_TOPIC`]. Malformed or wrong-topic logs are skipped; consensus
+/// validates each returned command (tag + signatures) before acting on it.
 pub fn parse_rotation_logs(logs: &Value) -> Vec<Bytes> {
-    let Some(arr) = logs.as_array() else {
-        return Vec::new();
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for log in arr {
-        let Some(topics) = log["topics"].as_array() else {
-            continue;
-        };
-        if topics
-            .first()
-            .and_then(|t| t.as_str())
-            .map(str::to_ascii_lowercase)
-            != Some(ROTATION_TOPIC.to_string())
-        {
-            continue;
-        }
-        if let Some(cmd) = decode_abi_bytes(log["data"].as_str().unwrap_or_default()) {
-            out.push(Bytes::from(cmd));
-        }
-    }
-    out
-}
-
-/// Decode a single ABI-encoded dynamic `bytes` value from a hex `data` blob:
-/// a 32-byte offset (expected `0x20`), a 32-byte length, then that many bytes.
-/// Returns `None` if the blob is too short, the offset is unexpected, or the
-/// declared length runs past the data.
-fn decode_abi_bytes(data: &str) -> Option<Vec<u8>> {
-    let raw = hex::decode(data.trim_start_matches("0x")).ok()?;
-    // [0..32] offset, [32..64] length, then the bytes.
-    if raw.len() < 64 {
-        return None;
-    }
-    // The offset to the single dynamic argument is always 0x20 (one word).
-    if word_to_usize(&raw[0..32])? != 32 {
-        return None;
-    }
-    let len = word_to_usize(&raw[32..64])?;
-    let start: usize = 64;
-    let end = start.checked_add(len)?;
-    if end > raw.len() {
-        return None;
-    }
-    Some(raw[start..end].to_vec())
-}
-
-/// Interpret a 32-byte ABI word as a `usize`, rejecting any value that does not
-/// fit (a length/offset that large is a malformed log, not a real rotation).
-fn word_to_usize(word: &[u8]) -> Option<usize> {
-    // Only the low 8 bytes can be non-zero for a plausible length/offset.
-    if word[..24].iter().any(|&b| b != 0) {
-        return None;
-    }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&word[24..32]);
-    usize::try_from(u64::from_be_bytes(buf)).ok()
+    crate::predeploy_log::parse_command_logs(logs, ROTATION_TOPIC)
 }
 
 #[cfg(test)]

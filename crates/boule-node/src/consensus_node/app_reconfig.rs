@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 
 use boule_consensus::View;
 use boule_consensus::consensus_params::ConsensusParamUpdate;
+use boule_consensus::endpoint_registry::SignedEndpointCommand;
 use boule_consensus::reconfig::{
     MIN_V_EFF_DELAY, MIN_VALIDATOR_FLOOR, ReconfigCommand, WeightChange,
 };
@@ -174,11 +175,13 @@ impl ConsensusNode {
     /// rotation commands, which have no one-boundary-at-a-time guard to dedupe
     /// them the way [`Self::mint_staged_reconfig`] does for reconfigs.
     ///
-    /// [`ValidatorEffect::KeyRotation`] (#730) and [`ValidatorEffect::ParamUpdate`]
-    /// (#542) have live apply paths and are minted as their system commands.
-    /// [`ValidatorEffect::EndpointUpdate`] has no effect-materialiser producer
-    /// yet (#731), so it is logged as unsupported rather than silently dropped —
-    /// a surfaced seam gap (cf. the integration-surface catalog, #728).
+    /// Every [`ValidatorEffect`] category now has a live apply path and is
+    /// minted as its consensus system command: [`ValidatorEffect::KeyRotation`]
+    /// (#730), [`ValidatorEffect::EndpointUpdate`] (#731), and
+    /// [`ValidatorEffect::ParamUpdate`] (#542). Each mint first confirms the
+    /// payload's declared category (defense against the effect channel smuggling
+    /// a mismatched command in). A future `#[non_exhaustive]` category with no
+    /// materialiser is surfaced rather than silently dropped (cf. #728).
     pub(super) fn mint_staged_effects(&mut self, view: View) {
         if self.staged_effects.is_empty() {
             return;
@@ -214,11 +217,33 @@ impl ConsensusNode {
                         ),
                     }
                 }
-                ValidatorEffect::EndpointUpdate(_) => tracing::warn!(
-                    target: TRACE_TARGET,
-                    view = view.0,
-                    "app_effect_endpoint_update_unsupported_dropped", // #731/#546
-                ),
+                ValidatorEffect::EndpointUpdate(bytes) => {
+                    // #731: the EL recorded a validator endpoint advertisement
+                    // (#546); re-materialise it as a SignedEndpointCommand so it
+                    // flows through `apply_committed_endpoints` at commit, where
+                    // the validator's signature + monotone seq are verified.
+                    // Confirm the declared category matches the payload first.
+                    if !SignedEndpointCommand::is_endpoint_payload(&bytes) {
+                        tracing::error!(
+                            target: TRACE_TARGET,
+                            view = view.0,
+                            "mint_staged_effects_endpoint_update_payload_not_an_endpoint",
+                        );
+                        continue;
+                    }
+                    match self.mempool.insert(bytes) {
+                        Ok(_) => tracing::info!(
+                            target: TRACE_TARGET,
+                            view = view.0,
+                            "app_effect_minted_endpoint_update",
+                        ),
+                        Err(e) => tracing::error!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "mint_staged_effects_mempool_insert_failed",
+                        ),
+                    }
+                }
                 ValidatorEffect::ParamUpdate(bytes) => {
                     // #542: the EL drove a live consensus-parameter change;
                     // re-materialise it as a ConsensusParamUpdate command so it
