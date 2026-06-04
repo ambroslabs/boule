@@ -154,6 +154,21 @@ pub const STORAGE_KEY_OPERATOR_KEY_HISTORY: &[u8] = b"consensus/operator_key_his
 /// input a later slashing pass (#658) consumes.
 pub const STORAGE_KEY_COMMITTED_EVIDENCE: &[u8] = b"consensus/committed_evidence";
 
+/// Storage key for the persisted
+/// [`boule_consensus::consensus_params::ConsensusParamHistory`] (#746, follow-up
+/// to #542). Written after every commit that scheduled a new
+/// [`ConsensusParamUpdate`](boule_consensus::consensus_params::ConsensusParamUpdate)
+/// boundary; read at startup by [`ConsensusNode::recover`] so the active live
+/// parameters (e.g. `min_block_interval`) track committed updates across
+/// restarts instead of reverting to config defaults. Same encoding shape as
+/// [`STORAGE_KEY_VALIDATOR_HISTORY`]: a single postcard blob over the full
+/// history (genesis params + every later boundary) rather than a journal —
+/// recovery is one read + decode, and (unlike a rebuild-from-blocks approach)
+/// it survives block pruning. A blob that fails to decode under the current
+/// `ConsensusParams` layout is ignored and recovery falls back to the
+/// from-config genesis-only history.
+pub const STORAGE_KEY_PARAM_HISTORY: &[u8] = b"consensus/param_history";
+
 /// Storage key for the persisted validator endpoint registry (#546).
 /// Written after every commit that applied an endpoint command; read at
 /// startup. The endpoint list is a discovery hint, not safety-critical, so

@@ -126,12 +126,13 @@ pub use persistence::{
     STORAGE_KEY_COMMITTED_EVIDENCE, STORAGE_KEY_ENDPOINT_REGISTRY, STORAGE_KEY_HEIGHT_PREFIX,
     STORAGE_KEY_HIGH_QC, STORAGE_KEY_LAST_COMMITTED, STORAGE_KEY_LAST_TIMEOUT_VOTE,
     STORAGE_KEY_LAST_VOTED_VIEW, STORAGE_KEY_LOCKED, STORAGE_KEY_OPERATOR_KEY_HISTORY,
-    STORAGE_KEY_PROPOSED_IN_VIEW, STORAGE_KEY_VALIDATOR_HISTORY, STORAGE_KEY_VALIDATOR_KEY_HISTORY,
-    block_storage_key, decode_block, decode_height_storage_key, decode_high_qc,
-    decode_last_committed, decode_last_timeout_vote, decode_locked, decode_proposed_in_view,
-    decode_voted_view, encode_block, encode_high_qc, encode_last_committed,
-    encode_last_timeout_vote, encode_locked, encode_proposed_in_view, encode_voted_view,
-    height_storage_key, load_block_from_storage, load_block_range_from_storage, recover_state,
+    STORAGE_KEY_PARAM_HISTORY, STORAGE_KEY_PROPOSED_IN_VIEW, STORAGE_KEY_VALIDATOR_HISTORY,
+    STORAGE_KEY_VALIDATOR_KEY_HISTORY, block_storage_key, decode_block, decode_height_storage_key,
+    decode_high_qc, decode_last_committed, decode_last_timeout_vote, decode_locked,
+    decode_proposed_in_view, decode_voted_view, encode_block, encode_high_qc,
+    encode_last_committed, encode_last_timeout_vote, encode_locked, encode_proposed_in_view,
+    encode_voted_view, height_storage_key, load_block_from_storage, load_block_range_from_storage,
+    recover_state,
 };
 
 use persistence::RecentQcCache;
@@ -1227,6 +1228,53 @@ impl ConsensusNode {
         let endpoint_registry =
             Self::load_endpoint_registry(storage.as_ref(), config.max_endpoint_list_length);
 
+        // #746: recover the persisted consensus-parameter history if any
+        // committed update has flushed it. The genesis params come from config
+        // (the same `min_block_interval` a fresh boot seeds), so a from-config
+        // genesis-only history is the fallback on a missing or undecodable blob
+        // — mirroring the `validator_history` recovery above. The recovered
+        // schedule is authoritative once written, so we never overwrite it.
+        let genesis_params = boule_consensus::consensus_params::ConsensusParams {
+            min_block_interval_ms: config.min_block_interval.as_millis() as u64,
+        };
+        let param_history = match storage
+            .get(STORAGE_KEY_PARAM_HISTORY)
+            .context("read param_history from storage")?
+        {
+            Some(raw) => {
+                match postcard::from_bytes::<
+                    boule_consensus::consensus_params::PersistedConsensusParamHistory,
+                >(&raw)
+                .map_err(anyhow::Error::from)
+                .and_then(|p| {
+                    boule_consensus::consensus_params::ConsensusParamHistory::from_persisted(p)
+                }) {
+                    Ok(h) => h,
+                    // A blob that predates a `ConsensusParams` layout bump (or is
+                    // otherwise undecodable / structurally invalid) is ignored:
+                    // fall back to the from-config genesis-only history, the same
+                    // forward-compat discipline the validator history uses.
+                    Err(e) => {
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            error = %e,
+                            "param_history_decode_failed_falling_back_to_genesis",
+                        );
+                        boule_consensus::consensus_params::ConsensusParamHistory::new(
+                            genesis_params,
+                        )
+                    }
+                }
+            }
+            None => boule_consensus::consensus_params::ConsensusParamHistory::new(genesis_params),
+        };
+        // Seed the cached active `min_block_interval` from the recovered
+        // schedule at the last-committed view, so a convergence-relevant
+        // parameter the chain had already activated is in force immediately on
+        // restart rather than reverting to the config default until the next
+        // commit re-derives it.
+        let min_block_interval = param_history.at(last_committed.view).min_block_interval();
+
         Ok(Self {
             self_id,
             core,
@@ -1256,12 +1304,8 @@ impl ConsensusNode {
             app,
             loopback_stack: Vec::new(),
             draining_loopback: false,
-            min_block_interval: config.min_block_interval,
-            param_history: boule_consensus::consensus_params::ConsensusParamHistory::new(
-                boule_consensus::consensus_params::ConsensusParams {
-                    min_block_interval_ms: config.min_block_interval.as_millis() as u64,
-                },
-            ),
+            min_block_interval,
+            param_history,
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             staged_validator_updates: Vec::new(),
             staged_effects: Vec::new(),
@@ -11446,6 +11490,143 @@ mod tests {
         let b_later = empty_block(b.hash(), 9, 9);
         node.apply_committed_param_updates(&b_later);
         assert_eq!(node.min_block_interval, Duration::ZERO);
+    }
+
+    /// #746: a committed `ConsensusParamUpdate` is persisted on apply, and a
+    /// restart (`recover`) re-derives the same parameter schedule from durable
+    /// storage rather than reverting to the config default — the convergence-
+    /// critical `min_block_interval` survives the restart. Mirrors the
+    /// validator-history persist→recover round-trips above.
+    #[test]
+    fn persist_then_recover_preserves_param_history() {
+        use boule_consensus::consensus_params::{ConsensusParamUpdate, ConsensusParams};
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        // Session 1: apply two committed param updates. The genesis default is
+        // ZERO (`for_testing`); the second boundary at v_eff 5 is already
+        // active once a committed block reaches view 5.
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        );
+        assert_eq!(node.min_block_interval, Duration::ZERO);
+
+        let u1 = ConsensusParamUpdate {
+            min_block_interval_ms: Some(250),
+            v_eff: View::new(3),
+        };
+        let mut b1 = empty_block(genesis().hash(), 1, 1);
+        b1.commands = vec![u1.encode()];
+        node.apply_committed_param_updates(&b1);
+
+        let u2 = ConsensusParamUpdate {
+            min_block_interval_ms: Some(400),
+            v_eff: View::new(5),
+        };
+        let mut b3 = empty_block(b1.hash(), 3, 3);
+        b3.commands = vec![u2.encode()];
+        node.apply_committed_param_updates(&b3);
+
+        // Commit a block at view 5 so both boundaries have activated and the
+        // cached active value reflects the second boundary.
+        let b5 = empty_block(b3.hash(), 5, 5);
+        node.apply_committed_param_updates(&b5);
+        assert_eq!(node.min_block_interval, Duration::from_millis(400));
+
+        // The recovery path seeds the active value from `last_committed.view`,
+        // so persist the (height, view) checkpoint the chain has reached.
+        node.storage
+            .put(
+                STORAGE_KEY_LAST_COMMITTED,
+                &encode_last_committed(&LastCommitted {
+                    height: Height(5),
+                    view: View(5),
+                    last_committed_hash: b5.hash(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let pre_history = node.param_history.clone();
+        drop(node);
+
+        // Session 2: recover from the same storage. The schedule and the active
+        // value match what they were before the restart — no revert to the
+        // config default.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+
+        assert_eq!(
+            recovered.param_history, pre_history,
+            "recovered param schedule matches pre-restart",
+        );
+        assert_eq!(
+            recovered.min_block_interval,
+            Duration::from_millis(400),
+            "active min_block_interval survives restart",
+        );
+        // Spot-check the schedule resolves identically across views.
+        assert_eq!(
+            recovered.param_history.at(View::new(2)),
+            ConsensusParams {
+                min_block_interval_ms: 0
+            },
+        );
+        assert_eq!(
+            recovered.param_history.at(View::new(3)),
+            ConsensusParams {
+                min_block_interval_ms: 250
+            },
+        );
+        assert_eq!(
+            recovered.param_history.at(View::new(5)),
+            ConsensusParams {
+                min_block_interval_ms: 400
+            },
+        );
+    }
+
+    /// #746: with no committed param update ever persisted, `recover` produces a
+    /// genesis-only history seeded from the config default — no blob, no
+    /// boundaries, the active value is the configured one.
+    #[test]
+    fn recover_without_param_blob_is_genesis_only() {
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        let wal: Arc<dyn Wal> = Arc::new(MemoryWal::new());
+        let cfg = test_config(four_validators());
+
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::clone(&wal),
+        )
+        .unwrap();
+        assert_eq!(recovered.min_block_interval, Duration::ZERO);
+        assert_eq!(
+            recovered.param_history,
+            boule_consensus::consensus_params::ConsensusParamHistory::new(
+                boule_consensus::consensus_params::ConsensusParams {
+                    min_block_interval_ms: 0,
+                },
+            ),
+        );
     }
 
     /// #727 defense-in-depth: a [`ValidatorEffect::KeyRotation`] whose payload
