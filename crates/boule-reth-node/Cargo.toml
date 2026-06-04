@@ -45,6 +45,12 @@ reth-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0
 reth-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0" }
 reth-ethereum-payload-builder = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0" }
+# The shanghai/cancun/prague new-payload field checks. We replicate
+# `EthereumExecutionPayloadValidator::ensure_well_formed_payload` in the custom
+# engine validator (to bypass alloy's hardcoded 32-byte `extra_data` cap on the
+# verify path — #791), and these are the per-hardfork checks it runs. Same
+# repo/tag (no fork); already in the dep tree transitively.
+reth-payload-validator = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0" }
 
 # alloy-evm carries `EthBlockExecutionCtx` and the block-executor traits; pin to
 # the exact version reth v2.2.0 resolves (0.34.0).

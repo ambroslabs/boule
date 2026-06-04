@@ -5,12 +5,24 @@
 //! `extra_data` (see [`crate::registry`]), which exceeds the Ethereum yellow-paper
 //! 32-byte `extra_data` limit reth enforces by default in `EthBeaconConsensus`.
 //! Since boule runs its own chain (not Ethereum mainnet), relaxing that single
-//! header-validation rule is sound and is the least-disruptive way to get the
-//! full payload through build → propagate → `newPayloadV4`. We bound it at
+//! header-validation rule is sound. We bound it at
 //! [`crate::registry::MAX_EXTRA_DATA`] so a malicious oversized header is still
 //! rejected.
 //!
-//! This is the only consensus rule we change; everything else delegates to the
+//! ## This is one of *two* `extra_data` caps (#791)
+//!
+//! Relaxing `EthBeaconConsensus` here covers header validation, but it is **not**
+//! sufficient on its own: the **verify path** (`newPayloadV4`) converts the
+//! incoming `ExecutionPayload` to a block through alloy's
+//! `ExecutionPayloadV1::into_block_raw_*`, which hardcodes a separate
+//! `MAXIMUM_EXTRA_DATA_SIZE = 32` that is not a parameter. So a >32-byte payload
+//! would build fine but be rejected on verify. That second cap is routed around
+//! in the custom engine validator
+//! ([`crate::engine_types::BouleEngineValidator`]), which converts with the cap
+//! bypassed. Both relaxations together get the full payload through
+//! build → propagate → `newPayloadV4`.
+//!
+//! This is the only *consensus* rule we change; everything else delegates to the
 //! stock `EthBeaconConsensus`.
 
 use std::sync::Arc;

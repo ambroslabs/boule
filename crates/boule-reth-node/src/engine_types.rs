@@ -18,7 +18,8 @@ use alloy_primitives::{B256, Bytes};
 use reth_ethereum::{
     Block,
     EthPrimitives,
-    chainspec::ChainSpec,
+    TransactionSigned,
+    chainspec::{ChainSpec, EthereumHardforks},
     node::{
         api::{
             AddOnsContext, BuiltPayload, EngineApiValidator, EngineTypes, FullNodeComponents,
@@ -29,18 +30,20 @@ use reth_ethereum::{
         },
         builder::rpc::PayloadValidatorBuilder,
     },
-    primitives::{Header, SealedBlock},
+    primitives::{Block as _, Header, SealedBlock},
     provider::EthStorage,
     // The engine/rpc types via reth's own re-export, so they are the SAME crate
     // instance reth's traits expect (avoids a duplicate alloy_rpc_types_engine).
     rpc::types::engine::{
         ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV2, ExecutionPayloadEnvelopeV3,
         ExecutionPayloadEnvelopeV4, ExecutionPayloadEnvelopeV5, ExecutionPayloadEnvelopeV6,
-        ExecutionPayloadV1, PayloadAttributes as EthPayloadAttributes, PayloadId,
+        ExecutionPayloadSidecar, ExecutionPayloadV1, PayloadAttributes as EthPayloadAttributes,
+        PayloadError, PayloadId,
     },
 };
 use reth_ethereum_payload_builder::EthereumExecutionPayloadValidator;
 use reth_payload_builder::EthBuiltPayload;
+use reth_payload_validator::{cancun, prague, shanghai};
 use serde::{Deserialize, Serialize};
 
 use crate::registry::RegistryPayload;
@@ -159,6 +162,93 @@ impl BouleEngineValidator {
     fn chain_spec(&self) -> &ChainSpec {
         self.inner.chain_spec()
     }
+
+    /// Convert an [`ExecutionData`] into a `SealedBlock`, running the **same**
+    /// consensus-layout checks as reth's stock
+    /// [`EthereumExecutionPayloadValidator::ensure_well_formed_payload`] —
+    /// **except** alloy's hardcoded 32-byte `extra_data` cap, which boule's chain
+    /// relaxes (encoding option (a), #781/#788) so the full
+    /// `(keys, weights, settledView)` registry payload fits in the header.
+    ///
+    /// ## Why this can't just call the stock validator (#791)
+    ///
+    /// The 32-byte cap lives inside alloy's `ExecutionPayloadV1::into_block_raw_*`
+    /// (`MAXIMUM_EXTRA_DATA_SIZE`), which the stock validator funnels every
+    /// `newPayloadV4` through. It is not a parameter, so it cannot be raised the
+    /// way the *build*-path `EthBeaconConsensus` cap is (see [`crate::consensus`]).
+    /// We therefore replicate the validator here and route around the cap by
+    /// converting with the `extra_data` temporarily stripped to empty, then
+    /// **restoring the full bytes on the header before sealing** — so the recomputed
+    /// block hash is taken over the real header (matching the proposer's sealed
+    /// hash) and the body/hardfork checks run on the identical block. Everything
+    /// else is byte-for-byte the stock validator.
+    ///
+    /// `extra_data` is still bounded: the build path caps it at
+    /// [`crate::registry::MAX_EXTRA_DATA`], and an oversized payload that survived
+    /// to here would only fail the codec ([`RegistryPayload::decode`] no-ops it).
+    fn ensure_well_formed_payload_uncapped(
+        &self,
+        payload: ExecutionData,
+    ) -> Result<SealedBlock<Block>, PayloadError> {
+        let ExecutionData { payload, sidecar } = payload;
+
+        let expected_hash = payload.block_hash();
+
+        // Convert with the `extra_data` cap bypassed, then verify the hash —
+        // exactly as the stock validator does, on the real (full) header.
+        let sealed_block = block_from_payload_uncapped(payload, &sidecar)?;
+        if expected_hash != sealed_block.hash() {
+            return Err(PayloadError::BlockHash {
+                execution: sealed_block.hash(),
+                consensus: expected_hash,
+            });
+        }
+
+        let chain_spec = self.chain_spec();
+        let timestamp = sealed_block.timestamp;
+
+        shanghai::ensure_well_formed_fields(
+            sealed_block.body(),
+            chain_spec.is_shanghai_active_at_timestamp(timestamp),
+        )?;
+
+        cancun::ensure_well_formed_fields(
+            &sealed_block,
+            sidecar.cancun(),
+            chain_spec.is_cancun_active_at_timestamp(timestamp),
+        )?;
+
+        prague::ensure_well_formed_fields(
+            sealed_block.body(),
+            sidecar.prague(),
+            chain_spec.is_prague_active_at_timestamp(timestamp),
+        )?;
+
+        Ok(sealed_block)
+    }
+}
+
+/// Convert an [`ExecutionPayload`] (+ its sidecar) into a `SealedBlock`, routing
+/// **around** alloy's hardcoded 32-byte `extra_data` cap (#791) without forking
+/// alloy or re-implementing its version-aware conversion.
+///
+/// The cap lives only in alloy's `ExecutionPayloadV1::into_block_raw_*`
+/// (`MAXIMUM_EXTRA_DATA_SIZE`), checked on the `extra_data` carried by the V1
+/// inner payload. We lift those bytes out (`as_v1_mut`), run alloy's stock
+/// `try_into_block_with_sidecar` on the now-empty `extra_data` (so the check
+/// passes for any size), then **restore the full bytes on the resulting header
+/// before sealing** — so the recomputed block hash is over the true header,
+/// matching the bytes the proposer sealed and every replica propagates. The
+/// caller checks that hash against the payload's declared hash, exactly as the
+/// stock validator does.
+fn block_from_payload_uncapped(
+    mut payload: ExecutionPayload,
+    sidecar: &ExecutionPayloadSidecar,
+) -> Result<SealedBlock<Block>, PayloadError> {
+    let extra_data = std::mem::take(&mut payload.as_v1_mut().extra_data);
+    let mut block: Block = payload.try_into_block_with_sidecar::<TransactionSigned>(sidecar)?;
+    block.header.extra_data = extra_data;
+    Ok(block.seal_slow())
 }
 
 impl PayloadValidator<BouleEngineTypes> for BouleEngineValidator {
@@ -168,9 +258,7 @@ impl PayloadValidator<BouleEngineTypes> for BouleEngineValidator {
         &self,
         payload: ExecutionData,
     ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
-        self.inner
-            .ensure_well_formed_payload(payload)
-            .map_err(Into::into)
+        Ok(self.ensure_well_formed_payload_uncapped(payload)?)
     }
 
     fn validate_payload_attributes_against_header(
@@ -225,5 +313,76 @@ where
 
     async fn build(self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::Validator> {
         Ok(BouleEngineValidator::new(ctx.config.chain.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal sealed `Block` carrying `extra_data` of the given length,
+    /// then re-derive its V1 `ExecutionPayload` (as a verifier receives it).
+    fn payload_with_extra_data(len: usize) -> (B256, ExecutionPayload) {
+        let mut header = Header {
+            extra_data: Bytes::from(vec![0xAB; len]),
+            ..Default::default()
+        };
+        // A base fee is required for the payload→block conversion to succeed.
+        header.base_fee_per_gas = Some(7);
+        let block = Block {
+            header,
+            body: Default::default(),
+        };
+        let sealed: SealedBlock<Block> = block.seal_slow();
+        let hash = sealed.hash();
+        // A block with no withdrawals / beacon root → a V1 execution payload
+        // (and an empty sidecar, which we don't need here).
+        let (payload, _sidecar) =
+            ExecutionPayload::from_block_unchecked(hash, &sealed.into_block());
+        (hash, payload)
+    }
+
+    /// The #791 core: alloy's stock conversion rejects a >32-byte `extra_data`,
+    /// but [`block_from_payload_uncapped`] accepts it and reproduces the exact
+    /// sealed-header bytes and hash — so the verify path round-trips the full
+    /// registry payload that build sealed.
+    #[test]
+    fn uncapped_conversion_accepts_oversized_extra_data() {
+        // 64 bytes > MAXIMUM_EXTRA_DATA_SIZE (32): the registry-payload case.
+        let (hash, payload) = payload_with_extra_data(64);
+
+        // Stock alloy conversion rejects it (this is the verify-path gap #791).
+        let stock = payload
+            .clone()
+            .try_into_block_with_sidecar::<TransactionSigned>(&ExecutionPayloadSidecar::none());
+        assert!(
+            matches!(stock, Err(PayloadError::ExtraData(_))),
+            "stock conversion enforces the 32-byte cap (got {stock:?})",
+        );
+
+        // Our uncapped conversion accepts it and recovers the true header.
+        let sealed = block_from_payload_uncapped(payload, &ExecutionPayloadSidecar::none())
+            .expect("uncapped conversion accepts >32-byte extra_data");
+        assert_eq!(
+            sealed.hash(),
+            hash,
+            "the recomputed hash matches the proposer's sealed hash",
+        );
+        assert_eq!(
+            sealed.into_block().header.extra_data.as_ref(),
+            vec![0xAB; 64].as_slice(),
+            "the full extra_data is restored on the header",
+        );
+    }
+
+    /// A ≤32-byte `extra_data` (the common settled-only block) round-trips through
+    /// the uncapped path identically — it is a strict superset of the stock path.
+    #[test]
+    fn uncapped_conversion_handles_small_extra_data() {
+        let (hash, payload) = payload_with_extra_data(22); // settled-only size
+        let sealed = block_from_payload_uncapped(payload, &ExecutionPayloadSidecar::none())
+            .expect("small extra_data converts");
+        assert_eq!(sealed.hash(), hash);
+        assert_eq!(sealed.into_block().header.extra_data.len(), 22);
     }
 }

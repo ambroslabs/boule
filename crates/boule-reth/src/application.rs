@@ -77,6 +77,17 @@ pub struct RethApplication {
     /// pulls pending consensus-layer system txs (reconfig/rotation) from it
     /// into the block — the only path for them onto the reth backend.
     mempool: Arc<dyn Mempool>,
+    /// Seated-weight deltas committed but **not yet mirrored through the EL**
+    /// (#791 Part B). Weight changes come from a block's *execution* logs, so
+    /// they are only known after `commit` — too late for that block's own
+    /// `extra_data`. They are therefore staged here at `commit` and carried in
+    /// the **next** block's `registryPayload` (the same one-block lag the legacy
+    /// `recordWeight` tx path has). `commit` reconciles the buffer against each
+    /// committed block's `extra_data` (decoding the weights it already mirrored)
+    /// so nothing is carried twice and nothing leaks across leader rotation.
+    /// Keyed by validator so a later delta for the same validator supersedes an
+    /// earlier pending one (the absolute weight is what the EL applies).
+    pending_weights: Mutex<std::collections::BTreeMap<NodeId, u64>>,
 }
 
 impl RethApplication {
@@ -107,6 +118,7 @@ impl RethApplication {
             }),
             stake_source: Mutex::new(stake_source),
             mempool,
+            pending_weights: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -131,11 +143,16 @@ impl RethApplication {
     ///   [`registry::record_key_for_rotation`] into the EL's 128-byte EIP-2537
     ///   form. Non-BLS / undecodable commands are skipped (logged), never failing
     ///   the build.
-    /// - **`weights`** — left empty here: seated-weight deltas are staged at the
-    ///   integration layer (not visible to the `Application` at build time), so
-    ///   the legacy tx-write path (`record_validator_weights`, which still runs in
-    ///   `commit`) covers them this phase. Threading weight deltas through to the
-    ///   EL build path is Phase-3/5 work (see #781).
+    /// - **`weights`** — the seated-weight deltas committed but not yet mirrored
+    ///   through the EL (#791 Part B). A weight change is a function of a block's
+    ///   *execution* logs, so it is only known after that block's `commit` — too
+    ///   late for its own `extra_data`. We therefore stage each block's deltas in
+    ///   [`Self::pending_weights`] at `commit` and carry the pending set in the
+    ///   **next** block's payload here (the same one-block lag the legacy
+    ///   `recordWeight` tx path has). Snapshotting (not draining) the buffer keeps
+    ///   the build idempotent if the proposal is skipped; `commit` is what clears a
+    ///   delta, once it sees a committed block's `extra_data` already mirrored it.
+    ///   In a consensus-canonical order (by validator id, via the `BTreeMap`).
     ///
     /// Determinism across replicas does not depend on this sourcing: the EL reads
     /// the write set from the *sealed header* `extra_data` on every node's verify
@@ -162,7 +179,51 @@ impl RethApplication {
             }
         }
 
-        crate::registry_payload::RegistryPayload::new(keys, &[], settled_view)
+        // Snapshot the pending seated-weight deltas (committed, not yet
+        // EL-mirrored). The `BTreeMap` gives a stable per-validator order.
+        let weights: Vec<ValidatorUpdate> = self
+            .pending_weights
+            .lock()
+            .iter()
+            .map(|(&node_id, &weight)| ValidatorUpdate { node_id, weight })
+            .collect();
+
+        crate::registry_payload::RegistryPayload::new(keys, &weights, settled_view)
+    }
+
+    /// #791 Part B — keep the [`Self::pending_weights`] buffer correct across a
+    /// commit. First **drop** the seated-weight deltas this committed block's
+    /// sealed `extra_data` already mirrored through the EL (decoded from the
+    /// committed execution payload's `extraData`), then **stage** this block's
+    /// freshly-derived deltas so they ride the next block's `extra_data`.
+    ///
+    /// A pending entry is removed only when the *committed* block carried the
+    /// exact `(validator, weight)` it still holds — a stale pending value that has
+    /// since been superseded by a newer delta is left in place to be re-carried.
+    /// Staging overwrites per validator (the absolute weight is what the EL
+    /// applies), so the buffer holds at most one entry per validator. Run on every
+    /// replica, off authoritative committed state, so it is deterministic.
+    fn reconcile_pending_weights(&self, payload: &Value, new_updates: &[ValidatorUpdate]) {
+        let carried = payload["extraData"]
+            .as_str()
+            .map(|s| s.trim_start_matches("0x"))
+            .and_then(|s| hex::decode(s).ok())
+            .and_then(|bytes| crate::registry_payload::RegistryPayload::decode(&bytes))
+            .map(|p| p.weights)
+            .unwrap_or_default();
+
+        let mut pending = self.pending_weights.lock();
+        // Drop only deltas the committed block actually mirrored (same value),
+        // so a superseded-then-replaced pending value survives to be re-carried.
+        for (validator, weight) in carried {
+            if pending.get(&validator) == Some(&weight) {
+                pending.remove(&validator);
+            }
+        }
+        // Stage this block's new deltas (overwrites supersede per validator).
+        for u in new_updates {
+            pending.insert(u.node_id, u.weight);
+        }
     }
 
     /// Read the staking predeploy's `Deposit`/`Withdraw` events *and* the
@@ -1099,6 +1160,15 @@ impl Application for RethApplication {
             let validator_updates = self
                 .derive_validator_updates(&payload, block.header.height)
                 .await;
+            // #791 Part B — EL-mirrored weights: reconcile then re-stage the
+            // pending-weight buffer. This block's sealed `extra_data` carried the
+            // weight deltas that were pending when it was *built*; now that it has
+            // committed (on every replica), the EL has applied them, so drop them
+            // from the buffer. Then stage this block's freshly-derived deltas to
+            // ride the next block's `extra_data`. Done on **every** node (not just
+            // the proposer) and keyed by validator, so the buffer is byte-identical
+            // across replicas and a later delta supersedes an earlier pending one.
+            self.reconcile_pending_weights(&payload, &validator_updates);
             // Submission-predeploy events: each carries an encoded consensus
             // command submitted as an EVM tx, surfaced as a ValidatorEffect the
             // integration layer re-materialises into a block command (consensus
@@ -2944,6 +3014,92 @@ mod tests {
             &view_word,
             "recordSettled(committed_view - SETTLED_VIEW_MARGIN)",
         );
+    }
+
+    // ── #791 Part B: seated weights flow through the EL `extra_data` ─────────
+
+    /// A seated-weight change committed in block N is **staged** and carried in
+    /// the **next** build's `registryPayload` (the one-block lag), so the EL
+    /// applies `recordWeight` from `extra_data` on every replica. Build N's own
+    /// payload cannot carry it (the delta is only known after N executes).
+    #[tokio::test]
+    async fn committed_weight_delta_rides_the_next_block_payload() {
+        let self_id = [1u8; 32];
+        let node = [2u8; 32];
+        // A Withdraw of the full genesis stake (3) → weight 0 (a removal).
+        let staking_logs = serde_json::json!([{
+            "topics": [staking::WITHDRAW_TOPIC, format!("0x{}", "02".repeat(32))],
+            "data": format!("0x{:064x}", 3u64),
+        }]);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let app = weight_app(self_id, staking_logs, vec![(node, 3u64)], Arc::clone(&sent));
+
+        let g = genesis();
+        let ctx = AppContext {
+            proposer: self_id,
+            ..Default::default()
+        };
+        let view = View(registry::SETTLED_VIEW_MARGIN + 6);
+
+        // Block N's own payload carries no weight yet (nothing staged).
+        assert!(
+            app.registry_payload_for_build(view, &[]).weights.is_empty(),
+            "block N cannot carry its own (not-yet-executed) weight delta",
+        );
+
+        // Commit N: the Withdraw is derived → weight 0 staged for the next block.
+        let block = app
+            .build_proposal(&ctx, &g, view, &sample_qc(&g), &HashMap::new(), 0)
+            .await
+            .expect("build");
+        app.commit(&ctx, &block).await.expect("commit");
+
+        // Block N+1's payload now carries the seated-weight delta the EL applies.
+        let next = app.registry_payload_for_build(view + View(1), &[]);
+        assert_eq!(
+            next.weights,
+            vec![(node, 0)],
+            "the committed weight delta rides the next block's registryPayload",
+        );
+    }
+
+    /// Once a committed block's sealed `extra_data` has mirrored a staged weight
+    /// delta through the EL, [`reconcile_pending_weights`] drops it so it is not
+    /// carried twice — and a delta the block did *not* carry is retained.
+    #[test]
+    fn reconcile_drops_only_the_weights_a_committed_block_mirrored() {
+        let self_id = [1u8; 32];
+        let kept = [7u8; 32];
+        let app = weight_app(
+            self_id,
+            Value::Array(Vec::new()),
+            vec![],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        // Stage two pending deltas as if two prior blocks produced them.
+        {
+            let mut p = app.pending_weights.lock();
+            p.insert([2u8; 32], 0);
+            p.insert(kept, 5);
+        }
+        // A committed block whose `extra_data` mirrored only validator [2;32]→0.
+        let carried = crate::registry_payload::RegistryPayload::new(
+            vec![],
+            &[ValidatorUpdate {
+                node_id: [2u8; 32],
+                weight: 0,
+            }],
+            None,
+        );
+        let payload = serde_json::json!({
+            "extraData": format!("0x{}", hex::encode(carried.encode())),
+        });
+
+        app.reconcile_pending_weights(&payload, &[]);
+
+        let p = app.pending_weights.lock();
+        assert_eq!(p.get(&[2u8; 32]), None, "mirrored delta dropped");
+        assert_eq!(p.get(&kept), Some(&5), "un-mirrored delta retained");
     }
 
     /// #767 — below the conservative margin nothing is settleable, so the
