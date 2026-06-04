@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Start reth as a bare execution layer for a boule chain: custom
-# Cancun-at-genesis chainspec, Engine API on :8551 (JWT), public eth RPC on
+# Prague-at-genesis chainspec, Engine API on :8551 (JWT), public eth RPC on
 # :8545, no internal block production (boule drives it via the Engine API).
 #
-# Requires reth v2.2.0 on PATH. Generates jwt.hex on first run.
+# Requires a reth on PATH that activates Prague (pin updated from v2.2.0 — see
+# PRAGUE-MIGRATION.md). Generates jwt.hex on first run.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
