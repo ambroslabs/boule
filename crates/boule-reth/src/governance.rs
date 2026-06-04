@@ -19,15 +19,29 @@
 //! bespoke consensus-side signature-accumulation + tx-gossip path.
 //!
 //! The contract's *tally* logic (the stake-weighted supermajority crossing,
-//! validator-gating, double-approval dedup) is the interesting part and is
-//! exercised against a live reth (see the PR / `Governance.sol` doc); this
-//! module is just the read half plus the on-chain identifiers. The tally is
-//! **weight-based** (#729): `approve` takes the 32-byte validator id the caller
-//! votes as, staticcalls the `Registry`'s `weightOf`/`totalWeight` surface
-//! (#759), requires `weightOf > 0` (seated), and emits `Approved` once the
-//! accumulated approving weight crosses a strict two-thirds supermajority of
-//! `totalWeight()` — all documented on the contract, including the residual
-//! trust that a caller names the validator it votes as.
+//! validator-gating, double-approval dedup, and #764 BLS authentication) is the
+//! interesting part and is exercised against a live reth (see the PR /
+//! `Governance.sol` doc); this module is just the read half plus the on-chain
+//! identifiers. The tally is **weight-based** (#729) and **authenticated** (#764):
+//! `approve` takes the 32-byte validator id the caller votes as plus the
+//! validator's BLS signature over a domain-separated digest, staticcalls the
+//! `Registry`'s `weightOf`/`totalWeight`/`keyAt`/`settledView` surface (#759),
+//! requires `weightOf > 0` (seated), verifies the signature against
+//! `keyAt(validator, settledView())` via `BlsVerify`, and emits `Approved` once
+//! the accumulated approving weight crosses a strict two-thirds supermajority of
+//! `totalWeight()`.
+//!
+//! ## #764: the forged-quorum hole and its fix
+//!
+//! The earlier gate checked only `weightOf(validator) > 0`, so — validator ids
+//! being public — a single actor could `approve` once per real validator id and
+//! forge a ⅔ supermajority `Approved` that consensus then applied. #764 closes
+//! this: each approval must carry the validator's own **BLS signature** over
+//! `keccak256(abi.encode(AUTH_DOMAIN, chainId, contract, proposalId,
+//! validator))`, verified in-EVM against the registry key. Naming a validator you
+//! don't control no longer counts — you cannot produce its signature. The
+//! authenticated in-EVM tally is thus the authority; consensus still validates
+//! the carried command's well-formedness but need not re-run the quorum.
 //!
 //! These constants are the authoritative identifiers and match the compiled
 //! runtime bytecode embedded in `genesis.json`; the tests below pin the address,
@@ -49,11 +63,31 @@ pub const GOVERNANCE_ADDRESS: &str = "0x0000000000000000000000000000000000000b14
 pub const APPROVED_TOPIC: &str =
     "0xd686e9e9eda221dfab37aa6cae405e85e661ed8e45cbe791790ed38093d85b75";
 
-/// 4-byte selector of `approve(bytes32 proposalId, bytes reconfigCommand, bytes32 validator)`
-/// — the stake-weighted, validator-gated tally entry point (#729). The third
-/// arg is the 32-byte validator id the caller votes as; the contract reads its
-/// `Registry.weightOf` (gated `> 0`) and accumulates it.
-pub const APPROVE_SELECTOR: [u8; 4] = [0x80, 0x30, 0x9c, 0x0a];
+/// 4-byte selector of
+/// `approve(bytes32 proposalId, bytes reconfigCommand, bytes32 validator, bytes blsSig)`
+/// — the **authenticated**, stake-weighted, validator-gated tally entry point
+/// (#729 + #764). The third arg is the 32-byte validator id the caller votes as
+/// (the contract reads its `Registry.weightOf`, gated `> 0`); the fourth is the
+/// validator's BLS signature (EIP-2537 G2, 256 bytes) over the approval digest,
+/// verified in-EVM via `BlsVerify` against `Registry.keyAt(validator,
+/// settledView())` before its weight is accrued — so naming a validator you do
+/// not control cannot contribute its weight (the #764 forged-quorum fix).
+pub const APPROVE_SELECTOR: [u8; 4] = [0x8e, 0x4a, 0x23, 0xcb];
+
+/// 4-byte selector of `approveDigest(bytes32 proposalId, bytes32 validator)` —
+/// the view helper returning the 32-byte digest a validator must BLS-sign to
+/// approve (#764): `keccak256(abi.encode(AUTH_DOMAIN, chainId, contract,
+/// proposalId, validator))`. Off-chain signers reconstruct exactly this.
+pub const APPROVE_DIGEST_SELECTOR: [u8; 4] = [0x73, 0x87, 0x53, 0xb8];
+
+/// `keccak256("BOULE_GOV_APPROVE_V1")` — the governance approval-signing domain
+/// tag (#764). Embedded as `AUTH_DOMAIN` in `Governance.sol`; it separates a
+/// governance approval signature from a `Param` approval (distinct domain) and
+/// from any other use of the validator's BLS key, closing cross-context replay.
+pub const AUTH_DOMAIN: [u8; 32] = [
+    0x1c, 0x22, 0x99, 0xbe, 0x36, 0x1b, 0x40, 0xa5, 0x31, 0x53, 0x98, 0x8f, 0x6f, 0x3d, 0xb6, 0x5c,
+    0xee, 0x90, 0x2f, 0x43, 0xa7, 0xd6, 0x4d, 0x94, 0x8a, 0xbe, 0x0a, 0x4e, 0xaa, 0x15, 0x6f, 0xe9,
+];
 
 /// 4-byte selector of `approvals(bytes32)` (the running accumulated approving
 /// weight).
@@ -130,6 +164,7 @@ mod tests {
         );
         for (name, sel) in [
             ("approve", APPROVE_SELECTOR),
+            ("approveDigest", APPROVE_DIGEST_SELECTOR),
             ("approvals", APPROVALS_SELECTOR),
             ("isApproved", IS_APPROVED_SELECTOR),
         ] {
@@ -138,6 +173,37 @@ mod tests {
                 "{name} selector must appear in the dispatcher",
             );
         }
+        // #764: the approval-signing domain tag must be the PUSH32 operand the
+        // contract embeds, so the digest the contract checks matches what an
+        // off-chain signer reconstructs from `AUTH_DOMAIN`.
+        assert!(
+            code.contains(&hex::encode(AUTH_DOMAIN)),
+            "AUTH_DOMAIN must appear as the PUSH32 operand in the bytecode",
+        );
+    }
+
+    /// #764 authentication staticcalls `Registry.keyAt` / `settledView` to fetch
+    /// the validator's settled BLS key, then verifies the approval signature
+    /// in-EVM. The Governance bytecode must therefore embed both Registry
+    /// selectors (as `abi.encodeWithSelector` PUSH4 operands) so the cross-contract
+    /// auth path cannot silently drift from `crate::registry`'s canonical values.
+    #[test]
+    fn registry_key_surface_pinned_in_governance_bytecode() {
+        use crate::registry::{KEY_AT_SELECTOR, SETTLED_VIEW_SELECTOR};
+        let g: serde_json::Value =
+            serde_json::from_str(include_str!("../genesis.json")).expect("genesis.json parses");
+        let code = g["alloc"][GOVERNANCE_ADDRESS]["code"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            code.contains(&hex::encode(KEY_AT_SELECTOR)),
+            "Registry keyAt selector must appear in Governance's #764 auth staticcall",
+        );
+        assert!(
+            code.contains(&hex::encode(SETTLED_VIEW_SELECTOR)),
+            "Registry settledView selector must appear in Governance's #764 auth staticcall",
+        );
     }
 
     /// The stake-weighted tally (#729) staticcalls the `Registry`'s weight

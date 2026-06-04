@@ -155,21 +155,37 @@ moves onto the EVM.
 > Unlike `Rotation.sol` / `Endpoint.sol`, a parameter update is not tied to a
 > single validator, so the event carries **no indexed `validator`**.
 >
-> **Authorization is an open #542 follow-up:** who may change a consensus
-> parameter (a governance multisig, a validator-quorum signature) is
-> deliberately unresolved. This predeploy emits whatever is submitted; the only
-> consensus-side guard today is the `v_eff` delay floor. The first wired
-> parameter (`min_block_interval`) is leader-local and harmless, bounding the
-> risk until authorization lands.
+> **Authorization (#746 + #764).** The original single-submitter `submitParam`
+> emitter was replaced by a validator-weighted, BLS-authenticated quorum
+> mirroring `Governance.sol`: a validator calls `approve(bytes32 proposalId,
+> bytes paramCommand, bytes32 validator, bytes blsSig)`, the contract reads
+> `Registry.weightOf`/`totalWeight` (gated `> 0`), verifies the validator's BLS
+> signature over `keccak256(abi.encode(AUTH_DOMAIN, chainid, address(this),
+> proposalId, validator))` (`AUTH_DOMAIN = keccak256("BOULE_PARAM_APPROVE_V1")`,
+> a **distinct** domain from `Governance` so the two cannot be cross-replayed)
+> against `Registry.keyAt(validator, settledView())` via `BlsVerify`, and emits
+> `ParamSubmitted` once the accrued weight crosses ⅔. This closes the
+> forged-quorum hole — see the `Governance.sol` section for the full digest /
+> replay / key-view / per-approval / consensus-re-check reasoning, which applies
+> identically here. The `v_eff` delay floor stays as consensus-side
+> defense-in-depth.
 
 | | |
 |---|---|
 | Address | `0x0000000000000000000000000000000000000b11` |
 | `ParamSubmitted(bytes)` topic0 | `0x27d1e5d546bb0a37e323040c28412ac11a38a95061bbe56c3f95d635f8826a0b` |
-| `submitParam(bytes)` selector | `0x18433fc7` |
+| `approve(bytes32,bytes,bytes32,bytes)` selector | `0x8e4a23cb` |
+| `approveDigest(bytes32,bytes32)` selector | `0x738753b8` |
+| `approvals(bytes32)` selector | `0xbf7c2131` |
+| `isApproved(bytes32)` selector | `0x48aefc32` |
+| `AUTH_DOMAIN` (`keccak256("BOULE_PARAM_APPROVE_V1")`) | `0xfa566b51e8b3f0ea73bb6bd0a56040634697f7ad06bdedc3e670759fbf84c6cd` |
 
 These identifiers are mirrored as constants in `src/param.rs`; unit tests pin
-the address, topic, and selector to the genesis account's bytecode.
+the address, topic, selectors, `AUTH_DOMAIN`, and the `Registry` weight/key-surface
+selectors to the genesis account's bytecode. The authenticated quorum is validated
+against a **live reth** by `test/param-auth.mjs` (valid signed approval counts,
+forged/wrong-key rejected, forged-quorum closed, non-seated rejected, ⅔ crossing
+emits once), which uses the `bls-sign` helper for signatures.
 
 ### Reproducing the bytecode
 
@@ -283,30 +299,48 @@ signature-accumulation + bespoke tx-gossip approach.
 > Binding `proposalId` to the command hash means any approver disagreeing on the
 > command produces a different id and so a separate tally.
 >
-> **MVP weight model — one-validator-one-vote.** The tally counts *distinct
-> approving addresses*, not stake weight: there is no on-chain queryable
-> validator-weight source today (`Staking.sol` is a pure event emitter whose
-> balances live consensus-side in `BondedStakeLedger`; `Registry.sol` mirrors
-> BLS keys, not weight), so inventing one here would duplicate state. `quorum`
-> is a count of validators, fixed by the first approver for a `proposalId`.
-> Stake-weighting the tally and restricting `approve` to seated validators is the
-> same follow-up the sibling predeploys carry; consensus still validates the
-> carried command, bounding the exposure of an over-counted tally.
+> **Weighted, validator-gated tally (#729).** The tally is stake-weighted and
+> restricted to seated validators: `approve` reads `Registry.weightOf(validator)`
+> (gated `> 0`) and `Registry.totalWeight()`, accumulates the approver's weight
+> (deduplicated per `(proposalId, validator)`), and emits once the running weight
+> crosses a strict two-thirds supermajority (`weight·3 > totalWeight·2`).
+>
+> **In-EVM BLS authentication (#764).** Each approval carries the validator's own
+> **BLS signature** over `keccak256(abi.encode(AUTH_DOMAIN, chainid,
+> address(this), proposalId, validator))` (`AUTH_DOMAIN =
+> keccak256("BOULE_GOV_APPROVE_V1")`), verified in-EVM via `BlsVerify` against
+> `Registry.keyAt(validator, settledView())`. This closes the forged-quorum hole:
+> naming a validator id you don't control accrues no weight, because you cannot
+> produce its signature. The domain tag / chainid / contract / proposalId fields
+> close cross-context, cross-chain, cross-contract, and cross-command replay; the
+> `(proposalId, validator)` dedup removes any need for a nonce. The authenticated
+> in-EVM tally is now the authority — consensus still validates the carried
+> command's well-formedness but need not re-run the quorum. Verification is
+> per-approval (one pairing each, ~hundreds of k gas); BLS *aggregation* is a
+> follow-up. `msg.sender` is irrelevant, so a relayer can submit a validator's
+> signed approval.
 
 | | |
 |---|---|
 | Address | `0x0000000000000000000000000000000000000b14` |
 | `Approved(bytes32,bytes)` topic0 | `0xd686e9e9eda221dfab37aa6cae405e85e661ed8e45cbe791790ed38093d85b75` |
-| `approve(bytes32,bytes,uint64)` selector | `0x410fa955` |
+| `approve(bytes32,bytes,bytes32,bytes)` selector | `0x8e4a23cb` |
+| `approveDigest(bytes32,bytes32)` selector | `0x738753b8` |
 | `approvals(bytes32)` selector | `0xbf7c2131` |
 | `isApproved(bytes32)` selector | `0x48aefc32` |
+| `AUTH_DOMAIN` (`keccak256("BOULE_GOV_APPROVE_V1")`) | `0x1c2299be361b40a53153988f6f3db65cee902f43a7d64d948abe0a4eaa156fe9` |
 
 These identifiers are mirrored as constants in `src/governance.rs`; unit tests
-pin the address, topic, and selectors to the genesis account's bytecode. The
-contract's approval-tally logic is validated against a **live reth** by the
-manual harness `test/governance.mjs` (see its header): below-quorum approvals
-emit nothing, crossing quorum emits `Approved` exactly once, and a
-double-approval by the same validator does not double-count.
+pin the address, topic, selectors, `AUTH_DOMAIN`, and the `Registry`
+weight/key-surface selectors to the genesis account's bytecode. The contract's
+authenticated approval-tally logic is validated against a **live reth** by the
+manual harness `test/governance.mjs` (see its header): a valid BLS-signed
+approval counts, a forged/wrong-key signature is rejected, naming a validator
+without its signature accrues no weight (forged-quorum closed), a non-seated
+caller reverts, and crossing the ⅔ weight threshold emits `Approved` exactly
+once. The harness shells out to the `bls-sign` helper
+(`cargo run -p boule-consensus --bin bls-sign`) for boule BLS signatures + EIP-2537
+pubkeys over the contract's `approveDigest`.
 
 ### Reproducing the bytecode
 
