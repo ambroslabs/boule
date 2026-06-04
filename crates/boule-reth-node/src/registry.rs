@@ -35,9 +35,13 @@ use alloy_sol_types::{SolCall, sol};
 /// `contracts/Registry.sol`, the `SYSTEM`/`WRITER` change in Phase 2).
 pub const SYSTEM_ADDRESS: Address = address!("0xfffffffffffffffffffffffffffffffffffffffe");
 
-/// The boule `Registry` predeploy address (mirror of `boule-reth`'s genesis
-/// seed; see `crates/boule-reth/src/registry.rs`).
-pub const REGISTRY_ADDRESS: Address = address!("0x00000000000000000000000000000000000b0011");
+/// The canonical boule `Registry` predeploy address — the **single** address
+/// the registry lives at, genesis-seeded by `boule-reth` and read by slashing /
+/// governance / `keyAt` / `weightOf` / `settledView`. Must equal
+/// `boule-reth`'s `REGISTRY_ADDRESS` (`crates/boule-reth/src/registry.rs`), or
+/// the EL's `SYSTEM → REGISTRY` system calls would land at a dead address that
+/// the rest of boule never reads (#793).
+pub const REGISTRY_ADDRESS: Address = address!("0x0000000000000000000000000000000000000b12");
 
 /// 4-byte magic prefixing a boule registry payload in `extra_data`. Anything
 /// without this prefix (e.g. stock reth's client-version `extra_data`) decodes
@@ -337,6 +341,28 @@ mod tests {
     fn empty_payload_is_empty() {
         assert!(RegistryPayload::default().is_empty());
         assert!(!sample().is_empty());
+    }
+
+    #[test]
+    fn registry_address_is_the_canonical_predeploy() {
+        // The EL MUST write to the same Registry the rest of boule reads
+        // (slashing / governance / keyAt / weightOf / settledView). That is
+        // boule-reth's canonical genesis-seeded predeploy at `0x…0b12` (#793).
+        assert_eq!(
+            REGISTRY_ADDRESS,
+            address!("0x0000000000000000000000000000000000000b12"),
+            "EL Registry address must be the canonical 0x…0b12 predeploy",
+        );
+    }
+
+    #[test]
+    fn system_address_is_the_eip4788_system_caller() {
+        // The keyless EL system caller (no key, no nonce) — must match
+        // `Registry.sol`'s SYSTEM constant gating `onlyWriter`.
+        assert_eq!(
+            SYSTEM_ADDRESS,
+            address!("0xfffffffffffffffffffffffffffffffffffffffe"),
+        );
     }
 
     #[test]

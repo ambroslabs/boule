@@ -15,10 +15,12 @@ ROOT="$DIR/../.."
 NODE_DIR="$DIR/../boule-reth-node"
 DATADIR="/tmp/reth-a1-drive"
 JWT="/tmp/reth-a1-drive.jwt"
-# The custom EL writes the Registry at this address (mirror of
-# boule_reth_node::registry::REGISTRY_ADDRESS). The drive genesis must deploy the
-# Registry code here so the EL's system calls hit real contract code.
-EL_REGISTRY="0x00000000000000000000000000000000000b0011"
+# The canonical Registry predeploy address (#793): the custom EL writes here
+# (boule_reth_node::registry::REGISTRY_ADDRESS) AND boule's generated genesis
+# already seeds the Registry here (boule_reth::registry::REGISTRY_ADDRESS), so
+# the EL's system calls hit the same contract slashing/governance/keyAt/weightOf
+# /settledView read. No mirroring to a second address — 0x…0b12 is the one truth.
+EL_REGISTRY="0x0000000000000000000000000000000000000b12"
 
 cleanup() {
   [ -n "${EL_PID:-}" ] && kill "$EL_PID" 2>/dev/null || true
@@ -30,25 +32,26 @@ trap cleanup EXIT INT TERM
 [ -f "$JWT" ] || openssl rand -hex 32 > "$JWT"
 rm -rf "$DATADIR"
 
-# Build the boule-reth genesis (predeploy code + dev validator seed), then COPY
-# the Registry alloc entry (code + storage) to the EL's write address so the
-# custom executor's system calls land on real contract code. (The b0011 vs 0b12
-# address split between #788's node and boule-reth's genesis is a known seam to
-# reconcile — see the PR; here we deploy at both so the live proof can read back.)
-echo "generating drive genesis (Registry mirrored at $EL_REGISTRY)..."
+# Generate the boule-reth genesis (predeploy code + dev validator seed). It
+# already seeds the canonical Registry at 0x…0b12 with the SYSTEM-caller access
+# control (#788), which is exactly the address the custom EL writes to (#793) —
+# so we run that genesis verbatim, no mirroring to a second address. Assert the
+# Registry predeploy is present at the canonical address before booting.
+echo "generating drive genesis (canonical Registry at $EL_REGISTRY)..."
 GEN="/tmp/reth-a1-drive.genesis.json"
-cargo run -q --manifest-path "$ROOT/Cargo.toml" -p boule-reth --bin gen-genesis -- 4 "$GEN.base"
-python3 - "$GEN.base" "$GEN" "$EL_REGISTRY" <<'PY'
+cargo run -q --manifest-path "$ROOT/Cargo.toml" -p boule-reth --bin gen-genesis -- 4 "$GEN"
+python3 - "$GEN" "$EL_REGISTRY" <<'PY'
 import json, sys
-base, out, el_reg = sys.argv[1], sys.argv[2], sys.argv[3]
-g = json.load(open(base))
+gen, el_reg = sys.argv[1], sys.argv[2]
+g = json.load(open(gen))
 alloc = g["alloc"]
-# Find the boule-reth Registry entry (lowercase 0b12) case-insensitively.
-src_key = next(k for k in alloc if k.lower().endswith("0b12"))
-reg = json.loads(json.dumps(alloc[src_key]))  # deep copy (code + storage)
-alloc[el_reg] = reg
-json.dump(g, open(out, "w"), indent=2)
-print(f"mirrored Registry {src_key} -> {el_reg}")
+# The canonical Registry predeploy must be seeded at 0x…0b12 with code, or the
+# EL's system calls would hit a dead address (#793).
+key = next((k for k in alloc if k.lower().endswith("0b12")), None)
+assert key is not None, f"no Registry predeploy at {el_reg} in generated genesis"
+code = alloc[key].get("code", "")
+assert code.startswith("0x60") and len(code) > 2000, "Registry predeploy lacks real code"
+print(f"canonical Registry present at {key} ({len(code)} bytes of code)")
 PY
 
 # Build the custom EL if not present.
