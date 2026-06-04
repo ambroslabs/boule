@@ -184,10 +184,19 @@ on a live reth v2.2.0, and rejects a tampered signature. So:
   equivocation proof carries two `(view, block_hash)` messages that must differ
   only in `block_hash` at the same `view`.
 
-So the isolated remaining work for step 3 is the **in-Solidity hash-to-curve**
-(intricate but bounded; the pairing + formats are proven) plus the predeploy
-wrapper (read `Registry.keyAt`, check same-view/different-hash, verify both
-sigs, slash via `Staking`, emit `Slashed`).
+**Update — the full in-EVM verify is now built and verified** (`contracts/BlsVerify.sol`):
+the in-Solidity hash-to-curve (`expand_message_xmd` over SHA-256 → MODEXP-reduce
+→ `2× MAP_FP2_TO_G2` → `G2ADD`) produces a point **byte-identical to blst's H**,
+and `verify(pubkey, msg, sig, -G1gen)` returns true for a real boule signature
+and false for a tampered message — confirmed on a live reth via
+`contracts/test/blsverify.mjs` against the blst vectors. So the crypto core of
+the slashing precompile is done.
+
+The isolated remaining work for step 3 is the **predeploy wrapper** around
+`BlsVerify`: read `Registry.keyAt(validator, view)`, reconstruct the two signed
+vote pre-images from the equivocation proof (the consensus vote-message format),
+check same-`view`/different-`block_hash`, `BlsVerify.verify` both, and on success
+slash via `Staking` + emit `Slashed`. boule then reads `Slashed` (the #655 path).
 
 ## Open questions
 
