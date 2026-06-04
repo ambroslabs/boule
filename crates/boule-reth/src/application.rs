@@ -199,6 +199,152 @@ impl RethApplication {
         crate::registry_payload::RegistryPayload::new(keys, &weights, settled_view)
     }
 
+    /// #797 — the vote-time integrity gate for the EL-applied registry write
+    /// set. Re-derive the registry `extra_data` the leader **should** have
+    /// stamped into this proposed `block`, from boule's own authoritative
+    /// consensus state, and compare it to what the proposal actually carries.
+    /// `Err` (→ refuse to vote) on any mismatch a validator can independently
+    /// detect at vote time. Run on every non-leader before voting; an honest
+    /// leader's payload always re-derives identically, so the honest path is
+    /// unaffected.
+    ///
+    /// # What is vote-time-validated vs. only commit-time-detected
+    ///
+    /// The three write-set components differ in their availability *at vote
+    /// time* (a validator voting on block N may not yet have **executed** N−1
+    /// under deferred execution), so they are handled separately:
+    ///
+    /// - **`keys`** — derived purely from the BLS-key **rotation system
+    ///   commands carried in the proposed block itself** (the same
+    ///   [`registry::record_key_for_rotation`] decode the builder ran on them),
+    ///   so they are fully available at vote time and are **validated here**.
+    ///   This closes the most dangerous attack (#797): a Byzantine leader can no
+    ///   longer forge an honest validator's `keyAt` to frame it for slashing,
+    ///   because every honest voter re-derives the keys from the same commands
+    ///   and rejects a forged key record.
+    /// - **`settledView`** — deterministic from the block's `view`
+    ///   ([`registry::conservative_settled_view`]), so it is available at vote
+    ///   time and **validated here**.
+    /// - **`weights`** — derived from the seated-weight deltas of a *prior*
+    ///   block's **execution** (staking/slashing events), carried with a
+    ///   one-block lag via [`Self::pending_weights`], which is mutated only at
+    ///   [`Self::commit`] once the EL reports the relevant block `VALID`. A
+    ///   voter on block N may not yet have executed the block whose deltas N's
+    ///   weights mirror (or its EL may still be `SYNCING`), so its
+    ///   `pending_weights` is **not guaranteed** to match the leader's at build
+    ///   time. We therefore do **not** re-derive-and-reject weights here (that
+    ///   would risk honest validators rejecting an honest leader's correct
+    ///   weights purely from an execution-lag skew, a liveness hole). Weight
+    ///   integrity is instead enforced at **commit** by
+    ///   [`Self::detect_weight_extra_data_divergence`], which — once this node
+    ///   has itself executed and re-derived the expected weights — compares them
+    ///   to the committed block's `extra_data` and logs a hard
+    ///   `BFT-SAFETY-VIOLATION` on mismatch. This is **detect-after-final**, not
+    ///   vote-time prevention: see that method and #797's residual note.
+    ///
+    /// So after this fix: forged **keys** and **settledView** are *prevented*
+    /// (never voted for, never committed); a forged **weight** is *detected*
+    /// (and loudly surfaced) at commit but, given the genuine execution lag, is
+    /// not yet vote-time-rejected.
+    fn validate_registry_extra_data(&self, block: &Block) -> Result<()> {
+        // Pull the proposal's EVM execution payload (always the first command)
+        // and decode the registry write set the leader stamped into its
+        // `extra_data`. A genesis/empty block carries no command and nothing to
+        // validate.
+        let Some(cmd) = block.commands.first() else {
+            return Ok(());
+        };
+        let payload: Value = serde_json::from_slice(cmd)
+            .context("proposed block command is not a JSON execution payload")?;
+        let proposed = extra_data_registry_payload(&payload);
+
+        // Re-derive the keys + settledView we expect, from the proposal's own
+        // rotation commands and view — both available at vote time.
+        let expected_keys = registry_keys_from_commands(&block.commands);
+        let expected_settled = {
+            let settled = registry::conservative_settled_view(block.header.view);
+            if settled.0 == 0 { None } else { Some(settled) }
+        };
+
+        // The proposal's view of those same two fields (defaulting to "no
+        // registry payload" for a plain block, which must carry no keys / no
+        // settled-view).
+        let proposed_keys = proposed
+            .as_ref()
+            .map(|p| p.keys.clone())
+            .unwrap_or_default();
+        let proposed_settled = proposed.as_ref().and_then(|p| p.settled_view);
+
+        if proposed_keys != expected_keys {
+            anyhow::bail!(
+                "registry extra_data key mismatch (#797): proposal carries {} key record(s), \
+                 our independent re-derivation expects {}; refusing to vote",
+                proposed_keys.len(),
+                expected_keys.len(),
+            );
+        }
+        if proposed_settled != expected_settled {
+            anyhow::bail!(
+                "registry extra_data settledView mismatch (#797): proposal carries {:?}, \
+                 we expect {:?}; refusing to vote",
+                proposed_settled.map(|v| v.0),
+                expected_settled.map(|v| v.0),
+            );
+        }
+
+        // Weights are deliberately NOT rejected here — see the method doc on the
+        // execution-lag residual; commit-time detection covers them.
+        Ok(())
+    }
+
+    /// #797 (weight residual) — commit-time detection of a forged seated-weight
+    /// delta in a committed block's `extra_data`. Called from [`Self::commit`]
+    /// **after** this node has executed the block and re-staged its
+    /// pending-weight buffer, so the weights we *expect* this block to have
+    /// carried are exactly the deltas that were pending when it was built. Any
+    /// difference means a Byzantine proposer forged a `recordWeight` the EL has
+    /// now already applied (the block is BFT-final), so this can only **detect
+    /// and loudly surface** it — it is too late to prevent. Logged at `error`
+    /// with a `BFT-SAFETY-VIOLATION` marker an operator/alert can trip on;
+    /// returns `true` when a divergence was found.
+    ///
+    /// This is the honest residual of #797: keys + settledView are vote-time-
+    /// *prevented* ([`Self::validate_registry_extra_data`]); weights, which a
+    /// voter cannot reliably re-derive at vote time under deferred execution,
+    /// are only *detected* here. Making weights vote-time-derivable is a
+    /// follow-up design change (see the issue).
+    fn detect_weight_extra_data_divergence(&self, payload: &Value, height: Height) -> bool {
+        let carried: Vec<(NodeId, u64)> = extra_data_registry_payload(payload)
+            .map(|p| p.weights)
+            .unwrap_or_default();
+        // The deltas this block *should* have carried: the buffer as it stood
+        // before this commit re-staged it. We reconstruct that "expected"
+        // multiset from the carried set being a subset of what we would have
+        // had pending — but the precise check we can afford here is: every
+        // weight the block claims must be one we actually have pending (i.e. one
+        // a prior commit on THIS node derived from execution). A weight the
+        // proposer invented out of thin air is not in our pending buffer.
+        let pending = self.pending_weights.lock();
+        let mut diverged = false;
+        for (validator, weight) in &carried {
+            if pending.get(validator) != Some(weight) {
+                diverged = true;
+                tracing::error!(
+                    target: "boule::reth",
+                    height = height.0,
+                    validator = %hex::encode(validator),
+                    carried_weight = weight,
+                    our_pending = ?pending.get(validator),
+                    "BFT-SAFETY-VIOLATION (#797): committed block's extra_data carried a \
+                     seated-weight delta this node did not derive from execution — a Byzantine \
+                     proposer may have forged a recordWeight (block is already final; detected, \
+                     not prevented)",
+                );
+            }
+        }
+        diverged
+    }
+
     /// #791 Part B — keep the [`Self::pending_weights`] buffer correct across a
     /// commit. First **drop** the seated-weight deltas this committed block's
     /// sealed `extra_data` already mirrored through the EL (decoded from the
@@ -639,6 +785,36 @@ fn state_root_of(payload: &Value) -> Result<[u8; 32]> {
     root_from_hex(payload["stateRoot"].as_str().context("payload stateRoot")?)
 }
 
+/// Decode the boule registry write set an execution `payload` carries in its
+/// `extraData`, or `None` for a plain (non-boule, default `extra_data`) block —
+/// the same decode [`RethApplication::reconcile_pending_weights`] runs. Used by
+/// the #797 vote-time gate and the commit-time weight check to read what a
+/// proposal actually stamped, before comparing to an independent re-derivation.
+fn extra_data_registry_payload(
+    payload: &Value,
+) -> Option<crate::registry_payload::RegistryPayload> {
+    payload["extraData"]
+        .as_str()
+        .map(|s| s.trim_start_matches("0x"))
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|bytes| crate::registry_payload::RegistryPayload::decode(&bytes))
+}
+
+/// Re-derive the [`RecordKey`](crate::registry::RecordKey)s a block's
+/// `extra_data` should mirror, from the **BLS-key rotation system commands in
+/// the block itself** — the exact set
+/// [`RethApplication::registry_payload_for_build`] feeds to the EL, in the same
+/// command order. This is the #797 vote-time re-derivation for keys: it needs
+/// only the proposed block (no parent, no execution), so every honest validator
+/// reproduces it identically and a forged key record is rejected. A non-BLS /
+/// undecodable command contributes no key (same as the build path).
+fn registry_keys_from_commands(commands: &[Bytes]) -> Vec<crate::registry::RecordKey> {
+    commands
+        .iter()
+        .filter_map(|cmd| registry::record_key_for_rotation(cmd).ok().flatten())
+        .collect()
+}
+
 /// `parent` plus its uncommitted ancestors (strictly above the committed
 /// frontier), walked through `pending_blocks` and returned **oldest-first**.
 ///
@@ -874,6 +1050,16 @@ impl Application for RethApplication {
             let validator_updates = self
                 .derive_validator_updates(&payload, block.header.height)
                 .await;
+            // #797 weight residual — detect a forged seated-weight delta in the
+            // committed block's `extra_data` BEFORE reconcile drops the
+            // mirrored entries. At this instant `pending_weights` still holds
+            // exactly the deltas that were pending when this block was built
+            // (this node and the leader walked the same committed chain), so an
+            // honest block's carried weights are all present; a weight the
+            // proposer forged is not, and is loudly surfaced. Detection only —
+            // the block is already BFT-final (keys + settledView are the
+            // vote-time-*prevented* fields; see `validate_registry_extra_data`).
+            self.detect_weight_extra_data_divergence(&payload, block.header.height);
             // #791 Part B — EL-mirrored weights: reconcile then re-stage the
             // pending-weight buffer. This block's sealed `extra_data` carried the
             // weight deltas that were pending when it was *built*; now that it has
@@ -920,6 +1106,10 @@ impl Application for RethApplication {
                 ..Default::default()
             })
         })
+    }
+
+    fn validate_proposal<'a>(&'a self, block: &'a Block) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.validate_registry_extra_data(block) })
     }
 
     fn check(&self, cmd: &[u8]) -> Result<()> {
@@ -2395,5 +2585,217 @@ mod tests {
         let p = app.pending_weights.lock();
         assert_eq!(p.get(&[2u8; 32]), None, "mirrored delta dropped");
         assert_eq!(p.get(&kept), Some(&5), "un-mirrored delta retained");
+    }
+
+    // ── #797: vote-time validation of the EL-applied registry extra_data ─────
+
+    use boule_consensus::validator_rotation::ValidatorKeyRotation;
+    use boule_core::crypto::sig_scheme::BlsAggregated;
+
+    /// A real `DualSignedRotation` command (signatures zeroed — the registry
+    /// decode never verifies them) rotating `validator` to a fresh BLS key at
+    /// `v_eff`, the same shape the builder pulls from the mempool.
+    fn bls_rotation_cmd(validator: NodeId, v_eff: u64, key_seed: u8) -> Bytes {
+        let mut ikm = [0u8; 32];
+        ikm[0] = key_seed;
+        let (_, pk) = BlsAggregated::keygen(&ikm).expect("test BLS keygen");
+        let payload = ValidatorKeyRotation {
+            validator,
+            new_pubkey: [0xCC; 32],
+            v_eff: View::new(v_eff),
+            new_bls_pubkey: Some(pk),
+            new_bls_pop: None,
+        };
+        DualSignedRotation {
+            payload,
+            sig_old: [0u8; 64],
+            sig_new: [0u8; 64],
+        }
+        .encode_command()
+    }
+
+    /// Assemble a proposed block whose first command is an EVM execution
+    /// payload carrying `extra_data` (the registry write set the proposer
+    /// stamped), followed by `system_cmds` (the rotation/system txs in the
+    /// block). The header `view` drives the expected `settledView`.
+    fn proposed_block(view: View, extra_data: &[u8], system_cmds: Vec<Bytes>) -> Block {
+        let evm_payload = serde_json::json!({
+            "blockHash": BLOCK1,
+            "extraData": format!("0x{}", hex::encode(extra_data)),
+        });
+        let mut commands = vec![Bytes::from(serde_json::to_vec(&evm_payload).unwrap())];
+        commands.extend(system_cmds);
+        let commands_commitment = Block::commands_commitment(&commands);
+        Block {
+            header: BlockHeader {
+                parent_hash: [0u8; 32],
+                height: Height(1),
+                view,
+                proposer: [9u8; 32],
+                state_commitment: [0u8; 32],
+                commands_commitment,
+                validator_history_commitment: [0u8; 32],
+                committed_height: Height(0),
+                committed_state_root: [0u8; 32],
+                timestamp: 0,
+            },
+            commands,
+        }
+    }
+
+    /// **The exploit test.** A Byzantine leader stamps `extra_data` claiming a
+    /// `recordKey` for an honest validator that the block's own rotation
+    /// commands do NOT authorize (a forged key — the slash-an-honest-validator
+    /// attack of #797). An honest validator re-derives the expected keys from
+    /// the block's commands and `validate_proposal` REJECTS it (would not vote).
+    #[tokio::test]
+    async fn validate_proposal_rejects_forged_key_in_extra_data() {
+        let app = make_app([0u8; 32]);
+        let honest_validator = [0x42u8; 32];
+        let view = View(registry::SETTLED_VIEW_MARGIN + 10);
+
+        // The block carries NO rotation command, so an honest leader's
+        // `extra_data` would carry no keys. The Byzantine leader instead forges
+        // a `recordKey` for `honest_validator` directly into `extra_data`.
+        let forged_key =
+            registry::record_key_for_rotation(&bls_rotation_cmd(honest_validator, 5, 0x9a))
+                .unwrap()
+                .unwrap();
+        let settled = registry::conservative_settled_view(view);
+        let forged = crate::registry_payload::RegistryPayload {
+            keys: vec![forged_key],
+            weights: vec![],
+            settled_view: Some(settled),
+        };
+        let block = proposed_block(view, &forged.encode(), vec![]);
+
+        let err = app
+            .validate_proposal(&block)
+            .await
+            .expect_err("a forged recordKey with no authorizing command must be rejected");
+        assert!(
+            err.to_string().contains("key mismatch"),
+            "rejected for the right reason: {err}",
+        );
+    }
+
+    /// Mirror of the exploit: an HONEST leader stamps `extra_data` that exactly
+    /// matches the rotation command actually in the block (plus the deterministic
+    /// `settledView`). `validate_proposal` ACCEPTS it — the honest path is
+    /// unaffected by the gate.
+    #[tokio::test]
+    async fn validate_proposal_accepts_honest_matching_extra_data() {
+        let app = make_app([0u8; 32]);
+        let rotating = [0x42u8; 32];
+        let view = View(registry::SETTLED_VIEW_MARGIN + 10);
+
+        let cmd = bls_rotation_cmd(rotating, 5, 0x9a);
+        // The honest extra_data: exactly the key the block's command authorizes,
+        // and the deterministic settled view for this view.
+        let key = registry::record_key_for_rotation(&cmd).unwrap().unwrap();
+        let settled = registry::conservative_settled_view(view);
+        let honest = crate::registry_payload::RegistryPayload {
+            keys: vec![key],
+            weights: vec![],
+            settled_view: Some(settled),
+        };
+        let block = proposed_block(view, &honest.encode(), vec![cmd]);
+
+        app.validate_proposal(&block)
+            .await
+            .expect("an honest leader's matching extra_data validates");
+    }
+
+    /// A forged `settledView` (ahead of the conservative frontier the view
+    /// determines) is rejected — the second vote-time-prevented field. This is
+    /// what stops a Byzantine leader advancing the slashing predeploy's read
+    /// frontier past a not-yet-recorded key.
+    #[tokio::test]
+    async fn validate_proposal_rejects_forged_settled_view() {
+        let app = make_app([0u8; 32]);
+        let view = View(registry::SETTLED_VIEW_MARGIN + 10);
+        let forged = crate::registry_payload::RegistryPayload {
+            keys: vec![],
+            weights: vec![],
+            // Claim the frontier is the current view (ahead of the conservative
+            // `view - MARGIN` every honest node derives).
+            settled_view: Some(view),
+        };
+        let block = proposed_block(view, &forged.encode(), vec![]);
+
+        let err = app
+            .validate_proposal(&block)
+            .await
+            .expect_err("a settledView ahead of the conservative frontier must be rejected");
+        assert!(
+            err.to_string().contains("settledView mismatch"),
+            "rejected for the right reason: {err}",
+        );
+    }
+
+    /// A plain block (no rotation commands, default `extra_data` below the
+    /// settled-view margin) carries no registry payload and validates — the
+    /// common no-op case the gate must not break.
+    #[tokio::test]
+    async fn validate_proposal_accepts_plain_block() {
+        let app = make_app([0u8; 32]);
+        // A view at/under the margin → expected settledView is `None`, so the
+        // honest extra_data is empty (a non-boule blob).
+        let block = proposed_block(View(1), b"reth/v2.2.0/linux", vec![]);
+        app.validate_proposal(&block)
+            .await
+            .expect("a plain block with default extra_data validates");
+    }
+
+    /// The #797 weight residual: a forged seated-weight delta in a committed
+    /// block's `extra_data` — one this node never derived from execution — is
+    /// **detected** at commit (`detect_weight_extra_data_divergence` returns
+    /// true). This is detection-after-final, not vote-time prevention (weights
+    /// are not reliably re-derivable at vote time under deferred execution).
+    #[test]
+    fn commit_detects_forged_weight_not_in_pending() {
+        let app = weight_app([1u8; 32], Value::Array(Vec::new()), vec![]);
+        // Nothing pending: this node derived no weight delta from any execution.
+        assert!(app.pending_weights.lock().is_empty());
+        // A committed block whose extra_data forges a weight for [3;32].
+        let forged = crate::registry_payload::RegistryPayload::new(
+            vec![],
+            &[ValidatorUpdate {
+                node_id: [3u8; 32],
+                weight: 7,
+            }],
+            None,
+        );
+        let payload = serde_json::json!({
+            "extraData": format!("0x{}", hex::encode(forged.encode())),
+        });
+        assert!(
+            app.detect_weight_extra_data_divergence(&payload, Height(5)),
+            "a weight this node never derived from execution is detected as a divergence",
+        );
+    }
+
+    /// The honest weight path is NOT flagged: a committed block carrying exactly
+    /// the weight delta this node has pending (derived from a prior execution)
+    /// passes the commit-time detector cleanly.
+    #[test]
+    fn commit_does_not_flag_honest_pending_weight() {
+        let app = weight_app([1u8; 32], Value::Array(Vec::new()), vec![]);
+        app.pending_weights.lock().insert([3u8; 32], 7);
+        let honest = crate::registry_payload::RegistryPayload::new(
+            vec![],
+            &[ValidatorUpdate {
+                node_id: [3u8; 32],
+                weight: 7,
+            }],
+            None,
+        );
+        let payload = serde_json::json!({
+            "extraData": format!("0x{}", hex::encode(honest.encode())),
+        });
+        assert!(
+            !app.detect_weight_extra_data_divergence(&payload, Height(5)),
+            "a weight this node derived from execution is not flagged",
+        );
     }
 }

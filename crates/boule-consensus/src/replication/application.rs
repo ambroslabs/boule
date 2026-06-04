@@ -338,6 +338,44 @@ pub trait Application: Send + Sync {
         timestamp: u64,
     ) -> BoxFuture<'a, anyhow::Result<Block>>;
 
+    /// Vote-time proposal validation — the integrity gate that lets an
+    /// application **refuse to vote** for a proposed `block` whose contents it
+    /// cannot independently re-derive from its own consensus state (#797).
+    ///
+    /// Called on the **non-leader receive path**, *before* the safety core is
+    /// allowed to emit a `Vote` for `block` (the integration layer runs this on
+    /// `ProposalReceived` and, on `Err`, never feeds the proposal to the safety
+    /// core, so no vote is cast). It must therefore be:
+    ///
+    /// - **Synchronous in spirit / cheap** — like the other read hooks it should
+    ///   answer from already-resolved local state, not a fresh round trip. It is
+    ///   async only to share the seam's [`BoxFuture`] convention; an
+    ///   implementation that needs no I/O resolves immediately.
+    /// - **Deterministic across honest replicas** — every honest validator must
+    ///   reach the same accept/reject decision, or a forged proposal could be
+    ///   accepted by some and rejected by others.
+    ///
+    /// The motivating attack (#797): under the reth EL, the leader stamps an
+    /// authoritative registry write set `(keys, settledView, weights)` into the
+    /// block's `extra_data`, which every replica's EL applies **unverified**. A
+    /// Byzantine leader can forge an honest validator's key (then self-sign an
+    /// equivocation and get it slashed) or forge weights to swing a quorum. This
+    /// hook lets a validator re-derive the expected write set from its own state
+    /// and reject a mismatch so a forged payload never reaches the BFT quorum.
+    ///
+    /// `Err` is the "do not vote for this proposal" signal: the integration layer
+    /// logs it and drops the proposal rather than stepping it into the safety
+    /// core, so the validator simply does not vote (and a later honest leader
+    /// re-proposes). It is **not** a fault for the local node — the offending
+    /// block is the proposer's.
+    ///
+    /// The default is `Ok(())`: an application with nothing proposer-authored to
+    /// re-derive (the counter app, a PoA backend) accepts every safety-valid
+    /// proposal, exactly as before this hook existed.
+    fn validate_proposal<'a>(&'a self, _block: &'a Block) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Execute a committed `block` — the deferred-execution step. This is
     /// the only point at which the application mutates its own state in
     /// response to consensus, and it is where an out-of-process execution
