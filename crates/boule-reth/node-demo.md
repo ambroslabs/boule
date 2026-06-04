@@ -5,10 +5,11 @@ Engine API, then sends an EVM transfer through consensus.
 
 > Architecture: consensus orders opaque EVM execution payloads (1 boule
 > block = 1 payload). The leader asks reth to build a payload
-> (`forkchoiceUpdatedV3` + `getPayloadV3`); at commit every node executes
-> it (`newPayloadV3`) and finalizes (`forkchoiceUpdatedV3`
-> head=safe=finalized). Deferred-execution model. Engine API V3,
-> Cancun-at-genesis. The reth backend lives in `boule-reth` and plugs into
+> (`forkchoiceUpdatedV3` + `getPayloadV4`); at commit every node executes
+> it (`newPayloadV4`) and finalizes (`forkchoiceUpdatedV3`
+> head=safe=finalized). Deferred-execution model. Engine API V4,
+> Prague-at-genesis (see `PRAGUE-MIGRATION.md` for the live-reth
+> finalization steps). The reth backend lives in `boule-reth` and plugs into
 > consensus through the async `Application` seam; the node opts in via the
 > `reth` cargo feature.
 

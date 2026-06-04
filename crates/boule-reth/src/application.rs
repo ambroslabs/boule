@@ -365,7 +365,7 @@ fn state_root_of(payload: &Value) -> Result<[u8; 32]> {
 ///
 /// This is the chain a leader must make sure reth knows before it can build
 /// on `parent`. The committed frontier and everything below it are already in
-/// reth (commit runs `newPayloadV3`), but under HotStuff pipelining `parent`
+/// reth (commit runs `newPayloadV4`), but under HotStuff pipelining `parent`
 /// and its recent ancestors may still be uncommitted — and a *rotated* leader
 /// only ever **voted** on them (deferred execution: it never executed them),
 /// so its reth has not seen those payloads. Registering this chain oldest-
@@ -417,7 +417,7 @@ impl Application for RethApplication {
             // Make sure reth knows the uncommitted chain we're about to build
             // on. A rotated leader may have only voted on `parent` and its
             // recent ancestors (never executed them), so register each payload
-            // (`newPayloadV3`, no finalize) oldest-first before building.
+            // (`newPayloadV4`, no finalize) oldest-first before building.
             // Idempotent for blocks reth already knows; the genesis parent has
             // an empty chain. This is what makes the reth backend work across
             // leader rotation under pipelining.
@@ -1315,8 +1315,8 @@ mod tests {
                         include_str!("../fixtures/04-fcu-final.json")
                     }
                 }
-                "engine_getPayloadV3" => include_str!("../fixtures/02-getpayload.json"),
-                "engine_newPayloadV3" => include_str!("../fixtures/03-newpayload.json"),
+                "engine_getPayloadV4" => include_str!("../fixtures/02-getpayload.json"),
+                "engine_newPayloadV4" => include_str!("../fixtures/03-newpayload.json"),
                 other => panic!("unexpected engine method {other}"),
             };
             let v = serde_json::from_str::<Value>(raw).unwrap()["result"].clone();
@@ -1362,7 +1362,7 @@ mod tests {
         .expect("build");
 
         let m = methods.lock();
-        let new_payloads = m.iter().filter(|x| *x == "engine_newPayloadV3").count();
+        let new_payloads = m.iter().filter(|x| *x == "engine_newPayloadV4").count();
         assert_eq!(new_payloads, 3, "two ancestors (a, b) + the built block");
         // Both ancestors are registered before the build's forkchoiceUpdatedV3.
         let first_fcu = m
@@ -1371,7 +1371,7 @@ mod tests {
             .expect("build issues a forkchoiceUpdatedV3");
         let registered_before_build = m[..first_fcu]
             .iter()
-            .filter(|x| *x == "engine_newPayloadV3")
+            .filter(|x| *x == "engine_newPayloadV4")
             .count();
         assert_eq!(
             registered_before_build, 2,
@@ -1391,7 +1391,7 @@ mod tests {
             _tag: &str,
         ) -> BoxFuture<'_, anyhow::Result<Value>> {
             let v = match method {
-                "engine_newPayloadV3" => serde_json::json!({ "status": "SYNCING" }),
+                "engine_newPayloadV4" => serde_json::json!({ "status": "SYNCING" }),
                 "engine_forkchoiceUpdatedV3" => {
                     serde_json::json!({ "payloadStatus": { "status": "SYNCING" } })
                 }
@@ -1468,7 +1468,7 @@ mod tests {
                 _tag: &str,
             ) -> BoxFuture<'_, Result<Value>> {
                 let v = match method {
-                    "engine_newPayloadV3" => serde_json::json!({ "status": "VALID" }),
+                    "engine_newPayloadV4" => serde_json::json!({ "status": "VALID" }),
                     "engine_forkchoiceUpdatedV3" => {
                         serde_json::json!({ "payloadStatus": { "status": "VALID" } })
                     }

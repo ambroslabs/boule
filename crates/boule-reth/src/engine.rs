@@ -1,13 +1,21 @@
-//! `RethEngine` — the Engine API V3 driver.
+//! `RethEngine` — the Engine API V4 driver.
 //!
 //! Two operations, matching the deferred-execution model:
 //! - [`RethEngine::build_block`] — leader side: `forkchoiceUpdatedV3(attrs)` +
-//!   `getPayloadV3`. Produces the EVM block and its state root.
-//! - [`RethEngine::commit_block`] — all nodes: `newPayloadV3` (execute) +
+//!   `getPayloadV4`. Produces the EVM block and its state root.
+//! - [`RethEngine::commit_block`] — all nodes: `newPayloadV4` (execute) +
 //!   `forkchoiceUpdatedV3(head=safe=finalized)`.
 //!
-//! V3, Cancun-at-genesis, `withdrawals=[]`, zero blob/beacon fields, zero
-//! `prevRandao` for the single-validator case.
+//! **Prague-at-genesis (#732 prerequisite).** Prague moves the payload methods
+//! to V4: `newPayloadV4` gains a fourth `executionRequests` argument (EIP-7685)
+//! and `getPayloadV4` returns one. `forkchoiceUpdatedV3` is unchanged across
+//! Prague. This boule chain triggers **no** execution requests — its staking is
+//! a custom predeploy (#655), not the beacon deposit contract, and it uses no
+//! EL withdrawals/consolidations — so `executionRequests` is always the empty
+//! list, which is what we pass to `newPayloadV4`.
+//!
+//! `withdrawals=[]`, zero blob/beacon fields, zero `prevRandao` for the
+//! single-validator case.
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -113,7 +121,7 @@ impl<'a> RethEngine<'a> {
 
         let got = self
             .transport
-            .call("engine_getPayloadV3", json!([payload_id]), "02-getpayload")
+            .call("engine_getPayloadV4", json!([payload_id]), "02-getpayload")
             .await?;
         let payload = got["executionPayload"].clone();
         Ok(BuiltBlock {
@@ -141,18 +149,20 @@ impl<'a> RethEngine<'a> {
         let executed = self
             .transport
             .call(
-                "engine_newPayloadV3",
-                json!([payload, [], zero32()]),
+                // V4 adds the 4th `executionRequests` arg (EIP-7685); empty for
+                // this chain (no beacon deposits / EL withdrawals / consolidations).
+                "engine_newPayloadV4",
+                json!([payload, [], zero32(), []]),
                 "03-newpayload",
             )
             .await?;
-        let exec_status = payload_status(&executed["status"], "newPayloadV3")?;
+        let exec_status = payload_status(&executed["status"], "newPayloadV4")?;
 
         let hash = payload["blockHash"]
             .as_str()
             .context("payload blockHash")?
             .to_string();
-        // Always drive forkchoice — even when newPayloadV3 returned SYNCING — so
+        // Always drive forkchoice — even when newPayloadV4 returned SYNCING — so
         // the EL has a canonical head to sync toward. This is the Engine API
         // contract: `SYNCING` means "I don't have the parent yet"; the CL must
         // still send forkchoiceUpdated so the EL knows where to sync. The fcU
@@ -180,7 +190,7 @@ impl<'a> RethEngine<'a> {
         Ok((hash, status))
     }
 
-    /// Deliver a built payload to reth (`newPayloadV3`) WITHOUT finalizing, so
+    /// Deliver a built payload to reth (`newPayloadV4`) WITHOUT finalizing, so
     /// the block becomes known and later builds can chain on it. Needed under
     /// HotStuff pipelining: when the leader builds block N, its parent N-1 may
     /// not be committed/finalized yet, so reth must already know N-1's payload.
@@ -188,12 +198,12 @@ impl<'a> RethEngine<'a> {
         let executed = self
             .transport
             .call(
-                "engine_newPayloadV3",
-                json!([payload, [], zero32()]),
+                "engine_newPayloadV4",
+                json!([payload, [], zero32(), []]),
                 "03-newpayload",
             )
             .await?;
-        payload_status(&executed["status"], "newPayloadV3(register)")
+        payload_status(&executed["status"], "newPayloadV4(register)")
     }
 }
 
@@ -296,7 +306,7 @@ mod tests {
         ) -> boule_core::clock::BoxFuture<'_, Result<Value>> {
             self.methods.lock().push(method.to_string());
             let v = match method {
-                "engine_newPayloadV3" => json!({ "status": "SYNCING", "latestValidHash": null }),
+                "engine_newPayloadV4" => json!({ "status": "SYNCING", "latestValidHash": null }),
                 "engine_forkchoiceUpdatedV3" => {
                     json!({ "payloadStatus": { "status": "SYNCING" }, "payloadId": null })
                 }
@@ -323,7 +333,7 @@ mod tests {
         assert_eq!(status, ElStatus::Syncing, "EL reported syncing");
         // Crucially, forkchoiceUpdated was still issued so the EL has a target.
         let m = methods.lock();
-        assert!(m.iter().any(|x| x == "engine_newPayloadV3"));
+        assert!(m.iter().any(|x| x == "engine_newPayloadV4"));
         assert!(
             m.iter().any(|x| x == "engine_forkchoiceUpdatedV3"),
             "forkchoiceUpdated must be sent even when newPayload is SYNCING"

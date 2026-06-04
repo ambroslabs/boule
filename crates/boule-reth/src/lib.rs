@@ -83,10 +83,10 @@ pub(crate) mod testing {
                             Self::result(include_str!("../fixtures/04-fcu-final.json"))
                         }
                     }
-                    "engine_getPayloadV3" => {
+                    "engine_getPayloadV4" => {
                         Self::result(include_str!("../fixtures/02-getpayload.json"))
                     }
-                    "engine_newPayloadV3" => {
+                    "engine_newPayloadV4" => {
                         Self::result(include_str!("../fixtures/03-newpayload.json"))
                     }
                     other => bail!("FixtureTransport: unexpected method {other}"),
