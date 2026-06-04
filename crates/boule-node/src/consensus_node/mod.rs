@@ -445,6 +445,15 @@ pub struct ConsensusNode {
     /// Always empty for a backend that drives none of these (PoA, the reth EL
     /// default).
     staged_effects: Vec<ValidatorEffect>,
+    /// A governance-approved reconfig (#729) the [`Application`] surfaced via a
+    /// [`ValidatorEffect::Reconfig`](boule_consensus::replication::application::ValidatorEffect::Reconfig),
+    /// staged whole for [`ConsensusNode::mint_staged_governance_reconfig`].
+    /// Unlike `staged_effects` (drained), this is retained-until-landed like
+    /// `staged_validator_updates` and minted **verbatim** (its add `consent_sig`
+    /// is bound to the command's `v_eff`, so the `v_eff` must not be recomputed).
+    /// Cleared when its own boundary lands. `None` for a backend that drives no
+    /// governance reconfigs (PoA, the reth EL default).
+    staged_governance_reconfig: Option<boule_consensus::reconfig::ReconfigCommand>,
     /// When this node, as leader, last broadcast a proposal. Used to decide
     /// whether a fresh proposal must wait out [`Self::min_block_interval`].
     last_proposal_at: Option<tokio::time::Instant>,
@@ -788,6 +797,7 @@ impl ConsensusNode {
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             staged_validator_updates: Vec::new(),
             staged_effects: Vec::new(),
+            staged_governance_reconfig: None,
             last_proposal_at: None,
             stashed_proposal: None,
             dropped_commands,
@@ -1255,6 +1265,7 @@ impl ConsensusNode {
             weak_subjectivity_checkpoint: config.weak_subjectivity_checkpoint,
             staged_validator_updates: Vec::new(),
             staged_effects: Vec::new(),
+            staged_governance_reconfig: None,
             last_proposal_at: None,
             stashed_proposal: None,
             dropped_commands,
@@ -3857,6 +3868,136 @@ mod tests {
         assert!(
             five_validators().contains(&leader_vid),
             "leader at v_eff must come from post-boundary set",
+        );
+    }
+
+    /// A governance reconfig (#729) at `v_eff` for adding nid(5) — no operator
+    /// key, so no consent needed — used by the #729 tests below.
+    fn governance_add_reconfig(v_eff: View) -> boule_consensus::reconfig::ReconfigCommand {
+        use boule_consensus::reconfig::{ReconfigCommand, ValidatorEntry};
+        ReconfigCommand {
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: "127.0.0.1:9005".parse().unwrap(),
+                bls_pop: None,
+                operator_pubkey: None,
+                weight: 1,
+                consent_sig: None,
+                initial_endpoints: vec![],
+            }],
+            removes: vec![],
+            changes: vec![],
+            v_eff,
+        }
+    }
+
+    /// #729: a `ValidatorEffect::Reconfig` is staged (not minted) by
+    /// `mint_staged_effects`, then minted **verbatim** — `v_eff` unchanged,
+    /// because an add's `consent_sig` is bound to it — by
+    /// `mint_staged_governance_reconfig`. The stage is retained after minting.
+    #[test]
+    fn governance_reconfig_effect_is_staged_then_minted_verbatim() {
+        use boule_consensus::reconfig::ReconfigCommand;
+
+        let mut node = make_node(nid(1));
+        let cmd = governance_add_reconfig(View(20));
+        node.staged_effects = vec![ValidatorEffect::Reconfig(cmd.encode())];
+
+        // 1. The effect is moved into the governance stage, not minted.
+        node.mint_staged_effects(View(2));
+        assert_eq!(node.staged_governance_reconfig.as_ref(), Some(&cmd));
+        assert!(
+            !node
+                .mempool
+                .propose(16)
+                .iter()
+                .any(|c| ReconfigCommand::is_reconfig_payload(c)),
+            "mint_staged_effects stages a governance reconfig, it does not mint it",
+        );
+
+        // 2. The build-path mint emits it verbatim, and retains the stage.
+        node.mint_staged_governance_reconfig(View(2));
+        let minted = node
+            .mempool
+            .propose(16)
+            .into_iter()
+            .find(|c| ReconfigCommand::is_reconfig_payload(c))
+            .expect("a governance reconfig was minted");
+        assert_eq!(
+            ReconfigCommand::decode(&minted).unwrap(),
+            cmd,
+            "minted verbatim — v_eff and consent-bound terms unchanged",
+        );
+        assert_eq!(
+            node.staged_governance_reconfig.as_ref(),
+            Some(&cmd),
+            "retained until its boundary lands",
+        );
+    }
+
+    /// #729: a governance reconfig whose `v_eff` can no longer clear the
+    /// apply-time floor is dropped (its bound consent is dead), not minted.
+    #[test]
+    fn stale_governance_reconfig_is_dropped() {
+        use boule_consensus::reconfig::ReconfigCommand;
+
+        let mut node = make_node(nid(1));
+        node.staged_governance_reconfig = Some(governance_add_reconfig(View(3)));
+
+        node.mint_staged_governance_reconfig(View(50));
+
+        assert!(
+            node.staged_governance_reconfig.is_none(),
+            "dropped as stale"
+        );
+        assert!(
+            !node
+                .mempool
+                .propose(16)
+                .iter()
+                .any(|c| ReconfigCommand::is_reconfig_payload(c)),
+            "a stale governance reconfig mints nothing",
+        );
+    }
+
+    /// #729: when the staged governance reconfig's own boundary commits, the
+    /// stage is cleared (so the next proposal does not re-mint it).
+    #[test]
+    fn committed_governance_reconfig_clears_the_stage() {
+        use boule_consensus::reconfig::MIN_V_EFF_DELAY;
+
+        let mut node = make_node(nid(1));
+        let cmd = governance_add_reconfig(MIN_V_EFF_DELAY + 3);
+        node.staged_governance_reconfig = Some(cmd.clone());
+
+        // Commit a block at view 0 carrying exactly this reconfig.
+        node.apply_commit(block_with_reconfig(1, 0, nid(1), cmd));
+
+        assert_eq!(
+            node.validator_history.boundary_count(),
+            2,
+            "the governance reconfig boundary landed",
+        );
+        assert!(
+            node.staged_governance_reconfig.is_none(),
+            "the stage is cleared once its own boundary lands",
+        );
+    }
+
+    /// #729 defense-in-depth: a `Reconfig` effect carrying a non-reconfig
+    /// payload is rejected — nothing is staged.
+    #[test]
+    fn reconfig_effect_with_non_reconfig_payload_is_rejected() {
+        let mut node = make_node(nid(1));
+        node.staged_effects = vec![ValidatorEffect::Reconfig(bytes::Bytes::from_static(
+            b"not-a-reconfig",
+        ))];
+
+        node.mint_staged_effects(View(2));
+
+        assert!(
+            node.staged_governance_reconfig.is_none(),
+            "a mis-tagged reconfig payload is not staged",
         );
     }
 

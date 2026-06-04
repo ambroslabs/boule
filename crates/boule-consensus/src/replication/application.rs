@@ -103,16 +103,35 @@ pub enum ValidatorEffect {
     KeyRotation(Bytes),
     /// A validator endpoint-list update (#731 / #546): the EL records a
     /// validator's advertised network endpoints and surfaces the resulting
-    /// endpoint command here. The endpoint-registry mechanism does not exist on
-    /// this branch yet, so consensus currently has no apply path — the
-    /// materializer surfaces this as an *unsupported* effect (logged, not
-    /// silently dropped) until #731/#546 lands.
+    /// signed endpoint command ([`SignedEndpointCommand`]) here. Consensus
+    /// re-materializes it as a block command, applied via the endpoint registry
+    /// (the signature + monotone `seq` are verified there).
+    ///
+    /// [`SignedEndpointCommand`]: crate::endpoint_registry::SignedEndpointCommand
     EndpointUpdate(Bytes),
     /// A live consensus-parameter update (#542): the EL drives a change to a
-    /// tunable consensus parameter. As with [`Self::EndpointUpdate`], the
-    /// consensus-side apply path does not exist yet, so the materializer
-    /// surfaces this as an unsupported effect until #542 lands.
+    /// tunable consensus parameter, carried as the encoded
+    /// [`ConsensusParamUpdate`] command. Consensus re-materializes it as a block
+    /// command, validated against the `v_eff` delay floor and scheduled at its
+    /// view boundary.
+    ///
+    /// [`ConsensusParamUpdate`]: crate::consensus_params::ConsensusParamUpdate
     ParamUpdate(Bytes),
+    /// A governance-approved membership reconfiguration (#729): the EL's
+    /// governance mechanism tallied approval for a validator-set change and
+    /// surfaces the resulting encoded [`ReconfigCommand`] here — adds (with
+    /// endpoint + inbound `consent_sig`, #548), removes, and weight changes.
+    ///
+    /// Consensus re-materializes it as a block command, applied via the existing
+    /// reconfig path (membership validation + the `v_eff` boundary). Unlike a
+    /// staking-driven weight delta ([`CommitResult::validator_updates`]), this
+    /// carries the *whole* command and is minted **verbatim**: an add's
+    /// `consent_sig` pre-image is bound to the command's `v_eff`, so consensus
+    /// must not recompute it. It is minted under the same one-reconfig-boundary-
+    /// at-a-time discipline as the staking path, so the two never conflict.
+    ///
+    /// [`ReconfigCommand`]: crate::reconfig::ReconfigCommand
+    Reconfig(Bytes),
 }
 
 /// What an [`Application`] returns from [`Application::commit`] — the channel
@@ -495,11 +514,12 @@ mod tests {
                 ValidatorEffect::KeyRotation(Bytes::from_static(b"rot")),
                 ValidatorEffect::EndpointUpdate(Bytes::from_static(b"ep")),
                 ValidatorEffect::ParamUpdate(Bytes::from_static(b"param")),
+                ValidatorEffect::Reconfig(Bytes::from_static(b"reconfig")),
             ],
             ..Default::default()
         };
         assert!(r.validator_updates.is_empty());
-        assert_eq!(r.effects.len(), 3);
+        assert_eq!(r.effects.len(), 4);
         assert_eq!(
             r.effects[0],
             ValidatorEffect::KeyRotation(Bytes::from_static(b"rot"))
