@@ -1,29 +1,35 @@
 //! On-chain identifiers for the live consensus-parameter-update predeploy
-//! (#542 producer).
+//! (#542 producer, authorization #746).
 //!
-//! A consensus parameter is changed by calling the `Param` contract
-//! (`contracts/Param.sol`), deployed as a genesis predeploy at
-//! [`PARAM_ADDRESS`], with the encoded boule `ConsensusParamUpdate` command as
-//! calldata. boule reads the `ParamSubmitted` events it emits from each
+//! A consensus parameter is changed by having the seated validators approve the
+//! specific update on the `Param` contract (`contracts/Param.sol`), deployed as
+//! a genesis predeploy at [`PARAM_ADDRESS`]. Each validator calls
+//! `approve(proposalId, paramCommand, validator)`; the contract staticcalls the
+//! `Registry` (#759) for the validator's seated `weightOf`/`totalWeight`,
+//! accumulates approving weight per proposal (deduplicated per validator), and
+//! emits a single `ParamSubmitted(paramCommand)` once the accrued weight crosses
+//! a `> 2/3 · totalWeight` supermajority — a validator-weighted quorum mirroring
+//! the #729 governance tally. boule reads those `ParamSubmitted` events from each
 //! committed block — filtered by [`PARAM_TOPIC`] — via [`parse_param_logs`],
 //! turning each back into the encoded command bytes. Those become a
 //! [`ValidatorEffect::ParamUpdate`](boule_consensus::replication::application::ValidatorEffect::ParamUpdate)
 //! on the widened `CommitResult` (#727); consensus re-materialises the command
 //! into a block, where the existing param path (#542) validates the `v_eff`
 //! delay and schedules the change at its view boundary so every replica adopts
-//! the new value at the same view. The `ConsensusParamHistory` apply mechanism
-//! is unchanged — only the *submission* path moves onto the EVM.
+//! the new value at the same view.
 //!
-//! Unlike rotation/endpoint, a parameter update is not tied to a single
-//! validator, so the event carries no indexed `validator`. **Authorization**
-//! (who may change a consensus parameter) is an open #542 follow-up: this
-//! predeploy emits whatever is submitted, and the only consensus-side guard
-//! today is the `v_eff` delay floor — bounded in risk while the one wired
-//! parameter (`min_block_interval`) is leader-local.
+//! The `ParamSubmitted(bytes)` event shape/topic and the `ConsensusParamHistory`
+//! apply mechanism are **unchanged** by #746 — only the *gating* moved: a single
+//! unauthenticated `submitParam` no longer emits; authorization is now an
+//! upstream weighted quorum. Unlike rotation/endpoint, the event carries no
+//! indexed `validator` (the vote-time `validator` arg is not part of the emitted
+//! command). The `validator` arg is caller-supplied (the same dumb-carrier caveat
+//! as the sibling predeploys): exposure is bounded because the carried command is
+//! consensus-validated and the `v_eff` floor stays as defense-in-depth.
 //!
 //! These constants are the authoritative identifiers and match the compiled
 //! runtime bytecode embedded in `genesis.json`; the tests below pin the
-//! address, topic, and selector to the genesis artifact so the Rust constants
+//! address, topic, and selectors to the genesis artifact so the Rust constants
 //! and the on-chain contract cannot drift.
 
 use bytes::Bytes;
@@ -34,11 +40,20 @@ use serde_json::{Value, json};
 pub const PARAM_ADDRESS: &str = "0x0000000000000000000000000000000000000b11";
 
 /// `keccak256("ParamSubmitted(bytes)")` — topic0 of the `ParamSubmitted`
-/// event, emitted by `submitParam(bytes paramCommand)`.
+/// event, emitted by `approve(...)` once a weighted supermajority approves.
+/// Shape and topic are deliberately unchanged from the original #542 producer so
+/// the read/apply path stays compatible — only the gating moved upstream (#746).
 pub const PARAM_TOPIC: &str = "0x27d1e5d546bb0a37e323040c28412ac11a38a95061bbe56c3f95d635f8826a0b";
 
-/// 4-byte selector of `submitParam(bytes)`.
-pub const SUBMIT_SELECTOR: [u8; 4] = [0x18, 0x43, 0x3f, 0xc7];
+/// 4-byte selector of `approve(bytes32,bytes,bytes32)` — a validator's weighted
+/// approval of a parameter update (#746).
+pub const APPROVE_SELECTOR: [u8; 4] = [0x80, 0x30, 0x9c, 0x0a];
+
+/// 4-byte selector of `approvals(bytes32)` (the running accrued-weight tally).
+pub const APPROVALS_SELECTOR: [u8; 4] = [0xbf, 0x7c, 0x21, 0x31];
+
+/// 4-byte selector of `isApproved(bytes32)` (whether the supermajority crossed).
+pub const IS_APPROVED_SELECTOR: [u8; 4] = [0x48, 0xae, 0xfc, 0x32];
 
 /// The `eth_getLogs` filter selecting one block's parameter events: the
 /// predeploy address, the block by hash, and the event topic.
@@ -92,11 +107,13 @@ mod tests {
         assert!(code.len() > 2 + 300 * 2, "non-trivial contract code");
     }
 
-    /// The event topic and function selector the Rust constants declare must be
+    /// The event topic and function selectors the Rust constants declare must be
     /// the ones solc compiled into the predeploy bytecode (the `PUSH32` operand
-    /// before the `LOG1`, and the dispatcher selector). Ties the constants to
+    /// before the `LOG1`, and the dispatcher selectors). Ties the constants to
     /// the artifact without a keccak dependency: if the ABI changes, the
-    /// embedded bytecode changes and this fails.
+    /// embedded bytecode changes and this fails. Also pins the `Registry` weight
+    /// selectors the contract staticcalls (#746/#759), so a drift in either the
+    /// read side or the registry surface is caught here.
     #[test]
     fn topic_and_selector_match_genesis_bytecode() {
         let g: serde_json::Value =
@@ -106,9 +123,55 @@ mod tests {
             code.contains(PARAM_TOPIC.trim_start_matches("0x")),
             "event topic constant must appear as the PUSH32 operand in the bytecode",
         );
+        for (name, sel) in [
+            ("approve", APPROVE_SELECTOR),
+            ("approvals", APPROVALS_SELECTOR),
+            ("isApproved", IS_APPROVED_SELECTOR),
+        ] {
+            assert!(
+                code.contains(&hex::encode(sel)),
+                "{name} selector must appear in the dispatcher",
+            );
+        }
+        // The weighted-quorum gate staticcalls the Registry's weight surface;
+        // those selectors must appear as PUSH4 operands in the staticcall path.
+        for (name, sel) in [
+            ("weightOf", crate::registry::WEIGHT_OF_SELECTOR),
+            ("totalWeight", crate::registry::TOTAL_WEIGHT_SELECTOR),
+        ] {
+            assert!(
+                code.contains(&hex::encode(sel)),
+                "registry {name} selector must appear in the staticcall path",
+            );
+        }
+    }
+
+    /// The Registry address the gate staticcalls (`weightOf`/`totalWeight`) must
+    /// be the real registry predeploy — else every `approve` would call a dead
+    /// address and revert. solc compiles the small constant address
+    /// (`0x…0b12`) to its minimal `PUSH2 0x0b12` form (leading zero bytes
+    /// dropped), so this pins that minimal operand baked into the Param bytecode
+    /// to [`crate::registry::REGISTRY_ADDRESS`] rather than the 20-byte form.
+    #[test]
+    fn staticcalls_the_registry_predeploy_address() {
+        let g: serde_json::Value =
+            serde_json::from_str(include_str!("../genesis.json")).expect("genesis.json parses");
+        let code = g["alloc"][PARAM_ADDRESS]["code"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        // REGISTRY_ADDRESS with leading zero bytes stripped == "b12"; solc pushes
+        // it as PUSH2 (0x61) 0x0b12, i.e. the operand "0b12" in the bytecode.
+        let minimal = crate::registry::REGISTRY_ADDRESS
+            .trim_start_matches("0x")
+            .trim_start_matches('0');
+        assert_eq!(
+            minimal, "b12",
+            "registry address is the small …0b12 predeploy"
+        );
         assert!(
-            code.contains(&hex::encode(SUBMIT_SELECTOR)),
-            "function selector constant must appear in the dispatcher",
+            code.contains("610b12"),
+            "the registry predeploy address must appear as the PUSH2 staticcall target",
         );
     }
 
