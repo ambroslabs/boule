@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::engine::{ElStatus, RethEngine, root_from_hex};
 use crate::transport::EngineTransport;
-use crate::{endpoint, param, rotation, staking};
+use crate::{endpoint, param, rotation, slashing, staking};
 
 /// Max boule system txs to pull from the mempool into one proposal. Only a
 /// single reconfig is ever pending (the one-reconfig-at-a-time rule), so this
@@ -114,20 +114,23 @@ impl RethApplication {
         RethEngine::new(&*self.transport, self.fee_recipient.clone())
     }
 
-    /// Read the staking predeploy's `Deposit`/`Withdraw` events for the
-    /// just-executed `payload`, apply them to the CL-native stake ledger,
-    /// and return the validator-set deltas (#655). Only called once the EL
+    /// Read the staking predeploy's `Deposit`/`Withdraw` events *and* the
+    /// slashing predeploy's `Slashed` events for the just-executed `payload`,
+    /// apply them to the CL-native stake ledger, and return the validator-set
+    /// deltas (#655 staking + #732/#658b slashing). Only called once the EL
     /// reports the payload `VALID`, so its logs are available. A failed
-    /// `eth_getLogs` is logged and yields no updates — a transient RPC error
-    /// must not fail the commit (consensus commits regardless of the EL).
+    /// `eth_getLogs` is logged and yields no updates for that category — a
+    /// transient RPC error must not fail the commit (consensus commits
+    /// regardless of the EL).
     async fn derive_validator_updates(
         &self,
         payload: &Value,
         height: Height,
     ) -> Vec<ValidatorUpdate> {
+        let block_hash = payload["blockHash"].as_str();
         // Read this block's staking events (empty on any failure — the height
         // still advances so unbondings mature, #660).
-        let ops = match payload["blockHash"].as_str() {
+        let ops = match block_hash {
             Some(block_hash) => match self
                 .transport
                 .eth_rpc("eth_getLogs", staking::logs_filter(block_hash))
@@ -145,6 +148,27 @@ impl RethApplication {
             },
             None => Vec::new(),
         };
+        // Read this block's `Slashed` events — the slashing predeploy verified
+        // each equivocation in the EVM (#732) and only signals; boule applies
+        // the penalty here, burning the equivocator's bonded stake (#658b).
+        let slashed = match block_hash {
+            Some(block_hash) => match self
+                .transport
+                .eth_rpc("eth_getLogs", slashing::logs_filter(block_hash))
+                .await
+            {
+                Ok(logs) => slashing::parse_slashed_logs(&logs),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "boule::reth",
+                        error = %e,
+                        "eth_getLogs for slashing events failed; no slashes this block",
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
         let mut src = self.stake_source.lock();
         // Advance the ledger clock first (releases matured unbondings, #660),
         // then apply this block's ops so their unbonding release is scheduled
@@ -152,6 +176,14 @@ impl RethApplication {
         src.advance_to_height(height);
         for (node_id, op) in ops {
             src.apply(node_id, op);
+        }
+        // Slash after advancing the clock so the equivocator's still-locked
+        // unbonding stake is burned too (matured stake is no longer slashable,
+        // #660). The resulting `weight 0` removals drain alongside the staking
+        // deltas — the integration layer materialises them into one reconfig,
+        // merging with the membership jail (#658a).
+        for node_id in slashed {
+            src.slash(node_id);
         }
         src.take_updates()
     }
@@ -555,10 +587,12 @@ impl Application for RethApplication {
                     return Ok(CommitResult::default());
                 }
             }
-            // The EL executed this block, so the staking predeploy's events for
-            // it are now readable. Read them (#655) and feed the CL-native
+            // The EL executed this block, so the staking and slashing
+            // predeploys' events for it are now readable. Read them (#655
+            // Deposit/Withdraw + #732/#658b Slashed) and feed the CL-native
             // stake ledger; the resulting deltas become validator_updates the
-            // integration layer materialises into a reconfig (#652).
+            // integration layer materialises into a reconfig (#652) — slashes
+            // arriving as `weight 0` removals merged with the jail (#658a).
             let validator_updates = self
                 .derive_validator_updates(&payload, block.header.height)
                 .await;
@@ -830,6 +864,95 @@ mod tests {
                 weight: 0,
             }],
             "a Withdraw of the full stake removes the validator (weight 0)",
+        );
+    }
+
+    /// Test transport serving slashing-predeploy `Slashed` logs only for the
+    /// slashing `eth_getLogs` filter (keyed on the filter's `address`), so a
+    /// commit's staking read sees nothing and its slashing read sees the canned
+    /// log.
+    struct SlashingTransport {
+        inner: FixtureTransport,
+        slashed_logs: Value,
+    }
+    impl EngineTransport for SlashingTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, _method: &str, params: Value) -> BoxFuture<'_, Result<Value>> {
+            let is_slashing = params[0]["address"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case(slashing::SLASHING_ADDRESS));
+            let logs = if is_slashing {
+                self.slashed_logs.clone()
+            } else {
+                Value::Array(Vec::new())
+            };
+            Box::pin(async move { Ok(logs) })
+        }
+    }
+
+    /// #732 end-to-end (reth side): a `Slashed` event in a committed block burns
+    /// the equivocator's bonded stake through the `StakeSource`, surfacing as a
+    /// `weight 0` removal in `validator_updates` (the membership jail, #658a,
+    /// merges via the reconfig path). The slashing predeploy already verified
+    /// the equivocation in the EVM, so boule needs only the validator id.
+    #[tokio::test]
+    async fn commit_reads_slashed_logs_into_a_validator_removal() {
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+
+        // An equivocator seeded with genesis stake 1_000; a Slashed event for
+        // it zeroes the stake (weight 0 = removal).
+        let equivocator = [2u8; 32];
+        let slashed_logs = serde_json::json!([{
+            "topics": [slashing::SLASHED_TOPIC, format!("0x{}", "02".repeat(32))],
+            // viewNum(uint64) + blockA + blockB — unread by the apply path.
+            "data": format!("0x{:064x}{}{}", 5u64, "aa".repeat(32), "bb".repeat(32)),
+        }]);
+        let app = RethApplication::new(
+            Box::new(SlashingTransport {
+                inner: FixtureTransport,
+                slashed_logs,
+            }),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(BondedStakeLedger::seeded_from([(equivocator, 1_000u64)])),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        );
+
+        let g = genesis();
+        let block = app
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
+            .await
+            .expect("build");
+        let result = app
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit");
+
+        assert_eq!(
+            result.validator_updates,
+            vec![ValidatorUpdate {
+                node_id: equivocator,
+                weight: 0,
+            }],
+            "a Slashed event burns the equivocator's stake (weight 0 = removal)",
+        );
+        assert!(
+            result.effects.is_empty(),
+            "Slashed is applied directly to the stake source, not carried as an effect",
         );
     }
 
