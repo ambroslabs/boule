@@ -17,7 +17,10 @@
 //!
 //! - `eth_getTransactionCount(system, "pending")` returns the shared pending
 //!   nonce (the count of accepted system txs) — exactly what a rotating set of
-//!   proposers, each independently fetching the pending nonce, would read.
+//!   proposers, each independently fetching the pending nonce, would read. The
+//!   `"latest"`/executed nonce equals it (the mock applies every accepted tx
+//!   synchronously), so the #767 settled-frontier gate sees no in-flight
+//!   registry writes and may advance `settledView`.
 //! - `eth_sendRawTransaction(raw)` decodes + recovers the tx, **rejects** a
 //!   stale nonce (`< pending`, modelling reth dropping a colliding/duplicate
 //!   nonce), otherwise accepts it, bumps the pending nonce, and applies the
@@ -325,6 +328,18 @@ impl EngineTransport for RecordingTransport {
         Box::pin(async move { Ok(nonce) })
     }
 
+    fn eth_get_transaction_count_executed(
+        &self,
+        _address: &str,
+    ) -> BoxFuture<'_, anyhow::Result<u64>> {
+        // The mock applies every accepted submission synchronously in
+        // `accept_raw` (no pending pool), so the executed (`latest`) nonce
+        // always equals the pending nonce. The #767 settled-frontier gate
+        // therefore sees no in-flight registry writes and may advance.
+        let nonce = self.evm.0.lock().pending_nonce;
+        Box::pin(async move { Ok(nonce) })
+    }
+
     fn send_raw_transaction(&self, raw: Bytes) -> BoxFuture<'_, anyhow::Result<Value>> {
         let hash = self.evm.accept_raw(&raw);
         Box::pin(async move { Ok(Value::String(hash?)) })
@@ -450,9 +465,10 @@ fn system_addr() -> Address {
 // (a) proposer-only: non-proposers submit nothing; exactly one node writes.
 // ---------------------------------------------------------------------------
 
-/// A 4-node set commits the same block; only the block's proposer writes the
-/// `recordWeight` + `recordSettled` system txs. The other three submit nothing,
-/// so the EVM sees exactly one node's writes (no N-fold redundant pool spam).
+/// A 4-node set commits the same block (above the settled-view margin); only
+/// the block's proposer writes the `recordWeight` + `recordSettled` system txs.
+/// The other three submit nothing, so the EVM sees exactly one node's writes
+/// (no N-fold redundant pool spam).
 #[tokio::test]
 async fn only_the_proposer_submits_writes() {
     let nodes: Vec<NodeId> = (1u8..=4).map(|i| [i; 32]).collect();
@@ -467,14 +483,18 @@ async fn only_the_proposer_submits_writes() {
         .map(|&id| make_node(id, evm.clone(), logs.clone(), &[(leaving, 5)]))
         .collect();
 
+    // Commit above the settled-view margin (view 5 > SETTLED_VIEW_MARGIN = 4)
+    // so the conservative frontier writes a real recordSettled(view − margin).
     let proposer = nodes[2];
-    let block = committed_block(1, 1, proposer);
+    let view = registry::SETTLED_VIEW_MARGIN + 1; // 5
+    let block = committed_block(1, view, proposer);
     for app in &apps {
         app.commit(&ctx(proposer), &block).await.expect("commit");
     }
 
+    let settled = view - registry::SETTLED_VIEW_MARGIN; // 1
     let subs = evm.submissions();
-    // Exactly: one recordWeight (leaving → 0) + one recordSettled(view 1).
+    // Exactly: one recordWeight (leaving → 0) + one recordSettled(view − margin).
     assert_eq!(
         subs.len(),
         2,
@@ -488,9 +508,9 @@ async fn only_the_proposer_submits_writes() {
             weight: 0
         }
     );
-    assert_eq!(subs[1].call, Call::RecordSettled { view: 1 });
+    assert_eq!(subs[1].call, Call::RecordSettled { view: settled });
     assert!(subs.iter().all(|s| s.applied), "both writes land");
-    assert_eq!(evm.settled_view(), 1);
+    assert_eq!(evm.settled_view(), settled);
     assert_eq!(evm.weight_of(&leaving), 0, "removed validator drained");
 }
 
@@ -499,11 +519,17 @@ async fn only_the_proposer_submits_writes() {
 //     writes with monotone, gap-free system-account nonces.
 // ---------------------------------------------------------------------------
 
-/// Across three views with a *rotating* proposer (node1, node2, node3), each
-/// commit advances the settled frontier and (where a rotation log is present)
-/// records a key. Every node commits every block, but only the per-view
-/// proposer writes — so the shared system account's nonces are monotone and
-/// gap-free (0,1,2,…), never colliding despite three different signers.
+/// Across three committed views with a *rotating* proposer (node1, node2,
+/// node3), each commit advances the settled frontier and (where a rotation log
+/// is present) records a key. Every node commits every block, but only the
+/// per-view proposer writes — so the shared system account's nonces are
+/// monotone and gap-free (0,1,2,…), never colliding despite three different
+/// signers.
+///
+/// The committed views are held above the settled-view margin (5,6,7 >
+/// `SETTLED_VIEW_MARGIN` = 4) so the conservative frontier actually writes a
+/// `recordSettled(view − margin)` each commit (= views 1,2,3) rather than
+/// suppressing it below the margin.
 ///
 /// The node apps are *persistent* across the three blocks (heights advance
 /// 1→2→3, frontier by one each commit, as on the real path), and the shared
@@ -531,19 +557,22 @@ async fn rotating_proposer_writes_exactly_once_with_sane_nonces() {
     ];
     for (i, rot) in per_block_rotation.iter().enumerate() {
         let height = (i + 1) as u64;
+        // Commit above the margin so each commit writes recordSettled(view −
+        // margin): views 5,6,7 → settled 1,2,3.
+        let view = height + registry::SETTLED_VIEW_MARGIN;
         let proposer = nodes[i]; // rotate the proposer each block
         match rot {
             Some((v_eff, seed)) => logs.set_rotation(rotation_log(rotating, *v_eff, *seed)),
             None => logs.set_rotation(Value::Array(Vec::new())),
         }
-        let block = committed_block(height, height, proposer);
+        let block = committed_block(height, view, proposer);
         for app in &apps {
             app.commit(&ctx(proposer), &block).await.expect("commit");
         }
     }
 
     let applied = evm.applied();
-    // Two recordKeys (views 1 & 3) + three recordSettled (one per view) = 5.
+    // Two recordKeys (blocks 1 & 3) + three recordSettled (one per view) = 5.
     let keys: Vec<_> = applied
         .iter()
         .filter(|s| matches!(s.call, Call::RecordKey { .. }))
@@ -586,6 +615,11 @@ async fn restart_replay_is_idempotent_no_corruption() {
     let evm = SharedEvm::new();
     let logs = BlockLogs::with(Value::Array(Vec::new()), rotation_log(rotating, 5, 0x9a));
 
+    // Commit above the settled-view margin so a real recordSettled is written
+    // (view 9 > SETTLED_VIEW_MARGIN = 4 ⇒ recordSettled clamps to view 5).
+    let commit_view = registry::SETTLED_VIEW_MARGIN + 5; // 9
+    let settled = commit_view - registry::SETTLED_VIEW_MARGIN; // 5
+
     // A node restart re-derives a fresh `RethApplication` over reth's already
     // persisted state (the same `SharedEvm`) and re-commits the identical block.
     let commit_block_1 = || {
@@ -593,12 +627,12 @@ async fn restart_replay_is_idempotent_no_corruption() {
         let logs = logs.clone();
         async move {
             let app = make_node(proposer, evm, logs, &[(rotating, 1)]);
-            let block = committed_block(1, 7, proposer);
+            let block = committed_block(1, commit_view, proposer);
             app.commit(&ctx(proposer), &block).await.expect("commit");
         }
     };
 
-    // First commit: records key(vEff 5) + settled(view 7).
+    // First commit: records key(vEff 5) + settled(commit_view − margin).
     commit_block_1().await;
     let after_first = evm.applied().len();
     assert_eq!(
@@ -607,10 +641,10 @@ async fn restart_replay_is_idempotent_no_corruption() {
     );
     let frontier_key = evm.0.lock().key_frontier.get(&rotating).copied();
     assert_eq!(frontier_key, Some(5));
-    assert_eq!(evm.settled_view(), 7);
+    assert_eq!(evm.settled_view(), settled);
 
     // Restart: a fresh app over the *same* EVM re-derives and re-commits the
-    // identical block (same vEff 5, same view 7).
+    // identical block (same vEff 5, same view).
     commit_block_1().await;
 
     // The replay submitted two more txs, but neither changed state.
@@ -629,7 +663,7 @@ async fn restart_replay_is_idempotent_no_corruption() {
     );
     assert_eq!(
         evm.settled_view(),
-        7,
+        settled,
         "settled view unchanged by the replayed recordSettled"
     );
 
