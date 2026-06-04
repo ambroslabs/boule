@@ -157,6 +157,77 @@ impl ConsensusNode {
         }
     }
 
+    /// If this node has a staged governance reconfig (#729) and no reconfig
+    /// boundary is already pending, mint it **verbatim** into the mempool so the
+    /// proposal this node builds at `view` carries it. Called next to
+    /// [`Self::mint_staged_reconfig`] on the build path.
+    ///
+    /// A governance reconfig is minted whole and unchanged — unlike the staking
+    /// path, its `v_eff` is *not* recomputed, because an add's `consent_sig`
+    /// (#548) pre-image is bound to that exact `v_eff`. It rides the same
+    /// one-reconfig-boundary-at-a-time discipline as the staking path: the same
+    /// pending guard here, and the apply path's "first reconfig per block wins"
+    /// rule, mean a governance and a staking reconfig minted into the same round
+    /// never both land — the loser is retained and re-minted next round, so the
+    /// two serialise rather than conflict.
+    ///
+    /// The stage is left in place after a mint and cleared only when *this*
+    /// reconfig's boundary lands (see [`Self::apply_committed_reconfigs`]), so a
+    /// block that never commits re-mints rather than losing it. A governance
+    /// reconfig whose `v_eff` has gone stale (it can no longer clear the
+    /// apply-time floor, and `view` only advances) is dropped here — its consent
+    /// is dead, so governance must re-approve with a later `v_eff`.
+    pub(super) fn mint_staged_governance_reconfig(&mut self, view: View) {
+        let Some(cmd) = self.staged_governance_reconfig.clone() else {
+            return;
+        };
+
+        // Stale: `v_eff` can no longer clear the apply-time validation floor,
+        // and it never will (views only advance). Drop it — the bound consent
+        // is dead; governance re-approves with a later `v_eff`.
+        let floor = std::cmp::max(self.min_v_eff_delay, MIN_V_EFF_DELAY);
+        let too_soon = view
+            .checked_add(floor)
+            .is_none_or(|earliest| cmd.v_eff < earliest);
+        if too_soon {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                view = view.0,
+                v_eff = cmd.v_eff.0,
+                "governance_reconfig_dropped_stale_v_eff",
+            );
+            self.staged_governance_reconfig = None;
+            return;
+        }
+
+        // One-reconfig-at-a-time: skip if a boundary is already pending (the
+        // apply path would drop a second one), and re-mint next round.
+        let pending = self
+            .validator_history
+            .iter()
+            .any(|(v_eff, _)| v_eff != View::ZERO && v_eff > view);
+        if pending {
+            return;
+        }
+
+        match self.mempool.insert(cmd.encode()) {
+            Ok(_) => tracing::info!(
+                target: TRACE_TARGET,
+                view = view.0,
+                v_eff = cmd.v_eff.0,
+                adds = cmd.adds.len(),
+                removes = cmd.removes.len(),
+                changes = cmd.changes.len(),
+                "governance_reconfig_minted",
+            ),
+            Err(e) => tracing::error!(
+                target: TRACE_TARGET,
+                error = %e,
+                "mint_staged_governance_reconfig_mempool_insert_failed",
+            ),
+        }
+    }
+
     /// Drain the staged execution-layer transaction effects (#727) and
     /// materialise each into its consensus system command on the proposal this
     /// node is about to build as leader. Called next to
@@ -175,13 +246,18 @@ impl ConsensusNode {
     /// rotation commands, which have no one-boundary-at-a-time guard to dedupe
     /// them the way [`Self::mint_staged_reconfig`] does for reconfigs.
     ///
-    /// Every [`ValidatorEffect`] category now has a live apply path and is
-    /// minted as its consensus system command: [`ValidatorEffect::KeyRotation`]
-    /// (#730), [`ValidatorEffect::EndpointUpdate`] (#731), and
-    /// [`ValidatorEffect::ParamUpdate`] (#542). Each mint first confirms the
-    /// payload's declared category (defense against the effect channel smuggling
-    /// a mismatched command in). A future `#[non_exhaustive]` category with no
-    /// materialiser is surfaced rather than silently dropped (cf. #728).
+    /// Every [`ValidatorEffect`] category now has a live apply path:
+    /// [`ValidatorEffect::KeyRotation`] (#730),
+    /// [`ValidatorEffect::EndpointUpdate`] (#731), and
+    /// [`ValidatorEffect::ParamUpdate`] (#542) are minted here directly as their
+    /// consensus system commands; [`ValidatorEffect::Reconfig`] (#729) is
+    /// instead *staged* for [`Self::mint_staged_governance_reconfig`] (it can't
+    /// be drained-and-minted here — its `v_eff`-bound consent must be preserved
+    /// and it must serialise with the staking reconfig path). Each mint/stage
+    /// first confirms the payload's declared category (defense against the
+    /// effect channel smuggling a mismatched command in). A future
+    /// `#[non_exhaustive]` category with no materialiser is surfaced rather than
+    /// silently dropped (cf. #728).
     pub(super) fn mint_staged_effects(&mut self, view: View) {
         if self.staged_effects.is_empty() {
             return;
@@ -268,6 +344,32 @@ impl ConsensusNode {
                             target: TRACE_TARGET,
                             error = %e,
                             "mint_staged_effects_mempool_insert_failed",
+                        ),
+                    }
+                }
+                ValidatorEffect::Reconfig(bytes) => {
+                    // #729: the EL's governance mechanism approved a membership
+                    // reconfig. Stage it (last-wins) for
+                    // `mint_staged_governance_reconfig`, which mints it verbatim
+                    // under the one-boundary discipline — it is NOT minted here,
+                    // because its `v_eff`-bound consent forbids recomputation and
+                    // it must serialise with the staking reconfig path rather
+                    // than race it. Confirm the declared category first.
+                    match ReconfigCommand::decode(&bytes) {
+                        Ok(cmd) => {
+                            tracing::info!(
+                                target: TRACE_TARGET,
+                                view = view.0,
+                                v_eff = cmd.v_eff.0,
+                                "governance_reconfig_staged",
+                            );
+                            self.staged_governance_reconfig = Some(cmd);
+                        }
+                        Err(e) => tracing::error!(
+                            target: TRACE_TARGET,
+                            view = view.0,
+                            error = %e,
+                            "mint_staged_effects_reconfig_payload_not_a_reconfig",
                         ),
                     }
                 }
