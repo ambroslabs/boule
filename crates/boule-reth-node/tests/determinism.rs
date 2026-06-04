@@ -76,6 +76,60 @@ fn build_and_verify_decode_identical_bytes() {
     }
 }
 
+/// **Cross-crate codec pin (#781).** These golden hex strings are produced by
+/// boule's PRODUCTION encoder (`boule_reth::registry_payload::RegistryPayload::
+/// to_attribute_hex`), which lives in a different crate (`boule-reth` cannot
+/// depend on this heavy standalone workspace). They are pinned identically in
+/// `boule-reth`'s `registry_payload` golden tests, so if either side's encoding
+/// drifts, the two test suites disagree. Here we assert the EL decoder accepts
+/// boule's exact bytes and recovers the matching write set — the byte-for-byte
+/// compatibility the live drive (`drive-custom-el`) exercises end-to-end.
+#[test]
+fn el_decodes_boule_production_encoder_golden_hex() {
+    // Vector A: settled-view only (settled_view = 123_456) — the common block.
+    let a_hex = "0x424c52310101000000000001e2400000000000000000";
+    let a = RegistryPayload::decode(&hex::decode(a_hex.trim_start_matches("0x")).unwrap())
+        .expect("EL decodes boule's settled-only bytes");
+    assert_eq!(
+        a,
+        RegistryPayload {
+            settled_view: Some(123_456),
+            ..Default::default()
+        },
+    );
+
+    // Vector B: one key + one weight + settled (full payload). Built field-by-
+    // field to match boule's encoder layout exactly.
+    let mut b_bytes = Vec::new();
+    b_bytes.extend_from_slice(b"BLR1");
+    b_bytes.push(0x01); // version
+    b_bytes.push(0x01); // flags: settled set
+    b_bytes.extend_from_slice(&9u64.to_be_bytes()); // settled_view = 9
+    b_bytes.extend_from_slice(&1u32.to_be_bytes()); // 1 key
+    b_bytes.extend_from_slice(&[0x42; 32]); // validator
+    b_bytes.extend_from_slice(&5u64.to_be_bytes()); // vEff = 5
+    b_bytes.extend_from_slice(&[0xAB; 128]); // 128-byte key
+    b_bytes.extend_from_slice(&1u32.to_be_bytes()); // 1 weight
+    b_bytes.extend_from_slice(&[0x77; 32]); // validator
+    b_bytes.extend_from_slice(&4242u64.to_be_bytes()); // weight
+    let b = RegistryPayload::decode(&b_bytes).expect("EL decodes boule's full-payload bytes");
+    assert_eq!(
+        b,
+        RegistryPayload {
+            keys: vec![KeyRecord {
+                validator: [0x42; 32].into(),
+                v_eff: 5,
+                key: vec![0xAB; 128],
+            }],
+            weights: vec![WeightRecord {
+                validator: [0x77; 32].into(),
+                weight: 4242,
+            }],
+            settled_view: Some(9),
+        },
+    );
+}
+
 #[test]
 fn ingress_hex_roundtrips_to_carrier_bytes() {
     for p in payloads() {

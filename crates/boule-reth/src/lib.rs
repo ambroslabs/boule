@@ -39,6 +39,7 @@ pub mod jwt;
 pub mod param;
 pub mod predeploy_log;
 pub mod registry;
+pub mod registry_payload;
 pub mod rotation;
 pub mod slashing;
 pub mod staking;

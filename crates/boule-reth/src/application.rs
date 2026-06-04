@@ -114,6 +114,57 @@ impl RethApplication {
         RethEngine::new(&*self.transport, self.fee_recipient.clone())
     }
 
+    /// Compute the A1 EL-applied registry write set (#781) the leader carries to
+    /// the custom EL on the build attributes for the block at `view`.
+    ///
+    /// Sourced from boule's authoritative consensus state, mirroring exactly what
+    /// the legacy tx-write path in [`Self::commit`] would record:
+    ///
+    /// - **`settledView`** — [`registry::conservative_settled_view`]`(view)`, the
+    ///   same conservative frontier (#767) `record_settled_view` advances to. The
+    ///   primary, near-always-present field; on the common no-rotation block it is
+    ///   the *only* one, keeping the carried `extra_data` to a handful of bytes.
+    ///   `None` below the margin (genesis frontier is already 0).
+    /// - **`keys`** — the BLS-key rotations this block materializes: each
+    ///   rotation system tx the leader is including (`system_cmds`, the same
+    ///   commands it pulls into the block) decoded via
+    ///   [`registry::record_key_for_rotation`] into the EL's 128-byte EIP-2537
+    ///   form. Non-BLS / undecodable commands are skipped (logged), never failing
+    ///   the build.
+    /// - **`weights`** — left empty here: seated-weight deltas are staged at the
+    ///   integration layer (not visible to the `Application` at build time), so
+    ///   the legacy tx-write path (`record_validator_weights`, which still runs in
+    ///   `commit`) covers them this phase. Threading weight deltas through to the
+    ///   EL build path is Phase-3/5 work (see #781).
+    ///
+    /// Determinism across replicas does not depend on this sourcing: the EL reads
+    /// the write set from the *sealed header* `extra_data` on every node's verify
+    /// path, so the leader's job is only to mirror authoritative state. Holding
+    /// the set in a consensus-canonical order keeps the encoded bytes stable.
+    fn registry_payload_for_build(
+        &self,
+        view: View,
+        system_cmds: &[Bytes],
+    ) -> crate::registry_payload::RegistryPayload {
+        let settled = registry::conservative_settled_view(view);
+        let settled_view = if settled.0 == 0 { None } else { Some(settled) };
+
+        let mut keys = Vec::new();
+        for cmd in system_cmds {
+            match registry::record_key_for_rotation(cmd) {
+                Ok(Some(rk)) => keys.push(rk),
+                Ok(None) => {} // not a BLS-key rotation — nothing to mirror
+                Err(e) => tracing::warn!(
+                    target: "boule::reth",
+                    error = %e,
+                    "EL registry write: undecodable rotation command at build; skipping recordKey",
+                ),
+            }
+        }
+
+        crate::registry_payload::RegistryPayload::new(keys, &[], settled_view)
+    }
+
     /// Read the staking predeploy's `Deposit`/`Withdraw` events *and* the
     /// slashing predeploy's `Slashed` events for the just-executed `payload`,
     /// apply them to the CL-native stake ledger, and return the validator-set
@@ -893,8 +944,28 @@ impl Application for RethApplication {
                     }
                 }
             }
+            // A1 EL-applied registry writes (#781): the leader computes the
+            // authoritative `(keys, weights, settledView)` write set for this
+            // block and hands it to the custom EL on the build attributes. The
+            // EL transcribes it into the sealed header `extra_data` and applies
+            // `recordKey`/`recordWeight`/`recordSettled` as system calls, so every
+            // replica mirrors the identical registry state from the propagated
+            // block (no proposer trust — see #777). The pulled-in rotation system
+            // txs (`reconfig_cmds` below) feed the key writes; the settled view is
+            // the conservative frontier the tx path also computes. Empty for the
+            // common no-rotation block, which keeps `extra_data` (and the header)
+            // small. This runs alongside the legacy tx-write path in `commit`
+            // (the Registry's dual-writer accepts both); the tx path is removed in
+            // Phase 3.
+            let reconfig_cmds = self.mempool.propose(SYSTEM_TX_LIMIT);
+            let registry_payload = self.registry_payload_for_build(view, &reconfig_cmds);
             let built = engine
-                .build_block(&parent_evm_hash, evm_ts, self.build_wait)
+                .build_block(
+                    &parent_evm_hash,
+                    evm_ts,
+                    self.build_wait,
+                    &registry_payload.to_attribute_hex(),
+                )
                 .await?;
             // Register immediately so a later build can chain on this block
             // before it commits (HotStuff pipelining).
@@ -914,7 +985,7 @@ impl Application for RethApplication {
             // this, a minted reconfig would never commit. Their validity is
             // checked at commit (apply_committed_reconfigs); app commands in
             // the pool are ignored here.
-            for cmd in self.mempool.propose(SYSTEM_TX_LIMIT) {
+            for cmd in reconfig_cmds {
                 if ReconfigCommand::is_reconfig_payload(&cmd)
                     || DualSignedRotation::is_rotation_payload(&cmd)
                     || boule_consensus::validator_rotation::DualSignedRotationCancel::is_cancel_payload(&cmd)
