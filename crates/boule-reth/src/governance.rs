@@ -3,9 +3,11 @@
 //! A validator-set membership change (a *reconfig*) is approved on-chain by the
 //! seated validators calling the `Governance` contract
 //! (`contracts/Governance.sol`), deployed as a genesis predeploy at
-//! [`GOVERNANCE_ADDRESS`]. The contract tallies distinct approvals per proposal
-//! and, once they cross quorum, emits a single `Approved(proposalId,
-//! reconfigCommand)`. boule reads those `Approved` events from each committed
+//! [`GOVERNANCE_ADDRESS`]. The contract accumulates each distinct approving
+//! validator's on-chain weight per proposal and, once that weight crosses a
+//! two-thirds supermajority of the `Registry`'s `totalWeight()`, emits a single
+//! `Approved(proposalId, reconfigCommand)`. boule reads those events from each
+//! committed
 //! block — filtered by [`APPROVED_TOPIC`] — via [`parse_approved_logs`], turning
 //! the carried `reconfigCommand` back into the encoded command bytes. Those
 //! become a
@@ -16,11 +18,16 @@
 //! half of #548: approvals ride the ordinary EVM mempool/gossip rather than a
 //! bespoke consensus-side signature-accumulation + tx-gossip path.
 //!
-//! The contract's *tally* logic (quorum crossing, double-approval dedup) is the
-//! interesting part and is exercised against a live reth (see the PR /
-//! `Governance.sol` doc); this module is just the read half plus the on-chain
-//! identifiers. The MVP weight model is one-validator-one-vote — distinct
-//! approving addresses, not stake weight — documented on the contract.
+//! The contract's *tally* logic (the stake-weighted supermajority crossing,
+//! validator-gating, double-approval dedup) is the interesting part and is
+//! exercised against a live reth (see the PR / `Governance.sol` doc); this
+//! module is just the read half plus the on-chain identifiers. The tally is
+//! **weight-based** (#729): `approve` takes the 32-byte validator id the caller
+//! votes as, staticcalls the `Registry`'s `weightOf`/`totalWeight` surface
+//! (#759), requires `weightOf > 0` (seated), and emits `Approved` once the
+//! accumulated approving weight crosses a strict two-thirds supermajority of
+//! `totalWeight()` — all documented on the contract, including the residual
+//! trust that a caller names the validator it votes as.
 //!
 //! These constants are the authoritative identifiers and match the compiled
 //! runtime bytecode embedded in `genesis.json`; the tests below pin the address,
@@ -35,15 +42,21 @@ use serde_json::{Value, json};
 pub const GOVERNANCE_ADDRESS: &str = "0x0000000000000000000000000000000000000b14";
 
 /// `keccak256("Approved(bytes32,bytes)")` — topic0 of the `Approved` event,
-/// emitted once per proposal by `approve(bytes32,bytes,uint64)` when the
-/// distinct-approver tally first reaches quorum.
+/// emitted once per proposal by `approve(bytes32,bytes,bytes32)` when the
+/// accumulated approving **weight** first crosses the supermajority. The event
+/// shape (and so this topic) is unchanged by the weighted tally (#729), so the
+/// read path is untouched.
 pub const APPROVED_TOPIC: &str =
     "0xd686e9e9eda221dfab37aa6cae405e85e661ed8e45cbe791790ed38093d85b75";
 
-/// 4-byte selector of `approve(bytes32,bytes,uint64)`.
-pub const APPROVE_SELECTOR: [u8; 4] = [0x41, 0x0f, 0xa9, 0x55];
+/// 4-byte selector of `approve(bytes32 proposalId, bytes reconfigCommand, bytes32 validator)`
+/// — the stake-weighted, validator-gated tally entry point (#729). The third
+/// arg is the 32-byte validator id the caller votes as; the contract reads its
+/// `Registry.weightOf` (gated `> 0`) and accumulates it.
+pub const APPROVE_SELECTOR: [u8; 4] = [0x80, 0x30, 0x9c, 0x0a];
 
-/// 4-byte selector of `approvals(bytes32)` (the running distinct-approver tally).
+/// 4-byte selector of `approvals(bytes32)` (the running accumulated approving
+/// weight).
 pub const APPROVALS_SELECTOR: [u8; 4] = [0xbf, 0x7c, 0x21, 0x31];
 
 /// 4-byte selector of `isApproved(bytes32)`.
@@ -125,6 +138,43 @@ mod tests {
                 "{name} selector must appear in the dispatcher",
             );
         }
+    }
+
+    /// The stake-weighted tally (#729) staticcalls the `Registry`'s weight
+    /// surface, so the Governance bytecode must embed the **Registry**
+    /// `weightOf(bytes32)` and `totalWeight()` selectors (as `abi.encodeWithSelector`
+    /// PUSH4 operands) and the Registry address. Pins the cross-contract
+    /// constants in `Governance.sol` to `crate::registry`'s canonical values: if
+    /// the Registry's ABI/address drifts from what Governance calls, the
+    /// staticcalls would silently fail and this catches it at build time.
+    #[test]
+    fn registry_weight_surface_pinned_in_governance_bytecode() {
+        use crate::registry::{REGISTRY_ADDRESS, TOTAL_WEIGHT_SELECTOR, WEIGHT_OF_SELECTOR};
+        let g: serde_json::Value =
+            serde_json::from_str(include_str!("../genesis.json")).expect("genesis.json parses");
+        let code = g["alloc"][GOVERNANCE_ADDRESS]["code"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            code.contains(&hex::encode(WEIGHT_OF_SELECTOR)),
+            "Registry weightOf selector must appear in Governance's staticcall",
+        );
+        assert!(
+            code.contains(&hex::encode(TOTAL_WEIGHT_SELECTOR)),
+            "Registry totalWeight selector must appear in Governance's staticcall",
+        );
+        // The Registry address is the staticcall target. solc emits the small
+        // `…b12` address as a minimal PUSH (leading zero bytes truncated), so
+        // pin the meaningful low bytes rather than the full 20-byte zero-padding.
+        let addr = REGISTRY_ADDRESS
+            .trim_start_matches("0x")
+            .to_ascii_lowercase();
+        let addr_suffix = addr.trim_start_matches('0');
+        assert!(
+            code.contains(addr_suffix),
+            "the Registry predeploy address (low bytes {addr_suffix}) must appear as the staticcall target",
+        );
     }
 
     #[test]
