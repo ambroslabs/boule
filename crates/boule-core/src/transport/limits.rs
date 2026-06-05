@@ -560,13 +560,33 @@ impl ConnectionLimitsConfig {
     }
 
     /// Defaults baked into the binary when the operator omits
-    /// `[p2p.limits]` connection caps. Loose enough for a 4–dozen-
-    /// validator cluster.
+    /// `[p2p.limits]` connection caps. Sized for **public exposure** as
+    /// part of the MVP-public-testnet work (#805): a validator runs a
+    /// small trusted committee but the listener now also fronts an
+    /// open population of non-validating full/RPC nodes (#802), so the
+    /// inbound ceiling is raised an order of magnitude over the old
+    /// "~dozen-validator cluster" sizing (`max_inbound: 64`).
+    ///
+    /// - `max_inbound: 512` — room for a few hundred follower nodes to
+    ///   subscribe to gossip + sync without the cap firing on honest
+    ///   demand. The per-connection memory cost (one framing task + two
+    ///   bounded channels) is small, and the in-flight handshake bound
+    ///   ([`HandshakeLimitsConfig`]) — not this number — is what caps
+    ///   pre-admission resource use under a flood.
+    /// - `max_outbound: 64` — a node still only *dials* its configured
+    ///   peer set + bootstrap; outbound fan-out is not driven by the
+    ///   public population, so this stays at the cluster sizing.
+    /// - `max_per_ip: 8` — a single source IP (e.g. a NAT fronting a
+    ///   couple of honest nodes, or a load balancer) gets a little
+    ///   headroom, but not enough for one address to monopolise the
+    ///   inbound budget. The pre-handshake per-IP guard
+    ///   ([`HandshakeLimitsConfig::max_inflight_per_ip`]) backstops this
+    ///   *before* the handshake completes.
     pub fn production_defaults() -> Self {
         Self {
-            max_inbound: 64,
+            max_inbound: 512,
             max_outbound: 64,
-            max_per_ip: 4,
+            max_per_ip: 8,
             // No total cap by default at the `[p2p.limits]` layer; the
             // overlay-layer cap from #187 lands a tighter limit when
             // it's plumbed through `node.rs`.
@@ -734,6 +754,192 @@ impl ConnectionLimiter {
     /// against `max_total` (#187).
     pub fn total(&self) -> usize {
         self.inbound().saturating_add(self.outbound())
+    }
+}
+
+// ── HandshakeLimiter ─────────────────────────────────────────────────────────
+
+/// Pre-admission bounds on in-flight (un-admitted) inbound TLS
+/// handshakes (#805).
+///
+/// The [`ConnectionLimiter`] above is charged only **after** a
+/// handshake completes and a [`Direction::Inbound`] `NewConnection` is
+/// registered. That leaves a window — accept the TCP socket, run the
+/// TLS handshake — that is entirely **un**-bounded: a slowloris-style
+/// flood of half-open TLS handshakes from many source IPs spawns one
+/// accept task each and pins kernel sockets + handshake buffers without
+/// ever tripping the post-admission caps. This limiter closes that hole
+/// by bounding the number of handshakes the listener will run
+/// concurrently, both globally and per source IP, **before** any TLS
+/// work begins. Paired with a wall-clock handshake timeout in the
+/// listener, a half-open peer can hold a handshake slot for at most
+/// `timeout`, so the flood's steady-state resource use is bounded by
+/// `max_inflight` regardless of how many IPs participate.
+#[derive(Debug, Clone)]
+pub struct HandshakeLimitsConfig {
+    /// Maximum inbound handshakes running concurrently across all
+    /// source IPs. A flood can pin at most this many accept tasks at
+    /// once; once the budget is full the listener *refuses* further
+    /// accepts outright (drops the socket without running TLS) rather
+    /// than queueing them, so a flood cannot build an unbounded backlog
+    /// of pending handshakes. Set to `usize::MAX` to disable.
+    pub max_inflight: usize,
+    /// Maximum concurrent in-flight handshakes from a single source IP.
+    /// Fires *before* the TLS handshake runs, so one address cannot
+    /// monopolise the global `max_inflight` budget with half-open
+    /// handshakes. Set to `usize::MAX` to disable per-IP counting.
+    pub max_inflight_per_ip: usize,
+    /// Wall-clock ceiling on a single inbound TLS handshake. The
+    /// listener wraps `acceptor.accept(..)` in this timeout; a peer
+    /// that stalls mid-handshake (slowloris) is dropped at the deadline
+    /// and its handshake slot freed. Applied by the listener, carried
+    /// here so the bound and its budget live in one config.
+    pub timeout: Duration,
+}
+
+impl HandshakeLimitsConfig {
+    /// Public-exposure defaults (#805). `max_inflight` is generous
+    /// enough that a burst of honest reconnects (e.g. after a leader
+    /// rotation, every follower redials) clears quickly, while still
+    /// being a hard ceiling a flood cannot exceed. `max_inflight_per_ip`
+    /// is tight: an honest peer completes a handshake in well under a
+    /// second, so even a NAT fronting several nodes rarely has more than
+    /// a couple in flight at once. The 10s `timeout` is comfortably
+    /// above a real TLS round-trip on a slow link yet short enough that
+    /// a slowloris peer cannot pin a slot for long.
+    pub fn production_defaults() -> Self {
+        Self {
+            max_inflight: 256,
+            max_inflight_per_ip: 4,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// Permissive defaults that effectively disable the handshake bound
+    /// — used by the simulator and tests where it is not under
+    /// assertion.
+    pub fn unbounded_for_tests() -> Self {
+        Self {
+            max_inflight: usize::MAX,
+            max_inflight_per_ip: usize::MAX,
+            // A very long timeout never fires in a fast test; the
+            // handshake-timeout tests construct their own short value.
+            timeout: Duration::from_secs(3600),
+        }
+    }
+}
+
+/// Outcome of a refused [`HandshakeLimiter::try_acquire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeReject {
+    /// Global `max_inflight` is saturated.
+    TotalInflight,
+    /// `max_inflight_per_ip` is saturated for the connection's IP.
+    PerIpInflight,
+}
+
+impl HandshakeReject {
+    /// Stable short label for log fields.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TotalInflight => "max_inflight",
+            Self::PerIpInflight => "max_inflight_per_ip",
+        }
+    }
+}
+
+/// Counts in-flight inbound handshakes globally and per source IP, and
+/// hands out an RAII [`HandshakePermit`] that releases its slot on drop.
+/// One instance is shared by the listener across all accept tasks.
+pub struct HandshakeLimiter {
+    config: HandshakeLimitsConfig,
+    inflight: AtomicUsize,
+    per_ip: Mutex<HashMap<IpAddr, usize>>,
+    rejects: AtomicU64,
+}
+
+impl HandshakeLimiter {
+    /// Construct a handshake limiter from `config`.
+    pub fn new(config: HandshakeLimitsConfig) -> Self {
+        Self {
+            config,
+            inflight: AtomicUsize::new(0),
+            per_ip: Mutex::new(HashMap::new()),
+            rejects: AtomicU64::new(0),
+        }
+    }
+
+    /// The configured handshake wall-clock timeout — the listener reads
+    /// this to bound a single `acceptor.accept(..)`.
+    pub fn timeout(&self) -> Duration {
+        self.config.timeout
+    }
+
+    /// Try to reserve a handshake slot for an inbound connection from
+    /// `ip`. On success returns a [`HandshakePermit`] whose `Drop`
+    /// releases the slot — the listener holds it for the duration of the
+    /// (timed) handshake. On failure the reject counter is incremented
+    /// and the caller drops the socket without running TLS.
+    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Result<HandshakePermit, HandshakeReject> {
+        // Per-IP first so a single source can't drive the global counter
+        // up to its ceiling on its own. The lock guards both the read
+        // and the increment so concurrent accepts can't race past it.
+        let mut per_ip = self.per_ip.lock();
+        let ip_count = per_ip.get(&ip).copied().unwrap_or(0);
+        if ip_count >= self.config.max_inflight_per_ip {
+            self.rejects.fetch_add(1, Ordering::Relaxed);
+            return Err(HandshakeReject::PerIpInflight);
+        }
+        if self.inflight.load(Ordering::Acquire) >= self.config.max_inflight {
+            self.rejects.fetch_add(1, Ordering::Relaxed);
+            return Err(HandshakeReject::TotalInflight);
+        }
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+        *per_ip.entry(ip).or_insert(0) += 1;
+        Ok(HandshakePermit {
+            limiter: Arc::clone(self),
+            ip,
+        })
+    }
+
+    fn release(&self, ip: IpAddr) {
+        self.inflight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                Some(c.saturating_sub(1))
+            })
+            .ok();
+        let mut per_ip = self.per_ip.lock();
+        if let Some(c) = per_ip.get_mut(&ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                per_ip.remove(&ip);
+            }
+        }
+    }
+
+    /// Cumulative `try_acquire` rejections (pre-handshake floods).
+    pub fn rejects(&self) -> u64 {
+        self.rejects.load(Ordering::Relaxed)
+    }
+
+    /// Handshakes currently in flight (acquired but not yet released).
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII permit for one in-flight handshake. Releasing on `Drop` means
+/// the slot is freed on **every** exit path — handshake success, TLS
+/// error, *and* the timeout branch — without the listener having to
+/// remember to release explicitly.
+pub struct HandshakePermit {
+    limiter: Arc<HandshakeLimiter>,
+    ip: IpAddr,
+}
+
+impl Drop for HandshakePermit {
+    fn drop(&mut self) {
+        self.limiter.release(self.ip);
     }
 }
 
@@ -1204,5 +1410,86 @@ mod tests {
         cl.release(Direction::Inbound, ip);
         // After release we can re-admit from the same IP.
         assert!(cl.try_admit(Direction::Inbound, ip).is_ok());
+    }
+
+    // ── HandshakeLimiter ──────────────────────────────────────────────────
+
+    fn hs_config(max_inflight: usize, max_inflight_per_ip: usize) -> HandshakeLimitsConfig {
+        HandshakeLimitsConfig {
+            max_inflight,
+            max_inflight_per_ip,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// Assert a [`HandshakeLimiter::try_acquire`] was refused with the
+    /// expected reason. `HandshakePermit` is intentionally not
+    /// `Debug`/`PartialEq` (it carries an `Arc` and runs `Drop`), so the
+    /// `Result` can't go through `assert_eq!`.
+    fn assert_hs_rejected(
+        result: Result<HandshakePermit, HandshakeReject>,
+        expected: HandshakeReject,
+    ) {
+        match result {
+            Err(reason) => assert_eq!(reason, expected),
+            Ok(_) => panic!("expected handshake reject {}, got Ok", expected.label()),
+        }
+    }
+
+    /// #805 acceptance: a half-open flood from many IPs cannot pin more
+    /// than `max_inflight` handshake slots — the global ceiling holds
+    /// even when no single IP trips the per-IP cap.
+    #[test]
+    fn handshake_limiter_caps_global_inflight() {
+        let hl = Arc::new(HandshakeLimiter::new(hs_config(3, 99)));
+        // Three half-open handshakes from distinct IPs fill the global
+        // budget; the permits are held (not dropped) to model in-flight.
+        let _p1 = hl.try_acquire(ipv4(10, 0, 0, 1)).expect("slot 1");
+        let _p2 = hl.try_acquire(ipv4(10, 0, 0, 2)).expect("slot 2");
+        let _p3 = hl.try_acquire(ipv4(10, 0, 0, 3)).expect("slot 3");
+        assert_eq!(hl.inflight(), 3);
+        // Fourth from yet another IP is refused on the global cap.
+        assert_hs_rejected(
+            hl.try_acquire(ipv4(10, 0, 0, 4)),
+            HandshakeReject::TotalInflight,
+        );
+        assert_eq!(hl.rejects(), 1);
+    }
+
+    /// A single source IP can hold at most `max_inflight_per_ip`
+    /// half-open handshakes regardless of global headroom — so one
+    /// attacker can't monopolise the handshake budget.
+    #[test]
+    fn handshake_limiter_caps_per_ip_inflight() {
+        let hl = Arc::new(HandshakeLimiter::new(hs_config(99, 2)));
+        let ip = ipv4(10, 0, 0, 1);
+        let _p1 = hl.try_acquire(ip).expect("slot 1");
+        let _p2 = hl.try_acquire(ip).expect("slot 2");
+        assert_hs_rejected(hl.try_acquire(ip), HandshakeReject::PerIpInflight);
+        // A different IP still has its own budget.
+        assert!(hl.try_acquire(ipv4(10, 0, 0, 2)).is_ok());
+    }
+
+    /// Dropping a permit (handshake finished, errored, or timed out)
+    /// frees both the global and per-IP slot so the next accept proceeds.
+    #[test]
+    fn handshake_permit_releases_slot_on_drop() {
+        let hl = Arc::new(HandshakeLimiter::new(hs_config(1, 1)));
+        let ip = ipv4(10, 0, 0, 1);
+        {
+            let _p = hl.try_acquire(ip).expect("slot");
+            assert_eq!(hl.inflight(), 1);
+            // Budget exhausted while the permit is alive.
+            assert_hs_rejected(hl.try_acquire(ip), HandshakeReject::PerIpInflight);
+        }
+        // Permit dropped at end of scope — slot is free again.
+        assert_eq!(hl.inflight(), 0);
+        assert!(hl.try_acquire(ip).is_ok());
+    }
+
+    #[test]
+    fn handshake_limiter_timeout_is_readable() {
+        let hl = Arc::new(HandshakeLimiter::new(hs_config(1, 1)));
+        assert_eq!(hl.timeout(), Duration::from_secs(10));
     }
 }

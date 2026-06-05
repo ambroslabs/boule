@@ -948,6 +948,26 @@ pub struct P2pLimitsConfig {
     /// Maximum concurrent connections from a single source IP.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: usize,
+    /// Wall-clock ceiling (milliseconds) on a single inbound TLS
+    /// handshake (#805). A peer that stalls mid-handshake — a
+    /// slowloris half-open flood — is dropped at this deadline and its
+    /// handshake slot freed, so it cannot pin accept-side resources
+    /// indefinitely. The pre-#805 listener ran `acceptor.accept()` with
+    /// no timeout at all.
+    #[serde(default = "default_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
+    /// Maximum inbound TLS handshakes running concurrently across all
+    /// source IPs (#805). Bounds pre-admission resource use under a
+    /// half-open flood — the post-handshake `max_inbound_connections`
+    /// cap is charged only *after* a handshake completes, leaving the
+    /// handshake window itself unbounded before this knob.
+    #[serde(default = "default_max_inflight_handshakes")]
+    pub max_inflight_handshakes: usize,
+    /// Maximum concurrent in-flight handshakes from a single source IP
+    /// (#805). Fires before TLS runs, so one address cannot monopolise
+    /// `max_inflight_handshakes` with half-open handshakes.
+    #[serde(default = "default_max_inflight_handshakes_per_ip")]
+    pub max_inflight_handshakes_per_ip: usize,
     /// Per-message-type and bytes/sec rate buckets.
     #[serde(default)]
     pub rate: P2pRateLimitsConfig,
@@ -972,8 +992,21 @@ impl P2pLimitsConfig {
             max_inbound_connections: default_max_inbound_connections(),
             max_outbound_connections: default_max_outbound_connections(),
             max_connections_per_ip: default_max_connections_per_ip(),
+            handshake_timeout_ms: default_handshake_timeout_ms(),
+            max_inflight_handshakes: default_max_inflight_handshakes(),
+            max_inflight_handshakes_per_ip: default_max_inflight_handshakes_per_ip(),
             rate: P2pRateLimitsConfig::default(),
             violations: P2pViolationsConfig::default(),
+        }
+    }
+
+    /// Project the parsed handshake-cap fields into the runtime
+    /// [`crate::transport::limits::HandshakeLimitsConfig`] (#805).
+    pub fn handshake_limits(&self) -> crate::transport::limits::HandshakeLimitsConfig {
+        crate::transport::limits::HandshakeLimitsConfig {
+            max_inflight: self.max_inflight_handshakes,
+            max_inflight_per_ip: self.max_inflight_handshakes_per_ip,
+            timeout: std::time::Duration::from_millis(self.handshake_timeout_ms),
         }
     }
 }
@@ -1079,13 +1112,31 @@ impl Default for P2pViolationsConfig {
     }
 }
 
+// Public-exposure connection-cap defaults (#805). Raised from the old
+// "~dozen-validator cluster" sizing (64 / 64 / 4) now that the listener
+// fronts an open population of non-validating full/RPC nodes (#802).
+// See `crate::transport::limits::ConnectionLimitsConfig::production_defaults`
+// for the full rationale.
 fn default_max_inbound_connections() -> usize {
-    64
+    512
 }
 fn default_max_outbound_connections() -> usize {
     64
 }
 fn default_max_connections_per_ip() -> usize {
+    8
+}
+// Pre-admission handshake bounds (#805). These cap *un-admitted*
+// half-open TLS handshakes — the slowloris window the post-handshake
+// connection caps above do not cover. See
+// `crate::transport::limits::HandshakeLimitsConfig::production_defaults`.
+fn default_handshake_timeout_ms() -> u64 {
+    10_000
+}
+fn default_max_inflight_handshakes() -> usize {
+    256
+}
+fn default_max_inflight_handshakes_per_ip() -> usize {
     4
 }
 fn default_proposal_per_sec() -> f64 {
@@ -2583,9 +2634,12 @@ listen_addr = "127.0.0.1:8080"
 "#,
         );
         let limits = c.p2p.limits.expect("limits section");
-        assert_eq!(limits.max_inbound_connections, 64);
+        assert_eq!(limits.max_inbound_connections, 512);
         assert_eq!(limits.max_outbound_connections, 64);
-        assert_eq!(limits.max_connections_per_ip, 4);
+        assert_eq!(limits.max_connections_per_ip, 8);
+        assert_eq!(limits.handshake_timeout_ms, 10_000);
+        assert_eq!(limits.max_inflight_handshakes, 256);
+        assert_eq!(limits.max_inflight_handshakes_per_ip, 4);
         assert_eq!(limits.rate.proposal_per_sec, 16.0);
         assert_eq!(limits.violations.window_secs, 10);
         assert_eq!(limits.violations.max_violations, 100);
@@ -2613,7 +2667,7 @@ vote_per_sec = 1024.0
         );
         let limits = c.p2p.limits.expect("limits section");
         assert_eq!(limits.max_connections_per_ip, 1);
-        assert_eq!(limits.max_inbound_connections, 64); // default kept
+        assert_eq!(limits.max_inbound_connections, 512); // default kept
         assert_eq!(limits.rate.vote_per_sec, 1024.0);
         assert_eq!(limits.rate.proposal_per_sec, 16.0); // default kept
         // Violation window/count defaults are preserved. The projection
