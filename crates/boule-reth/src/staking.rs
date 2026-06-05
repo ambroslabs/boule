@@ -23,6 +23,40 @@ use crate::engine::root_from_hex;
 /// Fixed genesis-predeploy address of the staking contract.
 pub const STAKING_ADDRESS: &str = "0x0000000000000000000000000000000000000b0e";
 
+/// Storage slot of the `Staking` predeploy's `owner` field (#821) — the sole
+/// state variable in `Staking.sol`, so it occupies slot `0`. The genesis
+/// builder seeds the deployment owner here; `withdraw` reverts unless
+/// `msg.sender == owner`, so only this address can drive a validator unbond.
+pub const OWNER_SLOT: u64 = 0;
+
+/// The single `(slot, value)` genesis-storage write seeding the `Staking`
+/// predeploy's `owner` (#821). `owner` is the only state variable, at slot
+/// [`OWNER_SLOT`]; the 20-byte EVM address is right-aligned in the 32-byte
+/// word, matching Solidity's `address` storage encoding. Returns the
+/// `("0x…32-byte slot", "0x…32-byte value")` JSON pair the deployment genesis
+/// builder merges into `alloc[STAKING_ADDRESS].storage`.
+///
+/// `owner` is a 20-byte EVM address (any case, with or without a `0x` prefix).
+/// Errors if it is not 20 bytes of hex.
+pub fn owner_seed_storage_json(owner: &str) -> Result<(String, String), String> {
+    let bytes = hex::decode(owner.trim_start_matches("0x").trim_start_matches("0X"))
+        .map_err(|e| format!("staking owner {owner:?}: bad address hex: {e}"))?;
+    if bytes.len() != 20 {
+        return Err(format!(
+            "staking owner {owner:?}: address must be 20 bytes (40 hex chars), got {}",
+            bytes.len()
+        ));
+    }
+    let mut slot = [0u8; 32];
+    slot[24..].copy_from_slice(&OWNER_SLOT.to_be_bytes());
+    let mut value = [0u8; 32];
+    value[12..].copy_from_slice(&bytes); // address right-aligned in the word
+    Ok((
+        format!("0x{}", hex::encode(slot)),
+        format!("0x{}", hex::encode(value)),
+    ))
+}
+
 /// `keccak256("Deposit(bytes32,uint256)")` — topic0 of the `Deposit` event,
 /// emitted by `deposit(bytes32 nodeId)` with the bonded `amount`.
 pub const DEPOSIT_TOPIC: &str =
@@ -132,8 +166,34 @@ mod tests {
         assert!(code.starts_with("0x60"), "looks like EVM runtime bytecode");
         assert!(
             code.len() > 2 + 400 * 2,
-            "non-trivial contract code (~536 bytes)"
+            "non-trivial contract code (~973 bytes after the #821 owner gate)"
         );
+    }
+
+    #[test]
+    fn owner_seed_storage_writes_address_right_aligned_at_slot_zero() {
+        let owner = "0x00000000000000000000000000000000000Facc7";
+        let (slot, value) = owner_seed_storage_json(owner).unwrap();
+        // owner is the only state variable → slot 0.
+        assert_eq!(
+            slot,
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        // 20-byte address right-aligned (12 leading zero bytes) in the word.
+        let mut want = [0u8; 32];
+        want[12..]
+            .copy_from_slice(&hex::decode("00000000000000000000000000000000000facc7").unwrap());
+        assert_eq!(value, format!("0x{}", hex::encode(want)));
+    }
+
+    #[test]
+    fn owner_seed_storage_accepts_no_prefix_and_rejects_bad_length() {
+        // No 0x prefix, mixed case — accepted.
+        assert!(owner_seed_storage_json("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266").is_ok());
+        // Wrong length — rejected (fails closed at genesis-build time).
+        assert!(owner_seed_storage_json("0xdeadbeef").is_err());
+        // Not hex — rejected.
+        assert!(owner_seed_storage_json("0xnothex").is_err());
     }
 
     fn topic_node(b: u8) -> String {
