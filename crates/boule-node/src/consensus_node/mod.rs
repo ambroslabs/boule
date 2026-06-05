@@ -74,6 +74,7 @@ use boule_consensus::hotstuff::step::{HotStuffCore, StateUpdate};
 use boule_consensus::hotstuff::{HotStuffState, QuorumCertificate, genesis_qc};
 use boule_consensus::limits::CacheEvictionCounters;
 use boule_consensus::liveness_tracker::LivenessTracker;
+use boule_consensus::node_role::NodeRole;
 use boule_consensus::operator_key_history::OperatorKeyHistory;
 use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::pacemaker::Pacemaker;
@@ -258,6 +259,16 @@ pub struct ConsensusNode {
     pub wal: Arc<dyn Wal>,
     /// The ordered committee this node participates in.
     pub validator_set: ValidatorSet,
+    /// Whether this node votes/proposes ([`NodeRole::Validator`]) or
+    /// merely follows the chain ([`NodeRole::Full`]). Derived at
+    /// construction from whether `self_id` is in `validator_set` (#802).
+    /// The integration layer gates every weight-bearing outbound
+    /// consensus message (Vote / Proposal / NewView / timeout) on this:
+    /// a full node receives, verifies, applies, syncs, and relays the
+    /// chain but emits none of them. A full node has no voting weight
+    /// either way, so this gate is belt-and-suspenders for the
+    /// "a follower must never affect consensus" property.
+    pub role: NodeRole,
     /// View-keyed history of `validator_set` across reconfiguration
     /// boundaries (#248). Until #253 lands the active reconfiguration
     /// path, this holds only the genesis boundary, so `set_at(view)`
@@ -658,6 +669,24 @@ pub(super) fn weak_subjectivity_violation(
     ))
 }
 
+/// Derive this node's [`NodeRole`] from whether its `self_id` is a member
+/// of the genesis validator set (#802).
+///
+/// Membership is resolved through the genesis-pubkey mapping
+/// (`ValidatorId::from_genesis_pubkey`): at boot a validator's stable id
+/// equals its initial signing pubkey, which is exactly the mapping
+/// `build_validator_set` uses to seed the set. A full node's `self_id` is
+/// never in the set, and key rotation only re-keys existing members, so
+/// this is a stable determinant for the lifetime of the process.
+fn role_for(self_id: NodeId, validator_set: &ValidatorSet) -> NodeRole {
+    let self_as_validator = ValidatorId::from_genesis_pubkey(self_id);
+    if validator_set.contains(&self_as_validator) {
+        NodeRole::Validator
+    } else {
+        NodeRole::Full
+    }
+}
+
 impl ConsensusNode {
     /// Construct a `ConsensusNode` from configuration and backing
     /// resources. Does **not** start the event loop.
@@ -760,6 +789,7 @@ impl ConsensusNode {
                 .iter()
                 .map(|(v, op)| (ValidatorId::from_genesis_pubkey(*v), *op)),
         );
+        let role = role_for(self_id, &config.validator_set);
         Self {
             self_id,
             core,
@@ -768,6 +798,7 @@ impl ConsensusNode {
             storage,
             wal,
             validator_set: config.validator_set,
+            role,
             validator_history,
             signing_view: Arc::new(AtomicU64::new(0)),
             validator_key_history,
@@ -1275,6 +1306,14 @@ impl ConsensusNode {
         // commit re-derives it.
         let min_block_interval = param_history.at(last_committed.view).min_block_interval();
 
+        // Role is a genesis property (#802): derive from the genesis
+        // boundary in the recovered history so it matches `new` and stays
+        // stable across any committed reconfig. A full node is never in
+        // the set at any boundary.
+        let role = role_for(
+            self_id,
+            validator_history.set_at(View::ZERO).for_view(View::ZERO),
+        );
         Ok(Self {
             self_id,
             core,
@@ -1283,6 +1322,7 @@ impl ConsensusNode {
             storage,
             wal,
             validator_set: active_set,
+            role,
             validator_history,
             signing_view: Arc::new(AtomicU64::new(0)),
             validator_key_history,
@@ -1996,6 +2036,46 @@ mod tests {
         assert_eq!(node.self_id, nid(3));
         assert_eq!(node.core.self_id(), nid(3));
         assert_eq!(node.pacemaker.self_id(), nid(3));
+    }
+
+    // ── #802: node role derivation ────────────────────────────────────────────
+
+    /// A node whose `self_id` is in the genesis validator set boots as a
+    /// [`NodeRole::Validator`].
+    #[test]
+    fn role_is_validator_when_self_in_set() {
+        let node = make_node(nid(2));
+        assert_eq!(node.role, NodeRole::Validator);
+        assert!(node.role.is_validator());
+    }
+
+    /// A node whose `self_id` is NOT in the genesis validator set boots as
+    /// a [`NodeRole::Full`] (follow-only) node — the #802 capability.
+    #[test]
+    fn role_is_full_when_self_not_in_set() {
+        // nid(9) is outside the {1,2,3,4} committee.
+        let node = make_node(nid(9));
+        assert_eq!(node.role, NodeRole::Full);
+        assert!(node.role.is_full());
+        // It still holds the validator set (so it can verify), it just
+        // isn't a member.
+        assert_eq!(node.validator_set.len(), 4);
+        assert!(
+            !node
+                .validator_set
+                .contains(&ValidatorId::from_genesis_pubkey(nid(9))),
+        );
+    }
+
+    /// `role_for` is the pure determinant used by both `new` and
+    /// `recover`: membership via the genesis-pubkey mapping.
+    #[test]
+    fn role_for_matches_membership() {
+        let vs = four_validators();
+        assert_eq!(role_for(nid(1), &vs), NodeRole::Validator);
+        assert_eq!(role_for(nid(4), &vs), NodeRole::Validator);
+        assert_eq!(role_for(nid(5), &vs), NodeRole::Full);
+        assert_eq!(role_for(nid(200), &vs), NodeRole::Full);
     }
 
     #[test]
