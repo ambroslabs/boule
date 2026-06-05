@@ -149,9 +149,11 @@ async fn submitted_tx_is_committed() {
     let cmd = CounterCommand::Increment.encode().to_vec();
     let http = reqwest::Client::new();
     for n in &state.nodes {
-        let api = n.api_addr.expect("api_addr");
+        // `/mempool/submit` is a privileged route on the isolated admin
+        // listener (#807), not the public api_addr.
+        let admin = n.admin_addr.expect("admin_addr");
         let resp = http
-            .post(format!("http://{api}/mempool/submit"))
+            .post(format!("http://{admin}/mempool/submit"))
             .body(cmd.clone())
             .send()
             .await
@@ -266,9 +268,10 @@ async fn submitted_stake_command_changes_the_validator_set() {
     let cmd = StakeCommand::unbond(removed, 1).encode().to_vec();
     let http = reqwest::Client::new();
     for n in &state.nodes {
-        let api = n.api_addr.expect("api_addr");
+        // Privileged route — admin listener, not the public api_addr (#807).
+        let admin = n.admin_addr.expect("admin_addr");
         let resp = http
-            .post(format!("http://{api}/mempool/submit"))
+            .post(format!("http://{admin}/mempool/submit"))
             .body(cmd.clone())
             .send()
             .await
@@ -393,9 +396,10 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
     let cmd = StakeCommand::unbond(removed, 1).encode().to_vec();
     let http = reqwest::Client::new();
     for n in &state.nodes {
-        let api = n.api_addr.expect("api_addr");
+        // Privileged route — admin listener, not the public api_addr (#807).
+        let admin = n.admin_addr.expect("admin_addr");
         let resp = http
-            .post(format!("http://{api}/mempool/submit"))
+            .post(format!("http://{admin}/mempool/submit"))
             .body(cmd.clone())
             .send()
             .await
