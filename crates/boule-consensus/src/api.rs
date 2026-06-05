@@ -196,8 +196,7 @@ async fn get_status(
 }
 
 /// HTTP router exposing the minimal transaction-ingress endpoint
-/// `POST /mempool/submit`, mounted alongside [`router`] when `[consensus]`
-/// is configured.
+/// `POST /mempool/submit`.
 ///
 /// The request body is the raw command bytes; they are inserted into this
 /// node's mempool, from which the leader's block builder draws the next
@@ -205,9 +204,12 @@ async fn get_status(
 /// once *this* node is leader (or it is also submitted to whichever node
 /// is) — cross-validator gossip of submitted txs is a separate concern.
 ///
-/// Deliberately minimal: unauthenticated and unvalidated beyond a
-/// non-empty check, bounded only by the mempool capacity. Admission cost /
-/// rate-limiting (#545) and tx gossip are follow-ups.
+/// **Privileged surface (#807).** Submitting txs injects into the block
+/// builder's pool, so the node mounts this on its *admin* listener (see
+/// `boule_node::admin_api`), isolated from the public read-only API and
+/// optionally bearer-token gated — never on the public listener. Validation
+/// is still minimal here (a non-empty check, bounded by mempool capacity);
+/// admission cost / rate-limiting (#545) and tx gossip are follow-ups.
 pub fn submit_router(mempool: Arc<dyn Mempool>) -> Router {
     Router::new()
         .route("/mempool/submit", post(submit_tx))

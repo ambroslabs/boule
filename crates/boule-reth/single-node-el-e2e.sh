@@ -38,6 +38,9 @@ REGISTRY="0x0000000000000000000000000000000000000b12"
 STAKING="0x0000000000000000000000000000000000000b0e"
 ETH=http://127.0.0.1:8545
 API=http://127.0.0.1:8000
+# Privileged routes (mempool submit / rotate-key) live on the isolated admin
+# listener (#807), not the public API port.
+ADMIN_API=http://127.0.0.1:8010
 SENDER_PK=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
 
 BOULE="${BOULE:-$ROOT/target/debug/boule}"
@@ -148,6 +151,8 @@ backend = "file"
 path = "$WORK/bls.key"
 [api]
 listen_addr = "127.0.0.1:8000"
+[api.admin]
+listen_addr = "127.0.0.1:8010"
 [consensus]
 validators = ["$NID"]
 signature_scheme = "bls_aggregated"
@@ -244,7 +249,7 @@ if [ -z "$ROT_HEX" ]; then
   fail "rotation: rotation propose produced no envelope"
 else
   echo "$ROT_HEX" | xxd -r -p > "$WORK/rot.bin"
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/mempool/submit" \
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$ADMIN_API/mempool/submit" \
     -H 'content-type: application/octet-stream' --data-binary @"$WORK/rot.bin")
   echo "   /mempool/submit -> HTTP $CODE"
   [ "$CODE" = 202 ] || [ "$CODE" = 200 ] || fail "rotation: mempool submit returned HTTP $CODE"

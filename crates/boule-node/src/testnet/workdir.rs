@@ -58,6 +58,12 @@ pub struct NodeLayout {
     pub p2p_addr: Option<SocketAddr>,
     #[serde(default)]
     pub api_addr: Option<SocketAddr>,
+    /// Bound address of the privileged admin listener (`POST
+    /// /admin/rotate-key`, `POST /mempool/submit`), isolated from the
+    /// public `api_addr` (#807). The testnet enables a loopback admin
+    /// listener so the driver + tests can drive the privileged endpoints.
+    #[serde(default)]
+    pub admin_addr: Option<SocketAddr>,
     /// Path to this node's BLS validator key file. Populated only on
     /// `bls_aggregated` chains (#360); otherwise absent. Read by the
     /// node binary via `[node.bls_validator_identity] backend = "file"`.
@@ -156,6 +162,10 @@ pub struct NodeAddrFile {
     pub p2p_addr: String,
     pub api_addr: String,
     pub node_id: String,
+    /// Bound admin-listener address, present only when the node ran with
+    /// an `[api.admin] listen_addr` (the testnet always sets one).
+    #[serde(default)]
+    pub admin_addr: Option<String>,
 }
 
 /// Read and parse the addr_file emitted by a started `boule`.
@@ -198,6 +208,7 @@ mod tests {
             node_id: Some("foo".to_string()),
             p2p_addr: "127.0.0.1:7000".parse().ok(),
             api_addr: "127.0.0.1:8000".parse().ok(),
+            admin_addr: "127.0.0.1:9000".parse().ok(),
             bls_key_path: None,
         };
         let state = State {

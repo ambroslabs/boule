@@ -170,6 +170,9 @@ backend = "file"
 path = "$5"
 [api]
 listen_addr = "127.0.0.1:$3"
+[api.admin]
+# Privileged routes on an isolated loopback admin listener (api port + 10).
+listen_addr = "127.0.0.1:$(( $3 + 10 ))"
 [[peers]]
 addr = "${10}"
 node_id = "${11}"
@@ -246,9 +249,9 @@ RUST_LOG=off "$BOULE" rotation propose -c "$WORK/node1.toml" \
 ROT_HEX=$(grep -oiE '[0-9a-f]{64,}' "$WORK/rot.out" | head -1)
 if [ -n "$ROT_HEX" ]; then
   echo "$ROT_HEX" | xxd -r -p > "$WORK/rot.bin"
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:8001/mempool/submit" \
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:8011/mempool/submit" \
     -H 'content-type: application/octet-stream' --data-binary @"$WORK/rot.bin")
-  echo "   /mempool/submit (node1) -> HTTP $CODE"
+  echo "   /mempool/submit (node1 admin) -> HTTP $CODE"
 else
   fail "rotation: no envelope produced"
 fi

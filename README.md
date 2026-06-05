@@ -83,11 +83,27 @@ A minimal `config.toml`:
 listen_addr = "0.0.0.0:7000"
 
 [api]
+# Public, read-only HTTP surface: GET /consensus/status, /peers, /metrics,
+# /health, /ready. Safe to expose to a load balancer / monitoring stack.
 listen_addr = "127.0.0.1:8080"
+
+# Privileged operator surface (POST /admin/rotate-key, /mempool/submit),
+# isolated onto its own listener. Off by default — set listen_addr to a
+# trusted interface (loopback / private subnet) to enable it. Optionally
+# require a bearer token as a second layer.
+# [api.admin]
+# listen_addr    = "127.0.0.1:8090"
+# auth_token_env = "BOULE_ADMIN_TOKEN"   # request must send: Authorization: Bearer <token>
 
 # [[peers]]
 # addr = "127.0.0.1:7001"
 ```
+
+The public listener never serves the privileged routes. Operators wire
+`/health` (liveness) and `/ready` (readiness: committed progress + a
+healthy view, and — for validators — at least one peer) into their load
+balancer, and scrape `/metrics` (Prometheus text) for consensus + p2p
+health.
 
 The node's long-term Ed25519 identity can be sourced from a file, an
 environment variable, an encrypted file, an OS keyring, or an external

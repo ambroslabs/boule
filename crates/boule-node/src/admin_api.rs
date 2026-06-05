@@ -9,27 +9,40 @@
 //! backend named in the request, then drives the rotation: build the
 //! dual-signed tx, admit it into the mempool, schedule the live swap.
 //!
-//! # Security posture
+//! # Security posture (#807)
 //!
-//! Mounted on the same API listener as `POST /mempool/submit` and, like it,
-//! **unauthenticated** — operators must bind the API to a trusted interface.
-//! Triggering a rotation is *not* a key-theft vector: building the rotation
-//! tx needs this node's current signing key to produce `sig_old`, so a
-//! caller who reaches this endpoint cannot make the network accept a key the
-//! chain never recorded. The worst case is a self-inflicted liveness fault
-//! (the node schedules a swap to a key whose tx never commits and goes
-//! silent at `v_eff`), recoverable by rotating again. Authn / a dedicated
-//! admin listener are follow-ups, tracked with the broader API-auth story.
+//! This is a **privileged** surface and is isolated from the public API
+//! listener two ways (defense in depth):
+//!
+//! 1. **Separate listener.** [`router`] is mounted only on the admin
+//!    listener (`[api.admin] listen_addr`), never merged into the public
+//!    router. When the admin listener is unset, these routes are not served
+//!    at all. The public listener exposes only read-only + observability
+//!    endpoints.
+//! 2. **Bearer auth (belt).** When a token is configured (`[api.admin]
+//!    auth_token` / `auth_token_env`), every request must carry
+//!    `Authorization: Bearer <token>`; a missing/wrong token gets `401`.
+//!
+//! Triggering a rotation is *not* a key-theft vector even without auth:
+//! building the rotation tx needs this node's current signing key to produce
+//! `sig_old`, so a caller who reaches this endpoint cannot make the network
+//! accept a key the chain never recorded. The worst case is a self-inflicted
+//! liveness fault (the node schedules a swap to a key whose tx never commits
+//! and goes silent at `v_eff`), recoverable by rotating again. The mempool
+//! submit endpoint shares this listener for the same reason.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use boule_consensus::replication::mempool::Mempool;
 use boule_core::crypto::signed::{NodeSigner, Signer};
 use boule_core::identity::node_id_to_base58;
 
@@ -80,12 +93,69 @@ impl From<RotationReceipt> for RotateKeyResponse {
     }
 }
 
-/// Router mounting `POST /admin/rotate-key`, merged into the node's main
-/// API router alongside the status + submit routers.
-pub fn router(handle: Arc<RotationHandle>) -> Router {
-    Router::new()
+/// Build the **privileged** admin router — `POST /admin/rotate-key` and
+/// `POST /mempool/submit` — for mounting on the dedicated admin listener
+/// (#807). Never merge this into the public listener's router.
+///
+/// When `auth_token` is `Some`, a bearer-token auth layer wraps every route:
+/// requests must carry `Authorization: Bearer <token>` or they get `401`.
+/// When `None`, the listener relies on network isolation alone (the operator
+/// is expected to have bound a loopback / trusted interface; `Config::validate`
+/// warns if it is neither loopback nor token-protected).
+pub fn router(
+    handle: Arc<RotationHandle>,
+    mempool: Arc<dyn Mempool>,
+    auth_token: Option<String>,
+) -> Router {
+    let mut router = Router::new()
         .route("/admin/rotate-key", post(rotate_key))
         .with_state(handle)
+        // Reuse the consensus crate's mempool-submit router so there is one
+        // definition of the submit semantics; it is privileged (lets a caller
+        // inject txs into the block builder's pool), so it lives here on the
+        // admin listener rather than on the public one (#807).
+        .merge(boule_consensus::api::submit_router(mempool));
+    if let Some(token) = auth_token {
+        router = router.layer(middleware::from_fn_with_state(
+            Arc::new(token),
+            require_bearer,
+        ));
+    }
+    router
+}
+
+/// Bearer-token gate for the privileged routes. Compares the
+/// `Authorization: Bearer <token>` header against the configured secret in
+/// constant time and rejects anything else with `401`.
+async fn require_bearer(
+    State(expected): State<Arc<String>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => {
+            Ok(next.run(req).await)
+        }
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Length-aware constant-time byte comparison, so the auth check does not
+/// leak the token via early-exit timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn rotate_key(
@@ -241,5 +311,129 @@ mod tests {
         assert_eq!(resp.new_pubkey, node_id_to_base58(&[2u8; 32]));
         assert_eq!(resp.v_eff, 60);
         assert_eq!(resp.current_view, 5);
+    }
+
+    // --- privileged-router auth + isolation (#807) -----------------------
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // `oneshot`
+
+    /// Build a privileged admin router over a fresh handle + mempool.
+    fn admin_router(token: Option<String>) -> (Router, Arc<dyn Mempool>) {
+        let genesis = fresh_signer();
+        let view = Arc::new(AtomicU64::new(0));
+        let signer = Arc::new(RotatableSigner::new(
+            Arc::clone(&genesis),
+            Arc::clone(&view),
+        ));
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(64));
+        let handle = Arc::new(RotationHandle::new(
+            genesis.node_id(),
+            ChainId::TEST,
+            SignatureSchemeChoice::Ed25519Collected,
+            view,
+            Arc::clone(&mempool),
+            signer,
+        ));
+        (super::router(handle, Arc::clone(&mempool), token), mempool)
+    }
+
+    #[tokio::test]
+    async fn admin_router_without_token_admits_submit() {
+        let (router, mempool) = admin_router(None);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mempool/submit")
+                    .body(Body::from("a-tx"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_router_with_token_rejects_missing_and_wrong_bearer() {
+        let (router, mempool) = admin_router(Some("s3cret".to_string()));
+
+        // No Authorization header → 401.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mempool/submit")
+                    .body(Body::from("tx"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong token → 401.
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mempool/submit")
+                    .header("authorization", "Bearer nope")
+                    .body(Body::from("tx"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Both rejections happened before the handler ran — pool untouched.
+        assert_eq!(mempool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_router_with_token_accepts_correct_bearer() {
+        let (router, mempool) = admin_router(Some("s3cret".to_string()));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mempool/submit")
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::from("tx"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(mempool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_router_mounts_rotate_key() {
+        // Sanity: the privileged rotate-key route is present on the admin
+        // router (a malformed body still routes — it 400s, not 404s).
+        let (router, _mempool) = admin_router(None);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/rotate-key")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
     }
 }

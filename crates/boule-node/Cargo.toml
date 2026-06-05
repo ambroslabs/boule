@@ -35,6 +35,9 @@ tracing-subscriber  = { version = "0.3", features = ["env-filter", "json"] }
 hex                 = "0.4"
 futures-util        = { version = "0.3", features = ["sink"] }
 axum                = "0.8"
+# Prometheus text-format exporter (#808). `default-features = false` drops
+# the protobuf push-gateway path; we only need the registry + `TextEncoder`.
+prometheus          = { version = "0.14", default-features = false }
 postcard            = { version = "1", default-features = false, features = ["use-std"] }
 parking_lot         = "0.12"
 reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
@@ -56,3 +59,6 @@ tokio               = { version = "1", features = ["full", "test-util"] }
 proptest            = { version = "1", default-features = false, features = ["std", "bit-set"] }
 tempfile            = "3"
 rcgen               = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Drive axum routers in-process (`ServiceExt::oneshot`) for the API tests.
+tower               = { version = "0.5", features = ["util"] }
+http-body-util      = "0.1"
