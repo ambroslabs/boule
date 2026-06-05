@@ -1232,6 +1232,7 @@ dependencies = [
  "nybbles",
  "parking_lot",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "sha3 0.10.9",

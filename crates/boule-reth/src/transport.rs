@@ -88,6 +88,26 @@ impl HttpTransport {
     pub async fn eth(&self, method: &str, params: Value) -> Result<Value> {
         self.rpc(&self.eth_url, method, params, false).await
     }
+
+    /// Forward a *pre-built* JSON-RPC payload (single object or batch array)
+    /// verbatim to the public eth endpoint and return reth's raw response,
+    /// unmodified. Unlike [`Self::eth`] this does not rewrite the `id` or
+    /// re-wrap the request, so it preserves the caller's `id` and batch shape —
+    /// used by the public RPC proxy (#806) to relay client requests as-is. No
+    /// JWT (public RPC).
+    pub async fn eth_raw(&self, payload: Value) -> Result<Value> {
+        let resp: Value = self
+            .http
+            .post(&self.eth_url)
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("POST (raw) -> {}", self.eth_url))?
+            .json()
+            .await
+            .context("decoding raw eth RPC response")?;
+        Ok(resp)
+    }
 }
 
 impl EngineTransport for HttpTransport {
