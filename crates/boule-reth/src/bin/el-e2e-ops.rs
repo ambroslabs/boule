@@ -153,6 +153,143 @@ async fn send_tx(t: &HttpTransport, to: &str, calldata: Vec<u8>, value: u128) ->
     }
 }
 
+async fn fetch_chain_id(t: &HttpTransport) -> Result<u64> {
+    let h = t.eth("eth_chainId", json!([])).await?;
+    Ok(u64::from_str_radix(h.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0))
+}
+async fn fetch_nonce(t: &HttpTransport, addr: &str) -> Result<u64> {
+    let h = t
+        .eth("eth_getTransactionCount", json!([addr, "pending"]))
+        .await?;
+    Ok(u64::from_str_radix(h.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0))
+}
+async fn fetch_block(t: &HttpTransport) -> Result<u64> {
+    let h = t.eth("eth_blockNumber", json!([])).await?;
+    Ok(u64::from_str_radix(h.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0))
+}
+/// Sign a plain 21k-gas value transfer (no nonce/chain RPC — caller manages them).
+fn sign_transfer(
+    signer: &PrivateKeySigner,
+    nonce: u64,
+    to: Address,
+    value: U256,
+    chain_id: u64,
+) -> Result<String> {
+    let tx = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit: 21_000,
+        max_fee_per_gas: 5_000_000_000,
+        max_priority_fee_per_gas: 1_000_000_000,
+        to: TxKind::Call(to),
+        value,
+        access_list: Default::default(),
+        input: Bytes::new(),
+    };
+    let sig = signer.sign_hash_sync(&tx.signature_hash())?;
+    let env: TxEnvelope = tx.into_signed(sig).into();
+    Ok(format!("0x{}", hex::encode(env.encoded_2718())))
+}
+
+/// loadtest <num_wallets> <duration_secs> <target_tps(0=unbounded)>
+/// Fund N wallets from the dev account, then fire transfers between them and
+/// measure submit-rate vs mined-rate (does the chain keep up, or wedge?).
+async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let chain_id = fetch_chain_id(t).await?;
+    let dev: PrivateKeySigner = DEV_PK.parse().context("dev pk")?;
+    let dev_addr = format!("0x{}", hex::encode(dev.address()));
+    let wallets: Vec<PrivateKeySigner> = (0..n).map(|_| PrivateKeySigner::random()).collect();
+    let addrs: Vec<Address> = wallets.iter().map(|w| w.address()).collect();
+    // fund each wallet 1 ETH from the dev account (sequential nonces)
+    let mut dev_nonce = fetch_nonce(t, &dev_addr).await?;
+    let fund = U256::from(1_000_000_000_000_000_000u128);
+    let mut last = String::new();
+    for a in &addrs {
+        let raw = sign_transfer(&dev, dev_nonce, *a, fund, chain_id)?;
+        if let Ok(r) = t.eth("eth_sendRawTransaction", json!([raw])).await {
+            last = r.as_str().unwrap_or("").to_string();
+        }
+        dev_nonce += 1;
+    }
+    eprintln!("funding {n} wallets (1 ETH each), waiting for inclusion...");
+    let _ = await_receipt(t, &last).await;
+    // load phase
+    let ta = Arc::new(transport());
+    let submitted = Arc::new(AtomicU64::new(0));
+    let errors = Arc::new(AtomicU64::new(0));
+    let start_h = fetch_block(t).await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(dur_secs);
+    let per_wallet_delay = if target_tps > 0 {
+        std::time::Duration::from_secs_f64(n as f64 / target_tps as f64)
+    } else {
+        std::time::Duration::ZERO
+    };
+    eprintln!(
+        "load: {n} wallets, {dur_secs}s, target_tps={} ...",
+        if target_tps == 0 { "unbounded".into() } else { target_tps.to_string() }
+    );
+    let mut handles = vec![];
+    for (i, w) in wallets.into_iter().enumerate() {
+        let (sub, err, tx, ads, d) = (
+            submitted.clone(),
+            errors.clone(),
+            ta.clone(),
+            addrs.clone(),
+            per_wallet_delay,
+        );
+        handles.push(tokio::spawn(async move {
+            let mut nonce = 0u64;
+            while tokio::time::Instant::now() < deadline {
+                let j = (i + 1 + nonce as usize) % ads.len();
+                let to = ads[if j == i { (j + 1) % ads.len() } else { j }];
+                if let Ok(raw) = sign_transfer(&w, nonce, to, U256::from(1u64), chain_id) {
+                    match tx.eth("eth_sendRawTransaction", json!([raw])).await {
+                        Ok(_) => {
+                            sub.fetch_add(1, Ordering::Relaxed);
+                            nonce += 1;
+                        }
+                        Err(_) => {
+                            err.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+                if !d.is_zero() {
+                    tokio::time::sleep(d).await;
+                }
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+    let subs = submitted.load(Ordering::Relaxed);
+    let errs = errors.load(Ordering::Relaxed);
+    // let the mempool tail drain, then count included via on-chain nonces
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    let mut included = 0u64;
+    for a in &addrs {
+        included += fetch_nonce(t, &format!("0x{}", hex::encode(a))).await.unwrap_or(0);
+    }
+    let end_h = fetch_block(t).await?;
+    println!("=== loadtest result ===");
+    println!(
+        "submitted: {subs} (errors {errs}) in {dur_secs}s = {:.1} tx/s submit-rate",
+        subs as f64 / dur_secs as f64
+    );
+    println!(
+        "mined:     {included} txs across {} blocks = {:.1} tx/s mined-rate",
+        end_h - start_h,
+        included as f64 / dur_secs as f64
+    );
+    println!(
+        "backlog:   {} txs submitted-but-not-yet-mined (mempool drained?)",
+        subs.saturating_sub(included)
+    );
+    Ok(())
+}
+
 /// Poll for the receipt of `tx_hash` (the dev EL mines via real consensus, so it
 /// may take a few blocks); returns `(status_ok, topic0s)` once mined.
 async fn await_receipt(t: &HttpTransport, tx_hash: &str) -> Result<(bool, Vec<(String, String)>)> {
@@ -219,6 +356,13 @@ async fn main() -> Result<()> {
                 .context("AMOUNT_WEI")?;
             let h = send_tx(&t, to, Vec::new(), amount).await?;
             println!("{h}");
+        }
+        // loadtest <NUM_WALLETS> <DURATION_SECS> <TARGET_TPS|0>
+        Some("loadtest") => {
+            let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let dur: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
+            let tps: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            loadtest(&t, n, dur, tps).await?;
         }
         Some("read") => {
             let node = parse_hex32(&args[1])?;
