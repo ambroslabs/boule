@@ -542,7 +542,7 @@ impl RethApplication {
     /// Bounded-retry `eth_getLogs` for the validator-set-delta reads
     /// (staking / slashing / predeploy effects) in `commit` (#803).
     ///
-    /// The [`HttpTransport`] already retries a *transient* transport blip
+    /// The [`crate::transport::HttpTransport`] already retries a *transient* transport blip
     /// (connection reset, brief 5xx) under the hood; this layer adds a second,
     /// slower retry ring specifically for `eth_getLogs` over reth's log index,
     /// which can lag the freshly-`forkchoiceUpdated` head by a beat even after
