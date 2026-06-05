@@ -173,7 +173,8 @@ async fn submitted_tx_is_committed() {
     loop {
         let mut all_drained = true;
         for n in &state.nodes {
-            let api = n.api_addr.expect("api_addr");
+            // `/consensus/status` moved to the admin listener (#823).
+            let api = n.admin_addr.expect("admin_addr");
             let st = admin::consensus_status(api).await.expect("status");
             assert_eq!(
                 st.dropped_commands,
@@ -240,7 +241,7 @@ async fn submitted_stake_command_changes_the_validator_set() {
 
     // Remove the highest-sorted validator (`validator_set` is ordered), then
     // observe liveness on a node that is still seated.
-    let api0 = state.nodes[0].api_addr.expect("api_addr");
+    let api0 = state.nodes[0].admin_addr.expect("admin_addr");
     let st0 = admin::consensus_status(api0).await.expect("status");
     assert_eq!(st0.validator_set.len(), 5, "genesis set has 5 validators");
     let removed_b58 = st0
@@ -253,7 +254,8 @@ async fn submitted_stake_command_changes_the_validator_set() {
     // An API of a node that will remain seated, to watch progress afterward.
     let mut obs_api = None;
     for n in &state.nodes {
-        let api = n.api_addr.expect("api_addr");
+        // `/consensus/status` moved to the admin listener (#823).
+        let api = n.admin_addr.expect("admin_addr");
         let st = admin::consensus_status(api).await.expect("status");
         if st.node_id != removed_b58 {
             obs_api = Some(api);
@@ -291,7 +293,8 @@ async fn submitted_stake_command_changes_the_validator_set() {
     loop {
         let mut all_reduced = true;
         for n in &state.nodes {
-            let api = n.api_addr.expect("api_addr");
+            // `/consensus/status` moved to the admin listener (#823).
+            let api = n.admin_addr.expect("admin_addr");
             let st = admin::consensus_status(api).await.expect("status");
             if st.validator_set.len() != 4 || st.validator_set.contains(&removed_b58) {
                 all_reduced = false;
@@ -374,7 +377,7 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
 
     // Remove the *median* validator (index 2 of the sorted 5), shifting the
     // bitmap positions of the two validators sorted after it.
-    let api0 = state.nodes[0].api_addr.expect("api_addr");
+    let api0 = state.nodes[0].admin_addr.expect("admin_addr");
     let st0 = admin::consensus_status(api0).await.expect("status");
     assert_eq!(st0.validator_set.len(), 5, "genesis set has 5 validators");
     let removed_b58 = st0.validator_set[2].clone();
@@ -383,7 +386,8 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
     // An API of a node that stays seated, to watch progress afterward.
     let mut obs_api = None;
     for n in &state.nodes {
-        let api = n.api_addr.expect("api_addr");
+        // `/consensus/status` moved to the admin listener (#823).
+        let api = n.admin_addr.expect("admin_addr");
         let st = admin::consensus_status(api).await.expect("status");
         if st.node_id != removed_b58 {
             obs_api = Some(api);
@@ -417,7 +421,8 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
     loop {
         let mut all_reduced = true;
         for n in &state.nodes {
-            let api = n.api_addr.expect("api_addr");
+            // `/consensus/status` moved to the admin listener (#823).
+            let api = n.admin_addr.expect("admin_addr");
             let st = admin::consensus_status(api).await.expect("status");
             if st.validator_set.len() != 4 || st.validator_set.contains(&removed_b58) {
                 all_reduced = false;

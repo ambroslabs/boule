@@ -381,7 +381,7 @@ async fn dump_diagnostics(state: &State) {
         let name = n.display_name();
         let alive = lifecycle::pid_alive(n).is_some();
         let mut line = format!("    {name}: {}", if alive { "up" } else { "down" });
-        if let Some(api) = n.api_addr {
+        if let Some(api) = n.admin_addr {
             if let Ok(Some(s)) = admin::maybe_consensus_status(api).await {
                 line += &format!(
                     " height={} role={} gossip_sink_overflow={}",
@@ -417,7 +417,7 @@ async fn backpressure_growth(state: &State) -> Result<(), String> {
     async fn sample(state: &State) -> BTreeMap<String, u64> {
         let mut m = BTreeMap::new();
         for n in &state.nodes {
-            if let Some(api) = n.api_addr {
+            if let Some(api) = n.admin_addr {
                 if let Ok(Some(s)) = admin::maybe_consensus_status(api).await {
                     m.insert(n.display_name(), s.backpressure.gossip_sink_overflow_total);
                 }
@@ -1006,7 +1006,7 @@ async fn survivors_partitioned(state: &State) -> bool {
     for n in &survivors {
         let me = n.display_name();
         adj.entry(me.clone()).or_default();
-        if let Some(api) = n.api_addr {
+        if let Some(api) = n.admin_addr {
             if let Ok(Some(peers)) = admin::maybe_peers(api).await {
                 for pid in peers {
                     if let Some(pname) = id2name.get(&pid) {
