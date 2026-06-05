@@ -150,6 +150,10 @@ pub use tls::NodeId;
 ///     // `Some(listener)` for normal nodes; `None` skips the inbound
 ///     // listener task (issue #138's `[p2p] inbound_disabled = true`).
 ///     listener: Some(listener),
+///     // `None` opts out of the pre-admission handshake bound + timeout
+///     // (#805); production wiring passes
+///     // `Some(Arc::new(HandshakeLimiter::new(..)))`.
+///     handshake_limiter: None,
 ///     clock,
 ///     peer_cmd_tx: None,
 /// };
