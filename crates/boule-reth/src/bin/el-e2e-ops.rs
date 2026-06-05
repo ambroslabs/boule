@@ -66,12 +66,9 @@ sol! {
 
 fn transport() -> HttpTransport {
     // No JWT needed for the public eth RPC; pass an empty secret.
-    HttpTransport::new(
-        "http://127.0.0.1:8551".into(),
-        "http://127.0.0.1:8545".into(),
-        Vec::new(),
-        None,
-    )
+    // `ETH_URL` overrides the default so this can drive a remote node.
+    let eth = std::env::var("ETH_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".into());
+    HttpTransport::new("http://127.0.0.1:8551".into(), eth, Vec::new(), None)
 }
 
 fn parse_hex32(s: &str) -> Result<[u8; 32]> {
@@ -209,6 +206,18 @@ async fn main() -> Result<()> {
             let mut cd = DEPOSIT_SELECTOR.to_vec();
             cd.extend_from_slice(&node);
             let h = send_tx(&t, STAKING_ADDRESS, cd, amount).await?;
+            println!("{h}");
+        }
+        // fund <ADDRESS> <AMOUNT_WEI> — plain value transfer (no calldata) from
+        // the prefunded dev account to an EOA. Drives a faucet-style top-up.
+        Some("fund") => {
+            let to = args.get(1).context("usage: fund <ADDRESS> <AMOUNT_WEI>")?;
+            let amount: u128 = args
+                .get(2)
+                .context("AMOUNT_WEI")?
+                .parse()
+                .context("AMOUNT_WEI")?;
+            let h = send_tx(&t, to, Vec::new(), amount).await?;
             println!("{h}");
         }
         Some("read") => {
