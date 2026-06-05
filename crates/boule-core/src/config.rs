@@ -227,8 +227,20 @@ fn default_reth_build_wait_ms() -> u64 {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ConsensusConfig {
     /// Base58-encoded NodeIds of every validator in the committee.
-    /// Must include this node's own ID.
+    /// Must include this node's own ID **unless** [`Self::full_node`] is
+    /// set, in which case this node follows the committee without being a
+    /// member.
     pub validators: Vec<String>,
+    /// Run as a non-validating full (RPC / observer) node (#802). When
+    /// `true`, this node's own ID is **not** required to appear in
+    /// [`Self::validators`]: it receives, verifies, applies, syncs, and
+    /// relays the chain — and serves its execution-layer JSON-RPC — but
+    /// never proposes, votes, sends timeout messages, or participates in
+    /// leader rotation. Defaults to `false` (a validating node, today's
+    /// behaviour). A node whose ID *is* in `validators` but which sets
+    /// this flag is rejected at startup as a misconfiguration.
+    #[serde(default)]
+    pub full_node: bool,
     /// 32-byte hex string used as the genesis block's `state_commitment`.
     /// Must match across all replicas. Defaults to all zeros. For the
     /// reth backend this must equal reth's genesis state root (the node

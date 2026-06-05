@@ -213,6 +213,14 @@ impl ConsensusNode {
         // is broadcasting timeouts on backoff, each one earns one fresh
         // NewView, but no per-message amplification beyond that.
         if view < self.pacemaker.current_view() {
+            // #802: a full (follow-only) node never emits a NewView, not
+            // even the unicast catch-up reply — NewView is a weight-bearing
+            // consensus message (it carries a high_qc a peer will adopt).
+            // The validators in the set still answer wedged peers; a
+            // follower stays silent on the wire.
+            if self.role.is_full() {
+                return Ok(());
+            }
             if let Some(high_qc) = self.core.state().high_qc.clone() {
                 let nv = NewView {
                     high_qc: high_qc.into_inner(),

@@ -398,6 +398,13 @@ pub struct VoteObserver {
     /// [`SimCluster::assert_no_replica_double_voted`] panics on a
     /// non-empty list at teardown.
     violations: Mutex<Vec<VoteViolation>>,
+    /// Per-node set of consensus message kinds (`"vote"`, `"proposal"`,
+    /// `"new_view"`, `"timeout"`, …) observed leaving that node. Used by
+    /// the full-node (#802) tests to assert a follow-only node emits no
+    /// weight-bearing consensus messages. Outer key is the emitting
+    /// node's `NodeId` (the route task's `my_id`); the inner set is the
+    /// distinct kinds seen.
+    emitted_kinds: Mutex<HashMap<NodeId, HashSet<&'static str>>>,
 }
 
 impl VoteObserver {
@@ -478,6 +485,68 @@ impl VoteObserver {
                 signed.payload.block_hash,
             );
         }
+    }
+
+    /// Record the consensus message *kind* emitted by `emitter`, keyed by
+    /// the route task's `my_id` (the node that produced the frame) rather
+    /// than the signer. Used by the full-node tests (#802) to assert a
+    /// follow-only node emits no weight-bearing consensus message
+    /// (`vote` / `proposal` / `new_view` / `timeout`). Sync-protocol
+    /// frames (block / range / snapshot requests + responses) are also
+    /// recorded so the test can affirm a full node *does* still relay /
+    /// serve those.
+    fn observe_emitter_outbound(&self, emitter: NodeId, payload: &[u8], framing: PayloadFraming) {
+        // Unwrap the gossip overlay frame to the inner wire bytes, mirroring
+        // `observe_outbound`. Mesh framing is the wire bytes directly.
+        let wire_bytes: std::borrow::Cow<'_, [u8]> = match framing {
+            PayloadFraming::Mesh => std::borrow::Cow::Borrowed(payload),
+            PayloadFraming::GossipOverlay => {
+                match postcard::from_bytes::<boule_transport_tcp::overlay::gossip::wire::OverlayFrame>(
+                    payload,
+                ) {
+                    Ok(boule_transport_tcp::overlay::gossip::wire::OverlayFrame::Forward {
+                        payload: inner,
+                        ..
+                    }) => std::borrow::Cow::Owned(inner.to_vec()),
+                    _ => return,
+                }
+            }
+        };
+        let Ok(msg) =
+            postcard::from_bytes::<boule_consensus::wire::WireMessage>(wire_bytes.as_ref())
+        else {
+            return;
+        };
+        use boule_consensus::wire::WireMessage as W;
+        let kind: &'static str = match msg {
+            W::Proposal(_) => "proposal",
+            W::Vote(..) => "vote",
+            W::NewView(_) => "new_view",
+            W::TimeoutVote(_) => "timeout",
+            W::BlockRequest(_) => "block_request",
+            W::BlockResponse(_) => "block_response",
+            W::BlockRangeRequest { .. } => "block_range_request",
+            W::SnapshotManifestRequest { .. } => "snapshot_manifest_request",
+            W::SnapshotManifestResponse(_) => "snapshot_manifest_response",
+            W::SnapshotChunkRequest { .. } => "snapshot_chunk_request",
+            W::SnapshotChunkResponse { .. } => "snapshot_chunk_response",
+            _ => "other",
+        };
+        self.emitted_kinds
+            .lock()
+            .entry(emitter)
+            .or_default()
+            .insert(kind);
+    }
+
+    /// Snapshot the set of consensus message kinds `emitter` was observed
+    /// emitting. Empty if it emitted nothing observable.
+    pub fn emitted_kinds(&self, emitter: NodeId) -> HashSet<&'static str> {
+        self.emitted_kinds
+            .lock()
+            .get(&emitter)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -1674,6 +1743,27 @@ impl SimCluster {
         (nid, mempool)
     }
 
+    /// Tail-spawn a non-validating **full / follow-only node** (#802) into
+    /// the running cluster.
+    ///
+    /// Identical wiring to [`Self::spawn_validator_into`] — a fresh signer +
+    /// node booted from the genesis committee config with empty storage,
+    /// wired into the live mesh routing — with one deliberate difference in
+    /// intent: the test that calls this **never** commits a `ReconfigCommand`
+    /// adding the node to the committee, so it stays a
+    /// [`NodeRole::Full`](boule_consensus::node_role::NodeRole::Full) node for
+    /// the whole run. (A freshly-minted signer's id is never in the genesis
+    /// validator set, so `ConsensusNode::new` derives the `Full` role
+    /// automatically.) It receives, verifies, applies, syncs, and relays the
+    /// chain but emits no `Vote` / `Proposal` / `NewView` / timeout.
+    ///
+    /// Returns the new node's `(NodeId, mempool)`; the node is appended at the
+    /// last index of [`Self::node_ids`] (and the index-paired commit / mempool
+    /// vectors), so `peek_commit_heights().last()` is its committed frontier.
+    pub fn spawn_full_node_into(&mut self) -> (NodeId, Arc<dyn Mempool>) {
+        self.spawn_validator_into()
+    }
+
     /// Inject a committed signing-key rotation into node `idx`'s running
     /// signer (#312): at and after `v_eff` the node signs with `new_signer`,
     /// no restart. Models the operator having provisioned the new key + the
@@ -2725,6 +2815,7 @@ fn spawn_route_task(
             };
             if let Some(p) = payload_for_observer {
                 vote_observer.observe_outbound(&p, framing);
+                vote_observer.observe_emitter_outbound(my_id, &p, framing);
             }
 
             if partitioned.lock().contains(&my_id) {
@@ -8783,5 +8874,101 @@ mod tests {
             assert_no_conflicts(&committed);
             cluster.assert_no_replica_double_voted();
         }
+    }
+
+    // ── #802: non-validating (full / follow-only) node ────────────────────────
+
+    /// A full (non-validating) node spawned into a live 4-validator
+    /// cluster must **follow and apply** the committed chain — its
+    /// committed frontier tracks the committee's — while emitting **no**
+    /// weight-bearing consensus message (`vote` / `proposal` / `new_view`
+    /// / `timeout`). The validator cluster must keep making progress with
+    /// the follower attached.
+    ///
+    /// The follower's id is never in the genesis validator set and no
+    /// `ReconfigCommand` ever adds it, so `ConsensusNode::new` derives the
+    /// `NodeRole::Full` role and the integration layer gates off every
+    /// vote/propose/timeout emission (the single choke point exercised
+    /// here end-to-end).
+    #[tokio::test]
+    async fn full_node_follows_and_applies_without_voting() {
+        tokio::time::pause();
+
+        let mut cluster = SimCluster::spawn(4, Duration::from_millis(50)).await;
+
+        // Let the 4-validator committee build a short chain first, so the
+        // follower has real history to catch up on (genesis + a few
+        // committed blocks) via block-sync once it joins.
+        let warmed = cluster
+            .advance_and_yield_until(Duration::from_secs(5), |c| {
+                c.peek_commit_heights().iter().filter(|&&h| h >= 2).count() >= 4
+            })
+            .await;
+        assert!(warmed, "committee failed to commit a warm-up chain");
+
+        // Attach a follow-only node. It boots from the genesis committee
+        // config with empty storage and must block-sync the chain so far.
+        let (follower_id, _mp) = cluster.spawn_full_node_into();
+        // The new node is appended at the last index.
+        let follower_idx = cluster.node_ids.len() - 1;
+        assert_eq!(cluster.node_ids[follower_idx], follower_id);
+
+        // Record the committee's frontier at attach time, then drive until
+        // the follower catches up *past* it — proving it received,
+        // verified, and applied committed blocks on its own EL/SM.
+        let committee_floor_at_attach = cluster
+            .peek_commit_heights()
+            .iter()
+            .take(4)
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let target = committee_floor_at_attach + 2;
+
+        let caught_up = cluster
+            .advance_and_yield_until(Duration::from_secs(15), |c| {
+                let heights = c.peek_commit_heights();
+                let follower_h = heights[heights.len() - 1];
+                // Committee must keep progressing AND the follower must
+                // reach our target height.
+                follower_h >= target && heights.iter().take(4).all(|&h| h >= target)
+            })
+            .await;
+
+        let heights = cluster.peek_commit_heights();
+        let follower_h = heights[heights.len() - 1];
+        assert!(
+            caught_up,
+            "follower (h={follower_h}) failed to follow committee to height {target}; \
+             all heights = {heights:?}",
+        );
+
+        // The committee still reaches consensus with a follower attached:
+        // its frontier advanced past the attach-time floor.
+        assert!(
+            heights.iter().take(4).all(|&h| h >= target),
+            "committee stalled with a follower attached: {heights:?}",
+        );
+
+        // Safety: the follower emitted no weight-bearing consensus message.
+        let kinds = cluster.vote_observer.emitted_kinds(follower_id);
+        for weight_bearing in ["vote", "proposal", "new_view", "timeout"] {
+            assert!(
+                !kinds.contains(weight_bearing),
+                "full node emitted a `{weight_bearing}` message (emitted kinds: {kinds:?})",
+            );
+        }
+        // And it never appears as a voter in the per-replica vote map.
+        assert!(
+            cluster
+                .vote_observer
+                .emitted_kinds(follower_id)
+                .iter()
+                .all(|k| *k != "vote"),
+            "full node was observed voting",
+        );
+
+        // No replica (committee or follower) double-voted across the run.
+        cluster.assert_no_replica_double_voted();
     }
 }

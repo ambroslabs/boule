@@ -1006,9 +1006,29 @@ fn build_validator_set(cfg: &ConsensusConfig, self_id: &NodeId) -> anyhow::Resul
             .map_err(|e| anyhow::anyhow!("decoding validator NodeId {raw:?}: {e}"))?;
         ids.push(id);
     }
-    if !ids.iter().any(|id| id == self_id) {
+    let self_in_set = ids.iter().any(|id| id == self_id);
+    // #802: a full (non-validating) node deliberately runs outside the
+    // committee — it follows the chain without proposing or voting — so the
+    // "must include self_id" rule is relaxed for it. The two membership /
+    // role combinations that are *not* a coherent configuration are
+    // rejected here at startup:
+    //   - a validating node whose ID is absent from the set (it could never
+    //     propose or vote), and
+    //   - a full node whose ID *is* in the set (the role flag contradicts
+    //     committee membership; the node would be expected to vote but is
+    //     configured not to, stalling liveness for its share of views).
+    if cfg.full_node {
+        if self_in_set {
+            anyhow::bail!(
+                "[consensus] full_node = true but [consensus.validators] includes \
+                 this node's own ID {}; a full node must not be in the committee",
+                node_id_to_base58(self_id),
+            );
+        }
+    } else if !self_in_set {
         anyhow::bail!(
-            "[consensus.validators] does not include this node's own ID {}",
+            "[consensus.validators] does not include this node's own ID {} \
+             (set [consensus] full_node = true to run as a non-validating node)",
             node_id_to_base58(self_id),
         );
     }
@@ -1047,6 +1067,7 @@ mod tests {
     fn cons_cfg(scheme: SignatureSchemeChoice) -> ConsensusConfig {
         ConsensusConfig {
             validators: vec![],
+            full_node: false,
             genesis_seed_hex: None,
             weak_subjectivity_checkpoint: None,
             application: None,
@@ -1073,6 +1094,63 @@ mod tests {
 
     fn nid(b: u8) -> NodeId {
         [b; 32]
+    }
+
+    // ── #802: build_validator_set + full_node flag ────────────────────────────
+
+    /// A validating node whose own id is in `validators` builds the set.
+    #[test]
+    fn build_validator_set_validator_in_set_ok() {
+        let mut cfg = cons_cfg(SignatureSchemeChoice::default());
+        cfg.validators = vec![
+            node_id_to_base58(&nid(1)),
+            node_id_to_base58(&nid(2)),
+            node_id_to_base58(&nid(3)),
+            node_id_to_base58(&nid(4)),
+        ];
+        let vs = build_validator_set(&cfg, &nid(2)).expect("self in set is valid");
+        assert_eq!(vs.len(), 4);
+    }
+
+    /// A validating node (full_node = false) whose id is absent is
+    /// rejected — today's behaviour, now with a hint about the flag.
+    #[test]
+    fn build_validator_set_validator_not_in_set_rejected() {
+        let mut cfg = cons_cfg(SignatureSchemeChoice::default());
+        cfg.validators = vec![node_id_to_base58(&nid(1)), node_id_to_base58(&nid(2))];
+        let err = build_validator_set(&cfg, &nid(9)).expect_err("self absent must fail");
+        assert!(
+            err.to_string()
+                .contains("does not include this node's own ID")
+        );
+    }
+
+    /// A full node (full_node = true) whose id is absent builds the set —
+    /// the relaxed requirement that enables follow-only mode (#802).
+    #[test]
+    fn build_validator_set_full_node_not_in_set_ok() {
+        let mut cfg = cons_cfg(SignatureSchemeChoice::default());
+        cfg.full_node = true;
+        cfg.validators = vec![
+            node_id_to_base58(&nid(1)),
+            node_id_to_base58(&nid(2)),
+            node_id_to_base58(&nid(3)),
+            node_id_to_base58(&nid(4)),
+        ];
+        let vs = build_validator_set(&cfg, &nid(9)).expect("full node outside the set is valid");
+        // It carries the committee (so it can verify) but is not a member.
+        assert_eq!(vs.len(), 4);
+    }
+
+    /// A full node whose id IS in the committee is a contradiction and is
+    /// rejected at startup.
+    #[test]
+    fn build_validator_set_full_node_in_set_rejected() {
+        let mut cfg = cons_cfg(SignatureSchemeChoice::default());
+        cfg.full_node = true;
+        cfg.validators = vec![node_id_to_base58(&nid(1)), node_id_to_base58(&nid(2))];
+        let err = build_validator_set(&cfg, &nid(1)).expect_err("full node in set must fail");
+        assert!(err.to_string().contains("must not be in the committee"));
     }
 
     /// Provision a fresh BLS key file in `dir` and return its path
