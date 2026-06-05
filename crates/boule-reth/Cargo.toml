@@ -40,6 +40,15 @@ alloy-eips         = "2"
 # ABI-encode the slashing/governance predeploy calls the `el-e2e-ops` helper
 # submits in the A1 Phase-5 e2e (#785).
 alloy-sol-types    = "1.5.6"
+# #797 vote-time weight proof: build + verify a receipt-trie (MPT) inclusion
+# proof of the staking/slashing log a weight delta is derived from, against the
+# source block's `receiptsRoot`. `alloy-trie` is the vetted MPT verifier
+# (`proof::verify_proof`) + builder (`HashBuilder` + `ProofRetainer`);
+# `alloy-rlp` + `nybbles` give the receipt/key RLP + nibble path. All already in
+# the workspace lockfile via the EL's dependency tree.
+alloy-trie         = "0.9"
+alloy-rlp          = "0.3"
+nybbles            = "0.4"
 
 [build-dependencies]
 # `build.rs` generates genesis.json from genesis.template.json + the compiled

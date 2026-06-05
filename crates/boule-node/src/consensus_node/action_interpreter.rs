@@ -165,7 +165,20 @@ impl ConsensusNode {
                 // app) is unaffected.
                 if let SafetyEvent::ProposalReceived(signed) = &ev {
                     let block = &signed.inner().payload.block;
-                    if let Err(e) = self.app.validate_proposal(block).await {
+                    // Resolve any recent block the voter already holds (the #797
+                    // weight proof anchors to a recent source block's execution-
+                    // payload `receiptsRoot`). The source is at most the commit
+                    // depth back, so it is either an uncommitted ancestor (the
+                    // safety core's `pending_blocks`) or the just-committed
+                    // frontier (the durable block store) — both covered here. A
+                    // hash outside this window is a forged "too far back" anchor,
+                    // which the backend rejects (it never happens for an honest
+                    // weight, whose source the voter always still holds).
+                    let recent = RecentBlockResolver {
+                        pending: self.core.state().pending_blocks.clone(),
+                        storage: self.storage.clone(),
+                    };
+                    if let Err(e) = self.app.validate_proposal(block, &recent).await {
                         tracing::warn!(
                             target: TRACE_TARGET,
                             view = block.header.view.0,
@@ -1668,5 +1681,40 @@ impl ConsensusNode {
         );
         let pm_actions = self.step_pacemaker(PacemakerEvent::OnRoundSync { view, evidence });
         Box::pin(self.apply_pacemaker_actions(pm_actions, broadcaster, view_timer, signer)).await
+    }
+}
+
+/// Resolver handed to [`Application::validate_proposal`](boule_consensus::replication::application::Application::validate_proposal)
+/// so the application can anchor a vote-time check (the #797 weight
+/// receipt-inclusion proof) to a recent block the voter already holds.
+///
+/// Spans both stores the voter has at vote time:
+/// 1. `pending_blocks` — the proposed block's uncommitted ancestors (a snapshot
+///    cloned from the safety core so the lookup does not re-borrow `self`).
+/// 2. the durable block store — the recently-committed frontier (a weight's
+///    source block commits a few links before the carrying block, so it is
+///    typically just below the uncommitted chain).
+struct RecentBlockResolver {
+    pending: std::collections::HashMap<
+        boule_consensus::replication::block::BlockHash,
+        boule_consensus::replication::block::Block,
+    >,
+    storage: Arc<dyn boule_core::storage::Storage>,
+}
+
+impl boule_consensus::replication::application::RecentBlocks for RecentBlockResolver {
+    fn get(
+        &self,
+        hash: &boule_consensus::replication::block::BlockHash,
+    ) -> Option<boule_consensus::replication::block::Block> {
+        if let Some(b) = self.pending.get(hash) {
+            return Some(b.clone());
+        }
+        // Fall back to the durable committed block store; a backend error or a
+        // miss both resolve to "not held" (the backend then treats the anchor as
+        // unverifiable — a forgery for an in-window claim).
+        load_block_from_storage(self.storage.as_ref(), hash)
+            .ok()
+            .flatten()
     }
 }

@@ -44,6 +44,7 @@ pub mod rotation;
 pub mod slashing;
 pub mod staking;
 pub mod transport;
+pub mod weight_proof;
 
 pub use application::RethApplication;
 pub use engine::{BuiltBlock, RethEngine, root_from_hex};
