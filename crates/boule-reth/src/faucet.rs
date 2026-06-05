@@ -240,6 +240,18 @@ pub fn build_drip_raw_tx(
 pub struct FaucetService {
     cfg: FaucetConfig,
     transport: HttpTransport,
+    /// Serializes the whole fetch-nonce → sign → submit sequence (#823).
+    ///
+    /// The pending nonce comes from reth's mempool view, which only advances
+    /// once a tx is *accepted*. Two concurrent drips that both read the pending
+    /// nonce before either submits would build txs with the **same** nonce —
+    /// one wins, the other is rejected as a duplicate (or, worse, replaces the
+    /// first), so the drip silently fails or sticks. Holding this lock across
+    /// the read+submit makes nonce acquisition atomic per faucet account, so
+    /// back-to-back drips get strictly increasing nonces. The lock is only held
+    /// for the (single-account) submit path, so it does not serialize unrelated
+    /// faucet work.
+    nonce_lock: tokio::sync::Mutex<()>,
 }
 
 impl FaucetService {
@@ -247,7 +259,11 @@ impl FaucetService {
     pub fn new(cfg: FaucetConfig) -> Self {
         // Engine URL + secret unused (we only call public eth_* RPC).
         let transport = HttpTransport::new(String::new(), cfg.eth_url.clone(), Vec::new(), None);
-        Self { cfg, transport }
+        Self {
+            cfg,
+            transport,
+            nonce_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// The faucet's funding address (its key's address).
@@ -280,8 +296,17 @@ impl FaucetService {
     /// Sign + submit a drip to `to`, returning the tx hash. Reads chain id +
     /// pending nonce from reth, builds an EIP-1559 transfer, and submits it via
     /// `eth_sendRawTransaction`.
+    ///
+    /// Nonce acquisition is serialized (#823): the read-pending-nonce → submit
+    /// window is held under [`Self::nonce_lock`] so two concurrent drips cannot
+    /// observe the same pending nonce and collide. The chain id is read outside
+    /// the lock (it never changes), so only the nonce-sensitive tail is
+    /// serialized.
     pub async fn drip(&self, to: Address) -> Result<String> {
         let chain_id = self.chain_id().await?;
+        // Hold the lock across read-nonce → submit so concurrent drips get
+        // strictly increasing nonces rather than colliding on the same one.
+        let _guard = self.nonce_lock.lock().await;
         let nonce = self.pending_nonce().await?;
         let raw = build_drip_raw_tx(
             &self.cfg.signer,
@@ -484,5 +509,140 @@ mod tests {
         assert_eq!(parse_hex_u64("0x2a").unwrap(), 42);
         assert_eq!(parse_hex_u64("2a").unwrap(), 42);
         assert!(parse_hex_u64("0xnothex").is_err());
+    }
+
+    // ---- concurrent drip nonce serialization (#823) -----------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A minimal mock reth that models the mempool-pending-nonce hazard the
+    /// faucet's `nonce_lock` guards against:
+    ///
+    /// - `eth_chainId` → `0x539` (1337).
+    /// - `eth_getTransactionCount(_, "pending")` → the count of txs *accepted*
+    ///   so far, hex-encoded. This is exactly reth's pending-nonce behavior:
+    ///   it only advances once a tx is accepted, so two reads before either
+    ///   submit return the *same* value.
+    /// - `eth_sendRawTransaction` → records the nonce carried by the tx,
+    ///   bumps the accepted count, and returns a synthetic hash.
+    ///
+    /// Returns the bound `http://127.0.0.1:PORT` URL and a shared `Vec` that
+    /// collects every submitted nonce, so the test can assert there were no
+    /// collisions.
+    async fn spawn_mock_reth() -> (String, Arc<Mutex<Vec<u64>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicU64::new(0));
+        let nonces: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let nonces_srv = Arc::clone(&nonces);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let accepted = Arc::clone(&accepted);
+                let nonces = Arc::clone(&nonces_srv);
+                tokio::spawn(async move {
+                    // Read the request (small bodies); find the JSON body after
+                    // the header/body separator.
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = find_body(&buf) {
+                            let declared = content_length(&buf);
+                            if buf.len() - pos >= declared {
+                                break;
+                            }
+                        }
+                    }
+                    let pos = find_body(&buf).unwrap();
+                    let body = &buf[pos..];
+                    let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+                    let method = req["method"].as_str().unwrap();
+                    let id = req["id"].clone();
+                    let result = match method {
+                        "eth_chainId" => json!("0x539"),
+                        "eth_getTransactionCount" => {
+                            // Tiny delay so concurrent drips genuinely overlap
+                            // their read window absent the lock.
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            json!(format!("0x{:x}", accepted.load(Ordering::SeqCst)))
+                        }
+                        "eth_sendRawTransaction" => {
+                            let raw = req["params"][0].as_str().unwrap();
+                            let bytes = hex::decode(raw.trim_start_matches("0x")).unwrap();
+                            let env = TxEnvelope::decode_2718(&mut bytes.as_slice()).unwrap();
+                            let nonce = env.as_eip1559().unwrap().tx().nonce;
+                            nonces.lock().push(nonce);
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            json!(format!("0x{nonce:064x}"))
+                        }
+                        other => panic!("unexpected method {other}"),
+                    };
+                    let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                    let body = serde_json::to_vec(&resp).unwrap();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&body).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        (url, nonces)
+    }
+
+    fn find_body(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    fn content_length(buf: &[u8]) -> usize {
+        let text = String::from_utf8_lossy(buf);
+        for line in text.lines() {
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                return v.trim().parse().unwrap_or(0);
+            }
+        }
+        0
+    }
+
+    /// Concurrent drips must get strictly-increasing, distinct nonces — the
+    /// `nonce_lock` serializes read-nonce → submit so they cannot collide on
+    /// the same pending nonce. Without the lock, the 5ms read delay makes the
+    /// drips race and several would reuse nonce 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_drips_get_distinct_nonces() {
+        let (url, nonces) = spawn_mock_reth().await;
+        let svc = Arc::new(FaucetService::new(FaucetConfig::new(url, test_signer())));
+
+        const N: u64 = 8;
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let svc = Arc::clone(&svc);
+            handles.push(tokio::spawn(async move {
+                svc.drip(Address::from([i as u8 + 1; 20])).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().expect("drip must succeed");
+        }
+
+        let mut got = nonces.lock().clone();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            (0..N).collect::<Vec<_>>(),
+            "concurrent drips must produce the contiguous distinct nonce set 0..N (no collisions)",
+        );
     }
 }

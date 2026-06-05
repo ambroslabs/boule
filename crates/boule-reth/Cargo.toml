@@ -57,4 +57,6 @@ nybbles            = "0.4"
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+# `net` + `rt-multi-thread` back the in-test mock reth used by the
+# concurrent-drip nonce test (#823).
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }

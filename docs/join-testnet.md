@@ -72,9 +72,17 @@ openssl rand -hex 32 > /etc/boule/jwt.hex
 boule-reth-node node \
   --chain /etc/boule/genesis.json --datadir /var/lib/boule/reth \
   --authrpc.addr 127.0.0.1 --authrpc.port 8551 --authrpc.jwtsecret /etc/boule/jwt.hex \
-  --http --http.addr 127.0.0.1 --http.port 8545 --http.api eth,net,web3,txpool,admin \
+  --http --http.addr 127.0.0.1 --http.port 8545 --http.api eth,net,web3 \
   --port 30330 --ipcdisable &
 ```
+
+> **Never expose reth's HTTP RPC (`:8545`) or Engine API (`:8551`) to the
+> internet.** Both are bound to `127.0.0.1` above on purpose. The Engine API is
+> JWT-auth'd but is not a public surface; reth's HTTP RPC has no method-level
+> allow-list (raw `admin_*`/`txpool_*`/`debug_*` would be reachable). The
+> **only** public eth ingress is the `eth-rpc-proxy` (step 6), which forwards a
+> read-only-plus-`eth_sendRawTransaction` allow-list. That is why `--http.api`
+> is `eth,net,web3` (no `txpool,admin`) and `--http.addr` is loopback.
 
 Confirm your genesis state root matches the published `genesis_seed_hex`:
 
@@ -98,10 +106,11 @@ backend = "file"
 path = "/etc/boule/full.key"
 
 [api]
-# Public, read-only surface — status / peers / metrics / health / ready.
+# Public, read-only observability surface — metrics / health / ready only.
 listen_addr = "0.0.0.0:8010"
 [api.admin]
-# Privileged surface (mempool submit). Loopback-only; add auth_token_env in prod.
+# Privileged + internal-state surface (mempool submit, /consensus/status,
+# /peers). Loopback-only; add auth_token_env in prod (#823).
 listen_addr = "127.0.0.1:9010"
 
 # Seed peers: the trusted validators (host:p2p_port + their base58 NodeId).
@@ -156,9 +165,12 @@ It logs its role at boot (`role is full`). Verify it is following + serving RPC:
 
 ```sh
 # (a) boule is healthy + ready (follower readiness = committed progress).
+#     /health, /ready, /metrics are the PUBLIC surface (:8010).
 curl -s http://127.0.0.1:8010/health  ; echo
 curl -s http://127.0.0.1:8010/ready   ; echo
-curl -s http://127.0.0.1:8010/consensus/status | jq '{view, committed_height}'
+# /consensus/status and /peers expose full internal consensus state, so they
+# moved to the ADMIN listener (:9010, loopback / bearer-auth) — not public (#823).
+curl -s http://127.0.0.1:9010/consensus/status | jq '{view, committed_height}'
 
 # (b) your EL is following the committee's blocks (height climbs over time).
 curl -s -X POST http://127.0.0.1:8545 -H 'content-type: application/json' \
@@ -173,8 +185,34 @@ curl -s -X POST http://127.0.0.1:8545 -H 'content-type: application/json' \
 
 When `committed_height` and the EL `eth_blockNumber` both climb and track the
 validators, your full node is following the testnet and serving RPC. Submit
-EVM transactions to your own `:8545` — they gossip to the validators via
-`reth_peers` and land in a committed block.
+EVM transactions via the public proxy (step 6) — they gossip to the validators
+via `reth_peers` and land in a committed block.
+
+## 6. Expose a public eth RPC (and optional faucet)
+
+reth's `:8545` is loopback-only, so to let the public submit transactions and
+read chain state, run the `eth-rpc-proxy` in front of it as the **single public
+ingress**. It forwards only the allow-listed read-only + `eth_sendRawTransaction`
+surface (no `admin_*`/`txpool_*`/`debug_*`), with batch/body caps and per-IP
+rate limiting:
+
+```sh
+# Public on :8547, forwarding to reth's loopback RPC. This — not :8545 — is
+# what you publish / put behind your LB.
+ETH_RPC_PROXY_LISTEN_ADDR=0.0.0.0:8547 \
+ETH_RPC_PROXY_BACKEND_URL=http://127.0.0.1:8545 \
+  eth-rpc-proxy &
+
+# Verify the allow-list: a read is forwarded, admin_* is rejected.
+curl -s -X POST http://127.0.0.1:8547 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' | jq -r '.result'
+curl -s -X POST http://127.0.0.1:8547 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"admin_nodeInfo","params":[]}'      # -> method not found
+```
+
+Optionally run the `faucet` (drips gas to new addresses) from a prefunded EOA;
+it also submits through reth's loopback RPC and carries its own per-address /
+per-IP limits. See `faucet --help` for its env config.
 
 ---
 

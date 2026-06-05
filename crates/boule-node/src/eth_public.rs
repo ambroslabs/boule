@@ -26,13 +26,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Router, body::Bytes};
 use serde_json::{Value, json};
 use tracing::{info, warn};
+
+/// Max accepted body for `POST /faucet`. The request is a single
+/// `{ "address": "0x…" }` object — a few dozen bytes — so a small fixed cap
+/// rejects oversized bodies at the layer before any buffering (#823).
+const FAUCET_MAX_BODY_BYTES: usize = 4 * 1024;
 
 use boule_reth::faucet::{Admission, DripRequest, DripResponse, FaucetState};
 use boule_reth::rpc_proxy::{
@@ -42,9 +47,14 @@ use boule_reth::rpc_proxy::{
 // ───────────────────────────── faucet ──────────────────────────────────────
 
 /// Build the faucet router: `POST /faucet { "address": "0x…" }`.
+///
+/// A [`DefaultBodyLimit`] layer caps the request body up front, so an oversized
+/// body is rejected (`413`) before axum buffers it for the `Json` extractor —
+/// not after (#823).
 pub fn faucet_router(state: Arc<FaucetState>) -> Router {
     Router::new()
         .route("/faucet", post(faucet_handler))
+        .layer(DefaultBodyLimit::max(FAUCET_MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -124,9 +134,17 @@ fn rate_limited(msg: &str, retry_after_secs: u64) -> Response {
 
 /// Build the public eth-RPC proxy router: a single `POST /` that forwards
 /// allow-listed JSON-RPC to reth, with batch/body caps + per-IP rate limiting.
+///
+/// The configured `max_body_bytes` is enforced as a [`DefaultBodyLimit`] layer
+/// so an oversized body is rejected (`413`) *before* axum buffers it into the
+/// `Bytes` extractor, rather than after (#823). The handler keeps an explicit
+/// post-buffer check too, as defense in depth and to emit the JSON-RPC
+/// `BodyTooLarge` envelope for bodies that slip under the layer's granularity.
 pub fn rpc_proxy_router(state: Arc<PublicRpcState>) -> Router {
+    let max_body = state.cfg.max_body_bytes;
     Router::new()
         .route("/", post(rpc_proxy_handler))
+        .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
 }
 
@@ -299,5 +317,50 @@ mod tests {
     async fn rpc_proxy_rejects_malformed_json() {
         let (_status, v) = post_rpc(rpc_state(), "{not json").await;
         assert_eq!(v["error"]["code"], json!(-32700));
+    }
+
+    /// #823: an oversized body is rejected by the `DefaultBodyLimit` layer
+    /// (HTTP 413) *before* the handler buffers it — the body never reaches the
+    /// `Bytes` extractor or the rate limiter.
+    #[tokio::test]
+    async fn rpc_proxy_rejects_oversized_body_at_layer() {
+        let mut cfg = PublicRpcConfig::new("http://127.0.0.1:1".into());
+        cfg.max_body_bytes = 64; // tiny cap for the test
+        let state = PublicRpcState::new(cfg);
+        let app = rpc_proxy_router(state).layer(mock_peer());
+
+        let big = "x".repeat(4096);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// #823: the faucet router likewise rejects an oversized body at the layer
+    /// (413) before the `Json` extractor buffers it.
+    #[tokio::test]
+    async fn faucet_rejects_oversized_body_at_layer() {
+        let app = faucet_router(faucet_state()).layer(mock_peer());
+        let big = format!(r#"{{"address":"0x{}"}}"#, "0".repeat(8192));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/faucet")
+                    .header("content-type", "application/json")
+                    .body(Body::from(big))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

@@ -30,6 +30,18 @@
 //! liveness fault (the node schedules a swap to a key whose tx never commits
 //! and goes silent at `v_eff`), recoverable by rotating again. The mempool
 //! submit endpoint shares this listener for the same reason.
+//!
+//! # Internal-state reads moved here (#823)
+//!
+//! `GET /consensus/status` and `GET /peers` also live on this listener, *not*
+//! on the public one. The #809 safety review flagged them as exposing full
+//! internal consensus state to the open internet: `/consensus/status` returns
+//! the entire validator set, connected-peer node IDs, locked/high QCs, and
+//! vote/timeout buckets, while `/peers` returns the live peer topology. None of
+//! that is a key/IP leak, but it is operator-only introspection, so it is gated
+//! behind the admin listener (bearer-auth when a token is configured) rather
+//! than trimmed. The public listener keeps only `/health`, `/ready`,
+//! `/metrics`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -41,10 +53,13 @@ use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, watch};
 
 use boule_consensus::replication::mempool::Mempool;
+use boule_consensus::status::ConsensusStatus;
 use boule_core::crypto::signed::{NodeSigner, Signer};
 use boule_core::identity::node_id_to_base58;
+use boule_transport_tcp::{self as p2p, PeerCommand};
 
 use crate::rotation_handle::{RotationHandle, RotationReceipt};
 
@@ -93,9 +108,14 @@ impl From<RotationReceipt> for RotateKeyResponse {
     }
 }
 
-/// Build the **privileged** admin router — `POST /admin/rotate-key` and
-/// `POST /mempool/submit` — for mounting on the dedicated admin listener
+/// Build the **privileged** admin router — `POST /admin/rotate-key`,
+/// `POST /mempool/submit`, plus the internal-state reads `GET /consensus/status`
+/// and `GET /peers` (#823) — for mounting on the dedicated admin listener
 /// (#807). Never merge this into the public listener's router.
+///
+/// `status_rx` is the consensus status watch receiver (`None` on a gossip-only
+/// node, where `/consensus/status` is simply not mounted), and `p2p_cmd_tx`
+/// backs `/peers`.
 ///
 /// When `auth_token` is `Some`, a bearer-token auth layer wraps every route:
 /// requests must carry `Authorization: Bearer <token>` or they get `401`.
@@ -105,6 +125,8 @@ impl From<RotationReceipt> for RotateKeyResponse {
 pub fn router(
     handle: Arc<RotationHandle>,
     mempool: Arc<dyn Mempool>,
+    status_rx: Option<watch::Receiver<Arc<ConsensusStatus>>>,
+    p2p_cmd_tx: mpsc::Sender<PeerCommand>,
     auth_token: Option<String>,
 ) -> Router {
     let mut router = Router::new()
@@ -114,7 +136,13 @@ pub fn router(
         // definition of the submit semantics; it is privileged (lets a caller
         // inject txs into the block builder's pool), so it lives here on the
         // admin listener rather than on the public one (#807).
-        .merge(boule_consensus::api::submit_router(mempool));
+        .merge(boule_consensus::api::submit_router(mempool))
+        // Internal-state reads relocated off the public listener (#823): the
+        // peer topology and the full consensus snapshot are operator-only.
+        .merge(p2p::api::router(p2p_cmd_tx));
+    if let Some(rx) = status_rx {
+        router = router.merge(boule_consensus::api::router(rx));
+    }
     if let Some(token) = auth_token {
         router = router.layer(middleware::from_fn_with_state(
             Arc::new(token),
@@ -127,7 +155,10 @@ pub fn router(
 /// Bearer-token gate for the privileged routes. Compares the
 /// `Authorization: Bearer <token>` header against the configured secret in
 /// constant time and rejects anything else with `401`.
-async fn require_bearer(
+///
+/// Exposed so the gossip-only admin listener (which mounts only `/peers`) can
+/// reuse the same gate as the full admin router.
+pub async fn require_bearer(
     State(expected): State<Arc<String>>,
     req: Request,
     next: Next,
@@ -336,7 +367,15 @@ mod tests {
             Arc::clone(&mempool),
             signer,
         ));
-        (super::router(handle, Arc::clone(&mempool), token), mempool)
+        // `/peers` needs a p2p command channel; the receiver is dropped (no
+        // peer manager in these unit tests), so a `/peers` request would hang.
+        // These tests only exercise the privileged routes + auth, never
+        // `/peers`, so a dummy sender is fine.
+        let (p2p_cmd_tx, _p2p_cmd_rx) = mpsc::channel(1);
+        (
+            super::router(handle, Arc::clone(&mempool), None, p2p_cmd_tx, token),
+            mempool,
+        )
     }
 
     #[tokio::test]

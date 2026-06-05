@@ -10,11 +10,22 @@ struct NodeAddrs {
     p2p_addr: String,
     api_addr: String,
     node_id: String,
+    /// Admin listener address, present when `[api.admin] listen_addr` is set.
+    /// The internal-state reads `/consensus/status` + `/peers` moved here (#823).
+    #[serde(default)]
+    admin_addr: Option<String>,
+}
+
+/// Parse the `host:port` tail of an addr-file address into a port.
+fn port_of(addr: &str) -> u16 {
+    addr.rsplit(':').next().unwrap().parse().unwrap()
 }
 
 struct NodeGuard {
     child: Child,
     api_port: u16,
+    /// Admin-listener port, when the node was configured with `[api.admin]`.
+    admin_port: Option<u16>,
     p2p_addr: String,
     node_id: String,
     _config: NamedTempFile,
@@ -25,6 +36,16 @@ struct NodeGuard {
 impl NodeGuard {
     fn api_url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.api_port, path)
+    }
+
+    /// URL on the admin listener. The internal-state reads `/consensus/status`
+    /// and `/peers` live here now (#823), so the harness spins up an admin
+    /// listener for every node and queries them through this.
+    fn admin_url(&self, path: &str) -> String {
+        let port = self
+            .admin_port
+            .expect("admin listener not configured for this node");
+        format!("http://127.0.0.1:{port}{path}")
     }
 }
 
@@ -147,7 +168,7 @@ async fn spawn_node_with_schema(peers: &[PeerDesc<'_>], schema: IdentitySchema) 
     };
 
     let config = format!(
-        "[node]\nlisten_addr = \"127.0.0.1:0\"\n{scalar_field}addr_file = \"{addr_file_path}\"\n{identity_table}\n[api]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}"
+        "[node]\nlisten_addr = \"127.0.0.1:0\"\n{scalar_field}addr_file = \"{addr_file_path}\"\n{identity_table}\n[api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}"
     );
 
     let mut config_file = NamedTempFile::new().unwrap();
@@ -181,11 +202,13 @@ async fn spawn_node_with_schema(peers: &[PeerDesc<'_>], schema: IdentitySchema) 
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+    let api_port: u16 = port_of(&addrs.api_addr);
+    let admin_port: Option<u16> = addrs.admin_addr.as_deref().map(port_of);
 
     NodeGuard {
         child,
         api_port,
+        admin_port,
         p2p_addr: addrs.p2p_addr,
         node_id: addrs.node_id,
         _config: config_file,
@@ -204,7 +227,9 @@ async fn wait_until_ready(node: &NodeGuard, timeout: Duration) {
                 node.api_port
             );
         }
-        if client.get(node.api_url("/peers")).send().await.is_ok() {
+        // Probe the public observability listener (`/ready` is always served
+        // there); the internal-state reads moved to the admin listener (#823).
+        if client.get(node.api_url("/ready")).send().await.is_ok() {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -221,7 +246,7 @@ async fn wait_for_peer_count(node: &NodeGuard, expected: usize, timeout: Duratio
                 node.api_port, expected
             );
         }
-        if let Ok(resp) = client.get(node.api_url("/peers")).send().await {
+        if let Ok(resp) = client.get(node.admin_url("/peers")).send().await {
             if let Ok(peers) = resp.json::<Value>().await {
                 if peers.as_array().map(|a| a.len()).unwrap_or(0) >= expected {
                     return;
@@ -379,7 +404,7 @@ async fn test_four_node_full_mesh_is_stable_under_simultaneous_dials() {
     while Instant::now() < watch_end {
         for guard in &guards {
             let peers: Value = client
-                .get(guard.api_url("/peers"))
+                .get(guard.admin_url("/peers"))
                 .send()
                 .await
                 .expect("/peers request failed")
@@ -502,7 +527,7 @@ async fn spawn_node_fixed_port(
         .collect();
 
     let config = format!(
-        "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}"
+        "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n[api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}"
     );
     let mut config_file = NamedTempFile::new().unwrap();
     config_file.write_all(config.as_bytes()).unwrap();
@@ -557,7 +582,8 @@ async fn spawn_node_fixed_port(
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+    let api_port: u16 = port_of(&addrs.api_addr);
+    let admin_port: Option<u16> = addrs.admin_addr.as_deref().map(port_of);
 
     // The key_dir is owned by the test function (so the key survives the
     // phase-1 shutdown); hand this guard a throwaway TempDir to keep the
@@ -567,6 +593,7 @@ async fn spawn_node_fixed_port(
     NodeGuard {
         child,
         api_port,
+        admin_port,
         p2p_addr: addrs.p2p_addr,
         node_id: addrs.node_id,
         _config: config_file,
@@ -602,7 +629,7 @@ async fn test_peers_endpoint_lists_connected_peers() {
 
     let client = reqwest::Client::new();
     let peers: Value = client
-        .get(node1.api_url("/peers"))
+        .get(node1.admin_url("/peers"))
         .send()
         .await
         .unwrap()
@@ -718,7 +745,7 @@ async fn spawn_consensus_node(
     // test tight.
     let config = format!(
         "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
     );
     let mut config_file = NamedTempFile::new().unwrap();
@@ -750,11 +777,13 @@ async fn spawn_consensus_node(
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+    let api_port: u16 = port_of(&addrs.api_addr);
+    let admin_port: Option<u16> = addrs.admin_addr.as_deref().map(port_of);
 
     NodeGuard {
         child,
         api_port,
+        admin_port,
         p2p_addr: addrs.p2p_addr,
         node_id: addrs.node_id,
         _config: config_file,
@@ -780,7 +809,7 @@ async fn test_consensus_status_endpoint_reports_live_progress() {
     // sane snapshot (startup-window path): the status is published
     // once at boot, so the endpoint must never 500.
     for g in &guards {
-        let resp = client.get(g.api_url("/consensus/status")).send().await;
+        let resp = client.get(g.admin_url("/consensus/status")).send().await;
         let resp = resp.expect("/consensus/status must respond during startup");
         assert_eq!(
             resp.status(),
@@ -804,7 +833,7 @@ async fn test_consensus_status_endpoint_reports_live_progress() {
             panic!("consensus cluster did not commit within 15s");
         }
         for g in &guards {
-            let resp = client.get(g.api_url("/consensus/status")).send().await;
+            let resp = client.get(g.admin_url("/consensus/status")).send().await;
             let body: Value = match resp {
                 Ok(r) if r.status() == 200 => r.json().await.unwrap_or(Value::Null),
                 _ => Value::Null,
@@ -823,7 +852,7 @@ async fn test_consensus_status_endpoint_reports_live_progress() {
     // correct on every node.
     for g in &guards {
         let body: Value = client
-            .get(g.api_url("/consensus/status"))
+            .get(g.admin_url("/consensus/status"))
             .send()
             .await
             .unwrap()
@@ -894,7 +923,7 @@ async fn spawn_consensus_node_gossip(
 
     let config = format!(
         "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [overlay]\nmode = \"gossip\"\noutbound_target = {target_degree}\npeer_gossip_interval_ms = {peer_gossip_interval_ms}\nmesh_check_interval_ms = {mesh_check_interval_ms}\nbootstrap_addrs = {bootstrap_toml}\n\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
     );
@@ -927,11 +956,13 @@ async fn spawn_consensus_node_gossip(
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+    let api_port: u16 = port_of(&addrs.api_addr);
+    let admin_port: Option<u16> = addrs.admin_addr.as_deref().map(port_of);
 
     NodeGuard {
         child,
         api_port,
+        admin_port,
         p2p_addr: addrs.p2p_addr,
         node_id: addrs.node_id,
         _config: config_file,
@@ -1043,7 +1074,7 @@ async fn test_gossip_overlay_3_node_smoke() {
             panic!("gossip-overlay cluster did not commit within 15s");
         }
         for g in &guards {
-            let resp = client.get(g.api_url("/consensus/status")).send().await;
+            let resp = client.get(g.admin_url("/consensus/status")).send().await;
             let body: Value = match resp {
                 Ok(r) if r.status() == 200 => r.json().await.unwrap_or(Value::Null),
                 _ => Value::Null,
@@ -1072,7 +1103,7 @@ async fn test_consensus_status_returns_404_on_gossip_only_node() {
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(node.api_url("/consensus/status"))
+        .get(node.admin_url("/consensus/status"))
         .send()
         .await
         .expect("GET /consensus/status must reach the node");
@@ -1121,7 +1152,7 @@ async fn spawn_consensus_node_inbound_disabled(
     // never bound; pick `127.0.0.1:0` so the parser is happy.
     let config = format!(
         "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [p2p]\ninbound_disabled = true\n\n\
         [overlay]\nmode = \"gossip\"\noutbound_target = {target_degree}\npeer_gossip_interval_ms = 250\nmesh_check_interval_ms = 250\nbootstrap_addrs = [{bootstrap_toml}]\n\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
@@ -1155,11 +1186,13 @@ async fn spawn_consensus_node_inbound_disabled(
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+    let api_port: u16 = port_of(&addrs.api_addr);
+    let admin_port: Option<u16> = addrs.admin_addr.as_deref().map(port_of);
 
     NodeGuard {
         child,
         api_port,
+        admin_port,
         p2p_addr: addrs.p2p_addr,
         node_id: addrs.node_id,
         _config: config_file,
@@ -1267,7 +1300,7 @@ async fn test_inbound_disabled_node_participates_via_outbound_only() {
             panic!("4-node cluster with one inbound-disabled node did not commit within 15s");
         }
         for g in &guards {
-            let resp = client.get(g.api_url("/consensus/status")).send().await;
+            let resp = client.get(g.admin_url("/consensus/status")).send().await;
             let body: Value = match resp {
                 Ok(r) if r.status() == 200 => r.json().await.unwrap_or(Value::Null),
                 _ => Value::Null,
@@ -1693,7 +1726,7 @@ async fn test_self_id_in_peers_list_fails_to_start() {
     let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
     let config = format!(
         "[node]\nlisten_addr = \"127.0.0.1:0\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [[peers]]\naddr = \"127.0.0.1:9999\"\nnode_id = \"{}\"\n",
         info.node_id,
     );
@@ -1746,7 +1779,7 @@ async fn test_self_loopback_dial_is_refused_at_handshake() {
     // is self. The dialer must catch it at TLS-handshake time.
     let config = format!(
         "[node]\nlisten_addr = \"{p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
-        [api]\nlisten_addr = \"127.0.0.1:0\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [[peers]]\naddr = \"{p2p_addr}\"\n",
     );
     let mut config_file = NamedTempFile::new().unwrap();
@@ -1776,11 +1809,13 @@ async fn test_self_loopback_dial_is_refused_at_handshake() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let api_port: u16 = addrs.api_addr.rsplit(':').next().unwrap().parse().unwrap();
+    let api_port: u16 = port_of(&addrs.api_addr);
+    let admin_port: Option<u16> = addrs.admin_addr.as_deref().map(port_of);
 
     let guard = NodeGuard {
         child,
         api_port,
+        admin_port,
         p2p_addr: addrs.p2p_addr,
         node_id: addrs.node_id,
         _config: config_file,
@@ -1798,7 +1833,7 @@ async fn test_self_loopback_dial_is_refused_at_handshake() {
     let watch_end = Instant::now() + Duration::from_secs(2);
     while Instant::now() < watch_end {
         let peers: Value = client
-            .get(guard.api_url("/peers"))
+            .get(guard.admin_url("/peers"))
             .send()
             .await
             .expect("/peers request failed")
