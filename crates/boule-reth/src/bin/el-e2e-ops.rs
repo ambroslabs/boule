@@ -240,6 +240,7 @@ async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -
             per_wallet_delay,
         );
         handles.push(tokio::spawn(async move {
+            let addr = format!("0x{}", hex::encode(w.address()));
             let mut nonce = 0u64;
             while tokio::time::Instant::now() < deadline {
                 let j = (i + 1 + nonce as usize) % ads.len();
@@ -251,7 +252,14 @@ async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -
                             nonce += 1;
                         }
                         Err(_) => {
+                            // txpool backpressure / nonce drift: re-sync the nonce
+                            // from chain and back off so we don't spam-retry a
+                            // rejected nonce (which would DoS the RPC).
                             err.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(n) = fetch_nonce(&tx, &addr).await {
+                                nonce = n;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         }
                     }
                 }
