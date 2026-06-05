@@ -152,6 +152,63 @@ pub fn build_seeded_genesis(
     Ok(genesis)
 }
 
+/// One prefunded externally-owned account in genesis: `(20-byte address,
+/// balance in wei)`. The deployment builder writes `alloc[address].balance`
+/// for each — so a fresh chain has funded EOAs (e.g. a faucet account, a dev
+/// signer) from block zero with no funding tx.
+///
+/// `address` is the 20-byte EVM address (any case); `balance` is the decimal
+/// wei amount rendered as the `0x…` hex genesis `alloc` expects.
+pub type PrefundAlloc = (String, u128);
+
+/// Build a deployment genesis: the embedded base genesis with (1) the
+/// `Registry` predeploy seeded with `validators` (keys + weights + totalWeight,
+/// the weighted-quorum surface from block zero); (2) the EVM `config.chainId`
+/// set to `chain_id` (the public testnet's EVM chain-id, distinct from the
+/// boule consensus chain-id derived from the genesis parts); and (3) every
+/// `(address, balance)` in `prefund` written to `alloc[address].balance`.
+///
+/// This is the per-deployment entry point the testnet tooling
+/// (`gen-testnet-genesis`) calls: it takes the deployment's *minted* validators
+/// (not the dev set) plus an operator-chosen chain-id and prefund list.
+///
+/// Note on `settledView`: every genesis key entry is `vEff = 0`, so the
+/// Registry's `settledView` scalar (slot 3) is already correct at its EVM
+/// default of `0` for the genesis set — slashing proofs for `view <=
+/// settledView` cover all genesis validators without seeding a redundant zero
+/// word. See [`crate::registry::genesis_seed_storage`].
+pub fn build_deployment_genesis(
+    chain_id: u64,
+    validators: impl IntoIterator<Item = GenesisValidator>,
+    prefund: impl IntoIterator<Item = PrefundAlloc>,
+) -> Result<Value, GenesisSeedError> {
+    let mut genesis = build_seeded_genesis(validators)?;
+
+    // Override the EVM chain-id.
+    genesis
+        .get_mut("config")
+        .and_then(Value::as_object_mut)
+        .ok_or(GenesisSeedError::MalformedGenesis)?
+        .insert("chainId".to_string(), Value::from(chain_id));
+
+    // Prefund EOAs (faucet / dev accounts). Merge into any existing alloc
+    // entry for the address (preserving e.g. code) rather than clobbering.
+    let alloc = genesis
+        .get_mut("alloc")
+        .ok_or(GenesisSeedError::MalformedGenesis)?
+        .as_object_mut()
+        .ok_or(GenesisSeedError::MalformedGenesis)?;
+    for (address, balance) in prefund {
+        let entry = alloc
+            .entry(address)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .ok_or(GenesisSeedError::MalformedGenesis)?;
+        entry.insert("balance".to_string(), Value::from(format!("0x{balance:x}")));
+    }
+    Ok(genesis)
+}
+
 /// A deterministic dev/test genesis validator set: `n` validators whose
 /// `NodeId` is `[i+1; 32]`, whose BLS pubkey is the deterministic
 /// [`BlsAggregated`] key derived from IKM `[i+1, 0, …]`, and whose weight is
@@ -290,6 +347,61 @@ mod tests {
                 "weightOf(dev validator {i}) == {weight}",
             );
         }
+    }
+
+    /// The deployment builder overrides the EVM chain-id, prefunds the
+    /// requested EOAs, and still seeds the weighted-quorum surface — the three
+    /// per-deployment knobs the testnet tooling drives.
+    #[test]
+    fn deployment_genesis_sets_chain_id_and_prefunds() {
+        let (pk0, pk1) = {
+            let g = dev_genesis_validators(2);
+            (g[0].1, g[1].1)
+        };
+        let v0: NodeId = [0xa0; 32];
+        let v1: NodeId = [0xa1; 32];
+        let faucet = "0x00000000000000000000000000000000000Facc7";
+        let dev_eoa = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"; // already in base
+        let genesis = build_deployment_genesis(
+            424242,
+            [(v0, pk0, 4u64), (v1, pk1, 6u64)],
+            [
+                (faucet.to_string(), 1_000_000_000_000_000_000_000u128), // 1000 ETH
+                (dev_eoa.to_string(), 7u128),
+            ],
+        )
+        .unwrap();
+
+        // (1) chain-id overridden.
+        assert_eq!(genesis["config"]["chainId"], Value::from(424242u64));
+
+        // (2) faucet prefunded with the exact wei (rendered as 0x-hex).
+        assert_eq!(
+            genesis["alloc"][faucet]["balance"],
+            Value::from(format!("0x{:x}", 1_000_000_000_000_000_000_000u128)),
+        );
+        // An existing alloc entry's balance is overridden in place.
+        assert_eq!(genesis["alloc"][dev_eoa]["balance"], Value::from("0x7"));
+
+        // (3) weighted-quorum surface still seeded: totalWeight == 4 + 6 == 10.
+        let storage = genesis["alloc"][REGISTRY_ADDRESS]["storage"]
+            .as_object()
+            .expect("Registry storage seeded");
+        let total_slot = "0x0000000000000000000000000000000000000000000000000000000000000002";
+        let mut want_total = [0u8; 32];
+        want_total[31] = 10;
+        assert_eq!(
+            storage.get(total_slot).and_then(Value::as_str),
+            Some(format!("0x{}", hex::encode(want_total)).as_str()),
+        );
+
+        // settledView (slot 3) is NOT seeded — genesis vEff=0 keys make its EVM
+        // default of 0 correct, so seeding a zero word would be redundant.
+        let settled_slot = "0x0000000000000000000000000000000000000000000000000000000000000003";
+        assert!(
+            !storage.contains_key(settled_slot),
+            "settledView must rely on the EVM zero default for the genesis set",
+        );
     }
 
     /// Seeding fails closed if the base genesis has no `Registry` predeploy to
