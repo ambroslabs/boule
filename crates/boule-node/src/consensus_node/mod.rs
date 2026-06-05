@@ -10625,6 +10625,73 @@ mod tests {
             .expect("happy-path recovery must pass consistency check");
     }
 
+    /// #815: a validator that restarts after a committed reconfig on a chain
+    /// whose **genesis set has non-uniform weights** must still pass the
+    /// recovery consistency check. The recovery rebuild seeds its genesis
+    /// boundary from the loaded history's genesis members; if it reconstructs
+    /// that boundary with default (weight-1) weights instead of the real
+    /// genesis weights, the rebuilt validator-history commitment diverges from
+    /// the chain's stamped commitment and the node refuses to boot. Every
+    /// pre-existing test used a uniform weight-1 set, so this only surfaces on
+    /// a weighted chain (the reth testnet seeds weights `1..=N`).
+    #[test]
+    fn verify_persisted_history_consistency_weighted_genesis_after_reconfig() {
+        use boule_consensus::reconfig::{MIN_V_EFF_DELAY, ReconfigCommand, WeightChange};
+
+        let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+        // Non-uniform genesis weights (mirrors gen-genesis' `1..=N`). This is
+        // the load-bearing difference from the happy-path test, which uses an
+        // all-weight-1 set where the seed bug is invisible.
+        let vs =
+            ValidatorSet::with_weights(vec![(vid(1), 1), (vid(2), 2), (vid(3), 3), (vid(4), 4)])
+                .unwrap();
+        let g = genesis_with_real_commitment(&vs);
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
+
+        // Phase 1: commit a weight-change reconfig (the shape the reth/EL
+        // stake-deposit path mints — `changes`, no `adds`).
+        let mut node = ConsensusNode::new(
+            nid(1),
+            cfg.clone(),
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        );
+        let v_eff = MIN_V_EFF_DELAY + 5;
+        let cmd = ReconfigCommand {
+            adds: vec![],
+            removes: vec![],
+            changes: vec![WeightChange {
+                node_id: nid(1),
+                weight: 7,
+            }],
+            v_eff,
+        };
+        let mut block1 = block_with_reconfig_extending(g.hash(), 1, 0, nid(1), cmd, [0u8; 32]);
+        stamp_post_block_commitment(&mut block1, &node);
+        node.apply_commit(block1);
+        assert_eq!(node.validator_history.boundary_count(), 2);
+        drop(node);
+
+        // Phase 2: recover and run the consistency check. Before the fix this
+        // fails with a `validator_history_commitment` mismatch at the reconfig
+        // block, because the rebuild's genesis boundary carries weight-1
+        // members instead of the real `1,2,3,4`.
+        let recovered = ConsensusNode::recover(
+            nid(1),
+            cfg,
+            make_sm(),
+            Arc::new(InMemoryMempool::new(64)),
+            Arc::clone(&storage),
+            Arc::new(MemoryWal::new()),
+        )
+        .expect("recover should succeed");
+        recovered
+            .verify_persisted_history_consistency()
+            .expect("weighted-genesis recovery must pass the consistency check");
+    }
+
     /// #637: when `block_retention_window` has pruned a committed block the
     /// backward walk needs, the best-effort anti-rollback check must **skip**
     /// (not refuse to start) — a node has to be able to restart after
