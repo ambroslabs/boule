@@ -14,10 +14,16 @@ possible, the conclusion (**it is not** — only a receipt/MPT inclusion proof
 works), and the concrete **option-1 design** for that heavier path, so the
 heavy build is a deliberate decision rather than an accident.
 
-> **Status: BUILT.** Option 1 (the receipt-inclusion proof) is now implemented —
-> see [Implementation](#implementation-what-was-built) at the end. The common
-> 1-block-lag forged weight is **rejected at vote time**; the precise
-> prevented-vs-detected split the build settled on is recorded there.
+> **Status: BUILT + gap-excuse closed (#797).** Option 1 (the receipt-inclusion
+> proof) is implemented, and the **gap-excuse residual is now closed**: a proof
+> anchors to the weight's **named source block within a bounded recent window
+> `K`** (`MAX_WEIGHT_PROOF_ANCHOR_LAG`), not only the immediate parent, and a
+> weight that names no resolvable in-window source is **rejected, not deferred**.
+> A Byzantine leader can no longer pass a forged weight off as "too far back to
+> verify". See [Implementation](#implementation-what-was-built) and
+> [The gap-excuse fix](#the-gap-excuse-fix-797--reject-not-defer) at the end. The
+> only weight case still left to commit-time detection is the *exact* post-
+> `Withdraw` seated amount, which needs ledger state.
 
 ## TL;DR
 
@@ -231,15 +237,46 @@ Option 1 with the **(1a) parent-chain `receiptsRoot` anchor** is implemented in
   command is covered by `commands_commitment` and ignored by the EL and every
   `apply_committed_*` path (none recognise the tag).
 - **Leader** (`build_proposal`): when the block's `extra_data` carries weight
-  deltas, fetch the parent EVM block's receipts (`eth_getBlockReceipts`), build a
-  receipt-inclusion proof per delta, attach the `WeightProofSet` command.
-  Best-effort: a receipt-fetch failure logs and omits the proof (the delta then
-  falls to commit detection) rather than failing the proposal.
+  deltas, walk the recent source candidates (parent chain through
+  `pending_blocks`, bounded to the window), fetch each candidate's receipts
+  (`eth_getBlockReceipts`), and build a receipt-inclusion proof per delta against
+  the first candidate carrying its log — **naming that source block's boule
+  hash** in the proof (`anchor_block`). Usually the source is the parent (the
+  1-block path). Best-effort on a receipt-fetch failure (the delta then falls to
+  commit detection) rather than failing the proposal.
 - **Voter** (`validate_proposal` → `validate_weight_proofs` →
-  `WeightProofSet::verify_against_parent`): the hook now also receives the
-  **parent block** (resolved by the integration layer from the safety core's
-  pending blocks), reads its execution-payload `receiptsRoot`, verifies each
-  carried proof against it, and re-derives each delta from the proven log.
+  `WeightProofSet::verify_against_recent`): the hook receives a `RecentBlocks`
+  resolver (the integration layer's `pending_blocks` **plus** the durable
+  committed-block store), resolves each proof's **named source block**, reads its
+  execution-payload `receiptsRoot`, verifies each carried proof against it, and
+  re-derives each delta from the proven log.
+
+### The gap-excuse fix (#797 — reject, not defer)
+
+The original build anchored only to the **immediate parent**, so any weight whose
+source was a few blocks back (a self-synced gap, or simply the normal commit-depth
+lag) couldn't anchor and was **deferred** to commit detection. A Byzantine leader
+could exploit that by claiming its forged weight's source was "too far back to
+verify" — the **gap-excuse residual**.
+
+The premise that closes it (verified in code): a weight delta is staged in
+`pending_weights` at its **source block's commit** (a three-chain deep), and the
+*next* built block snapshots the whole pending set — so an honest source is at
+most the commit depth back from the block carrying the delta. The voter always
+still holds that source: it is either an **uncommitted ancestor** (the safety
+core's `pending_blocks`, retained for `height > committed`) or the
+**just-committed frontier** (the durable block store the integration layer reads).
+There is therefore **no honest reason** for a proposer to carry a weight whose
+source it can't anchor to a recent committed block within a bounded window
+`K = MAX_WEIGHT_PROOF_ANCHOR_LAG` (set generously above the commit depth so no
+honest leader is ever rejected).
+
+So the fix: each proof **names its source block**, the voter resolves it from the
+recent window and verifies against **that block's** `receiptsRoot` (not only the
+parent's), and a weight that names **no resolvable in-window source** is
+**rejected** — closing the gap-excuse. The only weight case left to commit
+detection is the *exact* post-`Withdraw` amount (it needs ledger state); every
+other forgery, including the "too far back" excuse, is now refused at vote time.
 
 ### The prevented-vs-detected split the build settled on
 
@@ -250,14 +287,16 @@ voter-side ledger state** — this is what keeps it lag-independent (no
 honest-rejects-honest). With that constraint the sound, vote-time-**prevented**
 guarantees are:
 
-1. **Existence + node binding.** Every weight delta MUST carry a valid MPT
-   inclusion proof of ≥1 staking/slashing log **for that exact `node_id`** in the
-   parent's `receiptsRoot`. No proof / invalid proof / wrong-node proof → reject.
-   This is the core #797 attack closed: a leader can't invent a weight from
-   nothing (the fabricated-`Slashed` framing of an honest validator, or a
-   governance/param-swinging weight — neither has a real log to prove). To stop a
-   leader mixing one real proof with an unbacked forgery, **if the block carries
-   any parent-anchored proof, every claimed weight must be parent-anchored.**
+1. **Existence + node binding + in-window source.** Every weight delta MUST carry
+   a valid MPT inclusion proof of ≥1 staking/slashing log **for that exact
+   `node_id`** in the **named source block's** `receiptsRoot`, where that source
+   is a block the voter holds within the recent anchor window `K`. No proof /
+   invalid proof / wrong-node proof / **unresolvable-or-too-far-back source** →
+   reject. This is the core #797 attack closed: a leader can't invent a weight
+   from nothing (the fabricated-`Slashed` framing of an honest validator, or a
+   governance/param-swinging weight — neither has a real log to prove), **and**
+   can't dodge by claiming the source is "too far back" (the gap-excuse) — every
+   claimed weight must name a held in-window source.
 2. **`Slashed` pins weight 0.** A delta backed by a proven `Slashed` must claim
    weight `0`; a non-zero claim → reject.
 3. **Deposit floor.** A pure-`Deposit` delta's absolute weight is
@@ -271,19 +310,24 @@ guarantees are:
 - The **exact post-`Withdraw` amount** (`prior − amount`) — `prior` is ledger
   state. The proof still binds the delta to a *real `Withdraw` for the claimed
   node* at vote time; the precise value is left to
-  `detect_weight_extra_data_divergence`.
-- The **self-synced-gap source** (#674): when the EL self-synced past the source
-  block so it isn't the immediate parent, the proof doesn't anchor to the
-  parent's `receiptsRoot`. Rather than reject an honest leader, an
-  *un*-anchored-only proof set defers to commit detection. The common
-  1-block-lag path is unaffected and remains prevented.
+  `detect_weight_extra_data_divergence`. **This is now the only deferred weight
+  case** — the self-synced-gap / multi-block-lag source is no longer deferred
+  (see below).
+
+The **multi-block-lag / self-synced-gap source** (#674) is no longer deferred:
+the proof names its source block and the voter anchors to **that** block's
+`receiptsRoot` (resolved from `pending_blocks` or the committed store), so a
+legitimate multi-block-lag weight is **accepted** and an unanchorable one is
+**rejected**. This closes the gap-excuse residual.
 
 ### Tests (the bar)
 
-`weight_proof.rs` and `application.rs` cover: an honest 1-block-lag deposit
-validates with its proof; a forged weight with **no** receipt proof is rejected
-at vote time; a proof of a **different amount** is rejected; a sub-deposit-floor
-claim is rejected; `Slashed` must claim 0; a tampered proof under the real root
-is rejected; the no-parent case defers; and the codec round-trips. The
-cross-crate registry codec determinism pin (`registry_payload.rs`) is untouched
-and still passes.
+`weight_proof.rs` and `application.rs` cover: an honest deposit validates with
+its proof (1-block lag); a **legitimate multi-block-lag weight (source 3 back,
+valid proof) is accepted** (the liveness bar); a weight naming an **unheld /
+too-far-back source is rejected at vote time** (the gap-excuse exploit); a forged
+weight with **no** receipt proof is rejected; a proof of a **different amount** is
+rejected; a sub-deposit-floor claim is rejected; `Slashed` must claim 0; a
+tampered proof under the named source's real root is rejected; and the codec
+round-trips (now including the `anchor_block`). The cross-crate registry codec
+determinism pin (`registry_payload.rs`) is untouched and still passes.

@@ -33,6 +33,35 @@ use crate::hotstuff::qc::QuorumCertificate;
 use crate::replication::block::{Block, BlockHash};
 use crate::{Height, View};
 
+/// A read-only resolver, handed to [`Application::validate_proposal`], for any
+/// **recent block the voter already holds** — by its header hash.
+///
+/// This spans two stores the integration layer owns: the proposed block's
+/// uncommitted ancestors (the safety core's `pending_blocks`) and the
+/// recently-committed frontier (the durable block store). It exists so a
+/// vote-time check can anchor to a block a few links back without re-fetching it
+/// over the network.
+///
+/// The reth backend's #797 weight-proof check is the sole user: a seated-weight
+/// delta in a block's `extra_data` is derived from the staking/slashing logs of
+/// a *source* block whose execution emitted them. The lag from that source block
+/// to the block that carries the delta is bounded by the **commit depth** — the
+/// delta is staged at the source block's commit (a three-chain deep) and the
+/// very next built block carries the whole pending set, so an honest source is
+/// at most a handful of blocks back and is always still resolvable here. That
+/// bound is what lets the backend **reject** (rather than defer) a leader whose
+/// weight names a source it cannot anchor: an honest leader never does.
+///
+/// `get` returns `None` for a hash outside the held window (a block evicted
+/// below the retention horizon, or one the voter never saw) — far below any
+/// honest weight-proof anchor, so the backend treats an unresolvable anchor as a
+/// forgery, not an honest gap.
+pub trait RecentBlocks: Send + Sync {
+    /// The recent block with this header hash, if the voter holds it (in
+    /// `pending_blocks` or the recently-committed block store), else `None`.
+    fn get(&self, hash: &BlockHash) -> Option<Block>;
+}
+
 /// One application-driven change to the validator set, mirroring ABCI's
 /// `ValidatorUpdate { pub_key, power }`: the application names a validator
 /// by its identity key and the voting weight it should have.
@@ -369,14 +398,20 @@ pub trait Application: Send + Sync {
     /// re-proposes). It is **not** a fault for the local node — the offending
     /// block is the proposer's.
     ///
-    /// `parent` is the proposed `block`'s parent (resolved by the integration
-    /// layer from the safety core's pending blocks), or `None` when the voter
-    /// does not yet hold it. The reth backend uses it for the #797 weight
+    /// `recent` resolves any **recent block the voter already holds** by its
+    /// header hash — the proposed block's uncommitted ancestors (the safety
+    /// core's `pending_blocks`) *and* the recently-committed frontier (the
+    /// durable block store). The reth backend uses it for the #797 weight
     /// **receipt-inclusion proof**: a weight delta riding this block's
-    /// `extra_data` was derived from the *parent's* EVM execution, so the
-    /// parent's execution payload carries the `receiptsRoot` the carried proof is
-    /// verified against — without re-executing anything. An application that does
-    /// not need the parent ignores it.
+    /// `extra_data` was derived from a *recent* block's EVM execution (its
+    /// staking/slashing logs), so that source block's execution payload carries
+    /// the `receiptsRoot` the carried proof is verified against — without
+    /// re-executing anything. Because the lag from a delta's source block to the
+    /// block carrying it is bounded by the commit depth (the source is at most a
+    /// few blocks back — see [`RecentBlocks`]), the voter always holds the source
+    /// block and can anchor the proof to it, so a leader claiming its weight's
+    /// source is "too far back to verify" is rejected rather than deferred. An
+    /// application with nothing proposer-authored to verify ignores `recent`.
     ///
     /// The default is `Ok(())`: an application with nothing proposer-authored to
     /// re-derive (the counter app, a PoA backend) accepts every safety-valid
@@ -384,7 +419,7 @@ pub trait Application: Send + Sync {
     fn validate_proposal<'a>(
         &'a self,
         _block: &'a Block,
-        _parent: Option<&'a Block>,
+        _recent: &'a dyn RecentBlocks,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async { Ok(()) })
     }

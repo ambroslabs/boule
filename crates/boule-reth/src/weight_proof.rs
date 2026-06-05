@@ -16,18 +16,26 @@
 //! is derived from, verifiable against a `receiptsRoot` the voter already trusts
 //! **without executing the source block** (see `docs/a1-weight-proof-design.md`).
 //!
-//! ## The 1-block-lag anchor (the common, prevented path)
+//! ## The recent-source anchor (the prevented path)
 //!
-//! A weight delta riding block `K+1`'s `extra_data` was derived from the
-//! **execution of block `K`** (its staking/slashing logs) — and `K` is exactly
-//! the **parent** of `K+1`. Every honest voter holds the parent block (it is the
-//! proposed block's `parent_hash`, resolved from the safety core's pending
-//! blocks) and therefore holds the parent's execution payload, whose
-//! `receiptsRoot` is committed by the parent's own `state_commitment`. So for the
-//! 1-block lag the voter needs **no proof of the root** — only the receipt-trie
-//! inclusion proof *into* the parent's `receiptsRoot`, which this module builds
-//! (leader side, [`WeightProofSet::generate`]) and verifies (voter side,
-//! [`WeightProofSet::verify_against_parent`]).
+//! A weight delta riding block `N`'s `extra_data` was derived from the
+//! **execution of a recent source block `K`** (its staking/slashing logs). The
+//! delta is staged in `pending_weights` at `K`'s `commit` — a three-chain deep —
+//! and the next built block snapshots the whole pending set, so `K` is at most
+//! [`MAX_WEIGHT_PROOF_ANCHOR_LAG`] blocks back from `N` (the commit depth plus a
+//! small slack). Every honest voter still holds `K` at vote time: it is either an
+//! uncommitted ancestor of `N` (the safety core's `pending_blocks`) or the
+//! just-committed frontier (the durable block store) — the integration layer
+//! resolves both. Each proof **names its source block `K`** (by boule block
+//! hash); the voter resolves `K`, reads its execution-payload `receiptsRoot`
+//! (committed by `K`'s own `state_commitment`), and verifies the receipt-trie
+//! inclusion proof *into* that root. This module builds the proofs (leader side,
+//! [`WeightProof::generate_one`] / [`WeightProofSet::generate`]) and verifies
+//! them (voter side, [`WeightProofSet::verify_against_recent`]).
+//!
+//! Because the source is always a held, in-window block, a leader claiming its
+//! weight's source is "too far back to verify" is **rejected**, not deferred:
+//! that excuse was the #797 gap-excuse residual (#797), and it is now closed.
 //!
 //! ## What is vote-time *prevented* vs. *detected*
 //!
@@ -61,16 +69,17 @@
 //! design flags; the common honest path (a deposit or a full unbond / slash) is
 //! fully vote-time-pinned.
 //!
-//! ## The self-synced-gap fallback (#674)
+//! ## Multi-block lag / self-synced gap (#674) — anchored, not deferred
 //!
-//! The parent-anchor optimisation needs the source block to be the immediate
-//! parent. If the EL self-synced past the source (a multi-block gap), the source
-//! is below the parent and its `receiptsRoot` is not the parent's; such a proof
-//! fails [`WeightProofSet::verify_against_parent`]. Rather than reject an honest
-//! leader in that rare case, the voter treats a weight whose proof does not anchor
-//! to the parent as **not vote-time-verifiable** and lets it through to commit-
-//! time detection — exactly the pre-#797 behaviour for that block. The common
-//! 1-block-lag path is unaffected and remains prevented.
+//! A delta whose source `K` is not the immediate parent — a multi-block lag, or
+//! an EL self-synced past `K` (#674) — still names `K`, which the voter resolves
+//! from `pending_blocks` or the recently-committed block store and anchors to
+//! `K`'s own `receiptsRoot`. Only a source older than
+//! [`MAX_WEIGHT_PROOF_ANCHOR_LAG`] — never reached by an honest delta, whose
+//! source is at most the commit depth back — is unresolvable; a leader naming
+//! such a source is **rejected**, not deferred. There is no longer a
+//! deferred-to-commit weight case other than the exact post-`Withdraw` amount
+//! above.
 //!
 //! ## Carrier
 //!
@@ -91,12 +100,31 @@ use anyhow::{Context, Result, bail};
 use boule_core::identity::NodeId;
 use serde_json::Value;
 
+use boule_consensus::Height;
+use boule_consensus::replication::block::BlockHash;
+
 use crate::{slashing, staking};
 
 /// 4-byte magic prefixing the weight-proof block command (distinct from the
 /// registry `extra_data` magic `BLR1`, so the EL/registry codec never mistakes
 /// one for the other). "WPR1" = Weight-PRoof v1.
 pub const MAGIC: [u8; 4] = *b"WPR1";
+
+/// The maximum number of blocks back a weight delta's **source block** (the one
+/// whose execution emitted the backing log) may sit from the block that carries
+/// the delta in its `extra_data` — the window a voter accepts a proof anchor in.
+///
+/// A delta is staged in `pending_weights` at its source block's `commit` (which
+/// lands a **three-chain** — commit depth 3 — after the source was proposed),
+/// and the *next* built block snapshots the whole pending set, so an honest
+/// source is at most the commit depth plus a small slack for a skipped build
+/// behind the carrier. We set the bound generously above the commit depth so no
+/// honest leader is ever rejected, while still being a hard, finite window: a
+/// leader claiming a source older than this — the "too far back to verify"
+/// excuse #797 closed — is **rejected**, not deferred. Honest sources within the
+/// window are always still held by the voter (`pending_blocks` + the just-
+/// committed frontier), so they verify.
+pub const MAX_WEIGHT_PROOF_ANCHOR_LAG: u64 = 8;
 
 /// Wire-format version byte.
 pub const VERSION: u8 = 1;
@@ -111,6 +139,13 @@ pub struct WeightProof {
     pub node_id: NodeId,
     /// The absolute seated weight the `extra_data` claims for `node_id`.
     pub weight: u64,
+    /// The **boule block hash** of the source block whose EVM execution emitted
+    /// the backing log — the block the voter resolves (via `RecentBlocks`) to
+    /// read the `receiptsRoot` this proof verifies against. Naming the source
+    /// lets the voter anchor to a block a few links back (a multi-block lag), not
+    /// only the immediate parent, so a "too far back" excuse cannot defer a
+    /// forgery (#797): a named source outside the recent window is rejected.
+    pub anchor_block: BlockHash,
     /// The source receipt's index in the source block (its position in the
     /// block's receipt list), used to key the receipt trie (`rlp(index)`).
     pub receipt_index: u32,
@@ -121,6 +156,49 @@ pub struct WeightProof {
     /// The MPT branch nodes from `receiptsRoot` down to the receipt leaf, root
     /// first (the order [`verify_proof`] consumes).
     pub proof_nodes: Vec<Vec<u8>>,
+}
+
+/// Resolves a named source block hash to its `(receiptsRoot, height)` if the
+/// voter holds it (within the recent anchor window), else `None` — the voter's
+/// view handed to [`WeightProofSet::verify_against_recent`].
+pub type SourceResolver<'a> = dyn Fn(&BlockHash) -> Option<([u8; 32], Height)> + 'a;
+
+impl WeightProof {
+    /// Leader side: build the receipt-inclusion proof for one `(node_id, weight)`
+    /// delta from `source_receipts` (an `eth_getBlockReceipts` result for the
+    /// source EVM block), anchored at `anchor_block` (that block's boule hash).
+    ///
+    /// Returns `Ok(None)` when `source_receipts` carries **no** staking/slashing
+    /// log for `node_id` — i.e. this is not the delta's source block — so the
+    /// caller can try the next candidate block. `Ok(Some(_))` is the proof of the
+    /// first matching receipt. (A node has at most one weight-affecting receipt
+    /// per block in the toy model; the first match is canonical.)
+    pub fn generate_one(
+        node_id: NodeId,
+        weight: u64,
+        anchor_block: BlockHash,
+        source_receipts: &Value,
+    ) -> Result<Option<Self>> {
+        let receipts = parse_block_receipts(source_receipts)?;
+        let Some(idx) = receipts
+            .iter()
+            .position(|r| receipt_has_log_for(r, &node_id))
+        else {
+            return Ok(None);
+        };
+        // Pre-encode every receipt to its 2718 consensus bytes — both the trie
+        // leaves and the carried `receipt_2718` use this exact encoding.
+        let encoded: Vec<Vec<u8>> = receipts.iter().map(|r| r.encoded_2718()).collect();
+        let proof_nodes = build_receipt_proof(&encoded, idx)?;
+        Ok(Some(WeightProof {
+            node_id,
+            weight,
+            anchor_block,
+            receipt_index: idx as u32,
+            receipt_2718: encoded[idx].clone(),
+            proof_nodes,
+        }))
+    }
 }
 
 /// The per-block set of weight proofs — one [`WeightProof`] per `(node_id,
@@ -138,147 +216,107 @@ impl WeightProofSet {
     }
 
     /// Leader side: build the receipt-inclusion proof for each `(node_id,
-    /// weight)` in `weights`, from the **source block's full receipt list**
-    /// (`source_receipts`, an `eth_getBlockReceipts` result for the source EVM
-    /// block — the proposed block's parent under the 1-block lag).
-    ///
-    /// For each weight delta we find the receipt(s) carrying a staking/slashing
-    /// log for that `node_id`, build the block's receipt trie with a
-    /// [`ProofRetainer`] targeting that receipt's key, and retain the root→leaf
-    /// proof. A weight delta with no matching log in the source block gets **no**
-    /// proof entry (an honest leader never produces one — a delta is always
-    /// derived from a log; if reth's receipts are unexpectedly missing it, the
-    /// proof is simply absent and the voter falls back to commit-time detection
-    /// for that delta, never a spurious reject).
-    pub fn generate(weights: &[(NodeId, u64)], source_receipts: &Value) -> Result<Self> {
-        if weights.is_empty() {
-            return Ok(Self::default());
-        }
-        let receipts = parse_block_receipts(source_receipts)?;
-        // Pre-encode every receipt to its 2718 consensus bytes — both the trie
-        // leaves and the carried `receipt_2718` use this exact encoding.
-        let encoded: Vec<Vec<u8>> = receipts.iter().map(|r| r.encoded_2718()).collect();
-
+    /// weight)` in `weights`, all from a single source block's receipts
+    /// (`source_receipts`, an `eth_getBlockReceipts` result) anchored at
+    /// `anchor_block` (the source block's boule hash). Convenience wrapper for
+    /// the common case where every delta's log is in the same block — the leader
+    /// path that anchors deltas to different recent blocks uses
+    /// [`WeightProof::generate_one`] directly.
+    pub fn generate(
+        weights: &[(NodeId, u64)],
+        anchor_block: BlockHash,
+        source_receipts: &Value,
+    ) -> Result<Self> {
         let mut proofs = Vec::new();
         for &(node_id, weight) in weights {
-            // The first receipt that carries a staking/slashing log for this
-            // node is the backing receipt. (A node has at most one weight-
-            // affecting receipt per block in the toy model; the first match is
-            // canonical.)
-            let Some(idx) = receipts
-                .iter()
-                .position(|r| receipt_has_log_for(r, &node_id))
-            else {
-                // No backing log in this block's receipts — leave it unproven
-                // (commit-time detection covers it). Honest leaders don't hit
-                // this; it guards against a transient receipt-fetch gap.
-                continue;
-            };
-            let proof_nodes = build_receipt_proof(&encoded, idx)?;
-            proofs.push(WeightProof {
-                node_id,
-                weight,
-                receipt_index: idx as u32,
-                receipt_2718: encoded[idx].clone(),
-                proof_nodes,
-            });
+            if let Some(p) =
+                WeightProof::generate_one(node_id, weight, anchor_block, source_receipts)?
+            {
+                proofs.push(p);
+            }
         }
         Ok(Self { proofs })
     }
 
-    /// Voter side: verify the whole proof set against the **parent block's
-    /// `receiptsRoot`** (the 1-block-lag anchor), then re-derive each delta and
-    /// check it against the claimed `extra_data` weights.
+    /// Voter side: verify the whole proof set, anchoring each carried proof to
+    /// the **source block it names** (resolved via `resolve`) and re-deriving
+    /// each delta against the claimed `extra_data` weights.
     ///
     /// `claimed_weights` is the `(node_id, weight)` set the proposal's
-    /// `extra_data` actually carries (decoded by the caller). `parent_receipts_root`
-    /// is read from the committed parent's execution payload. Returns `Ok(())`
-    /// only if **every** claimed weight is soundly accounted for at vote time
-    /// (proven-and-consistent, or a documented not-vote-time-verifiable case that
-    /// is explicitly deferred to commit); `Err` (→ refuse to vote) on any
-    /// forgery a voter can detect here.
-    pub fn verify_against_parent(
+    /// `extra_data` carries. `carrier_height` is the proposed block's height (the
+    /// block carrying the weights). `resolve(anchor_block)` returns the named
+    /// source block's `(receiptsRoot, height)` if the voter holds it, else
+    /// `None`.
+    ///
+    /// Returns `Ok(())` only if **every** claimed weight is soundly accounted for
+    /// at vote time. `Err` (→ refuse to vote) on any forgery a voter can detect:
+    /// a missing/invalid proof, a wrong-node proof, an amount/consistency
+    /// mismatch, or a named source that is **unresolvable or outside the recent
+    /// anchor window** ([`MAX_WEIGHT_PROOF_ANCHOR_LAG`]) — the "too far back"
+    /// excuse #797 closes. An honest weight's source is always a recent block the
+    /// voter still holds, so an honest leader is never rejected.
+    pub fn verify_against_recent(
         &self,
         claimed_weights: &[(NodeId, u64)],
-        parent_receipts_root: [u8; 32],
+        carrier_height: Height,
+        resolve: &SourceResolver<'_>,
     ) -> Result<()> {
-        let root = B256::from(parent_receipts_root);
-
-        // Every carried proof must verify against the parent's receiptsRoot and
-        // its proven logs must be for the claimed node — a proof that doesn't
-        // anchor here is either a forgery or a self-synced-gap source (handled
-        // per-claim below), so we don't hard-fail the *set*, but we only treat a
-        // proof as backing a claim once it has verified.
         for claim in claimed_weights {
             let (node_id, weight) = *claim;
-            // Find a carried proof for this exact node that verifies against the
-            // parent's receiptsRoot.
-            let mut backed = false;
-            for p in self.proofs.iter().filter(|p| p.node_id == node_id) {
-                if p.weight != weight {
-                    // A proof that proves a *different* claimed amount than the
-                    // `extra_data` carries is a forgery attempt — reject.
-                    bail!(
-                        "weight proof for {} claims weight {} but extra_data carries {}; \
-                         refusing to vote (#797)",
-                        hex::encode(node_id),
-                        p.weight,
-                        weight,
-                    );
-                }
-                match verify_one(p, root) {
-                    Ok(logs) => {
-                        check_weight_consistent_with_logs(node_id, weight, &logs)?;
-                        backed = true;
-                        break;
-                    }
-                    Err(VerifyOutcome::WrongAnchor) => {
-                        // Proof doesn't anchor to the parent's receiptsRoot — the
-                        // self-synced-gap fallback: not vote-time-verifiable, so
-                        // leave this claim to commit-time detection rather than
-                        // reject an honest leader. Keep scanning for a proof that
-                        // *does* anchor (there usually is none in the gap case).
-                    }
-                    Err(VerifyOutcome::Invalid(e)) => return Err(e),
-                }
+            // Find a carried proof for this exact node.
+            let Some(p) = self.proofs.iter().find(|p| p.node_id == node_id) else {
+                bail!(
+                    "weight delta for {} (claimed {}) carries no receipt proof — a forged \
+                     weight invented from nothing; refusing to vote (#797)",
+                    hex::encode(node_id),
+                    weight,
+                );
+            };
+            if p.weight != weight {
+                // A proof that proves a *different* claimed amount than the
+                // `extra_data` carries is a forgery attempt — reject.
+                bail!(
+                    "weight proof for {} claims weight {} but extra_data carries {}; \
+                     refusing to vote (#797)",
+                    hex::encode(node_id),
+                    p.weight,
+                    weight,
+                );
             }
-            if !backed {
-                // No parent-anchored proof backed this claim. Either the leader
-                // forged a weight with no real log (the attack — there is no
-                // proof to anchor), or this is the self-synced-gap case where the
-                // source is below the parent. We cannot distinguish the two at
-                // vote time without the source block, so to avoid an honest-
-                // rejects-honest hole we DEFER to commit-time detection — UNLESS
-                // the leader carried a proof for this node that failed to anchor,
-                // which only happens in the gap case. A forged-from-nothing
-                // weight carries no proof at all and lands here too; it is then
-                // caught at commit. This matches the design's documented
-                // prevented (parent-anchored) vs. detected (gap / unproven) split.
-                //
-                // To keep the COMMON path strictly prevented we require: if the
-                // proposal carries ANY parent-anchored proof at all (i.e. it is a
-                // normal 1-block-lag block, not a gap-closing commit), then every
-                // claimed weight MUST be parent-anchored. A leader cannot mix a
-                // real proof with a forged-unproven weight.
-                if self.any_parent_anchored(root) {
-                    bail!(
-                        "weight delta for {} (claimed {}) carries no parent-anchored receipt \
-                         proof, but this block proves other weights against the parent — a \
-                         forged weight; refusing to vote (#797)",
-                        hex::encode(node_id),
-                        weight,
-                    );
-                }
+            // Resolve the source block this proof names. An unresolvable source is
+            // a forged "too far back" anchor (an honest source is always held).
+            let Some((root, src_height)) = resolve(&p.anchor_block) else {
+                bail!(
+                    "weight delta for {} (claimed {}) names source block {} the voter does not \
+                     hold — a forged or too-far-back anchor; refusing to vote (#797)",
+                    hex::encode(node_id),
+                    weight,
+                    hex::encode(p.anchor_block),
+                );
+            };
+            // The source must be within the recent anchor window: at/below the
+            // carrier and no more than MAX_WEIGHT_PROOF_ANCHOR_LAG links back.
+            // (Resolving it already proves we hold it, but a leader could name a
+            // genuinely-old held block to dodge the freshness intent; pin it.)
+            if src_height.0 >= carrier_height.0
+                || carrier_height.0 - src_height.0 > MAX_WEIGHT_PROOF_ANCHOR_LAG
+            {
+                bail!(
+                    "weight delta for {} (claimed {}) anchors to height {} but the carrier is at \
+                     {} (window {}); refusing to vote (#797)",
+                    hex::encode(node_id),
+                    weight,
+                    src_height.0,
+                    carrier_height.0,
+                    MAX_WEIGHT_PROOF_ANCHOR_LAG,
+                );
             }
+            // Verify the inclusion proof against the named source's receiptsRoot
+            // and re-derive the weight from the proven log(s).
+            let logs = verify_one(p, B256::from(root))?;
+            check_weight_consistent_with_logs(node_id, weight, &logs)?;
         }
         Ok(())
-    }
-
-    /// Whether any carried proof verifies against `root` — used to decide if this
-    /// is a normal parent-anchored block (where every weight must be proven) vs.
-    /// a self-synced-gap block (deferred to commit detection).
-    fn any_parent_anchored(&self, root: B256) -> bool {
-        self.proofs.iter().any(|p| verify_one(p, root).is_ok())
     }
 
     /// Encode the proof set into the dedicated block-command bytes (see the
@@ -286,7 +324,7 @@ impl WeightProofSet {
     ///
     /// ```text
     /// magic[4]="WPR1" | version[1]=1 | proof_count u32 BE |
-    ///   { node_id[32] | weight u64 BE | receipt_index u32 BE |
+    ///   { node_id[32] | weight u64 BE | anchor_block[32] | receipt_index u32 BE |
     ///     receipt_len u32 BE | receipt_2718[receipt_len] |
     ///     node_count u32 BE | { node_len u32 BE | node[node_len] } * } *
     /// ```
@@ -298,6 +336,7 @@ impl WeightProofSet {
         for p in &self.proofs {
             out.extend_from_slice(&p.node_id);
             out.extend_from_slice(&p.weight.to_be_bytes());
+            out.extend_from_slice(&p.anchor_block);
             out.extend_from_slice(&p.receipt_index.to_be_bytes());
             out.extend_from_slice(&(p.receipt_2718.len() as u32).to_be_bytes());
             out.extend_from_slice(&p.receipt_2718);
@@ -332,6 +371,7 @@ impl WeightProofSet {
         for _ in 0..count {
             let node_id: NodeId = c.take(32)?.try_into().ok()?;
             let weight = u64::from_be_bytes(c.take(8)?.try_into().ok()?);
+            let anchor_block: BlockHash = c.take(32)?.try_into().ok()?;
             let receipt_index = u32::from_be_bytes(c.take(4)?.try_into().ok()?);
             let receipt_len = u32::from_be_bytes(c.take(4)?.try_into().ok()?) as usize;
             let receipt_2718 = c.take(receipt_len)?.to_vec();
@@ -344,6 +384,7 @@ impl WeightProofSet {
             proofs.push(WeightProof {
                 node_id,
                 weight,
+                anchor_block,
                 receipt_index,
                 receipt_2718,
                 proof_nodes,
@@ -356,62 +397,39 @@ impl WeightProofSet {
     }
 }
 
-/// The outcome of verifying a single proof against a candidate root.
-enum VerifyOutcome {
-    /// The proof's first/root node doesn't match the candidate root — the proof
-    /// is for a *different* `receiptsRoot` (e.g. the self-synced-gap source), not
-    /// necessarily a forgery.
-    WrongAnchor,
-    /// The proof is malformed or doesn't prove its claimed receipt under the root
-    /// — a forgery a voter must reject.
-    Invalid(anyhow::Error),
-}
-
-/// Verify one [`WeightProof`] against `root`: the MPT inclusion of the receipt
-/// at `receipt_index` (keyed `rlp(index)`) with value `receipt_2718`, then
-/// recover the proven staking/slashing logs for `node_id`. On success returns
-/// those logs (decoded `Log`s for the node); on failure distinguishes a wrong
-/// anchor (gap fallback) from a genuine invalid proof.
-fn verify_one(p: &WeightProof, root: B256) -> std::result::Result<Vec<Log>, VerifyOutcome> {
-    // Anchor check: the first proof node must hash to `root`. alloy's
-    // `verify_proof` already enforces this, but we want to tell "wrong root"
-    // (gap) apart from "tampered proof" (forgery), so probe the root match.
-    let root_word = alloy_trie::nodes::RlpNode::word_rlp(&root);
-    let anchors = p
-        .proof_nodes
-        .first()
-        .map(|n| alloy_trie::nodes::RlpNode::from_rlp(n).as_slice() == root_word.as_slice())
-        .unwrap_or(false);
-
+/// Verify one [`WeightProof`] against `root` (the named source block's
+/// `receiptsRoot`): the MPT inclusion of the receipt at `receipt_index` (keyed
+/// `rlp(index)`) with value `receipt_2718`, then recover the proven staking/
+/// slashing logs for `node_id`. On success returns those logs; `Err` (→ reject)
+/// on a tampered/malformed proof or a receipt with no log for the node.
+fn verify_one(p: &WeightProof, root: B256) -> Result<Vec<Log>> {
     let key = receipt_trie_key(p.receipt_index);
     let proof_iter: Vec<AlloyBytes> = p
         .proof_nodes
         .iter()
         .map(|n| AlloyBytes::copy_from_slice(n))
         .collect();
-    let res = verify_proof(root, key, Some(p.receipt_2718.clone()), proof_iter.iter());
-    if let Err(e) = res {
-        if !anchors {
-            return Err(VerifyOutcome::WrongAnchor);
-        }
-        return Err(VerifyOutcome::Invalid(anyhow::anyhow!(
-            "receipt-trie inclusion proof failed for {} at index {}: {e}",
+    verify_proof(root, key, Some(p.receipt_2718.clone()), proof_iter.iter()).map_err(|e| {
+        anyhow::anyhow!(
+            "receipt-trie inclusion proof failed for {} at index {} against the named source's \
+             receiptsRoot: {e}; refusing to vote (#797)",
             hex::encode(p.node_id),
             p.receipt_index,
-        )));
-    }
+        )
+    })?;
 
     // The proven receipt is authentic — decode it and pull the node's logs.
-    let logs = decode_receipt_logs(&p.receipt_2718).map_err(VerifyOutcome::Invalid)?;
+    let logs = decode_receipt_logs(&p.receipt_2718)?;
     let node_logs: Vec<Log> = logs
         .into_iter()
         .filter(|l| log_is_for(l, &p.node_id))
         .collect();
     if node_logs.is_empty() {
-        return Err(VerifyOutcome::Invalid(anyhow::anyhow!(
-            "proven receipt for {} carries no staking/slashing log for that node",
+        bail!(
+            "proven receipt for {} carries no staking/slashing log for that node; \
+             refusing to vote (#797)",
             hex::encode(p.node_id),
-        )));
+        );
     }
     Ok(node_logs)
 }
@@ -822,9 +840,33 @@ mod tests {
         }
     }
 
-    /// **Honest 1-block-lag block validates.** A Deposit of 5 for node 7 in the
-    /// parent block yields a seated weight of 5; the leader carries a proof, and
-    /// `verify_against_parent` accepts it against the parent's `receiptsRoot`.
+    /// The boule hash + height of the (single) source block in these tests; the
+    /// carrier is one above it, so the lag is the common 1.
+    const SRC_HASH: BlockHash = [0xABu8; 32];
+    const SRC_HEIGHT: Height = Height(100);
+    const CARRIER_HEIGHT: Height = Height(101);
+
+    /// A `resolve` closure mapping `SRC_HASH` → `(root, SRC_HEIGHT)` and every
+    /// other hash → `None` (not held). The common case: one held source block.
+    fn resolve_src(root: [u8; 32]) -> impl Fn(&BlockHash) -> Option<([u8; 32], Height)> {
+        move |h: &BlockHash| {
+            if *h == SRC_HASH {
+                Some((root, SRC_HEIGHT))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Generate a proof set anchored at `SRC_HASH`.
+    fn gen_set(weights: &[(NodeId, u64)], receipts: &Value) -> WeightProofSet {
+        WeightProofSet::generate(weights, SRC_HASH, receipts).unwrap()
+    }
+
+    /// **Honest block validates (1-block lag).** A Deposit of 5 for node 7 in the
+    /// source block yields a seated weight of 5; the leader carries a proof naming
+    /// the source, and `verify_against_recent` accepts it against the source's
+    /// `receiptsRoot`.
     #[test]
     fn honest_deposit_proof_verifies() {
         let node = [7u8; 32];
@@ -832,17 +874,76 @@ mod tests {
         let root = receipts_root(&receipts);
         let weights = vec![(node, 5u64)];
 
-        let set = WeightProofSet::generate(&weights, &receipts).unwrap();
+        let set = gen_set(&weights, &receipts);
         assert_eq!(set.proofs.len(), 1);
-        set.verify_against_parent(&weights, root)
-            .expect("honest deposit proof verifies against the parent receiptsRoot");
+        set.verify_against_recent(&weights, CARRIER_HEIGHT, &resolve_src(root))
+            .expect("honest deposit proof verifies against the source receiptsRoot");
+    }
+
+    /// **Honest multi-block lag validates (the liveness bar).** A delta whose
+    /// source is 3 blocks back (a legitimate commit-depth lag) names that source;
+    /// the voter still holds it (within the window) and the proof verifies — it is
+    /// NOT rejected as "too far back".
+    #[test]
+    fn honest_multi_block_lag_proof_verifies() {
+        let node = [7u8; 32];
+        let receipts = json!([deposit_receipt(7, 5)]);
+        let root = receipts_root(&receipts);
+        let weights = vec![(node, 5u64)];
+        let set = gen_set(&weights, &receipts);
+
+        // Carrier 3 blocks above the source (within MAX_WEIGHT_PROOF_ANCHOR_LAG).
+        let carrier = Height(SRC_HEIGHT.0 + 3);
+        set.verify_against_recent(&weights, carrier, &resolve_src(root))
+            .expect("a 3-block-lag weight with a valid proof to its held source verifies");
+    }
+
+    /// **The gap-excuse exploit — a weight whose source is not held is REJECTED,
+    /// not deferred.** A Byzantine leader claims a weight backed by a proof naming
+    /// a source block the voter does not hold (the "too far back to verify"
+    /// excuse). It is rejected at vote time.
+    #[test]
+    fn unheld_source_anchor_is_rejected() {
+        let node = [7u8; 32];
+        let receipts = json!([deposit_receipt(7, 5)]);
+        // The proof names a source the resolver never returns.
+        let set = WeightProofSet::generate(&[(node, 5u64)], [0xCDu8; 32], &receipts).unwrap();
+        let claimed = vec![(node, 5u64)];
+        // resolve_src only knows SRC_HASH; the proof's [0xCD;32] anchor is unheld.
+        let err = set
+            .verify_against_recent(&claimed, CARRIER_HEIGHT, &resolve_src([0u8; 32]))
+            .expect_err("a weight naming an unheld source must be rejected, not deferred");
+        assert!(
+            err.to_string().contains("the voter does not hold"),
+            "rejected for the right reason: {err}",
+        );
+    }
+
+    /// **A source older than the anchor window is rejected.** Even if the voter
+    /// holds the named source, a leader naming one beyond
+    /// `MAX_WEIGHT_PROOF_ANCHOR_LAG` is rejected (the freshness bound).
+    #[test]
+    fn too_far_back_source_is_rejected() {
+        let node = [7u8; 32];
+        let receipts = json!([deposit_receipt(7, 5)]);
+        let root = receipts_root(&receipts);
+        let set = gen_set(&[(node, 5u64)], &receipts);
+        let claimed = vec![(node, 5u64)];
+        // Carrier well beyond the window above the held source.
+        let carrier = Height(SRC_HEIGHT.0 + MAX_WEIGHT_PROOF_ANCHOR_LAG + 5);
+        let err = set
+            .verify_against_recent(&claimed, carrier, &resolve_src(root))
+            .expect_err("a source beyond the anchor window must be rejected");
+        assert!(
+            err.to_string().contains("window"),
+            "rejected for the right reason: {err}",
+        );
     }
 
     /// **The exploit (forged-from-nothing).** A Byzantine leader claims a weight
-    /// for node 9 that has NO staking/slashing log in the parent block, and
-    /// (being honest about the other delta) DOES prove node 7's. Because the
-    /// block carries a parent-anchored proof, every claimed weight must be
-    /// proven — the unbacked forgery is rejected at vote time.
+    /// for node 9 that has NO staking/slashing log in any held block, alongside an
+    /// honest proven weight. The unbacked forgery carries no proof and is rejected
+    /// at vote time.
     #[test]
     fn forged_weight_with_no_proof_is_rejected() {
         let real = [7u8; 32];
@@ -853,14 +954,14 @@ mod tests {
         // extra_data claims both the real (7→5) and a forged (9→1000) weight.
         let claimed = vec![(real, 5u64), (forged, 1000u64)];
         // The leader can only prove the real one (9 has no log).
-        let set = WeightProofSet::generate(&claimed, &receipts).unwrap();
+        let set = gen_set(&claimed, &receipts);
         assert_eq!(set.proofs.len(), 1, "only node 7 has a backing log");
 
         let err = set
-            .verify_against_parent(&claimed, root)
+            .verify_against_recent(&claimed, CARRIER_HEIGHT, &resolve_src(root))
             .expect_err("a forged weight with no receipt proof must be rejected");
         assert!(
-            err.to_string().contains("no parent-anchored receipt proof"),
+            err.to_string().contains("carries no receipt proof"),
             "rejected for the right reason: {err}",
         );
     }
@@ -875,11 +976,11 @@ mod tests {
         let root = receipts_root(&receipts);
 
         // The leader builds a proof asserting weight 5 (the real delta)…
-        let set = WeightProofSet::generate(&[(node, 5u64)], &receipts).unwrap();
+        let set = gen_set(&[(node, 5u64)], &receipts);
         // …but the extra_data claims weight 1 for the same node.
         let claimed = vec![(node, 1u64)];
         let err = set
-            .verify_against_parent(&claimed, root)
+            .verify_against_recent(&claimed, CARRIER_HEIGHT, &resolve_src(root))
             .expect_err("proof amount disagreeing with extra_data must be rejected");
         assert!(
             err.to_string()
@@ -900,9 +1001,9 @@ mod tests {
         // Both the proof and extra_data claim weight 1, but the proven deposit is
         // 100 — the seated weight cannot be below it.
         let claimed = vec![(node, 1u64)];
-        let set = WeightProofSet::generate(&claimed, &receipts).unwrap();
+        let set = gen_set(&claimed, &receipts);
         let err = set
-            .verify_against_parent(&claimed, root)
+            .verify_against_recent(&claimed, CARRIER_HEIGHT, &resolve_src(root))
             .expect_err("claimed weight below the proven deposit sum must be rejected");
         assert!(
             err.to_string().contains("proven deposits total 100"),
@@ -921,16 +1022,16 @@ mod tests {
 
         // Honest: a slash → weight 0, accepted.
         let ok = vec![(node, 0u64)];
-        let set_ok = WeightProofSet::generate(&ok, &receipts).unwrap();
+        let set_ok = gen_set(&ok, &receipts);
         set_ok
-            .verify_against_parent(&ok, root)
+            .verify_against_recent(&ok, CARRIER_HEIGHT, &resolve_src(root))
             .expect("a slash → weight 0 verifies");
 
         // Forged: claim a non-zero weight off a Slashed log.
         let bad = vec![(node, 50u64)];
-        let set_bad = WeightProofSet::generate(&bad, &receipts).unwrap();
+        let set_bad = gen_set(&bad, &receipts);
         let err = set_bad
-            .verify_against_parent(&bad, root)
+            .verify_against_recent(&bad, CARRIER_HEIGHT, &resolve_src(root))
             .expect_err("a non-zero weight off a Slashed must be rejected");
         assert!(
             err.to_string().contains("pins the seated weight to 0"),
@@ -938,41 +1039,44 @@ mod tests {
         );
     }
 
-    /// **Wrong-root proof (forged receiptsRoot / wrong anchor) does not back a
-    /// claim.** A proof generated against one block's receipts, checked against a
-    /// DIFFERENT root, fails to anchor; with a parent-anchored sibling proof
-    /// present the unbacked claim is rejected.
+    /// **A tampered proof under the named source's real root is rejected.** A
+    /// flipped byte in the target receipt makes the leaf mismatch under the
+    /// correctly-named source `receiptsRoot` → reject (a forgery).
     #[test]
-    fn proof_against_wrong_root_does_not_anchor() {
+    fn tampered_proof_under_real_root_is_rejected() {
         let node = [7u8; 32];
-        let other = [8u8; 32];
         let receipts = json!([deposit_receipt(7, 5), deposit_receipt(8, 9)]);
         let root = receipts_root(&receipts);
-        // A proof set proving both nodes against the real root.
-        let claimed = vec![(node, 5u64), (other, 9u64)];
-        let set = WeightProofSet::generate(&claimed, &receipts).unwrap();
-        // Verify against a corrupted root: nothing anchors, and since no proof
-        // anchors, we DEFER (gap fallback) rather than reject — both claims fall
-        // to commit detection. This must NOT panic / falsely accept a forgery as
-        // proven.
-        let mut bad_root = root;
-        bad_root[0] ^= 0xff;
-        set.verify_against_parent(&claimed, bad_root)
-            .expect("a wholly-unanchored set defers to commit detection (gap fallback)");
-        // But against the real root, both anchor and verify.
-        set.verify_against_parent(&claimed, root)
-            .expect("both proofs anchor and verify against the real root");
+        let mut set = gen_set(&[(node, 5u64), ([8u8; 32], 9u64)], &receipts);
+        // Tamper node 7's proven receipt bytes; the proof anchors to the named
+        // source's root but the leaf no longer matches.
+        let idx = set.proofs.iter().position(|p| p.node_id == node).unwrap();
+        set.proofs[idx].receipt_2718[5] ^= 0xff;
+        let err = set
+            .verify_against_recent(
+                &[(node, 5u64), ([8u8; 32], 9u64)],
+                CARRIER_HEIGHT,
+                &resolve_src(root),
+            )
+            .expect_err("a tampered receipt under the real root must be rejected");
+        assert!(
+            err.to_string().contains("inclusion proof failed"),
+            "rejected for a proof reason: {err}",
+        );
     }
 
-    /// The proof-set codec round-trips and rejects malformed blobs.
+    /// The proof-set codec round-trips (including the anchor block) and rejects
+    /// malformed blobs.
     #[test]
     fn codec_roundtrips_and_rejects_garbage() {
         let node = [7u8; 32];
         let receipts = json!([deposit_receipt(7, 5)]);
-        let set = WeightProofSet::generate(&[(node, 5u64)], &receipts).unwrap();
+        let set = gen_set(&[(node, 5u64)], &receipts);
         let bytes = set.encode();
         assert!(WeightProofSet::is_weight_proof_command(&bytes));
-        assert_eq!(WeightProofSet::decode(&bytes), Some(set));
+        let decoded = WeightProofSet::decode(&bytes).unwrap();
+        assert_eq!(decoded, set);
+        assert_eq!(decoded.proofs[0].anchor_block, SRC_HASH);
 
         assert_eq!(WeightProofSet::decode(b"reth/v2.2.0"), None);
         assert_eq!(WeightProofSet::decode(&[]), None);
@@ -983,32 +1087,6 @@ mod tests {
         assert_eq!(
             WeightProofSet::decode(&WeightProofSet::default().encode()),
             Some(WeightProofSet::default()),
-        );
-    }
-
-    /// **A tampered proof in a multi-receipt block is rejected at vote time, not
-    /// deferred.** With a sibling honest receipt present the root is a real
-    /// branch node, so a flipped byte in the target receipt makes the leaf
-    /// mismatch *under* the correctly-anchored root → `Invalid` → reject (a
-    /// forgery), distinct from a wrong-root gap proof.
-    #[test]
-    fn tampered_proof_under_real_root_is_rejected() {
-        let node = [7u8; 32];
-        let receipts = json!([deposit_receipt(7, 5), deposit_receipt(8, 9)]);
-        let root = receipts_root(&receipts);
-        let mut set =
-            WeightProofSet::generate(&[(node, 5u64), ([8u8; 32], 9u64)], &receipts).unwrap();
-        // Tamper node 7's proven receipt bytes; the proof still anchors (the root
-        // branch node is intact) but the leaf no longer matches.
-        let idx = set.proofs.iter().position(|p| p.node_id == node).unwrap();
-        set.proofs[idx].receipt_2718[5] ^= 0xff;
-        let err = set
-            .verify_against_parent(&[(node, 5u64), ([8u8; 32], 9u64)], root)
-            .expect_err("a tampered receipt under the real root must be rejected");
-        assert!(
-            err.to_string().contains("inclusion proof failed")
-                || err.to_string().contains("no parent-anchored"),
-            "rejected for a proof reason: {err}",
         );
     }
 }
