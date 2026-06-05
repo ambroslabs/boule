@@ -89,6 +89,23 @@ pub struct RethApplication {
     /// Keyed by validator so a later delta for the same validator supersedes an
     /// earlier pending one (the absolute weight is what the EL applies).
     pending_weights: Mutex<std::collections::BTreeMap<NodeId, u64>>,
+    /// Recently-committed `(boule block hash, EVM block hash)` pairs, newest
+    /// last, bounded to a small ring (#803). Populated on every `commit`.
+    ///
+    /// The #797 weight-proof anchor (a delta's backing staking/slashing log)
+    /// lives in a RECENT source block, but a single deposit can sit pending for
+    /// several views before its carrier block commits (it shares the block with
+    /// a rotation, or the carrier's view loses leadership), by which time the
+    /// SOURCE block has dropped below the committed frontier. The build-side
+    /// candidate window built only from `pending_blocks` stops at the committed
+    /// frontier, so it could no longer reach a just-committed source — the leader
+    /// then attached no proof and every voter rejected the (real) weight,
+    /// **livelocking the chain** (the multi-validator bug #803). The voter CAN
+    /// still resolve such a source (its `RecentBlocks` falls back to the durable
+    /// block store), so the fix is to let the LEADER name + prove it: this ring
+    /// extends the candidate window [`crate::weight_proof::MAX_WEIGHT_PROOF_ANCHOR_LAG`]
+    /// blocks below the committed frontier too.
+    recent_committed: Mutex<std::collections::VecDeque<(BlockHash, String)>>,
 }
 
 impl RethApplication {
@@ -120,6 +137,7 @@ impl RethApplication {
             stake_source: Mutex::new(stake_source),
             mempool,
             pending_weights: Mutex::new(std::collections::BTreeMap::new()),
+            recent_committed: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -412,6 +430,20 @@ impl RethApplication {
                     continue 'delta;
                 }
             }
+            // No candidate in the window carried this delta's backing log. An
+            // honest delta always has a recent source block, so this means the
+            // source has aged out of the candidate window (or the candidate set
+            // is too narrow) — the voter will reject the unproven weight (#797),
+            // stalling liveness. Surface it loudly with the window we searched so
+            // the gap is diagnosable rather than a silent empty proof set.
+            tracing::warn!(
+                target: "boule::reth",
+                validator = %hex::encode(node_id),
+                weight,
+                candidate_blocks = candidates.len(),
+                "weight proof: NO backing receipt found for delta across the source-candidate \
+                 window; voters will reject this weight (#797) — liveness risk",
+            );
         }
         Ok(crate::weight_proof::WeightProofSet { proofs })
     }
@@ -507,6 +539,64 @@ impl RethApplication {
     /// `eth_getLogs` is logged and yields no updates for that category — a
     /// transient RPC error must not fail the commit (consensus commits
     /// regardless of the EL).
+    /// Bounded-retry `eth_getLogs` for the validator-set-delta reads
+    /// (staking / slashing / predeploy effects) in `commit` (#803).
+    ///
+    /// The [`crate::transport::HttpTransport`] already retries a *transient* transport blip
+    /// (connection reset, brief 5xx) under the hood; this layer adds a second,
+    /// slower retry ring specifically for `eth_getLogs` over reth's log index,
+    /// which can lag the freshly-`forkchoiceUpdated` head by a beat even after
+    /// the payload is `VALID` (the receipts/log index is built slightly behind
+    /// the canonical head). A first call can legitimately return *zero* logs for
+    /// a block that does have them simply because the index hasn't caught up —
+    /// indistinguishable from a real empty block, so we cannot retry on
+    /// "empty". We therefore only retry on an outright *error*, and rely on the
+    /// transport's own per-call retry to ride out the index lag.
+    ///
+    /// On exhaustion this does **not** silently return empty: it logs a loud
+    /// `BFT-SAFETY` alert (a dropped validator-set delta on a subset of nodes is
+    /// a registry divergence / safety split, #772/#797) and returns the error to
+    /// the caller, which decides whether the category is correctness-critical
+    /// (predeploy effects → must backfill) or best-effort (a transient staking
+    /// read the next block's height-advance still tolerates).
+    async fn get_logs_retry(&self, filter: Value, kind: &str) -> Result<Value> {
+        // A short, bounded ring on top of the transport's own retry. Total added
+        // wall is ~0.7s worst case — enough for the log index to settle, short
+        // enough not to stall commit.
+        const ATTEMPTS: u32 = 4;
+        const BASE: Duration = Duration::from_millis(80);
+        let mut last_err = None;
+        for attempt in 0..ATTEMPTS {
+            match self.transport.eth_rpc("eth_getLogs", filter.clone()).await {
+                Ok(logs) => return Ok(logs),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "boule::reth",
+                        kind,
+                        attempt = attempt + 1,
+                        max_attempts = ATTEMPTS,
+                        error = %e,
+                        "eth_getLogs failed; retrying (validator-set deltas must not be dropped)",
+                    );
+                    last_err = Some(e);
+                    if attempt + 1 < ATTEMPTS {
+                        let wait = BASE.saturating_mul(1 << attempt);
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+            }
+        }
+        let err = last_err.unwrap_or_else(|| anyhow::anyhow!("eth_getLogs exhausted retries"));
+        tracing::error!(
+            target: "boule::reth",
+            kind,
+            error = %err,
+            "BFT-SAFETY: eth_getLogs for validator-set deltas FAILED after all retries; \
+             this node may drop a delta others applied — registry divergence risk (#803/#772)",
+        );
+        Err(err)
+    }
+
     async fn derive_validator_updates(
         &self,
         payload: &Value,
@@ -517,19 +607,13 @@ impl RethApplication {
         // still advances so unbondings mature, #660).
         let ops = match block_hash {
             Some(block_hash) => match self
-                .transport
-                .eth_rpc("eth_getLogs", staking::logs_filter(block_hash))
+                .get_logs_retry(staking::logs_filter(block_hash), "staking")
                 .await
             {
                 Ok(logs) => staking::parse_stake_logs(&logs),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "boule::reth",
-                        error = %e,
-                        "eth_getLogs for staking events failed; no staking ops this block",
-                    );
-                    Vec::new()
-                }
+                // Exhausted retries already logged a BFT-SAFETY alert; the height
+                // still advances so unbondings mature (#660).
+                Err(_) => Vec::new(),
             },
             None => Vec::new(),
         };
@@ -538,19 +622,11 @@ impl RethApplication {
         // the penalty here, burning the equivocator's bonded stake (#658b).
         let slashed = match block_hash {
             Some(block_hash) => match self
-                .transport
-                .eth_rpc("eth_getLogs", slashing::logs_filter(block_hash))
+                .get_logs_retry(slashing::logs_filter(block_hash), "slashing")
                 .await
             {
                 Ok(logs) => slashing::parse_slashed_logs(&logs),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "boule::reth",
-                        error = %e,
-                        "eth_getLogs for slashing events failed; no slashes this block",
-                    );
-                    Vec::new()
-                }
+                Err(_) => Vec::new(),
             },
             None => Vec::new(),
         };
@@ -604,17 +680,14 @@ impl RethApplication {
         kind: &str,
     ) -> Vec<ValidatorEffect> {
         let _ = block_hash; // the filter already embeds it; kept for symmetry
-        let logs = match self.transport.eth_rpc("eth_getLogs", filter).await {
+        let logs = match self.get_logs_retry(filter, kind).await {
             Ok(logs) => logs,
-            Err(e) => {
-                tracing::warn!(
-                    target: "boule::reth",
-                    error = %e,
-                    kind,
-                    "eth_getLogs for predeploy events failed; no effects this block",
-                );
-                return Vec::new();
-            }
+            // Exhausted retries already logged a BFT-SAFETY alert. A predeploy
+            // effect (Reconfig/rotation/endpoint/param/governance) is emitted
+            // once per proposal with no re-submit, so dropping it here on a
+            // subset of nodes is a silent validator-set divergence — the alert
+            // is the operator's signal to intervene.
+            Err(_) => return Vec::new(),
         };
         parse(&logs).into_iter().map(wrap).collect()
     }
@@ -753,40 +826,24 @@ impl RethApplication {
             // Staking + slashing → the CL stake ledger (drained by the current
             // block's derive_validator_updates, alongside this block's deltas).
             let ops = match self
-                .transport
-                .eth_rpc("eth_getLogs", staking::logs_filter_by_number(evm_number))
+                .get_logs_retry(
+                    staking::logs_filter_by_number(evm_number),
+                    "staking (self-sync gap)",
+                )
                 .await
             {
                 Ok(logs) => staking::parse_stake_logs(&logs),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "boule::reth",
-                        height = h,
-                        evm_number,
-                        error = %e,
-                        "self-sync backfill: eth_getLogs failed; staking events for \
-                         this skipped block are lost",
-                    );
-                    Vec::new()
-                }
+                Err(_) => Vec::new(),
             };
             let slashed = match self
-                .transport
-                .eth_rpc("eth_getLogs", slashing::logs_filter_by_number(evm_number))
+                .get_logs_retry(
+                    slashing::logs_filter_by_number(evm_number),
+                    "slashing (self-sync gap)",
+                )
                 .await
             {
                 Ok(logs) => slashing::parse_slashed_logs(&logs),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "boule::reth",
-                        height = h,
-                        evm_number,
-                        error = %e,
-                        "self-sync backfill: eth_getLogs failed; slashing events for \
-                         this skipped block are lost",
-                    );
-                    Vec::new()
-                }
+                Err(_) => Vec::new(),
             };
             {
                 let mut src = self.stake_source.lock();
@@ -991,15 +1048,16 @@ fn weight_proof_source_candidates(
     pending_blocks: &HashMap<BlockHash, Block>,
     committed_height: Height,
     parent_evm_hash: String,
+    recent_committed: &std::collections::VecDeque<(BlockHash, String)>,
 ) -> Vec<(BlockHash, String)> {
+    let max = crate::weight_proof::MAX_WEIGHT_PROOF_ANCHOR_LAG as usize;
     let mut out = Vec::new();
     let mut cursor = parent;
     // The parent's EVM hash is already resolved by the caller; reuse it.
     out.push((parent.hash(), parent_evm_hash));
-    for _ in 1..crate::weight_proof::MAX_WEIGHT_PROOF_ANCHOR_LAG {
-        // Stop at the committed frontier minus one: we keep the parent chain plus
-        // the single just-committed ancestor (a normal-lag delta's source), which
-        // `pending_blocks` still holds until the next commit prunes it.
+    // Walk the uncommitted ancestor chain first (newest-first), held in
+    // `pending_blocks` until commit prunes it.
+    while out.len() < max {
         if cursor.header.height.0 <= committed_height.0 {
             break;
         }
@@ -1010,6 +1068,23 @@ fn weight_proof_source_candidates(
         if let Some(evm_hash) = evm_block_hash_of(cursor) {
             out.push((cursor.hash(), evm_hash));
         }
+    }
+    // #803: extend the window below the committed frontier with the recently-
+    // committed ring (newest-first). A weight delta can sit pending for a few
+    // views before its carrier commits, by which point its source block has
+    // dropped below the committed frontier and is gone from `pending_blocks` —
+    // but the voter can still resolve it from durable storage, so the leader must
+    // be able to name + prove against it. Skip any hash already in `out` (the
+    // just-committed parent appears in both) and cap the total window at the
+    // anchor lag.
+    for (boule_hash, evm_hash) in recent_committed.iter().rev() {
+        if out.len() >= max {
+            break;
+        }
+        if out.iter().any(|(h, _)| h == boule_hash) {
+            continue;
+        }
+        out.push((*boule_hash, evm_hash.clone()));
     }
     out
 }
@@ -1152,11 +1227,13 @@ impl Application for RethApplication {
                 // receipts carry its log — naming that source block so the voter
                 // resolves the same `receiptsRoot`. Usually that is the parent
                 // (the 1-block path); a multi-block lag anchors a few links back.
+                let recent_committed = self.recent_committed.lock().clone();
                 let candidates = weight_proof_source_candidates(
                     parent,
                     pending_blocks,
                     committed_height,
                     parent_evm_hash.clone(),
+                    &recent_committed,
                 );
                 match self
                     .build_weight_proofs(&registry_payload.weights, &candidates)
@@ -1238,6 +1315,20 @@ impl Application for RethApplication {
                     gap_effects = self
                         .backfill_self_synced_gap(&payload, prev_height, block.header.height)
                         .await;
+                    // Record this committed block's (boule hash, EVM hash) in the
+                    // recent ring so a later build can anchor a still-pending
+                    // weight delta to it even after it drops below the committed
+                    // frontier (#803 — see `recent_committed`).
+                    if let Some(evm_hash) = payload["blockHash"].as_str() {
+                        let mut ring = self.recent_committed.lock();
+                        ring.push_back((block.hash(), evm_hash.to_string()));
+                        // Keep a touch more than the anchor lag so the source is
+                        // always reachable; bounded so the ring can't grow.
+                        let cap = (crate::weight_proof::MAX_WEIGHT_PROOF_ANCHOR_LAG as usize) + 2;
+                        while ring.len() > cap {
+                            ring.pop_front();
+                        }
+                    }
                 }
                 ElStatus::Syncing => {
                     // The EL doesn't have this block's parent yet; commit_block
@@ -1335,6 +1426,19 @@ impl Application for RethApplication {
     }
 
     fn check(&self, cmd: &[u8]) -> Result<()> {
+        // The #797 weight-proof command (`WPR1`) is an auxiliary block command
+        // the reth builder attaches alongside the EVM payload to carry the
+        // receipt-inclusion proofs for this block's seated-weight deltas. It is
+        // NOT an execution payload — the EL and every commit path ignore it, and
+        // its validity is checked by the vote-time registry gate
+        // (`validate_registry_extra_data` / `validate_weight_proofs`), not here.
+        // It must be includable, or the generic vote-time includability check
+        // (which calls `check` on every non-system command) would make honest
+        // voters abstain on any block carrying a weight proof — livelocking the
+        // chain the moment a stake delta needs proving (#803).
+        if crate::weight_proof::WeightProofSet::is_weight_proof_command(cmd) {
+            return Ok(());
+        }
         // Tier-1 includability: the command must decode to an execution
         // payload carrying a block hash. Stateless — no reth round-trip.
         let payload: Value =
@@ -2110,6 +2214,24 @@ mod tests {
     }
 
     #[test]
+    fn check_accepts_the_weight_proof_command() {
+        // #803: a block carrying a weight delta also carries a `WPR1` weight-proof
+        // command. `check` must accept it (it is not an EVM payload), or the
+        // generic vote-time includability check would make honest voters abstain
+        // on every weight-bearing block — livelocking the chain.
+        let app = make_app([0u8; 32]);
+        let wpr = crate::weight_proof::WeightProofSet::default().encode();
+        assert!(
+            crate::weight_proof::WeightProofSet::is_weight_proof_command(&wpr),
+            "fixture is a WPR1 command",
+        );
+        assert!(
+            app.check(&wpr).is_ok(),
+            "the weight-proof command must be includable",
+        );
+    }
+
+    #[test]
     fn snapshot_round_trips_height_and_root() {
         let app = make_app([0u8; 32]);
         {
@@ -2221,6 +2343,74 @@ mod tests {
         let chain = uncommitted_chain(&c, &pending, Height(0));
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].header.height.0, 3);
+    }
+
+    #[test]
+    fn weight_proof_candidates_include_recent_committed_below_frontier() {
+        // The #803 livelock repro: a weight delta's source block has dropped
+        // BELOW the committed frontier (committed faster than the carrier
+        // committed), so it is gone from `pending_blocks`. The candidate window
+        // must still reach it via the recent-committed ring — otherwise the
+        // leader can attach no proof and voters reject the (real) weight forever.
+        let g = genesis();
+        // src(15) is the delta's source — committed and pruned from pending.
+        let src = block_with_payload(g.hash(), 15, "0x1500");
+        // The uncommitted carrier chain: p18(parent, committed frontier at 17).
+        let p16 = block_with_payload(src.hash(), 16, "0x1600");
+        let p17 = block_with_payload(p16.hash(), 17, "0x1700");
+        let p18 = block_with_payload(p17.hash(), 18, "0x1800");
+        // Only the uncommitted blocks remain in pending; src is gone.
+        let pending: HashMap<BlockHash, Block> =
+            [(p17.hash(), p17.clone()), (p18.hash(), p18.clone())]
+                .into_iter()
+                .collect();
+        // Recent-committed ring holds src (and others) as (boule_hash, evm_hash).
+        let ring: std::collections::VecDeque<(BlockHash, String)> = [
+            (g.hash(), "0x0000".to_string()),
+            (src.hash(), "0x1500".to_string()),
+            (p16.hash(), "0x1600".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        // Build candidates for carrier whose parent is p18, committed frontier 17.
+        let cands =
+            weight_proof_source_candidates(&p18, &pending, Height(17), "0x1800".to_string(), &ring);
+        // src must appear — without the ring it would be excluded (it is below
+        // the committed frontier and absent from pending).
+        assert!(
+            cands.iter().any(|(h, _)| *h == src.hash()),
+            "the source block below the committed frontier must be a candidate (#803)",
+        );
+        // No duplicate of the parent (p18 is the resolved parent_evm_hash entry).
+        let p18_count = cands.iter().filter(|(h, _)| *h == p18.hash()).count();
+        assert_eq!(p18_count, 1, "the parent appears exactly once");
+    }
+
+    #[test]
+    fn weight_proof_candidates_without_ring_miss_a_pruned_source() {
+        // Regression guard: with an EMPTY ring (pre-#803 behaviour) the same
+        // pruned source is unreachable — proving the ring is what closes the gap.
+        let g = genesis();
+        let src = block_with_payload(g.hash(), 15, "0x1500");
+        let p16 = block_with_payload(src.hash(), 16, "0x1600");
+        let p17 = block_with_payload(p16.hash(), 17, "0x1700");
+        let p18 = block_with_payload(p17.hash(), 18, "0x1800");
+        let pending: HashMap<BlockHash, Block> = [(p17.hash(), p17), (p18.hash(), p18.clone())]
+            .into_iter()
+            .collect();
+        let empty_ring = std::collections::VecDeque::new();
+        let cands = weight_proof_source_candidates(
+            &p18,
+            &pending,
+            Height(17),
+            "0x1800".to_string(),
+            &empty_ring,
+        );
+        assert!(
+            !cands.iter().any(|(h, _)| *h == src.hash()),
+            "without the ring a pruned source is correctly unreachable (the bug)",
+        );
     }
 
     /// Transport that records the engine methods called while replaying the
