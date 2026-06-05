@@ -45,6 +45,12 @@ const STAKING_ADDRESS: &str = "0x0000000000000000000000000000000000000b0e";
 const DEPOSIT_SELECTOR: [u8; 4] = [0xb2, 0x14, 0xfa, 0xa5]; // deposit(bytes32)
 /// anvil dev account #0 (prefunded in the dev genesis).
 const DEV_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+/// `disperse(address[])` selector — splits `msg.value` equally to all recipients.
+const DISPERSE_SELECTOR: [u8; 4] = [0x23, 0x81, 0x7f, 0xcd];
+/// Creation bytecode for `Disperse.sol` (compiled with solc 0.8.24 --optimize).
+/// Deployed once by `massfund`, then funds many wallets per tx (no per-account
+/// nonce bottleneck — the whole point of the mass-funding contract).
+const DISPERSE_BIN: &str = "608060405234801561000f575f80fd5b506102188061001d5f395ff3fe60806040526004361061001d575f3560e01c806323817fcd14610021575b5f80fd5b61003461002f366004610113565b610036565b005b5f6100418234610182565b90505f5b8281101561010d575f848483818110610060576100606101a1565b905060200201602081019061007591906101b5565b6001600160a01b0316836040515f6040518083038185875af1925050503d805f81146100bc576040519150601f19603f3d011682016040523d82523d5f602084013e6100c1565b606091505b50509050806101045760405162461bcd60e51b815260206004820152600b60248201526a1cd95b990819985a5b195960aa1b604482015260640160405180910390fd5b50600101610045565b50505050565b5f8060208385031215610124575f80fd5b823567ffffffffffffffff8082111561013b575f80fd5b818501915085601f83011261014e575f80fd5b81358181111561015c575f80fd5b8660208260051b8501011115610170575f80fd5b60209290920196919550909350505050565b5f8261019c57634e487b7160e01b5f52601260045260245ffd5b500490565b634e487b7160e01b5f52603260045260245ffd5b5f602082840312156101c5575f80fd5b81356001600160a01b03811681146101db575f80fd5b939250505056fea2646970667358221220bcf8b46303b45b5092d4d547a628bd677d3b43b2223709d3f899587568df19f564736f6c63430008180033";
 
 // ABI shapes for the predeploy calls the helper ABI-encodes (matching the
 // Solidity selectors pinned in slashing.rs / governance.rs).
@@ -243,23 +249,163 @@ async fn genfund(t: &HttpTransport, n: usize, path: &str) -> Result<()> {
     let mut dev_nonce = fetch_nonce(t, &dev_addr).await?;
     let fund = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
     let mut last = String::new();
+    let mut funded = 0usize;
+    // Submit each funding tx, RETRYING THE SAME WALLET on error rather than
+    // advancing the nonce — a nonce gap here strands every later tx as
+    // future-nonce and leaves wallets silently unfunded (the bug that made the
+    // spread test send from empty wallets). On backpressure (account-slots /
+    // txpool full) we drain, re-sync the nonce from chain, and retry.
     for (idx, w) in wallets.iter().enumerate() {
-        let raw = sign_transfer(&dev, dev_nonce, w.address(), fund, chain_id)?;
-        if let Ok(r) = t.eth("eth_sendRawTransaction", json!([raw])).await {
-            last = r.as_str().unwrap_or("").to_string();
+        loop {
+            let raw = sign_transfer(&dev, dev_nonce, w.address(), fund, chain_id)?;
+            match t.eth("eth_sendRawTransaction", json!([raw])).await {
+                Ok(r) => {
+                    last = r.as_str().unwrap_or("").to_string();
+                    dev_nonce += 1;
+                    funded += 1;
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    if msg.contains("nonce too low") || msg.contains("already known") {
+                        // it actually landed; the RPC reply just raced — advance.
+                        dev_nonce += 1;
+                        funded += 1;
+                        break;
+                    }
+                    if msg.contains("insufficient funds") {
+                        anyhow::bail!(
+                            "genfund: faucet can't fund wallet {idx} (nonce {dev_nonce}): {e}"
+                        );
+                    }
+                    // backpressure (txpool full / account slots): drain in-flight
+                    // to free capacity, then retry the SAME nonce — never skip.
+                    if !last.is_empty() {
+                        let _ = await_receipt(t, &last).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
         }
-        dev_nonce += 1;
-        if (idx + 1) % 12 == 0 {
+        if (idx + 1) % 64 == 0 {
             let _ = await_receipt(t, &last).await;
         }
     }
     let _ = await_receipt(t, &last).await;
+    eprintln!("genfund: confirmed-submit {funded}/{n} funding txs");
     let mut out = String::new();
     for w in &wallets {
         out.push_str(&format!("0x{}\n", hex::encode(w.to_bytes())));
     }
     std::fs::write(path, out)?;
     eprintln!("genfund: {n} wallets funded; keys -> {path}");
+    Ok(())
+}
+
+/// Sign an arbitrary EIP-1559 tx (Create or Call) with explicit gas — caller
+/// manages nonce/chain. Used for the Disperse deploy + batched disperse calls.
+fn sign_tx(
+    signer: &PrivateKeySigner,
+    nonce: u64,
+    to: TxKind,
+    value: U256,
+    input: Vec<u8>,
+    gas_limit: u64,
+    chain_id: u64,
+) -> Result<String> {
+    let tx = TxEip1559 {
+        chain_id,
+        nonce,
+        gas_limit,
+        max_fee_per_gas: 5_000_000_000,
+        max_priority_fee_per_gas: 1_000_000_000,
+        to,
+        value,
+        access_list: Default::default(),
+        input: Bytes::from(input),
+    };
+    let sig = signer.sign_hash_sync(&tx.signature_hash())?;
+    let env: TxEnvelope = tx.into_signed(sig).into();
+    Ok(format!("0x{}", hex::encode(env.encoded_2718())))
+}
+
+/// Poll for the receipt of a contract-creation tx; returns its `contractAddress`.
+async fn await_contract_address(t: &HttpTransport, tx_hash: &str) -> Result<String> {
+    for _ in 0..60 {
+        let r = t.eth("eth_getTransactionReceipt", json!([tx_hash])).await?;
+        if r.is_null() {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        anyhow::ensure!(r["status"].as_str() == Some("0x1"), "deploy tx reverted");
+        let addr = r["contractAddress"].as_str().context("no contractAddress in receipt")?;
+        return Ok(addr.to_string());
+    }
+    bail!("deploy receipt for {tx_hash} never appeared")
+}
+
+/// massfund <N> <KEYSFILE> [WEI_EACH] — deploy the Disperse contract once, then
+/// fund N fresh wallets WEI_EACH each via batched `disperse(address[])` calls
+/// (≤200 recipients per tx). One tx funds a whole batch, so funding is bounded
+/// by block throughput, not by the dev account's per-account nonce limit — the
+/// fix for the slow/clog-prone genfund faucet loop. Writes the keys at the end.
+async fn massfund(t: &HttpTransport, n: usize, path: &str, wei_each: u128) -> Result<()> {
+    const BATCH: usize = 200;
+    let chain_id = fetch_chain_id(t).await?;
+    let dev: PrivateKeySigner = DEV_PK.parse().context("dev pk")?;
+    let dev_addr = format!("0x{}", hex::encode(dev.address()));
+    let wallets: Vec<PrivateKeySigner> = (0..n).map(|_| PrivateKeySigner::random()).collect();
+    let addrs: Vec<Address> = wallets.iter().map(|w| w.address()).collect();
+    let mut nonce = fetch_nonce(t, &dev_addr).await?;
+
+    // 1. deploy Disperse once
+    let code = hex::decode(DISPERSE_BIN).context("disperse bytecode")?;
+    let raw = sign_tx(&dev, nonce, TxKind::Create, U256::ZERO, code, 1_000_000, chain_id)?;
+    let dh = t.eth("eth_sendRawTransaction", json!([raw])).await?;
+    let dh = dh.as_str().context("deploy hash")?.to_string();
+    nonce += 1;
+    let disperse_addr = await_contract_address(t, &dh).await?;
+    let disperse: Address = disperse_addr.parse().context("disperse addr")?;
+    eprintln!("massfund: Disperse deployed at {disperse_addr}");
+
+    // 2. fund recipients in batches — one disperse() tx per batch
+    let mut funded = 0usize;
+    for chunk in addrs.chunks(BATCH) {
+        // calldata = selector ++ abi.encode(address[]): offset, length, words
+        let mut cd = DISPERSE_SELECTOR.to_vec();
+        cd.extend_from_slice(&left_pad32(&[0x20]));
+        cd.extend_from_slice(&left_pad32(&(chunk.len() as u64).to_be_bytes()));
+        for a in chunk {
+            cd.extend_from_slice(&left_pad32(a.as_slice()));
+        }
+        let value = U256::from(wei_each) * U256::from(chunk.len() as u64);
+        // ~40k gas/recipient (new-account value transfer) + overhead
+        let gas = 60_000 + chunk.len() as u64 * 40_000;
+        let raw = sign_tx(&dev, nonce, TxKind::Call(disperse), value, cd, gas, chain_id)?;
+        let h = loop {
+            match t.eth("eth_sendRawTransaction", json!([raw])).await {
+                Ok(r) => break r.as_str().unwrap_or("").to_string(),
+                Err(e) => {
+                    if e.to_string().to_lowercase().contains("insufficient funds") {
+                        bail!("massfund: faucet can't fund batch at {funded}: {e}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        };
+        nonce += 1;
+        let (ok, _) = await_receipt(t, &h).await?;
+        anyhow::ensure!(ok, "disperse batch reverted (gas? value?) at {funded}");
+        funded += chunk.len();
+        eprintln!("massfund: funded {funded}/{n}");
+    }
+
+    let mut out = String::new();
+    for w in &wallets {
+        out.push_str(&format!("0x{}\n", hex::encode(w.to_bytes())));
+    }
+    std::fs::write(path, out)?;
+    eprintln!("massfund: {funded} wallets funded ({wei_each} wei each); keys -> {path}");
     Ok(())
 }
 
@@ -450,6 +596,17 @@ async fn main() -> Result<()> {
             let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
             let path = args.get(2).map(String::as_str).unwrap_or("/tmp/wallets.keys");
             genfund(&t, n, path).await?;
+        }
+        // massfund <N> <KEYSFILE> [WEI_EACH] — deploy Disperse, fund N wallets
+        // in batches (one tx each), write keys. Defaults WEI_EACH = 0.05 ETH.
+        Some("massfund") => {
+            let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
+            let path = args.get(2).map(String::as_str).unwrap_or("/tmp/wallets.keys");
+            let wei: u128 = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50_000_000_000_000_000); // 0.05 ETH
+            massfund(&t, n, path, wei).await?;
         }
         // loadkeys <KEYSFILE> <DUR> <TPS> — load from pre-funded wallet keys.
         Some("loadkeys") => {
