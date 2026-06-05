@@ -202,7 +202,7 @@ async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -
     let addrs: Vec<Address> = wallets.iter().map(|w| w.address()).collect();
     // fund each wallet 1 ETH from the dev account (sequential nonces)
     let mut dev_nonce = fetch_nonce(t, &dev_addr).await?;
-    let fund = U256::from(1_000_000_000_000_000_000u128);
+    let fund = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
     let mut last = String::new();
     eprintln!("funding {n} wallets (1 ETH each) in batches...");
     for (idx, a) in addrs.iter().enumerate() {
@@ -241,7 +241,7 @@ async fn genfund(t: &HttpTransport, n: usize, path: &str) -> Result<()> {
     let dev_addr = format!("0x{}", hex::encode(dev.address()));
     let wallets: Vec<PrivateKeySigner> = (0..n).map(|_| PrivateKeySigner::random()).collect();
     let mut dev_nonce = fetch_nonce(t, &dev_addr).await?;
-    let fund = U256::from(1_000_000_000_000_000_000u128);
+    let fund = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
     let mut last = String::new();
     for (idx, w) in wallets.iter().enumerate() {
         let raw = sign_transfer(&dev, dev_nonce, w.address(), fund, chain_id)?;
