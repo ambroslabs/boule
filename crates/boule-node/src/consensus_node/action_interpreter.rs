@@ -1007,6 +1007,26 @@ impl ConsensusNode {
                 SafetyAction::Persist(_) => unreachable!(),
 
                 SafetyAction::Broadcast(mut msg) => {
+                    // #802 follow-only gate: a full node verifies, locks,
+                    // adopts high_qc, and commits exactly like a validator
+                    // (all of that already ran inside the safety core), but
+                    // it must never put a weight-bearing consensus message
+                    // on the wire — Vote, Proposal, or NewView. Drop it here
+                    // before signing/broadcast/self-loopback. The safety
+                    // core's own state is already updated; suppressing the
+                    // egress (and the loopback that would otherwise count
+                    // our own vote toward a QC) is all that's needed. A full
+                    // node has no voting weight regardless, so this is the
+                    // explicit, single-choke-point enforcement of the
+                    // "a follower cannot affect consensus" property.
+                    if self.role.is_full() {
+                        tracing::trace!(
+                            target: TRACE_TARGET,
+                            msg = msg_kind(&msg),
+                            "follow_only_suppressed_outbound",
+                        );
+                        continue;
+                    }
                     tracing::debug!(
                         target: TRACE_TARGET,
                         msg = msg_kind(&msg),
@@ -1285,6 +1305,18 @@ impl ConsensusNode {
                     high_qc,
                     parent,
                 } => {
+                    // #802: a full node never builds or broadcasts a
+                    // proposal. The safety core only emits BuildProposal
+                    // when self is the round-robin leader of `view`, and a
+                    // full node (not in the validator set) is never a leader
+                    // — so this arm is unreachable for a full node in
+                    // practice. Guard it anyway as a defence-in-depth
+                    // belt-and-suspenders, so block production can never
+                    // originate from a follower regardless of upstream
+                    // leader-selection changes.
+                    if self.role.is_full() {
+                        continue;
+                    }
                     // #606: block-building moved out of the synchronous safety
                     // core. `await` the application's async build seam (#225
                     // M1) here, then feed the result back through
@@ -1516,6 +1548,14 @@ impl ConsensusNode {
                 }
 
                 PacemakerAction::BecomeLeader(v) => {
+                    // #802: a full node is not in the validator set, so the
+                    // pacemaker's leader selector never resolves a view to
+                    // it and this action is never emitted for a follower.
+                    // Skip it defensively anyway so no proposal can ever be
+                    // built from a follower even if leader selection changes.
+                    if self.role.is_full() {
+                        continue;
+                    }
                     let safety_actions = self.core.become_leader(v);
                     self.apply_safety_actions(safety_actions, broadcaster, view_timer, signer)
                         .await?;
@@ -1527,6 +1567,21 @@ impl ConsensusNode {
                 }
 
                 PacemakerAction::SendTimeout(v) => {
+                    // #802: a full node tracks view advances (so it stays in
+                    // sync) but never broadcasts a timeout message — a
+                    // timeout vote carries weight toward a TC just like a
+                    // Vote carries weight toward a QC. The pacemaker still
+                    // advances the local view via AdvanceToView; only the
+                    // outbound timeout is suppressed. The view-timer was
+                    // re-armed by the accompanying ResetTimer action.
+                    if self.role.is_full() {
+                        tracing::trace!(
+                            target: TRACE_TARGET,
+                            view = v.0,
+                            "follow_only_suppressed_timeout",
+                        );
+                        continue;
+                    }
                     self.send_timeout(v, broadcaster, view_timer, signer)
                         .await?;
                 }
