@@ -16,13 +16,14 @@ set -uo pipefail
 OUTDIR="$1"; N="$2"; M="$3"; HOST="$4"
 SLOTS=$((N + M))
 
-authport() { echo $((8551 + 10 * $1)); }
-httpport() { echo $((8545 + 10 * $1)); }
-elp2p()    { echo $((30330 + $1)); }
-p2pport()  { echo $((7001 + $1)); }
-apiport()  { echo $((8001 + $1)); }
-adminport(){ echo $((9001 + $1)); }
-role_of()  { [ "$1" -lt "$N" ] && echo validator || echo full; }
+authport()  { echo $((8551 + 10 * $1)); }
+httpport()  { echo $((8545 + 10 * $1)); }
+proxyport() { echo $((8547 + 10 * $1)); }
+elp2p()     { echo $((30330 + $1)); }
+p2pport()   { echo $((7001 + $1)); }
+apiport()   { echo $((8001 + $1)); }
+adminport() { echo $((9001 + $1)); }
+role_of()   { [ "$1" -lt "$N" ] && echo validator || echo full; }
 
 # Images are operator-supplied: build boule (--features reth) and boule-reth-node
 # into containers, or bind-mount the host binaries. We reference them by name and
@@ -37,6 +38,12 @@ COMPOSE="$OUTDIR/docker-compose.yml"
   echo "# Bring up:   docker compose -f docker-compose.yml up -d"
   echo "# Images:     build boule (--features reth) as \$BOULE_IMAGE and boule-reth-node as \$RETH_IMAGE,"
   echo "#             or bind-mount host binaries into /usr/local/bin (see docs/join-testnet.md)."
+  echo "# SECURITY (#822): reth's HTTP RPC and Engine API are NOT host-published."
+  echo "# reth listens only on the internal 'testnet' bridge (no 'ports:' entry), so"
+  echo "# admin_*/txpool_*/engine_* are unreachable from the host/internet. The ONLY"
+  echo "# public eth ingress is the eth-rpc-proxy, which forwards the allow-listed"
+  echo "# read-only + eth_sendRawTransaction surface. --http.api is eth,net,web3 (no"
+  echo "# txpool,admin), and the Engine API stays JWT-auth'd + bridge-only."
   echo "services:"
   for i in $(seq 0 $((SLOTS - 1))); do
     role=$(role_of "$i")
@@ -47,13 +54,24 @@ COMPOSE="$OUTDIR/docker-compose.yml"
     echo "      node --chain /genesis/genesis.json --datadir /data/reth$i"
     echo "      --authrpc.addr 0.0.0.0 --authrpc.port $(authport "$i") --authrpc.jwtsecret /data/jwt$i.hex"
     echo "      --http --http.addr 0.0.0.0 --http.port $(httpport "$i")"
-    echo "      --http.api eth,net,web3,txpool,admin"
+    echo "      --http.api eth,net,web3"
     echo "      --port $(elp2p "$i") --ipcdisable"
     echo "    volumes:"
     echo "      - ./genesis:/genesis:ro"
     echo "      - ./data:/data"
+    echo "    # No 'ports:' — HTTP RPC ($(httpport "$i")) + Engine API ($(authport "$i")) are reachable"
+    echo "    # only on the internal bridge (by eth-rpc-proxy-$i / boule-$i), never the host."
+    echo "    networks: [testnet]"
+    echo "  eth-rpc-proxy-$i:"
+    echo "    image: \${BOULE_IMAGE:-$BOULE_IMAGE}"
+    echo "    container_name: boule-eth-rpc-proxy-$i"
+    echo "    depends_on: [reth-$i]"
+    echo "    command: eth-rpc-proxy"
+    echo "    environment:"
+    echo "      ETH_RPC_PROXY_LISTEN_ADDR: \"0.0.0.0:$(proxyport "$i")\""
+    echo "      ETH_RPC_PROXY_BACKEND_URL: \"http://reth-$i:$(httpport "$i")\""
     echo "    ports:"
-    echo "      - \"$(httpport "$i"):$(httpport "$i")\"   # eth JSON-RPC"
+    echo "      - \"$(proxyport "$i"):$(proxyport "$i")\"   # PUBLIC eth JSON-RPC (allow-listed proxy)"
     echo "    networks: [testnet]"
     echo "  boule-$i:"
     echo "    image: \${BOULE_IMAGE:-$BOULE_IMAGE}"
@@ -85,13 +103,37 @@ Description=boule reth EL (slot $i, $role)
 After=network-online.target
 Wants=network-online.target
 
+# SECURITY (#822): HTTP RPC + Engine API bind 127.0.0.1 only. The public eth
+# ingress is boule-eth-rpc-proxy-$i.service (allow-listed); --http.api is
+# eth,net,web3 (no txpool,admin). Do NOT change --http.addr to 0.0.0.0 or add a
+# firewall hole to $(httpport "$i")/$(authport "$i").
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/boule-reth-node node --chain ${OUTDIR}/genesis/genesis.json \\
   --datadir ${OUTDIR}/data/reth$i \\
   --authrpc.addr 127.0.0.1 --authrpc.port $(authport "$i") --authrpc.jwtsecret ${OUTDIR}/data/jwt$i.hex \\
-  --http --http.addr 127.0.0.1 --http.port $(httpport "$i") --http.api eth,net,web3,txpool,admin \\
+  --http --http.addr 127.0.0.1 --http.port $(httpport "$i") --http.api eth,net,web3 \\
   --port $(elp2p "$i") --ipcdisable
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "$OUTDIR/systemd/boule-eth-rpc-proxy-$i.service" <<EOF
+[Unit]
+Description=boule public eth-RPC proxy (slot $i, $role)
+After=boule-reth-$i.service network-online.target
+Wants=boule-reth-$i.service
+
+# The ONLY public eth ingress: forwards the allow-listed read-only +
+# eth_sendRawTransaction surface to reth's loopback RPC (#822).
+[Service]
+Type=simple
+Environment=ETH_RPC_PROXY_LISTEN_ADDR=0.0.0.0:$(proxyport "$i")
+Environment=ETH_RPC_PROXY_BACKEND_URL=http://127.0.0.1:$(httpport "$i")
+ExecStart=/usr/local/bin/eth-rpc-proxy
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
@@ -125,19 +167,28 @@ RUN="$OUTDIR/run-local.sh"
   echo "# Bare-process bring-up of the generated testnet (no docker). Needs"
   echo "# boule (--features reth) + boule-reth-node on PATH or via \$BOULE / \$EL_BIN."
   echo "# Tears every process down on exit. For a self-contained local smoke test."
+  echo "# SECURITY (#822): everything here binds 127.0.0.1 and publishes NOTHING —"
+  echo "# this is a single-host loopback smoke test, not a public deployment. The"
+  echo "# public eth ingress is the per-node eth-rpc-proxy (allow-listed, on"
+  echo "# 127.0.0.1:\$PROXY here). reth's HTTP is loopback-only and drops 'txpool';"
+  echo "# 'admin' is kept ONLY so this script can admin_addPeer-mesh the ELs and is"
+  echo "# unreachable off-host. The public docker-compose / systemd tooling does NOT"
+  echo "# enable admin at all and never publishes reth's port."
   echo "set -uo pipefail"
   echo "OUTDIR=\"\$(cd \"\$(dirname \"\$0\")\" && pwd)\""
   echo "BOULE=\"\${BOULE:-boule}\"; EL_BIN=\"\${EL_BIN:-boule-reth-node}\""
+  echo "PROXY_BIN=\"\${PROXY_BIN:-eth-rpc-proxy}\""
   echo "PIDS=()"
   echo "cleanup(){ for p in \"\${PIDS[@]}\"; do kill \"\$p\" 2>/dev/null || true; done; }"
   echo "trap cleanup EXIT INT TERM"
   echo "mkdir -p \"\$OUTDIR/data\""
   echo "HTTP=($(for i in $(seq 0 $((SLOTS - 1))); do printf '%s ' "$(httpport "$i")"; done))"
+  echo "PROXY=($(for i in $(seq 0 $((SLOTS - 1))); do printf '%s ' "$(proxyport "$i")"; done))"
   echo "ELP2P=($(for i in $(seq 0 $((SLOTS - 1))); do printf '%s ' "$(elp2p "$i")"; done))"
   for i in $(seq 0 $((SLOTS - 1))); do
     echo "\"\$EL_BIN\" node --chain \"\$OUTDIR/genesis/genesis.json\" --datadir \"\$OUTDIR/data/reth$i\" \\"
     echo "  --authrpc.addr 127.0.0.1 --authrpc.port $(authport "$i") --authrpc.jwtsecret \"\$OUTDIR/data/jwt$i.hex\" \\"
-    echo "  --http --http.addr 127.0.0.1 --http.port $(httpport "$i") --http.api eth,net,web3,txpool,admin \\"
+    echo "  --http --http.addr 127.0.0.1 --http.port $(httpport "$i") --http.api eth,net,web3,admin \\"
     echo "  --disable-discovery --ipcdisable --port $(elp2p "$i") > \"\$OUTDIR/data/el$i.log\" 2>&1 & PIDS+=(\$!)"
   done
   # Wait for every EL's RPC, then admin_addPeer-mesh the reths so a rotated
@@ -161,6 +212,15 @@ for k in "${!HTTP[@]}"; do for j in "${!HTTP[@]}"; do [ "$k" = "$j" ] && continu
 done; done
 echo "reth mesh wired (${#HTTP[@]} ELs)"
 MESH
+  # Public eth ingress: one allow-listed proxy per node, in front of reth's
+  # loopback RPC (matches docker-compose / systemd). The proxy — not reth's
+  # :$(httpport 0)+ — is what a client/LB talks to (#822).
+  for i in $(seq 0 $((SLOTS - 1))); do
+    echo "ETH_RPC_PROXY_LISTEN_ADDR=\"127.0.0.1:$(proxyport "$i")\" \\"
+    echo "ETH_RPC_PROXY_BACKEND_URL=\"http://127.0.0.1:$(httpport "$i")\" \\"
+    echo "  \"\$PROXY_BIN\" > \"\$OUTDIR/data/proxy$i.log\" 2>&1 & PIDS+=(\$!)"
+  done
+  echo "echo 'eth-rpc-proxy up on 127.0.0.1:{$(for i in $(seq 0 $((SLOTS - 1))); do printf '%s,' "$(proxyport "$i")"; done | sed 's/,$//')}'"
   for i in $(seq 0 $((SLOTS - 1))); do
     echo "\"\$BOULE\" start --config \"\$OUTDIR/configs/node$i.toml\" > \"\$OUTDIR/data/boule$i.log\" 2>&1 & PIDS+=(\$!)"
   done

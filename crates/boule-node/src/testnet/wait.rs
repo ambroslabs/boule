@@ -42,7 +42,7 @@ pub async fn all_reach_height(state: &State, height: u64, timeout: Duration) -> 
             return Ok(false);
         }
         for n in live {
-            let api = match n.api_addr {
+            let api = match n.admin_addr {
                 Some(a) => a,
                 None => return Ok(false),
             };
@@ -90,7 +90,7 @@ pub async fn all_advance_by(state: &State, delta: u64, timeout: Duration) -> any
             let mut snap: HashMap<usize, u64> = HashMap::new();
             let mut all_reachable = true;
             for n in &live {
-                let api = match n.api_addr {
+                let api = match n.admin_addr {
                     Some(a) => a,
                     None => {
                         all_reachable = false;
@@ -121,7 +121,7 @@ pub async fn all_advance_by(state: &State, delta: u64, timeout: Duration) -> any
                 Some(t) => *t,
                 None => continue,
             };
-            let api = match n.api_addr {
+            let api = match n.admin_addr {
                 Some(a) => a,
                 None => {
                     all_advanced = false;
@@ -159,7 +159,7 @@ async fn all_healthy_check(state: &State, within: u64) -> anyhow::Result<bool> {
     let mut views = Vec::with_capacity(live.len());
     let mut min_height = u64::MAX;
     for n in &live {
-        let api = match n.api_addr {
+        let api = match n.admin_addr {
             Some(a) => a,
             None => return Ok(false),
         };
@@ -201,7 +201,7 @@ pub async fn node_caught_up(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     poll_until(timeout, || async {
-        let api = match node.api_addr {
+        let api = match node.admin_addr {
             Some(a) => a,
             None => return Ok(false),
         };
@@ -214,7 +214,7 @@ pub async fn node_caught_up(
             if super::lifecycle::pid_alive(n).is_none() {
                 continue;
             }
-            let api = match n.api_addr {
+            let api = match n.admin_addr {
                 Some(a) => a,
                 None => return Ok(false),
             };
@@ -263,7 +263,7 @@ pub async fn quiescent(state: &State, hold: Duration, timeout: Duration) -> anyh
         let live = live_nodes(state);
         let mut all_reachable = true;
         for n in &live {
-            let api = match n.api_addr {
+            let api = match n.admin_addr {
                 Some(a) => a,
                 None => {
                     all_reachable = false;

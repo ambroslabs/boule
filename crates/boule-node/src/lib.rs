@@ -253,20 +253,16 @@ pub async fn run(
     let peer_count: Arc<dyn crate::observability::PeerCount> =
         Arc::new(PeerManagerCount(p2p_cmd_tx.clone()));
     let api_handle = {
-        // The PUBLIC listener exposes only read-only + observability
-        // endpoints. Privileged routes (key rotation, mempool submit) are
-        // never mounted here — they live on the separate admin listener
-        // below (#807).
+        // The PUBLIC listener exposes only observability endpoints
+        // (`/health`, `/ready`, `/metrics`). Privileged routes (key rotation,
+        // mempool submit) and the internal-state reads `/consensus/status` +
+        // `/peers` (#823) are never mounted here — they live on the separate
+        // admin listener below (#807), which gates them behind bearer auth.
         let obs_state = crate::observability::ObservabilityState {
             status_rx: consensus_runtime.as_ref().map(|rc| rc.status_rx.clone()),
             peer_count: Arc::clone(&peer_count),
         };
-        let mut app = axum::Router::new()
-            .merge(p2p::api::router(p2p_cmd_tx.clone()))
-            .merge(crate::observability::router(obs_state));
-        if let Some(rc) = consensus_runtime.as_ref() {
-            app = app.merge(boule_consensus::api::router(rc.status_rx.clone()));
-        }
+        let app = axum::Router::new().merge(crate::observability::router(obs_state));
         tokio::spawn(async move {
             info!("public HTTP API listening on {api_actual_addr}");
             axum::serve(api_listener, app).await.unwrap();
@@ -281,22 +277,33 @@ pub async fn run(
         let token = config.api.admin.resolve_auth_token()?;
         let admin_listener = TcpListener::bind(admin_addr).await?;
         let admin_actual_addr = admin_listener.local_addr()?;
-        // The privileged routes need the rotation handle + mempool, which
-        // only exist with consensus. On a gossip-only node we still bind the
-        // listener (so the bound port is observable / stable) but mount an
-        // empty router — nothing privileged is reachable there either.
+        // The privileged rotate-key/mempool routes need the rotation handle +
+        // mempool, which only exist with consensus; the internal-state reads
+        // (`/consensus/status`, `/peers`) moved here too (#823). On a
+        // gossip-only node we still bind the listener and serve `/peers` (the
+        // only thing meaningful there) but mount no consensus-privileged
+        // routes.
         let app = match consensus_runtime.as_ref() {
             Some(rc) => crate::admin_api::router(
                 Arc::clone(&rc.rotation),
                 Arc::clone(&rc.mempool),
+                Some(rc.status_rx.clone()),
+                p2p_cmd_tx.clone(),
                 token.clone(),
             ),
             None => {
                 warn!(
                     "[api.admin] listen_addr is set but consensus is disabled; the admin \
-                     listener binds but exposes no privileged routes."
+                     listener binds but exposes only /peers (no consensus-privileged routes)."
                 );
-                axum::Router::new()
+                let mut r = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx.clone()));
+                if let Some(t) = token.clone() {
+                    r = r.layer(axum::middleware::from_fn_with_state(
+                        Arc::new(t),
+                        crate::admin_api::require_bearer,
+                    ));
+                }
+                r
             }
         };
         let authed = token.is_some();
