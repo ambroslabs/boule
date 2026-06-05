@@ -173,7 +173,82 @@ pub struct PeerConfig {
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct ApiConfig {
+    /// Public HTTP listener. Mounts only the public-safe surface:
+    /// `GET /consensus/status`, `GET /peers`, `GET /metrics`,
+    /// `GET /health`, `GET /ready`. Privileged routes
+    /// (`POST /admin/rotate-key`, `POST /mempool/submit`) are **never**
+    /// mounted here — they live on the separate admin listener (see
+    /// [`AdminApiConfig`]). Safe to expose to the public internet / a
+    /// load balancer.
     pub listen_addr: SocketAddr,
+    /// Privileged operator surface. Off by default (`listen_addr`
+    /// unset ⇒ the privileged routes are not mounted anywhere), so a
+    /// node never exposes key-rotation or mempool-submit on its public
+    /// port. Set `[api.admin] listen_addr` to a trusted interface
+    /// (typically loopback or a private subnet) to enable them.
+    #[serde(default)]
+    pub admin: AdminApiConfig,
+}
+
+/// `[api.admin]` — the privileged HTTP surface (`POST /admin/rotate-key`,
+/// `POST /mempool/submit`), isolated from the public listener (#807).
+///
+/// # Defense in depth
+///
+/// 1. **Separate listener.** The privileged routes bind to their own
+///    `listen_addr`, intended for a trusted interface (loopback / a
+///    private management subnet), and are *never* merged into the
+///    public [`ApiConfig::listen_addr`] router. When `listen_addr` is
+///    unset (the default) the privileged routes are not served at all.
+/// 2. **Bearer auth (belt).** When `auth_token` (or `auth_token_env`)
+///    is set, every privileged request must carry
+///    `Authorization: Bearer <token>`; mismatches get `401`. This is a
+///    second layer on top of the network isolation, not a replacement
+///    for it.
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct AdminApiConfig {
+    /// Interface the privileged routes bind to. `None` (the default)
+    /// disables the privileged surface entirely — nothing privileged is
+    /// reachable on any listener. Set to a *trusted* address; binding
+    /// `0.0.0.0` is accepted but warned about at startup unless a token
+    /// is also configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<SocketAddr>,
+    /// Shared-secret bearer token required on every privileged request
+    /// (`Authorization: Bearer <token>`). Prefer `auth_token_env` so the
+    /// secret never lands in a config file. When both are set
+    /// `auth_token_env` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Env var to read the bearer token from. Resolved at startup; an
+    /// unset/empty var is a hard configuration error so a node never
+    /// silently boots an *unauthenticated* admin listener when the
+    /// operator meant to require a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_env: Option<String>,
+}
+
+impl AdminApiConfig {
+    /// Resolve the configured bearer token, reading `auth_token_env`
+    /// from the environment if set (it takes precedence over the inline
+    /// `auth_token`). Returns `Ok(None)` when no token is configured —
+    /// the caller pairs that with the listener being loopback-only.
+    pub fn resolve_auth_token(&self) -> anyhow::Result<Option<String>> {
+        if let Some(var) = self.auth_token_env.as_ref() {
+            let val = std::env::var(var).map_err(|_| {
+                anyhow::anyhow!(
+                    "[api.admin].auth_token_env points at ${var}, which is unset or not \
+                     valid UTF-8; refusing to start an admin listener without the token \
+                     the operator asked to require"
+                )
+            })?;
+            if val.is_empty() {
+                anyhow::bail!("[api.admin].auth_token_env (${var}) is empty");
+            }
+            return Ok(Some(val));
+        }
+        Ok(self.auth_token.clone().filter(|t| !t.is_empty()))
+    }
 }
 
 /// `[consensus.application]` — which execution backend processes the
@@ -1433,6 +1508,20 @@ impl Config {
         if let Some(keepalive) = self.p2p.keepalive.as_ref() {
             keepalive.validate()?;
         }
+        // #807: surface the admin token (failing fast on a misconfigured
+        // `auth_token_env`) and warn loudly about an admin listener that is
+        // both publicly reachable *and* unauthenticated.
+        if let Some(admin_addr) = self.api.admin.listen_addr {
+            let token = self.api.admin.resolve_auth_token()?;
+            if !admin_addr.ip().is_loopback() && token.is_none() {
+                warn!(
+                    "[api.admin].listen_addr = {admin_addr} is not loopback and no \
+                     auth_token/auth_token_env is set — the privileged admin + mempool \
+                     API would be reachable off-box without authentication. Bind it to a \
+                     trusted interface or set an auth token."
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1722,6 +1811,74 @@ listen_addr = "127.0.0.1:8080"
         match id {
             IdentityConfig::File { path, .. } => assert_eq!(path, PathBuf::from("/tmp/x.key")),
             _ => panic!("expected file backend"),
+        }
+    }
+
+    #[test]
+    fn admin_api_defaults_to_disabled_and_unauthenticated() {
+        // No [api.admin] section ⇒ privileged surface off (listen_addr None,
+        // no token). The node never exposes admin/mempool by default.
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+"#,
+        );
+        assert!(c.api.admin.listen_addr.is_none());
+        assert!(c.api.admin.resolve_auth_token().unwrap().is_none());
+    }
+
+    #[test]
+    fn admin_api_parses_listener_and_inline_token() {
+        let c = parse(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "0.0.0.0:8080"
+
+[api.admin]
+listen_addr = "127.0.0.1:9090"
+auth_token = "hunter2"
+"#,
+        );
+        assert_eq!(
+            c.api.admin.listen_addr.unwrap().to_string(),
+            "127.0.0.1:9090"
+        );
+        assert_eq!(
+            c.api.admin.resolve_auth_token().unwrap().as_deref(),
+            Some("hunter2")
+        );
+    }
+
+    #[test]
+    fn admin_api_token_env_overrides_inline_and_errors_when_unset() {
+        let var = "BOULE_TEST_ADMIN_TOKEN_XYZ";
+        // SAFETY: single-threaded test; we set/remove our own scoped var.
+        unsafe {
+            std::env::remove_var(var);
+        }
+        let cfg: ApiConfig = toml::from_str(&format!(
+            "listen_addr = \"0.0.0.0:8080\"\n[admin]\nlisten_addr = \"127.0.0.1:9090\"\nauth_token = \"inline\"\nauth_token_env = \"{var}\"\n"
+        ))
+        .unwrap();
+        // Env var unset ⇒ hard error (don't silently fall back to no auth).
+        assert!(cfg.admin.resolve_auth_token().is_err());
+        unsafe {
+            std::env::set_var(var, "from-env");
+        }
+        assert_eq!(
+            cfg.admin.resolve_auth_token().unwrap().as_deref(),
+            Some("from-env"),
+            "env var takes precedence over inline token"
+        );
+        unsafe {
+            std::env::remove_var(var);
         }
     }
 

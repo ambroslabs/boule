@@ -120,6 +120,7 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
             node_id: Some(info.node_id),
             p2p_addr: Some(info.p2p_addr.parse()?),
             api_addr: Some(info.api_addr.parse()?),
+            admin_addr: info.admin_addr.as_deref().map(str::parse).transpose()?,
             ..layout
         });
     }
@@ -188,6 +189,7 @@ fn node_layout(workdir: &Path, index: usize, bootstrap_peers: Vec<usize>) -> Nod
         node_id: None,
         p2p_addr: None,
         api_addr: None,
+        admin_addr: None,
         bls_key_path: None,
     }
 }
@@ -317,6 +319,9 @@ fn write_minimal_config(layout: &NodeLayout) -> anyhow::Result<()> {
          path    = \"{key}\"\n\
          \n\
          [api]\n\
+         listen_addr = \"127.0.0.1:0\"\n\
+         \n\
+         [api.admin]\n\
          listen_addr = \"127.0.0.1:0\"\n",
         addr = layout.addr_path.display(),
         key = layout.key_path.display(),
@@ -415,6 +420,12 @@ fn write_final_config(
     let api = n
         .api_addr
         .ok_or_else(|| anyhow::anyhow!("missing api_addr for {}", n.display_name()))?;
+    // Bake the discovered admin-listener addr too; fall back to a fresh
+    // loopback dynamic port if a pre-#807 state file lacks it.
+    let admin = n
+        .admin_addr
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "127.0.0.1:0".to_string());
     let body = format!(
         "[node]\n\
          listen_addr = \"{p2p}\"\n\
@@ -426,6 +437,9 @@ fn write_final_config(
          {bls_node_identity_toml}\n\
          [api]\n\
          listen_addr = \"{api}\"\n\
+         \n\
+         [api.admin]\n\
+         listen_addr = \"{admin}\"\n\
          \n\
          [overlay]\n\
          mode            = \"gossip\"\n\
@@ -468,6 +482,7 @@ struct DiscoveryInfo {
     node_id: String,
     p2p_addr: String,
     api_addr: String,
+    admin_addr: Option<String>,
 }
 
 async fn launch_once_for_discovery(
@@ -505,6 +520,7 @@ async fn launch_once_for_discovery(
                     p2p_addr: addrs.p2p_addr,
                     api_addr: addrs.api_addr,
                     node_id: addrs.node_id,
+                    admin_addr: addrs.admin_addr,
                 };
             }
         }
@@ -524,6 +540,7 @@ async fn launch_once_for_discovery(
         node_id: info.node_id,
         p2p_addr: info.p2p_addr,
         api_addr: info.api_addr,
+        admin_addr: info.admin_addr,
     })
 }
 

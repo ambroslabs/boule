@@ -8,6 +8,7 @@
 pub mod admin_api;
 pub mod consensus_node;
 pub mod demo_staking;
+pub mod observability;
 pub mod rotatable_signer;
 pub mod rotation_handle;
 pub mod testnet;
@@ -244,28 +245,89 @@ pub async fn run(
     // Bind the API listener here so we know the actual port before writing addr_file.
     let api_listener = TcpListener::bind(config.api.listen_addr).await?;
     let api_actual_addr = api_listener.local_addr()?;
+    // Live peer-count probe shared by `/metrics` and `/ready` — round-trips
+    // the same peer manager that answers `/peers`.
+    let peer_count: Arc<dyn crate::observability::PeerCount> =
+        Arc::new(PeerManagerCount(p2p_cmd_tx.clone()));
     let api_handle = {
-        let mut app = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx.clone()));
+        // The PUBLIC listener exposes only read-only + observability
+        // endpoints. Privileged routes (key rotation, mempool submit) are
+        // never mounted here — they live on the separate admin listener
+        // below (#807).
+        let obs_state = crate::observability::ObservabilityState {
+            status_rx: consensus_runtime.as_ref().map(|rc| rc.status_rx.clone()),
+            peer_count: Arc::clone(&peer_count),
+        };
+        let mut app = axum::Router::new()
+            .merge(p2p::api::router(p2p_cmd_tx.clone()))
+            .merge(crate::observability::router(obs_state));
         if let Some(rc) = consensus_runtime.as_ref() {
-            app = app
-                .merge(boule_consensus::api::router(rc.status_rx.clone()))
-                .merge(boule_consensus::api::submit_router(Arc::clone(&rc.mempool)))
-                .merge(crate::admin_api::router(Arc::clone(&rc.rotation)));
+            app = app.merge(boule_consensus::api::router(rc.status_rx.clone()));
         }
         tokio::spawn(async move {
-            info!("HTTP API listening on {api_actual_addr}");
+            info!("public HTTP API listening on {api_actual_addr}");
             axum::serve(api_listener, app).await.unwrap();
         })
+    };
+
+    // Bind the separate ADMIN listener when configured (#807). It carries the
+    // privileged routes (`POST /admin/rotate-key`, `POST /mempool/submit`),
+    // optionally behind a bearer token. When `[api.admin] listen_addr` is
+    // unset, the privileged surface is not served anywhere — default-safe.
+    let (admin_handle, admin_actual_addr) = if let Some(admin_addr) = config.api.admin.listen_addr {
+        let token = config.api.admin.resolve_auth_token()?;
+        let admin_listener = TcpListener::bind(admin_addr).await?;
+        let admin_actual_addr = admin_listener.local_addr()?;
+        // The privileged routes need the rotation handle + mempool, which
+        // only exist with consensus. On a gossip-only node we still bind the
+        // listener (so the bound port is observable / stable) but mount an
+        // empty router — nothing privileged is reachable there either.
+        let app = match consensus_runtime.as_ref() {
+            Some(rc) => crate::admin_api::router(
+                Arc::clone(&rc.rotation),
+                Arc::clone(&rc.mempool),
+                token.clone(),
+            ),
+            None => {
+                warn!(
+                    "[api.admin] listen_addr is set but consensus is disabled; the admin \
+                     listener binds but exposes no privileged routes."
+                );
+                axum::Router::new()
+            }
+        };
+        let authed = token.is_some();
+        let handle = tokio::spawn(async move {
+            info!(
+                "admin HTTP API listening on {admin_actual_addr} (auth: {})",
+                if authed {
+                    "bearer-token"
+                } else {
+                    "none (network-isolated)"
+                }
+            );
+            axum::serve(admin_listener, app).await.unwrap();
+        });
+        (Some(handle), Some(admin_actual_addr))
+    } else {
+        info!(
+            "admin API disabled (no [api.admin] listen_addr); privileged routes are not \
+             reachable on any listener."
+        );
+        (None, None)
     };
 
     // Write bound addresses + node ID to addr_file if configured.
     // Tests use this to discover actual ports when listen_addr uses port 0.
     if let Some(ref path) = config.node.addr_file {
-        let content = serde_json::json!({
+        let mut content = serde_json::json!({
             "p2p_addr": p2p_actual_addr.to_string(),
             "api_addr": api_actual_addr.to_string(),
             "node_id": node_id_to_base58(&identity.node_id),
         });
+        if let Some(admin_addr) = admin_actual_addr {
+            content["admin_addr"] = serde_json::Value::String(admin_addr.to_string());
+        }
         std::fs::write(path, content.to_string())?;
     }
 
@@ -293,9 +355,19 @@ pub async fn run(
         None => (None, Vec::new()),
     };
 
+    // The HTTP servers run until their listeners close (axum::serve never
+    // returns on its own), so abort them rather than awaiting indefinitely.
+    api_handle.abort();
+    if let Some(h) = admin_handle.as_ref() {
+        h.abort();
+    }
+
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = manager_handle.await;
         let _ = api_handle.await;
+        if let Some(h) = admin_handle {
+            let _ = h.await;
+        }
         let _ = protocol_handle.await;
         if let Some(h) = consensus_join {
             let _ = h.await;
@@ -307,6 +379,28 @@ pub async fn run(
     .await;
 
     Ok(())
+}
+
+/// [`observability::PeerCount`] backed by the live p2p peer manager. Round-
+/// trips a [`p2p::PeerCommand::ListPeers`] (the same command `/peers` uses)
+/// and reports the length, degrading to `0` if the manager channel is closed.
+struct PeerManagerCount(mpsc::Sender<p2p::PeerCommand>);
+
+impl crate::observability::PeerCount for PeerManagerCount {
+    fn count(&self) -> futures_util::future::BoxFuture<'static, usize> {
+        let tx = self.0.clone();
+        Box::pin(async move {
+            let (reply, rx) = oneshot::channel::<Vec<p2p::NodeId>>();
+            if tx
+                .send(p2p::PeerCommand::ListPeers { reply })
+                .await
+                .is_err()
+            {
+                return 0;
+            }
+            rx.await.map(|peers| peers.len()).unwrap_or(0)
+        })
+    }
 }
 
 /// Bundle returned by [`start_consensus`].
