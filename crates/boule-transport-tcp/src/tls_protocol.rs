@@ -10,6 +10,7 @@ use super::tls::{TlsIdentity, base58_to_node_id};
 use super::{ConnectionProtocol, NodeId, PeerCommand};
 use boule_core::clock::Clock;
 use boule_core::config::PeerConfig;
+use boule_core::transport::limits::HandshakeLimiter;
 
 pub struct TlsConnectionProtocol {
     pub identity: Arc<TlsIdentity>,
@@ -19,6 +20,11 @@ pub struct TlsConnectionProtocol {
     /// `[p2p] inbound_disabled = true`). When `None`, no listener task
     /// is spawned and the node only ever participates as a dialer.
     pub listener: Option<TcpListener>,
+    /// Pre-admission bound on in-flight inbound TLS handshakes plus the
+    /// per-handshake wall-clock timeout (#805). `None` opts out (the
+    /// sim transport and any embedding without the limits configured),
+    /// leaving the legacy un-timed, unbounded accept path.
+    pub handshake_limiter: Option<Arc<HandshakeLimiter>>,
     pub clock: Arc<dyn Clock>,
     /// Optional handle back into the peer manager's command channel so the
     /// dialer can ask whether a peer is already connected before redialing
@@ -39,6 +45,7 @@ impl ConnectionProtocol for TlsConnectionProtocol {
                 self.identity.acceptor.clone(),
                 self.identity.node_id,
                 manager_tx.clone(),
+                self.handshake_limiter.clone(),
             ));
         }
 

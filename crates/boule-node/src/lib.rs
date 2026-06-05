@@ -269,10 +269,20 @@ pub async fn run(
         std::fs::write(path, content.to_string())?;
     }
 
+    // Pre-admission handshake bound (#805): construct alongside the
+    // listener when `[p2p.limits]` is present, mirroring the
+    // ConnectionLimiter's opt-in plumbing. Absent `[p2p.limits]` leaves
+    // the legacy un-timed accept path (closed-network test deployments).
+    let handshake_limiter = config.p2p.limits.as_ref().map(|l| {
+        Arc::new(boule_core::transport::limits::HandshakeLimiter::new(
+            l.handshake_limits(),
+        ))
+    });
     let protocol = TlsConnectionProtocol {
         identity: Arc::clone(&identity),
         peers: config.peers.clone(),
         listener: p2p_listener,
+        handshake_limiter,
         clock: Arc::clone(&clock),
         peer_cmd_tx: Some(p2p_cmd_tx.clone()),
     };
