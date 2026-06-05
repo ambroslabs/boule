@@ -206,15 +206,31 @@ async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -
     let mut dev_nonce = fetch_nonce(t, &dev_addr).await?;
     let fund = U256::from(1_000_000_000_000_000_000u128);
     let mut last = String::new();
-    for a in &addrs {
+    eprintln!("funding {n} wallets (1 ETH each) in batches...");
+    for (idx, a) in addrs.iter().enumerate() {
         let raw = sign_transfer(&dev, dev_nonce, *a, fund, chain_id)?;
         if let Ok(r) = t.eth("eth_sendRawTransaction", json!([raw])).await {
             last = r.as_str().unwrap_or("").to_string();
         }
         dev_nonce += 1;
+        // reth caps pending txs per sender; drain every 12 so funding from the
+        // single dev account doesn't get rejected past the per-account limit.
+        if (idx + 1) % 12 == 0 {
+            let _ = await_receipt(t, &last).await;
+        }
     }
-    eprintln!("funding {n} wallets (1 ETH each), waiting for inclusion...");
     let _ = await_receipt(t, &last).await;
+    let mut funded = 0usize;
+    for a in &addrs {
+        let b = t
+            .eth("eth_getBalance", json!([format!("0x{}", hex::encode(a)), "latest"]))
+            .await
+            .ok();
+        if b.and_then(|x| x.as_str().map(|s| s != "0x0")).unwrap_or(false) {
+            funded += 1;
+        }
+    }
+    eprintln!("funded {funded}/{n} wallets");
     // load phase
     let ta = Arc::new(transport());
     let submitted = Arc::new(AtomicU64::new(0));
