@@ -59,6 +59,16 @@ pub struct HealthView {
     /// view, or no block has committed yet (cold start is "healthy view,
     /// not yet ready").
     pub healthy_view: bool,
+    /// The consensus task has halted (#649): it panicked on a fail-stop
+    /// (the #642 weak-subjectivity halt, the #635 tier-3b exhausted
+    /// recovery, or the durable-persist guard) and stopped publishing
+    /// status. By design the daemon stays up serving reads, but a halted
+    /// validator must NOT be routed write traffic, so this forces
+    /// [`is_ready`](Self::is_ready) to `false` regardless of the (now
+    /// frozen) snapshot. Detected by the consensus task dropping its
+    /// [`watch::Sender`] on unwind, which closes the channel the
+    /// observability [`watch::Receiver`] reads.
+    pub halted: bool,
 }
 
 /// How far `current_view` may run ahead of `last_committed_view` before the
@@ -87,7 +97,16 @@ impl HealthView {
             has_peers: peer_count > 0,
             committed_progress,
             healthy_view,
+            halted: false,
         }
+    }
+
+    /// Mark this view as halted (the consensus task is gone). Builder-style
+    /// so the handler can stamp the freshly-derived view from the (frozen)
+    /// snapshot with the live channel-closed signal.
+    pub fn halted(mut self) -> Self {
+        self.halted = true;
+        self
     }
 
     /// Gossip-only node: no consensus, so readiness reduces to "the process
@@ -100,6 +119,7 @@ impl HealthView {
             has_peers: false,
             committed_progress: false,
             healthy_view: true,
+            halted: false,
         }
     }
 
@@ -112,6 +132,13 @@ impl HealthView {
     ///   committed progress (it follows the chain; it has no quorum role),
     ///   matching the full/RPC-node mode the testnet runs.
     pub fn is_ready(&self) -> bool {
+        // A halted consensus task (#649) is never ready, even on a
+        // gossip-only node: the snapshot is frozen, so the other axes are
+        // stale and must not be trusted. Checked first so it can never be
+        // overridden by frozen-healthy values.
+        if self.halted {
+            return false;
+        }
         if !self.consensus_enabled {
             return true;
         }
@@ -136,9 +163,13 @@ impl HealthView {
 pub fn render_prometheus(
     status: &ConsensusStatus,
     peer_count: usize,
+    halted: bool,
 ) -> Result<String, prometheus::Error> {
     let reg = Registry::new();
-    let health = HealthView::from_status(status, peer_count);
+    let mut health = HealthView::from_status(status, peer_count);
+    if halted {
+        health = health.halted();
+    }
 
     // --- helpers ---------------------------------------------------------
     let int_gauge = |name: &str, help: &str, val: i64| -> Result<(), prometheus::Error> {
@@ -259,6 +290,16 @@ pub fn render_prometheus(
         "1 if the node reports ready on /ready, else 0.",
         health.is_ready(),
     )?;
+    // #649: 1 once the consensus task has halted (panicked on a fail-stop and
+    // stopped publishing). The daemon stays up serving reads by design, so
+    // this is the only series that distinguishes a halted validator from a
+    // healthy one — `boule_node_ready` also flips to 0, but `halted` names the
+    // cause so an operator/alert can tell a halt apart from a normal drain.
+    bool_gauge(
+        "boule_consensus_halted",
+        "1 if the consensus task has halted (fail-stop), else 0.",
+        health.halted,
+    )?;
 
     let mut buf = Vec::new();
     TextEncoder::new().encode(&reg.gather(), &mut buf)?;
@@ -299,14 +340,36 @@ async fn current_status(state: &ObservabilityState) -> Option<Arc<ConsensusStatu
     state.status_rx.as_ref().map(|rx| rx.borrow().clone())
 }
 
+impl ObservabilityState {
+    /// Has the consensus task halted? (#649)
+    ///
+    /// The consensus task owns the sole [`watch::Sender<ConsensusStatus>`]
+    /// (moved into the spawned task in `start_consensus`). On a fail-stop the
+    /// task unwinds and drops the sender, closing the channel. A closed sender
+    /// makes [`watch::Receiver::has_changed`] return `Err`, which is a precise
+    /// "the consensus task is gone" signal — no timing threshold needed. The
+    /// last published snapshot is still readable from the receiver (so reads
+    /// keep working), but it is now frozen and must not be trusted for
+    /// readiness.
+    ///
+    /// Returns `false` on a gossip-only node (no consensus task to halt).
+    fn consensus_halted(&self) -> bool {
+        match &self.status_rx {
+            Some(rx) => rx.has_changed().is_err(),
+            None => false,
+        }
+    }
+}
+
 async fn metrics(State(state): State<ObservabilityState>) -> impl IntoResponse {
     let peer_count = state.peer_count.count().await;
+    let halted = state.consensus_halted();
     let body = match current_status(&state).await {
-        Some(status) => render_prometheus(&status, peer_count),
+        Some(status) => render_prometheus(&status, peer_count, halted),
         // Gossip-only: still expose the p2p peer gauge so the node is not a
         // metrics black hole. Render against a zeroed snapshot — but only the
         // p2p series carry meaning there, which the help text reflects.
-        None => render_prometheus(&gossip_only_status(peer_count), peer_count),
+        None => render_prometheus(&gossip_only_status(peer_count), peer_count, halted),
     };
     match body {
         Ok(text) => (
@@ -327,15 +390,20 @@ async fn metrics(State(state): State<ObservabilityState>) -> impl IntoResponse {
 }
 
 /// `/health` — liveness. The process answering at all *is* the signal, so
-/// this is always `200 OK`. The body distinguishes consensus-enabled from
-/// gossip-only for human eyeballs.
+/// this is always `200 OK` (process-up = liveness is the established
+/// contract). The body distinguishes consensus-enabled from gossip-only for
+/// human eyeballs, and (#649) carries an explicit `halted` flag so a halted
+/// validator is visible even though liveness is still `200`. The
+/// load-balancer drain signal is `/ready` → `503`, not `/health`.
 async fn health(State(state): State<ObservabilityState>) -> impl IntoResponse {
     let enabled = state.status_rx.is_some();
+    let halted = state.consensus_halted();
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "status": "ok",
+            "status": if halted { "halted" } else { "ok" },
             "consensus_enabled": enabled,
+            "halted": halted,
         })),
     )
 }
@@ -344,10 +412,12 @@ async fn health(State(state): State<ObservabilityState>) -> impl IntoResponse {
 /// `503` so a load balancer drains the node until it is participating.
 async fn ready(State(state): State<ObservabilityState>) -> impl IntoResponse {
     let peer_count = state.peer_count.count().await;
+    let halted = state.consensus_halted();
     let view = match current_status(&state).await {
         Some(status) => HealthView::from_status(&status, peer_count),
         None => HealthView::gossip_only(),
     };
+    let view = if halted { view.halted() } else { view };
     let ready = view.is_ready();
     let code = if ready {
         StatusCode::OK
@@ -358,6 +428,7 @@ async fn ready(State(state): State<ObservabilityState>) -> impl IntoResponse {
         code,
         Json(serde_json::json!({
             "ready": ready,
+            "halted": view.halted,
             "is_validator": view.is_validator,
             "has_peers": view.has_peers,
             "committed_progress": view.committed_progress,
@@ -442,7 +513,7 @@ mod tests {
     #[test]
     fn metrics_render_expected_series() {
         let status = base_status();
-        let text = render_prometheus(&status, 5).expect("render");
+        let text = render_prometheus(&status, 5, false).expect("render");
 
         // A handful of representative series + values.
         assert!(text.contains("boule_consensus_current_view 10"));
@@ -455,6 +526,8 @@ mod tests {
         assert!(text.contains("boule_consensus_cluster_participation_ratio 0.95"));
         // Health rolls up to ready (validator, has peers, committed, healthy).
         assert!(text.contains("boule_node_ready 1"));
+        // Not halted on a healthy node.
+        assert!(text.contains("boule_consensus_halted 0"));
 
         // Every series carries a HELP + TYPE header — valid exposition format.
         assert!(text.contains("# HELP boule_consensus_current_view"));
@@ -465,7 +538,7 @@ mod tests {
     fn non_validator_metric_is_zero() {
         let mut status = base_status();
         status.validator_set = vec!["peer-a".to_string()];
-        let text = render_prometheus(&status, 1).expect("render");
+        let text = render_prometheus(&status, 1, false).expect("render");
         assert!(text.contains("boule_consensus_is_validator 0"));
     }
 
@@ -473,7 +546,7 @@ mod tests {
     fn participation_gauge_absent_when_unknown() {
         let mut status = base_status();
         status.cluster_participation_permille = None;
-        let text = render_prometheus(&status, 1).expect("render");
+        let text = render_prometheus(&status, 1, false).expect("render");
         assert!(!text.contains("boule_consensus_cluster_participation_ratio"));
     }
 
@@ -544,6 +617,45 @@ mod tests {
         assert!(h.is_ready());
     }
 
+    // --- #649: halt detection policy ------------------------------------
+
+    #[test]
+    fn halted_validator_is_not_ready_despite_frozen_healthy_snapshot() {
+        // A snapshot frozen at its last *healthy* values (validator, peers,
+        // committed, healthy view) must still be unready once halted: the
+        // consensus task is gone and the snapshot can no longer be trusted.
+        let status = base_status();
+        let healthy = HealthView::from_status(&status, 2);
+        assert!(healthy.is_ready(), "precondition: snapshot reads healthy");
+
+        let halted = healthy.halted();
+        assert!(halted.halted);
+        assert!(
+            !halted.is_ready(),
+            "a halted validator must not be ready even with a healthy snapshot"
+        );
+    }
+
+    #[test]
+    fn halted_overrides_every_other_axis() {
+        // Even gossip-only (otherwise always-ready) is unready when halted.
+        let halted_gossip = HealthView::gossip_only().halted();
+        assert!(!halted_gossip.is_ready());
+
+        // And a follower that would otherwise be ready.
+        let mut status = base_status();
+        status.validator_set = vec!["peer-a".to_string(), "peer-b".to_string()];
+        let follower = HealthView::from_status(&status, 0);
+        assert!(follower.is_ready(), "precondition: follower ready");
+        assert!(!follower.halted().is_ready());
+    }
+
+    #[test]
+    fn fresh_status_renders_not_halted() {
+        let h = HealthView::from_status(&base_status(), 2);
+        assert!(!h.halted, "a freshly-derived view defaults to not halted");
+    }
+
     // --- HTTP-level tests over the live router ---------------------------
 
     use axum::body::Body;
@@ -560,8 +672,38 @@ mod tests {
         }
     }
 
+    /// Build state with a *live* status sender. The sender is returned so the
+    /// caller keeps it alive — dropping it would close the channel and trip
+    /// the #649 halt detection, which the non-halt tests must not do.
+    fn state_with_tx(
+        status: ConsensusStatus,
+        peers: usize,
+    ) -> (ObservabilityState, watch::Sender<Arc<ConsensusStatus>>) {
+        let (tx, rx) = watch::channel(Arc::new(status));
+        let state = ObservabilityState {
+            status_rx: Some(rx),
+            peer_count: Arc::new(FixedPeers(peers)),
+        };
+        (state, tx)
+    }
+
+    /// Convenience wrapper for tests that don't need the sender handle but
+    /// must keep the channel open: leaks the sender for the test's lifetime so
+    /// the receiver never observes a closed channel.
     fn state_with(status: ConsensusStatus, peers: usize) -> ObservabilityState {
-        let (_tx, rx) = watch::channel(Arc::new(status));
+        let (state, tx) = state_with_tx(status, peers);
+        // Keep the sender alive for the duration of the (short) test so the
+        // channel stays open; the process exits right after, reclaiming it.
+        Box::leak(Box::new(tx));
+        state
+    }
+
+    /// Build state whose consensus task has "halted": the status sender is
+    /// dropped, closing the channel, exactly as a panicked consensus task
+    /// would leave it. The last snapshot is still readable but frozen.
+    fn halted_state(status: ConsensusStatus, peers: usize) -> ObservabilityState {
+        let (tx, rx) = watch::channel(Arc::new(status));
+        drop(tx); // consensus task gone -> sender dropped -> channel closed.
         ObservabilityState {
             status_rx: Some(rx),
             peer_count: Arc::new(FixedPeers(peers)),
@@ -646,6 +788,67 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(body_string(resp).await.contains("\"ready\":false"));
+    }
+
+    #[tokio::test]
+    async fn ready_returns_503_when_consensus_halted() {
+        // base_status() is a healthy validator with peers — it returns 200
+        // while the sender is live (asserted in ready_returns_200_*). With the
+        // sender dropped (consensus task gone), /ready must flip to 503 and the
+        // body must carry the halted flag even though the snapshot is frozen
+        // at healthy values.
+        let router = router(halted_state(base_status(), 2));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_string(resp).await;
+        assert!(body.contains("\"ready\":false"));
+        assert!(body.contains("\"halted\":true"));
+    }
+
+    #[tokio::test]
+    async fn health_is_200_but_reports_halted_when_consensus_halted() {
+        // Liveness contract: process-up = 200, always. But the body must
+        // distinguish a halted node.
+        let router = router(halted_state(base_status(), 2));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("\"halted\":true"));
+        assert!(body.contains("\"status\":\"halted\""));
+    }
+
+    #[tokio::test]
+    async fn metrics_emit_halted_gauge_when_consensus_halted() {
+        let router = router(halted_state(base_status(), 2));
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("boule_consensus_halted 1"));
+        assert!(body.contains("boule_node_ready 0"));
     }
 
     #[tokio::test]
