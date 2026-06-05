@@ -557,9 +557,19 @@ async fn start_consensus(
     rate_limiter: Option<Arc<boule_consensus::rate_limit::MessageRateLimiter>>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
+    // #803: surface the participation role at boot so an operator (and the
+    // multi-validator e2e harness) can confirm a non-validating node is running
+    // in the follow-only role and will never cast a vote.
+    let node_role = if cons_cfg.full_node {
+        boule_consensus::node_role::NodeRole::Full
+    } else {
+        boule_consensus::node_role::NodeRole::Validator
+    };
     info!(
-        "consensus: validator_set has {} members",
-        validator_set.len()
+        role = node_role.as_str(),
+        "consensus: validator_set has {} members; this node's role is {}",
+        validator_set.len(),
+        node_role.as_str(),
     );
     // Genesis stake (= genesis weight) per validator, captured before
     // `validator_set` is moved into the node config. Seeds the reth backend's
@@ -720,12 +730,19 @@ async fn start_consensus(
     )?;
     if let Some(BlsBootstrap { history, identity }) = bls_setup {
         node = node.with_bls_key_history(history);
-        let bls_signer: Arc<
-            dyn boule_core::crypto::signed::PartialSigner<
-                    boule_core::crypto::sig_scheme::BlsAggregated,
-                >,
-        > = Arc::new(boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity));
-        node = node.with_bls_signer(bls_signer);
+        // A validator wires its BLS partial signer; a full node (#803) has no
+        // signing identity — it verifies inbound QCs via the history above but
+        // never produces partials, so it leaves the signer unset.
+        if let Some(identity) = identity {
+            let bls_signer: Arc<
+                dyn boule_core::crypto::signed::PartialSigner<
+                        boule_core::crypto::sig_scheme::BlsAggregated,
+                    >,
+            > = Arc::new(
+                boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity),
+            );
+            node = node.with_bls_signer(bls_signer);
+        }
     }
 
     // Select the execution backend (`[consensus.application]`). Absent or
@@ -856,13 +873,19 @@ fn build_connection_limiter(
 
 /// Bundle returned by [`reconcile_bls_identity`] on `bls_aggregated`
 /// chains: the per-historical-view pubkey table (consumed by the
-/// dispatch verifier on inbound QCs) plus the loaded validator
-/// identity (consumed by the dispatch signer on outbound votes,
-/// wrapped in `BlsPartialSignerImpl` in the caller).
+/// dispatch verifier on inbound QCs) plus — for a **validator** — the
+/// loaded validator identity (consumed by the dispatch signer on
+/// outbound votes, wrapped in `BlsPartialSignerImpl` in the caller).
+///
+/// A [full node](boule_consensus::node_role::NodeRole::Full) (#802/#803)
+/// gets the history (it still verifies inbound QCs) but **no** `identity`:
+/// it is not in the committee and never produces QC partials, so it must
+/// not be required to carry a BLS signing key. `identity` is therefore
+/// `None` for a full node and `Some` for a validator.
 #[derive(Debug)]
 struct BlsBootstrap {
     history: boule_consensus::bls_key_history::BlsKeyHistory,
-    identity: boule_core::crypto::bls_key::BlsValidatorIdentity,
+    identity: Option<boule_core::crypto::bls_key::BlsValidatorIdentity>,
 }
 
 /// Reconcile the node's local BLS identity with the chain's signature
@@ -902,52 +925,72 @@ fn reconcile_bls_identity(
             Ok(None)
         }
         SignatureSchemeChoice::BlsAggregated => {
-            let bls_cfg = bls_identity_config.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "consensus.signature_scheme = \"bls_aggregated\" requires \
-                     [node.bls_validator_identity] to be set so the node can produce QC \
-                     partials. Configure a BLS key path before booting against this chain.",
-                )
-            })?;
-            let provider = boule_core::config::build_bls_provider(bls_cfg)
-                .context("building BLS validator-key provider from config")?;
-            let identity = provider
-                .load_or_init()
-                .context("loading BLS validator key from configured backend")?;
-            // Cross-check that the loaded BLS pubkey appears in the
-            // genesis BLS table for THIS node's NodeId. Catches both
-            // the "wrong key file" case (BLS key on disk doesn't match
-            // the one in genesis) and the "wrong node" case (this
-            // NodeId isn't a genesis BLS validator at all).
-            let expected = genesis_bls.iter().find(|(nid, _)| nid == self_id);
-            match expected {
-                Some((_, expected_pk)) if expected_pk == &identity.public => {
+            // #803: a full (non-validating) node on a BLS chain still needs the
+            // genesis BLS pubkey *history* to verify inbound QCs, but it never
+            // produces QC partials — so it must NOT be required to carry a BLS
+            // signing key. Load + cross-check the local identity only for a
+            // validator; a full node gets `identity = None` (and may set or omit
+            // `[node.bls_validator_identity]` freely).
+            let identity = if cons_cfg.full_node {
+                if bls_identity_config.is_some() {
                     info!(
-                        backend = provider.name(),
-                        bls_pubkey = %hex::encode(identity.public),
-                        "consensus: BLS validator identity reconciled with genesis",
+                        "consensus: full node on a bls_aggregated chain — \
+                         [node.bls_validator_identity] is present but unused (a full node \
+                         verifies QCs but never signs partials)",
                     );
                 }
-                Some((_, expected_pk)) => {
-                    anyhow::bail!(
-                        "consensus: loaded BLS pubkey {} does not match the genesis BLS pubkey \
-                         {} for this node ({}). The on-disk BLS key was generated for a \
-                         different validator slot.",
-                        hex::encode(identity.public),
-                        hex::encode(expected_pk),
-                        node_id_to_base58(self_id),
-                    );
+                None
+            } else {
+                let bls_cfg = bls_identity_config.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "consensus.signature_scheme = \"bls_aggregated\" requires \
+                         [node.bls_validator_identity] to be set so the node can produce QC \
+                         partials. Configure a BLS key path before booting against this chain \
+                         (or set [consensus] full_node = true for a non-validating node).",
+                    )
+                })?;
+                let provider = boule_core::config::build_bls_provider(bls_cfg)
+                    .context("building BLS validator-key provider from config")?;
+                let identity = provider
+                    .load_or_init()
+                    .context("loading BLS validator key from configured backend")?;
+                // Cross-check that the loaded BLS pubkey appears in the
+                // genesis BLS table for THIS node's NodeId. Catches both
+                // the "wrong key file" case (BLS key on disk doesn't match
+                // the one in genesis) and the "wrong node" case (this
+                // NodeId isn't a genesis BLS validator at all).
+                let expected = genesis_bls.iter().find(|(nid, _)| nid == self_id);
+                match expected {
+                    Some((_, expected_pk)) if expected_pk == &identity.public => {
+                        info!(
+                            backend = provider.name(),
+                            bls_pubkey = %hex::encode(identity.public),
+                            "consensus: BLS validator identity reconciled with genesis",
+                        );
+                    }
+                    Some((_, expected_pk)) => {
+                        anyhow::bail!(
+                            "consensus: loaded BLS pubkey {} does not match the genesis BLS \
+                             pubkey {} for this node ({}). The on-disk BLS key was generated \
+                             for a different validator slot.",
+                            hex::encode(identity.public),
+                            hex::encode(expected_pk),
+                            node_id_to_base58(self_id),
+                        );
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "consensus: this node ({}) is not a BLS-genesis validator but the \
+                             chain's signature_scheme = \"bls_aggregated\". Either add this \
+                             node to consensus.validators_bls in genesis, set [consensus] \
+                             full_node = true to follow as a non-validating node, or boot \
+                             against a chain on which it is a member.",
+                            node_id_to_base58(self_id),
+                        );
+                    }
                 }
-                None => {
-                    anyhow::bail!(
-                        "consensus: this node ({}) is not a BLS-genesis validator but the \
-                         chain's signature_scheme = \"bls_aggregated\". Either add this node \
-                         to consensus.validators_bls in genesis, or boot against a chain on \
-                         which it is a member.",
-                        node_id_to_base58(self_id),
-                    );
-                }
-            }
+                Some(identity)
+            };
             // Prefer the persisted form (#339) so reconfig-added
             // validators and post-genesis rotations survive restart.
             // Fall back to a fresh genesis seed when storage has
@@ -1309,7 +1352,13 @@ mod tests {
                 .expect("BLS chain must seed a history + identity");
         assert_eq!(bootstrap.history.len(), 2);
         assert_eq!(bootstrap.history.key_at(&self_id, 0), Some(pk));
-        assert_eq!(bootstrap.identity.public, pk);
+        assert_eq!(
+            bootstrap
+                .identity
+                .expect("validator has a signing identity")
+                .public,
+            pk
+        );
     }
 
     #[test]
@@ -1396,6 +1445,38 @@ mod tests {
         // the dispatch signer can produce real BLS partials on Vote
         // frames (#354 step 2 — without this the production startup
         // would silently boot a BLS validator that can't sign votes).
-        assert_eq!(reloaded.identity.public, pk);
+        assert_eq!(
+            reloaded
+                .identity
+                .expect("validator has a signing identity")
+                .public,
+            pk
+        );
+    }
+
+    /// #803: a full node on a `bls_aggregated` chain boots WITHOUT a local BLS
+    /// signing key. It must still get the genesis BLS history (to verify inbound
+    /// QCs) but `identity` is `None` — it never produces partials. Before the
+    /// fix, `reconcile_bls_identity` hard-failed startup demanding a BLS key for
+    /// every node, so a full node could not join a BLS chain at all.
+    #[test]
+    fn full_node_on_bls_chain_needs_no_signing_key() {
+        let mut cfg = cons_cfg(SignatureSchemeChoice::BlsAggregated);
+        cfg.full_node = true;
+        let self_id = nid(9); // NOT in the genesis BLS set — a follower
+        // A genesis BLS set that does NOT contain this node.
+        let genesis = vec![(nid(1), [0x11; 48]), (nid(2), [0x22; 48])];
+        let storage = empty_storage();
+        // No bls_identity_config at all — a full node need not configure one.
+        let bootstrap = reconcile_bls_identity(&cfg, None, &self_id, &genesis, storage.as_ref())
+            .expect("full node on a BLS chain must boot")
+            .expect("BLS chain still seeds a verification history");
+        assert!(
+            bootstrap.identity.is_none(),
+            "a full node has no BLS signing identity",
+        );
+        // It carries the genesis history so it can verify QCs from the committee.
+        assert_eq!(bootstrap.history.len(), 2);
+        assert_eq!(bootstrap.history.key_at(&nid(1), 0), Some([0x11; 48]));
     }
 }
