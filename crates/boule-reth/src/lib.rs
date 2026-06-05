@@ -33,6 +33,7 @@
 pub mod application;
 pub mod endpoint;
 pub mod engine;
+pub mod faucet;
 pub mod genesis;
 pub mod governance;
 pub mod jwt;
@@ -41,6 +42,7 @@ pub mod predeploy_log;
 pub mod registry;
 pub mod registry_payload;
 pub mod rotation;
+pub mod rpc_proxy;
 pub mod slashing;
 pub mod staking;
 pub mod transport;

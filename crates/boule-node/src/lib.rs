@@ -8,6 +8,9 @@
 pub mod admin_api;
 pub mod consensus_node;
 pub mod demo_staking;
+/// Public eth-facing HTTP services (faucet + RPC proxy); reth-only (#806).
+#[cfg(feature = "reth")]
+pub mod eth_public;
 pub mod observability;
 pub mod rotatable_signer;
 pub mod rotation_handle;

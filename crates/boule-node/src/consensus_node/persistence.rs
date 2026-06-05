@@ -813,25 +813,42 @@ impl ConsensusNode {
         // would differ from the genesis members on any chain that
         // has already committed a reconfig.
         //
+        // Carry the genesis boundary's **weights** through, not just
+        // its members (#815). The commitment binds the weighted set
+        // (`PersistedBoundary` serializes the parallel weight vector),
+        // so seeding with default weight-1 members would make the
+        // rebuilt genesis boundary diverge from the chain's stamped
+        // commitment on any chain whose genesis weights are non-uniform
+        // — the very first walk iteration would then fire a spurious
+        // mismatch on perfectly healthy storage. Using
+        // `iter_weighted()` reproduces the exact genesis set the chain
+        // committed.
+        //
         // Trusting the loaded blob's genesis boundary is safe even
-        // under tampering: if those members are wrong, the very
-        // first iteration of the walk below computes a commitment
+        // under tampering: if those members or weights are wrong, the
+        // very first iteration of the walk below computes a commitment
         // over the tampered seed and compares against the genesis
         // *block*'s stamped commitment (which was hashed over the
-        // *real* members at chain birth). The mismatch fires the
+        // *real* weighted set at chain birth). The mismatch fires the
         // rejection.
-        let genesis_members: Vec<boule_consensus::validator_set::ValidatorId> = self
+        let genesis_weighted: Vec<(boule_consensus::validator_set::ValidatorId, u64)> = self
             .validator_history
             .iter()
             .next()
-            .map(|(_, set)| set.iter().copied().collect())
+            .map(|(_, set)| set.iter_weighted().map(|(id, w)| (*id, w)).collect())
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "validator history rebuild: loaded validator_history is empty (no genesis \
                      boundary)"
                 )
             })?;
-        let genesis_seed_set = ValidatorSet::new(genesis_members);
+        // `with_weights` only rejects weight 0; the loaded boundary came
+        // through `from_persisted`, which already enforces that invariant,
+        // so a genuine genesis boundary can't trip it. If it somehow does,
+        // surface it rather than silently dropping weights.
+        let genesis_seed_set = ValidatorSet::with_weights(genesis_weighted).map_err(|e| {
+            anyhow::anyhow!("validator history rebuild: genesis seed set construction failed: {e}")
+        })?;
         let _ = chain.first().expect("non-empty chain"); // sanity: bind drops when block-walked is non-empty
         let mut rebuilt_set = ValidatorSetHistory::from_genesis(genesis_seed_set.clone());
         let mut rebuilt_key = ValidatorKeyHistory::new(genesis_seed_set.iter().copied());
