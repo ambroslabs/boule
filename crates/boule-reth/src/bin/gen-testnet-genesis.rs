@@ -13,6 +13,7 @@
 //! ```text
 //! gen-testnet-genesis \
 //!     --chain-id <U64> \
+//!     --staking-owner <0xADDR> \
 //!     --out <PATH> \
 //!     [--prefund <0xADDR>:<WEI> ...] \
 //!     --validator <NODE_ID_B58>:<BLS_PUBKEY_HEX>:<WEIGHT> ...
@@ -24,6 +25,12 @@
 //!   Registry **must** seed non-zero weights or weighted quorum is inert.
 //! - `--prefund` repeats; `WEI` is decimal wei. A faucet account (#806) is just
 //!   another `--prefund` entry — this binary has no coupling to the faucet.
+//! - `--staking-owner` is the 20-byte EVM address allowed to call the `Staking`
+//!   predeploy's `withdraw` (#821): unbonding (which removes a validator) is a
+//!   trusted-owner action, not open self-service. **Required** — a deployment
+//!   that left it unset would have `owner == address(0)`, disabling `withdraw`
+//!   entirely (fails closed), but the operator must consciously choose the
+//!   address rather than silently ship a no-withdraw chain.
 //! - `--out` is the genesis path (default: stdout).
 //!
 //! The seeded storage is byte-identical to what a live reth answers for
@@ -81,6 +88,7 @@ fn parse_prefund(spec: &str) -> anyhow::Result<PrefundAlloc> {
 fn main() -> anyhow::Result<()> {
     let mut chain_id: Option<u64> = None;
     let mut out: Option<String> = None;
+    let mut staking_owner: Option<String> = None;
     let mut validators: Vec<GenesisValidator> = Vec::new();
     let mut prefund: Vec<PrefundAlloc> = Vec::new();
 
@@ -94,6 +102,12 @@ fn main() -> anyhow::Result<()> {
                 chain_id = Some(
                     v.parse()
                         .map_err(|e| anyhow::anyhow!("bad --chain-id: {e}"))?,
+                );
+            }
+            "--staking-owner" => {
+                staking_owner = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--staking-owner needs a value"))?,
                 );
             }
             "--out" => {
@@ -116,7 +130,8 @@ fn main() -> anyhow::Result<()> {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: gen-testnet-genesis --chain-id <U64> [--out PATH] \
+                    "usage: gen-testnet-genesis --chain-id <U64> \
+                     --staking-owner <0xADDR> [--out PATH] \
                      [--prefund <0xADDR>:<WEI> ...] \
                      --validator <NODE_ID_B58>:<BLS_PUBKEY_HEX>:<WEIGHT> ..."
                 );
@@ -127,12 +142,18 @@ fn main() -> anyhow::Result<()> {
     }
 
     let chain_id = chain_id.ok_or_else(|| anyhow::anyhow!("--chain-id is required"))?;
+    let staking_owner = staking_owner.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--staking-owner <0xADDR> is required (the address allowed to call \
+             Staking.withdraw — unbonding is a trusted-owner action, #821)"
+        )
+    })?;
     anyhow::ensure!(
         !validators.is_empty(),
         "at least one --validator is required (an empty validator set can't reach quorum)"
     );
 
-    let genesis = build_deployment_genesis(chain_id, validators, prefund)
+    let genesis = build_deployment_genesis(chain_id, validators, prefund, &staking_owner)
         .map_err(|e| anyhow::anyhow!("building deployment genesis: {e}"))?;
     let json = serde_json::to_string_pretty(&genesis)? + "\n";
 

@@ -263,6 +263,21 @@ Pick a value unlikely to collide with a public network; it is independent of
 the boule **consensus** chain-id, which is derived from the genesis parts
 (validator set + BLS keys + seed) and binds the BLS proofs-of-possession.
 
+### Staking owner (validator unbonding)
+
+`STAKING_OWNER` (or `gen-testnet-genesis --staking-owner <0xADDR>`) seeds the
+single address allowed to call the `Staking` predeploy's `withdraw` (#821).
+boule reads a `Withdraw` event back as a validator-shrinking stake unbond, so an
+**unauthenticated** `withdraw` would let any internet caller (gas funded by the
+public faucet) remove any validator. On a trusted-set testnet, unbonding is an
+operator/governance action, not self-service, so only this owner may emit a
+`Withdraw`; every other caller's `withdraw` reverts and emits nothing. Defaults
+to the dev EOA (also prefunded so it can pay gas) — **set it to the operator's
+address in production.** If left unseeded, `owner == address(0)` disables
+`withdraw` entirely (fails closed). `deposit` stays open to anyone: it is
+additive-only (it can only *increase* a validator's stake) and so is not a
+removal vector.
+
 ### Seed peers / discovery
 
 The generated configs use a **static full-mesh** `[[peers]]` list (every node
