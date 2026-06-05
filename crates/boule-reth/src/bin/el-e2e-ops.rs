@@ -195,8 +195,6 @@ fn sign_transfer(
 /// Fund N wallets from the dev account, then fire transfers between them and
 /// measure submit-rate vs mined-rate (does the chain keep up, or wedge?).
 async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -> Result<()> {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
     let chain_id = fetch_chain_id(t).await?;
     let dev: PrivateKeySigner = DEV_PK.parse().context("dev pk")?;
     let dev_addr = format!("0x{}", hex::encode(dev.address()));
@@ -231,7 +229,66 @@ async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -
         }
     }
     eprintln!("funded {funded}/{n} wallets");
-    // load phase
+    run_load(t, wallets, dur_secs, target_tps).await
+}
+
+/// genfund <N> <KEYSFILE> — generate N wallets, fund 1 ETH each from the dev
+/// account (batched under reth's per-account limit), and write their private
+/// keys (one hex per line) so a separate `loadkeys` run can drive load from them.
+async fn genfund(t: &HttpTransport, n: usize, path: &str) -> Result<()> {
+    let chain_id = fetch_chain_id(t).await?;
+    let dev: PrivateKeySigner = DEV_PK.parse().context("dev pk")?;
+    let dev_addr = format!("0x{}", hex::encode(dev.address()));
+    let wallets: Vec<PrivateKeySigner> = (0..n).map(|_| PrivateKeySigner::random()).collect();
+    let mut dev_nonce = fetch_nonce(t, &dev_addr).await?;
+    let fund = U256::from(1_000_000_000_000_000_000u128);
+    let mut last = String::new();
+    for (idx, w) in wallets.iter().enumerate() {
+        let raw = sign_transfer(&dev, dev_nonce, w.address(), fund, chain_id)?;
+        if let Ok(r) = t.eth("eth_sendRawTransaction", json!([raw])).await {
+            last = r.as_str().unwrap_or("").to_string();
+        }
+        dev_nonce += 1;
+        if (idx + 1) % 12 == 0 {
+            let _ = await_receipt(t, &last).await;
+        }
+    }
+    let _ = await_receipt(t, &last).await;
+    let mut out = String::new();
+    for w in &wallets {
+        out.push_str(&format!("0x{}\n", hex::encode(w.to_bytes())));
+    }
+    std::fs::write(path, out)?;
+    eprintln!("genfund: {n} wallets funded; keys -> {path}");
+    Ok(())
+}
+
+/// loadkeys <KEYSFILE> <DUR> <TPS> — drive load from pre-funded wallet keys
+/// (so many nodes can run in parallel against one funded wallet pool).
+async fn loadkeys(t: &HttpTransport, path: &str, dur_secs: u64, target_tps: u64) -> Result<()> {
+    let data = std::fs::read_to_string(path)?;
+    let wallets: Vec<PrivateKeySigner> = data
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().parse())
+        .collect::<std::result::Result<_, _>>()
+        .context("parse wallet keys")?;
+    eprintln!("loadkeys: {} wallets from {path}", wallets.len());
+    run_load(t, wallets, dur_secs, target_tps).await
+}
+
+/// Tx-storm load phase from already-funded `wallets`; prints submit/mined/backlog.
+async fn run_load(
+    t: &HttpTransport,
+    wallets: Vec<PrivateKeySigner>,
+    dur_secs: u64,
+    target_tps: u64,
+) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let n = wallets.len();
+    let chain_id = fetch_chain_id(t).await?;
+    let addrs: Vec<Address> = wallets.iter().map(|w| w.address()).collect();
     let ta = Arc::new(transport());
     let submitted = Arc::new(AtomicU64::new(0));
     let errors = Arc::new(AtomicU64::new(0));
@@ -387,6 +444,19 @@ async fn main() -> Result<()> {
             let dur: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
             let tps: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             loadtest(&t, n, dur, tps).await?;
+        }
+        // genfund <N> <KEYSFILE> — fund N wallets centrally, write their keys.
+        Some("genfund") => {
+            let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
+            let path = args.get(2).map(String::as_str).unwrap_or("/tmp/wallets.keys");
+            genfund(&t, n, path).await?;
+        }
+        // loadkeys <KEYSFILE> <DUR> <TPS> — load from pre-funded wallet keys.
+        Some("loadkeys") => {
+            let path = args.get(1).map(String::as_str).unwrap_or("/tmp/wallets.keys");
+            let dur: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
+            let tps: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            loadkeys(&t, path, dur, tps).await?;
         }
         Some("read") => {
             let node = parse_hex32(&args[1])?;
