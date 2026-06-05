@@ -961,6 +961,14 @@ fn state_root_of(payload: &Value) -> Result<[u8; 32]> {
     root_from_hex(payload["stateRoot"].as_str().context("payload stateRoot")?)
 }
 
+/// Parse an `eth_blockNumber` JSON-RPC result (a `0x`-prefixed hex quantity)
+/// into a block height. `None` for a non-string / non-hex result — the caller
+/// ([`RethApplication::el_head`]) treats that as "head unknown" and falls back.
+fn parse_block_number(v: &Value) -> Option<u64> {
+    let s = v.as_str()?;
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+}
+
 /// The `receiptsRoot` of a block's EVM execution payload (#797 weight-proof
 /// anchor), or `None` for a block with no command / no parseable root. The
 /// `receiptsRoot` is part of the execution payload reth built, so it is
@@ -1478,6 +1486,44 @@ impl Application for RethApplication {
         // EL reported VALID. Lags the consensus committed height while the EL
         // is SYNCING, which is what the startup EL-catch-up (#635) keys off.
         Some(self.committed.lock().height)
+    }
+
+    fn el_head<'a>(&'a self) -> BoxFuture<'a, Option<Height>> {
+        // reth's *actual* head (`eth_blockNumber`), read straight from the EL —
+        // used by #826's EL-catch-up to start the replay from the block reth is
+        // really missing after an unclean crash, rather than boule's recorded
+        // (possibly ahead) frontier. Best-effort: a transport that cannot answer
+        // (`eth_*` unsupported) or a transient failure yields `None`, and the
+        // catch-up falls back to `executed_height`.
+        Box::pin(async move {
+            match self
+                .transport
+                .eth_rpc("eth_blockNumber", serde_json::json!([]))
+                .await
+            {
+                Ok(v) => match parse_block_number(&v) {
+                    Some(h) => Some(Height(h)),
+                    None => {
+                        tracing::warn!(
+                            target: "boule::reth",
+                            result = %v,
+                            "el_head: eth_blockNumber returned an unparseable result; \
+                             EL-catch-up will fall back to the tracked frontier",
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        target: "boule::reth",
+                        error = %e,
+                        "el_head: eth_blockNumber query failed; \
+                         EL-catch-up will fall back to the tracked frontier",
+                    );
+                    None
+                }
+            }
+        })
     }
 
     fn state_commitment(&self) -> [u8; 32] {
@@ -2261,6 +2307,18 @@ mod tests {
         assert_eq!(app.executed_height(), Some(Height(0)), "starts at genesis");
         app.recover_frontier(Height(42), [0xAB; 32]);
         assert_eq!(app.executed_height(), Some(Height(42)));
+    }
+
+    #[test]
+    fn parse_block_number_decodes_hex_quantity_and_rejects_junk() {
+        // #826: `el_head` parses an `eth_blockNumber` hex quantity into a height.
+        assert_eq!(parse_block_number(&serde_json::json!("0x0")), Some(0));
+        assert_eq!(parse_block_number(&serde_json::json!("0x10")), Some(16));
+        assert_eq!(parse_block_number(&serde_json::json!("0x1267")), Some(4711));
+        // A non-string / non-hex / null result is "head unknown" → fall back.
+        assert_eq!(parse_block_number(&serde_json::json!(123)), None);
+        assert_eq!(parse_block_number(&serde_json::json!("zz")), None);
+        assert_eq!(parse_block_number(&serde_json::Value::Null), None);
     }
 
     #[test]

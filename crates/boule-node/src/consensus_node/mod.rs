@@ -1513,10 +1513,31 @@ impl ConsensusNode {
         let Some(executed) = self.app.executed_height() else {
             return;
         };
-        if committed == 0 || committed.saturating_sub(executed.0) < min_gap.max(1) {
+        // The replay must start from the EL's **true** frontier, which after an
+        // unclean crash (SIGKILL mid-commit) can be *below* boule's tracked
+        // `executed_height`: boule persisted the advanced frontier but reth never
+        // durably committed the block (#826). Querying reth's real head
+        // (`eth_blockNumber`) and starting from `min(executed, el_head)` re-feeds
+        // exactly the blocks reth is missing; starting from `executed+1` alone
+        // would skip them and re-wedge. `el_head` is best-effort — `None`
+        // (unsupported transport / transient failure) falls back to `executed`.
+        let frontier = match self.app.el_head().await {
+            Some(head) if head.0 < executed.0 => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    tracked = executed.0,
+                    el_head = head.0,
+                    "el_catchup: reth's actual head is below the tracked frontier \
+                     (unclean crash?); replaying from the EL's real head",
+                );
+                head.0
+            }
+            _ => executed.0,
+        };
+        if committed == 0 || committed.saturating_sub(frontier) < min_gap.max(1) {
             return;
         }
-        let behind = committed - executed.0;
+        let behind = committed - frontier;
         // The committed tip's content hash, from the height index, anchors the
         // backward storage walk.
         let tip_hash: BlockHash = match self.storage.get(&height_storage_key(Height(committed))) {
@@ -1528,7 +1549,7 @@ impl ConsensusNode {
             _ => {
                 tracing::warn!(
                     target: TRACE_TARGET,
-                    executed = executed.0,
+                    executed = frontier,
                     committed,
                     "el_catchup: no committed tip hash at the committed height; skipping EL replay",
                 );
@@ -1538,7 +1559,7 @@ impl ConsensusNode {
         let gap = match load_block_range_from_storage(
             &*self.storage,
             tip_hash,
-            Height(executed.0 + 1),
+            Height(frontier + 1),
             Height(committed),
             behind as usize,
         ) {
@@ -1551,7 +1572,7 @@ impl ConsensusNode {
         if (gap.len() as u64) < behind {
             tracing::warn!(
                 target: TRACE_TARGET,
-                executed = executed.0,
+                executed = frontier,
                 committed,
                 behind,
                 retained = gap.len(),
@@ -1564,7 +1585,7 @@ impl ConsensusNode {
         }
         tracing::info!(
             target: TRACE_TARGET,
-            executed = executed.0,
+            executed = frontier,
             committed,
             blocks = gap.len(),
             "el_catchup: replaying committed payloads to catch the execution layer up",
@@ -11280,7 +11301,26 @@ mod tests {
     /// `commit`, so a test can assert the gap was replayed in order.
     struct RecordingApp {
         executed: Height,
+        /// Overrides the EL's *actual* head (`el_head`) independently of the
+        /// tracked `executed` frontier, so a test can model an unclean crash
+        /// where reth's real head is below boule's recorded frontier (#826).
+        /// `None` keeps the default (no out-of-process head reported).
+        el_head: Option<Height>,
         commits: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl RecordingApp {
+        fn new(executed: Height) -> Self {
+            Self {
+                executed,
+                el_head: None,
+                commits: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn with_el_head(mut self, el_head: Height) -> Self {
+            self.el_head = Some(el_head);
+            self
+        }
     }
 
     impl boule_consensus::replication::application::Application for RecordingApp {
@@ -11311,6 +11351,10 @@ mod tests {
         }
         fn executed_height(&self) -> Option<Height> {
             Some(self.executed)
+        }
+        fn el_head<'a>(&'a self) -> boule_core::clock::BoxFuture<'a, Option<Height>> {
+            let head = self.el_head;
+            Box::pin(async move { head })
         }
         fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
             Ok(())
@@ -11849,10 +11893,7 @@ mod tests {
         // must replay heights 3,4,5 into the app, oldest-first.
         let mut node = make_node_with_retention(nid(1), 0);
         commit_n_blocks(&mut node, 5);
-        let app = Arc::new(RecordingApp {
-            executed: Height(2),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let app = Arc::new(RecordingApp::new(Height(2)));
         node.app = app.clone();
 
         node.el_catchup_replay(1).await;
@@ -11873,10 +11914,7 @@ mod tests {
         commit_n_blocks(&mut node, 20);
 
         // EL at 17 is only 3 behind — below threshold 16 → the live path is a no-op.
-        let near = Arc::new(RecordingApp {
-            executed: Height(17),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let near = Arc::new(RecordingApp::new(Height(17)));
         node.app = near.clone();
         node.el_catchup_replay(EL_CATCHUP_LIVE_GAP_THRESHOLD).await;
         assert!(
@@ -11885,10 +11923,7 @@ mod tests {
         );
 
         // The boot path (min_gap = 1) still closes that same small gap.
-        let boot = Arc::new(RecordingApp {
-            executed: Height(17),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let boot = Arc::new(RecordingApp::new(Height(17)));
         node.app = boot.clone();
         node.el_catchup_replay(1).await;
         assert_eq!(
@@ -11898,10 +11933,7 @@ mod tests {
         );
 
         // A genuine wedge (EL at 2, 18 behind ≥ threshold) IS replayed in order.
-        let wedged = Arc::new(RecordingApp {
-            executed: Height(2),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let wedged = Arc::new(RecordingApp::new(Height(2)));
         node.app = wedged.clone();
         node.el_catchup_replay(EL_CATCHUP_LIVE_GAP_THRESHOLD).await;
         assert_eq!(
@@ -11920,10 +11952,7 @@ mod tests {
         // The default node app is the counter MempoolBlockBuilder (None).
         // Calling replay must not panic and must commit nothing extra; we
         // assert by swapping in a RecordingApp that *claims* it is caught up.
-        let app = Arc::new(RecordingApp {
-            executed: Height(4),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let app = Arc::new(RecordingApp::new(Height(4)));
         node.app = app.clone();
         node.el_catchup_replay(1).await;
         assert!(
@@ -11940,10 +11969,7 @@ mod tests {
         // catch-up must replay nothing rather than feed a non-contiguous gap.
         let mut node = make_node_with_retention(nid(1), 2);
         commit_n_blocks(&mut node, 5);
-        let app = Arc::new(RecordingApp {
-            executed: Height(0),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let app = Arc::new(RecordingApp::new(Height(0)));
         node.app = app.clone();
 
         node.el_catchup_replay(1).await;
@@ -11951,6 +11977,50 @@ mod tests {
         assert!(
             app.commits.lock().unwrap().is_empty(),
             "a gap that is not fully retained must not be partially replayed",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_replays_from_the_el_head_when_below_the_tracked_frontier() {
+        // #826: an unclean crash (SIGKILL mid-commit) can leave reth's actual
+        // head BELOW boule's tracked `executed_height` — boule persisted the
+        // advanced frontier but reth never durably committed the block. Replaying
+        // from `frontier+1` would skip the blocks reth is missing and re-wedge;
+        // the catch-up must start from reth's real head instead.
+        let mut node = make_node_with_retention(nid(1), 0);
+        commit_n_blocks(&mut node, 5);
+        // Tracked frontier claims 4, but reth's real head is only 2 (it lost
+        // blocks 3,4 on the crash). The replay must re-feed 3,4,5, not just 5.
+        let app = Arc::new(RecordingApp::new(Height(4)).with_el_head(Height(2)));
+        node.app = app.clone();
+
+        node.el_catchup_replay(1).await;
+
+        assert_eq!(
+            *app.commits.lock().unwrap(),
+            vec![3, 4, 5],
+            "replay must start from reth's actual head (2), not the tracked frontier (4)",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_ignores_an_el_head_above_the_tracked_frontier() {
+        // The clean case: reth's head is at/above the tracked frontier (the
+        // normal deferred-lag relationship). `el_head` must not pull the replay
+        // start *forward* past the tracked frontier — only a head BELOW the
+        // frontier (an unclean crash) moves the start. Here frontier=2, head=4:
+        // the gap to replay stays (2, 5] = {3,4,5}.
+        let mut node = make_node_with_retention(nid(1), 0);
+        commit_n_blocks(&mut node, 5);
+        let app = Arc::new(RecordingApp::new(Height(2)).with_el_head(Height(4)));
+        node.app = app.clone();
+
+        node.el_catchup_replay(1).await;
+
+        assert_eq!(
+            *app.commits.lock().unwrap(),
+            vec![3, 4, 5],
+            "an el_head at/above the tracked frontier must not narrow the replay range",
         );
     }
 

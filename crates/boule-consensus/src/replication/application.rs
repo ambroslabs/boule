@@ -482,6 +482,32 @@ pub trait Application: Send + Sync {
         None
     }
 
+    /// The execution layer's **actual head** — the highest block number the EL
+    /// itself reports (a reth `eth_blockNumber`), as opposed to
+    /// [`Self::executed_height`], which is boule's *tracked* committed frontier
+    /// for the EL.
+    ///
+    /// These normally agree, but an **unclean crash** (SIGKILL mid-commit) can
+    /// leave reth's real head *below* the frontier boule recorded: boule
+    /// persisted the advanced frontier but reth never durably committed the
+    /// block. The EL-catch-up replay (#826) must then start from reth's real
+    /// head, not boule's frontier — replaying from `frontier+1` would skip the
+    /// blocks reth is actually missing and re-wedge the EL.
+    ///
+    /// `None` (the default) means "no out-of-process head to query" — an
+    /// in-process application, or a transport that cannot answer. The catch-up
+    /// then falls back to [`Self::executed_height`] alone. An implementation
+    /// returns `Some(h)` only when it has authoritatively read the EL's head;
+    /// a transient query failure also yields `None` (best-effort), so the
+    /// catch-up degrades to the frontier-based start rather than stalling.
+    ///
+    /// Async (unlike the other read hooks) because reading the EL head is a
+    /// real round trip to the out-of-process EL; it is only ever called off the
+    /// background EL-catch-up timer, never on a latency-sensitive path.
+    fn el_head<'a>(&'a self) -> BoxFuture<'a, Option<Height>> {
+        Box::pin(async { None })
+    }
+
     /// Slash the validator `node_id` — the economic half of the
     /// equivocation penalty (#658b), called by the integration layer when
     /// committed evidence first records that validator. An application that
