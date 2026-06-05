@@ -30,6 +30,7 @@ use boule_core::identity::NodeId;
 use serde_json::Value;
 
 use crate::registry::{REGISTRY_ADDRESS, genesis_seed_storage_json};
+use crate::staking::{STAKING_ADDRESS, owner_seed_storage_json};
 
 /// One genesis validator's seed: its 32-byte on-chain id (boule [`NodeId`]),
 /// its compressed BLS G1 pubkey (converted to 128-byte EIP-2537 on seed), and
@@ -52,6 +53,19 @@ pub enum GenesisSeedError {
     /// The base genesis JSON is structurally wrong (e.g. `alloc` is not an
     /// object, or the `Registry` entry is not an object).
     MalformedGenesis,
+    /// A deployment genesis was requested with an **empty** validator set
+    /// (#823 item 4). An empty set seeds `totalWeight == 0`, so consensus can
+    /// never reach quorum and every weighted-quorum feature is inert — fail
+    /// closed at build time rather than emit a dead chain. (The
+    /// `gen-testnet-genesis` CLI already guards this; the library fn now does
+    /// too, so every caller is protected.)
+    EmptyValidatorSet,
+    /// The base genesis has no `Staking` predeploy entry at [`STAKING_ADDRESS`]
+    /// to seed the [`withdraw`-gating](crate::staking) `owner` into, or the
+    /// supplied owner address is malformed (#821). The `Staking` predeploy must
+    /// be present (with its `code`/`contract`) in the base genesis; seeding only
+    /// adds its `owner` storage word.
+    StakingOwner(String),
 }
 
 impl std::fmt::Display for GenesisSeedError {
@@ -67,6 +81,14 @@ impl std::fmt::Display for GenesisSeedError {
                     f,
                     "base genesis is malformed (alloc / Registry not an object)"
                 )
+            }
+            GenesisSeedError::EmptyValidatorSet => write!(
+                f,
+                "deployment genesis requires a non-empty validator set \
+                 (an empty set seeds totalWeight == 0 and can never reach quorum)"
+            ),
+            GenesisSeedError::StakingOwner(msg) => {
+                write!(f, "seeding Staking owner at {STAKING_ADDRESS}: {msg}")
             }
         }
     }
@@ -139,6 +161,59 @@ pub fn seed_registry_genesis(
     Ok(())
 }
 
+/// Seed the `Staking` predeploy's `withdraw`-gating `owner` (#821) into
+/// `genesis["alloc"][STAKING_ADDRESS]["storage"]`, in place. After this, the
+/// staking predeploy's `withdraw(nodeId, amount)` reverts for every caller
+/// except `owner`, so only the trusted deployment owner can drive a validator
+/// unbond/removal — closing the open-internet validator-removal vector (an
+/// unauthenticated `Withdraw` boule would read back as a `StakeOp::Unbond`).
+///
+/// `owner` is a 20-byte EVM address (any case, with or without `0x`). The
+/// `Staking` predeploy entry must already be present in `genesis` (with its
+/// `code`/`contract`); this only adds its `owner` storage word. Errors if the
+/// predeploy is absent or the owner address is malformed.
+pub fn seed_staking_owner(genesis: &mut Value, owner: &str) -> Result<(), GenesisSeedError> {
+    let (slot, value) = owner_seed_storage_json(owner).map_err(GenesisSeedError::StakingOwner)?;
+
+    let alloc = genesis
+        .get_mut("alloc")
+        .ok_or_else(|| GenesisSeedError::StakingOwner("base genesis has no alloc".into()))?
+        .as_object_mut()
+        .ok_or(GenesisSeedError::MalformedGenesis)?;
+
+    // The template writes a lowercase key; match it directly first, then fall
+    // back to a case-insensitive lookup (reth compares alloc addresses
+    // case-insensitively).
+    let staking_key = if alloc.contains_key(STAKING_ADDRESS) {
+        STAKING_ADDRESS.to_string()
+    } else {
+        alloc
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(STAKING_ADDRESS))
+            .cloned()
+            .ok_or_else(|| {
+                GenesisSeedError::StakingOwner(format!(
+                    "no Staking predeploy at {STAKING_ADDRESS} to seed the owner into"
+                ))
+            })?
+    };
+
+    let staking = alloc
+        .get_mut(&staking_key)
+        .expect("key just resolved from this map")
+        .as_object_mut()
+        .ok_or(GenesisSeedError::MalformedGenesis)?;
+
+    let storage = staking
+        .entry("storage")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or(GenesisSeedError::MalformedGenesis)?;
+
+    storage.insert(slot, Value::from(value));
+    Ok(())
+}
+
 /// Build a full genesis `Value` from the embedded base genesis, seeding it with
 /// `validators` (their keys + weights + `totalWeight`). The general
 /// deployment-builder entry point when you want a fresh seeded genesis rather
@@ -165,12 +240,21 @@ pub type PrefundAlloc = (String, u128);
 /// `Registry` predeploy seeded with `validators` (keys + weights + totalWeight,
 /// the weighted-quorum surface from block zero); (2) the EVM `config.chainId`
 /// set to `chain_id` (the public testnet's EVM chain-id, distinct from the
-/// boule consensus chain-id derived from the genesis parts); and (3) every
-/// `(address, balance)` in `prefund` written to `alloc[address].balance`.
+/// boule consensus chain-id derived from the genesis parts); (3) every
+/// `(address, balance)` in `prefund` written to `alloc[address].balance`; and
+/// (4) the `Staking` predeploy's `withdraw`-gating `owner` seeded to
+/// `staking_owner` (#821), so only that address can drive a validator
+/// unbond/removal.
 ///
 /// This is the per-deployment entry point the testnet tooling
 /// (`gen-testnet-genesis`) calls: it takes the deployment's *minted* validators
-/// (not the dev set) plus an operator-chosen chain-id and prefund list.
+/// (not the dev set) plus an operator-chosen chain-id, prefund list, and
+/// staking owner.
+///
+/// **Fails closed on an empty validator set (#823 item 4):** an empty set seeds
+/// `totalWeight == 0`, so consensus can never reach quorum — this returns
+/// [`GenesisSeedError::EmptyValidatorSet`] rather than emit a dead chain. (The
+/// CLI already guarded this; the library fn now does too.)
 ///
 /// Note on `settledView`: every genesis key entry is `vEff = 0`, so the
 /// Registry's `settledView` scalar (slot 3) is already correct at its EVM
@@ -181,8 +265,21 @@ pub fn build_deployment_genesis(
     chain_id: u64,
     validators: impl IntoIterator<Item = GenesisValidator>,
     prefund: impl IntoIterator<Item = PrefundAlloc>,
+    staking_owner: &str,
 ) -> Result<Value, GenesisSeedError> {
+    // Fail closed on an empty validator set (#823 item 4): an empty set seeds
+    // totalWeight == 0 and can never reach quorum. Collect so we can check
+    // before consuming the iterator into the seeder.
+    let validators: Vec<GenesisValidator> = validators.into_iter().collect();
+    if validators.is_empty() {
+        return Err(GenesisSeedError::EmptyValidatorSet);
+    }
+
     let mut genesis = build_seeded_genesis(validators)?;
+
+    // (4) Gate the staking predeploy's `withdraw` behind the deployment owner
+    // (#821) — close the open-internet validator-removal vector.
+    seed_staking_owner(&mut genesis, staking_owner)?;
 
     // Override the EVM chain-id.
     genesis
@@ -369,6 +466,7 @@ mod tests {
                 (faucet.to_string(), 1_000_000_000_000_000_000_000u128), // 1000 ETH
                 (dev_eoa.to_string(), 7u128),
             ],
+            "0x00000000000000000000000000000000000Facc7",
         )
         .unwrap();
 
@@ -401,6 +499,76 @@ mod tests {
         assert!(
             !storage.contains_key(settled_slot),
             "settledView must rely on the EVM zero default for the genesis set",
+        );
+
+        // (4) the Staking predeploy's `owner` (slot 0) is seeded to the
+        // requested address, right-aligned — so `withdraw` is gated (#821).
+        let staking_storage = genesis["alloc"][STAKING_ADDRESS]["storage"]
+            .as_object()
+            .expect("Staking storage seeded with owner");
+        let owner_slot = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        assert_eq!(
+            staking_storage.get(owner_slot).and_then(Value::as_str),
+            Some("0x00000000000000000000000000000000000000000000000000000000000facc7"),
+            "Staking.owner seeded right-aligned at slot 0",
+        );
+    }
+
+    /// #823 item 4: the deployment builder fails closed on an empty validator
+    /// set rather than emitting a chain that seeds `totalWeight == 0` and can
+    /// never reach quorum. (The CLI already guarded this; the library fn now
+    /// does too, so every caller is protected.)
+    #[test]
+    fn deployment_genesis_rejects_empty_validator_set() {
+        let err = build_deployment_genesis(
+            424242,
+            std::iter::empty::<GenesisValidator>(),
+            std::iter::empty::<PrefundAlloc>(),
+            "0x00000000000000000000000000000000000Facc7",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenesisSeedError::EmptyValidatorSet),
+            "empty validator set must fail closed, got {err:?}",
+        );
+    }
+
+    /// A malformed staking-owner address fails the deployment build closed
+    /// (#821) — better a hard build error than a silently-misconfigured gate.
+    #[test]
+    fn deployment_genesis_rejects_malformed_staking_owner() {
+        let (pk0,) = (dev_genesis_validators(1)[0].1,);
+        let err = build_deployment_genesis(
+            424242,
+            [([0xa0; 32], pk0, 4u64)],
+            std::iter::empty::<PrefundAlloc>(),
+            "0xdeadbeef", // not 20 bytes
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenesisSeedError::StakingOwner(_)),
+            "malformed owner must fail closed, got {err:?}",
+        );
+    }
+
+    /// `seed_staking_owner` is idempotent on the embedded base genesis (the
+    /// Staking predeploy is present) and writes the owner right-aligned at slot
+    /// 0; the dev genesis (built without seeding an owner) leaves it unset, so
+    /// `owner == address(0)` disables `withdraw` (fails closed).
+    #[test]
+    fn dev_genesis_leaves_staking_owner_unset() {
+        let genesis = build_dev_genesis(2);
+        let staking = &genesis["alloc"][STAKING_ADDRESS];
+        // No storage (or no slot-0 owner word) → owner defaults to address(0),
+        // so `withdraw` reverts for everyone until an owner is seeded.
+        let owner_slot = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let seeded = staking["storage"]
+            .as_object()
+            .map(|s| s.contains_key(owner_slot))
+            .unwrap_or(false);
+        assert!(
+            !seeded,
+            "dev genesis must not seed a staking owner (withdraw stays disabled)",
         );
     }
 

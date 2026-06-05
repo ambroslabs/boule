@@ -25,6 +25,8 @@
 #             (use the validators' reachable IP/DNS for a real deployment)
 #   PREFUND   space-separated <0xADDR>:<WEI> prefund entries (default: one dev EOA)
 #             — a faucet account (#806) is just another entry here.
+#   STAKING_OWNER  the address allowed to call Staking.withdraw (#821 — unbonding
+#                  removes a validator, a trusted-owner action) (default: dev EOA)
 #   GENESIS_STATE_ROOT  pin the genesis EVM state root instead of booting reth
 #                       to read it (skips needing a live reth at generate time).
 #
@@ -45,6 +47,11 @@ HOST="${HOST:-127.0.0.1}"
 # Default prefund: the canonical anvil dev EOA with 1000 ETH (drop/override in
 # production). Format: <0xADDR>:<WEI> entries, space-separated.
 PREFUND="${PREFUND:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:1000000000000000000000}"
+# The address allowed to call the Staking predeploy's `withdraw` (#821):
+# unbonding removes a validator, so it is a trusted-owner governance action, not
+# open self-service. Defaults to the dev EOA (which is also prefunded above so it
+# can pay gas); set STAKING_OWNER to the operator's address in production.
+STAKING_OWNER="${STAKING_OWNER:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
 REGISTRY="0x0000000000000000000000000000000000000b12"
 
 SLOTS=$((N + M))
@@ -127,7 +134,7 @@ for i in $(seq 0 $((N - 1))); do
 done
 PREFUND_ARGS=()
 for p in $PREFUND; do PREFUND_ARGS+=(--prefund "$p"); done
-"$GEN_TESTNET_GENESIS" --chain-id "$CHAIN_ID" --out "$GEN" \
+"$GEN_TESTNET_GENESIS" --chain-id "$CHAIN_ID" --staking-owner "$STAKING_OWNER" --out "$GEN" \
   "${PREFUND_ARGS[@]}" "${VAL_ARGS[@]}" \
   || { echo "FATAL: genesis build failed"; exit 2; }
 echo "   wrote $GEN"
