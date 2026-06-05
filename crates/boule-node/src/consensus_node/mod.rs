@@ -145,6 +145,19 @@ use timeout_bucket::TimeoutBucket;
 /// boundaries without drowning in p2p / gossip traffic.
 pub const TRACE_TARGET: &str = "boule_core::consensus";
 
+/// Minimum EL-behind gap (`committed − executed`) that triggers a **live**
+/// `el_catchup_replay` from the run loop (#826). The execution layer normally
+/// lags the committed frontier by only the deferred-execution depth (a few
+/// blocks); we replay from consensus only when it has fallen well past that —
+/// a genuine wedge: a slow EL start, a post-restart gap, or a follower that
+/// block-synced ahead of an EL with no devp2p peers. Keeping a margin above
+/// the steady-state lag means the live commit path executes ordinary blocks
+/// exactly once and we never re-run a recently-committed block's side effects.
+const EL_CATCHUP_LIVE_GAP_THRESHOLD: u64 = 16;
+
+/// How often the run loop checks whether the EL has wedged behind (#826).
+const EL_CATCHUP_TICK: Duration = Duration::from_secs(2);
+
 /// Short, stable tag for a [`ConsensusMsg`] variant — suitable as a
 /// structured-log field value.
 pub(super) fn msg_kind(msg: &ConsensusMsg) -> &'static str {
@@ -1487,14 +1500,20 @@ impl ConsensusNode {
         );
     }
 
-    async fn el_catchup_replay(&self) {
+    /// Replay committed payloads to catch a behind execution layer up (#635,
+    /// #826). Only replays when the EL is behind by at least `min_gap` blocks:
+    /// the boot path passes `1` (close any gap on startup), while the live
+    /// run-loop path passes [`EL_CATCHUP_LIVE_GAP_THRESHOLD`] so the normal
+    /// deferred-execution lag never triggers a redundant replay (which would
+    /// re-run a recently-committed block's side effects).
+    async fn el_catchup_replay(&self, min_gap: u64) {
         let committed = self.last_committed_height.load(Ordering::Relaxed);
         // Only an out-of-process EL reports a lagging executed height; an
         // in-process application returns `None` and is skipped (no double-apply).
         let Some(executed) = self.app.executed_height() else {
             return;
         };
-        if committed == 0 || executed.0 >= committed {
+        if committed == 0 || committed.saturating_sub(executed.0) < min_gap.max(1) {
             return;
         }
         let behind = committed - executed.0;
@@ -1624,8 +1643,20 @@ impl ConsensusNode {
 
         // Before participating, catch a behind execution layer up by replaying
         // the committed payloads consensus still holds (#635). A no-op for an
-        // in-process application or an already-caught-up EL.
-        self.el_catchup_replay().await;
+        // in-process application or an already-caught-up EL. `min_gap = 1`:
+        // close any gap at boot. The run loop re-checks on a timer (#826).
+        self.el_catchup_replay(1).await;
+
+        // #826: the EL can also wedge *after* boot — a fresh follower that
+        // block-syncs ahead of a still-starting reth, or a node whose EL
+        // briefly fell behind — and with no devp2p peers it cannot self-sync
+        // the gap. A periodic, gap-thresholded replay closes it from the
+        // committed payloads consensus still holds.
+        let mut el_catchup_tick = tokio::time::interval(EL_CATCHUP_TICK);
+        el_catchup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first `tick()` resolves immediately; the boot replay above
+        // already covered that instant, so skip past it.
+        el_catchup_tick.tick().await;
 
         // Publish an initial snapshot before doing anything else, so
         // the HTTP endpoint has a sane value available even if it's
@@ -1716,6 +1747,16 @@ impl ConsensusNode {
                         BLOCK_SYNC_RETRY_INITIAL_DELAY,
                     )
                     .await?;
+                }
+
+                _ = el_catchup_tick.tick() => {
+                    // #826: re-run the EL catch-up if the execution layer has
+                    // wedged well behind the committed frontier (slow EL start,
+                    // post-restart gap, follower that block-synced ahead with no
+                    // devp2p peers). Idempotent and gap-thresholded, so a healthy
+                    // node — where the EL only lags by the deferred depth — is a
+                    // no-op; a wedged one replays the in-storage gap in order.
+                    self.el_catchup_replay(EL_CATCHUP_LIVE_GAP_THRESHOLD).await;
                 }
 
                 disc = discovery_events.recv() => {
@@ -11814,12 +11855,59 @@ mod tests {
         });
         node.app = app.clone();
 
-        node.el_catchup_replay().await;
+        node.el_catchup_replay(1).await;
 
         assert_eq!(
             *app.commits.lock().unwrap(),
             vec![3, 4, 5],
             "the in-storage gap (3..=5) must be replayed in height order",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_respects_the_min_gap_threshold() {
+        // #826: the live run-loop path passes a gap threshold so the normal
+        // deferred-execution lag (a few blocks) never triggers a replay, while a
+        // genuine wedge does. Commit 1..=20.
+        let mut node = make_node_with_retention(nid(1), 0);
+        commit_n_blocks(&mut node, 20);
+
+        // EL at 17 is only 3 behind — below threshold 16 → the live path is a no-op.
+        let near = Arc::new(RecordingApp {
+            executed: Height(17),
+            commits: std::sync::Mutex::new(Vec::new()),
+        });
+        node.app = near.clone();
+        node.el_catchup_replay(EL_CATCHUP_LIVE_GAP_THRESHOLD).await;
+        assert!(
+            near.commits.lock().unwrap().is_empty(),
+            "a sub-threshold (normal-lag) gap must not be replayed by the live path",
+        );
+
+        // The boot path (min_gap = 1) still closes that same small gap.
+        let boot = Arc::new(RecordingApp {
+            executed: Height(17),
+            commits: std::sync::Mutex::new(Vec::new()),
+        });
+        node.app = boot.clone();
+        node.el_catchup_replay(1).await;
+        assert_eq!(
+            *boot.commits.lock().unwrap(),
+            vec![18, 19, 20],
+            "the boot path replays any gap regardless of the live threshold",
+        );
+
+        // A genuine wedge (EL at 2, 18 behind ≥ threshold) IS replayed in order.
+        let wedged = Arc::new(RecordingApp {
+            executed: Height(2),
+            commits: std::sync::Mutex::new(Vec::new()),
+        });
+        node.app = wedged.clone();
+        node.el_catchup_replay(EL_CATCHUP_LIVE_GAP_THRESHOLD).await;
+        assert_eq!(
+            *wedged.commits.lock().unwrap(),
+            (3u64..=20).collect::<Vec<u64>>(),
+            "a wedge at/above the threshold is replayed oldest-first by the live path",
         );
     }
 
@@ -11837,7 +11925,7 @@ mod tests {
             commits: std::sync::Mutex::new(Vec::new()),
         });
         node.app = app.clone();
-        node.el_catchup_replay().await;
+        node.el_catchup_replay(1).await;
         assert!(
             app.commits.lock().unwrap().is_empty(),
             "a caught-up EL must not be replayed into",
@@ -11858,7 +11946,7 @@ mod tests {
         });
         node.app = app.clone();
 
-        node.el_catchup_replay().await;
+        node.el_catchup_replay(1).await;
 
         assert!(
             app.commits.lock().unwrap().is_empty(),
