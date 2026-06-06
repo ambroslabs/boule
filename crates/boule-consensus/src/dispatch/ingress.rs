@@ -378,14 +378,16 @@ pub fn ingress_block_request(hash: BlockHash, from: NodeId) -> Vec<Dispatch> {
 pub fn ingress_block_response(
     signed: Signed<crate::wire::BlockResponsePayload>,
     from: NodeId,
-    key_history: &ValidatorKeyHistory,
+    _key_history: &ValidatorKeyHistory,
     chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
-    use crate::validator_set::Pubkey;
-    let signer_pk = Pubkey::from_node_id(signed.signer);
-    if key_history.validator_for(&signer_pk).is_none() {
-        return Err(IngressError::UnknownSigner(signed.signer));
-    }
+    // #858: any connected peer may serve a block — a caught-up *sentry*, not
+    // only a validator. The block is independently verified downstream
+    // (content-hash binding + the inflight gate in the `ReceiveBlock` handler,
+    // and the block's own QC in the safety core), so the responder need not be
+    // in the validator set. We still verify the envelope signature: for a
+    // validator it remains slashable evidence of a wrong-hash answer;
+    // a non-validator simply isn't slashable, but its block is still checked.
     verify_sig(&signed, chain_id)?;
     let crate::wire::BlockResponsePayload {
         requested_hash,
@@ -429,14 +431,13 @@ pub fn ingress_block_range_request(
 pub fn ingress_block_range_response(
     signed: Signed<crate::wire::BlockRangeResponsePayload>,
     from: NodeId,
-    key_history: &ValidatorKeyHistory,
+    _key_history: &ValidatorKeyHistory,
     chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
-    use crate::validator_set::Pubkey;
-    let signer_pk = Pubkey::from_node_id(signed.signer);
-    if key_history.validator_for(&signer_pk).is_none() {
-        return Err(IngressError::UnknownSigner(signed.signer));
-    }
+    // #858: any connected peer may serve a block range — see
+    // `ingress_block_response`. The blocks are independently verified
+    // (in-range + ascending shape here, content-hash + QC downstream), so the
+    // responder need not be a validator.
     verify_sig(&signed, chain_id)?;
     let crate::wire::BlockRangeResponsePayload {
         from_height,

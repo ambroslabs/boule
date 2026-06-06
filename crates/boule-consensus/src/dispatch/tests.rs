@@ -348,7 +348,11 @@ fn ingress_block_response_happy_path() {
 }
 
 #[test]
-fn ingress_block_response_unknown_signer_rejected() {
+fn ingress_block_response_from_non_validator_accepted() {
+    // #858: a caught-up sentry (not in the validator set) may serve a block.
+    // The response is accepted as long as its signature is valid; the block is
+    // verified downstream by content-hash + the inflight gate, so the
+    // responder need not be a validator.
     let signer = fresh_signer();
     let other = fresh_signer();
     let vs = make_vs_with_signers(&[&other]); // signer not in VS
@@ -360,8 +364,12 @@ fn ingress_block_response_unknown_signer_rejected() {
     let wire = WireMessage::BlockResponse(signed);
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
-    let err = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap_err();
-    assert!(matches!(err, IngressError::UnknownSigner(_)));
+    let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap();
+    assert!(matches!(
+        dispatches.as_slice(),
+        [Dispatch::ReceiveBlock { requested_hash, block: None, .. }]
+            if *requested_hash == [0xAB; 32]
+    ));
 }
 
 #[test]
