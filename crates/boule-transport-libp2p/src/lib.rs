@@ -19,11 +19,15 @@
 //!   PKCS#8 → libp2p `Keypair` bridge that reuses the consensus key
 //!   (Phase 0, #840).
 //! - [`swarm`] — the tokio libp2p `Swarm` over tcp + TLS + yamux, carrying
-//!   `identify` (Phase 1, #841).
+//!   `gossipsub` + `identify` (Phase 1/2, #841/#842).
+//! - [`overlay`] — the swarm-owning driver task implementing the
+//!   `Broadcaster`/`Discovery` seam over gossipsub (Phase 2, #842).
 //!
-//! The [`OverlayMode::Libp2p`](boule_core::config::OverlayMode::Libp2p)
-//! backend is selectable in config but does not yet wire the `Swarm` into the
-//! `Broadcaster`/`Discovery` seam — that begins in Phase 2 (#842).
+//! The driver is not yet wired into `node::run` — selecting
+//! [`OverlayMode::Libp2p`](boule_core::config::OverlayMode::Libp2p) still
+//! fails closed until the keypair-threading step lands. The driver is
+//! exercised directly by the crate's integration tests.
 
 pub mod identity;
+pub mod overlay;
 pub mod swarm;

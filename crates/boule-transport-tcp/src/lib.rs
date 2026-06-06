@@ -260,37 +260,10 @@ pub enum ProtocolOutbound {
 /// Every registered protocol sees `PeerConnected` / `PeerDisconnected` for
 /// every peer (the manager fans these out to all protocol event channels),
 /// and `Message` for frames tagged with its own protocol ID.
-#[derive(Debug)]
-pub enum ProtocolEvent {
-    /// A peer just completed the handshake and is addressable. Delivered to
-    /// every registered protocol.
-    PeerConnected {
-        /// The peer that just connected.
-        node_id: NodeId,
-        /// Remote address the peer is reachable at.
-        ///
-        /// On outbound connections this is the dial target; on
-        /// inbound connections it is whatever the listener saw on
-        /// `accept`. The gossip overlay (issue #137) uses this field
-        /// to seed its `PeerTable` so peer-list gossip has something
-        /// to publish; protocols that don't care can ignore it.
-        addr: std::net::SocketAddr,
-    },
-    /// A peer disconnected (network failure, explicit `Disconnect`, or
-    /// peer-side teardown). Delivered to every registered protocol.
-    PeerDisconnected {
-        /// The peer that just disconnected.
-        node_id: NodeId,
-    },
-    /// A frame tagged with this protocol's ID arrived from `from`.
-    Message {
-        /// The sender; already authenticated by the transport.
-        from: NodeId,
-        /// Opaque application payload (protocol ID and length prefix have
-        /// been stripped).
-        payload: Bytes,
-    },
-}
+///
+/// The definition lives in `boule-core` (the transport-agnostic seam) so the
+/// libp2p backend can produce it too; it is re-exported here unchanged.
+pub use boule_core::transport::overlay::ProtocolEvent;
 
 /// The application-facing endpoint for a single protocol ID.
 ///

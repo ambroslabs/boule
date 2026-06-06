@@ -1,6 +1,6 @@
 //! `NodeId` ↔ libp2p `PeerId` identity adapter.
 //!
-//! boule's [`NodeId`](boule_core::identity::NodeId) is the raw 32-byte
+//! boule's [`NodeId`] is the raw 32-byte
 //! Ed25519 public key. libp2p's `PeerId` for an Ed25519 key is the
 //! *identity* multihash of the protobuf-encoded public key — because the
 //! encoded key is ≤ 42 bytes, libp2p embeds it verbatim rather than hashing

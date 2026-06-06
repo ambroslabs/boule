@@ -32,14 +32,16 @@ libp2p = { version = "0.56", features = [
 ] }
 anyhow = "1"
 tracing = "0.1"
+bytes = "1"
+parking_lot = "0.12"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 # Parse the node's PKCS#8 DER key to reuse the consensus Ed25519 key for the
 # libp2p transport. Already in the tree via libp2p-identity; the `pkcs8`
 # feature adds the RFC 8410 decoder.
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-futures = "0.3"
 # Generate PKCS#8 in the exact form boule's identity backends store, to test
 # the key bridge against real input.
 ring = "0.17"

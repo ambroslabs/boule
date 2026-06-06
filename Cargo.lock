@@ -1359,9 +1359,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boule-core",
+ "bytes",
  "ed25519-dalek",
  "futures",
  "libp2p",
+ "parking_lot",
  "ring",
  "tokio",
  "tracing",

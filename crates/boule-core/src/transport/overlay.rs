@@ -88,3 +88,41 @@ pub trait Discovery: Send + Sync {
     /// follow-up `known_peers` snapshot.
     fn subscribe(&self) -> broadcast::Receiver<DiscoveryEvent>;
 }
+
+// ── ProtocolEvent ──────────────────────────────────────────────────────────────
+
+/// Inbound seam an overlay implementation delivers to consensus.
+///
+/// Every overlay backend (the custom gossip overlay, the libp2p backend)
+/// surfaces inbound activity to consensus as a stream of these events:
+/// `PeerConnected` / `PeerDisconnected` membership deltas and `Message`
+/// payloads. This lives in `boule-core` (not a specific transport crate) so
+/// any backend can produce it without depending on another transport.
+#[derive(Debug)]
+pub enum ProtocolEvent {
+    /// A peer just completed the handshake and is addressable.
+    PeerConnected {
+        /// The peer that just connected.
+        node_id: NodeId,
+        /// Remote address the peer is reachable at.
+        ///
+        /// On outbound connections this is the dial target; on inbound
+        /// connections it is whatever the listener saw on `accept`. The
+        /// custom gossip overlay (#137) uses this to seed its `PeerTable`;
+        /// backends/protocols that don't care can ignore it.
+        addr: SocketAddr,
+    },
+    /// A peer disconnected (network failure, explicit teardown, or
+    /// peer-side close).
+    PeerDisconnected {
+        /// The peer that just disconnected.
+        node_id: NodeId,
+    },
+    /// An application payload arrived from `from`.
+    Message {
+        /// The sender, already authenticated by the transport.
+        from: NodeId,
+        /// Opaque application payload (any transport framing stripped).
+        payload: Bytes,
+    },
+}
