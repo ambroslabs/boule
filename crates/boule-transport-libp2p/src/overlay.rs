@@ -211,15 +211,32 @@ impl Driver {
                 _ = redial.tick() => self.redial_missing_bootstraps(),
                 cmd = self.cmd_rx.recv() => match cmd {
                     Some(Command::Broadcast(payload)) => {
+                        let bytes = payload.len();
                         if let Err(e) = self
                             .swarm
                             .behaviour_mut()
                             .gossipsub
                             .publish(self.topic.clone(), payload.to_vec())
                         {
-                            // `InsufficientPeers` is expected before the mesh
-                            // forms; nothing actionable, just trace it.
-                            debug!(target: TRACE, error = %e, "gossipsub publish failed");
+                            match e {
+                                // Expected before the mesh forms; nothing
+                                // actionable, just trace it.
+                                gossipsub::PublishError::NoPeersSubscribedToTopic => {
+                                    debug!(target: TRACE, "gossipsub publish: no peers subscribed yet (mesh forming)");
+                                }
+                                // Anything else (esp. `MessageTooLarge`) silently
+                                // drops a consensus message — a correctness/liveness
+                                // hazard that hid at `debug!` and caused #862. Make
+                                // it loud.
+                                other => {
+                                    tracing::warn!(
+                                        target: TRACE,
+                                        error = %other,
+                                        bytes,
+                                        "gossipsub publish dropped a consensus message",
+                                    );
+                                }
+                            }
                         }
                     }
                     Some(Command::SendTo { target, payload }) => match peer_id_for(&target) {
