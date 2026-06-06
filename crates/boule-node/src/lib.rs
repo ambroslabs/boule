@@ -99,6 +99,20 @@ pub async fn run(
             Arc::new(NodeSigner::from_identity(&network_identity)?)
         }
     };
+
+    // Derive the libp2p transport keypair from the network identity's PKCS#8
+    // key *before* it is dropped, so the libp2p backend reuses the consensus
+    // key (its PeerId == this node's NodeId). Only built when the libp2p
+    // overlay is selected.
+    let overlay_is_libp2p = matches!(config.overlay.mode, OverlayMode::Libp2p);
+    let libp2p_keypair = if overlay_is_libp2p {
+        Some(
+            boule_transport_libp2p::identity::keypair_from_pkcs8_der(&network_identity.pkcs8_der)
+                .context("derive libp2p transport keypair from network identity")?,
+        )
+    } else {
+        None
+    };
     drop(network_identity);
     drop(validator_identity);
 
@@ -227,11 +241,23 @@ pub async fn run(
     // to dial back; consensus traffic flows over connections we
     // initiated.
     let inbound_disabled = config.p2p.inbound_disabled;
-    let (p2p_listener, p2p_actual_addr) = if inbound_disabled {
-        info!(
-            "P2P inbound disabled (outbound-only mode); skipping listener bind on {}",
-            config.node.listen_addr
-        );
+    // In libp2p mode the libp2p Swarm owns its own TCP listener (bound on the
+    // same `node.listen_addr`), so the boule TCP manager must NOT also bind it
+    // — otherwise both race for the port (EADDRINUSE). The manager itself
+    // stays alive (peerless) so /peers, /metrics, and the admin router keep
+    // working; only the listener bind is skipped.
+    let (p2p_listener, p2p_actual_addr) = if inbound_disabled || overlay_is_libp2p {
+        if overlay_is_libp2p {
+            info!(
+                "overlay=libp2p owns its own listener; skipping boule TCP listener bind on {}",
+                config.node.listen_addr
+            );
+        } else {
+            info!(
+                "P2P inbound disabled (outbound-only mode); skipping listener bind on {}",
+                config.node.listen_addr
+            );
+        }
         (None, config.node.listen_addr)
     } else {
         let listener = TcpListener::bind(config.node.listen_addr).await?;
@@ -271,6 +297,7 @@ pub async fn run(
                 rate_limiter,
                 private_peers,
                 persistent_peers,
+                libp2p_keypair,
             )
             .await?,
         )
@@ -598,6 +625,7 @@ async fn start_consensus(
     rate_limiter: Option<Arc<boule_consensus::rate_limit::MessageRateLimiter>>,
     private_peers: std::collections::HashSet<NodeId>,
     persistent_peers: std::collections::HashSet<NodeId>,
+    libp2p_keypair: Option<boule_transport_libp2p::identity::Keypair>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     // #803: surface the participation role at boot so an operator (and the
@@ -746,6 +774,7 @@ async fn start_consensus(
         clock,
         private_peers,
         persistent_peers,
+        libp2p_keypair,
     )
     .await?;
 
@@ -1062,6 +1091,13 @@ fn reconcile_bls_identity(
 /// Result of [`build_overlay_wiring`]: the broadcaster + discovery +
 /// event-receiver triple consensus consumes, plus the overlay-side
 /// shutdown / joins.
+///
+/// Idle-connection timeout for the libp2p backend. Consensus broadcasts at
+/// least once per block interval (~1s), so 60s keeps connections warm between
+/// rounds without holding dead ones indefinitely. (No `[overlay]` knob yet —
+/// add one if operators need to tune it.)
+const LIBP2P_IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 struct OverlayWiring {
     broadcaster: Arc<dyn Broadcaster>,
     discovery: Arc<dyn Discovery>,
@@ -1094,6 +1130,7 @@ async fn build_overlay_wiring(
     clock: Arc<dyn Clock>,
     private_peers: std::collections::HashSet<NodeId>,
     persistent_peers: std::collections::HashSet<NodeId>,
+    libp2p_keypair: Option<boule_transport_libp2p::identity::Keypair>,
 ) -> anyhow::Result<OverlayWiring> {
     match overlay_cfg.mode {
         OverlayMode::Gossip => {
@@ -1184,18 +1221,55 @@ async fn build_overlay_wiring(
             })
         }
         OverlayMode::Libp2p => {
-            // Phase 0 (#840): the backend is *selectable* but the libp2p
-            // overlay itself lands in Phase 1 (#841). Derive the local
-            // PeerId so the identity adapter is exercised on this path,
-            // then fail closed with a clear pointer rather than silently
-            // falling back to gossip.
-            let peer_id = boule_transport_libp2p::identity::peer_id_for(&self_id)
-                .context("derive libp2p PeerId for self")?;
-            anyhow::bail!(
-                "[overlay] mode = \"libp2p\" selects the libp2p backend \
-                 (local PeerId {peer_id}), but it is not yet implemented — \
-                 landing in Phase 1 (#841). Use mode = \"gossip\" until then."
+            // The libp2p backend (#840) owns its own Swarm/transport and does
+            // not use the TCP peer manager — `p2p_cmd_tx` / `dialer_ctx` are
+            // unused here (the listener was skipped in `run`). The keypair was
+            // derived from the network identity in `run` before it was dropped.
+            let _ = (p2p_cmd_tx, dialer_ctx, private_peers, persistent_peers);
+            let keypair = libp2p_keypair.context(
+                "internal wiring error: libp2p overlay selected but no keypair was derived",
+            )?;
+            // Inbound-disabled validators dial out only (no listener); others
+            // bind the configured address.
+            let listen_addr = if inbound_disabled {
+                None
+            } else {
+                Some(self_listen_addr)
+            };
+            let handles = boule_transport_libp2p::overlay::spawn(
+                boule_transport_libp2p::overlay::SpawnConfig {
+                    keypair,
+                    listen_addr,
+                    bootstrap_addrs: overlay_cfg.bootstrap_addrs.clone(),
+                    idle_connection_timeout: LIBP2P_IDLE_CONNECTION_TIMEOUT,
+                },
+            )
+            .context("spawn libp2p overlay")?;
+
+            info!(
+                "overlay: libp2p (listen={}, bootstrap_addrs={})",
+                if inbound_disabled {
+                    "disabled (outbound-only)".to_string()
+                } else {
+                    self_listen_addr.to_string()
+                },
+                overlay_cfg.bootstrap_addrs.len()
             );
+
+            let broadcaster: Arc<dyn Broadcaster> = handles.broadcaster;
+            let discovery: Arc<dyn overlay_traits::Discovery> = handles.discovery;
+            Ok(OverlayWiring {
+                broadcaster,
+                discovery,
+                event_rx: handles.event_rx,
+                overlay_shutdown: Some(handles.shutdown),
+                overlay_joins: vec![handles.join],
+                // No libp2p analog for these manager/gossip-sink counters —
+                // they feed status reporting only. A peerless zero counter is
+                // correct (gossipsub manages its own queues).
+                gossip_sink_overflows: None,
+                peer_outbound_overflows: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            })
         }
     }
 }

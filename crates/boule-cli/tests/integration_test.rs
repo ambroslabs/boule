@@ -1093,6 +1093,165 @@ async fn test_gossip_overlay_3_node_smoke() {
     drop(key_dirs);
 }
 
+// ── libp2p-overlay smoke test (#842) ─────────────────────────────────────────
+
+/// Spawn a consensus-running node with `[overlay] mode = "libp2p"`. Unlike the
+/// gossip overlay, Phase 2 libp2p has no peer-list gossip, so every node lists
+/// every other node in `bootstrap_addrs` up front (full mesh).
+async fn spawn_consensus_node_libp2p(
+    key_path: &str,
+    fixed_p2p_addr: &str,
+    bootstrap_addrs: &[String],
+    validators_toml: &str,
+) -> NodeGuard {
+    let addr_file = NamedTempFile::new().unwrap();
+    let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
+
+    let bootstrap_toml = if bootstrap_addrs.is_empty() {
+        "[]".to_string()
+    } else {
+        let inner = bootstrap_addrs
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("[{inner}]")
+    };
+
+    let config = format!(
+        "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
+        [overlay]\nmode = \"libp2p\"\nbootstrap_addrs = {bootstrap_toml}\n\n\
+        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
+    );
+    let mut config_file = NamedTempFile::new().unwrap();
+    config_file.write_all(config.as_bytes()).unwrap();
+    config_file.flush().unwrap();
+
+    run_init(config_file.path().to_str().unwrap());
+
+    let bin = env!("CARGO_BIN_EXE_boule");
+    let child = Command::new(bin)
+        .args(["start", "--config", config_file.path().to_str().unwrap()])
+        .env("RUST_LOG", "warn")
+        .spawn()
+        .expect("failed to spawn libp2p-overlay consensus node");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let addrs = loop {
+        if Instant::now() > deadline {
+            panic!("libp2p-overlay node did not write addr_file within 30s");
+        }
+        let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
+        if !content.is_empty() {
+            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
+                break addrs;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let api_port: u16 = port_of(&addrs.api_addr);
+    let admin_port: Option<u16> = addrs.admin_addr.as_deref().map(port_of);
+
+    NodeGuard {
+        child,
+        api_port,
+        admin_port,
+        p2p_addr: addrs.p2p_addr,
+        node_id: addrs.node_id,
+        _config: config_file,
+        _key_dir: tempfile::tempdir().unwrap(),
+        _addr_file: addr_file,
+    }
+}
+
+/// Boot an `n`-node consensus cluster over the libp2p overlay. Every node
+/// bootstraps to every other node (full mesh) since Phase 2 has no peer
+/// discovery yet (#844).
+async fn start_libp2p_consensus_cluster(n: usize) -> (Vec<NodeGuard>, Vec<tempfile::TempDir>) {
+    let key_dirs: Vec<tempfile::TempDir> = (0..n).map(|_| tempfile::tempdir().unwrap()).collect();
+    let key_paths: Vec<String> = key_dirs
+        .iter()
+        .map(|d| d.path().join("node.key").to_str().unwrap().to_owned())
+        .collect();
+
+    // Phase 1: discover each node's bound p2p addr + node_id (runs in the
+    // default gossip mode on an OS-assigned port, then frees it).
+    let mut specs: Vec<ConsensusNodeSpec> = Vec::with_capacity(n);
+    for key_path in &key_paths {
+        let info = launch_once_for_discovery(key_path).await;
+        specs.push(ConsensusNodeSpec {
+            key_path: key_path.clone(),
+            p2p_addr: info.p2p_addr,
+            node_id: info.node_id,
+        });
+    }
+
+    let validators_toml = specs
+        .iter()
+        .map(|s| format!("\"{}\"", s.node_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Phase 2: relaunch each node in libp2p mode bootstrapping to all others.
+    let mut guards: Vec<NodeGuard> = Vec::with_capacity(n);
+    for (i, spec) in specs.iter().enumerate() {
+        let bootstrap: Vec<String> = specs
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, s)| s.p2p_addr.clone())
+            .collect();
+        guards.push(
+            spawn_consensus_node_libp2p(
+                &spec.key_path,
+                &spec.p2p_addr,
+                &bootstrap,
+                &validators_toml,
+            )
+            .await,
+        );
+    }
+
+    (guards, key_dirs)
+}
+
+/// 3-node smoke test for #842: consensus commits over the libp2p gossipsub
+/// overlay end-to-end. No `/peers` assertion — in libp2p mode the boule TCP
+/// manager is peerless (libp2p peers live in the Swarm), so liveness is the
+/// real proof the overlay carries consensus traffic.
+#[tokio::test]
+async fn test_libp2p_overlay_3_node_smoke() {
+    const N: usize = 3;
+    let (guards, key_dirs) = start_libp2p_consensus_cluster(N).await;
+
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    'outer: loop {
+        if Instant::now() > deadline {
+            panic!("libp2p-overlay cluster did not commit within 15s");
+        }
+        for g in &guards {
+            let resp = client.get(g.admin_url("/consensus/status")).send().await;
+            let body: Value = match resp {
+                Ok(r) if r.status() == 200 => r.json().await.unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            let committed = body["last_committed_height"].as_u64().unwrap_or(0);
+            let current_view = body["current_view"].as_u64().unwrap_or(0);
+            if committed == 0 || current_view == 0 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue 'outer;
+            }
+        }
+        break;
+    }
+
+    drop(guards);
+    drop(key_dirs);
+}
+
 #[tokio::test]
 async fn test_consensus_status_returns_404_on_gossip_only_node() {
     // A vanilla (no [consensus]) node must not expose the endpoint.
