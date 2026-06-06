@@ -1183,6 +1183,20 @@ async fn build_overlay_wiring(
                 peer_outbound_overflows,
             })
         }
+        OverlayMode::Libp2p => {
+            // Phase 0 (#840): the backend is *selectable* but the libp2p
+            // overlay itself lands in Phase 1 (#841). Derive the local
+            // PeerId so the identity adapter is exercised on this path,
+            // then fail closed with a clear pointer rather than silently
+            // falling back to gossip.
+            let peer_id = boule_transport_libp2p::identity::peer_id_for(&self_id)
+                .context("derive libp2p PeerId for self")?;
+            anyhow::bail!(
+                "[overlay] mode = \"libp2p\" selects the libp2p backend \
+                 (local PeerId {peer_id}), but it is not yet implemented — \
+                 landing in Phase 1 (#841). Use mode = \"gossip\" until then."
+            );
+        }
     }
 }
 

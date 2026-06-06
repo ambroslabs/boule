@@ -1,0 +1,34 @@
+[package]
+name = "boule-transport-libp2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "libp2p transport backend for boule: implements the boule_core Broadcaster/Discovery seam over a libp2p Swarm (gossipsub broadcast + request-response unicast + identify/kad discovery). Migration target (#840) replacing boule-transport-tcp's custom gossip overlay."
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/boule-transport-libp2p"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+boule-core = { path = "../boule-core", version = "0.1.0" }
+# Feature set is the full migration target (#840). Phase 0 only exercises
+# `identity`, but the whole tree is pulled in now so `cargo deny` validates
+# the real dependency surface up front. `connection-limits` is intentionally
+# absent — it is a non-optional part of libp2p-swarm, not a feature.
+libp2p = { version = "0.56", features = [
+    "tcp",
+    "tls",
+    "noise",
+    "yamux",
+    "gossipsub",
+    "request-response",
+    "kad",
+    "identify",
+    "tokio",
+    "macros",
+] }
+anyhow = "1"
+tracing = "0.1"

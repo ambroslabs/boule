@@ -1310,10 +1310,9 @@ fn default_max_violations() -> u32 {
 /// warning at config load.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct OverlayConfig {
-    /// Which overlay implementation to use. Only `gossip` exists today
-    /// (the legacy full-mesh overlay was retired in #137); the field is
-    /// kept so a future overlay can be selected without reshaping the
-    /// config.
+    /// Which overlay implementation to use: `gossip` (default, the custom
+    /// partial-mesh overlay) or `libp2p` (the in-progress migration
+    /// target, #840). See [`OverlayMode`].
     #[serde(default)]
     pub mode: OverlayMode,
     /// Soft floor on the outbound direct-peer count maintained by the
@@ -1415,9 +1414,10 @@ impl OverlayConfig {
 
 /// Which topology overlay implementation to drive consensus with.
 ///
-/// Single-variant today — the legacy full-mesh overlay was retired once
-/// gossip became the production default (#137). The enum is retained so
-/// a future overlay can be added without reshaping the config surface.
+/// `gossip` is the production default (the legacy full-mesh overlay was
+/// retired once gossip landed, #137). `libp2p` is the in-progress
+/// migration target (#840) that will eventually become the default and
+/// retire the custom overlay entirely (Phase 6, #845).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverlayMode {
@@ -1427,6 +1427,13 @@ pub enum OverlayMode {
     /// when the validator set grows.
     #[default]
     Gossip,
+    /// libp2p backend (#840): gossipsub broadcast + request-response
+    /// unicast + identify/kad discovery over a libp2p `Swarm`, replacing
+    /// the custom gossip overlay. Selectable now, but the implementation
+    /// lands across Phases 1–6 — selecting it before Phase 1 fails closed
+    /// at startup. The `gossip`-specific knobs above are ignored in this
+    /// mode.
+    Libp2p,
 }
 
 /// Operator-facing UI defaults. Currently a single knob: the default
