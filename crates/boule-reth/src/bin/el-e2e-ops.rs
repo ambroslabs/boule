@@ -351,7 +351,7 @@ async fn await_contract_address(t: &HttpTransport, tx_hash: &str) -> Result<Stri
     bail!("deploy receipt for {tx_hash} never appeared")
 }
 
-/// massfund <N> <KEYSFILE> [WEI_EACH] — deploy the Disperse contract once, then
+/// `massfund <N> <KEYSFILE> [WEI_EACH]` — deploy the Disperse contract once, then
 /// fund N fresh wallets WEI_EACH each via batched `disperse(address[])` calls
 /// (≤200 recipients per tx). One tx funds a whole batch, so funding is bounded
 /// by block throughput, not by the dev account's per-account nonce limit — the
