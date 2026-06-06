@@ -508,6 +508,20 @@ pub trait Application: Send + Sync {
         Box::pin(async { None })
     }
 
+    /// Past-retention EL recovery handoff (#831). When the committed gap exceeds
+    /// the consensus block-retention window, it cannot be replayed from
+    /// consensus (those blocks are pruned). Point the execution layer at the
+    /// committed `tip` — a `forkchoiceUpdated(tip)` — so it acquires a sync
+    /// target and snap/full-syncs the gap from its devp2p peers (for a validator,
+    /// from its sentries). Without this, an EL with peers connected but no target
+    /// sits idle and never recovers. Re-invoked off the catch-up timer until the
+    /// gap shrinks back within retention, where in-order replay finishes the tail.
+    ///
+    /// Default no-op: an in-process application has no out-of-process EL to drive.
+    fn el_devp2p_handoff<'a>(&'a self, _tip: &'a Block) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Slash the validator `node_id` — the economic half of the
     /// equivocation penalty (#658b), called by the integration layer when
     /// committed evidence first records that validator. An application that

@@ -1546,6 +1546,33 @@ impl Application for RethApplication {
         })
     }
 
+    fn el_devp2p_handoff<'a>(&'a self, tip: &'a Block) -> BoxFuture<'a, Result<()>> {
+        // #831: the committed gap is past the retention window, so it can't be
+        // replayed from consensus. Register the committed tip's payload and
+        // forkchoiceUpdated to it — even though reth lacks the parents and returns
+        // SYNCING — so reth has a sync target and snap/full-syncs the gap from its
+        // devp2p peers (a validator from its sentries). This is the one place we
+        // deliberately forkchoice to a non-VALID head; the within-retention commit
+        // path (#826) must NOT, which is why this lives only on the past-retention
+        // catch-up branch.
+        Box::pin(async move {
+            let Some(cmd) = tip.commands.first() else {
+                return Ok(());
+            };
+            let payload: Value = serde_json::from_slice(cmd)
+                .context("el_devp2p_handoff: tip is not a JSON payload")?;
+            let _ = self.engine().register_payload(&payload).await?;
+            let status = self.engine().forkchoice(&payload).await?;
+            tracing::info!(
+                target: "boule::reth",
+                height = tip.header.height.0,
+                ?status,
+                "el_devp2p_handoff: pointed reth at the committed tip for devp2p self-sync (#831)",
+            );
+            Ok(())
+        })
+    }
+
     fn state_commitment(&self) -> [u8; 32] {
         self.committed.lock().state_root
     }
