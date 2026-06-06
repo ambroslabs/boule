@@ -172,10 +172,16 @@ impl GossipOverlayConfig {
                 interval: Duration::from_millis(cfg.peer_gossip_interval_ms),
                 fanout: cfg.peer_gossip_fanout,
                 max_entries: None,
+                // Populated by the binary from `[[peers]]` after
+                // `from_config` (sentry topology, #827).
+                private: std::collections::HashSet::new(),
             },
             maintenance: MeshMaintenanceConfig {
                 interval: Duration::from_millis(cfg.mesh_check_interval_ms),
                 outbound_target: cfg.outbound_target,
+                // Populated by the binary from `[[peers]]` after
+                // `from_config` (sentry topology, #827).
+                persistent: std::collections::HashSet::new(),
             },
             dedup_capacity: cfg.dedup_capacity,
             dedup_ttl: Duration::from_millis(cfg.dedup_ttl_ms),

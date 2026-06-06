@@ -82,6 +82,12 @@ pub struct MeshMaintenanceConfig {
     /// `target_degree` in #187 to disambiguate from the new inbound
     /// and total caps.
     pub outbound_target: usize,
+    /// Sentry-topology persistent peers (#827, cf. Tendermint
+    /// `persistent_peers`). The trim path **never** evicts a peer in
+    /// this set, even when the realised outbound count drifts above
+    /// `outbound_target` — so the critical validator↔sentry links stay
+    /// up under churn/load.
+    pub persistent: HashSet<NodeId>,
 }
 
 impl Default for MeshMaintenanceConfig {
@@ -89,6 +95,7 @@ impl Default for MeshMaintenanceConfig {
         Self {
             interval: Duration::from_secs(5),
             outbound_target: 8,
+            persistent: HashSet::new(),
         }
     }
 }
@@ -344,6 +351,12 @@ pub fn tick_once(
             let mut found_at: Option<usize> = None;
             for i in (0..tail_idx).rev() {
                 let id = state.dialed_order[i];
+                // Persistent peers (sentry topology, #827) are never
+                // trimmed: skip them so a validator↔sentry link is
+                // preserved even above `outbound_target`.
+                if config.persistent.contains(&id) {
+                    continue;
+                }
                 if direct_set.contains(&id) {
                     found_at = Some(i);
                     break;
@@ -470,6 +483,7 @@ mod tests {
         MeshMaintenanceConfig {
             interval: Duration::from_secs(5),
             outbound_target: target,
+            persistent: HashSet::new(),
         }
     }
 
@@ -759,6 +773,76 @@ mod tests {
         let trimmed: Vec<NodeId> = dialer.disconnected.lock().clone();
         assert_eq!(trimmed, vec![nid(6), nid(5)]);
         assert_eq!(state.dialed_count(), 0);
+    }
+
+    /// A persistent peer (sentry topology, #827) is never trimmed even
+    /// when it sits above `outbound_target` across multiple ticks — the
+    /// validator↔sentry link must survive churn/load.
+    #[test]
+    fn persistent_peer_never_trimmed() {
+        let table = PeerTable::new(nid(0), 64);
+        let direct = LockedVec::new();
+        // 3 direct peers, target = 1 → 2 over target. nid(1) is the
+        // persistent (validator) link; nid(2), nid(3) are trimmable.
+        direct.set(vec![nid(1), nid(2), nid(3)]);
+        let dialer = RecordingDialer::default();
+        let mut state = MaintenanceState::new();
+        for i in 1..=3u8 {
+            state.record_dial(nid(i));
+        }
+        let mut rng = ChaCha20Rng::seed_from_u64(827);
+
+        let persistent: HashSet<NodeId> = [nid(1)].into_iter().collect();
+        let cfg = MeshMaintenanceConfig {
+            interval: Duration::from_secs(5),
+            outbound_target: 1,
+            persistent,
+        };
+
+        // Tick 1: defer (streak = 1).
+        let first = tick_once(&cfg, &table, &direct, &dialer, &mut state, &mut rng);
+        assert_eq!(first.trimmed, 0);
+
+        // Tick 2: trim. Excess = 2; only nid(2)/nid(3) are eligible —
+        // the persistent nid(1) is skipped and stays connected.
+        let second = tick_once(&cfg, &table, &direct, &dialer, &mut state, &mut rng);
+        assert_eq!(second.trimmed, 2);
+        let trimmed: Vec<NodeId> = dialer.disconnected.lock().clone();
+        assert!(
+            !trimmed.contains(&nid(1)),
+            "persistent peer must never be trimmed",
+        );
+        assert!(trimmed.contains(&nid(2)));
+        assert!(trimmed.contains(&nid(3)));
+    }
+
+    /// A persistent peer alone over the target produces zero trims —
+    /// `TickOutcome.trimmed == 0`.
+    #[test]
+    fn persistent_peer_alone_over_target_yields_no_trim() {
+        let table = PeerTable::new(nid(0), 64);
+        let direct = LockedVec::new();
+        // 2 direct peers, both persistent, target = 1 → 1 over target,
+        // but neither is eligible for trim.
+        direct.set(vec![nid(1), nid(2)]);
+        let dialer = RecordingDialer::default();
+        let mut state = MaintenanceState::new();
+        state.record_dial(nid(1));
+        state.record_dial(nid(2));
+        let mut rng = ChaCha20Rng::seed_from_u64(8270);
+
+        let persistent: HashSet<NodeId> = [nid(1), nid(2)].into_iter().collect();
+        let cfg = MeshMaintenanceConfig {
+            interval: Duration::from_secs(5),
+            outbound_target: 1,
+            persistent,
+        };
+
+        // Two ticks above target; trim never fires on persistent peers.
+        let _ = tick_once(&cfg, &table, &direct, &dialer, &mut state, &mut rng);
+        let outcome = tick_once(&cfg, &table, &direct, &dialer, &mut state, &mut rng);
+        assert_eq!(outcome.trimmed, 0, "no persistent peer may be trimmed");
+        assert!(dialer.disconnected.lock().is_empty());
     }
 
     /// Streak resets to zero on a tick at-or-below target; if a

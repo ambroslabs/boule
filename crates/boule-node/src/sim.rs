@@ -3284,10 +3284,12 @@ impl SimCluster {
                     interval: Duration::from_millis(50),
                     fanout: target_degree,
                     max_entries: None,
+                    private: std::collections::HashSet::new(),
                 },
                 maintenance: MeshMaintenanceConfig {
                     interval: Duration::from_secs(1),
                     outbound_target: target_degree,
+                    persistent: std::collections::HashSet::new(),
                 },
                 dedup_capacity: 4096,
                 dedup_ttl: Duration::from_secs(60),
