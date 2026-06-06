@@ -746,6 +746,7 @@ async fn spawn_consensus_node(
     let config = format!(
         "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n{peer_lines}\n\
+        [overlay]\nmode = \"gossip\"\n\n\
         [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
     );
     let mut config_file = NamedTempFile::new().unwrap();
@@ -1556,9 +1557,10 @@ fn test_config_default_resolved_toml_round_trips() {
     // though the source file omitted it.
     assert!(stdout.contains("timeout_base_ms"));
     // [overlay] is fully synthesized from defaults — the source had
-    // no [overlay] section at all.
+    // no [overlay] section at all. libp2p is the default since the #840
+    // cutover.
     assert!(stdout.contains("[overlay]"));
-    assert!(stdout.contains("mode = \"gossip\""));
+    assert!(stdout.contains("mode = \"libp2p\""));
 
     // Round-trip: write the resolved output to a new file and re-run
     // `config`. Output must match byte-for-byte.
@@ -1590,7 +1592,7 @@ fn test_config_format_json_emits_valid_json() {
     // would target.
     assert_eq!(parsed["node"]["listen_addr"], json!("127.0.0.1:7000"));
     assert_eq!(parsed["consensus"]["timeout_base_ms"], json!(200));
-    assert_eq!(parsed["overlay"]["mode"], json!("gossip"));
+    assert_eq!(parsed["overlay"]["mode"], json!("libp2p"));
 }
 
 #[test]

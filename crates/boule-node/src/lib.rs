@@ -105,7 +105,11 @@ pub async fn run(
     // key (its PeerId == this node's NodeId). Only built when the libp2p
     // overlay is selected.
     let overlay_is_libp2p = matches!(config.overlay.mode, OverlayMode::Libp2p);
-    let libp2p_keypair = if overlay_is_libp2p {
+    // The libp2p overlay (which owns its own listener) is only built when
+    // consensus is enabled. A non-consensus node is just the TCP manager even
+    // in libp2p mode, so it must still bind the TCP listener.
+    let libp2p_overlay_active = overlay_is_libp2p && config.consensus.is_some();
+    let libp2p_keypair = if libp2p_overlay_active {
         Some(
             boule_transport_libp2p::identity::keypair_from_pkcs8_der(&network_identity.pkcs8_der)
                 .context("derive libp2p transport keypair from network identity")?,
@@ -260,19 +264,25 @@ pub async fn run(
     // — otherwise both race for the port (EADDRINUSE). The manager itself
     // stays alive (peerless) so /peers, /metrics, and the admin router keep
     // working; only the listener bind is skipped.
-    let (p2p_listener, p2p_actual_addr) = if inbound_disabled || overlay_is_libp2p {
-        if overlay_is_libp2p {
-            info!(
-                "overlay=libp2p owns its own listener; skipping boule TCP listener bind on {}",
-                config.node.listen_addr
-            );
-        } else {
-            info!(
-                "P2P inbound disabled (outbound-only mode); skipping listener bind on {}",
-                config.node.listen_addr
-            );
-        }
+    let (p2p_listener, p2p_actual_addr) = if inbound_disabled {
+        info!(
+            "P2P inbound disabled (outbound-only mode); skipping listener bind on {}",
+            config.node.listen_addr
+        );
         (None, config.node.listen_addr)
+    } else if libp2p_overlay_active {
+        // The libp2p Swarm owns its own TCP listener, so the boule TCP manager
+        // must NOT bind it (EADDRINUSE). But the manager stays alive (peerless)
+        // for /peers, /metrics, and the admin router. We still resolve a
+        // concrete port here — bind + immediately free a listener — so a
+        // configured port 0 becomes a real address that `addr_file` reports and
+        // libp2p then binds (mirrors the TCP path's `local_addr()`; same
+        // bind-then-rebind race the testnet discovery already relies on).
+        let probe = TcpListener::bind(config.node.listen_addr).await?;
+        let addr = probe.local_addr()?;
+        drop(probe);
+        info!("overlay=libp2p will bind {addr}; skipping boule TCP listener bind");
+        (None, addr)
     } else {
         let listener = TcpListener::bind(config.node.listen_addr).await?;
         let addr = listener.local_addr()?;
