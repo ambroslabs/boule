@@ -64,7 +64,7 @@ pub use egress::{
     egress_block_range_request, egress_block_range_response, egress_block_request,
     egress_block_response, egress_consensus_msg_with_loopback, egress_equivocation_evidence,
     egress_safety, egress_snapshot_chunk_request, egress_snapshot_chunk_response,
-    egress_snapshot_manifest_request, egress_snapshot_manifest_response,
+    egress_snapshot_manifest_request, egress_snapshot_manifest_response, egress_status,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use ingress::{ingress, ingress_wire};
@@ -119,6 +119,10 @@ pub enum Dispatch {
     Pacemaker(crate::pacemaker::Event),
     /// Peer requested the block with this hash; serve it if held.
     ServeBlock { hash: BlockHash, to: NodeId },
+    /// Peer advertised its committed height (#857). The integration layer
+    /// records it so block-sync can target a connected neighbour that
+    /// actually holds the needed block.
+    PeerStatus { from: NodeId, height: Height },
     /// Peer replied to our [`WireMessage::BlockRequest`].
     ///
     /// `requested_hash` is the hash the responder claims to be
