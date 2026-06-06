@@ -1236,12 +1236,26 @@ async fn build_overlay_wiring(
             } else {
                 Some(self_listen_addr)
             };
+            // Connection-gating allow-list (#844/#836): non-empty → validator
+            // isolation (refuse all but these peers); empty → open node.
+            let allowed_peers = if overlay_cfg.allowed_peers.is_empty() {
+                None
+            } else {
+                let mut ids = Vec::with_capacity(overlay_cfg.allowed_peers.len());
+                for raw in &overlay_cfg.allowed_peers {
+                    ids.push(base58_to_node_id(raw).map_err(|e| {
+                        anyhow::anyhow!("decoding [overlay] allowed_peers entry {raw:?}: {e}")
+                    })?);
+                }
+                Some(ids)
+            };
             let handles = boule_transport_libp2p::overlay::spawn(
                 boule_transport_libp2p::overlay::SpawnConfig {
                     keypair,
                     listen_addr,
                     bootstrap_addrs: overlay_cfg.bootstrap_addrs.clone(),
                     idle_connection_timeout: LIBP2P_IDLE_CONNECTION_TIMEOUT,
+                    allowed_peers,
                 },
             )
             .context("spawn libp2p overlay")?;
