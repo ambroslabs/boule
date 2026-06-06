@@ -169,6 +169,21 @@ pub struct PeerConfig {
     /// Omit for trust-on-first-use (e.g. in development).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
+    /// Sentry-topology: when `true`, this node never relays this peer's
+    /// address in PeerList gossip (cf. Tendermint `private_peer_ids`).
+    /// A sentry sets this on its hidden validator so the validator's
+    /// address is not leaked mesh-wide. Requires `node_id` (the peer is
+    /// identified by its ID, not its address, in gossip).
+    #[serde(default)]
+    pub private: bool,
+    /// Sentry-topology: when `true`, this is an unconditional peer the
+    /// overlay maintenance never trims/evicts, and whose inbound
+    /// connections are always accepted regardless of inbound caps (cf.
+    /// Tendermint `persistent_peers` + `unconditional_peer_ids`). Keeps
+    /// the critical validator↔sentry links alive under churn/load.
+    /// Requires `node_id`.
+    #[serde(default)]
+    pub persistent: bool,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -1546,6 +1561,19 @@ impl Config {
     pub fn validate(&self, self_id: &NodeId) -> anyhow::Result<()> {
         for (idx, peer) in self.peers.iter().enumerate() {
             let Some(raw) = peer.node_id.as_deref() else {
+                if peer.private || peer.persistent {
+                    let flag = if peer.private {
+                        "private"
+                    } else {
+                        "persistent"
+                    };
+                    anyhow::bail!(
+                        "[[peers]][{idx}] (addr = {}) sets `{flag} = true` but has no \
+                         `node_id` — private/persistent peers are identified by their \
+                         NodeId in gossip and connection admission; add a `node_id`.",
+                        peer.addr,
+                    );
+                }
                 continue;
             };
             let pid = base58_to_node_id(raw).map_err(|e| {
@@ -2963,6 +2991,95 @@ node_id = "0OIl"
             format!("{err:#}").contains("malformed node_id"),
             "got: {err:#}",
         );
+    }
+
+    #[test]
+    fn peer_private_persistent_flags_round_trip() {
+        // The sentry-topology flags must parse and serialize back
+        // (#827). Default is false when omitted; `true` is honored.
+        let other_id: NodeId = [9u8; 32];
+        let raw = node_id_to_base58(&other_id);
+        let toml_str = format!(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[[peers]]
+addr = "10.0.0.5:7000"
+node_id = "{raw}"
+private = true
+persistent = true
+
+[[peers]]
+addr = "10.0.0.6:7000"
+node_id = "{raw}"
+"#,
+        );
+        let cfg: Config = toml::from_str(&toml_str).unwrap();
+        assert!(cfg.peers[0].private);
+        assert!(cfg.peers[0].persistent);
+        assert!(!cfg.peers[1].private, "flags default to false");
+        assert!(!cfg.peers[1].persistent, "flags default to false");
+
+        // Round-trip back through TOML and re-parse to confirm the
+        // flags survive serialization.
+        let re = toml::to_string(&cfg).unwrap();
+        let cfg2: Config = toml::from_str(&re).unwrap();
+        assert!(cfg2.peers[0].private);
+        assert!(cfg2.peers[0].persistent);
+    }
+
+    #[test]
+    fn validate_rejects_private_peer_without_node_id() {
+        let self_id: NodeId = [5u8; 32];
+        let cfg: Config = toml::from_str(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[[peers]]
+addr = "127.0.0.1:7001"
+private = true
+"#,
+        )
+        .unwrap();
+        let err = cfg
+            .validate(&self_id)
+            .expect_err("private without node_id must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("private"), "got: {msg}");
+        assert!(msg.contains("node_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_persistent_peer_without_node_id() {
+        let self_id: NodeId = [6u8; 32];
+        let cfg: Config = toml::from_str(
+            r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[[peers]]
+addr = "127.0.0.1:7001"
+persistent = true
+"#,
+        )
+        .unwrap();
+        let err = cfg
+            .validate(&self_id)
+            .expect_err("persistent without node_id must reject");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("persistent"), "got: {msg}");
+        assert!(msg.contains("node_id"), "got: {msg}");
     }
 
     #[test]
