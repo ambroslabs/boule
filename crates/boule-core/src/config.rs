@@ -1421,25 +1421,22 @@ impl OverlayConfig {
 
 /// Which topology overlay implementation to drive consensus with.
 ///
-/// `gossip` is the production default (the legacy full-mesh overlay was
-/// retired once gossip landed, #137). `libp2p` is the in-progress
-/// migration target (#840) that will eventually become the default and
-/// retire the custom overlay entirely (Phase 6, #845).
+/// `libp2p` is the default as of the #840 cutover (Phase 6, #845): gossipsub
+/// broadcast + request-response block-sync + connection-gating over a libp2p
+/// `Swarm`. `gossip` (the custom partial-mesh overlay, #137) remains
+/// selectable as a fallback until it is physically retired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OverlayMode {
-    /// Partial-mesh gossip overlay (issue #137). Operators get a
-    /// bounded direct-peer count (`outbound_target`, default 8, plus
-    /// the inbound caps from #187) without coordinated config rollouts
-    /// when the validator set grows.
-    #[default]
+    /// Partial-mesh gossip overlay (issue #137). The pre-#840 backend, kept
+    /// as a selectable fallback. Operators get a bounded direct-peer count
+    /// (`outbound_target` etc.) and peer-list-gossip discovery.
     Gossip,
-    /// libp2p backend (#840): gossipsub broadcast + request-response
-    /// unicast + identify/kad discovery over a libp2p `Swarm`, replacing
-    /// the custom gossip overlay. Selectable now, but the implementation
-    /// lands across Phases 1–6 — selecting it before Phase 1 fails closed
-    /// at startup. The `gossip`-specific knobs above are ignored in this
-    /// mode.
+    /// libp2p backend (#840, default): gossipsub broadcast + request-response
+    /// block-sync + identify + connection-gating (`allowed_peers`) over a
+    /// libp2p `Swarm`. The `gossip`-specific knobs above are ignored in this
+    /// mode; peers come from `bootstrap_addrs` + `allowed_peers`.
+    #[default]
     Libp2p,
 }
 
@@ -2543,10 +2540,10 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 "#,
         );
-        // Defaults match the breakdown-comment values on #137,
-        // including `mode = "gossip"` after the stack-9 cutover, and
-        // the split direct-peer budgets from #187.
-        assert_eq!(c.overlay.mode, OverlayMode::Gossip);
+        // `mode` defaults to `libp2p` since the #840 cutover. The
+        // gossip-specific knobs below still carry their #137/#187 defaults
+        // (they're inert in libp2p mode but remain for the gossip fallback).
+        assert_eq!(c.overlay.mode, OverlayMode::Libp2p);
         assert_eq!(c.overlay.outbound_target, 8);
         assert_eq!(c.overlay.inbound_max, 16);
         assert_eq!(c.overlay.total_max, 24);
