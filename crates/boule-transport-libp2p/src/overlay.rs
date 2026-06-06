@@ -110,6 +110,7 @@ pub fn spawn(cfg: SpawnConfig) -> Result<Libp2pOverlayHandles> {
         disco_tx: disco_tx.clone(),
         peers: Arc::clone(&peers),
         topic: consensus_topic().hash(),
+        bootstrap_addrs: cfg.bootstrap_addrs.clone(),
         shutdown_rx,
     };
     let join = tokio::spawn(driver.run());
@@ -189,14 +190,25 @@ struct Driver {
     disco_tx: broadcast::Sender<DiscoveryEvent>,
     peers: Arc<Mutex<HashSet<NodeId>>>,
     topic: TopicHash,
+    /// Static bootstrap addresses, re-dialed periodically to repeer (#855).
+    bootstrap_addrs: Vec<SocketAddr>,
     shutdown_rx: oneshot::Receiver<()>,
 }
 
+/// How often the driver re-dials bootstrap peers it isn't connected to (#855).
+const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
+
 impl Driver {
     async fn run(mut self) {
+        // #855: periodic repeering. The single dial at startup can fail if a
+        // bootstrap peer wasn't listening yet; without this a node that loses
+        // (or never makes) a connection never recovers it.
+        let mut redial = tokio::time::interval(REDIAL_INTERVAL);
+        redial.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = &mut self.shutdown_rx => break,
+                _ = redial.tick() => self.redial_missing_bootstraps(),
                 cmd = self.cmd_rx.recv() => match cmd {
                     Some(Command::Broadcast(payload)) => {
                         if let Err(e) = self
@@ -228,6 +240,21 @@ impl Driver {
                 },
                 ev = self.swarm.select_next_some() => self.on_swarm_event(ev).await,
             }
+        }
+    }
+
+    /// #855: re-dial bootstrap peers we aren't connected to. Only dials when
+    /// we're below the bootstrap count, so a fully-connected node doesn't
+    /// churn duplicate connections; a node that lost (or never made) a peer
+    /// keeps retrying until it repeers.
+    fn redial_missing_bootstraps(&mut self) {
+        if self.bootstrap_addrs.is_empty() || self.peers.lock().len() >= self.bootstrap_addrs.len()
+        {
+            return;
+        }
+        let addrs = self.bootstrap_addrs.clone();
+        for addr in addrs {
+            let _ = self.swarm.dial(socketaddr_to_multiaddr(addr));
         }
     }
 

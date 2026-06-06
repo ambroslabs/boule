@@ -441,6 +441,11 @@ pub struct ConsensusNode {
     /// before `run` starts (or in tests that bypass it) the set is empty
     /// and the status snapshot reports zero connected peers.
     peers_connected: HashSet<NodeId>,
+    /// Round-robin cursor for retargeting a block-sync `RequestBlock` onto a
+    /// connected neighbour when the safety core named a block-holder we are
+    /// not connected to (#854). Rotates across retries so a neighbour that
+    /// can't serve the block doesn't wedge sync.
+    block_sync_neighbour_rr: u64,
     /// Height of the most recently committed block, updated in
     /// [`ConsensusNode::apply_commit`]. Zero before the first commit.
     /// Wrapped in `Arc<AtomicU64>` so the [`MempoolBlockBuilder`] can
@@ -895,6 +900,7 @@ impl ConsensusNode {
             block_sync_credit: Arc::new(block_sync::BlockSyncCreditWindow::new()),
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
+            block_sync_neighbour_rr: 0,
             last_committed_height,
             app,
             loopback_stack: Vec::new(),
@@ -1422,6 +1428,7 @@ impl ConsensusNode {
             block_sync_credit: Arc::new(block_sync::BlockSyncCreditWindow::new()),
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
+            block_sync_neighbour_rr: 0,
             last_committed_height,
             app,
             loopback_stack: Vec::new(),

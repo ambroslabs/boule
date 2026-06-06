@@ -1198,9 +1198,33 @@ impl ConsensusNode {
                             "block_sync_request_self_dropped",
                         );
                     } else {
+                        // #854: the safety core names a block-holder (the
+                        // proposer / a QC signer) as a hint, but in a
+                        // non-flooding overlay we can only reach *connected*
+                        // peers — a validator behind sentries is unreachable.
+                        // If we're not connected to `peer`, retarget to a
+                        // connected neighbour: they follow the chain and can
+                        // serve the block, and the core's retry rotates to
+                        // another neighbour if this one can't. When the holder
+                        // *is* connected (full mesh / the sim), behaviour is
+                        // unchanged.
+                        let dest = if self.peers_connected.contains(&peer)
+                            || self.peers_connected.is_empty()
+                        {
+                            peer
+                        } else {
+                            let mut neighbours: Vec<NodeId> =
+                                self.peers_connected.iter().copied().collect();
+                            neighbours.sort_unstable();
+                            let idx = (self.block_sync_neighbour_rr as usize) % neighbours.len();
+                            self.block_sync_neighbour_rr =
+                                self.block_sync_neighbour_rr.wrapping_add(1);
+                            neighbours[idx]
+                        };
                         tracing::info!(
                             target: TRACE_TARGET,
-                            dest = %node_id_to_base58(&peer),
+                            dest = %node_id_to_base58(&dest),
+                            block_holder = %node_id_to_base58(&peer),
                             hash = ?hash,
                             requesting_height = expected_height.0,
                             triggered_by = reason.as_str(),
@@ -1208,7 +1232,7 @@ impl ConsensusNode {
                             our_high_qc_view = ?self.core.state().high_qc.as_ref().map(|q| q.view().0),
                             "block_sync_request_emitted",
                         );
-                        let out = dispatch::egress_block_request(hash, peer);
+                        let out = dispatch::egress_block_request(hash, dest);
                         send_outbound(
                             broadcaster,
                             self.rate_limiter.as_deref(),
