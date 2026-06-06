@@ -17,6 +17,11 @@ use anyhow::{Context, Result};
 use boule_core::identity::NodeId;
 use libp2p::identity::{self, PeerId, PublicKey};
 
+/// Re-export so downstream crates (e.g. `boule-node`) can name the libp2p
+/// keypair type — produced by [`keypair_from_pkcs8_der`] and consumed by
+/// [`crate::overlay::SpawnConfig`] — without a direct `libp2p` dependency.
+pub use libp2p::identity::Keypair;
+
 /// Multihash code for the identity hash (raw, un-hashed digest). Ed25519
 /// `PeerId`s use this, which is what makes them reversible.
 const IDENTITY_MULTIHASH_CODE: u64 = 0x00;
