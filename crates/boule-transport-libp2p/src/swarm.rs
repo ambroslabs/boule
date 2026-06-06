@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode};
-use libp2p::{Swarm, identify, identity::Keypair, swarm::NetworkBehaviour, tcp, tls, yamux};
+use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::{
+    StreamProtocol, Swarm, identify, identity::Keypair, swarm::NetworkBehaviour, tcp, tls, yamux,
+};
 
 /// Identify protocol name advertised on the wire.
 pub const IDENTIFY_PROTOCOL: &str = "/boule/id/1.0.0";
@@ -22,6 +25,15 @@ pub const IDENTIFY_PROTOCOL: &str = "/boule/id/1.0.0";
 pub const AGENT_VERSION: &str = concat!("boule/", env!("CARGO_PKG_VERSION"));
 /// The single gossipsub topic all consensus broadcast traffic flows over.
 pub const CONSENSUS_TOPIC: &str = "/boule/consensus/1.0.0";
+/// Addressed point-to-point protocol for block-sync / `send_to` traffic.
+pub const BLOCK_SYNC_PROTOCOL: &str = "/boule/blocksync/1.0.0";
+
+/// The block-sync behaviour type: request = opaque consensus payload bytes,
+/// response = empty ack. Consensus does its own request/response correlation
+/// via two independent `send_to`s, so this protocol only needs to *deliver*
+/// to a specific peer (the ack just satisfies request-response's req/resp
+/// shape).
+pub type BlockSync = request_response::cbor::Behaviour<Vec<u8>, ()>;
 
 /// The gossipsub topic handle for [`CONSENSUS_TOPIC`].
 pub fn consensus_topic() -> IdentTopic {
@@ -33,6 +45,8 @@ pub fn consensus_topic() -> IdentTopic {
 pub struct Behaviour {
     /// Consensus broadcast (votes / proposals / timeouts) over one topic.
     pub gossipsub: gossipsub::Behaviour,
+    /// Addressed point-to-point delivery for block-sync / `send_to` (#843).
+    pub block_sync: BlockSync,
     /// Peer protocol/version exchange + observed-address reporting.
     pub identify: identify::Behaviour,
 }
@@ -64,12 +78,21 @@ impl Behaviour {
             .subscribe(&consensus_topic())
             .context("subscribe consensus topic")?;
 
+        let block_sync = BlockSync::new(
+            [(
+                StreamProtocol::new(BLOCK_SYNC_PROTOCOL),
+                ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
+
         let identify = identify::Behaviour::new(
             identify::Config::new(IDENTIFY_PROTOCOL.to_string(), keypair.public())
                 .with_agent_version(AGENT_VERSION.to_string()),
         );
         Ok(Self {
             gossipsub,
+            block_sync,
             identify,
         })
     }
