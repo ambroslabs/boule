@@ -224,6 +224,28 @@ impl<'a> RethEngine<'a> {
             .await?;
         payload_status(&executed["status"], "newPayloadV4(register)")
     }
+
+    /// Advance forkchoice to `payload`'s block (`head = safe = finalized` — BFT
+    /// finality, no reorgs) WITHOUT re-executing it. Call this only after a
+    /// VALID `register_payload`/`newPayloadV4` for the same block, so reth
+    /// already has the parent chain and adopting the head cannot put it into
+    /// SYNCING. Pairs with the VALID-gated commit path that walks an EL gap
+    /// forward one adopted block at a time (#826).
+    pub async fn forkchoice(&self, payload: &Value) -> Result<ElStatus> {
+        let hash = payload["blockHash"].as_str().context("payload blockHash")?;
+        let finalized = self
+            .transport
+            .call(
+                "engine_forkchoiceUpdatedV3",
+                json!([forkchoice(hash), Value::Null]),
+                "04-fcu-final",
+            )
+            .await?;
+        payload_status(
+            &finalized["payloadStatus"]["status"],
+            "forkchoiceUpdatedV3(final)",
+        )
+    }
 }
 
 /// How the CL must interpret an Engine API payload/forkchoice status.

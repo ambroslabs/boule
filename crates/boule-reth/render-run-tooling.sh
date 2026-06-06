@@ -63,7 +63,11 @@ COMPOSE="$OUTDIR/docker-compose.yml"
     echo "        --authrpc.addr 0.0.0.0 --authrpc.port $(authport "$i") --authrpc.jwtsecret /data/jwt$i.hex"
     echo "        --http --http.addr 0.0.0.0 --http.port $(httpport "$i")"
     echo "        --http.api eth,net,web3"
-    echo "        --port $(elp2p "$i") --addr 0.0.0.0 --ipcdisable \$\$TP"
+    echo "        --port $(elp2p "$i") --addr 0.0.0.0 --ipcdisable"
+    # As a BFT EL backend (not a public gossip relay), treat RPC-submitted txs
+    # like any other: subject to eviction + per-account limits, so a burst (or a
+    # buggy client's future-nonce txs) can't pin the pool full forever (#832).
+    echo "        --txpool.nolocals --txpool.lifetime 300 --txpool.max-account-slots 128 \$\$TP"
     echo "    volumes:"
     echo "      - ./genesis:/genesis:ro"
     echo "      - ./data:/data"
@@ -124,7 +128,8 @@ ExecStart=/usr/local/bin/boule-reth-node node --chain ${OUTDIR}/genesis/genesis.
   --datadir ${OUTDIR}/data/reth$i \\
   --authrpc.addr 127.0.0.1 --authrpc.port $(authport "$i") --authrpc.jwtsecret ${OUTDIR}/data/jwt$i.hex \\
   --http --http.addr 127.0.0.1 --http.port $(httpport "$i") --http.api eth,net,web3 \\
-  --port $(elp2p "$i") --ipcdisable
+  --port $(elp2p "$i") --ipcdisable \\
+  --txpool.nolocals --txpool.lifetime 300 --txpool.max-account-slots 128
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536

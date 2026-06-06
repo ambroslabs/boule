@@ -1292,7 +1292,27 @@ impl Application for RethApplication {
             let payload: Value = serde_json::from_slice(cmd)
                 .context("committed block command is not a JSON execution payload")?;
             let new_root = state_root_of(&payload)?;
-            let (_, status) = self.engine().commit_block(&payload).await?;
+            // Execute the payload, then advance forkchoice (adopt it as the
+            // canonical head) ONLY when reth reports VALID — i.e. it has the
+            // parent chain and actually executed this block. forkchoiceUpdated
+            // to a head whose parents reth lacks (newPayload returned SYNCING)
+            // latches reth into SYNCING toward that head, after which it IGNORES
+            // the in-order payloads el_catchup feeds to walk the gap ("Received
+            // forkchoice updated message when syncing") and wedges forever
+            // (#826). For a SYNCING block we register only (newPayloadV4, no
+            // fcU); el_catchup then walks the contiguous gap forward, each block
+            // executing VALID and being adopted here. VALID-gating also covers
+            // the unclean-crash case (reth's real head below boule's tracked
+            // frontier: re-fed blocks whose parent IS present execute VALID and
+            // are adopted) and EL self-sync past a gap (#674/#772).
+            // Past-retention gaps (CL can't replay) still need a tip forkchoice
+            // to hand off to reth devp2p sync — tracked separately in #831.
+            let exec = self.engine().register_payload(&payload).await?;
+            let status = if exec == ElStatus::Valid {
+                self.engine().forkchoice(&payload).await?
+            } else {
+                ElStatus::Syncing
+            };
             // Submission effects derived from blocks the EL self-synced past
             // (#772). Empty unless this commit closed a gap; prepended to the
             // current block's effects below so the materialised order is the
@@ -1665,6 +1685,114 @@ mod tests {
         assert!(result.validator_updates.is_empty());
 
         assert_eq!(hex::encode(app.state_commitment()), BLOCK1_STATE_ROOT);
+    }
+
+    /// Models reth's SYNCING-ignore (#826): while `syncing` is set,
+    /// `engine_newPayloadV4` returns SYNCING (reth lacks the block's parents,
+    /// as for a gapped block); otherwise it falls through to the golden
+    /// fixtures (VALID). Records every `engine_forkchoiceUpdatedV3` so a test
+    /// can assert the commit path does NOT forkchoice to a head reth can't yet
+    /// execute — the exact thing that latched reth into SYNCING and wedged it.
+    struct GatedTransport {
+        inner: FixtureTransport,
+        syncing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fcu_calls: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+    impl EngineTransport for GatedTransport {
+        fn call(&self, method: &str, params: Value, tag: &str) -> BoxFuture<'_, Result<Value>> {
+            use std::sync::atomic::Ordering;
+            if method == "engine_newPayloadV4" && self.syncing.load(Ordering::SeqCst) {
+                let v = serde_json::json!({ "status": "SYNCING", "latestValidHash": Value::Null });
+                return Box::pin(async move { Ok(v) });
+            }
+            if method == "engine_forkchoiceUpdatedV3" {
+                self.fcu_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.call(method, params, tag)
+        }
+        fn eth_rpc(&self, _method: &str, _params: Value) -> BoxFuture<'_, Result<Value>> {
+            Box::pin(async move { Ok(Value::Array(Vec::new())) })
+        }
+    }
+
+    /// #826 regression: `commit` must execute the payload (`newPayloadV4`) but
+    /// only `forkchoiceUpdated` to it once reth reports VALID. Forkchoicing to a
+    /// block whose parents reth lacks (newPayload SYNCING) latched reth into
+    /// SYNCING toward an un-haveable head, after which it ignored the in-order
+    /// catch-up payloads and wedged. Pre-fix code forkchoiced unconditionally
+    /// and this test would have caught it; the golden-fixture tests did not,
+    /// because the fixture transport never reports SYNCING.
+    #[tokio::test]
+    async fn commit_does_not_forkchoice_to_a_block_reth_cannot_execute() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let syncing = Arc::new(AtomicBool::new(false));
+        let fcu_calls = Arc::new(AtomicU32::new(0));
+        let app = RethApplication::new(
+            Box::new(GatedTransport {
+                inner: FixtureTransport,
+                syncing: syncing.clone(),
+                fcu_calls: fcu_calls.clone(),
+            }),
+            [1u8; 32],
+            FEE,
+            RETH_GENESIS,
+            [0u8; 32],
+            Duration::ZERO,
+            Box::new(boule_consensus::replication::stake_source::BondedStakeLedger::empty()),
+            std::sync::Arc::new(boule_consensus::replication::impls::InMemoryMempool::new(
+                64,
+            )),
+        );
+        let g = genesis();
+        // Build with reth healthy so the proposal is produced normally.
+        let block = app
+            .build_proposal(
+                &AppContext::default(),
+                &g,
+                View(1),
+                &sample_qc(&g),
+                &HashMap::new(),
+                0,
+            )
+            .await
+            .expect("build");
+        let fcu_after_build = fcu_calls.load(Ordering::SeqCst);
+
+        // Commit while reth reports SYNCING (parents absent): the commit path
+        // must NOT forkchoice to the block and must NOT advance the frontier.
+        syncing.store(true, Ordering::SeqCst);
+        let r = app
+            .commit(&AppContext::default(), &block)
+            .await
+            .expect("commit while syncing");
+        assert!(r.validator_updates.is_empty());
+        assert_eq!(
+            fcu_calls.load(Ordering::SeqCst),
+            fcu_after_build,
+            "no forkchoiceUpdated must be issued while newPayload is SYNCING (#826)",
+        );
+        assert_eq!(
+            app.state_commitment(),
+            [0u8; 32],
+            "frontier held at genesis while the EL is syncing the gap",
+        );
+
+        // Once reth has the parents (newPayload VALID — el_catchup walked the
+        // gap up to this block), the same commit DOES forkchoice and adopts it.
+        syncing.store(false, Ordering::SeqCst);
+        app.commit(&AppContext::default(), &block)
+            .await
+            .expect("commit once valid");
+        assert!(
+            fcu_calls.load(Ordering::SeqCst) > fcu_after_build,
+            "forkchoiceUpdated must be issued once newPayload is VALID",
+        );
+        assert_eq!(
+            hex::encode(app.state_commitment()),
+            BLOCK1_STATE_ROOT,
+            "frontier advances once the block is adopted",
+        );
     }
 
     /// Test transport: engine_* via the golden fixtures (so `commit` reaches

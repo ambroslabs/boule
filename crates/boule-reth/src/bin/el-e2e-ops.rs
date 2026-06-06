@@ -227,10 +227,15 @@ async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -
     let mut funded = 0usize;
     for a in &addrs {
         let b = t
-            .eth("eth_getBalance", json!([format!("0x{}", hex::encode(a)), "latest"]))
+            .eth(
+                "eth_getBalance",
+                json!([format!("0x{}", hex::encode(a)), "latest"]),
+            )
             .await
             .ok();
-        if b.and_then(|x| x.as_str().map(|s| s != "0x0")).unwrap_or(false) {
+        if b.and_then(|x| x.as_str().map(|s| s != "0x0"))
+            .unwrap_or(false)
+        {
             funded += 1;
         }
     }
@@ -338,7 +343,9 @@ async fn await_contract_address(t: &HttpTransport, tx_hash: &str) -> Result<Stri
             continue;
         }
         anyhow::ensure!(r["status"].as_str() == Some("0x1"), "deploy tx reverted");
-        let addr = r["contractAddress"].as_str().context("no contractAddress in receipt")?;
+        let addr = r["contractAddress"]
+            .as_str()
+            .context("no contractAddress in receipt")?;
         return Ok(addr.to_string());
     }
     bail!("deploy receipt for {tx_hash} never appeared")
@@ -360,7 +367,15 @@ async fn massfund(t: &HttpTransport, n: usize, path: &str, wei_each: u128) -> Re
 
     // 1. deploy Disperse once
     let code = hex::decode(DISPERSE_BIN).context("disperse bytecode")?;
-    let raw = sign_tx(&dev, nonce, TxKind::Create, U256::ZERO, code, 1_000_000, chain_id)?;
+    let raw = sign_tx(
+        &dev,
+        nonce,
+        TxKind::Create,
+        U256::ZERO,
+        code,
+        1_000_000,
+        chain_id,
+    )?;
     let dh = t.eth("eth_sendRawTransaction", json!([raw])).await?;
     let dh = dh.as_str().context("deploy hash")?.to_string();
     nonce += 1;
@@ -381,7 +396,15 @@ async fn massfund(t: &HttpTransport, n: usize, path: &str, wei_each: u128) -> Re
         let value = U256::from(wei_each) * U256::from(chunk.len() as u64);
         // ~40k gas/recipient (new-account value transfer) + overhead
         let gas = 60_000 + chunk.len() as u64 * 40_000;
-        let raw = sign_tx(&dev, nonce, TxKind::Call(disperse), value, cd, gas, chain_id)?;
+        let raw = sign_tx(
+            &dev,
+            nonce,
+            TxKind::Call(disperse),
+            value,
+            cd,
+            gas,
+            chain_id,
+        )?;
         let h = loop {
             match t.eth("eth_sendRawTransaction", json!([raw])).await {
                 Ok(r) => break r.as_str().unwrap_or("").to_string(),
@@ -447,7 +470,11 @@ async fn run_load(
     };
     eprintln!(
         "load: {n} wallets, {dur_secs}s, target_tps={} ...",
-        if target_tps == 0 { "unbounded".into() } else { target_tps.to_string() }
+        if target_tps == 0 {
+            "unbounded".into()
+        } else {
+            target_tps.to_string()
+        }
     );
     let mut handles = vec![];
     for (i, w) in wallets.into_iter().enumerate() {
@@ -497,7 +524,9 @@ async fn run_load(
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
     let mut included = 0u64;
     for a in &addrs {
-        included += fetch_nonce(t, &format!("0x{}", hex::encode(a))).await.unwrap_or(0);
+        included += fetch_nonce(t, &format!("0x{}", hex::encode(a)))
+            .await
+            .unwrap_or(0);
     }
     let end_h = fetch_block(t).await?;
     println!("=== loadtest result ===");
@@ -594,14 +623,20 @@ async fn main() -> Result<()> {
         // genfund <N> <KEYSFILE> — fund N wallets centrally, write their keys.
         Some("genfund") => {
             let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
-            let path = args.get(2).map(String::as_str).unwrap_or("/tmp/wallets.keys");
+            let path = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("/tmp/wallets.keys");
             genfund(&t, n, path).await?;
         }
         // massfund <N> <KEYSFILE> [WEI_EACH] — deploy Disperse, fund N wallets
         // in batches (one tx each), write keys. Defaults WEI_EACH = 0.05 ETH.
         Some("massfund") => {
             let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
-            let path = args.get(2).map(String::as_str).unwrap_or("/tmp/wallets.keys");
+            let path = args
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or("/tmp/wallets.keys");
             let wei: u128 = args
                 .get(3)
                 .and_then(|s| s.parse().ok())
@@ -610,7 +645,10 @@ async fn main() -> Result<()> {
         }
         // loadkeys <KEYSFILE> <DUR> <TPS> — load from pre-funded wallet keys.
         Some("loadkeys") => {
-            let path = args.get(1).map(String::as_str).unwrap_or("/tmp/wallets.keys");
+            let path = args
+                .get(1)
+                .map(String::as_str)
+                .unwrap_or("/tmp/wallets.keys");
             let dur: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
             let tps: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             loadkeys(&t, path, dur, tps).await?;
