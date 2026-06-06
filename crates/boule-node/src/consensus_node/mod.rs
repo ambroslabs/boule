@@ -145,6 +145,61 @@ use timeout_bucket::TimeoutBucket;
 /// boundaries without drowning in p2p / gossip traffic.
 pub const TRACE_TARGET: &str = "boule_core::consensus";
 
+/// Minimum EL-behind gap (`committed − executed`) that triggers a **live**
+/// `el_catchup_replay` from the run loop (#826). The execution layer normally
+/// lags the committed frontier by only the deferred-execution depth (a few
+/// blocks); we replay from consensus only when it has fallen well past that —
+/// a genuine wedge: a slow EL start, a post-restart gap, or a follower that
+/// block-synced ahead of an EL with no devp2p peers. Keeping a margin above
+/// the steady-state lag means the live commit path executes ordinary blocks
+/// exactly once and we never re-run a recently-committed block's side effects.
+const EL_CATCHUP_LIVE_GAP_THRESHOLD: u64 = 16;
+
+/// How often the run loop checks whether the EL has wedged behind (#826).
+const EL_CATCHUP_TICK: Duration = Duration::from_secs(2);
+
+/// EL-behind gap (`committed − frontier`) at/above which a seated validator
+/// is treated as a *dead proposer* and drained from `/ready` (#828). Must
+/// sit well above [`EL_CATCHUP_LIVE_GAP_THRESHOLD`] so an ordinary deferred
+/// lag, or an in-progress live catch-up replay, never trips the unready
+/// signal — only a genuinely *stuck* EL does.
+const EL_BEHIND_READY_THRESHOLD: u64 = 32;
+
+/// Consecutive `el_catchup` ticks the gap must hold at/above
+/// [`EL_BEHIND_READY_THRESHOLD`] before the EL-behind signal trips (and,
+/// symmetrically, below it before the signal clears). At
+/// [`EL_CATCHUP_TICK`] cadence this is a few seconds of sustained lag —
+/// hysteresis so a momentary sample neither flaps the readiness signal nor
+/// drains a node that is one replay away from catching up (#828).
+const EL_BEHIND_SUSTAIN: u32 = 3;
+
+/// Pure hysteresis transition for the EL-behind (#828) degraded signal.
+///
+/// Given the previous `(degraded, sustain)` state and the freshly-sampled
+/// `gap` (`committed − frontier`), returns the next `(degraded, sustain)`:
+/// the signal trips false→true only after the gap has been
+/// `≥ EL_BEHIND_READY_THRESHOLD` for [`EL_BEHIND_SUSTAIN`] consecutive
+/// ticks, and clears true→false only after it has been *below* the
+/// threshold for [`EL_BEHIND_SUSTAIN`] consecutive ticks. `sustain` counts
+/// up toward whichever transition is pending and resets whenever the sample
+/// agrees with the current state. Factored out of the run loop so the
+/// hysteresis is unit-testable without a timer.
+fn el_behind_next(prev_degraded: bool, prev_sustain: u32, gap: u64) -> (bool, u32) {
+    let over = gap >= EL_BEHIND_READY_THRESHOLD;
+    if over == prev_degraded {
+        // Sample agrees with the current state: no pending transition.
+        (prev_degraded, 0)
+    } else {
+        // Sample disagrees: count toward flipping the signal.
+        let sustain = prev_sustain + 1;
+        if sustain >= EL_BEHIND_SUSTAIN {
+            (over, 0)
+        } else {
+            (prev_degraded, sustain)
+        }
+    }
+}
+
 /// Short, stable tag for a [`ConsensusMsg`] variant — suitable as a
 /// structured-log field value.
 pub(super) fn msg_kind(msg: &ConsensusMsg) -> &'static str {
@@ -614,6 +669,30 @@ pub struct ConsensusNode {
     /// fails because a sibling deployment with a different genesis has
     /// a different `ChainId`.
     chain_id: ChainId,
+    /// Whether this node's execution layer is *persistently* behind the
+    /// committed frontier — a seated validator in this state is a silent
+    /// dead proposer: it correctly refuses to propose (the #316/#598
+    /// build-time safety) but every view it leads dies to timeout while it
+    /// still looks "healthy" (#828). Computed in the `el_catchup` run-loop
+    /// arm with hysteresis ([`el_behind_next`]): set true once the gap
+    /// `committed − frontier` has held `≥ EL_BEHIND_READY_THRESHOLD` for
+    /// [`EL_BEHIND_SUSTAIN`] consecutive ticks, cleared symmetrically.
+    /// Surfaced on `/ready` (a validator drains) and a Prometheus gauge.
+    /// Always `false` for an in-process app (`executed_height()` is `None`).
+    ///
+    /// MVP is DETECT + SURFACE only; eager leader-yield (#828 option ii)
+    /// and delinquency eviction (#721) are follow-ups, out of scope here.
+    el_behind: bool,
+    /// The EL-behind gap (`committed − frontier`) sampled at the most recent
+    /// `el_catchup` tick. Surfaced under [`ConsensusStatus::el_behind_height_gap`]
+    /// for operators; meaningful only alongside [`Self::el_behind`].
+    el_behind_height_gap: u64,
+    /// Consecutive `el_catchup` ticks the gap has been at/above
+    /// [`EL_BEHIND_READY_THRESHOLD`] (or, once degraded, *below* it). The
+    /// hysteresis counter that gates [`Self::el_behind`] flips so a single
+    /// transient sample never trips or clears the degraded signal. Driven by
+    /// [`el_behind_next`].
+    el_behind_sustain: u32,
 }
 
 /// Per-`(from_height, to_height)` retry accounting for
@@ -857,6 +936,9 @@ impl ConsensusNode {
                 config.snapshot_policy,
             ),
             chain_id,
+            el_behind: false,
+            el_behind_height_gap: 0,
+            el_behind_sustain: 0,
         }
     }
 
@@ -1377,6 +1459,9 @@ impl ConsensusNode {
                 config.snapshot_policy,
             ),
             chain_id,
+            el_behind: false,
+            el_behind_height_gap: 0,
+            el_behind_sustain: 0,
         })
     }
 
@@ -1487,17 +1572,51 @@ impl ConsensusNode {
         );
     }
 
-    async fn el_catchup_replay(&self) {
+    /// Replay committed payloads to catch a behind execution layer up (#635,
+    /// #826). Only replays when the EL is behind by at least `min_gap` blocks:
+    /// the boot path passes `1` (close any gap on startup), while the live
+    /// run-loop path passes [`EL_CATCHUP_LIVE_GAP_THRESHOLD`] so the normal
+    /// deferred-execution lag never triggers a redundant replay (which would
+    /// re-run a recently-committed block's side effects).
+    /// The execution layer's **true** frontier for catch-up / detection:
+    /// `min(executed_height, el_head)`. Returns `None` for an in-process
+    /// application (`executed_height()` is `None` → never EL-behind).
+    ///
+    /// The frontier can sit *below* boule's tracked `executed_height` after
+    /// an unclean crash (SIGKILL mid-commit): boule persisted the advanced
+    /// frontier but reth never durably committed the block (#826). Querying
+    /// reth's real head (`eth_blockNumber`) and taking the min re-anchors on
+    /// what reth actually has. `el_head` is best-effort — `None`
+    /// (unsupported transport / transient failure) falls back to `executed`.
+    async fn el_frontier(&self) -> Option<u64> {
+        let executed = self.app.executed_height()?;
+        let frontier = match self.app.el_head().await {
+            Some(head) if head.0 < executed.0 => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    tracked = executed.0,
+                    el_head = head.0,
+                    "el_catchup: reth's actual head is below the tracked frontier \
+                     (unclean crash?); replaying from the EL's real head",
+                );
+                head.0
+            }
+            _ => executed.0,
+        };
+        Some(frontier)
+    }
+
+    async fn el_catchup_replay(&self, min_gap: u64) {
         let committed = self.last_committed_height.load(Ordering::Relaxed);
         // Only an out-of-process EL reports a lagging executed height; an
         // in-process application returns `None` and is skipped (no double-apply).
-        let Some(executed) = self.app.executed_height() else {
+        let Some(frontier) = self.el_frontier().await else {
             return;
         };
-        if committed == 0 || executed.0 >= committed {
+        if committed == 0 || committed.saturating_sub(frontier) < min_gap.max(1) {
             return;
         }
-        let behind = committed - executed.0;
+        let behind = committed - frontier;
         // The committed tip's content hash, from the height index, anchors the
         // backward storage walk.
         let tip_hash: BlockHash = match self.storage.get(&height_storage_key(Height(committed))) {
@@ -1509,7 +1628,7 @@ impl ConsensusNode {
             _ => {
                 tracing::warn!(
                     target: TRACE_TARGET,
-                    executed = executed.0,
+                    executed = frontier,
                     committed,
                     "el_catchup: no committed tip hash at the committed height; skipping EL replay",
                 );
@@ -1519,7 +1638,7 @@ impl ConsensusNode {
         let gap = match load_block_range_from_storage(
             &*self.storage,
             tip_hash,
-            Height(executed.0 + 1),
+            Height(frontier + 1),
             Height(committed),
             behind as usize,
         ) {
@@ -1532,7 +1651,7 @@ impl ConsensusNode {
         if (gap.len() as u64) < behind {
             tracing::warn!(
                 target: TRACE_TARGET,
-                executed = executed.0,
+                executed = frontier,
                 committed,
                 behind,
                 retained = gap.len(),
@@ -1545,7 +1664,7 @@ impl ConsensusNode {
         }
         tracing::info!(
             target: TRACE_TARGET,
-            executed = executed.0,
+            executed = frontier,
             committed,
             blocks = gap.len(),
             "el_catchup: replaying committed payloads to catch the execution layer up",
@@ -1599,6 +1718,16 @@ impl ConsensusNode {
         let mut retry_timer = BlockSyncRetryTimer::new(retry_timer_tx);
         let mut retry_timer_delay: Option<Duration> = None;
 
+        // #826: periodic EL catch-up re-check, delivered via a channel-armed
+        // single-shot timer (same shape as the block-sync retry timer above),
+        // NOT a directly-polled `tokio::time::interval`. A polled interval keeps
+        // a tokio timer always-pending in the `select!`, which the sim's time
+        // model cannot drive — it silently stalls the consensus liveness tests.
+        // A channel-delivered armed timer lives in its own task, so the loop
+        // only polls a `recv()`. Re-armed after each fire to make it periodic.
+        let (el_catchup_tx, mut el_catchup_rx) = mpsc::channel::<()>(1);
+        let mut el_catchup_timer = BlockSyncRetryTimer::new(el_catchup_tx);
+
         // Boot-time snapshot of recovered durable state. Logged once
         // per node start so operators can correlate "did we come up
         // already behind the live cluster?" with downstream block-sync
@@ -1624,8 +1753,18 @@ impl ConsensusNode {
 
         // Before participating, catch a behind execution layer up by replaying
         // the committed payloads consensus still holds (#635). A no-op for an
-        // in-process application or an already-caught-up EL.
-        self.el_catchup_replay().await;
+        // in-process application or an already-caught-up EL. `min_gap = 1`:
+        // close any gap at boot. The run loop re-checks on a timer (#826).
+        self.el_catchup_replay(1).await;
+
+        // #826: the EL can also wedge *after* boot — a fresh follower that
+        // block-syncs ahead of a still-starting reth, or a node whose EL
+        // briefly fell behind — and with no devp2p peers it cannot self-sync
+        // the gap. A periodic, gap-thresholded replay closes it from the
+        // committed payloads consensus still holds.
+        // Arm the first post-boot EL catch-up re-check; the boot replay above
+        // already covered the current instant.
+        el_catchup_timer.arm(EL_CATCHUP_TICK);
 
         // Publish an initial snapshot before doing anything else, so
         // the HTTP endpoint has a sane value available even if it's
@@ -1716,6 +1855,52 @@ impl ConsensusNode {
                         BLOCK_SYNC_RETRY_INITIAL_DELAY,
                     )
                     .await?;
+                }
+
+                Some(()) = el_catchup_rx.recv() => {
+                    // #826: re-run the EL catch-up if the execution layer has
+                    // wedged well behind the committed frontier (slow EL start,
+                    // post-restart gap, follower that block-synced ahead with no
+                    // devp2p peers). Idempotent and gap-thresholded, so a healthy
+                    // node — where the EL only lags by the deferred depth — is a
+                    // no-op; a wedged one replays the in-storage gap in order.
+                    self.el_catchup_replay(EL_CATCHUP_LIVE_GAP_THRESHOLD).await;
+
+                    // #828: AFTER the replay attempt, re-sample the gap and run
+                    // the EL-behind detector. If the EL is *persistently* behind
+                    // (replay can't close it — e.g. the gap is past the retention
+                    // window, or reth is wedged) a seated validator is a silent
+                    // dead proposer. Trip a hysteresed degraded signal so the
+                    // node drains from `/ready` and is visible on a metric. Eager
+                    // leader-yield (#828 option ii) and delinquency eviction
+                    // (#721) are deliberately out of scope here.
+                    let committed = self.last_committed_height.load(Ordering::Relaxed);
+                    let gap = match self.el_frontier().await {
+                        Some(frontier) => committed.saturating_sub(frontier),
+                        // In-process app (no out-of-process EL): never behind.
+                        None => 0,
+                    };
+                    let was_behind = self.el_behind;
+                    let (behind, sustain) =
+                        el_behind_next(self.el_behind, self.el_behind_sustain, gap);
+                    self.el_behind = behind;
+                    self.el_behind_sustain = sustain;
+                    self.el_behind_height_gap = gap;
+                    if behind && !was_behind {
+                        // Single WARN on the false→true transition (not per tick).
+                        tracing::warn!(
+                            target: TRACE_TARGET,
+                            committed,
+                            height_gap = gap,
+                            threshold = EL_BEHIND_READY_THRESHOLD,
+                            "el_behind: execution layer is persistently behind the \
+                             committed frontier; this validator is a dead proposer \
+                             (skips every leader view) and is now draining from /ready (#828)",
+                        );
+                    }
+                    self.publish_status();
+                    // Re-arm for the next periodic catch-up (single-shot timer).
+                    el_catchup_timer.arm(EL_CATCHUP_TICK);
                 }
 
                 disc = discovery_events.recv() => {
@@ -2086,6 +2271,102 @@ mod tests {
             node.core.state().pending_blocks.contains_key(&g_hash),
             "genesis block must be pre-seeded into pending_blocks",
         );
+    }
+
+    /// #828: the two EL-behind fields populate from the node's degraded
+    /// state, and default to the not-behind values on a fresh node.
+    #[test]
+    fn build_status_surfaces_el_behind() {
+        let mut node = make_node(nid(1));
+        // Fresh node: not behind.
+        let status = node.build_status();
+        assert!(!status.el_behind);
+        assert_eq!(status.el_behind_height_gap, 0);
+
+        // Mark the node degraded (as the el_catchup tick would) and re-snapshot.
+        node.el_behind = true;
+        node.el_behind_height_gap = 176;
+        let status = node.build_status();
+        assert!(status.el_behind);
+        assert_eq!(status.el_behind_height_gap, 176);
+    }
+
+    /// #828: the pure hysteresis transition trips only after
+    /// `EL_BEHIND_SUSTAIN` consecutive over-threshold ticks and clears
+    /// symmetrically — no timer involved.
+    #[test]
+    fn el_behind_hysteresis_trips_and_clears_after_sustain() {
+        let over = EL_BEHIND_READY_THRESHOLD; // exactly at threshold counts as over.
+        let under = EL_BEHIND_READY_THRESHOLD - 1;
+
+        // From not-degraded: the first SUSTAIN-1 over-threshold ticks count up
+        // but do NOT trip; the SUSTAIN-th flips it true.
+        let mut degraded = false;
+        let mut sustain = 0u32;
+        for tick in 1..EL_BEHIND_SUSTAIN {
+            let (d, s) = el_behind_next(degraded, sustain, over);
+            degraded = d;
+            sustain = s;
+            assert!(
+                !degraded,
+                "must not trip before {EL_BEHIND_SUSTAIN} ticks (tick {tick})"
+            );
+            assert_eq!(sustain, tick);
+        }
+        let (d, s) = el_behind_next(degraded, sustain, over);
+        degraded = d;
+        sustain = s;
+        assert!(
+            degraded,
+            "trips on the {EL_BEHIND_SUSTAIN}th sustained over-threshold tick"
+        );
+        assert_eq!(sustain, 0, "counter resets once the signal flips");
+
+        // A single brief dip below threshold does NOT clear it (hysteresis).
+        let (d, s) = el_behind_next(degraded, sustain, under);
+        assert!(
+            d,
+            "one under-threshold sample must not clear a degraded signal"
+        );
+        assert_eq!(s, 1);
+        // An over-threshold sample while degraded resets the clearing counter.
+        let (d2, s2) = el_behind_next(d, s, over);
+        assert!(d2);
+        assert_eq!(s2, 0, "agreeing sample resets the pending-clear counter");
+
+        // Sustained under-threshold clears it symmetrically.
+        degraded = true;
+        sustain = 0;
+        for tick in 1..EL_BEHIND_SUSTAIN {
+            let (d, s) = el_behind_next(degraded, sustain, under);
+            degraded = d;
+            sustain = s;
+            assert!(
+                degraded,
+                "must stay degraded before {EL_BEHIND_SUSTAIN} clear ticks (tick {tick})"
+            );
+            assert_eq!(sustain, tick);
+        }
+        let (d, s) = el_behind_next(degraded, sustain, under);
+        assert!(
+            !d,
+            "clears on the {EL_BEHIND_SUSTAIN}th sustained under-threshold tick"
+        );
+        assert_eq!(s, 0);
+    }
+
+    /// #828: a gap of exactly `EL_BEHIND_READY_THRESHOLD` counts as over;
+    /// one below stays not-degraded indefinitely.
+    #[test]
+    fn el_behind_hysteresis_steady_states() {
+        // Below threshold forever: never trips, counter stays at 0.
+        let mut st = (false, 0u32);
+        for _ in 0..(EL_BEHIND_SUSTAIN + 5) {
+            st = el_behind_next(st.0, st.1, EL_BEHIND_READY_THRESHOLD - 1);
+            assert_eq!(st, (false, 0));
+        }
+        // Threshold must sit above the live-catchup gap so normal lag never trips.
+        const _: () = assert!(EL_BEHIND_READY_THRESHOLD > EL_CATCHUP_LIVE_GAP_THRESHOLD);
     }
 
     #[test]
@@ -11239,7 +11520,26 @@ mod tests {
     /// `commit`, so a test can assert the gap was replayed in order.
     struct RecordingApp {
         executed: Height,
+        /// Overrides the EL's *actual* head (`el_head`) independently of the
+        /// tracked `executed` frontier, so a test can model an unclean crash
+        /// where reth's real head is below boule's recorded frontier (#826).
+        /// `None` keeps the default (no out-of-process head reported).
+        el_head: Option<Height>,
         commits: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl RecordingApp {
+        fn new(executed: Height) -> Self {
+            Self {
+                executed,
+                el_head: None,
+                commits: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn with_el_head(mut self, el_head: Height) -> Self {
+            self.el_head = Some(el_head);
+            self
+        }
     }
 
     impl boule_consensus::replication::application::Application for RecordingApp {
@@ -11270,6 +11570,10 @@ mod tests {
         }
         fn executed_height(&self) -> Option<Height> {
             Some(self.executed)
+        }
+        fn el_head<'a>(&'a self) -> boule_core::clock::BoxFuture<'a, Option<Height>> {
+            let head = self.el_head;
+            Box::pin(async move { head })
         }
         fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
             Ok(())
@@ -11808,18 +12112,53 @@ mod tests {
         // must replay heights 3,4,5 into the app, oldest-first.
         let mut node = make_node_with_retention(nid(1), 0);
         commit_n_blocks(&mut node, 5);
-        let app = Arc::new(RecordingApp {
-            executed: Height(2),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let app = Arc::new(RecordingApp::new(Height(2)));
         node.app = app.clone();
 
-        node.el_catchup_replay().await;
+        node.el_catchup_replay(1).await;
 
         assert_eq!(
             *app.commits.lock().unwrap(),
             vec![3, 4, 5],
             "the in-storage gap (3..=5) must be replayed in height order",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_respects_the_min_gap_threshold() {
+        // #826: the live run-loop path passes a gap threshold so the normal
+        // deferred-execution lag (a few blocks) never triggers a replay, while a
+        // genuine wedge does. Commit 1..=20.
+        let mut node = make_node_with_retention(nid(1), 0);
+        commit_n_blocks(&mut node, 20);
+
+        // EL at 17 is only 3 behind — below threshold 16 → the live path is a no-op.
+        let near = Arc::new(RecordingApp::new(Height(17)));
+        node.app = near.clone();
+        node.el_catchup_replay(EL_CATCHUP_LIVE_GAP_THRESHOLD).await;
+        assert!(
+            near.commits.lock().unwrap().is_empty(),
+            "a sub-threshold (normal-lag) gap must not be replayed by the live path",
+        );
+
+        // The boot path (min_gap = 1) still closes that same small gap.
+        let boot = Arc::new(RecordingApp::new(Height(17)));
+        node.app = boot.clone();
+        node.el_catchup_replay(1).await;
+        assert_eq!(
+            *boot.commits.lock().unwrap(),
+            vec![18, 19, 20],
+            "the boot path replays any gap regardless of the live threshold",
+        );
+
+        // A genuine wedge (EL at 2, 18 behind ≥ threshold) IS replayed in order.
+        let wedged = Arc::new(RecordingApp::new(Height(2)));
+        node.app = wedged.clone();
+        node.el_catchup_replay(EL_CATCHUP_LIVE_GAP_THRESHOLD).await;
+        assert_eq!(
+            *wedged.commits.lock().unwrap(),
+            (3u64..=20).collect::<Vec<u64>>(),
+            "a wedge at/above the threshold is replayed oldest-first by the live path",
         );
     }
 
@@ -11832,12 +12171,9 @@ mod tests {
         // The default node app is the counter MempoolBlockBuilder (None).
         // Calling replay must not panic and must commit nothing extra; we
         // assert by swapping in a RecordingApp that *claims* it is caught up.
-        let app = Arc::new(RecordingApp {
-            executed: Height(4),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let app = Arc::new(RecordingApp::new(Height(4)));
         node.app = app.clone();
-        node.el_catchup_replay().await;
+        node.el_catchup_replay(1).await;
         assert!(
             app.commits.lock().unwrap().is_empty(),
             "a caught-up EL must not be replayed into",
@@ -11852,17 +12188,58 @@ mod tests {
         // catch-up must replay nothing rather than feed a non-contiguous gap.
         let mut node = make_node_with_retention(nid(1), 2);
         commit_n_blocks(&mut node, 5);
-        let app = Arc::new(RecordingApp {
-            executed: Height(0),
-            commits: std::sync::Mutex::new(Vec::new()),
-        });
+        let app = Arc::new(RecordingApp::new(Height(0)));
         node.app = app.clone();
 
-        node.el_catchup_replay().await;
+        node.el_catchup_replay(1).await;
 
         assert!(
             app.commits.lock().unwrap().is_empty(),
             "a gap that is not fully retained must not be partially replayed",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_replays_from_the_el_head_when_below_the_tracked_frontier() {
+        // #826: an unclean crash (SIGKILL mid-commit) can leave reth's actual
+        // head BELOW boule's tracked `executed_height` — boule persisted the
+        // advanced frontier but reth never durably committed the block. Replaying
+        // from `frontier+1` would skip the blocks reth is missing and re-wedge;
+        // the catch-up must start from reth's real head instead.
+        let mut node = make_node_with_retention(nid(1), 0);
+        commit_n_blocks(&mut node, 5);
+        // Tracked frontier claims 4, but reth's real head is only 2 (it lost
+        // blocks 3,4 on the crash). The replay must re-feed 3,4,5, not just 5.
+        let app = Arc::new(RecordingApp::new(Height(4)).with_el_head(Height(2)));
+        node.app = app.clone();
+
+        node.el_catchup_replay(1).await;
+
+        assert_eq!(
+            *app.commits.lock().unwrap(),
+            vec![3, 4, 5],
+            "replay must start from reth's actual head (2), not the tracked frontier (4)",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_ignores_an_el_head_above_the_tracked_frontier() {
+        // The clean case: reth's head is at/above the tracked frontier (the
+        // normal deferred-lag relationship). `el_head` must not pull the replay
+        // start *forward* past the tracked frontier — only a head BELOW the
+        // frontier (an unclean crash) moves the start. Here frontier=2, head=4:
+        // the gap to replay stays (2, 5] = {3,4,5}.
+        let mut node = make_node_with_retention(nid(1), 0);
+        commit_n_blocks(&mut node, 5);
+        let app = Arc::new(RecordingApp::new(Height(2)).with_el_head(Height(4)));
+        node.app = app.clone();
+
+        node.el_catchup_replay(1).await;
+
+        assert_eq!(
+            *app.commits.lock().unwrap(),
+            vec![3, 4, 5],
+            "an el_head at/above the tracked frontier must not narrow the replay range",
         );
     }
 

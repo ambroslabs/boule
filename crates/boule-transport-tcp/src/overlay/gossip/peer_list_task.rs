@@ -22,6 +22,7 @@
 //! would imply an entirely different deployment shape) we can
 //! revisit.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +54,13 @@ pub struct PeerListGossipConfig {
     /// belt-and-braces guard if a future config bumps
     /// `PeerTable::capacity` past comfortable wire sizes.
     pub max_entries: Option<usize>,
+    /// Sentry-topology private peers (#827, cf. Tendermint
+    /// `private_peer_ids`). Any [`NodeId`] in this set is **never**
+    /// included in an outbound peer-list frame, so a sentry never
+    /// relays its hidden validator's address mesh-wide. The peer stays
+    /// in the local table and is still a direct peer — only the
+    /// *relay* is suppressed.
+    pub private: HashSet<NodeId>,
 }
 
 impl Default for PeerListGossipConfig {
@@ -61,6 +69,7 @@ impl Default for PeerListGossipConfig {
             interval: Duration::from_secs(5),
             fanout: 3,
             max_entries: None,
+            private: HashSet::new(),
         }
     }
 }
@@ -114,12 +123,22 @@ pub struct SelfAdvertise {
 /// Build the postcard wire bytes for a peer-list push, optionally
 /// capped at `max_entries` freshest entries. When `self_entry` is
 /// provided, it's prepended to the snapshot — see [`SelfAdvertise`].
+///
+/// Any peer whose [`NodeId`] is in `private` is dropped from the
+/// relayed frame (#827, sentry topology): a sentry never leaks its
+/// hidden validator's address into the mesh. The self-entry is never
+/// filtered — a node advertises itself per the `inbound_disabled`
+/// path, not via `private`.
 pub fn build_peer_list_frame(
     table: &PeerTable,
     self_entry: Option<PeerEntry>,
     max_entries: Option<usize>,
+    private: &HashSet<NodeId>,
 ) -> Bytes {
     let mut entries = table.snapshot();
+    if !private.is_empty() {
+        entries.retain(|e| !private.contains(&e.node_id));
+    }
     if let Some(e) = self_entry {
         entries.push(e);
     }
@@ -260,7 +279,7 @@ fn tick_once(
         last_seen_unix_ms: now_unix_ms(),
         reachable: s.reachable,
     });
-    let frame = build_peer_list_frame(table, self_entry, config.max_entries);
+    let frame = build_peer_list_frame(table, self_entry, config.max_entries, &config.private);
     for target in peers {
         sink.send_to(target, frame.clone());
     }
@@ -301,6 +320,7 @@ impl DirectPeers for LockedVec {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -340,7 +360,7 @@ mod tests {
         table.upsert(nid(1), addr(7001), 100);
         table.upsert(nid(2), addr(7002), 200);
 
-        let bytes = build_peer_list_frame(&table, None, None);
+        let bytes = build_peer_list_frame(&table, None, None, &HashSet::new());
         let decoded: OverlayFrame = postcard::from_bytes(&bytes).expect("decode");
         let OverlayFrame::PeerList(entries) = decoded else {
             panic!("expected PeerList variant");
@@ -351,13 +371,35 @@ mod tests {
     }
 
     #[test]
+    fn build_frame_drops_private_peers() {
+        // A sentry must never relay its hidden validator's address
+        // (#827). nid(2) is marked private; the relayed frame must
+        // omit it while still carrying the non-private peer nid(1).
+        let table = PeerTable::new(nid(0), 16);
+        table.upsert(nid(1), addr(7001), 100);
+        table.upsert(nid(2), addr(7002), 200);
+        table.upsert(nid(3), addr(7003), 300);
+
+        let private: HashSet<NodeId> = [nid(2)].into_iter().collect();
+        let bytes = build_peer_list_frame(&table, None, None, &private);
+        let decoded: OverlayFrame = postcard::from_bytes(&bytes).expect("decode");
+        let OverlayFrame::PeerList(entries) = decoded else {
+            panic!("expected PeerList variant");
+        };
+        let ids: Vec<_> = entries.iter().map(|e| e.node_id).collect();
+        assert!(!ids.contains(&nid(2)), "private peer must be dropped");
+        assert!(ids.contains(&nid(1)));
+        assert!(ids.contains(&nid(3)));
+    }
+
+    #[test]
     fn build_frame_caps_at_max_entries_freshest_first() {
         let table = PeerTable::new(nid(0), 16);
         table.upsert(nid(1), addr(7001), 100);
         table.upsert(nid(2), addr(7002), 300);
         table.upsert(nid(3), addr(7003), 200);
 
-        let bytes = build_peer_list_frame(&table, None, Some(2));
+        let bytes = build_peer_list_frame(&table, None, Some(2), &HashSet::new());
         let decoded: OverlayFrame = postcard::from_bytes(&bytes).expect("decode");
         let OverlayFrame::PeerList(entries) = decoded else {
             panic!("expected PeerList variant");
@@ -446,6 +488,7 @@ mod tests {
             interval: Duration::from_secs(5),
             fanout: 3,
             max_entries: None,
+            private: HashSet::new(),
         };
 
         let (sd_tx, sd_rx) = oneshot::channel();
@@ -500,6 +543,7 @@ mod tests {
             interval: Duration::from_secs(1),
             fanout: 1,
             max_entries: None,
+            private: HashSet::new(),
         };
 
         let advertise = SelfAdvertise {
@@ -554,6 +598,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn publisher_never_relays_private_peer() {
+        // End-to-end at the publisher level (#827): a private peer in
+        // the table is present locally but must never appear in any
+        // relayed peer-list frame.
+        let table = PeerTable::new(nid(0), 16);
+        table.upsert(nid(1), addr(7001), 100); // public
+        table.upsert(nid(9), addr(7009), 100); // private (validator)
+        let direct = Arc::new(LockedVec::new());
+        direct.set(vec![nid(1), nid(9)]);
+        let sink = Arc::new(RecordingSink::default());
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
+
+        let cfg = PeerListGossipConfig {
+            interval: Duration::from_secs(1),
+            fanout: 5,
+            max_entries: None,
+            private: [nid(9)].into_iter().collect(),
+        };
+
+        let (sd_tx, sd_rx) = oneshot::channel();
+        let task = tokio::spawn({
+            let direct = direct.clone() as Arc<dyn DirectPeers>;
+            let sink = sink.clone() as Arc<dyn OverlayUnicast>;
+            let table = table.clone();
+            let clock = clock.clone();
+            run_peer_list_publisher(
+                cfg, table, direct, sink, clock, /* seed */ 7, None, sd_rx,
+            )
+        });
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let _ = sd_tx.send(());
+        let _ = task.await;
+
+        let sent = sink.sent.lock();
+        assert!(!sent.is_empty(), "publisher fired at least once");
+        for (_, payload) in sent.iter() {
+            match postcard::from_bytes::<OverlayFrame>(payload).unwrap() {
+                OverlayFrame::PeerList(entries) => {
+                    assert!(
+                        entries.iter().all(|e| e.node_id != nid(9)),
+                        "private peer must never be relayed",
+                    );
+                }
+                other => panic!("expected PeerList, got {other:?}"),
+            }
+        }
+        // The private peer is still in our local table.
+        assert!(table.snapshot().iter().any(|e| e.node_id == nid(9)));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn publisher_skips_when_no_direct_peers() {
         let table = PeerTable::new(nid(0), 16);
         let direct = Arc::new(LockedVec::new()); // empty
@@ -564,6 +664,7 @@ mod tests {
             interval: Duration::from_secs(5),
             fanout: 3,
             max_entries: None,
+            private: HashSet::new(),
         };
 
         let (sd_tx, sd_rx) = oneshot::channel();
@@ -634,6 +735,7 @@ mod tests {
             interval: Duration::from_secs(1),
             fanout: 3,
             max_entries: None,
+            private: HashSet::new(),
         };
 
         let (sd_a_tx, sd_a_rx) = oneshot::channel();

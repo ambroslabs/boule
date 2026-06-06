@@ -122,6 +122,33 @@ pub async fn run(
 
     let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
 
+    // Sentry-topology peer sets (#827), decoded from `[[peers]]`.
+    // `config.validate` above guarantees every `private`/`persistent`
+    // entry carries a well-formed `node_id`, so these decodes cannot
+    // fail. `private` peers are never relayed in PeerList gossip;
+    // `persistent` peers are never trimmed by maintenance and are
+    // admitted past the inbound cap (the unconditional set).
+    let private_peers: std::collections::HashSet<NodeId> = config
+        .peers
+        .iter()
+        .filter(|p| p.private)
+        .filter_map(|p| p.node_id.as_deref().and_then(|s| base58_to_node_id(s).ok()))
+        .collect();
+    let persistent_peers: std::collections::HashSet<NodeId> = config
+        .peers
+        .iter()
+        .filter(|p| p.persistent)
+        .filter_map(|p| p.node_id.as_deref().and_then(|s| base58_to_node_id(s).ok()))
+        .collect();
+    if !private_peers.is_empty() || !persistent_peers.is_empty() {
+        info!(
+            "sentry topology: {} private (non-gossiped) peer(s), {} persistent \
+             (unconditional) peer(s)",
+            private_peers.len(),
+            persistent_peers.len(),
+        );
+    }
+
     let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
     let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
     let (peer_gone_tx, _) = broadcast::channel::<p2p::NodeId>(64);
@@ -157,6 +184,10 @@ pub async fn run(
                 interval: std::time::Duration::from_millis(k.interval_ms),
                 timeout: std::time::Duration::from_millis(k.timeout_ms),
             });
+        // Persistent peers (#827) are the unconditional set: inbound
+        // connections from them bypass the connection limiter's
+        // inbound caps so a validator↔sentry link is never refused.
+        let unconditional = persistent_peers.clone();
         tokio::spawn(p2p::manager::run(
             our_id,
             p2p_cmd_rx,
@@ -166,6 +197,7 @@ pub async fn run(
             dtx,
             connection_limiter,
             keepalive,
+            unconditional,
         ))
     };
 
@@ -237,6 +269,8 @@ pub async fn run(
                 p2p_actual_addr,
                 inbound_disabled,
                 rate_limiter,
+                private_peers,
+                persistent_peers,
             )
             .await?,
         )
@@ -562,6 +596,8 @@ async fn start_consensus(
     self_listen_addr: std::net::SocketAddr,
     inbound_disabled: bool,
     rate_limiter: Option<Arc<boule_consensus::rate_limit::MessageRateLimiter>>,
+    private_peers: std::collections::HashSet<NodeId>,
+    persistent_peers: std::collections::HashSet<NodeId>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     // #803: surface the participation role at boot so an operator (and the
@@ -708,6 +744,8 @@ async fn start_consensus(
         inbound_disabled,
         dialer_ctx,
         clock,
+        private_peers,
+        persistent_peers,
     )
     .await?;
 
@@ -1054,6 +1092,8 @@ async fn build_overlay_wiring(
     inbound_disabled: bool,
     dialer_ctx: DialerCtx,
     clock: Arc<dyn Clock>,
+    private_peers: std::collections::HashSet<NodeId>,
+    persistent_peers: std::collections::HashSet<NodeId>,
 ) -> anyhow::Result<OverlayWiring> {
     match overlay_cfg.mode {
         OverlayMode::Gossip => {
@@ -1082,7 +1122,12 @@ async fn build_overlay_wiring(
             let mut seed_bytes = [0u8; 8];
             seed_bytes.copy_from_slice(&self_id[0..8]);
             let rng_seed = u64::from_le_bytes(seed_bytes);
-            let cfg = GossipOverlayConfig::from_config(overlay_cfg, rng_seed);
+            let mut cfg = GossipOverlayConfig::from_config(overlay_cfg, rng_seed);
+            // Sentry topology (#827): `from_config` can't see `[[peers]]`,
+            // so inject the private (non-gossiped) and persistent
+            // (never-trimmed) sets here.
+            cfg.peer_list.private = private_peers;
+            cfg.maintenance.persistent = persistent_peers;
 
             // In outbound-only mode (issue #138) the listener was
             // never bound, so there is no advertisable listen address.

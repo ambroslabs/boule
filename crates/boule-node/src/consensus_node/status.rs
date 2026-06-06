@@ -246,6 +246,9 @@ impl ConsensusNode {
                 .map(|v| boule_transport_tcp::tls::node_id_to_base58(v.as_node_id()))
                 .collect(),
             cluster_participation_permille: self.liveness_tracker.cluster_participation_permille(),
+            // #828: surface the persistently-behind-EL dead-proposer signal.
+            el_behind: self.el_behind,
+            el_behind_height_gap: self.el_behind_height_gap,
         }
     }
 }

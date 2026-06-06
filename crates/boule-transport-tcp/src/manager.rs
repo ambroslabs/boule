@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -154,6 +154,14 @@ pub enum ManagerMsg {
     },
 }
 
+/// Run the p2p manager event loop. Owns the peer + protocol tables and
+/// services [`PeerCommand`]s and inbound [`ManagerMsg`]s.
+///
+/// `unconditional_peers` is the sentry-topology unconditional set
+/// (#827, the `persistent` `[[peers]]`): an **inbound** connection from
+/// any of these node IDs is admitted regardless of the
+/// [`ConnectionLimiter`] inbound caps, so a validator↔sentry link is
+/// always accepted under load. Empty disables the bypass.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     our_node_id: NodeId,
@@ -164,6 +172,7 @@ pub async fn run(
     discovery_tx: broadcast::Sender<DiscoveryEvent>,
     connection_limiter: Option<Arc<ConnectionLimiter>>,
     keepalive: Option<KeepaliveConfig>,
+    unconditional_peers: HashSet<NodeId>,
 ) {
     // `BTreeMap` so broadcast and event-fan-out iteration is deterministic;
     // the sim's byte-identical-trace determinism test relies on this, and
@@ -209,7 +218,12 @@ pub async fn run(
                         // the monotonic id sequence (which other tests
                         // rely on for tie-breaker replays).
                         if let Some(limiter) = connection_limiter.as_ref() {
-                            if let Err(reason) = limiter.try_admit(direction, addr.ip()) {
+                            if let Err(reason) = limiter.try_admit_peer(
+                                direction,
+                                addr.ip(),
+                                Some(&node_id),
+                                &unconditional_peers,
+                            ) {
                                 warn!(
                                     peer = %node_id_to_base58(&node_id),
                                     addr = %addr,
@@ -714,6 +728,18 @@ mod tests {
             our_node_id: NodeId,
             connection_limiter: Option<Arc<ConnectionLimiter>>,
         ) -> Self {
+            Self::start_with_limiter_and_unconditional(
+                our_node_id,
+                connection_limiter,
+                HashSet::new(),
+            )
+        }
+
+        fn start_with_limiter_and_unconditional(
+            our_node_id: NodeId,
+            connection_limiter: Option<Arc<ConnectionLimiter>>,
+            unconditional_peers: HashSet<NodeId>,
+        ) -> Self {
             let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(16);
             let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(64);
             let (peer_gone_tx, peer_gone_rx) = broadcast::channel::<NodeId>(16);
@@ -729,6 +755,7 @@ mod tests {
                     discovery_tx,
                     connection_limiter,
                     None,
+                    unconditional_peers,
                 )
                 .await;
             });
@@ -1488,6 +1515,50 @@ mod tests {
             limiter.rejects() >= 92,
             "remaining 92 attempts must register as rejects; got {}",
             limiter.rejects()
+        );
+    }
+
+    /// #827: an unconditional/persistent peer is admitted past the
+    /// inbound cap. Models `inbound_flood_stops_at_inbound_max` but
+    /// exempts one node id — the inbound cap fills, yet the persistent
+    /// peer still lands in the table.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unconditional_peer_admitted_past_inbound_cap() {
+        let limiter = Arc::new(ConnectionLimiter::new(ConnectionLimitsConfig {
+            max_inbound: 2,
+            max_outbound: 99,
+            max_per_ip: 200,
+            max_total: usize::MAX,
+        }));
+        let validator = nid(200);
+        let unconditional: HashSet<NodeId> = [validator].into_iter().collect();
+        let mgr = TestManager::start_with_limiter_and_unconditional(
+            nid(1),
+            Some(Arc::clone(&limiter)),
+            unconditional,
+        );
+        let _h = mgr.register(0x01).await;
+
+        // Saturate the inbound cap (max_inbound = 2) with normal peers.
+        let _a = add_peer_with(&mgr, nid(10), sa(10, 0, 0, 1, 7001), Direction::Inbound).await;
+        let _b = add_peer_with(&mgr, nid(11), sa(10, 0, 0, 2, 7002), Direction::Inbound).await;
+        assert_eq!(mgr.list_peers().await.len(), 2);
+
+        // A normal third inbound is refused (cap full).
+        let _c = add_peer_with(&mgr, nid(12), sa(10, 0, 0, 3, 7003), Direction::Inbound).await;
+        assert_eq!(
+            mgr.list_peers().await.len(),
+            2,
+            "normal peer rejected at cap"
+        );
+        assert!(limiter.rejects() >= 1);
+
+        // The persistent peer is admitted despite the saturated cap.
+        let _v = add_peer_with(&mgr, validator, sa(10, 0, 0, 9, 7009), Direction::Inbound).await;
+        let peers = mgr.list_peers().await;
+        assert!(
+            peers.contains(&validator),
+            "unconditional peer must be admitted past the inbound cap; got {peers:?}",
         );
     }
 

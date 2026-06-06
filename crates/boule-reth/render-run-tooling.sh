@@ -50,17 +50,32 @@ COMPOSE="$OUTDIR/docker-compose.yml"
     echo "  reth-$i:"
     echo "    image: \${RETH_IMAGE:-$RETH_IMAGE}"
     echo "    container_name: boule-reth-$i"
-    echo "    command: >"
-    echo "      node --chain /genesis/genesis.json --datadir /data/reth$i"
-    echo "      --authrpc.addr 0.0.0.0 --authrpc.port $(authport "$i") --authrpc.jwtsecret /data/jwt$i.hex"
-    echo "      --http --http.addr 0.0.0.0 --http.port $(httpport "$i")"
-    echo "      --http.api eth,net,web3"
-    echo "      --port $(elp2p "$i") --ipcdisable"
+    echo "    # Wrapped in sh so it picks up an optional /data/reth$i.trusted-peers"
+    echo "    # file (#826): reth-mesh.sh scrapes each reth's enode post-boot and"
+    echo "    # writes that file, then restarts this service so a wiped/late-join"
+    echo "    # follower's reth devp2p-syncs the unretained gap from its peers."
+    echo "    entrypoint: [\"/bin/sh\", \"-c\"]"
+    echo "    command:"
+    echo "      - >"
+    echo "        TP=\"\"; [ -s /data/reth$i.trusted-peers ] &&"
+    echo "        TP=\"--trusted-peers \$\$(cat /data/reth$i.trusted-peers)\";"
+    echo "        exec boule-reth-node node --chain /genesis/genesis.json --datadir /data/reth$i"
+    echo "        --authrpc.addr 0.0.0.0 --authrpc.port $(authport "$i") --authrpc.jwtsecret /data/jwt$i.hex"
+    echo "        --http --http.addr 0.0.0.0 --http.port $(httpport "$i")"
+    echo "        --http.api eth,net,web3"
+    echo "        --port $(elp2p "$i") --addr 0.0.0.0 --ipcdisable"
+    # As a BFT EL backend (not a public gossip relay), treat RPC-submitted txs
+    # like any other: subject to eviction + per-account limits, so a burst (or a
+    # buggy client's future-nonce txs) can't pin the pool full forever (#832).
+    echo "        --txpool.nolocals --txpool.lifetime 300 --txpool.max-account-slots 128 \$\$TP"
     echo "    volumes:"
     echo "      - ./genesis:/genesis:ro"
     echo "      - ./data:/data"
-    echo "    # No 'ports:' — HTTP RPC ($(httpport "$i")) + Engine API ($(authport "$i")) are reachable"
+    echo "    # No HTTP/Engine 'ports:' — RPC ($(httpport "$i")) + Engine API ($(authport "$i")) are reachable"
     echo "    # only on the internal bridge (by eth-rpc-proxy-$i / boule-$i), never the host."
+    echo "    # The devp2p port ($(elp2p "$i")) IS open on the bridge so reths peer (#826),"
+    echo "    # but is NOT host-published — peering is intra-cluster, not public."
+    echo "    expose: [\"$(elp2p "$i")\"]"
     echo "    networks: [testnet]"
     echo "  eth-rpc-proxy-$i:"
     echo "    image: \${BOULE_IMAGE:-$BOULE_IMAGE}"
@@ -113,7 +128,8 @@ ExecStart=/usr/local/bin/boule-reth-node node --chain ${OUTDIR}/genesis/genesis.
   --datadir ${OUTDIR}/data/reth$i \\
   --authrpc.addr 127.0.0.1 --authrpc.port $(authport "$i") --authrpc.jwtsecret ${OUTDIR}/data/jwt$i.hex \\
   --http --http.addr 127.0.0.1 --http.port $(httpport "$i") --http.api eth,net,web3 \\
-  --port $(elp2p "$i") --ipcdisable
+  --port $(elp2p "$i") --ipcdisable \\
+  --txpool.nolocals --txpool.lifetime 300 --txpool.max-account-slots 128
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
@@ -159,6 +175,54 @@ WantedBy=multi-user.target
 EOF
 done
 echo "   wrote $OUTDIR/systemd/*.service ($SLOTS slots)"
+
+# ── reth devp2p peering driver (#826, post-boot two-phase) ──
+# Ship the generic peering helper alongside the artifacts, then render a
+# topology-pinned driver that scrapes each compose reth's enode from `docker
+# logs` and writes a per-node /data/rethN.trusted-peers file, then restarts the
+# reth services (which re-exec with --trusted-peers). The reth mesh MIRRORS the
+# consensus topology these artifacts build — a trusted-testnet FULL MESH (every
+# node peers every other), same as configs' [[peers]]. (For a sentry deployment,
+# edit PEERS[] below so a validator's reth peers ONLY its sentries' reths.)
+cp "$(cd "$(dirname "$0")" && pwd)/reth-peering.sh" "$OUTDIR/reth-peering.sh"
+chmod +x "$OUTDIR/reth-peering.sh"
+MESH="$OUTDIR/reth-mesh.sh"
+{
+  echo "#!/usr/bin/env bash"
+  echo "# Wire reth devp2p peering for the compose testnet (#826), post-boot."
+  echo "#   bash reth-mesh.sh        # scrape enodes, write trusted-peers, restart reths"
+  echo "# Run AFTER 'docker compose up -d' once the reths have logged their enode."
+  echo "# Idempotent: re-run after wiping/late-joining a follower's reth to (re)peer it."
+  echo "set -uo pipefail"
+  echo "OUTDIR=\"\$(cd \"\$(dirname \"\$0\")\" && pwd)\""
+  echo "N=$N; M=$M; SLOTS=$SLOTS"
+  echo "elp2p() { echo \$((30330 + \$1)); }"
+  echo "# docker-compose service/container names per slot."
+  echo "svc()  { echo \"reth-\$1\"; }"
+  echo "cont() { echo \"boule-reth-\$1\"; }"
+  echo "# Scrape slot i's enode from its container log, at its compose-DNS host"
+  echo "# (the container name) and devp2p port — the reachable address a PEER dials"
+  echo "# (NOT reth's advertised 127.0.0.1)."
+  echo "tmp=\$(mktemp -d)"
+  echo "specs=()"
+  echo "for i in \$(seq 0 \$((SLOTS-1))); do"
+  echo "  log=\"\$tmp/reth\$i.log\""
+  echo "  docker logs \"\$(cont \"\$i\")\" > \"\$log\" 2>&1 || { echo \"FATAL: no logs for \$(cont \"\$i\") — is it up?\"; exit 1; }"
+  echo "  # FULL MESH: peer every OTHER slot. (Sentry: restrict this list.)"
+  echo "  peers=\"\"; sep=\"\"; for j in \$(seq 0 \$((SLOTS-1))); do [ \"\$j\" = \"\$i\" ] && continue; peers=\"\$peers\$sep\$j\"; sep=\",\"; done"
+  echo "  specs+=(\"name=\$i:log=\$log:host=\$(cont \"\$i\"):port=\$(elp2p \"\$i\"):peers=\$peers\")"
+  echo "done"
+  echo "bash \"\$OUTDIR/reth-peering.sh\" build \"\$tmp\" \"\${specs[@]}\" || exit 1"
+  echo "# Install each node's trusted-peers file where its compose reth reads it,"
+  echo "# then restart the reth services so they re-exec with --trusted-peers."
+  echo "for i in \$(seq 0 \$((SLOTS-1))); do cp \"\$tmp/\$i.trusted-peers\" \"\$OUTDIR/data/reth\$i.trusted-peers\"; done"
+  echo "rm -rf \"\$tmp\""
+  echo "echo '── restarting reth services with --trusted-peers ──'"
+  echo "docker compose -f \"\$OUTDIR/docker-compose.yml\" restart \$(for i in \$(seq 0 \$((SLOTS-1))); do printf 'reth-%s ' \"\$i\"; done)"
+  echo "echo '── reth mesh wired; peers should connect within a few seconds ──'"
+} > "$MESH"
+chmod +x "$MESH"
+echo "   wrote $MESH (+ reth-peering.sh helper)"
 
 # ── bare-process local bring-up (no docker) ──
 RUN="$OUTDIR/run-local.sh"

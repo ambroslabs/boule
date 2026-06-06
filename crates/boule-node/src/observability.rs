@@ -69,6 +69,15 @@ pub struct HealthView {
     /// [`watch::Sender`] on unwind, which closes the channel the
     /// observability [`watch::Receiver`] reads.
     pub halted: bool,
+    /// This node's execution layer is *persistently* behind the committed
+    /// frontier (#828), so a seated validator is a silent dead proposer —
+    /// it correctly refuses to propose but every view it leads dies to
+    /// timeout. Sourced from [`ConsensusStatus::el_behind`]. When `true`,
+    /// [`is_ready`](Self::is_ready) drains a **validator** (mirroring the
+    /// no-peers gate) so a load balancer routes write traffic elsewhere; a
+    /// non-validating / gossip node is unaffected. Always `false` for an
+    /// in-process application.
+    pub el_behind: bool,
 }
 
 /// How far `current_view` may run ahead of `last_committed_view` before the
@@ -98,6 +107,7 @@ impl HealthView {
             committed_progress,
             healthy_view,
             halted: false,
+            el_behind: status.el_behind,
         }
     }
 
@@ -120,6 +130,7 @@ impl HealthView {
             committed_progress: false,
             healthy_view: true,
             halted: false,
+            el_behind: false,
         }
     }
 
@@ -146,6 +157,14 @@ impl HealthView {
             return false;
         }
         if self.is_validator && !self.has_peers {
+            return false;
+        }
+        // #828: a validator whose EL is persistently behind is a dead
+        // proposer — it skips every leader view to timeout. Drain it (like
+        // the no-peers gate) so it stops burning leader slots from the LB's
+        // perspective. Only validators drain; a non-validating / gossip node
+        // follows the chain and has no proposer duty, so it is unaffected.
+        if self.is_validator && self.el_behind {
             return false;
         }
         true
@@ -299,6 +318,21 @@ pub fn render_prometheus(
         "boule_consensus_halted",
         "1 if the consensus task has halted (fail-stop), else 0.",
         health.halted,
+    )?;
+    // #828: 1 once this node's execution layer is persistently behind the
+    // committed frontier — a seated validator in this state is a silent dead
+    // proposer (skips every leader view to timeout). `boule_node_ready` also
+    // drops to 0 for a validator, but this series names the cause so an
+    // operator/alert can tell a behind-EL drain apart from a no-peers drain.
+    bool_gauge(
+        "boule_consensus_el_behind",
+        "1 if this node's execution layer is persistently behind the committed frontier, else 0.",
+        health.el_behind,
+    )?;
+    int_gauge(
+        "boule_consensus_el_behind_height_gap",
+        "Height gap (committed - EL frontier) at the most recent catch-up sample.",
+        status.el_behind_height_gap as i64,
     )?;
 
     let mut buf = Vec::new();
@@ -469,6 +503,8 @@ fn gossip_only_status(_peer_count: usize) -> ConsensusStatus {
         backpressure: Default::default(),
         delinquent_validators: Vec::new(),
         cluster_participation_permille: None,
+        el_behind: false,
+        el_behind_height_gap: 0,
     }
 }
 
@@ -507,6 +543,8 @@ mod tests {
             backpressure: Default::default(),
             delinquent_validators: Vec::new(),
             cluster_participation_permille: Some(950),
+            el_behind: false,
+            el_behind_height_gap: 0,
         }
     }
 
@@ -648,6 +686,52 @@ mod tests {
         let follower = HealthView::from_status(&status, 0);
         assert!(follower.is_ready(), "precondition: follower ready");
         assert!(!follower.halted().is_ready());
+    }
+
+    // --- #828: persistently-behind-EL (dead proposer) policy ------------
+
+    #[test]
+    fn el_behind_validator_is_not_ready() {
+        // A validator that would otherwise be ready (peers, committed,
+        // healthy view) drains once its EL is persistently behind.
+        let mut status = base_status();
+        status.el_behind = true;
+        let h = HealthView::from_status(&status, 2);
+        assert!(h.is_validator);
+        assert!(h.has_peers);
+        assert!(h.el_behind);
+        assert!(
+            !h.is_ready(),
+            "a validator with a persistently-behind EL must not be ready"
+        );
+    }
+
+    #[test]
+    fn el_behind_non_validator_still_ready() {
+        // A non-validating follower has no proposer duty, so a behind EL
+        // does not drain it — it still follows the chain.
+        let mut status = base_status();
+        status.validator_set = vec!["peer-a".to_string(), "peer-b".to_string()];
+        status.el_behind = true;
+        let h = HealthView::from_status(&status, 0);
+        assert!(!h.is_validator);
+        assert!(h.el_behind);
+        assert!(
+            h.is_ready(),
+            "a non-validating node with a behind EL still follows the chain and is ready"
+        );
+    }
+
+    #[test]
+    fn metrics_emit_el_behind_gauge_when_validator_behind() {
+        let mut status = base_status();
+        status.el_behind = true;
+        status.el_behind_height_gap = 176;
+        let text = render_prometheus(&status, 2, false).expect("render");
+        assert!(text.contains("boule_consensus_el_behind 1"));
+        assert!(text.contains("boule_consensus_el_behind_height_gap 176"));
+        // A behind validator also drains from /ready.
+        assert!(text.contains("boule_node_ready 0"));
     }
 
     #[test]

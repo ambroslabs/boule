@@ -39,7 +39,7 @@
 //! `SimClock` drives the rate-limiter under virtual time exactly like
 //! in production.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -655,6 +655,38 @@ impl ConnectionLimiter {
             per_ip: Mutex::new(HashMap::new()),
             rejects: AtomicU64::new(0),
         }
+    }
+
+    /// Like [`Self::try_admit`], but bypasses the inbound caps for an
+    /// *unconditional* peer (sentry-topology, #827).
+    ///
+    /// When `node_id` is present and listed in `unconditional`, an
+    /// **inbound** connection is registered unconditionally — the
+    /// per-IP, total, and per-direction inbound caps are skipped — so a
+    /// validator↔sentry link is always accepted regardless of load (cf.
+    /// Tendermint `unconditional_peer_ids`). The slot is still counted
+    /// (so a later [`Self::release`] balances) but never refused.
+    /// Outbound connections, and connections whose peer is not in the
+    /// set, fall through to the normal [`Self::try_admit`] caps.
+    pub fn try_admit_peer(
+        &self,
+        direction: Direction,
+        ip: IpAddr,
+        node_id: Option<&NodeId>,
+        unconditional: &HashSet<NodeId>,
+    ) -> Result<(), RejectReason> {
+        let is_unconditional = matches!(direction, Direction::Inbound)
+            && node_id.is_some_and(|id| unconditional.contains(id));
+        if is_unconditional {
+            // Register the slot without consulting any cap. Both
+            // increments happen under the per-IP mutex to match the
+            // accounting discipline of `try_admit`.
+            let mut per_ip = self.per_ip.lock();
+            self.inbound.fetch_add(1, Ordering::AcqRel);
+            *per_ip.entry(ip).or_insert(0) += 1;
+            return Ok(());
+        }
+        self.try_admit(direction, ip)
     }
 
     /// Try to register a connection. On success, the caller must
@@ -1362,6 +1394,75 @@ mod tests {
         );
         // A different IP is unaffected.
         assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 2)).is_ok());
+    }
+
+    #[test]
+    fn unconditional_peer_admitted_past_inbound_cap() {
+        // A persistent/unconditional validator↔sentry link is admitted
+        // even when the inbound (and total, and per-IP) caps are
+        // saturated (#827).
+        let cl = ConnectionLimiter::new(ConnectionLimitsConfig {
+            max_inbound: 1,
+            max_outbound: 99,
+            max_per_ip: 99,
+            max_total: usize::MAX,
+        });
+        let validator = nid(42);
+        let unconditional: HashSet<NodeId> = [validator].into_iter().collect();
+
+        // Saturate the inbound cap with a normal peer.
+        assert!(cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 1)).is_ok());
+        // A normal inbound is now refused (inbound cap reached).
+        assert_eq!(
+            cl.try_admit(Direction::Inbound, ipv4(10, 0, 0, 2)),
+            Err(RejectReason::TotalInbound)
+        );
+        // The unconditional peer is admitted anyway.
+        assert!(
+            cl.try_admit_peer(
+                Direction::Inbound,
+                ipv4(10, 0, 0, 5),
+                Some(&validator),
+                &unconditional,
+            )
+            .is_ok(),
+            "unconditional peer must bypass the inbound cap",
+        );
+        // It is still counted, so release balances the books.
+        assert_eq!(cl.inbound(), 2);
+        cl.release(Direction::Inbound, ipv4(10, 0, 0, 5));
+        assert_eq!(cl.inbound(), 1);
+    }
+
+    #[test]
+    fn non_unconditional_peer_still_capped() {
+        // A peer *not* in the unconditional set goes through the normal
+        // caps even via try_admit_peer.
+        let cl = ConnectionLimiter::new(ConnectionLimitsConfig {
+            max_inbound: 1,
+            max_outbound: 99,
+            max_per_ip: 99,
+            max_total: usize::MAX,
+        });
+        let unconditional: HashSet<NodeId> = [nid(42)].into_iter().collect();
+        assert!(
+            cl.try_admit_peer(
+                Direction::Inbound,
+                ipv4(10, 0, 0, 1),
+                Some(&nid(7)),
+                &unconditional,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            cl.try_admit_peer(
+                Direction::Inbound,
+                ipv4(10, 0, 0, 2),
+                Some(&nid(8)),
+                &unconditional,
+            ),
+            Err(RejectReason::TotalInbound),
+        );
     }
 
     /// #187 / #511 acceptance: `max_total` is enforced before the
