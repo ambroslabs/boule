@@ -1657,9 +1657,19 @@ impl ConsensusNode {
                 retained = gap.len(),
                 "el_catchup: execution layer is behind past the block-retention window; \
                  the committed gap is not fully stored, so it cannot be replayed from \
-                 consensus. The EL must self-sync from peers (configure reth_peers, #631) \
-                 or be seeded from a checkpoint.",
+                 consensus. Handing off to the EL's devp2p self-sync from peers (#831).",
             );
+            // #831: point the EL at the committed tip so it acquires a sync
+            // target and snap/full-syncs the unretained gap from its devp2p peers
+            // (a validator from its sentries). Re-invoked every catch-up tick
+            // until the gap shrinks back within retention, where the in-order
+            // replay below finishes the tail. `gap` holds the retained recent
+            // blocks oldest-first, so its last entry is the committed tip.
+            if let Some(tip) = gap.last() {
+                if let Err(e) = self.app.el_devp2p_handoff(tip).await {
+                    tracing::warn!(target: TRACE_TARGET, error = %e, "el_catchup: el_devp2p_handoff failed");
+                }
+            }
             return;
         }
         tracing::info!(
@@ -11526,6 +11536,8 @@ mod tests {
         /// `None` keeps the default (no out-of-process head reported).
         el_head: Option<Height>,
         commits: std::sync::Mutex<Vec<u64>>,
+        /// Tip heights passed to `el_devp2p_handoff` (#831 past-retention path).
+        handoffs: std::sync::Mutex<Vec<u64>>,
     }
 
     impl RecordingApp {
@@ -11534,6 +11546,7 @@ mod tests {
                 executed,
                 el_head: None,
                 commits: std::sync::Mutex::new(Vec::new()),
+                handoffs: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn with_el_head(mut self, el_head: Height) -> Self {
@@ -11574,6 +11587,16 @@ mod tests {
         fn el_head<'a>(&'a self) -> boule_core::clock::BoxFuture<'a, Option<Height>> {
             let head = self.el_head;
             Box::pin(async move { head })
+        }
+        fn el_devp2p_handoff<'a>(
+            &'a self,
+            tip: &'a Block,
+        ) -> boule_core::clock::BoxFuture<'a, anyhow::Result<()>> {
+            let h = tip.header.height.0;
+            Box::pin(async move {
+                self.handoffs.lock().unwrap().push(h);
+                Ok(())
+            })
         }
         fn check(&self, _cmd: &[u8]) -> anyhow::Result<()> {
             Ok(())
@@ -12196,6 +12219,30 @@ mod tests {
         assert!(
             app.commits.lock().unwrap().is_empty(),
             "a gap that is not fully retained must not be partially replayed",
+        );
+    }
+
+    #[tokio::test]
+    async fn el_catchup_hands_off_to_devp2p_past_retention() {
+        // #831: when the committed gap exceeds the retention window, the catch-up
+        // can't replay it — instead it must hand off to the EL's devp2p self-sync
+        // by pointing it at the committed tip. Retention=2, commit 1..=5, EL at 0:
+        // gap (5) > retained (2), so no replay, but el_devp2p_handoff(tip=5) fires.
+        let mut node = make_node_with_retention(nid(1), 2);
+        commit_n_blocks(&mut node, 5);
+        let app = Arc::new(RecordingApp::new(Height(0)));
+        node.app = app.clone();
+
+        node.el_catchup_replay(1).await;
+
+        assert!(
+            app.commits.lock().unwrap().is_empty(),
+            "past-retention gap must not be replayed",
+        );
+        assert_eq!(
+            *app.handoffs.lock().unwrap(),
+            vec![5],
+            "past-retention must hand off to devp2p, pointing the EL at the committed tip",
         );
     }
 
