@@ -26,12 +26,14 @@ use futures::StreamExt as _;
 use libp2p::core::ConnectedPoint;
 use libp2p::gossipsub::TopicHash;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, PeerId, Swarm, gossipsub, identity::Keypair, multiaddr::Protocol};
+use libp2p::{
+    Multiaddr, PeerId, Swarm, gossipsub, identity::Keypair, multiaddr::Protocol, request_response,
+};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::debug;
 
-use crate::identity::node_id_for;
+use crate::identity::{node_id_for, peer_id_for};
 use crate::swarm::{Behaviour, BehaviourEvent, build_swarm, consensus_topic};
 
 const TRACE: &str = "boule_transport_libp2p::overlay";
@@ -40,6 +42,8 @@ const TRACE: &str = "boule_transport_libp2p::overlay";
 enum Command {
     /// Publish a payload to the consensus topic.
     Broadcast(Bytes),
+    /// Deliver a payload to a single peer (block-sync / unicast, #843).
+    SendTo { target: NodeId, payload: Bytes },
     /// Dial a peer at the given address (bootstrap ingestion).
     Dial(Multiaddr),
 }
@@ -129,13 +133,12 @@ impl Broadcaster for Libp2pBroadcaster {
         })
     }
 
-    fn send_to(&self, _target: NodeId, payload: Bytes) -> BoxFuture<'_, ()> {
-        // Phase 2 bridge: no addressed unicast yet (#843). Mirror the custom
-        // overlay's broadcast-as-unicast — publish to the topic; the target
-        // acts on it, others ignore (consensus dispatch is idempotent).
+    fn send_to(&self, target: NodeId, payload: Bytes) -> BoxFuture<'_, ()> {
+        // Real addressed delivery via request-response (#843) — a direct
+        // stream to `target`, no whole-mesh fan-out.
         let tx = self.cmd_tx.clone();
         Box::pin(async move {
-            let _ = tx.send(Command::Broadcast(payload)).await;
+            let _ = tx.send(Command::SendTo { target, payload }).await;
         })
     }
 }
@@ -196,6 +199,17 @@ impl Driver {
                             debug!(target: TRACE, error = %e, "gossipsub publish failed");
                         }
                     }
+                    Some(Command::SendTo { target, payload }) => match peer_id_for(&target) {
+                        Ok(peer) => {
+                            // Direct stream to `target` (dials if an address is
+                            // known, else fails — consensus retries another peer).
+                            self.swarm
+                                .behaviour_mut()
+                                .block_sync
+                                .send_request(&peer, payload.to_vec());
+                        }
+                        Err(e) => debug!(target: TRACE, error = %e, "send_to: bad target NodeId"),
+                    },
                     Some(Command::Dial(addr)) => {
                         let _ = self.swarm.dial(addr);
                     }
@@ -227,6 +241,33 @@ impl Driver {
                     })
                     .await;
             }
+            SwarmEvent::Behaviour(BehaviourEvent::BlockSync(
+                request_response::Event::Message { peer, message, .. },
+            )) => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    // `peer` is the direct sender (point-to-point, no relay).
+                    if let Some(from) = node_id_for(&peer) {
+                        let _ = self
+                            .event_tx
+                            .send(ProtocolEvent::Message {
+                                from,
+                                payload: Bytes::from(request),
+                            })
+                            .await;
+                    }
+                    // Ack so request-response considers the exchange complete;
+                    // the real reply (e.g. a BlockResponse) comes back as its
+                    // own `send_to`. Failure just means the peer went away.
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .block_sync
+                        .send_response(channel, ());
+                }
+                request_response::Message::Response { .. } => {} // ack — ignored
+            },
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => self.on_connected(peer_id, &endpoint).await,
