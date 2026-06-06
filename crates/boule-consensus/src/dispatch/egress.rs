@@ -90,6 +90,15 @@ pub fn egress_equivocation_evidence(proof: super::EquivocationProof) -> Outbound
     Outbound::Broadcast(payload)
 }
 
+/// Encode a [`Status`](WireMessage::Status) height advertisement (#857) as a
+/// `Broadcast` frame. Unsigned — a routing hint only; the overlay
+/// authenticates the sender.
+pub fn egress_status(committed_height: crate::Height) -> Outbound {
+    let wire = WireMessage::Status { committed_height };
+    let payload = codec::encode(&wire).expect("Status encoding must not fail");
+    Outbound::Broadcast(payload)
+}
+
 /// Encode a [`BlockResponse`] as a `SendTo` outbound frame, signing
 /// the payload so a wrong-hash response is non-repudiable evidence
 /// (#434).
@@ -370,7 +379,8 @@ pub fn egress_consensus_msg_with_loopback(
         | WireMessage::SnapshotChunkResponse { .. }
         | WireMessage::BlockRangeRequest { .. }
         | WireMessage::BlockRangeResponse(_)
-        | WireMessage::EquivocationEvidence(_) => {
+        | WireMessage::EquivocationEvidence(_)
+        | WireMessage::Status { .. } => {
             unreachable!("sign_consensus_msg always produces Proposal/Vote/NewView wire variants")
         }
     };

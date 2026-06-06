@@ -57,11 +57,14 @@ pub enum MessageKind {
     BlockRangeResponse,
     /// `WireMessage::EquivocationEvidence` — postcard tag 12 (#657b).
     EquivocationEvidence,
+    /// `WireMessage::Status` — postcard tag 13 (#857). Periodic committed-
+    /// height advertisement for block-sync peer selection.
+    Status,
 }
 
 impl MessageKind {
     /// Every kind, in declaration / postcard-tag order.
-    pub const ALL: [MessageKind; 13] = [
+    pub const ALL: [MessageKind; 14] = [
         MessageKind::Proposal,
         MessageKind::Vote,
         MessageKind::NewView,
@@ -75,6 +78,7 @@ impl MessageKind {
         MessageKind::BlockRangeRequest,
         MessageKind::BlockRangeResponse,
         MessageKind::EquivocationEvidence,
+        MessageKind::Status,
     ];
 
     /// Map a [`WireMessage`](crate::wire::WireMessage)'s first postcard
@@ -96,6 +100,7 @@ impl MessageKind {
             10 => Self::BlockRangeRequest,
             11 => Self::BlockRangeResponse,
             12 => Self::EquivocationEvidence,
+            13 => Self::Status,
             _ => return None,
         })
     }
@@ -125,6 +130,7 @@ impl RateLimitKind for MessageKind {
             Self::BlockRangeRequest => "BlockRangeRequest",
             Self::BlockRangeResponse => "BlockRangeResponse",
             Self::EquivocationEvidence => "EquivocationEvidence",
+            Self::Status => "Status",
         }
     }
 }
@@ -163,6 +169,8 @@ pub fn message_rate_limits(c: &P2pLimitsConfig) -> RateLimitsConfig {
             MessageKind::BlockRangeRequest => c.rate.block_range_request_per_sec,
             MessageKind::BlockRangeResponse => c.rate.block_range_response_per_sec,
             MessageKind::EquivocationEvidence => c.rate.equivocation_evidence_per_sec,
+            // #857: ~1/s/peer honest (one per commit); not operator-tunable.
+            MessageKind::Status => 64.0,
         }),
         bytes_per_sec: c.rate.bytes_per_sec,
         outbound_bytes_per_sec: c.rate.outbound_bytes_per_sec,
@@ -217,6 +225,7 @@ pub fn production_message_rate_limits() -> RateLimitsConfig {
             // equivocator, so genuine traffic is tiny; 8/s caps a
             // bogus-proof flood (each costs the receiver a verification).
             MessageKind::EquivocationEvidence => 8.0,
+            MessageKind::Status => 64.0,
         }),
         bytes_per_sec: 1024.0 * 1024.0,
         outbound_bytes_per_sec: 1024.0 * 1024.0,
@@ -326,6 +335,12 @@ mod tests {
             "EquivocationEvidence must serialize at tag 12"
         );
 
+        let status = crate::wire::WireMessage::Status {
+            committed_height: crate::Height(7),
+        };
+        let bytes = postcard::to_allocvec(&status).expect("encode");
+        assert_eq!(bytes[0], 13, "Status must serialize at tag 13");
+
         for (tag, kind) in [
             (0, MessageKind::Proposal),
             (1, MessageKind::Vote),
@@ -340,12 +355,13 @@ mod tests {
             (10, MessageKind::BlockRangeRequest),
             (11, MessageKind::BlockRangeResponse),
             (12, MessageKind::EquivocationEvidence),
+            (13, MessageKind::Status),
         ] {
             assert_eq!(MessageKind::from_wire_tag(tag), Some(kind));
             // index() must equal the postcard tag.
             assert_eq!(kind.index(), tag as usize);
         }
-        assert_eq!(MessageKind::from_wire_tag(13), None);
+        assert_eq!(MessageKind::from_wire_tag(14), None);
         assert_eq!(MessageKind::from_wire_tag(0xFF), None);
     }
 }

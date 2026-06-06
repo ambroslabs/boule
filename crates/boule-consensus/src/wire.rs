@@ -215,6 +215,17 @@ pub enum WireMessage {
     /// independent of which peer relayed it. Lets a detector that is not the
     /// current leader still get its evidence to one, for block inclusion.
     EquivocationEvidence(crate::dispatch::EquivocationProof),
+    /// Periodic advertisement of the sender's committed height, broadcast on
+    /// each commit (#857). Lets a node behind the chain pick a connected
+    /// neighbour that actually holds the block it needs for block-sync,
+    /// instead of asking an unreachable proposer or an equally-behind peer.
+    /// Unsigned: it is only a routing hint (a lying peer simply fails to serve
+    /// and the requester rotates), and the overlay already authenticates the
+    /// sender. Appended at the end of the enum to preserve postcard variant
+    /// tags.
+    Status {
+        committed_height: Height,
+    },
 }
 
 /// Serde adapter for `Option<BlsPartialSig>` — a 96-byte fixed array that

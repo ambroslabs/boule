@@ -216,6 +216,15 @@ impl ConsensusNode {
                     .await?;
             }
 
+            Dispatch::PeerStatus { from, height } => {
+                // #857: record the peer's advertised committed height so
+                // block-sync can target a neighbour that actually holds the
+                // block. Only meaningful for connected peers (we can only ask
+                // those); keep it simple and record any we hear from — the
+                // selection step intersects with `peers_connected`.
+                self.peer_heights.insert(from, height);
+            }
+
             Dispatch::ServeBlock { hash, to } => {
                 // Per-peer credit window (#498). Acquires one
                 // outstanding-serve credit; if `to` is already at
@@ -1198,28 +1207,43 @@ impl ConsensusNode {
                             "block_sync_request_self_dropped",
                         );
                     } else {
-                        // #854: the safety core names a block-holder (the
+                        // #854/#857: the safety core names a block-holder (the
                         // proposer / a QC signer) as a hint, but in a
                         // non-flooding overlay we can only reach *connected*
                         // peers — a validator behind sentries is unreachable.
                         // If we're not connected to `peer`, retarget to a
-                        // connected neighbour: they follow the chain and can
-                        // serve the block, and the core's retry rotates to
-                        // another neighbour if this one can't. When the holder
-                        // *is* connected (full mesh / the sim), behaviour is
-                        // unchanged.
+                        // connected neighbour that has *advertised a committed
+                        // height covering this block* (#857) — so we never ask
+                        // an equally-behind peer. Fall back to any connected
+                        // neighbour if none has advertised a covering height
+                        // yet; rotate across retries either way. When the
+                        // holder *is* connected (full mesh / the sim),
+                        // behaviour is unchanged.
                         let dest = if self.peers_connected.contains(&peer)
                             || self.peers_connected.is_empty()
                         {
                             peer
                         } else {
-                            let mut neighbours: Vec<NodeId> =
-                                self.peers_connected.iter().copied().collect();
-                            neighbours.sort_unstable();
-                            let idx = (self.block_sync_neighbour_rr as usize) % neighbours.len();
+                            let mut pool: Vec<NodeId> = self
+                                .peers_connected
+                                .iter()
+                                .copied()
+                                .filter(|p| {
+                                    self.peer_heights
+                                        .get(p)
+                                        .is_some_and(|h| *h >= expected_height)
+                                })
+                                .collect();
+                            if pool.is_empty() {
+                                // No neighbour has advertised a covering height
+                                // yet — fall back to any connected neighbour.
+                                pool = self.peers_connected.iter().copied().collect();
+                            }
+                            pool.sort_unstable();
+                            let idx = (self.block_sync_neighbour_rr as usize) % pool.len();
                             self.block_sync_neighbour_rr =
                                 self.block_sync_neighbour_rr.wrapping_add(1);
-                            neighbours[idx]
+                            pool[idx]
                         };
                         tracing::info!(
                             target: TRACE_TARGET,
@@ -1244,7 +1268,19 @@ impl ConsensusNode {
                 }
 
                 SafetyAction::Commit(block) => {
+                    let committed_height = block.header.height;
                     self.commit_block(block).await;
+                    // #857: advertise our committed height so peers behind the
+                    // chain can pick us as a block-sync source. Event-driven
+                    // (no timer → sim-deterministic), rate-limited to block
+                    // production.
+                    send_outbound(
+                        broadcaster,
+                        self.rate_limiter.as_deref(),
+                        &self.peers_connected,
+                        dispatch::egress_status(committed_height),
+                    )
+                    .await;
                 }
 
                 SafetyAction::EquivocationEvidence {

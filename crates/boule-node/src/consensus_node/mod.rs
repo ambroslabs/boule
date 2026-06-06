@@ -446,6 +446,11 @@ pub struct ConsensusNode {
     /// not connected to (#854). Rotates across retries so a neighbour that
     /// can't serve the block doesn't wedge sync.
     block_sync_neighbour_rr: u64,
+    /// Last committed height each peer advertised via `WireMessage::Status`
+    /// (#857). Block-sync prefers a connected neighbour whose advertised
+    /// height covers the block it needs, so it never asks an equally-behind
+    /// peer. Pruned on disconnect.
+    peer_heights: HashMap<NodeId, Height>,
     /// Height of the most recently committed block, updated in
     /// [`ConsensusNode::apply_commit`]. Zero before the first commit.
     /// Wrapped in `Arc<AtomicU64>` so the [`MempoolBlockBuilder`] can
@@ -901,6 +906,7 @@ impl ConsensusNode {
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             block_sync_neighbour_rr: 0,
+            peer_heights: HashMap::new(),
             last_committed_height,
             app,
             loopback_stack: Vec::new(),
@@ -1429,6 +1435,7 @@ impl ConsensusNode {
             block_sync_range_inflight: HashMap::new(),
             peers_connected: HashSet::new(),
             block_sync_neighbour_rr: 0,
+            peer_heights: HashMap::new(),
             last_committed_height,
             app,
             loopback_stack: Vec::new(),
@@ -1940,6 +1947,8 @@ impl ConsensusNode {
                         Ok(DiscoveryEvent::PeerRemoved(node_id)) => {
                             tracing::debug!("consensus: peer removed {node_id:?}");
                             self.peers_connected.remove(&node_id);
+                            // #857: forget its advertised height too.
+                            self.peer_heights.remove(&node_id);
                             // Snapshot-sync (#230): drop from candidate
                             // set, reassign in-flight chunks. The state
                             // machine handles non-`Fetching` states as

@@ -146,6 +146,10 @@ pub fn ingress_wire_with_qc_verification(
         WireMessage::TimeoutVote(signed) => {
             ingress_timeout_vote(signed, history, key_history, qc_verification, chain_id)
         }
+        WireMessage::Status { committed_height } => Ok(vec![Dispatch::PeerStatus {
+            from,
+            height: committed_height,
+        }]),
         WireMessage::BlockRequest(hash) => Ok(ingress_block_request(hash, from)),
         WireMessage::BlockResponse(signed) => {
             ingress_block_response(signed, from, key_history, chain_id)
