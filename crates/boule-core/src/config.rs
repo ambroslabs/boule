@@ -923,14 +923,15 @@ fn default_snapshot_chunk_size_bytes() -> u32 {
     1024 * 1024
 }
 
-/// Default committed-block retention window (#194). Sized to comfortably
-/// exceed any plausibly-laggy peer in normal operation: at the
-/// `timeout_base_ms = 200` testnet rate, 10k blocks is roughly 30
-/// minutes of wall-clock; at production block times of a few seconds,
-/// it's hours. Operators with archive nodes or slower-catch-up
-/// requirements can override either way (`0` disables pruning).
+/// Default committed-block retention window (#194). Defaults to `0` —
+/// **archive** (never prune committed blocks) — so a node can always serve
+/// and CL-replay the full history to any laggy/restarting/late-joining peer,
+/// and the EL-catch-up never falls past the window (#831). Storage then grows
+/// unbounded; operators who want to cap it set a positive window (in blocks),
+/// below which older committed blocks are pruned. We default loose (archive)
+/// and let operators opt into pruning, rather than the reverse.
 fn default_block_retention_window() -> u64 {
-    10_000
+    0
 }
 
 /// Configuration for the p2p layer that is independent of the overlay
