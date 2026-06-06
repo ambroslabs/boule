@@ -38,6 +38,7 @@ async fn allow_list_refuses_unlisted_peers() {
         bootstrap_addrs: vec![ab, ac],
         idle_connection_timeout: Duration::from_secs(30),
         allowed_peers: Some(vec![node_b]),
+        limits: Default::default(),
     })
     .unwrap();
     let _b = spawn(SpawnConfig {
@@ -46,6 +47,7 @@ async fn allow_list_refuses_unlisted_peers() {
         bootstrap_addrs: vec![aa],
         idle_connection_timeout: Duration::from_secs(30),
         allowed_peers: None,
+        limits: Default::default(),
     })
     .unwrap();
     let _c = spawn(SpawnConfig {
@@ -54,6 +56,7 @@ async fn allow_list_refuses_unlisted_peers() {
         bootstrap_addrs: vec![aa],
         idle_connection_timeout: Duration::from_secs(30),
         allowed_peers: None,
+        limits: Default::default(),
     })
     .unwrap();
 

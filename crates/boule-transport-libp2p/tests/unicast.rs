@@ -37,6 +37,7 @@ async fn send_to_is_addressed_not_broadcast() {
         bootstrap_addrs: vec![ab, ac],
         idle_connection_timeout: Duration::from_secs(30),
         allowed_peers: None,
+        limits: Default::default(),
     })
     .unwrap();
     let mut b = spawn(SpawnConfig {
@@ -45,6 +46,7 @@ async fn send_to_is_addressed_not_broadcast() {
         bootstrap_addrs: vec![aa, ac],
         idle_connection_timeout: Duration::from_secs(30),
         allowed_peers: None,
+        limits: Default::default(),
     })
     .unwrap();
     let mut c = spawn(SpawnConfig {
@@ -53,6 +55,7 @@ async fn send_to_is_addressed_not_broadcast() {
         bootstrap_addrs: vec![aa, ab],
         idle_connection_timeout: Duration::from_secs(30),
         allowed_peers: None,
+        limits: Default::default(),
     })
     .unwrap();
 

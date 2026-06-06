@@ -16,8 +16,8 @@ async fn two_nodes_connect_and_identify() {
     let peer_a = kp_a.public().to_peer_id();
     let peer_b = kp_b.public().to_peer_id();
 
-    let mut a = build_swarm(kp_a, Duration::from_secs(30), None).unwrap();
-    let mut b = build_swarm(kp_b, Duration::from_secs(30), None).unwrap();
+    let mut a = build_swarm(kp_a, Duration::from_secs(30), None, Default::default()).unwrap();
+    let mut b = build_swarm(kp_b, Duration::from_secs(30), None, Default::default()).unwrap();
 
     a.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
         .unwrap();

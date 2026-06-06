@@ -34,7 +34,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::debug;
 
 use crate::identity::{node_id_for, peer_id_for};
-use crate::swarm::{Behaviour, BehaviourEvent, build_swarm, consensus_topic};
+use crate::swarm::{Behaviour, BehaviourEvent, Limits, build_swarm, consensus_topic};
 
 const TRACE: &str = "boule_transport_libp2p::overlay";
 
@@ -76,11 +76,18 @@ pub struct SpawnConfig {
     /// validator isolation (only these peers may connect); `None`/empty =
     /// open node (sentry).
     pub allowed_peers: Option<Vec<NodeId>>,
+    /// Connection-count caps (#544), mapped from `[p2p.limits]`.
+    pub limits: Limits,
 }
 
 /// Build the swarm, start its driver task, and return the seam handles.
 pub fn spawn(cfg: SpawnConfig) -> Result<Libp2pOverlayHandles> {
-    let mut swarm = build_swarm(cfg.keypair, cfg.idle_connection_timeout, cfg.allowed_peers)?;
+    let mut swarm = build_swarm(
+        cfg.keypair,
+        cfg.idle_connection_timeout,
+        cfg.allowed_peers,
+        cfg.limits,
+    )?;
     if let Some(addr) = cfg.listen_addr {
         swarm
             .listen_on(socketaddr_to_multiaddr(addr))

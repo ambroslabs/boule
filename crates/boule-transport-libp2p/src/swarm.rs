@@ -15,6 +15,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use boule_core::identity::NodeId;
 use libp2p::allow_block_list::{self, AllowedPeers};
+use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode};
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::behaviour::toggle::Toggle;
@@ -40,6 +41,16 @@ pub const BLOCK_SYNC_PROTOCOL: &str = "/boule/blocksync/1.0.0";
 /// shape).
 pub type BlockSync = request_response::cbor::Behaviour<Vec<u8>, ()>;
 
+/// Connection-count caps for the libp2p backend (#544), mapped from
+/// `[p2p.limits]`. `None` = unbounded.
+#[derive(Clone, Copy, Default)]
+pub struct Limits {
+    /// Cap on established inbound connections.
+    pub max_established_incoming: Option<u32>,
+    /// Cap on established outbound connections.
+    pub max_established_outgoing: Option<u32>,
+}
+
 /// The gossipsub topic handle for [`CONSENSUS_TOPIC`].
 pub fn consensus_topic() -> IdentTopic {
     IdentTopic::new(CONSENSUS_TOPIC)
@@ -53,6 +64,8 @@ pub struct Behaviour {
     /// inbound/outbound connection is refused at the transport. When unset
     /// (open / sentry node) the toggle is disabled and all peers are allowed.
     pub gating: Toggle<allow_block_list::Behaviour<AllowedPeers>>,
+    /// Connection-count caps (#544), mapped from `[p2p.limits]`.
+    pub connection_limits: connection_limits::Behaviour,
     /// Consensus broadcast (votes / proposals / timeouts) over one topic.
     pub gossipsub: gossipsub::Behaviour,
     /// Addressed point-to-point delivery for block-sync / `send_to` (#843).
@@ -69,11 +82,16 @@ impl Behaviour {
     fn new(
         keypair: &Keypair,
         allowed_peers: Option<&[NodeId]>,
+        limits: Limits,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::try_new(keypair, allowed_peers).map_err(Into::into)
+        Self::try_new(keypair, allowed_peers, limits).map_err(Into::into)
     }
 
-    fn try_new(keypair: &Keypair, allowed_peers: Option<&[NodeId]>) -> anyhow::Result<Self> {
+    fn try_new(
+        keypair: &Keypair,
+        allowed_peers: Option<&[NodeId]>,
+        limits: Limits,
+    ) -> anyhow::Result<Self> {
         let gating = match allowed_peers {
             Some(ids) if !ids.is_empty() => {
                 let mut b = allow_block_list::Behaviour::<AllowedPeers>::default();
@@ -84,6 +102,12 @@ impl Behaviour {
             }
             _ => Toggle::from(None),
         };
+
+        let connection_limits = connection_limits::Behaviour::new(
+            ConnectionLimits::default()
+                .with_max_established_incoming(limits.max_established_incoming)
+                .with_max_established_outgoing(limits.max_established_outgoing),
+        );
 
         // Signed messages + Strict validation: every received message must
         // carry a valid signature, source PeerId, and sequence number, so
@@ -117,6 +141,7 @@ impl Behaviour {
         );
         Ok(Self {
             gating,
+            connection_limits,
             gossipsub,
             block_sync,
             identify,
@@ -132,6 +157,7 @@ pub fn build_swarm(
     keypair: Keypair,
     idle_connection_timeout: Duration,
     allowed_peers: Option<Vec<NodeId>>,
+    limits: Limits,
 ) -> anyhow::Result<Swarm<Behaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -140,7 +166,7 @@ pub fn build_swarm(
             tls::Config::new,
             yamux::Config::default,
         )?
-        .with_behaviour(|kp| Behaviour::new(kp, allowed_peers.as_deref()))?
+        .with_behaviour(|kp| Behaviour::new(kp, allowed_peers.as_deref(), limits))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(idle_connection_timeout))
         .build();
     Ok(swarm)
