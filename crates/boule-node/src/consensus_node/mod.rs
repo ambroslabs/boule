@@ -1718,6 +1718,16 @@ impl ConsensusNode {
         let mut retry_timer = BlockSyncRetryTimer::new(retry_timer_tx);
         let mut retry_timer_delay: Option<Duration> = None;
 
+        // #826: periodic EL catch-up re-check, delivered via a channel-armed
+        // single-shot timer (same shape as the block-sync retry timer above),
+        // NOT a directly-polled `tokio::time::interval`. A polled interval keeps
+        // a tokio timer always-pending in the `select!`, which the sim's time
+        // model cannot drive — it silently stalls the consensus liveness tests.
+        // A channel-delivered armed timer lives in its own task, so the loop
+        // only polls a `recv()`. Re-armed after each fire to make it periodic.
+        let (el_catchup_tx, mut el_catchup_rx) = mpsc::channel::<()>(1);
+        let mut el_catchup_timer = BlockSyncRetryTimer::new(el_catchup_tx);
+
         // Boot-time snapshot of recovered durable state. Logged once
         // per node start so operators can correlate "did we come up
         // already behind the live cluster?" with downstream block-sync
@@ -1752,11 +1762,9 @@ impl ConsensusNode {
         // briefly fell behind — and with no devp2p peers it cannot self-sync
         // the gap. A periodic, gap-thresholded replay closes it from the
         // committed payloads consensus still holds.
-        let mut el_catchup_tick = tokio::time::interval(EL_CATCHUP_TICK);
-        el_catchup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // The first `tick()` resolves immediately; the boot replay above
-        // already covered that instant, so skip past it.
-        el_catchup_tick.tick().await;
+        // Arm the first post-boot EL catch-up re-check; the boot replay above
+        // already covered the current instant.
+        el_catchup_timer.arm(EL_CATCHUP_TICK);
 
         // Publish an initial snapshot before doing anything else, so
         // the HTTP endpoint has a sane value available even if it's
@@ -1849,7 +1857,7 @@ impl ConsensusNode {
                     .await?;
                 }
 
-                _ = el_catchup_tick.tick() => {
+                Some(()) = el_catchup_rx.recv() => {
                     // #826: re-run the EL catch-up if the execution layer has
                     // wedged well behind the committed frontier (slow EL start,
                     // post-restart gap, follower that block-synced ahead with no
@@ -1891,6 +1899,8 @@ impl ConsensusNode {
                         );
                     }
                     self.publish_status();
+                    // Re-arm for the next periodic catch-up (single-shot timer).
+                    el_catchup_timer.arm(EL_CATCHUP_TICK);
                 }
 
                 disc = discovery_events.recv() => {
