@@ -113,6 +113,20 @@ pub async fn run(
     } else {
         None
     };
+    // Connection-count caps for the libp2p backend (#544), mapped from
+    // `[p2p.limits]` (absent -> unbounded).
+    let libp2p_limits = boule_transport_libp2p::swarm::Limits {
+        max_established_incoming: config
+            .p2p
+            .limits
+            .as_ref()
+            .map(|l| l.max_inbound_connections as u32),
+        max_established_outgoing: config
+            .p2p
+            .limits
+            .as_ref()
+            .map(|l| l.max_outbound_connections as u32),
+    };
     drop(network_identity);
     drop(validator_identity);
 
@@ -298,6 +312,7 @@ pub async fn run(
                 private_peers,
                 persistent_peers,
                 libp2p_keypair,
+                libp2p_limits,
             )
             .await?,
         )
@@ -626,6 +641,7 @@ async fn start_consensus(
     private_peers: std::collections::HashSet<NodeId>,
     persistent_peers: std::collections::HashSet<NodeId>,
     libp2p_keypair: Option<boule_transport_libp2p::identity::Keypair>,
+    libp2p_limits: boule_transport_libp2p::swarm::Limits,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     // #803: surface the participation role at boot so an operator (and the
@@ -775,6 +791,7 @@ async fn start_consensus(
         private_peers,
         persistent_peers,
         libp2p_keypair,
+        libp2p_limits,
     )
     .await?;
 
@@ -1131,6 +1148,7 @@ async fn build_overlay_wiring(
     private_peers: std::collections::HashSet<NodeId>,
     persistent_peers: std::collections::HashSet<NodeId>,
     libp2p_keypair: Option<boule_transport_libp2p::identity::Keypair>,
+    libp2p_limits: boule_transport_libp2p::swarm::Limits,
 ) -> anyhow::Result<OverlayWiring> {
     match overlay_cfg.mode {
         OverlayMode::Gossip => {
@@ -1256,6 +1274,7 @@ async fn build_overlay_wiring(
                     bootstrap_addrs: overlay_cfg.bootstrap_addrs.clone(),
                     idle_connection_timeout: LIBP2P_IDLE_CONNECTION_TIMEOUT,
                     allowed_peers,
+                    limits: libp2p_limits,
                 },
             )
             .context("spawn libp2p overlay")?;
