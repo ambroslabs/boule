@@ -271,6 +271,8 @@ mod tests {
             backpressure: crate::status::BackpressureStatus::default(),
             delinquent_validators: Vec::new(),
             cluster_participation_permille: None,
+            el_behind: false,
+            el_behind_height_gap: 0,
         }
     }
 

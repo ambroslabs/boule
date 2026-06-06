@@ -368,6 +368,23 @@ pub struct ConsensusStatus {
     /// fault.
     #[serde(default)]
     pub cluster_participation_permille: Option<u64>,
+    /// Whether this node's execution layer is *persistently* behind the
+    /// committed frontier (#828). A seated validator in this state is a
+    /// silent dead proposer: it correctly refuses to propose (the #316/#598
+    /// build-time safety) yet every view it leads dies to timeout while it
+    /// still reports healthy. When `true`, the node drains itself from
+    /// `/ready` (validators only) and raises the `boule_consensus_el_behind`
+    /// gauge. Always `false` for an in-process application (no out-of-process
+    /// EL to fall behind). Detected with hysteresis so a momentary lag does
+    /// not flap the signal.
+    #[serde(default)]
+    pub el_behind: bool,
+    /// The EL-behind gap (`last_committed_height − EL frontier`) sampled at
+    /// the most recent catch-up tick (#828). Meaningful alongside
+    /// [`Self::el_behind`]; `0` when the EL is at/ahead of the frontier or
+    /// for an in-process application.
+    #[serde(default)]
+    pub el_behind_height_gap: u64,
 }
 
 /// How far on either side of `current_view` to include in the bucket
@@ -473,6 +490,8 @@ mod tests {
             },
             delinquent_validators: Vec::new(),
             cluster_participation_permille: None,
+            el_behind: false,
+            el_behind_height_gap: 0,
         }
     }
 
@@ -645,6 +664,8 @@ mod tests {
             backpressure: BackpressureStatus::default(),
             delinquent_validators: Vec::new(),
             cluster_participation_permille: None,
+            el_behind: false,
+            el_behind_height_gap: 0,
         };
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["current_view"], 0);
