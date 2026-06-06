@@ -56,6 +56,21 @@ pub fn keypair_from_ed25519_secret(secret: [u8; 32]) -> Result<identity::Keypair
     identity::Keypair::ed25519_from_bytes(secret).context("invalid Ed25519 secret key bytes")
 }
 
+/// Build a libp2p [`identity::Keypair`] from a node's PKCS#8 DER private key
+/// — the exact bytes every boule identity backend holds in
+/// `NodeIdentity { pkcs8_der }`. This is how Phase 1 (#841) keys the libp2p
+/// transport with the node's *existing* consensus key, so the libp2p
+/// `PeerId` equals [`peer_id_for`] of the node's `NodeId` (no second key).
+///
+/// Accepts both RFC 8410 v1 (seed only) and v2 (seed + public key, as ring
+/// emits) forms — the seed is extracted and the keypair re-derived from it.
+pub fn keypair_from_pkcs8_der(pkcs8_der: &[u8]) -> Result<identity::Keypair> {
+    use ed25519_dalek::pkcs8::DecodePrivateKey;
+    let signing = ed25519_dalek::SigningKey::from_pkcs8_der(pkcs8_der)
+        .context("parsing node PKCS#8 DER as Ed25519")?;
+    keypair_from_ed25519_secret(signing.to_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +113,24 @@ mod tests {
         let short = [0u8; 31];
         let ed = libp2p::identity::ed25519::PublicKey::try_from_bytes(&short);
         assert!(ed.is_err());
+    }
+
+    #[test]
+    fn pkcs8_bridge_reproduces_node_identity() {
+        // Generate a key in the EXACT PKCS#8 form boule's identity backends
+        // store (ring's v2 OneAsymmetricKey with the public key included).
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let ring_kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let node_id: NodeId = ring_kp.public_key().as_ref().try_into().unwrap();
+
+        // The libp2p keypair built from the same DER must carry the same
+        // identity the rest of boule addresses this node by.
+        let libp2p_kp = keypair_from_pkcs8_der(pkcs8.as_ref()).unwrap();
+        assert_eq!(
+            libp2p_kp.public().to_peer_id(),
+            peer_id_for(&node_id).unwrap()
+        );
     }
 }
