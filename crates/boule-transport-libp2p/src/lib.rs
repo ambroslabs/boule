@@ -13,12 +13,17 @@
 //! - **identify + kad** → [`Discovery`](boule_core::transport::overlay::Discovery)
 //!   (Phase 4, #844)
 //!
-//! ## Phase 0 (this commit)
+//! ## Implemented so far
 //!
-//! Only the [`identity`] adapter (`NodeId` ↔ libp2p `PeerId`) is implemented.
-//! It is the foundational, fully-testable piece every later phase builds on:
-//! it proves the addressing model maps 1:1 without a side table. The
-//! [`OverlayMode::Libp2p`](boule_core::config::OverlayMode::Libp2p) backend is
-//! selectable in config but fails closed until Phase 1 lands the `Swarm`.
+//! - [`identity`] — the `NodeId` ↔ libp2p `PeerId` adapter + the
+//!   PKCS#8 → libp2p `Keypair` bridge that reuses the consensus key
+//!   (Phase 0, #840).
+//! - [`swarm`] — the tokio libp2p `Swarm` over tcp + TLS + yamux, carrying
+//!   `identify` (Phase 1, #841).
+//!
+//! The [`OverlayMode::Libp2p`](boule_core::config::OverlayMode::Libp2p)
+//! backend is selectable in config but does not yet wire the `Swarm` into the
+//! `Broadcaster`/`Discovery` seam — that begins in Phase 2 (#842).
 
 pub mod identity;
+pub mod swarm;

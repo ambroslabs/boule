@@ -1359,7 +1359,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boule-core",
+ "ed25519-dalek",
+ "futures",
  "libp2p",
+ "ring",
+ "tokio",
  "tracing",
 ]
 
