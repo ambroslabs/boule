@@ -72,11 +72,15 @@ pub struct SpawnConfig {
     pub bootstrap_addrs: Vec<SocketAddr>,
     /// Idle-connection timeout for the swarm.
     pub idle_connection_timeout: Duration,
+    /// Connection-gating allow-list (#844/#836). `Some(non-empty)` =
+    /// validator isolation (only these peers may connect); `None`/empty =
+    /// open node (sentry).
+    pub allowed_peers: Option<Vec<NodeId>>,
 }
 
 /// Build the swarm, start its driver task, and return the seam handles.
 pub fn spawn(cfg: SpawnConfig) -> Result<Libp2pOverlayHandles> {
-    let mut swarm = build_swarm(cfg.keypair, cfg.idle_connection_timeout)?;
+    let mut swarm = build_swarm(cfg.keypair, cfg.idle_connection_timeout, cfg.allowed_peers)?;
     if let Some(addr) = cfg.listen_addr {
         swarm
             .listen_on(socketaddr_to_multiaddr(addr))

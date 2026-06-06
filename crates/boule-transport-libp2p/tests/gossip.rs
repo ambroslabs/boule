@@ -35,6 +35,7 @@ async fn gossipsub_broadcast_reaches_peer_through_seam() {
         listen_addr: Some(addr_a),
         bootstrap_addrs: vec![],
         idle_connection_timeout: Duration::from_secs(30),
+        allowed_peers: None,
     })
     .unwrap();
 
@@ -43,6 +44,7 @@ async fn gossipsub_broadcast_reaches_peer_through_seam() {
         listen_addr: Some(addr_b),
         bootstrap_addrs: vec![addr_a],
         idle_connection_timeout: Duration::from_secs(30),
+        allowed_peers: None,
     })
     .unwrap();
 

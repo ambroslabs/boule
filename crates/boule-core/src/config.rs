@@ -1360,10 +1360,16 @@ pub struct OverlayConfig {
     #[serde(default = "default_peer_table_capacity")]
     pub peer_table_capacity: usize,
     /// Bootstrap addresses dialed at startup. Each is a TOFU dial — the
-    /// peer's TLS identity is whatever it presents on the handshake.
-    /// Used in `mode = "gossip"` only.
+    /// peer's TLS identity is whatever it presents on the handshake. Used by
+    /// both `gossip` and `libp2p` overlays.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bootstrap_addrs: Vec<SocketAddr>,
+    /// Connection-gating allow-list of base58 NodeIds — `mode = "libp2p"`
+    /// only (#844/#836). When non-empty, the node refuses every connection
+    /// to/from a peer not in this list (validator isolation: list your
+    /// sentries). When empty, the node is open (sentry behaviour).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_peers: Vec<String>,
 }
 
 impl Default for OverlayConfig {
@@ -1381,6 +1387,7 @@ impl Default for OverlayConfig {
             dedup_ttl_ms: default_dedup_ttl_ms(),
             peer_table_capacity: default_peer_table_capacity(),
             bootstrap_addrs: Vec::new(),
+            allowed_peers: Vec::new(),
         }
     }
 }

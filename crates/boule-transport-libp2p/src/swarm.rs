@@ -13,11 +13,16 @@
 use std::time::Duration;
 
 use anyhow::Context as _;
+use boule_core::identity::NodeId;
+use libp2p::allow_block_list::{self, AllowedPeers};
 use libp2p::gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode};
 use libp2p::request_response::{self, ProtocolSupport};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::{
     StreamProtocol, Swarm, identify, identity::Keypair, swarm::NetworkBehaviour, tcp, tls, yamux,
 };
+
+use crate::identity::peer_id_for;
 
 /// Identify protocol name advertised on the wire.
 pub const IDENTIFY_PROTOCOL: &str = "/boule/id/1.0.0";
@@ -43,6 +48,11 @@ pub fn consensus_topic() -> IdentTopic {
 /// The boule libp2p behaviour. Grows one field per migration phase.
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
+    /// Connection gating (#844/#836). When `allowed_peers` is configured
+    /// (validator isolation), only those peers may connect — every other
+    /// inbound/outbound connection is refused at the transport. When unset
+    /// (open / sentry node) the toggle is disabled and all peers are allowed.
+    pub gating: Toggle<allow_block_list::Behaviour<AllowedPeers>>,
     /// Consensus broadcast (votes / proposals / timeouts) over one topic.
     pub gossipsub: gossipsub::Behaviour,
     /// Addressed point-to-point delivery for block-sync / `send_to` (#843).
@@ -54,12 +64,27 @@ pub struct Behaviour {
 impl Behaviour {
     /// Builder for `SwarmBuilder::with_behaviour` — boxes the error so the
     /// builder's `R: TryIntoBehaviour` bound resolves with a concrete
-    /// `Error` type.
-    fn new(keypair: &Keypair) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::try_new(keypair).map_err(Into::into)
+    /// `Error` type. `allowed_peers = Some(non-empty)` enables validator
+    /// isolation (allow-list gating); `None`/empty leaves the node open.
+    fn new(
+        keypair: &Keypair,
+        allowed_peers: Option<&[NodeId]>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::try_new(keypair, allowed_peers).map_err(Into::into)
     }
 
-    fn try_new(keypair: &Keypair) -> anyhow::Result<Self> {
+    fn try_new(keypair: &Keypair, allowed_peers: Option<&[NodeId]>) -> anyhow::Result<Self> {
+        let gating = match allowed_peers {
+            Some(ids) if !ids.is_empty() => {
+                let mut b = allow_block_list::Behaviour::<AllowedPeers>::default();
+                for id in ids {
+                    b.allow_peer(peer_id_for(id).context("allowed_peers entry")?);
+                }
+                Toggle::from(Some(b))
+            }
+            _ => Toggle::from(None),
+        };
+
         // Signed messages + Strict validation: every received message must
         // carry a valid signature, source PeerId, and sequence number, so
         // `message.source` is the cryptographically-verified publisher — a
@@ -91,6 +116,7 @@ impl Behaviour {
                 .with_agent_version(AGENT_VERSION.to_string()),
         );
         Ok(Self {
+            gating,
             gossipsub,
             block_sync,
             identify,
@@ -105,6 +131,7 @@ impl Behaviour {
 pub fn build_swarm(
     keypair: Keypair,
     idle_connection_timeout: Duration,
+    allowed_peers: Option<Vec<NodeId>>,
 ) -> anyhow::Result<Swarm<Behaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -113,7 +140,7 @@ pub fn build_swarm(
             tls::Config::new,
             yamux::Config::default,
         )?
-        .with_behaviour(Behaviour::new)?
+        .with_behaviour(|kp| Behaviour::new(kp, allowed_peers.as_deref()))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(idle_connection_timeout))
         .build();
     Ok(swarm)
