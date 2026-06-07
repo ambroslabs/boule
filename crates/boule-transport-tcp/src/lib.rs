@@ -96,7 +96,6 @@ pub mod tls_protocol;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 pub use tls::NodeId;
@@ -233,27 +232,10 @@ pub enum PeerCommand {
     },
 }
 
-/// Outbound direction of a protocol: one frame the application wants sent
-/// to peer(s).
-///
-/// The manager is responsible for translating `Broadcast` to per-peer sends
-/// and for routing `SendTo` to the right connection task.
-#[derive(Debug)]
-#[allow(dead_code)] // SendTo will be used once multi-protocol routing is needed
-pub enum ProtocolOutbound {
-    /// Send this payload to every currently connected peer. Used by gossip
-    /// for message fan-out.
-    Broadcast(Bytes),
-    /// Send this payload to a single peer. Used by request/response RPC and
-    /// future unicast protocols.
-    SendTo {
-        /// Target peer.
-        node_id: NodeId,
-        /// Opaque application-level payload. The manager wraps it with the
-        /// protocol ID and length-delimits it on the wire.
-        payload: Bytes,
-    },
-}
+// `ProtocolOutbound` now lives in `boule-core` (transport-agnostic, so test
+// doubles and the libp2p backend can produce it without depending on this
+// crate). Re-exported here for the manager's internal use + back-compat.
+pub use boule_core::transport::overlay::ProtocolOutbound;
 
 /// Inbound direction of a protocol: events from the manager.
 ///
