@@ -3,10 +3,10 @@
 //! [`HotStuffCore`] composes the wire types in [`super::qc`] and the pure
 //! predicates over [`super::state::HotStuffState`] into an
 //! `Event -> Vec<Action>` dispatcher — the entire public API of the
-//! safety core. Submodules hold the dispatch handlers ([`handlers`]),
-//! leader proposal building ([`proposal`]), block-sync retry
-//! ([`block_sync`]), cache eviction ([`eviction`]), and the public I/O
-//! types ([`types`]).
+//! safety core. Submodules cover the dispatch handlers (`handlers`),
+//! leader proposal building (`proposal`), block-sync retry
+//! (`block_sync`), cache eviction (`eviction`), and the public I/O types
+//! (`types`).
 //!
 //! # Purity
 //!

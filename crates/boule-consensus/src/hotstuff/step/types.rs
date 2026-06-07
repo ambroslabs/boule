@@ -91,7 +91,7 @@ impl VoteVariant {
 /// on-disk) so it survives a restart.
 ///
 /// Produced, never consumed, by the core: the core updates its in-memory
-/// [`super::state::HotStuffState`] immediately and emits the matching
+/// [`crate::hotstuff::state::HotStuffState`] immediately and emits the matching
 /// `StateUpdate` so the driver can mirror it durably before any dependent
 /// outbound [`Action`] leaves the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,7 +284,7 @@ pub trait BlockBuilder: Send + Sync {
     /// the parent so block time is non-decreasing (see
     /// [`BlockHeader::timestamp`](crate::replication::block::BlockHeader::timestamp)).
     ///
-    /// [`HotStuffState::pending_blocks`]: super::state::HotStuffState::pending_blocks
+    /// [`HotStuffState::pending_blocks`]: crate::hotstuff::state::HotStuffState::pending_blocks
     fn build(
         &self,
         parent: &Block,
