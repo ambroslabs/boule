@@ -1,25 +1,20 @@
 //! The [`Block`] type consensus chains together.
 //!
-//! A block carries a header (identity + chain-linking metadata) and an
-//! ordered `Vec<Bytes>` of opaque application commands. Keeping commands
-//! opaque decouples the block format from any particular
-//! [`crate::replication::StateMachine`] — the "swap components" property
-//! issue #21 is built around.
+//! A block is a header (identity + chain-linking metadata) plus an ordered
+//! `Vec<Bytes>` of opaque application commands. Commands stay opaque so the
+//! block format is independent of any [`crate::replication::StateMachine`].
 //!
 //! # Content addressing
 //!
-//! A block's identity is `sha256(postcard(header))`. The header includes
-//! `commands_commitment = sha256(postcard(Vec<Bytes>))` so the header
-//! hash indirectly commits to the command sequence; consensus never needs
-//! to rehash commands to check block integrity.
+//! A block's identity is `sha256(postcard(header))`. The header carries
+//! `commands_commitment = sha256(postcard(commands))`, so the header hash
+//! transitively commits to the command sequence — integrity checks never
+//! rehash the commands.
 //!
-//! # What lives here vs. the execution layer
-//!
-//! [`validate_structural`] performs the checks consensus itself needs:
-//! parent link, height/view monotonicity, and commands-commitment
-//! integrity. Application validation — running each command through the
-//! [`crate::replication::StateMachine`] — is the execution layer's
-//! concern and lives in milestone 8 (#24), not here.
+//! [`validate_structural`] runs the checks consensus needs (parent link,
+//! height/view/timestamp monotonicity, commands commitment). Running
+//! commands through the [`crate::replication::StateMachine`] is the
+//! execution layer's job, not this module's.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -33,10 +28,9 @@ pub type BlockHash = [u8; 32];
 
 /// The chain-linking metadata at the top of a [`Block`].
 ///
-/// The header is what consensus signs, hashes, and stamps into QCs. All
-/// fields are deterministically serializable via `postcard` (no maps,
-/// no floats), matching the convention documented in
-/// `src/crypto/signed.rs`.
+/// Consensus signs, hashes, and stamps this into QCs. All fields are
+/// deterministically `postcard`-serializable (no maps, no floats), so equal
+/// headers hash equally across processes and architectures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockHeader {
     /// Hash of this block's parent header. All-zero for the genesis block.
@@ -49,7 +43,7 @@ pub struct BlockHeader {
     /// greater than the parent's view (see [`validate_structural`]).
     pub view: View,
 
-    /// Ed25519 public key of the proposer, as used by `src/p2p/tls.rs`.
+    /// Ed25519 public key of the proposer. All-zero on genesis.
     pub proposer: NodeId,
 
     /// `StateMachine::state_commitment` after applying this block's commands
@@ -62,64 +56,48 @@ pub struct BlockHeader {
     /// command bytes invalidates the block.
     pub commands_commitment: [u8; 32],
 
-    /// Cryptographic commitment over the validator-history state at this
-    /// block (#325, audit finding 7-F2 anti-rollback). The commitment
-    /// covers the active `(ValidatorSetHistory, ValidatorKeyHistory,
-    /// BlsKeyHistory?)` triple as observable when this block was built;
-    /// see [`crate::history_commitment::validator_history_commitment_v1`]
-    /// for the canonical hash. Each block's signature therefore
-    /// implicitly attests to the validator-history timeline that
-    /// produced it, so a replica restoring from a tampered or
-    /// rolled-back persisted history blob can detect the divergence
-    /// against the chain's latest committed block.
-    ///
-    /// PR A populates this field at the leader and stamps a deterministic
-    /// value at genesis. Validation at recovery and at proposal-receive
-    /// time is wired in by follow-up PRs in the #325 stack — until those
-    /// land, the field is informational and never cross-checked.
+    /// Commitment over the validator-history state observable when this
+    /// block was built — the active `(ValidatorSetHistory,
+    /// ValidatorKeyHistory, BlsKeyHistory?)` triple, hashed by
+    /// [`crate::history_commitment::validator_history_commitment_v1`].
+    /// Binds each block's signature to the validator-history timeline that
+    /// produced it, so a replica recovering from a tampered or rolled-back
+    /// history blob can detect the divergence against the latest committed
+    /// block.
     pub validator_history_commitment: [u8; 32],
 
-    /// Height of the proposer's committed frontier at the time this block
-    /// was built — the anchor for the deferred (lagged) state-root check.
+    /// Height of the proposer's committed frontier when this block was
+    /// built — the anchor for the lagged state-root check
+    /// ([`Self::committed_state_root`]).
     pub committed_height: Height,
 
     /// `StateMachine::state_commitment` over the proposer's committed
     /// frontier (the block at [`Self::committed_height`]) — the *lagged*
-    /// state root, deliberately not this block's own post-state.
+    /// root, not this block's own post-state.
     ///
-    /// A voter that has committed to `committed_height` reproduces this
-    /// from its own execution before voting; a mismatch means the voter's
-    /// state machine has diverged from the chain, and it abstains. Because
-    /// the field is in the header hash, the votes that form a block's QC
-    /// attest to it — so the lagged root is *agreed*, not one leader's
-    /// unverified claim. The deferral (vs. this block's immediate
-    /// `state_commitment`) is what makes the check verifiable at vote time
-    /// without re-executing the proposed block: execution happens at
-    /// commit, so only an already-committed ancestor's root can be
-    /// reproduced before voting.
+    /// A voter that has committed to `committed_height` reproduces this from
+    /// its own execution before voting and abstains on mismatch. Being in
+    /// the header hash, a block's QC attests to it, so the lagged root is
+    /// agreed rather than the leader's unverified claim. Lagging (vs. the
+    /// immediate `state_commitment`) is what makes the check verifiable
+    /// before the proposed block is itself executed at commit.
     pub committed_state_root: [u8; 32],
 
-    /// Proposal time as Unix epoch **milliseconds**. The leader stamps
-    /// this at build from its wall clock, clamped to never precede the
-    /// parent's timestamp so the chain's time is non-decreasing
-    /// regardless of clock jumps (NTP, suspend/resume). Genesis is `0`.
+    /// Proposal time in Unix-epoch milliseconds. The leader stamps it from
+    /// its wall clock, clamped to never precede the parent so chain time is
+    /// non-decreasing across clock jumps; genesis is `0`.
     ///
-    /// First-class block time for the application's build context — an
-    /// execution layer (e.g. a reth EVM payload) derives its block
-    /// timestamp from this agreed value rather than inventing its own, so
-    /// the time a block executes against is part of what the QC attests
-    /// to. [`validate_structural`] enforces only monotonicity
-    /// (`child >= parent`); any tighter policy (e.g. EVM's strict
-    /// increase, or bounded future drift) is the application's concern.
+    /// The agreed block time for the application's build context (e.g. an
+    /// EVM payload derives its timestamp from this), so what a block
+    /// executes against is part of what the QC attests to.
+    /// [`validate_structural`] enforces only monotonicity (`child >=
+    /// parent`); any tighter policy is the application's concern.
     pub timestamp: u64,
 }
 
 impl BlockHeader {
     /// Content-address of this header: `sha256(postcard(self))`.
     pub fn hash(&self) -> BlockHash {
-        // postcard is deterministic for fixed-shape structs (no maps), so
-        // equal headers produce equal hashes across processes and
-        // architectures.
         let bytes =
             postcard::to_stdvec(self).expect("postcard encoding of BlockHeader cannot fail");
         let mut hasher = Sha256::new();
@@ -143,20 +121,15 @@ impl Block {
         self.header.hash()
     }
 
-    /// The canonical genesis block: height 0, view 0, all-zero parent hash,
-    /// no commands. `state_commitment` is the caller-supplied commitment
-    /// over the initial state machine. `validator_history_commitment` is
-    /// the caller-supplied commitment over the genesis-time validator
-    /// history (see #325 / [`BlockHeader::validator_history_commitment`]) —
-    /// production callers compute this via
-    /// [`crate::history_commitment::validator_history_commitment_v1`]
-    /// over the freshly-constructed `(ValidatorSetHistory,
-    /// ValidatorKeyHistory, BlsKeyHistory?)`; tests that don't exercise
-    /// the recovery-time check can pass `[0; 32]`.
+    /// The canonical genesis block: height 0, view 0, zero parent hash, no
+    /// commands, all-zero `proposer`. `state_commitment` commits to the
+    /// initial state machine; `validator_history_commitment` commits to the
+    /// genesis validator history (production callers compute it via
+    /// [`crate::history_commitment::validator_history_commitment_v1`]; tests
+    /// not exercising the recovery check may pass `[0; 32]`).
     ///
-    /// The `proposer` field is all-zero on genesis. Consensus treats
-    /// genesis as unsigned and validates it out-of-band against the
-    /// configured initial state commitment.
+    /// Consensus treats genesis as unsigned and validates it out-of-band
+    /// against the configured initial commitments.
     pub fn genesis(state_commitment: [u8; 32], validator_history_commitment: [u8; 32]) -> Self {
         let commands: Vec<Bytes> = Vec::new();
         Self {
@@ -168,23 +141,20 @@ impl Block {
                 state_commitment,
                 commands_commitment: Self::commands_commitment(&commands),
                 validator_history_commitment,
-                // Genesis is its own committed frontier: height 0 with the
-                // initial state root. Inert for the deferred-root check,
-                // which only ever compares against a non-genesis proposing
-                // block's stamped frontier.
+                // Genesis is its own committed frontier (height 0, initial
+                // state root); inert for the lagged-root check, which only
+                // compares against a non-genesis block's stamped frontier.
                 committed_height: Height::ZERO,
                 committed_state_root: state_commitment,
-                // Genesis is the chain's time origin.
                 timestamp: 0,
             },
             commands,
         }
     }
 
-    /// Compute the commitment that populates [`BlockHeader::commands_commitment`].
-    ///
-    /// Exposed as a public helper so proposers can fill in the header
-    /// consistently with what [`validate_structural`] checks.
+    /// Compute [`BlockHeader::commands_commitment`] for a command sequence.
+    /// Public so proposers fill the header consistently with what
+    /// [`validate_structural`] checks.
     pub fn commands_commitment(commands: &[Bytes]) -> [u8; 32] {
         let bytes = postcard::to_stdvec(commands)
             .expect("postcard encoding of Vec<Bytes> cannot fail for owned buffers");
@@ -195,31 +165,22 @@ impl Block {
 }
 
 /// Consensus-level ("structural") validation of a proposed block against
-/// its parent.
+/// its parent. Checks, in order:
 ///
-/// Checks, in order:
+/// 1. `parent_hash == parent_header.hash()` — extends the claimed parent.
+/// 2. `height == parent.height + 1` — contiguous chain.
+/// 3. `view > parent.view` — strictly increasing (HotStuff safety).
+/// 4. `commands_commitment == Block::commands_commitment(&commands)` — the
+///    header binds the command sequence that appeared with it.
+/// 5. `timestamp >= parent.timestamp` — block time non-decreasing. An
+///    honest leader clamps to the parent so this holds; a leader stamping
+///    time backward loses honest votes. Tighter policy is the
+///    application's concern (see [`BlockHeader::timestamp`]).
 ///
-/// 1. `child.header.parent_hash == parent_header.hash()` — block extends
-///    the claimed parent.
-/// 2. `child.header.height == parent_header.height + 1` — heights form a
-///    contiguous chain.
-/// 3. `child.header.view > parent_header.view` — views are strictly
-///    increasing (HotStuff safety relies on this; the pacemaker in #22
-///    only advances views forward).
-/// 4. `child.header.commands_commitment == Block::commands_commitment(&child.commands)`
-///    — header binds the command sequence that appeared with it.
-/// 5. `child.header.timestamp >= parent_header.timestamp` — block time is
-///    non-decreasing. Only monotonicity is enforced here; an honest
-///    leader clamps to the parent so this always holds, and a Byzantine
-///    leader that stamps time backward loses honest votes. Any tighter
-///    time policy is the application's concern (see
-///    [`BlockHeader::timestamp`]).
-///
-/// Application validation (running each command through
+/// Application validation (running commands through
 /// [`crate::replication::StateMachine::apply`] and checking the resulting
-/// `state_commitment` against the header) is the execution layer's
-/// responsibility and is intentionally out of scope here — consensus
-/// only needs the structural half per the #21 non-goals.
+/// `state_commitment`) is the execution layer's responsibility and is out
+/// of scope here.
 pub fn validate_structural(child: &Block, parent_header: &BlockHeader) -> anyhow::Result<()> {
     let parent_hash = parent_header.hash();
     if child.header.parent_hash != parent_hash {
