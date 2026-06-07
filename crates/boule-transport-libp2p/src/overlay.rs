@@ -210,7 +210,16 @@ struct Driver {
 }
 
 /// How often the driver re-dials bootstrap peers it isn't connected to (#855).
-const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
+///
+/// This is the recovery granularity for a *failed boot dial*: if a node's
+/// startup dial to a bootstrap loses the race (the bootstrap wasn't listening
+/// yet, or a contended host dropped the handshake), the node stays partitioned
+/// until the next tick re-dials it. Kept short so a boot-race heals in seconds
+/// rather than tens of seconds — at no churn cost, since `redial_missing_boot
+/// straps` (#867) only dials bootstraps it doesn't already hold an outbound
+/// connection to, so a fully-connected node dials nothing regardless of how
+/// often this fires.
+const REDIAL_INTERVAL: Duration = Duration::from_secs(2);
 
 impl Driver {
     async fn run(mut self) {
