@@ -14,8 +14,8 @@
 //!   dispatches based on the [`Decision`]. After K violations within a
 //!   sliding window of W seconds, [`Decision::Disconnect`] is returned
 //!   exactly once per peer — the caller is responsible for tearing down
-//!   the connection (typically by sending
-//!   `boule_transport_tcp::PeerCommand::Disconnect`). On egress, every
+//!   the connection (typically via the overlay
+//!   `Discovery::disconnect`). On egress, every
 //!   directed frame is charged against the recipient peer's outbound
 //!   bucket via [`RateLimiter::admit_outbound`]; on overflow the caller
 //!   skips the send. The outbound cap defends against the
@@ -512,15 +512,15 @@ impl<K: RateLimitKind> RateLimiter<K> {
 
 // ── ConnectionLimiter ────────────────────────────────────────────────────────
 
-/// Direction of a peer-manager connection registration. Carried on
-/// `boule_transport_tcp::manager::ManagerMsg::NewConnection` so the manager
+/// Direction of a peer-manager connection registration. Carried on the
+/// transport's new-connection notification so the manager
 /// can charge the right bucket in [`ConnectionLimiter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
-    /// Connection arrived via `boule_transport_tcp::listener::run` — count
+    /// Connection arrived via a transport's inbound-accept path — count
     /// against `max_inbound`.
     Inbound,
-    /// Connection arrived via `boule_transport_tcp::dialer::reconnect_loop` —
+    /// Connection arrived via a transport's outbound-dial path —
     /// count against `max_outbound`.
     Outbound,
 }
@@ -636,7 +636,7 @@ impl RejectReason {
 }
 
 /// Global connection caps. Stored in the manager and consulted on
-/// every `boule_transport_tcp::manager::ManagerMsg::NewConnection`.
+/// every transport new-connection notification.
 pub struct ConnectionLimiter {
     config: ConnectionLimitsConfig,
     inbound: AtomicUsize,

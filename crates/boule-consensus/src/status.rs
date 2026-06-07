@@ -156,8 +156,8 @@ pub struct CacheEvictionStatus {
 /// an undersized per-peer queue (#163 design notes).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BackpressureStatus {
-    /// Drops from
-    /// `boule_transport_tcp::overlay::gossip::sink::OverlaySink::send_to`'s
+    /// Drops from the overlay `Broadcaster::send_to`
+    /// (`boule_core::transport::overlay::Broadcaster`)'s
     /// `try_send` falling back on `Full`. Used by the gossip overlay's
     /// peer-list publisher and the overlay run loop's per-peer
     /// unicasts. Always zero on a node configured for mesh-mode

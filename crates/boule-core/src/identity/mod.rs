@@ -69,10 +69,22 @@ impl std::fmt::Debug for NodeIdentity {
 impl NodeIdentity {
     /// Validate the bytes parse as an Ed25519 PKCS#8 key pair.
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.key_pair().map(|_| ())
+    }
+
+    /// The node's overlay address: the 32-byte Ed25519 public key derived
+    /// from the key pair. (The public key bytes *are* the [`NodeId`].)
+    pub fn node_id(&self) -> anyhow::Result<NodeId> {
+        let kp = self.key_pair()?;
+        kp.public_key_raw()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("expected 32-byte Ed25519 public key"))
+    }
+
+    fn key_pair(&self) -> anyhow::Result<KeyPair> {
         let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(self.pkcs8_der.as_slice());
         KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519)
-            .context("parsing node key as Ed25519 PKCS#8 DER")?;
-        Ok(())
+            .context("parsing node key as Ed25519 PKCS#8 DER")
     }
 }
 

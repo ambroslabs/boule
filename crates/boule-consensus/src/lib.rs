@@ -2,7 +2,8 @@
 //!
 //! Consensus sits above [`crate::replication`] (state machine, mempool,
 //! block format) and [`boule_core::storage`] (durable state), and ships its
-//! messages through `boule_transport_tcp`. The design discipline of this crate —
+//! messages through a pluggable transport (today the libp2p overlay). The
+//! design discipline of this crate —
 //! small object-safe traits, `Arc<dyn Trait>` at the edges, pure state
 //! machines in the core — applies here especially hard: HotStuff
 //! implementations are historically buggy when safety, liveness, and I/O

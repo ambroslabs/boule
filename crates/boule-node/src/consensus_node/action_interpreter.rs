@@ -54,7 +54,7 @@ impl ConsensusNode {
     /// Classify `payload` and consult the rate limiter (if any).
     /// Returns `true` if the frame should be dispatched, `false` if
     /// the limiter dropped it. On a Disconnect decision, fires a
-    /// best-effort [`boule_transport_tcp::PeerCommand::Disconnect`] for `from`.
+    /// best-effort overlay `Discovery::disconnect` for `from`.
     pub(super) async fn admit_inbound(&self, from: NodeId, payload: &[u8]) -> bool {
         let Some(limiter) = self.rate_limiter.as_ref() else {
             return true;

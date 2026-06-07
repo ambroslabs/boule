@@ -23,8 +23,8 @@
 //! # Topology
 //!
 //! `Broadcast` is delivered to every node **except** the sender and
-//! `SendTo` is delivered exactly to the named peer — matching production
-//! p2p semantics (`src/p2p/manager.rs`). Self-addressed consensus
+//! `SendTo` is delivered exactly to the named peer — matching a
+//! production transport's semantics. Self-addressed consensus
 //! actions are looped back inside the integration layer itself (see
 //! [`ConsensusNode`] / issue #118); delivering them here as well would
 //! double-feed the safety core and mask regressions of the loopback.
@@ -38,7 +38,7 @@
 //! sends a shutdown signal to the node's run loop, permanently removes
 //! the killed peer from routing, and dispatches `PeerDisconnected` to
 //! every surviving node — matching the production peer-crash semantics
-//! established by `src/p2p/manager.rs` when a TLS peer drops.
+//! of a production transport when a peer drops.
 //!
 //! [`partition_into_groups`] / [`partition_into_two`] / [`partition_one_way`]
 //! install directed link cuts in a separate `partition_blocks` set so
@@ -1721,12 +1721,9 @@ impl SimCluster {
     /// in-memory `.send().await` mesh used by [`SimCluster`], the
     /// observable shape is that fast peers' route tasks block on
     /// delivery to the slow node once its inbound channel fills,
-    /// rather than the silently-dropping shape that the production
-    /// `p2p::manager` uses (where `try_send`-on-full triggers the
-    /// slow-peer disconnect heuristic from
-    /// [`boule_transport_tcp::manager::SLOW_PEER_OVERFLOW_THRESHOLD`]). The
-    /// production heuristic itself is unit-tested in
-    /// `src/p2p/manager.rs`; this primitive lets sim-level tests
+    /// rather than the silently-dropping shape that a production
+    /// transport uses (where `try_send`-on-full triggers a
+    /// slow-peer disconnect heuristic). This primitive lets sim-level tests
     /// exercise the persist-/process-blocks-consensus shape end-to-end
     /// against the safety core.
     pub fn set_slow_node(&self, idx: usize, delay: Duration) {
@@ -1741,7 +1738,7 @@ impl SimCluster {
     }
 
     /// Permanently kill node `idx`, matching the production peer-crash
-    /// semantics established by `src/p2p/manager.rs`:
+    /// semantics established by a production transport:
     ///
     /// 1. Signals shutdown to the node's run loop (stopping its event loop).
     /// 2. Inserts the killed peer into `dead_nodes` so subsequent
@@ -2661,7 +2658,7 @@ impl Drop for SimCluster {
 /// and `dead_nodes` fault-injection sets.
 ///
 /// Self-delivery is suppressed in both broadcast and send-to paths so
-/// the sim matches the production p2p semantics (`src/p2p/manager.rs`).
+/// the sim matches a production transport's semantics.
 /// Spawn a slow-node bridge (#497) that drains `raw_rx`, sleeps for
 /// the per-event delay configured on `delay_us`, and forwards to the
 /// returned receiver. With `delay_us == 0` (the default) this is a
@@ -3007,7 +3004,8 @@ mod tests {
     use boule_consensus::replication::block::Block;
     use boule_consensus::validator_set::ValidatorSet;
     use boule_core::crypto::signed::{ChainId, Signer};
-    use boule_transport_tcp::{NodeId, ProtocolEvent, ProtocolOutbound};
+    use boule_core::identity::NodeId;
+    use boule_core::transport::overlay::{ProtocolEvent, ProtocolOutbound};
 
     // ── VoteObserver unit tests (issue #422) ──────────────────────────────────
 
@@ -3401,17 +3399,16 @@ mod tests {
     ///
     /// # Why no slow-peer-disconnect assertion
     ///
-    /// The disconnect heuristic from #490 lives in
-    /// `src/p2p/manager.rs::SlowPeerTracker` and fires on
-    /// `try_send`-on-full of the per-peer outbound `write_tx` queue.
+    /// A production transport's slow-peer disconnect heuristic (#490)
+    /// fires on `try_send`-on-full of the per-peer outbound write queue.
     /// The sim's mesh routing uses `.send().await` (not `try_send`),
     /// so the production-shape "fast peer drops a slow peer" path is
-    /// not exercised by this harness. Wiring the sim through the real
-    /// `p2p::manager` (or backporting the tracker into the route
+    /// not exercised by this harness. Wiring the sim through a real
+    /// transport (or backporting the tracker into the route
     /// task) would let the assertion go end-to-end; both are larger
     /// refactors and are intentionally not part of #497. The
-    /// disconnect heuristic itself is unit-tested in
-    /// `src/p2p/manager.rs`'s test module — what this test verifies
+    /// disconnect heuristic itself is unit-tested by the production
+    /// transport — what this test verifies
     /// is the consumption-side back-pressure shape that the
     /// disconnect heuristic protects against.
     #[tokio::test]

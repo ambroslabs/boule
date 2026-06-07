@@ -406,10 +406,10 @@ pub struct ConsensusNode {
     /// `None` for mesh-mode runs and for the simulator's mesh harness —
     /// the field defaults to zero in `ConsensusStatus` in those cases.
     gossip_sink_overflows: Option<Arc<AtomicU64>>,
-    /// Shared overflow counter from the p2p manager — counts every
-    /// `try_send` `Full` on a per-peer outbound `write_tx`, across both
-    /// `SendTo` and `Broadcast` paths. Cloned from the
-    /// [`boule_transport_tcp::ProtocolHandle`] returned at registration. When
+    /// Shared overflow counter from the overlay — counts every
+    /// `try_send` `Full` on a per-peer outbound queue, across both
+    /// `SendTo` and `Broadcast` paths. Cloned from the overlay's
+    /// `peer_outbound_overflows` at registration. When
     /// `Some`, surfaced via
     /// [`boule_consensus::status::BackpressureStatus::peer_outbound_overflow_total`].
     /// `None` for the simulator's mesh harness (no real p2p manager).
@@ -1041,11 +1041,10 @@ impl ConsensusNode {
         self
     }
 
-    /// Wire the p2p manager's per-peer outbound overflow counter into
-    /// this node. Pass the `Arc<AtomicU64>` carried by every
-    /// [`boule_transport_tcp::ProtocolHandle`]
+    /// Wire the overlay's per-peer outbound overflow counter into
+    /// this node. Pass the `Arc<AtomicU64>` carried by the overlay
     /// (`peer_outbound_overflows`) — there's a single shared counter per
-    /// manager, so handing in the consensus-protocol's clone is fine.
+    /// overlay, so handing in the consensus-protocol's clone is fine.
     /// Surfaced via
     /// [`boule_consensus::status::BackpressureStatus::peer_outbound_overflow_total`].
     pub fn with_peer_outbound_overflow_counter(mut self, counter: Arc<AtomicU64>) -> Self {
@@ -1513,9 +1512,9 @@ impl ConsensusNode {
     ///
     /// Outbound traffic flows through `broadcaster` (a [`Broadcaster`]
     /// trait object) and peer-membership deltas through `discovery`'s
-    /// event stream. The mesh is the only implementation today; gossip
-    /// and dynamic-membership backends drop in here without touching
-    /// the event loop. See [`boule_transport_tcp::overlay`] for the contract.
+    /// event stream. The libp2p overlay is the production implementation;
+    /// the in-memory mesh fakes drop in here for tests without touching
+    /// the event loop. See [`boule_core::transport::overlay`] for the contract.
     /// Startup EL-catch-up (#635, tier-3a of the recovery cascade). An
     /// out-of-process execution layer (a reth EL) keeps its own state DB and
     /// can come up **behind** the consensus committed height — e.g. its datadir

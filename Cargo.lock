@@ -1202,7 +1202,6 @@ dependencies = [
  "boule-consensus",
  "boule-core",
  "boule-node",
- "boule-transport-tcp",
  "bytes",
  "clap",
  "futures-util",
@@ -1294,7 +1293,6 @@ dependencies = [
  "boule-core",
  "boule-reth",
  "boule-transport-libp2p",
- "boule-transport-tcp",
  "bs58",
  "bytes",
  "chrono",
@@ -1367,35 +1365,6 @@ dependencies = [
  "ring",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "boule-transport-tcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "boule-core",
- "bs58",
- "bytes",
- "chrono",
- "futures-util",
- "parking_lot",
- "postcard",
- "proptest",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
- "rcgen",
- "ring",
- "rustls",
- "serde",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "zeroize",
 ]
 
 [[package]]
