@@ -52,7 +52,9 @@
 //! - Dynamic membership / validator-set changes.
 
 pub mod gossip;
-mod memory;
 
-pub use boule_core::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
-pub use memory::{MemoryBroadcaster, MemoryDiscovery};
+// `MemoryBroadcaster`/`MemoryDiscovery` moved to `boule-core` (test doubles,
+// transport-agnostic); re-exported here for back-compat.
+pub use boule_core::transport::overlay::{
+    Broadcaster, Discovery, DiscoveryEvent, MemoryBroadcaster, MemoryDiscovery,
+};
