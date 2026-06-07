@@ -334,10 +334,13 @@ pub async fn run(
     // Bind the API listener here so we know the actual port before writing addr_file.
     let api_listener = TcpListener::bind(config.api.listen_addr).await?;
     let api_actual_addr = api_listener.local_addr()?;
-    // Live peer-count probe shared by `/metrics` and `/ready` — round-trips
-    // the same peer manager that answers `/peers`.
-    let peer_count: Arc<dyn crate::observability::PeerCount> =
-        Arc::new(PeerManagerCount(p2p_cmd_tx.clone()));
+    // Live peer-count probe shared by `/metrics` and `/ready`, read from the
+    // active overlay's discovery (the same source `/peers` reports). A node
+    // without consensus has no overlay, so it reports zero peers.
+    let peer_count: Arc<dyn crate::observability::PeerCount> = match consensus_runtime.as_ref() {
+        Some(rc) => Arc::new(OverlayPeerCount(Arc::clone(&rc.discovery))),
+        None => Arc::new(PeerManagerCount(p2p_cmd_tx.clone())),
+    };
     let api_handle = {
         // The PUBLIC listener exposes only observability endpoints
         // (`/health`, `/ready`, `/metrics`). Privileged routes (key rotation,
@@ -374,7 +377,7 @@ pub async fn run(
                 Arc::clone(&rc.rotation),
                 Arc::clone(&rc.mempool),
                 Some(rc.status_rx.clone()),
-                p2p_cmd_tx.clone(),
+                Arc::clone(&rc.discovery),
                 token.clone(),
             ),
             None => {
@@ -382,6 +385,8 @@ pub async fn run(
                     "[api.admin] listen_addr is set but consensus is disabled; the admin \
                      listener binds but exposes only /peers (no consensus-privileged routes)."
                 );
+                // No overlay without consensus — serve /peers from the legacy
+                // peer manager (the only peer source such a node has).
                 let mut r = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx.clone()));
                 if let Some(t) = token.clone() {
                     r = r.layer(axum::middleware::from_fn_with_state(
@@ -487,9 +492,20 @@ pub async fn run(
     Ok(())
 }
 
-/// [`observability::PeerCount`] backed by the live p2p peer manager. Round-
-/// trips a [`p2p::PeerCommand::ListPeers`] (the same command `/peers` uses)
-/// and reports the length, degrading to `0` if the manager channel is closed.
+/// [`observability::PeerCount`] backed by the active overlay's discovery —
+/// the same live peer set `/peers` reports.
+struct OverlayPeerCount(Arc<dyn Discovery>);
+
+impl crate::observability::PeerCount for OverlayPeerCount {
+    fn count(&self) -> futures_util::future::BoxFuture<'static, usize> {
+        let n = self.0.known_peers().len();
+        Box::pin(async move { n })
+    }
+}
+
+/// [`observability::PeerCount`] backed by the legacy p2p peer manager — used
+/// only by a node with no `[consensus]` section (and therefore no overlay).
+/// Round-trips a [`p2p::PeerCommand::ListPeers`] and reports the length.
 struct PeerManagerCount(mpsc::Sender<p2p::PeerCommand>);
 
 impl crate::observability::PeerCount for PeerManagerCount {
@@ -532,6 +548,10 @@ struct RunningConsensus {
     /// Overlay sub-task joins (orchestrator + publisher + partial-mesh
     /// maintenance).
     overlay_joins: Vec<tokio::task::JoinHandle<()>>,
+    /// The active overlay's discovery handle, exposed to `node::run` so the
+    /// admin `/peers` endpoint and the `/metrics` peer-count probe read the
+    /// live peer set directly (no separate peer manager).
+    discovery: Arc<dyn Discovery>,
 }
 
 /// Build the reth-backed
@@ -912,6 +932,9 @@ async fn start_consensus(
         Arc::clone(&rotatable_signer),
     ));
     let signer: Arc<dyn boule_core::crypto::signed::Signer> = rotatable_signer;
+    // Keep a handle to the discovery for the admin /peers + /metrics surface
+    // before `run` takes ownership of its copy.
+    let discovery_for_api = Arc::clone(&discovery);
     let join = tokio::spawn(async move {
         node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
             .await
@@ -925,6 +948,7 @@ async fn start_consensus(
         rotation,
         overlay_shutdown,
         overlay_joins,
+        discovery: discovery_for_api,
     })
 }
 

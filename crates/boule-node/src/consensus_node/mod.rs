@@ -4081,11 +4081,19 @@ mod tests {
     }
 
     /// A discovery whose `disconnect` calls land on the returned receiver.
-    fn make_disconnect_capturing_discovery()
-    -> (Arc<dyn Discovery>, tokio::sync::mpsc::UnboundedReceiver<NodeId>) {
+    fn make_disconnect_capturing_discovery() -> (
+        Arc<dyn Discovery>,
+        tokio::sync::mpsc::UnboundedReceiver<NodeId>,
+    ) {
         let (disconnects, rx) = tokio::sync::mpsc::unbounded_channel::<NodeId>();
         let (events, _) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
-        (Arc::new(CapturingDiscovery { disconnects, events }), rx)
+        (
+            Arc::new(CapturingDiscovery {
+                disconnects,
+                events,
+            }),
+            rx,
+        )
     }
 
     #[test]
@@ -10408,7 +10416,10 @@ mod tests {
             .await
             .expect("disconnect must fire within 1s")
             .expect("disconnect channel closed");
-        assert_eq!(node_id, attacker, "disconnect must target the flooding peer");
+        assert_eq!(
+            node_id, attacker,
+            "disconnect must target the flooding peer"
+        );
 
         // The limiter's per-kind drop counter and disconnect counter
         // also reflect the flood.
