@@ -76,18 +76,19 @@ use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::{Height, View};
 use boule_core::clock::{Clock, TokioClock};
 use boule_core::crypto::signed::{NodeSigner, Signer};
+use boule_core::identity::NodeId;
 use boule_core::identity::NodeIdentity;
 use boule_core::storage::{MemoryStorage, MemoryWal, Storage, Wal};
+use boule_core::transport::overlay::{
+    Broadcaster, Discovery, DiscoveryEvent, MemoryBroadcaster, MemoryDiscovery, ProtocolEvent,
+    ProtocolOutbound,
+};
 use boule_transport_tcp::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
 use boule_transport_tcp::overlay::gossip::overlay::{
     GossipOverlay, GossipOverlayConfig, GossipOverlayHandles, SpawnArgs,
 };
 use boule_transport_tcp::overlay::gossip::peer_list_task::{OverlayUnicast, PeerListGossipConfig};
 use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
-use boule_transport_tcp::overlay::{
-    Broadcaster, Discovery, DiscoveryEvent, MemoryBroadcaster, MemoryDiscovery,
-};
-use boule_transport_tcp::{NodeId, ProtocolEvent, ProtocolOutbound};
 use bytes::Bytes;
 use rand::Rng;
 use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};

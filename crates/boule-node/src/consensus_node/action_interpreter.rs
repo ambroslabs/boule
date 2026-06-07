@@ -19,10 +19,10 @@ use boule_consensus::rate_limit::MessageKind;
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
 use boule_core::crypto::signed::Signer;
+use boule_core::identity::NodeId;
+use boule_core::identity::node_id_to_base58;
 use boule_core::transport::limits::{Decision, RateLimitKind};
-use boule_transport_tcp::NodeId;
-use boule_transport_tcp::overlay::Broadcaster;
-use boule_transport_tcp::tls::node_id_to_base58;
+use boule_core::transport::overlay::Broadcaster;
 
 use super::{
     BlockSyncRangeInflight, ConsensusNode, TRACE_TARGET, load_block_from_storage, msg_kind,

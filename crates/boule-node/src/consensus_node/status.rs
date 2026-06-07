@@ -16,7 +16,7 @@ use boule_consensus::status::{
 };
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::{Height, View};
-use boule_transport_tcp::NodeId;
+use boule_core::identity::NodeId;
 
 use super::ConsensusNode;
 
@@ -147,7 +147,7 @@ impl ConsensusNode {
         let mut peers_connected: Vec<String> = self
             .peers_connected
             .iter()
-            .map(boule_transport_tcp::tls::node_id_to_base58)
+            .map(boule_core::identity::node_id_to_base58)
             .collect();
         peers_connected.sort();
 
@@ -161,7 +161,7 @@ impl ConsensusNode {
         let validator_set: Vec<String> = active_set
             .for_view(current_view)
             .iter()
-            .map(|v| boule_transport_tcp::tls::node_id_to_base58(v.as_node_id()))
+            .map(|v| boule_core::identity::node_id_to_base58(v.as_node_id()))
             .collect();
 
         // by_stable_id is a BTreeMap, so iter() already yields
@@ -173,12 +173,12 @@ impl ConsensusNode {
                 let entries: Vec<RotationEntry> = entries
                     .map(|(v_eff, pubkey)| RotationEntry {
                         v_eff,
-                        pubkey: boule_transport_tcp::tls::node_id_to_base58(&pubkey),
+                        pubkey: boule_core::identity::node_id_to_base58(&pubkey),
                     })
                     .collect();
                 let active_pubkey = entries.last().map(|e| e.pubkey.clone()).unwrap_or_default();
                 ValidatorKeyStatus {
-                    stable_id: boule_transport_tcp::tls::node_id_to_base58(stable_id.as_node_id()),
+                    stable_id: boule_core::identity::node_id_to_base58(stable_id.as_node_id()),
                     active_pubkey,
                     entries,
                 }
@@ -186,7 +186,7 @@ impl ConsensusNode {
             .collect();
 
         ConsensusStatus {
-            node_id: boule_transport_tcp::tls::node_id_to_base58(&self.self_id),
+            node_id: boule_core::identity::node_id_to_base58(&self.self_id),
             self_role,
             current_view,
             last_voted_view: state.last_voted_view,
@@ -243,7 +243,7 @@ impl ConsensusNode {
                 .liveness_tracker
                 .delinquents()
                 .iter()
-                .map(|v| boule_transport_tcp::tls::node_id_to_base58(v.as_node_id()))
+                .map(|v| boule_core::identity::node_id_to_base58(v.as_node_id()))
                 .collect(),
             cluster_participation_permille: self.liveness_tracker.cluster_participation_permille(),
             // #828: surface the persistently-behind-EL dead-proposer signal.

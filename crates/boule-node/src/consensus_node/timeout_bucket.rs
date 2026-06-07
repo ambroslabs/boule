@@ -29,9 +29,9 @@ use boule_consensus::pacemaker::Event as PacemakerEvent;
 use boule_consensus::pacemaker::HonestyThresholdEvidence as PacemakerHonestyThresholdEvidence;
 use boule_consensus::view_timer::ViewTimer;
 use boule_core::crypto::signed::{Signed, Signer};
-use boule_transport_tcp::NodeId;
-use boule_transport_tcp::overlay::Broadcaster;
-use boule_transport_tcp::tls::node_id_to_base58;
+use boule_core::identity::NodeId;
+use boule_core::identity::node_id_to_base58;
+use boule_core::transport::overlay::Broadcaster;
 
 use super::{
     ConsensusNode, STORAGE_KEY_LAST_TIMEOUT_VOTE, TRACE_TARGET, decode_last_timeout_vote,

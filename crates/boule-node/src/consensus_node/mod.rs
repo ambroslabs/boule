@@ -93,10 +93,11 @@ use boule_consensus::validator_set::{ValidatorId, ValidatorSet};
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
 use boule_core::crypto::signed::{ChainId, Signer};
+use boule_core::identity::NodeId;
+use boule_core::identity::node_id_to_base58;
 use boule_core::storage::{Storage, Wal};
-use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
-use boule_transport_tcp::tls::node_id_to_base58;
-use boule_transport_tcp::{NodeId, ProtocolEvent};
+use boule_core::transport::overlay::ProtocolEvent;
+use boule_core::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 
 mod action_interpreter;
 mod app_context;
@@ -2192,8 +2193,8 @@ mod tests {
     use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
     use boule_consensus::validator_set::ValidatorSet;
     use boule_core::crypto::signed::Signed;
+    use boule_core::identity::NodeId;
     use boule_core::storage::{MemoryStorage, MemoryWal};
-    use boule_transport_tcp::NodeId;
 
     fn nid(b: u8) -> NodeId {
         [b; 32]
@@ -2554,8 +2555,8 @@ mod tests {
             .expect("rotation applies cleanly to seeded history");
 
         let status = node.build_status();
-        let stable_id_b58 = boule_transport_tcp::tls::node_id_to_base58(&nid(2));
-        let new_key_b58 = boule_transport_tcp::tls::node_id_to_base58(&new_key);
+        let stable_id_b58 = boule_core::identity::node_id_to_base58(&nid(2));
+        let new_key_b58 = boule_core::identity::node_id_to_base58(&new_key);
 
         let rotated = status
             .validator_keys
@@ -4018,7 +4019,7 @@ mod tests {
 
     use boule_core::crypto::signed::NodeSigner;
     use boule_core::identity::NodeIdentity;
-    use boule_transport_tcp::{ProtocolEvent, ProtocolOutbound};
+    use boule_core::transport::overlay::{ProtocolEvent, ProtocolOutbound};
     use rcgen::KeyPair as RcgenKeyPair;
     use rcgen::PKCS_ED25519;
     use zeroize::Zeroizing;
@@ -4049,7 +4050,7 @@ mod tests {
     ) {
         let (send_tx, send_rx) = tokio::sync::mpsc::channel::<ProtocolOutbound>(16);
         let bc: Arc<dyn Broadcaster> = Arc::new(
-            boule_transport_tcp::overlay::MemoryBroadcaster::new(send_tx),
+            boule_core::transport::overlay::MemoryBroadcaster::new(send_tx),
         );
         (bc, send_rx)
     }
@@ -4057,7 +4058,7 @@ mod tests {
     /// Build a [`Discovery`] with no peers and a never-firing source.
     fn make_test_discovery() -> Arc<dyn Discovery> {
         let (_tx, rx) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
-        boule_transport_tcp::overlay::MemoryDiscovery::spawn(rx)
+        boule_core::transport::overlay::MemoryDiscovery::spawn(rx)
     }
 
     /// A [`Discovery`] whose `disconnect` records the target onto a channel,
@@ -9732,7 +9733,7 @@ mod tests {
         use boule_consensus::hotstuff::Proposal;
         use boule_core::clock::BoxFuture;
         use boule_core::storage::{Storage, WriteBatch};
-        use boule_transport_tcp::overlay::Broadcaster;
+        use boule_core::transport::overlay::Broadcaster;
 
         #[derive(Debug, Clone, PartialEq, Eq)]
         enum OrderEvent {
@@ -9982,7 +9983,7 @@ mod tests {
         use boule_consensus::hotstuff::qc::QuorumCertificate;
         use boule_core::clock::BoxFuture;
         use boule_core::storage::{Storage, WriteBatch};
-        use boule_transport_tcp::overlay::Broadcaster;
+        use boule_core::transport::overlay::Broadcaster;
 
         #[derive(Debug, Clone, PartialEq, Eq)]
         enum OrderEvent {

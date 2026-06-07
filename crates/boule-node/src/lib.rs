@@ -47,16 +47,17 @@ use boule_core::config::{
 };
 use boule_core::crypto::signed::{NodeSigner, Signer};
 use boule_core::identity::NodeIdentity;
+use boule_core::identity::{NodeId, base58_to_node_id, node_id_to_base58};
 use boule_core::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
+use boule_core::transport::overlay as overlay_traits;
+use boule_core::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use boule_transport_tcp::dialer::DialerCtx;
 use boule_transport_tcp::manager::ManagerMsg;
 use boule_transport_tcp::overlay::gossip::overlay::{
     DialerCtxAdapter, GossipOverlay, GossipOverlayConfig, SpawnArgs,
 };
 use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
-use boule_transport_tcp::overlay::{self as overlay_traits};
-use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
-use boule_transport_tcp::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
+use boule_transport_tcp::tls::TlsIdentity;
 use boule_transport_tcp::tls_protocol::TlsConnectionProtocol;
 use boule_transport_tcp::{self as p2p, ConnectionProtocol};
 

@@ -227,7 +227,7 @@ fn mint_bls_keys_if_needed(
 ) -> anyhow::Result<Option<Vec<BlsGenesisEntry>>> {
     use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
     use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
-    use boule_transport_tcp::tls::base58_to_node_id;
+    use boule_core::identity::base58_to_node_id;
     if scheme == SignatureSchemeChoice::Ed25519Collected {
         return Ok(None);
     }
@@ -237,7 +237,7 @@ fn mint_bls_keys_if_needed(
     // chain_id is known.
     struct PendingEntry {
         node_id: String,
-        node_id_bytes: boule_transport_tcp::tls::NodeId,
+        node_id_bytes: boule_core::identity::NodeId,
         secret: zeroize::Zeroizing<boule_core::crypto::sig_scheme::BlsSecretKey>,
         public: BlsPublicKey,
     }
@@ -277,9 +277,9 @@ fn mint_bls_keys_if_needed(
     // Pass 2: compute the deployment's chain_id from the validator
     // pubkeys + BLS table the genesis block will commit to, and mint a
     // chain-bound PoP per validator (#410).
-    let validator_ids: Vec<boule_transport_tcp::tls::NodeId> =
+    let validator_ids: Vec<boule_core::identity::NodeId> =
         pending.iter().map(|e| e.node_id_bytes).collect();
-    let bls_pubkeys: Vec<(boule_transport_tcp::tls::NodeId, BlsPublicKey)> = pending
+    let bls_pubkeys: Vec<(boule_core::identity::NodeId, BlsPublicKey)> = pending
         .iter()
         .map(|e| (e.node_id_bytes, e.public))
         .collect();

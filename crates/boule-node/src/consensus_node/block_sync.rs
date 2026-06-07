@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use boule_transport_tcp::tls::NodeId;
+use boule_core::identity::NodeId;
 
 /// Per-peer concurrency cap on `RequestBlock` serves. Sized small —
 /// the synchronous responder never reaches even 2 concurrent serves,
