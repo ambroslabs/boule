@@ -1,4 +1,3 @@
-
 //! Unit tests and the shared fixtures they build on.
 //!
 //! We hand-construct `Signed<T>` envelopes rather than signing with
