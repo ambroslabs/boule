@@ -12,7 +12,7 @@
 //! overlay's broadcast-as-unicast (publish; the target acts, others ignore).
 //! Phase 3 (#843) replaces it with a libp2p request-response stream.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,6 +113,7 @@ pub fn spawn(cfg: SpawnConfig) -> Result<Libp2pOverlayHandles> {
         peers: Arc::clone(&peers),
         topic: consensus_topic().hash(),
         bootstrap_addrs: cfg.bootstrap_addrs.clone(),
+        outbound_bootstrap: HashMap::new(),
         shutdown_rx,
     };
     let join = tokio::spawn(driver.run());
@@ -199,6 +200,12 @@ struct Driver {
     topic: TopicHash,
     /// Static bootstrap addresses, re-dialed periodically to repeer (#855).
     bootstrap_addrs: Vec<SocketAddr>,
+    /// Which bootstrap addresses we currently hold an *outbound* connection
+    /// to, keyed by the connected peer so a close can clear the exact entry
+    /// (#855). The redial loop targets only the bootstraps missing from this
+    /// set, so a node never leaves a specific dropped bootstrap un-redialed
+    /// (the old count heuristic could) and never re-dials a connected one.
+    outbound_bootstrap: HashMap<PeerId, SocketAddr>,
     shutdown_rx: oneshot::Receiver<()>,
 }
 
@@ -272,17 +279,17 @@ impl Driver {
         }
     }
 
-    /// #855: re-dial bootstrap peers we aren't connected to. Only dials when
-    /// we're below the bootstrap count, so a fully-connected node doesn't
-    /// churn duplicate connections; a node that lost (or never made) a peer
-    /// keeps retrying until it repeers.
+    /// #855: re-dial exactly the bootstrap addresses we don't currently hold
+    /// an outbound connection to. A node that lost (or never made) a specific
+    /// bootstrap keeps retrying just that one until it repeers; a node already
+    /// connected to all its bootstraps dials nothing, so there's no
+    /// duplicate-connection churn — unlike the old `peers.len() >=
+    /// bootstrap_addrs.len()` heuristic, which both skipped a missing
+    /// bootstrap whenever unrelated inbound peers inflated the count and
+    /// re-dialed already-connected peers when it did fire.
     fn redial_missing_bootstraps(&mut self) {
-        if self.bootstrap_addrs.is_empty() || self.peers.lock().len() >= self.bootstrap_addrs.len()
-        {
-            return;
-        }
-        let addrs = self.bootstrap_addrs.clone();
-        for addr in addrs {
+        let covered: HashSet<SocketAddr> = self.outbound_bootstrap.values().copied().collect();
+        for addr in bootstraps_to_redial(&self.bootstrap_addrs, &covered) {
             let _ = self.swarm.dial(socketaddr_to_multiaddr(addr));
         }
     }
@@ -351,6 +358,17 @@ impl Driver {
         let Some(node_id) = node_id_for(&peer_id) else {
             return;
         };
+        // #855: if this is an outbound dial that landed on one of our bootstrap
+        // addresses, record it so the redial loop knows that bootstrap is
+        // covered. Done before the dedup return so a re-established connection
+        // re-registers it.
+        if let ConnectedPoint::Dialer { address, .. } = endpoint {
+            if let Some(addr) = multiaddr_to_socketaddr(address) {
+                if self.bootstrap_addrs.contains(&addr) {
+                    self.outbound_bootstrap.insert(peer_id, addr);
+                }
+            }
+        }
         // First connection to this peer only (a peer may open several).
         if !self.peers.lock().insert(node_id) {
             return;
@@ -372,6 +390,10 @@ impl Driver {
     }
 
     async fn on_disconnected(&mut self, peer_id: PeerId) {
+        // #855: clear any bootstrap-coverage entry first (unconditionally, so
+        // it can't leak if the peer wasn't in `peers`), freeing the redial
+        // loop to re-dial this bootstrap on the next tick.
+        self.outbound_bootstrap.remove(&peer_id);
         let Some(node_id) = node_id_for(&peer_id) else {
             return;
         };
@@ -391,6 +413,20 @@ impl Driver {
 }
 
 // ── address helpers ────────────────────────────────────────────────────────────
+
+/// #855: the bootstrap addresses to re-dial — every configured bootstrap not
+/// already covered by a live outbound connection. Pure so the membership
+/// policy can be unit-tested without standing up a `Swarm`.
+fn bootstraps_to_redial(
+    bootstrap_addrs: &[SocketAddr],
+    covered: &HashSet<SocketAddr>,
+) -> Vec<SocketAddr> {
+    bootstrap_addrs
+        .iter()
+        .copied()
+        .filter(|a| !covered.contains(a))
+        .collect()
+}
 
 fn socketaddr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
     let ip = match addr.ip() {
@@ -420,4 +456,54 @@ fn endpoint_socketaddr(endpoint: &ConnectedPoint) -> Option<SocketAddr> {
         ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
     };
     multiaddr_to_socketaddr(ma)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn redials_every_bootstrap_when_none_are_covered() {
+        // The #855 boot case: a node with no connections re-dials all of them
+        // (the original "stuck at 0 peers" failure).
+        let boots = vec![addr(7001), addr(7002), addr(7003)];
+        let covered = HashSet::new();
+        assert_eq!(bootstraps_to_redial(&boots, &covered), boots);
+    }
+
+    #[test]
+    fn redials_nothing_when_all_bootstraps_are_covered() {
+        // A fully-connected node must not churn duplicate dials.
+        let boots = vec![addr(7001), addr(7002)];
+        let covered: HashSet<SocketAddr> = boots.iter().copied().collect();
+        assert!(bootstraps_to_redial(&boots, &covered).is_empty());
+    }
+
+    #[test]
+    fn redials_only_the_specific_missing_bootstrap() {
+        // The key fix over the count heuristic: one dropped bootstrap is
+        // re-dialed even though the others are still connected (and even
+        // though, in the real driver, unrelated inbound peers may keep the
+        // total peer count at or above the bootstrap count).
+        let boots = vec![addr(7001), addr(7002), addr(7003)];
+        let covered: HashSet<SocketAddr> = [addr(7001), addr(7003)].into_iter().collect();
+        assert_eq!(bootstraps_to_redial(&boots, &covered), vec![addr(7002)]);
+    }
+
+    #[test]
+    fn coverage_outside_the_bootstrap_set_is_ignored() {
+        // Connections to non-bootstrap peers never suppress a bootstrap dial.
+        let boots = vec![addr(7001)];
+        let covered: HashSet<SocketAddr> = [addr(9999)].into_iter().collect();
+        assert_eq!(bootstraps_to_redial(&boots, &covered), vec![addr(7001)]);
+    }
+
+    #[test]
+    fn no_bootstraps_means_no_dials() {
+        assert!(bootstraps_to_redial(&[], &HashSet::new()).is_empty());
+    }
 }
