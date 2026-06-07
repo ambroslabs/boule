@@ -1,37 +1,33 @@
 //! The ordered, deduplicated committee that participates in consensus.
 //!
-//! A [`ValidatorSet`] is the identity of a consensus committee: two sets
-//! over the same underlying [`ValidatorId`]s have byte-identical
-//! representation because [`ValidatorSet::new`] sorts and deduplicates on
-//! construction. This invariant lets selectors like
-//! [`super::pacemaker::leader::RoundRobinSelector`] rely on stable indexing
-//! (`validators[view % len]`) — every honest replica picks the same
-//! leader for a given view.
+//! [`ValidatorSet::new`] sorts and deduplicates on construction, so two
+//! sets over the same [`ValidatorId`]s are byte-identical and index
+//! identically. Selectors such as
+//! [`super::pacemaker::leader::RoundRobinSelector`] rely on this stable
+//! indexing (`validators[view % len]`) to pick the same leader on every
+//! replica.
 //!
-//! # Stable identity vs ephemeral signing key (#328)
+//! # Stable identity vs ephemeral signing key
 //!
-//! [`ValidatorId`] and [`Pubkey`] are two newtypes around [`NodeId`] that
-//! the consensus crate uses to keep "the slashing-correct stable
-//! identity of a validator" distinct in the type system from "whatever
-//! pubkey that validator is currently signing under". The runtime has
-//! always observed this distinction (every call site that needs the
-//! stable id goes through
-//! [`super::validator_key_history::ValidatorKeyHistory::validator_for`]),
-//! but until #328 the two were the same Rust type and a future slashing
-//! implementation taking a [`NodeId`] could not tell at compile time
-//! whether it had received a stable id or an ephemeral pubkey — exactly
-//! the condition under which CometBFT's cross-key double-sign bug
-//! reproduces.
+//! [`ValidatorId`] and [`Pubkey`] are distinct newtypes over [`NodeId`]:
 //!
-//! The bytes are still a [`NodeId`] under the hood, so wire format and
-//! storage are unchanged. The newtypes apply at the API boundary: a
-//! function that wants a stable id takes a [`ValidatorId`], and a
-//! function that wants the on-the-wire signer pubkey takes a [`Pubkey`].
-//! The only way to land in [`ValidatorId`] is through
-//! [`ValidatorId::from_genesis_pubkey`] at config time or via the
-//! [`super::validator_key_history::ValidatorKeyHistory`] reverse-index
-//! lookup — there is deliberately no `From<Pubkey> for ValidatorId`
-//! impl.
+//! - [`ValidatorId`] — a validator's stable identity, equal to the
+//!   founding key it joined the set with (at chain genesis or a later
+//!   reconfig) and fixed for its lifetime regardless of key rotations.
+//!   This is what [`ValidatorSet`] membership and slashing evidence key
+//!   on.
+//! - [`Pubkey`] — the consensus signing key a validator uses at a given
+//!   view, which changes on rotation.
+//!
+//! The split is a type-system guard: a function taking a [`ValidatorId`]
+//! cannot be passed an ephemeral [`Pubkey`] by mistake. A [`ValidatorId`]
+//! can only be obtained from a genesis pubkey
+//! ([`ValidatorId::from_genesis_pubkey`]) or via the reverse-index lookup
+//! [`super::validator_key_history::ValidatorKeyHistory::validator_for`];
+//! there is no conversion from arbitrary bytes or from [`Pubkey`].
+//!
+//! Both newtypes are `#[serde(transparent)]` over [`NodeId`], so wire
+//! format and storage are identical to the raw `NodeId`.
 
 use std::sync::Arc;
 
@@ -39,46 +35,33 @@ use serde::{Deserialize, Serialize};
 
 use boule_core::identity::NodeId;
 
-/// Stable, unchanging identifier for a validator. Equal to its genesis
-/// pubkey. The slashing-correct identity (#328 / audit finding 5-F1).
+/// A validator's stable identity: the pubkey it joined the set with (at
+/// chain genesis or a later reconfig add), fixed for its lifetime across
+/// any number of key rotations.
 ///
-/// Two [`ValidatorId`]s are equal iff they refer to the same validator
-/// across the validator's entire lifetime, even if that validator has
-/// rotated its consensus signing key any number of times. This is the
-/// type that appears in [`ValidatorSet`] membership and that a future
-/// slashing path will key its evidence on; it is **not** the type the
-/// wire envelope carries (that's [`Pubkey`]).
+/// Two [`ValidatorId`]s are equal iff they refer to the same validator.
+/// This is the type used for [`ValidatorSet`] membership and slashing
+/// evidence; it is not the type carried on the wire (that is [`Pubkey`]).
 ///
 /// # Constructors
 ///
-/// - [`Self::from_genesis_pubkey`] — at config-load / genesis-seeding
-///   time, before any rotations could have separated stable and
-///   ephemeral identities.
+/// - [`Self::from_genesis_pubkey`] — the only constructor taking raw
+///   bytes; valid only for a founding key, before any rotation.
 /// - [`super::validator_key_history::ValidatorKeyHistory::validator_for`]
-///   — given any pubkey the validator has ever used (genesis, current,
-///   or any rotated key), returns the stable id.
+///   — maps any pubkey a validator has ever used to its stable id.
 ///
-/// There is deliberately **no** `From<NodeId> for ValidatorId` and **no**
-/// `From<Pubkey> for ValidatorId` — those would let arbitrary bytes be
-/// promoted to a stable identity without going through the lookup, which
-/// is the load-bearing guard for #328.
-///
-/// # Wire format
+/// There is no `From<NodeId>` or `From<Pubkey>`: arbitrary bytes cannot
+/// be promoted to a stable identity without going through one of the
+/// constructors above. The doctest below enforces this.
 ///
 /// `Serialize`/`Deserialize` are `#[serde(transparent)]`, so the postcard
-/// bytes for `ValidatorId` are byte-identical to those for the inner
-/// `NodeId`. Existing on-disk and on-the-wire shapes are unchanged.
+/// bytes match those of the inner [`NodeId`].
 ///
 /// ```compile_fail
-/// # use boule_core::consensus::validator_set::{ValidatorId, Pubkey};
-/// # use boule_core::p2p::NodeId;
-/// // The compile_fail guard for #328: arbitrary bytes must not be
-/// // promotable to a stable validator id without going through a
-/// // lookup. If a future PR adds `From<Pubkey> for ValidatorId` (or
-/// // `From<NodeId> for ValidatorId`) this doctest will compile and
-/// // tip the guard over.
+/// # use boule_consensus::validator_set::{ValidatorId, Pubkey};
+/// # use boule_core::identity::NodeId;
 /// let pk: Pubkey = NodeId::default().into();
-/// let _: ValidatorId = pk.into();
+/// let _: ValidatorId = pk.into(); // no such conversion
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -86,29 +69,20 @@ use boule_core::identity::NodeId;
 pub struct ValidatorId(NodeId);
 
 impl ValidatorId {
-    /// Promote a genesis pubkey to a stable validator id.
-    ///
-    /// This is the only public constructor that takes raw bytes; the
-    /// name documents that it is allowed here because we are at network
-    /// birth, before any rotations could have separated stable and
-    /// ephemeral identities. Production code should call this only at
-    /// config-load time when seeding [`ValidatorSet`] and
-    /// [`super::validator_key_history::ValidatorKeyHistory`]; tests are
-    /// free to use it for fresh fixtures.
+    /// Promote a founding pubkey to a stable validator id. The only
+    /// constructor taking raw bytes; valid only when a validator first
+    /// joins the set (chain genesis or a reconfig add), before any
+    /// rotation has separated the stable id from the signing key.
     pub const fn from_genesis_pubkey(node_id: NodeId) -> Self {
         Self(node_id)
     }
 
-    /// Borrow the underlying `NodeId` bytes. The bytes are reusable for
-    /// storage, wire framing, and signature-verification preimages —
-    /// the typestate guards function signatures, not byte storage.
+    /// Borrow the underlying `NodeId` bytes.
     pub const fn as_node_id(&self) -> &NodeId {
         &self.0
     }
 
-    /// Move out the underlying `NodeId` bytes. Equivalent to
-    /// `From::<ValidatorId>::from(...)` but keeps `self` consumed by
-    /// value at the call site.
+    /// Move out the underlying `NodeId` bytes.
     pub const fn into_node_id(self) -> NodeId {
         self.0
     }
@@ -120,20 +94,14 @@ impl From<ValidatorId> for NodeId {
     }
 }
 
-/// Ephemeral consensus signing key — whatever pubkey the validator is
-/// currently (or, in spanning lookups, *was*) signing under at a given
-/// view.
+/// A validator's consensus signing key at a given view. Changes on key
+/// rotation; distinct from the stable [`ValidatorId`] so the two cannot
+/// be confused in a function signature.
 ///
-/// Distinct from [`ValidatorId`] so a slashing path that takes a stable
-/// id cannot be passed an ephemeral key by mistake. Same wire shape as
-/// [`NodeId`].
-///
-/// # Constructors
-///
-/// `From<NodeId>` and [`Self::from_node_id`] both accept raw bytes:
-/// every pubkey on the wire arrives as a `NodeId`, and converting to
-/// `Pubkey` is a cheap re-tag with no validation. Going the other way
-/// is also free via `From<Pubkey> for NodeId`.
+/// Converts freely to and from [`NodeId`] in both directions
+/// (`From<NodeId>` / [`Self::from_node_id`] and `From<Pubkey>`); a
+/// `NodeId` on the wire is already a pubkey, so the conversion is an
+/// unvalidated re-tag. Same wire shape as [`NodeId`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]
@@ -169,34 +137,21 @@ impl From<Pubkey> for NodeId {
     }
 }
 
-/// An ordered, deduplicated set of [`ValidatorId`]s with a `u64`
-/// voting weight per member.
+/// An ordered, deduplicated set of [`ValidatorId`]s, each with a `u64`
+/// voting weight.
 ///
-/// Members are sorted ascending (byte-lexicographic over the underlying
-/// `NodeId` bytes) and contain no duplicates. Weights live in a parallel
-/// array indexed identically to `members`: `weight_at(i)` is the weight
-/// of `members[i]`. Clone is zero-cost — both arrays are `Arc`-backed —
-/// so callers can hold `Arc<ValidatorSet>` on hot paths without copying.
+/// Members are sorted ascending (byte-lexicographic over the inner
+/// `NodeId`) with no duplicates. Weights are a parallel array indexed
+/// identically: `weight_at(i)` is the weight of `members[i]`. Both arrays
+/// are `Arc`-backed, so `Clone` is zero-cost.
 ///
-/// # Weights
+/// Constructors that don't take explicit weights default every member to
+/// weight `1`, under which weighted quorum reduces to count-based quorum.
 ///
-/// Subtask 1 of #144 (weighted voting power). The data structure carries
-/// per-validator weights, but every protocol predicate (`has_quorum`,
-/// `honesty_threshold`, leader rotation) is still count-based at this
-/// point — the predicates switch to weight-based in subtask 2 (#461).
-/// Until that lands, every constructor that doesn't take explicit
-/// weights defaults each member's weight to `1`, which is the degenerate
-/// case where weighted quorum reduces exactly to count-based quorum.
-///
-/// # Why weight 0 is forbidden at construction
-///
-/// `ValidatorSet::with_weights` returns `Err(WeightedSetError::ZeroWeight)`
-/// for any weight of zero. The reconfig payload (#462) already has an
-/// explicit "remove" path; allowing `weight = 0` would create a second
-/// way to spell removal and a divide-by-zero footgun for future
-/// stake-proportional features. The codebase has one canonical
-/// representation of "this validator is no longer voting": it is not in
-/// the set.
+/// A weight of `0` is rejected at construction
+/// ([`WeightedSetError::ZeroWeight`]): the only representation of "not
+/// voting" is absence from the set, and `0` would also be a
+/// divide-by-zero hazard for stake-proportional math.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorSet {
     members: Arc<[ValidatorId]>,
@@ -225,11 +180,9 @@ impl std::fmt::Display for WeightedSetError {
 impl std::error::Error for WeightedSetError {}
 
 impl ValidatorSet {
-    /// Construct a validator set from `members`, sorting ascending and
-    /// removing duplicates. Every member's weight defaults to `1`, so
-    /// the weighted-quorum predicate reduces exactly to the count-based
-    /// `2n/3 + 1` form. Two calls with the same underlying nodes in
-    /// different input orders produce equal sets.
+    /// Construct a validator set from `members`, sorted ascending and
+    /// deduplicated. Every weight defaults to `1`. Inputs differing only
+    /// in order produce equal sets.
     pub fn new(mut members: Vec<ValidatorId>) -> Self {
         members.sort_unstable();
         members.dedup();
@@ -241,11 +194,9 @@ impl ValidatorSet {
     }
 
     /// Construct a weighted validator set. `entries` is sorted by
-    /// [`ValidatorId`] and deduplicated; on collision the *first*
-    /// entry's weight wins (deterministic).
-    ///
-    /// Returns [`WeightedSetError::ZeroWeight`] if any entry has weight
-    /// 0; see the type-level docs for why zero is forbidden.
+    /// [`ValidatorId`] and deduplicated, keeping the first weight
+    /// supplied for each id. Returns [`WeightedSetError::ZeroWeight`] if
+    /// any entry has weight `0`.
     pub fn with_weights(mut entries: Vec<(ValidatorId, u64)>) -> Result<Self, WeightedSetError> {
         for (i, (_, w)) in entries.iter().enumerate() {
             if *w == 0 {
@@ -292,8 +243,7 @@ impl ValidatorSet {
         self.members.iter()
     }
 
-    /// Voting weight at sorted index `idx`. Panics on out-of-range,
-    /// mirroring the `members[idx]` convention.
+    /// Voting weight at sorted index `idx`. Panics if out of range.
     pub fn weight_at(&self, idx: usize) -> u64 {
         self.weights[idx]
     }
@@ -303,14 +253,13 @@ impl ValidatorSet {
         self.index_of(id).map(|i| self.weights[i])
     }
 
-    /// Sum of all member weights. Returns `u128` so weights summing
-    /// near `u64::MAX` (the issue's overflow case) don't wrap.
+    /// Sum of all member weights, as `u128` so near-`u64::MAX` weights
+    /// don't wrap.
     pub fn total_weight(&self) -> u128 {
         self.weights.iter().map(|w| u128::from(*w)).sum()
     }
 
-    /// Iterate `(&ValidatorId, u64)` pairs in sorted order. Used by the
-    /// weighted-quorum predicate (subtask 2) and by persistence.
+    /// Iterate `(&ValidatorId, u64)` pairs in sorted order.
     pub fn iter_weighted(&self) -> impl Iterator<Item = (&ValidatorId, u64)> + '_ {
         self.members.iter().zip(self.weights.iter().copied())
     }
@@ -375,11 +324,8 @@ mod tests {
         assert_eq!(collected, vec![vid(2), vid(5), vid(8)]);
     }
 
-    /// Wire format is byte-identical between `ValidatorId` /
-    /// `Pubkey` / inner `NodeId` because the newtypes derive
-    /// `#[serde(transparent)]`. The on-disk and on-the-wire shapes
-    /// produced by `postcard::to_stdvec` must therefore match the
-    /// pre-#328 baseline (just the 32 bytes of the inner `NodeId`).
+    /// `#[serde(transparent)]` makes the postcard bytes of `ValidatorId`
+    /// identical to those of the inner `NodeId`.
     #[test]
     fn validator_id_serializes_as_inner_node_id() {
         let id: ValidatorId = ValidatorId::from_genesis_pubkey([0xAB; 32]);
@@ -400,7 +346,7 @@ mod tests {
         );
     }
 
-    // ── #460: per-validator weight ──────────────────────────────────────
+    // ── per-validator weight ────────────────────────────────────────────
 
     #[test]
     fn new_defaults_all_weights_to_one() {
