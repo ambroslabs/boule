@@ -487,12 +487,15 @@ async fn start_consensus_cluster(n: usize) -> (Vec<NodeGuard>, Vec<tempfile::Tem
         );
     }
 
-    let ready_timeout = Duration::from_secs(10);
+    // Generous failure-timeouts: readiness + libp2p gossipsub mesh
+    // formation are sensitive to CI core contention and slower than the
+    // old TCP transport's immediate connect. The happy path early-exits.
+    let ready_timeout = Duration::from_secs(20);
     for g in &guards {
         wait_until_ready(g, ready_timeout).await;
     }
 
-    let mesh_timeout = Duration::from_secs(10);
+    let mesh_timeout = Duration::from_secs(20);
     for g in &guards {
         wait_for_peer_count(g, n - 1, mesh_timeout).await;
     }
