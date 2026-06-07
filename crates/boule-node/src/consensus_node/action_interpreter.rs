@@ -90,12 +90,10 @@ impl ConsensusNode {
                     msg_type = kind.label(),
                     "rate_limit_disconnect",
                 );
-                if let Some(cmd_tx) = self.peer_cmd_tx.as_ref() {
-                    // Fire-and-forget: if the channel is full or
-                    // closed (manager shut down), the limiter has
-                    // already recorded the disconnect-decision.
-                    let _ = cmd_tx
-                        .try_send(boule_transport_tcp::PeerCommand::Disconnect { node_id: from });
+                if let Some(disc) = self.disconnect_via.as_ref() {
+                    // Fire-and-forget via the active overlay; the limiter
+                    // has already recorded the disconnect-decision.
+                    disc.disconnect(from);
                 }
                 // Don't `forget_peer` here: the peer state's
                 // `disconnect_dispatched` latch silences any frames

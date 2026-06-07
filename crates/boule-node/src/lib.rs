@@ -884,7 +884,9 @@ async fn start_consensus(
     let (status_tx, status_rx) = watch::channel(initial_status);
     let mut node = node.with_status_publisher(status_tx);
     if let Some(limiter) = rate_limiter {
-        node = node.with_rate_limiter(limiter, Some(p2p_cmd_tx.clone()));
+        // The limiter's `Disconnect` decisions are routed through the active
+        // overlay's discovery inside `run` (libp2p tears the connection down).
+        node = node.with_rate_limiter(limiter);
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

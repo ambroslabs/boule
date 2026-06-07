@@ -1445,7 +1445,7 @@ impl SimCluster {
                     clock,
                 ));
                 limiters.push(Arc::clone(&limiter));
-                node = node.with_rate_limiter(limiter, None);
+                node = node.with_rate_limiter(limiter);
             }
 
             // Per-node outbound channel: node writes here through its
