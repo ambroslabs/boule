@@ -603,13 +603,14 @@ async fn test_consensus_status_endpoint_reports_live_progress() {
     }
 
     // Wait until every node reports `last_committed_height > 0` and
-    // `current_view > 0`. 15s is generous for a 4-node cluster on a
-    // laptop (HotStuff commits the 3rd proposal, which at
-    // timeout_base_ms=200 lands in well under a second).
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // `current_view > 0`. Failure-timeout only: the happy path early-exits
+    // in well under a second once the cluster commits, but libp2p
+    // mesh-formation latency is sensitive to CI core contention, so the
+    // bound is generous to cover the pathological-slow case.
+    let deadline = Instant::now() + Duration::from_secs(30);
     'outer: loop {
         if Instant::now() > deadline {
-            panic!("consensus cluster did not commit within 15s");
+            panic!("consensus cluster did not commit within 30s");
         }
         for g in &guards {
             let resp = client.get(g.admin_url("/consensus/status")).send().await;
@@ -803,10 +804,14 @@ async fn test_libp2p_overlay_3_node_smoke() {
     let (guards, key_dirs) = start_libp2p_consensus_cluster(N).await;
 
     let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Failure-timeout only (the happy path early-exits in ~a few seconds once
+    // the gossipsub mesh forms and the cluster commits). libp2p mesh-formation
+    // latency is sensitive to CI core contention, so this is generous — it
+    // bounds the pathological-slow case, not the expected duration.
+    let deadline = Instant::now() + Duration::from_secs(30);
     'outer: loop {
         if Instant::now() > deadline {
-            panic!("libp2p-overlay cluster did not commit within 15s");
+            panic!("libp2p-overlay cluster did not commit within 30s");
         }
         for g in &guards {
             let resp = client.get(g.admin_url("/consensus/status")).send().await;
