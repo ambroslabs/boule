@@ -19,10 +19,10 @@ use boule_consensus::rate_limit::MessageKind;
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
 use boule_core::crypto::signed::Signer;
+use boule_core::identity::NodeId;
+use boule_core::identity::node_id_to_base58;
 use boule_core::transport::limits::{Decision, RateLimitKind};
-use boule_transport_tcp::NodeId;
-use boule_transport_tcp::overlay::Broadcaster;
-use boule_transport_tcp::tls::node_id_to_base58;
+use boule_core::transport::overlay::Broadcaster;
 
 use super::{
     BlockSyncRangeInflight, ConsensusNode, TRACE_TARGET, load_block_from_storage, msg_kind,
@@ -54,7 +54,7 @@ impl ConsensusNode {
     /// Classify `payload` and consult the rate limiter (if any).
     /// Returns `true` if the frame should be dispatched, `false` if
     /// the limiter dropped it. On a Disconnect decision, fires a
-    /// best-effort [`boule_transport_tcp::PeerCommand::Disconnect`] for `from`.
+    /// best-effort overlay `Discovery::disconnect` for `from`.
     pub(super) async fn admit_inbound(&self, from: NodeId, payload: &[u8]) -> bool {
         let Some(limiter) = self.rate_limiter.as_ref() else {
             return true;
@@ -90,12 +90,10 @@ impl ConsensusNode {
                     msg_type = kind.label(),
                     "rate_limit_disconnect",
                 );
-                if let Some(cmd_tx) = self.peer_cmd_tx.as_ref() {
-                    // Fire-and-forget: if the channel is full or
-                    // closed (manager shut down), the limiter has
-                    // already recorded the disconnect-decision.
-                    let _ = cmd_tx
-                        .try_send(boule_transport_tcp::PeerCommand::Disconnect { node_id: from });
+                if let Some(disc) = self.disconnect_via.as_ref() {
+                    // Fire-and-forget via the active overlay; the limiter
+                    // has already recorded the disconnect-decision.
+                    disc.disconnect(from);
                 }
                 // Don't `forget_peer` here: the peer state's
                 // `disconnect_dispatched` latch silences any frames

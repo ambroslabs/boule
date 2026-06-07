@@ -2,7 +2,7 @@
 //!
 //! This module sits at the [`boule_consensus::hotstuff::HotStuffCore`]
 //! action boundary — adversaries intercept the stream of
-//! [`boule_transport_tcp::ProtocolOutbound`] frames their node would emit, decode
+//! [`boule_core::transport::overlay::ProtocolOutbound`] frames their node would emit, decode
 //! each as a [`WireMessage`], and craft *valid signed envelopes* that
 //! misbehave at the protocol level: equivocation, vote withholding,
 //! stale replays, forged QCs, timeout-vote spam.
@@ -55,7 +55,8 @@ use boule_consensus::hotstuff::{NewView, Proposal};
 use boule_consensus::replication::block::{Block, BlockHash};
 use boule_consensus::wire::WireMessage;
 use boule_core::crypto::signed::{ChainId, Signed};
-use boule_transport_tcp::{NodeId, ProtocolOutbound};
+use boule_core::identity::NodeId;
+use boule_core::transport::overlay::ProtocolOutbound;
 
 // ── Wire helpers ─────────────────────────────────────────────────────────────
 

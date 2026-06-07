@@ -17,7 +17,7 @@ use boule_consensus::replication::stake_source::StakeSource;
 use boule_consensus::replication::state_machine::{CommandValidator, StateMachine};
 use boule_consensus::{Height, View};
 use boule_core::clock::BoxFuture;
-use boule_transport_tcp::NodeId;
+use boule_core::identity::NodeId;
 
 use super::TRACE_TARGET;
 use crate::demo_staking::StakeCommand;

@@ -68,7 +68,8 @@ pub const MIN_V_EFF_DELAY: View = View::new(4);
 
 /// A pubkey + network address pair describing a validator to admit.
 ///
-/// `node_id` is the Ed25519 pubkey used by `boule_transport_tcp::tls`; `addr` is
+/// `node_id` is the node's Ed25519 network identity (the pubkey *is* the
+/// node id); `addr` is
 /// the routable socket peers should use to reach this validator. On BLS
 /// chains (#143 / #289) `bls_pop` carries the new validator's BLS
 /// pubkey paired with a proof-of-possession signature over that pubkey;

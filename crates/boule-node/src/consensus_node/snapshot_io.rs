@@ -28,10 +28,10 @@ use boule_consensus::hotstuff::step::{Action as SafetyAction, Event as SafetyEve
 use boule_consensus::pacemaker::leader::WeightedAccumulatorSelector;
 use boule_consensus::view_timer::ViewTimer;
 use boule_core::crypto::signed::Signer;
+use boule_core::identity::NodeId;
+use boule_core::identity::node_id_to_base58;
 use boule_core::storage::StorageExt;
-use boule_transport_tcp::NodeId;
-use boule_transport_tcp::overlay::Broadcaster;
-use boule_transport_tcp::tls::node_id_to_base58;
+use boule_core::transport::overlay::Broadcaster;
 
 use super::{
     ConsensusNode, LastCommitted, RECENT_QC_CACHE_CAPACITY, STORAGE_KEY_BLS_KEY_HISTORY,

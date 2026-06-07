@@ -41,8 +41,7 @@ pub(crate) fn handle(args: InitArgs) -> anyhow::Result<()> {
     // Cross-validate `[[peers]]` against the local NodeId now so a self-id is
     // caught at `init` rather than only surfacing at `start`.
     if let Some(net_id) = provider.try_load()? {
-        let tls = boule_transport_tcp::tls::TlsIdentity::from_identity(&net_id)?;
-        config.validate(&tls.node_id)?;
+        config.validate(&net_id.node_id()?)?;
     }
 
     if let Some(val_cfg) = config::resolve_validator_identity(&config.node) {
@@ -82,19 +81,17 @@ fn provision_or_report(
 ) -> anyhow::Result<()> {
     match provider.try_load()? {
         Some(id) => {
-            let tls = boule_transport_tcp::tls::TlsIdentity::from_identity(&id)?;
             println!(
                 "{slot} key already provisioned: NodeId = {}",
-                node_id_to_base58(&tls.node_id)
+                node_id_to_base58(&id.node_id()?)
             );
         }
         None => {
             if provider.is_provisioning_capable() {
                 let new_id = provider.load_or_init()?;
-                let tls = boule_transport_tcp::tls::TlsIdentity::from_identity(&new_id)?;
                 println!(
                     "provisioned new {slot} key: NodeId = {}",
-                    node_id_to_base58(&tls.node_id)
+                    node_id_to_base58(&new_id.node_id()?)
                 );
             } else {
                 println!(

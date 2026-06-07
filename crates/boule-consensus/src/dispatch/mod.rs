@@ -225,7 +225,7 @@ pub enum Dispatch {
 
 /// A postcard-encoded, ready-to-send frame for the p2p layer.
 ///
-/// Wraps the same shape as `boule_transport_tcp::ProtocolOutbound` but without
+/// Wraps the same shape as `boule_core::transport::overlay::ProtocolOutbound` but without
 /// the tokio channel dependency — the event loop converts this to
 /// `ProtocolOutbound` when sending.
 #[derive(Debug, Clone, PartialEq, Eq)]

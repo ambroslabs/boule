@@ -227,7 +227,7 @@ fn mint_bls_keys_if_needed(
 ) -> anyhow::Result<Option<Vec<BlsGenesisEntry>>> {
     use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
     use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
-    use boule_transport_tcp::tls::base58_to_node_id;
+    use boule_core::identity::base58_to_node_id;
     if scheme == SignatureSchemeChoice::Ed25519Collected {
         return Ok(None);
     }
@@ -237,7 +237,7 @@ fn mint_bls_keys_if_needed(
     // chain_id is known.
     struct PendingEntry {
         node_id: String,
-        node_id_bytes: boule_transport_tcp::tls::NodeId,
+        node_id_bytes: boule_core::identity::NodeId,
         secret: zeroize::Zeroizing<boule_core::crypto::sig_scheme::BlsSecretKey>,
         public: BlsPublicKey,
     }
@@ -277,9 +277,9 @@ fn mint_bls_keys_if_needed(
     // Pass 2: compute the deployment's chain_id from the validator
     // pubkeys + BLS table the genesis block will commit to, and mint a
     // chain-bound PoP per validator (#410).
-    let validator_ids: Vec<boule_transport_tcp::tls::NodeId> =
+    let validator_ids: Vec<boule_core::identity::NodeId> =
         pending.iter().map(|e| e.node_id_bytes).collect();
-    let bls_pubkeys: Vec<(boule_transport_tcp::tls::NodeId, BlsPublicKey)> = pending
+    let bls_pubkeys: Vec<(boule_core::identity::NodeId, BlsPublicKey)> = pending
         .iter()
         .map(|e| (e.node_id_bytes, e.public))
         .collect();
@@ -336,7 +336,9 @@ fn write_final_config(
     n: &NodeLayout,
     all: &[NodeLayout],
     validators: &[String],
-    target_degree: usize,
+    // libp2p discovery is bootstrap-addr driven; the gossip outbound-target
+    // knob is no longer wired into the generated config.
+    _target_degree: usize,
     timeout_base_ms: u64,
     timeout_max_ms: u64,
     signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
@@ -353,22 +355,17 @@ fn write_final_config(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let mut peers_toml = String::new();
+    // libp2p discovery is driven by bootstrap_addrs (the gossip overlay's
+    // [[peers]] peer-list was removed with the legacy transport).
+    let mut bootstrap_list: Vec<String> = Vec::new();
     for &peer_idx in &n.bootstrap_peers {
         let p = &all[peer_idx];
         let addr = p
             .p2p_addr
             .ok_or_else(|| anyhow::anyhow!("missing p2p_addr for peer {}", p.display_name()))?;
-        let id = p
-            .node_id
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("missing node_id for peer {}", p.display_name()))?;
-        write!(
-            peers_toml,
-            "\n[[peers]]\naddr    = \"{addr}\"\nnode_id = \"{id}\"\n"
-        )
-        .unwrap();
+        bootstrap_list.push(format!("\"{addr}\""));
     }
+    let bootstrap_toml = bootstrap_list.join(", ");
 
     // BLS genesis table (#360): on `bls_aggregated` chains, emit the
     // `[consensus] signature_scheme` field, the
@@ -442,16 +439,15 @@ fn write_final_config(
          listen_addr = \"{admin}\"\n\
          \n\
          [overlay]\n\
-         mode            = \"gossip\"\n\
-         outbound_target = {target_degree}\n\
+         mode            = \"libp2p\"\n\
+         bootstrap_addrs = [{bootstrap_toml}]\n\
          \n\
          [consensus]\n\
          validators       = [{validators_toml}]\n\
          storage_dir      = \"{storage}\"\n\
          timeout_base_ms  = {timeout_base_ms}\n\
          timeout_max_ms   = {timeout_max_ms}\n\
-         {bls_consensus_toml}\
-         {peers_toml}",
+         {bls_consensus_toml}",
         addr = n.addr_path.display(),
         key = n.key_path.display(),
         storage = n.consensus_dir.display(),

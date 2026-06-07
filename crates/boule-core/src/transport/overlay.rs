@@ -81,6 +81,15 @@ pub trait Discovery: Send + Sync {
     /// will use this for bootstrap-address ingestion.
     fn add_bootstrap(&self, addr: SocketAddr);
 
+    /// Request that the overlay drop its connection to `node_id`, if any.
+    ///
+    /// Best-effort and fire-and-forget: used by the inbound rate limiter to
+    /// shed an abusive peer (the limiter has already recorded the decision, so
+    /// a dropped request just means the peer stays connected a little longer).
+    /// The default is a no-op — the in-memory test double has no connections to
+    /// drop; real backends (libp2p) override it.
+    fn disconnect(&self, _node_id: NodeId) {}
+
     /// Subscribe to the discovery event stream.
     ///
     /// Each subscriber receives every [`DiscoveryEvent`] published from

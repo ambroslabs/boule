@@ -1,11 +1,10 @@
 //! Seeded topology generation for the testnet driver.
 //!
 //! The driver lays out an `n`-node cluster as a ring (each node lists
-//! `i-1` and `i+1 mod n` as verified `[[peers]]`) plus `seed_extra`
-//! random extra peers per node, drawn with a seeded RNG from
-//! `{0..n} \ {i, i-1, i+1}`. The realized peer set is enough for
-//! `[overlay].mode = "gossip"` to discover the rest of the cluster
-//! through peer-list gossip.
+//! `i-1` and `i+1 mod n` as neighbours) plus `seed_extra` random extra
+//! peers per node, drawn with a seeded RNG from `{0..n} \ {i, i-1, i+1}`.
+//! The realized peer set seeds each node's `[overlay].bootstrap_addrs`,
+//! which the libp2p overlay dials to join the cluster.
 
 use rand::SeedableRng;
 use rand::seq::IndexedRandom;

@@ -93,10 +93,11 @@ use boule_consensus::validator_set::{ValidatorId, ValidatorSet};
 use boule_consensus::view_timer::ViewTimer;
 use boule_consensus::{Height, View};
 use boule_core::crypto::signed::{ChainId, Signer};
+use boule_core::identity::NodeId;
+use boule_core::identity::node_id_to_base58;
 use boule_core::storage::{Storage, Wal};
-use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
-use boule_transport_tcp::tls::node_id_to_base58;
-use boule_transport_tcp::{NodeId, ProtocolEvent};
+use boule_core::transport::overlay::ProtocolEvent;
+use boule_core::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 
 mod action_interpreter;
 mod app_context;
@@ -397,7 +398,7 @@ pub struct ConsensusNode {
     /// (#308) / out-of-process Application (#225) wiring.
     commit_notifier: Option<Arc<dyn CommitNotifier>>,
     /// Shared overflow counter from
-    /// [`boule_transport_tcp::overlay::gossip::sink::OverlaySink`] when the node
+    /// `OverlaySink` (removed) when the node
     /// is wired to a gossip-mode overlay (issue #163 / #486). When
     /// `Some`, [`ConsensusNode::build_status`] reads its current value
     /// and surfaces it under
@@ -405,10 +406,10 @@ pub struct ConsensusNode {
     /// `None` for mesh-mode runs and for the simulator's mesh harness —
     /// the field defaults to zero in `ConsensusStatus` in those cases.
     gossip_sink_overflows: Option<Arc<AtomicU64>>,
-    /// Shared overflow counter from the p2p manager — counts every
-    /// `try_send` `Full` on a per-peer outbound `write_tx`, across both
-    /// `SendTo` and `Broadcast` paths. Cloned from the
-    /// [`boule_transport_tcp::ProtocolHandle`] returned at registration. When
+    /// Shared overflow counter from the overlay — counts every
+    /// `try_send` `Full` on a per-peer outbound queue, across both
+    /// `SendTo` and `Broadcast` paths. Cloned from the overlay's
+    /// `peer_outbound_overflows` at registration. When
     /// `Some`, surfaced via
     /// [`boule_consensus::status::BackpressureStatus::peer_outbound_overflow_total`].
     /// `None` for the simulator's mesh harness (no real p2p manager).
@@ -637,14 +638,15 @@ pub struct ConsensusNode {
     /// pre-#134 behaviour and is the default in the simulator's
     /// happy-path tests.
     rate_limiter: Option<Arc<RateLimiter>>,
-    /// Channel into the peer manager. When set together with
+    /// Handle into the active overlay's discovery. When set together with
     /// `rate_limiter`, a [`boule_core::transport::limits::Decision::Disconnect`]
-    /// from the limiter drives a [`boule_transport_tcp::PeerCommand::Disconnect`]
-    /// so the offending peer's TCP/TLS connection is torn down. `None`
-    /// in the simulator (which has no real manager); the limiter still
-    /// records the disconnect-decision in its own counter so tests
-    /// can observe the decision.
-    peer_cmd_tx: Option<mpsc::Sender<boule_transport_tcp::PeerCommand>>,
+    /// from the limiter drives [`boule_core::transport::overlay::Discovery::disconnect`]
+    /// so the offending peer's connection is torn down. Set from the
+    /// `discovery` passed to [`ConsensusNode::run`] when a rate limiter is
+    /// present; `None` in the simulator (the in-memory discovery's
+    /// `disconnect` is a no-op), where the limiter still records the
+    /// disconnect-decision in its own counter so tests can observe it.
+    disconnect_via: Option<Arc<dyn Discovery>>,
     /// Snapshot creation policy. When `is_enabled()`, [`ConsensusNode::apply_commit`]
     /// produces a snapshot at every multiple of `interval_blocks`.
     snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy,
@@ -939,7 +941,7 @@ impl ConsensusNode {
             last_committed_view: View::ZERO,
             status_tx: None,
             rate_limiter: None,
-            peer_cmd_tx: None,
+            disconnect_via: None,
             snapshot_policy: config.snapshot_policy,
             min_v_eff_delay: config.min_v_eff_delay,
             recent_qcs: Mutex::new(RecentQcCache::default()),
@@ -1027,7 +1029,7 @@ impl ConsensusNode {
     }
 
     /// Wire the gossip-mode overlay's
-    /// [`boule_transport_tcp::overlay::gossip::sink::OverlaySink`] overflow
+    /// `OverlaySink` (removed) overflow
     /// counter into this node so
     /// [`boule_consensus::status::BackpressureStatus::gossip_sink_overflow_total`]
     /// reflects the running drop count. Pass the `Arc<AtomicU64>`
@@ -1039,11 +1041,10 @@ impl ConsensusNode {
         self
     }
 
-    /// Wire the p2p manager's per-peer outbound overflow counter into
-    /// this node. Pass the `Arc<AtomicU64>` carried by every
-    /// [`boule_transport_tcp::ProtocolHandle`]
+    /// Wire the overlay's per-peer outbound overflow counter into
+    /// this node. Pass the `Arc<AtomicU64>` carried by the overlay
     /// (`peer_outbound_overflows`) — there's a single shared counter per
-    /// manager, so handing in the consensus-protocol's clone is fine.
+    /// overlay, so handing in the consensus-protocol's clone is fine.
     /// Surfaced via
     /// [`boule_consensus::status::BackpressureStatus::peer_outbound_overflow_total`].
     pub fn with_peer_outbound_overflow_counter(mut self, counter: Arc<AtomicU64>) -> Self {
@@ -1066,20 +1067,14 @@ impl ConsensusNode {
         self
     }
 
-    /// Attach a per-peer rate limiter (issue #134) and the optional
-    /// peer-command channel used to issue
-    /// [`boule_transport_tcp::PeerCommand::Disconnect`] when the limiter
-    /// returns [`boule_core::transport::limits::Decision::Disconnect`] for a peer.
-    /// Pass `peer_cmd_tx = None` in the simulator: the limiter will
-    /// still classify and drop, and tests can observe the disconnect
-    /// decision via [`RateLimiter::counters`].
-    pub fn with_rate_limiter(
-        mut self,
-        limiter: Arc<RateLimiter>,
-        peer_cmd_tx: Option<mpsc::Sender<boule_transport_tcp::PeerCommand>>,
-    ) -> Self {
+    /// Attach a per-peer rate limiter (issue #134). When the limiter returns
+    /// [`boule_core::transport::limits::Decision::Disconnect`] for a peer,
+    /// [`ConsensusNode::run`] tears the connection down via the active
+    /// overlay's [`Discovery::disconnect`]. The in-memory simulator discovery's
+    /// `disconnect` is a no-op, but the limiter still classifies and drops, and
+    /// tests can observe the disconnect decision via [`RateLimiter::counters`].
+    pub fn with_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
         self.rate_limiter = Some(limiter);
-        self.peer_cmd_tx = peer_cmd_tx;
         self
     }
 
@@ -1464,7 +1459,7 @@ impl ConsensusNode {
             last_committed_view: last_committed.view,
             status_tx: None,
             rate_limiter: None,
-            peer_cmd_tx: None,
+            disconnect_via: None,
             snapshot_policy: config.snapshot_policy,
             min_v_eff_delay: config.min_v_eff_delay,
             recent_qcs: Mutex::new(RecentQcCache::default()),
@@ -1517,9 +1512,9 @@ impl ConsensusNode {
     ///
     /// Outbound traffic flows through `broadcaster` (a [`Broadcaster`]
     /// trait object) and peer-membership deltas through `discovery`'s
-    /// event stream. The mesh is the only implementation today; gossip
-    /// and dynamic-membership backends drop in here without touching
-    /// the event loop. See [`boule_transport_tcp::overlay`] for the contract.
+    /// event stream. The libp2p overlay is the production implementation;
+    /// the in-memory mesh fakes drop in here for tests without touching
+    /// the event loop. See [`boule_core::transport::overlay`] for the contract.
     /// Startup EL-catch-up (#635, tier-3a of the recovery cascade). An
     /// out-of-process execution layer (a reth EL) keeps its own state DB and
     /// can come up **behind** the consensus committed height — e.g. its datadir
@@ -1728,6 +1723,12 @@ impl ConsensusNode {
         // connected before our subscription is still reflected. Discovery
         // events from the subscription point onward keep it in sync.
         self.peers_connected = discovery.known_peers().into_iter().collect();
+        // When a rate limiter is present, route its `Disconnect` decisions
+        // through the active overlay's discovery (libp2p tears the swarm
+        // connection down; the in-memory sim discovery is a no-op).
+        if self.rate_limiter.is_some() {
+            self.disconnect_via = Some(Arc::clone(&discovery));
+        }
 
         let (timer_tx, mut timer_rx) = mpsc::channel::<View>(4);
         let mut view_timer = ViewTimer::new(timer_tx);
@@ -2191,8 +2192,8 @@ mod tests {
     use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
     use boule_consensus::validator_set::ValidatorSet;
     use boule_core::crypto::signed::Signed;
+    use boule_core::identity::NodeId;
     use boule_core::storage::{MemoryStorage, MemoryWal};
-    use boule_transport_tcp::NodeId;
 
     fn nid(b: u8) -> NodeId {
         [b; 32]
@@ -2553,8 +2554,8 @@ mod tests {
             .expect("rotation applies cleanly to seeded history");
 
         let status = node.build_status();
-        let stable_id_b58 = boule_transport_tcp::tls::node_id_to_base58(&nid(2));
-        let new_key_b58 = boule_transport_tcp::tls::node_id_to_base58(&new_key);
+        let stable_id_b58 = boule_core::identity::node_id_to_base58(&nid(2));
+        let new_key_b58 = boule_core::identity::node_id_to_base58(&new_key);
 
         let rotated = status
             .validator_keys
@@ -4017,7 +4018,7 @@ mod tests {
 
     use boule_core::crypto::signed::NodeSigner;
     use boule_core::identity::NodeIdentity;
-    use boule_transport_tcp::{ProtocolEvent, ProtocolOutbound};
+    use boule_core::transport::overlay::{ProtocolEvent, ProtocolOutbound};
     use rcgen::KeyPair as RcgenKeyPair;
     use rcgen::PKCS_ED25519;
     use zeroize::Zeroizing;
@@ -4048,7 +4049,7 @@ mod tests {
     ) {
         let (send_tx, send_rx) = tokio::sync::mpsc::channel::<ProtocolOutbound>(16);
         let bc: Arc<dyn Broadcaster> = Arc::new(
-            boule_transport_tcp::overlay::MemoryBroadcaster::new(send_tx),
+            boule_core::transport::overlay::MemoryBroadcaster::new(send_tx),
         );
         (bc, send_rx)
     }
@@ -4056,7 +4057,43 @@ mod tests {
     /// Build a [`Discovery`] with no peers and a never-firing source.
     fn make_test_discovery() -> Arc<dyn Discovery> {
         let (_tx, rx) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
-        boule_transport_tcp::overlay::MemoryDiscovery::spawn(rx)
+        boule_core::transport::overlay::MemoryDiscovery::spawn(rx)
+    }
+
+    /// A [`Discovery`] whose `disconnect` records the target onto a channel,
+    /// so a test can observe a rate-limiter eviction (the production path now
+    /// runs through `Discovery::disconnect`, not a manager command channel).
+    struct CapturingDiscovery {
+        disconnects: tokio::sync::mpsc::UnboundedSender<NodeId>,
+        events: tokio::sync::broadcast::Sender<DiscoveryEvent>,
+    }
+    impl Discovery for CapturingDiscovery {
+        fn known_peers(&self) -> Vec<NodeId> {
+            Vec::new()
+        }
+        fn add_bootstrap(&self, _addr: std::net::SocketAddr) {}
+        fn disconnect(&self, node_id: NodeId) {
+            let _ = self.disconnects.send(node_id);
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<DiscoveryEvent> {
+            self.events.subscribe()
+        }
+    }
+
+    /// A discovery whose `disconnect` calls land on the returned receiver.
+    fn make_disconnect_capturing_discovery() -> (
+        Arc<dyn Discovery>,
+        tokio::sync::mpsc::UnboundedReceiver<NodeId>,
+    ) {
+        let (disconnects, rx) = tokio::sync::mpsc::unbounded_channel::<NodeId>();
+        let (events, _) = tokio::sync::broadcast::channel::<DiscoveryEvent>(8);
+        (
+            Arc::new(CapturingDiscovery {
+                disconnects,
+                events,
+            }),
+            rx,
+        )
     }
 
     #[test]
@@ -9695,7 +9732,7 @@ mod tests {
         use boule_consensus::hotstuff::Proposal;
         use boule_core::clock::BoxFuture;
         use boule_core::storage::{Storage, WriteBatch};
-        use boule_transport_tcp::overlay::Broadcaster;
+        use boule_core::transport::overlay::Broadcaster;
 
         #[derive(Debug, Clone, PartialEq, Eq)]
         enum OrderEvent {
@@ -9945,7 +9982,7 @@ mod tests {
         use boule_consensus::hotstuff::qc::QuorumCertificate;
         use boule_core::clock::BoxFuture;
         use boule_core::storage::{Storage, WriteBatch};
-        use boule_transport_tcp::overlay::Broadcaster;
+        use boule_core::transport::overlay::Broadcaster;
 
         #[derive(Debug, Clone, PartialEq, Eq)]
         enum OrderEvent {
@@ -10303,7 +10340,6 @@ mod tests {
     use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
     use boule_core::clock::{Clock, TokioClock};
     use boule_core::transport::limits::RateLimitsConfig;
-    use boule_transport_tcp::PeerCommand;
 
     /// Build a `WireMessage::BlockRequest([0; 32])` postcard frame.
     /// Cheap to construct (no signing required) and decodes cleanly
@@ -10317,8 +10353,8 @@ mod tests {
     /// Issue #134 acceptance criterion: a peer that floods at 10× the
     /// configured rate has its excess frames dropped *and* gets
     /// disconnected after K violations. We measure both outcomes —
-    /// the drop counter rises and a `PeerCommand::Disconnect` lands
-    /// on the manager-side channel.
+    /// the drop counter rises and a disconnect is dispatched via the
+    /// active overlay's discovery.
     #[tokio::test]
     async fn flooding_peer_is_dropped_and_disconnected() {
         // Build a config with a tight per-kind bucket and a low
@@ -10334,14 +10370,12 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
         let limiter = Arc::new(RateLimiter::new(cfg, Arc::clone(&clock)));
 
-        let node = make_node(nid(1));
-        let (peer_cmd_tx, mut peer_cmd_rx) = tokio::sync::mpsc::channel::<PeerCommand>(8);
-        let node = node.with_rate_limiter(Arc::clone(&limiter), Some(peer_cmd_tx));
+        let node = make_node(nid(1)).with_rate_limiter(Arc::clone(&limiter));
+        let (discovery, mut disco_rx) = make_disconnect_capturing_discovery();
 
         let signer = fresh_signer();
         let (event_tx, event_rx) = make_test_event_channel();
         let (broadcaster, mut _outbound_rx) = make_test_broadcaster();
-        let discovery = make_test_discovery();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let _join = tokio::spawn(async move {
@@ -10363,7 +10397,7 @@ mod tests {
         // Flood ~50 BlockRequests from a single peer. The first ~1 fits
         // in the bucket, the rest become violations; after
         // max_violations the limiter returns Decision::Disconnect once
-        // and the run loop forwards a PeerCommand::Disconnect.
+        // and the run loop forwards a disconnect via Discovery::disconnect.
         let attacker = nid(99);
         let frame = block_request_frame();
         for _ in 0..50 {
@@ -10378,19 +10412,14 @@ mod tests {
 
         // Wait for the disconnect command. 1s is generous — the run
         // loop processes the flood without any I/O.
-        let cmd = tokio::time::timeout(Duration::from_secs(1), peer_cmd_rx.recv())
+        let node_id = tokio::time::timeout(Duration::from_secs(1), disco_rx.recv())
             .await
-            .expect("disconnect command must fire within 1s")
-            .expect("peer_cmd_tx closed");
-        match cmd {
-            PeerCommand::Disconnect { node_id } => {
-                assert_eq!(
-                    node_id, attacker,
-                    "disconnect must target the flooding peer"
-                );
-            }
-            other => panic!("expected Disconnect, got {other:?}"),
-        }
+            .expect("disconnect must fire within 1s")
+            .expect("disconnect channel closed");
+        assert_eq!(
+            node_id, attacker,
+            "disconnect must target the flooding peer"
+        );
 
         // The limiter's per-kind drop counter and disconnect counter
         // also reflect the flood.
@@ -10416,9 +10445,7 @@ mod tests {
             Arc::clone(&clock),
         ));
 
-        let node = make_node(nid(1));
-        let (peer_cmd_tx, _peer_cmd_rx) = tokio::sync::mpsc::channel::<PeerCommand>(8);
-        let node = node.with_rate_limiter(Arc::clone(&limiter), Some(peer_cmd_tx));
+        let node = make_node(nid(1)).with_rate_limiter(Arc::clone(&limiter));
 
         let signer = fresh_signer();
         let (event_tx, event_rx) = make_test_event_channel();

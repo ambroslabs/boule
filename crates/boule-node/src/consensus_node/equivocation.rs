@@ -174,7 +174,7 @@ impl ConsensusNode {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     kind,
-                    validator = %boule_transport_tcp::tls::node_id_to_base58(who.as_node_id()),
+                    validator = %boule_core::identity::node_id_to_base58(who.as_node_id()),
                     view = view.0,
                     "consensus_equivocation_proof_built",
                 );

@@ -30,7 +30,6 @@ reth = ["boule-node/reth"]
 [dependencies]
 boule-core          = { path = "../boule-core", version = "0.1.0" }
 boule-consensus     = { path = "../boule-consensus", version = "0.1.0" }
-boule-transport-tcp = { path = "../boule-transport-tcp", version = "0.1.0" }
 boule-node          = { path = "../boule-node", version = "0.1.0" }
 tokio              = { version = "1", features = ["full"] }
 anyhow             = "1"

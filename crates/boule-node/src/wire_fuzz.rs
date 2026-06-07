@@ -56,8 +56,8 @@ use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::wire::WireMessage;
 use boule_consensus::{Height, View};
 use boule_core::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
+use boule_core::identity::NodeId;
 use boule_core::identity::NodeIdentity;
-use boule_transport_tcp::NodeId;
 
 // ── Shared signer pool ──────────────────────────────────────────────
 

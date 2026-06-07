@@ -50,16 +50,16 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::status::ConsensusStatus;
 use boule_core::crypto::signed::{NodeSigner, Signer};
 use boule_core::identity::node_id_to_base58;
-use boule_transport_tcp::{self as p2p, PeerCommand};
+use boule_core::transport::overlay::Discovery;
 
 use crate::rotation_handle::{RotationHandle, RotationReceipt};
 
@@ -126,7 +126,7 @@ pub fn router(
     handle: Arc<RotationHandle>,
     mempool: Arc<dyn Mempool>,
     status_rx: Option<watch::Receiver<Arc<ConsensusStatus>>>,
-    p2p_cmd_tx: mpsc::Sender<PeerCommand>,
+    discovery: Arc<dyn Discovery>,
     auth_token: Option<String>,
 ) -> Router {
     let mut router = Router::new()
@@ -139,7 +139,7 @@ pub fn router(
         .merge(boule_consensus::api::submit_router(mempool))
         // Internal-state reads relocated off the public listener (#823): the
         // peer topology and the full consensus snapshot are operator-only.
-        .merge(p2p::api::router(p2p_cmd_tx));
+        .merge(peers_router(discovery));
     if let Some(rx) = status_rx {
         router = router.merge(boule_consensus::api::router(rx));
     }
@@ -150,6 +150,24 @@ pub fn router(
         ));
     }
     router
+}
+
+/// `GET /peers` — the operator-only peer-topology read (#823), served from the
+/// active overlay's discovery (the same live set `/metrics` counts).
+fn peers_router(discovery: Arc<dyn Discovery>) -> Router {
+    Router::new()
+        .route("/peers", get(list_peers))
+        .with_state(discovery)
+}
+
+async fn list_peers(State(discovery): State<Arc<dyn Discovery>>) -> Json<Vec<String>> {
+    Json(
+        discovery
+            .known_peers()
+            .iter()
+            .map(node_id_to_base58)
+            .collect(),
+    )
 }
 
 /// Bearer-token gate for the privileged routes. Compares the
@@ -367,13 +385,14 @@ mod tests {
             Arc::clone(&mempool),
             signer,
         ));
-        // `/peers` needs a p2p command channel; the receiver is dropped (no
-        // peer manager in these unit tests), so a `/peers` request would hang.
-        // These tests only exercise the privileged routes + auth, never
-        // `/peers`, so a dummy sender is fine.
-        let (p2p_cmd_tx, _p2p_cmd_rx) = mpsc::channel(1);
+        // `/peers` is served from a discovery; these tests only exercise the
+        // privileged routes + auth, so an empty in-memory discovery is fine.
+        let (_tx, rx) =
+            tokio::sync::broadcast::channel::<boule_core::transport::overlay::DiscoveryEvent>(1);
+        let discovery: Arc<dyn Discovery> =
+            boule_core::transport::overlay::MemoryDiscovery::spawn(rx);
         (
-            super::router(handle, Arc::clone(&mempool), None, p2p_cmd_tx, token),
+            super::router(handle, Arc::clone(&mempool), None, discovery, token),
             mempool,
         )
     }

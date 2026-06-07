@@ -32,7 +32,7 @@ use anyhow::Context as _;
 
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
@@ -47,18 +47,10 @@ use boule_core::config::{
 };
 use boule_core::crypto::signed::{NodeSigner, Signer};
 use boule_core::identity::NodeIdentity;
+use boule_core::identity::{NodeId, base58_to_node_id, node_id_to_base58};
 use boule_core::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storage, Wal};
-use boule_transport_tcp::dialer::DialerCtx;
-use boule_transport_tcp::manager::ManagerMsg;
-use boule_transport_tcp::overlay::gossip::overlay::{
-    DialerCtxAdapter, GossipOverlay, GossipOverlayConfig, SpawnArgs,
-};
-use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
-use boule_transport_tcp::overlay::{self as overlay_traits};
-use boule_transport_tcp::overlay::{Broadcaster, Discovery, DiscoveryEvent};
-use boule_transport_tcp::tls::{NodeId, TlsIdentity, base58_to_node_id, node_id_to_base58};
-use boule_transport_tcp::tls_protocol::TlsConnectionProtocol;
-use boule_transport_tcp::{self as p2p, ConnectionProtocol};
+use boule_core::transport::overlay as overlay_traits;
+use boule_core::transport::overlay::{Broadcaster, Discovery};
 
 /// Run a node from a fully-resolved configuration plus the network and
 /// (optional) validator identities. When `validator_identity` is `None`,
@@ -70,15 +62,14 @@ pub async fn run(
     network_identity: NodeIdentity,
     validator_identity: Option<NodeIdentity>,
 ) -> anyhow::Result<()> {
-    let identity = Arc::new(TlsIdentity::from_identity(&network_identity)?);
+    let network_node_id = network_identity.node_id()?;
 
     // Reject configurations that would self-dial: a static [[peers]]
-    // entry whose `node_id` matches the local TLS identity loops the
-    // dialer back into our own listener and surfaces in /peers as a
-    // real peer. Done here (rather than at parse time) so the check
-    // can compare against the loaded local NodeId. TOFU bootstrap_addrs
-    // are checked instead by the dialer / listener handshake guards.
-    config.validate(&identity.node_id)?;
+    // entry whose `node_id` matches the local node identity surfaces in
+    // /peers as a real peer. Done here (rather than at parse time) so the
+    // check can compare against the loaded local NodeId. TOFU
+    // bootstrap_addrs are checked instead by the overlay handshake guards.
+    config.validate(&network_node_id)?;
 
     // Resolve the consensus-signing key. When `[node.validator_identity]`
     // is configured, build a separate `NodeSigner` from that key.
@@ -134,9 +125,9 @@ pub async fn run(
     drop(network_identity);
     drop(validator_identity);
 
-    info!("network node ID: {}", node_id_to_base58(&identity.node_id));
+    info!("network node ID: {}", node_id_to_base58(&network_node_id));
     let validator_node_id = consensus_signer.node_id();
-    if validator_node_id != identity.node_id {
+    if validator_node_id != network_node_id {
         info!(
             "validator node ID: {}",
             node_id_to_base58(&validator_node_id)
@@ -181,113 +172,25 @@ pub async fn run(
         );
     }
 
-    let (p2p_cmd_tx, p2p_cmd_rx) = mpsc::channel::<p2p::PeerCommand>(256);
-    let (internal_tx, internal_rx) = mpsc::channel::<ManagerMsg>(256);
-    let (peer_gone_tx, _) = broadcast::channel::<p2p::NodeId>(64);
-    // The p2p manager publishes discovery deltas
-    // (`PeerAdded`/`PeerRemoved`) onto this channel for any consumer that
-    // wants a topology-change event stream. The gossip overlay tracks its
-    // own peer set, so today this has no subscriber in `node::run`; it is
-    // kept as part of the manager's general event surface.
-    let (discovery_tx, _) = broadcast::channel::<DiscoveryEvent>(64);
-
-    let manager_handle = {
-        let itx = internal_tx.clone();
-        let pgt = peer_gone_tx.clone();
-        let dtx = discovery_tx.clone();
-        let our_id = identity.node_id;
-        // The connection limiter combines two config sources:
-        //   - `[p2p.limits]` (issue #134): abuse-protection caps that
-        //     fire on outright floods and per-IP saturation. Optional;
-        //     when absent we still want overlay-level caps (#187) to
-        //     apply.
-        //   - `[overlay]` (issue #187): degree-aware caps tied to the
-        //     gossip overlay's partial-mesh sizing.
-        let connection_limiter = build_connection_limiter(&config);
-        // `[p2p.keepalive]`: per-connection liveness probing. Absent
-        // leaves every connection task without a keepalive timer.
-        // Validated in `Config::validate`, so `timeout > interval` holds
-        // here.
-        let keepalive = config
-            .p2p
-            .keepalive
-            .as_ref()
-            .map(|k| p2p::connection::KeepaliveConfig {
-                interval: std::time::Duration::from_millis(k.interval_ms),
-                timeout: std::time::Duration::from_millis(k.timeout_ms),
-            });
-        // Persistent peers (#827) are the unconditional set: inbound
-        // connections from them bypass the connection limiter's
-        // inbound caps so a validator↔sentry link is never refused.
-        let unconditional = persistent_peers.clone();
-        tokio::spawn(p2p::manager::run(
-            our_id,
-            p2p_cmd_rx,
-            internal_rx,
-            itx,
-            pgt,
-            dtx,
-            connection_limiter,
-            keepalive,
-            unconditional,
-        ))
-    };
-
-    // The gossip overlay needs an outbound dialer for both
-    // `Discovery::add_bootstrap` (TOFU dials of operator-supplied
-    // bootstrap addresses) and the partial-mesh maintenance loop
-    // (verified dials when the table has unconnected candidates).
-    // `DialerCtx` bundles everything `reconnect_loop` needs; we
-    // construct it once here and clone into the overlay.
-    let dialer_ctx = DialerCtx {
-        identity: Arc::clone(&identity),
-        internal_tx: internal_tx.clone(),
-        peer_gone_tx: peer_gone_tx.clone(),
-        peer_cmd_tx: Some(p2p_cmd_tx.clone()),
-        clock: Arc::clone(&clock),
-    };
-
-    // Bind the P2P listener up front so the gossip overlay can
-    // self-advertise the actual bound address (the publisher injects
-    // a `(self_id, listen_addr)` self-entry into every peer-list
-    // push so receivers can dial us back). Listener is consumed
-    // later when `TlsConnectionProtocol` is constructed.
-    //
-    // Outbound-only mode (issue #138): when `[p2p] inbound_disabled =
-    // true` we skip the bind entirely. The overlay's self-advertise
-    // then carries `reachable = false` so peers know not to attempt
-    // to dial back; consensus traffic flows over connections we
-    // initiated.
     let inbound_disabled = config.p2p.inbound_disabled;
-    // In libp2p mode the libp2p Swarm owns its own TCP listener (bound on the
-    // same `node.listen_addr`), so the boule TCP manager must NOT also bind it
-    // — otherwise both race for the port (EADDRINUSE). The manager itself
-    // stays alive (peerless) so /peers, /metrics, and the admin router keep
-    // working; only the listener bind is skipped.
-    let (p2p_listener, p2p_actual_addr) = if inbound_disabled {
+    // libp2p owns its own TCP listener (the Swarm binds `node.listen_addr`).
+    // When inbound is enabled we probe-bind the configured address to resolve
+    // a port-0 into a concrete address for `addr_file`, then free it so libp2p
+    // can bind it (the testnet relies on this bind-then-rebind). A validator in
+    // outbound-only mode (#138) dials out only and binds nothing. A node with
+    // no [consensus] section has no overlay and binds nothing.
+    let p2p_actual_addr = if inbound_disabled {
         info!(
-            "P2P inbound disabled (outbound-only mode); skipping listener bind on {}",
+            "P2P inbound disabled (outbound-only mode); libp2p dials out only ({})",
             config.node.listen_addr
         );
-        (None, config.node.listen_addr)
-    } else if libp2p_overlay_active {
-        // The libp2p Swarm owns its own TCP listener, so the boule TCP manager
-        // must NOT bind it (EADDRINUSE). But the manager stays alive (peerless)
-        // for /peers, /metrics, and the admin router. We still resolve a
-        // concrete port here — bind + immediately free a listener — so a
-        // configured port 0 becomes a real address that `addr_file` reports and
-        // libp2p then binds (mirrors the TCP path's `local_addr()`; same
-        // bind-then-rebind race the testnet discovery already relies on).
+        config.node.listen_addr
+    } else {
         let probe = TcpListener::bind(config.node.listen_addr).await?;
         let addr = probe.local_addr()?;
         drop(probe);
-        info!("overlay=libp2p will bind {addr}; skipping boule TCP listener bind");
-        (None, addr)
-    } else {
-        let listener = TcpListener::bind(config.node.listen_addr).await?;
-        let addr = listener.local_addr()?;
-        info!("P2P listening on {addr}");
-        (Some(listener), addr)
+        info!("overlay=libp2p will bind {addr}");
+        addr
     };
 
     // Optionally start consensus. When the [consensus] section is
@@ -310,11 +213,9 @@ pub async fn run(
             start_consensus(
                 cons_cfg,
                 &config.overlay,
-                &p2p_cmd_tx,
                 &validator_node_id,
                 &consensus_signer,
                 config.node.bls_validator_identity.as_ref(),
-                dialer_ctx,
                 Arc::clone(&clock),
                 p2p_actual_addr,
                 inbound_disabled,
@@ -334,10 +235,13 @@ pub async fn run(
     // Bind the API listener here so we know the actual port before writing addr_file.
     let api_listener = TcpListener::bind(config.api.listen_addr).await?;
     let api_actual_addr = api_listener.local_addr()?;
-    // Live peer-count probe shared by `/metrics` and `/ready` — round-trips
-    // the same peer manager that answers `/peers`.
-    let peer_count: Arc<dyn crate::observability::PeerCount> =
-        Arc::new(PeerManagerCount(p2p_cmd_tx.clone()));
+    // Live peer-count probe shared by `/metrics` and `/ready`, read from the
+    // active overlay's discovery (the same source `/peers` reports). A node
+    // without consensus has no overlay, so it reports zero peers.
+    let peer_count: Arc<dyn crate::observability::PeerCount> = match consensus_runtime.as_ref() {
+        Some(rc) => Arc::new(OverlayPeerCount(Arc::clone(&rc.discovery))),
+        None => Arc::new(ZeroPeerCount),
+    };
     let api_handle = {
         // The PUBLIC listener exposes only observability endpoints
         // (`/health`, `/ready`, `/metrics`). Privileged routes (key rotation,
@@ -374,15 +278,19 @@ pub async fn run(
                 Arc::clone(&rc.rotation),
                 Arc::clone(&rc.mempool),
                 Some(rc.status_rx.clone()),
-                p2p_cmd_tx.clone(),
+                Arc::clone(&rc.discovery),
                 token.clone(),
             ),
             None => {
                 warn!(
                     "[api.admin] listen_addr is set but consensus is disabled; the admin \
-                     listener binds but exposes only /peers (no consensus-privileged routes)."
+                     listener binds but exposes no routes (a node without an overlay has no \
+                     peer source and no consensus-privileged routes)."
                 );
-                let mut r = axum::Router::new().merge(p2p::api::router(p2p_cmd_tx.clone()));
+                // No overlay without consensus and no legacy peer manager — the
+                // admin surface is empty. Still apply the bearer layer for
+                // consistency so the listener behaves uniformly.
+                let mut r = axum::Router::new();
                 if let Some(t) = token.clone() {
                     r = r.layer(axum::middleware::from_fn_with_state(
                         Arc::new(t),
@@ -419,7 +327,7 @@ pub async fn run(
         let mut content = serde_json::json!({
             "p2p_addr": p2p_actual_addr.to_string(),
             "api_addr": api_actual_addr.to_string(),
-            "node_id": node_id_to_base58(&identity.node_id),
+            "node_id": node_id_to_base58(&network_node_id),
         });
         if let Some(admin_addr) = admin_actual_addr {
             content["admin_addr"] = serde_json::Value::String(admin_addr.to_string());
@@ -427,28 +335,8 @@ pub async fn run(
         std::fs::write(path, content.to_string())?;
     }
 
-    // Pre-admission handshake bound (#805): construct alongside the
-    // listener when `[p2p.limits]` is present, mirroring the
-    // ConnectionLimiter's opt-in plumbing. Absent `[p2p.limits]` leaves
-    // the legacy un-timed accept path (closed-network test deployments).
-    let handshake_limiter = config.p2p.limits.as_ref().map(|l| {
-        Arc::new(boule_core::transport::limits::HandshakeLimiter::new(
-            l.handshake_limits(),
-        ))
-    });
-    let protocol = TlsConnectionProtocol {
-        identity: Arc::clone(&identity),
-        peers: config.peers.clone(),
-        listener: p2p_listener,
-        handshake_limiter,
-        clock: Arc::clone(&clock),
-        peer_cmd_tx: Some(p2p_cmd_tx.clone()),
-    };
-    let protocol_handle = tokio::spawn(protocol.run(internal_tx.clone(), peer_gone_tx.clone()));
-
     tokio::signal::ctrl_c().await?;
     info!("shutting down...");
-    drop(p2p_cmd_tx);
 
     let (consensus_join, overlay_joins) = match consensus_runtime {
         Some(rc) => {
@@ -469,12 +357,10 @@ pub async fn run(
     }
 
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
-        let _ = manager_handle.await;
         let _ = api_handle.await;
         if let Some(h) = admin_handle {
             let _ = h.await;
         }
-        let _ = protocol_handle.await;
         if let Some(h) = consensus_join {
             let _ = h.await;
         }
@@ -487,25 +373,24 @@ pub async fn run(
     Ok(())
 }
 
-/// [`observability::PeerCount`] backed by the live p2p peer manager. Round-
-/// trips a [`p2p::PeerCommand::ListPeers`] (the same command `/peers` uses)
-/// and reports the length, degrading to `0` if the manager channel is closed.
-struct PeerManagerCount(mpsc::Sender<p2p::PeerCommand>);
+/// [`observability::PeerCount`] backed by the active overlay's discovery —
+/// the same live peer set `/peers` reports.
+struct OverlayPeerCount(Arc<dyn Discovery>);
 
-impl crate::observability::PeerCount for PeerManagerCount {
+impl crate::observability::PeerCount for OverlayPeerCount {
     fn count(&self) -> futures_util::future::BoxFuture<'static, usize> {
-        let tx = self.0.clone();
-        Box::pin(async move {
-            let (reply, rx) = oneshot::channel::<Vec<p2p::NodeId>>();
-            if tx
-                .send(p2p::PeerCommand::ListPeers { reply })
-                .await
-                .is_err()
-            {
-                return 0;
-            }
-            rx.await.map(|peers| peers.len()).unwrap_or(0)
-        })
+        let n = self.0.known_peers().len();
+        Box::pin(async move { n })
+    }
+}
+
+/// [`observability::PeerCount`] for a node with no `[consensus]` section (and
+/// therefore no overlay): it has no peers, so it reports zero.
+struct ZeroPeerCount;
+
+impl crate::observability::PeerCount for ZeroPeerCount {
+    fn count(&self) -> futures_util::future::BoxFuture<'static, usize> {
+        Box::pin(async move { 0 })
     }
 }
 
@@ -532,6 +417,10 @@ struct RunningConsensus {
     /// Overlay sub-task joins (orchestrator + publisher + partial-mesh
     /// maintenance).
     overlay_joins: Vec<tokio::task::JoinHandle<()>>,
+    /// The active overlay's discovery handle, exposed to `node::run` so the
+    /// admin `/peers` endpoint and the `/metrics` peer-count probe read the
+    /// live peer set directly (no separate peer manager).
+    discovery: Arc<dyn Discovery>,
 }
 
 /// Build the reth-backed
@@ -630,20 +519,17 @@ async fn reth_application(
 
 /// Start the HotStuff consensus protocol alongside gossip + ping.
 ///
-/// Registers `boule_transport_tcp::overlay::gossip::PROTOCOL_ID`, spawns
-/// a `GossipOverlay` over the handle, ingests
-/// `overlay_cfg.bootstrap_addrs` via `Discovery::add_bootstrap`, and
-/// wires consensus to the overlay's `GossipBroadcaster` /
-/// `GossipDiscovery`.
+/// Registers the consensus protocol with the overlay, spawns a
+/// `GossipOverlay` over the handle, ingests `overlay_cfg.bootstrap_addrs`
+/// via `Discovery::add_bootstrap`, and wires consensus to the overlay's
+/// `GossipBroadcaster` / `GossipDiscovery`.
 #[allow(clippy::too_many_arguments)]
 async fn start_consensus(
     cons_cfg: &ConsensusConfig,
     overlay_cfg: &OverlayConfig,
-    p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
     self_id: &NodeId,
     signer: &Arc<NodeSigner>,
     bls_identity_config: Option<&BlsIdentityConfig>,
-    dialer_ctx: DialerCtx,
     clock: Arc<dyn Clock>,
     self_listen_addr: std::net::SocketAddr,
     inbound_disabled: bool,
@@ -792,11 +678,9 @@ async fn start_consensus(
         peer_outbound_overflows,
     } = build_overlay_wiring(
         overlay_cfg,
-        p2p_cmd_tx,
         *self_id,
         self_listen_addr,
         inbound_disabled,
-        dialer_ctx,
         clock,
         private_peers,
         persistent_peers,
@@ -884,7 +768,9 @@ async fn start_consensus(
     let (status_tx, status_rx) = watch::channel(initial_status);
     let mut node = node.with_status_publisher(status_tx);
     if let Some(limiter) = rate_limiter {
-        node = node.with_rate_limiter(limiter, Some(p2p_cmd_tx.clone()));
+        // The limiter's `Disconnect` decisions are routed through the active
+        // overlay's discovery inside `run` (libp2p tears the connection down).
+        node = node.with_rate_limiter(limiter);
     }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -910,6 +796,9 @@ async fn start_consensus(
         Arc::clone(&rotatable_signer),
     ));
     let signer: Arc<dyn boule_core::crypto::signed::Signer> = rotatable_signer;
+    // Keep a handle to the discovery for the admin /peers + /metrics surface
+    // before `run` takes ownership of its copy.
+    let discovery_for_api = Arc::clone(&discovery);
     let join = tokio::spawn(async move {
         node.run(broadcaster, discovery, event_rx, signer, shutdown_rx)
             .await
@@ -923,53 +812,8 @@ async fn start_consensus(
         rotation,
         overlay_shutdown,
         overlay_joins,
+        discovery: discovery_for_api,
     })
-}
-
-/// Merge `[p2p.limits]` (issue #134, abuse-protection caps) and
-/// `[overlay]` (#187, overlay-degree-aware caps) into a single
-/// [`boule_core::transport::limits::ConnectionLimitsConfig`] for the manager's
-/// admission gate. Returns `None` only when neither source
-/// contributes a binding limit, in which case the manager runs
-/// without a connection limiter (the simulator and gossip-only test
-/// paths).
-///
-/// Behaviour (the gossip overlay always contributes degree-aware caps
-/// from `[overlay]`, so a limiter is always built):
-///
-/// - `[p2p.limits]` absent → limiter built from overlay caps only;
-///   outbound and per-IP fall through to `usize::MAX` (no abuse
-///   protection without `[p2p.limits]`).
-/// - `[p2p.limits]` present → tighter of the two `max_inbound`s wins;
-///   overlay's `total_max` is the only source for `max_total`.
-fn build_connection_limiter(
-    config: &Config,
-) -> Option<Arc<boule_core::transport::limits::ConnectionLimiter>> {
-    use boule_core::transport::limits::ConnectionLimitsConfig;
-
-    let limits = config
-        .p2p
-        .limits
-        .as_ref()
-        .map(boule_core::transport::limits::ConnectionLimitsConfig::from_config);
-
-    let merged = match limits {
-        None => ConnectionLimitsConfig {
-            max_inbound: config.overlay.inbound_max,
-            max_outbound: usize::MAX,
-            max_per_ip: usize::MAX,
-            max_total: config.overlay.total_max,
-        },
-        Some(l) => ConnectionLimitsConfig {
-            max_inbound: l.max_inbound.min(config.overlay.inbound_max),
-            max_outbound: l.max_outbound,
-            max_per_ip: l.max_per_ip,
-            max_total: l.max_total.min(config.overlay.total_max),
-        },
-    };
-    Some(Arc::new(
-        boule_core::transport::limits::ConnectionLimiter::new(merged),
-    ))
 }
 
 /// Bundle returned by [`reconcile_bls_identity`] on `bls_aggregated`
@@ -1128,10 +972,10 @@ const LIBP2P_IDLE_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration:
 struct OverlayWiring {
     broadcaster: Arc<dyn Broadcaster>,
     discovery: Arc<dyn Discovery>,
-    event_rx: mpsc::Receiver<p2p::ProtocolEvent>,
+    event_rx: mpsc::Receiver<overlay_traits::ProtocolEvent>,
     overlay_shutdown: Option<oneshot::Sender<()>>,
     overlay_joins: Vec<tokio::task::JoinHandle<()>>,
-    /// Shared overflow counter from the gossip [`OverlaySink`].
+    /// Shared overflow counter from the gossip `OverlaySink` (removed).
     /// Plumbed into [`ConsensusNode::with_gossip_sink_overflow_counter`]
     /// so [`boule_consensus::status::BackpressureStatus`] surfaces the
     /// running drop count.
@@ -1149,111 +993,20 @@ struct OverlayWiring {
 #[allow(clippy::too_many_arguments)]
 async fn build_overlay_wiring(
     overlay_cfg: &OverlayConfig,
-    p2p_cmd_tx: &mpsc::Sender<p2p::PeerCommand>,
     self_id: NodeId,
     self_listen_addr: std::net::SocketAddr,
     inbound_disabled: bool,
-    dialer_ctx: DialerCtx,
     clock: Arc<dyn Clock>,
     private_peers: std::collections::HashSet<NodeId>,
     persistent_peers: std::collections::HashSet<NodeId>,
     libp2p_keypair: Option<boule_transport_libp2p::identity::Keypair>,
     libp2p_limits: boule_transport_libp2p::swarm::Limits,
 ) -> anyhow::Result<OverlayWiring> {
-    match overlay_cfg.mode {
-        OverlayMode::Gossip => {
-            // Register the gossip overlay's protocol. Consensus
-            // traffic + overlay control frames share this channel
-            // (`OverlayFrame::Forward { .. }` vs
-            // `OverlayFrame::PeerList(..)`).
-            let (reg_tx, reg_rx) = oneshot::channel();
-            p2p_cmd_tx
-                .send(p2p::PeerCommand::RegisterProtocol {
-                    id: boule_transport_tcp::overlay::gossip::PROTOCOL_ID,
-                    max_frame_bytes: Some(boule_transport_tcp::overlay::gossip::MAX_FRAME_BYTES),
-                    reply: reg_tx,
-                })
-                .await?;
-            let handle = reg_rx.await?;
-            let peer_outbound_overflows = Arc::clone(&handle.peer_outbound_overflows);
-
-            let sink = Arc::new(OverlaySink::new(handle.send_tx));
-            let gossip_sink_overflows = Some(sink.overflow_counter());
-            let dialer = Arc::new(DialerCtxAdapter::new(dialer_ctx));
-
-            // Mix self_id into the rng_seed so each node's RNG draws
-            // a different sequence. Take the first 8 bytes of the
-            // pubkey — sufficient entropy at validator-set scale.
-            let mut seed_bytes = [0u8; 8];
-            seed_bytes.copy_from_slice(&self_id[0..8]);
-            let rng_seed = u64::from_le_bytes(seed_bytes);
-            let mut cfg = GossipOverlayConfig::from_config(overlay_cfg, rng_seed);
-            // Sentry topology (#827): `from_config` can't see `[[peers]]`,
-            // so inject the private (non-gossiped) and persistent
-            // (never-trimmed) sets here.
-            cfg.peer_list.private = private_peers;
-            cfg.maintenance.persistent = persistent_peers;
-
-            // In outbound-only mode (issue #138) the listener was
-            // never bound, so there is no advertisable listen address.
-            // Pass `None` so the publisher omits the self-entry —
-            // peers learn about us only through whichever connection
-            // we initiated, and our `reachable = false` advertisement
-            // is carried by the publisher's `self_reachable` flag.
-            let advertise_addr = if inbound_disabled {
-                None
-            } else {
-                Some(self_listen_addr)
-            };
-            let handles = GossipOverlay::spawn(SpawnArgs {
-                self_id,
-                self_listen_addr: advertise_addr,
-                self_reachable: !inbound_disabled,
-                event_rx: handle.event_rx,
-                sink,
-                dialer,
-                clock,
-                config: cfg,
-            });
-
-            // Boot-time bootstrap ingestion. Each `add_bootstrap`
-            // call triggers a TOFU dial via the Dialer plumbed into
-            // `GossipDiscovery`.
-            for addr in &overlay_cfg.bootstrap_addrs {
-                handles.discovery.add_bootstrap(*addr);
-            }
-
-            info!(
-                "overlay: gossip (outbound_target={}, inbound_max={}, total_max={}, \
-                 bootstrap_addrs={})",
-                overlay_cfg.outbound_target,
-                overlay_cfg.inbound_max,
-                overlay_cfg.total_max,
-                overlay_cfg.bootstrap_addrs.len()
-            );
-
-            let broadcaster: Arc<dyn Broadcaster> = Arc::new(handles.broadcaster);
-            let discovery: Arc<dyn overlay_traits::Discovery> = handles.discovery;
-            Ok(OverlayWiring {
-                broadcaster,
-                discovery,
-                event_rx: handles.event_rx,
-                overlay_shutdown: Some(handles.shutdown),
-                overlay_joins: vec![
-                    handles.overlay_join,
-                    handles.publisher_join,
-                    handles.maintenance_join,
-                ],
-                gossip_sink_overflows,
-                peer_outbound_overflows,
-            })
-        }
-        OverlayMode::Libp2p => {
-            // The libp2p backend (#840) owns its own Swarm/transport and does
-            // not use the TCP peer manager — `p2p_cmd_tx` / `dialer_ctx` are
-            // unused here (the listener was skipped in `run`). The keypair was
-            // derived from the network identity in `run` before it was dropped.
-            let _ = (p2p_cmd_tx, dialer_ctx, private_peers, persistent_peers);
+    // libp2p (#840) is the only overlay backend. It owns its own
+    // Swarm/transport; the consensus seam never names the concrete overlay.
+    let _ = (self_id, clock, private_peers, persistent_peers);
+    {
+        {
             let keypair = libp2p_keypair.context(
                 "internal wiring error: libp2p overlay selected but no keypair was derived",
             )?;

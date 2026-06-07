@@ -107,7 +107,7 @@ impl ConsensusNode {
             recorded_any = true;
             tracing::warn!(
                 target: TRACE_TARGET,
-                validator = %boule_transport_tcp::tls::node_id_to_base58(who.as_node_id()),
+                validator = %boule_core::identity::node_id_to_base58(who.as_node_id()),
                 evidence_view = evidence_view.0,
                 committed_view = block_view.0,
                 "consensus_equivocation_evidence_committed",

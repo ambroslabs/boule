@@ -46,6 +46,8 @@ enum Command {
     SendTo { target: NodeId, payload: Bytes },
     /// Dial a peer at the given address (bootstrap ingestion).
     Dial(Multiaddr),
+    /// Drop the connection to a peer (rate-limiter eviction).
+    Disconnect(NodeId),
 }
 
 /// Everything [`spawn`] hands back to the rest of the node.
@@ -176,6 +178,11 @@ impl Discovery for Libp2pDiscovery {
             .try_send(Command::Dial(socketaddr_to_multiaddr(addr)));
     }
 
+    fn disconnect(&self, node_id: NodeId) {
+        // Non-blocking; the driver closes the swarm connection to this peer.
+        let _ = self.cmd_tx.try_send(Command::Disconnect(node_id));
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<DiscoveryEvent> {
         self.events.subscribe()
     }
@@ -252,6 +259,11 @@ impl Driver {
                     },
                     Some(Command::Dial(addr)) => {
                         let _ = self.swarm.dial(addr);
+                    }
+                    Some(Command::Disconnect(node_id)) => {
+                        if let Ok(peer) = peer_id_for(&node_id) {
+                            let _ = self.swarm.disconnect_peer_id(peer);
+                        }
                     }
                     None => break,
                 },
