@@ -2,11 +2,25 @@
 #
 # # Test groups
 #
-# `heavy-compute` is the cohort of CPU-bound tests that should never share a
-# physical core with another heavy test. `max-threads = 1` means at most one
-# test from this group runs at a time on a given runner; this keeps local
+# `heavy-compute` is the cohort of tests that should never share a physical
+# core with another heavy test. `max-threads = 1` means at most one test from
+# this group runs at a time on a given runner; this keeps local
 # `cargo nextest run` invocations honest and is the source of truth that the
 # CI shard split mirrors.
+#
+# Two kinds of test live here:
+#
+#   1. CPU-bound tests (25-node sims, BLS pairing/PoP) that would slow each
+#      other down by contending for cores.
+#   2. Multi-node libp2p cluster integration tests (the `testnet_driver_test`
+#      binary plus the `test_libp2p_overlay_3_node_smoke` /
+#      `test_consensus_status_endpoint_reports_live_progress` smoke tests).
+#      These are not CPU-bound, but they stand up real nodes over loopback
+#      sockets and must form a gossipsub mesh and commit within a budget.
+#      Under the default shard's `--test-threads=$(nproc)` they get starved
+#      during the mesh-formation window and flake (compounded by #855: the
+#      overlay does not re-dial bootstrap peers, so a startup dial race never
+#      recovers). Run one-at-a-time they get a full core and converge fast.
 #
 # # Adding a new heavy test
 #
@@ -34,5 +48,5 @@
 heavy-compute = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/)'
+filter = 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + binary(testnet_driver_test) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
 test-group = 'heavy-compute'

@@ -79,10 +79,13 @@ jobs:
         run: cargo clippy -p boule-cli --features reth --all-targets -- -D warnings
 
   test:
-    # Two shards on separate runners to isolate CPU-bound tests from the rest
-    # of the suite. The `heavy` shard runs compute-heavy tests serially
-    # (`--test-threads=1`); the `default` shard runs everything else at the
-    # runner's natural parallelism (no oversubscription).
+    # Two shards on separate runners to isolate tests that must not share a
+    # core from the rest of the suite. The `heavy` shard runs serially
+    # (`--test-threads=1`): compute-heavy tests (sims, BLS) plus the
+    # multi-node libp2p cluster integration tests, whose mesh-formation
+    # liveness is starved under the default shard's full parallelism. The
+    # `default` shard runs everything else at the runner's natural
+    # parallelism (no oversubscription).
     #
     # `HEAVY_FILTER` is the canonical filter expression that selects the
     # heavy cohort. KEEP IN SYNC with `.config/nextest.toml`'s
@@ -96,7 +99,7 @@ jobs:
       matrix:
         shard: [heavy, default]
     env:
-      HEAVY_FILTER: 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/)'
+      HEAVY_FILTER: 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + binary(testnet_driver_test) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
     steps:
       - uses: actions/checkout@v4
       - if: needs.changes.outputs.rust == 'true'
@@ -109,7 +112,7 @@ jobs:
         name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
       - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'heavy'
-        name: Heavy shard (compute-bound, serialized)
+        name: Heavy shard (serialized — compute-bound + multi-node clusters)
         run: cargo nextest run --locked --all-targets -E "$HEAVY_FILTER" --test-threads=1
       - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'default'
         name: Default shard (everything else, parallel)
