@@ -53,10 +53,6 @@ use boule_core::transport::overlay as overlay_traits;
 use boule_core::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 use boule_transport_tcp::dialer::DialerCtx;
 use boule_transport_tcp::manager::ManagerMsg;
-use boule_transport_tcp::overlay::gossip::overlay::{
-    DialerCtxAdapter, GossipOverlay, GossipOverlayConfig, SpawnArgs,
-};
-use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
 use boule_transport_tcp::tls::TlsIdentity;
 use boule_transport_tcp::tls_protocol::TlsConnectionProtocol;
 use boule_transport_tcp::{self as p2p, ConnectionProtocol};
@@ -1158,7 +1154,7 @@ struct OverlayWiring {
     event_rx: mpsc::Receiver<p2p::ProtocolEvent>,
     overlay_shutdown: Option<oneshot::Sender<()>>,
     overlay_joins: Vec<tokio::task::JoinHandle<()>>,
-    /// Shared overflow counter from the gossip [`OverlaySink`].
+    /// Shared overflow counter from the gossip `OverlaySink` (removed).
     /// Plumbed into [`ConsensusNode::with_gossip_sink_overflow_counter`]
     /// so [`boule_consensus::status::BackpressureStatus`] surfaces the
     /// running drop count.
@@ -1189,91 +1185,19 @@ async fn build_overlay_wiring(
 ) -> anyhow::Result<OverlayWiring> {
     match overlay_cfg.mode {
         OverlayMode::Gossip => {
-            // Register the gossip overlay's protocol. Consensus
-            // traffic + overlay control frames share this channel
-            // (`OverlayFrame::Forward { .. }` vs
-            // `OverlayFrame::PeerList(..)`).
-            let (reg_tx, reg_rx) = oneshot::channel();
-            p2p_cmd_tx
-                .send(p2p::PeerCommand::RegisterProtocol {
-                    id: boule_transport_tcp::overlay::gossip::PROTOCOL_ID,
-                    max_frame_bytes: Some(boule_transport_tcp::overlay::gossip::MAX_FRAME_BYTES),
-                    reply: reg_tx,
-                })
-                .await?;
-            let handle = reg_rx.await?;
-            let peer_outbound_overflows = Arc::clone(&handle.peer_outbound_overflows);
-
-            let sink = Arc::new(OverlaySink::new(handle.send_tx));
-            let gossip_sink_overflows = Some(sink.overflow_counter());
-            let dialer = Arc::new(DialerCtxAdapter::new(dialer_ctx));
-
-            // Mix self_id into the rng_seed so each node's RNG draws
-            // a different sequence. Take the first 8 bytes of the
-            // pubkey — sufficient entropy at validator-set scale.
-            let mut seed_bytes = [0u8; 8];
-            seed_bytes.copy_from_slice(&self_id[0..8]);
-            let rng_seed = u64::from_le_bytes(seed_bytes);
-            let mut cfg = GossipOverlayConfig::from_config(overlay_cfg, rng_seed);
-            // Sentry topology (#827): `from_config` can't see `[[peers]]`,
-            // so inject the private (non-gossiped) and persistent
-            // (never-trimmed) sets here.
-            cfg.peer_list.private = private_peers;
-            cfg.maintenance.persistent = persistent_peers;
-
-            // In outbound-only mode (issue #138) the listener was
-            // never bound, so there is no advertisable listen address.
-            // Pass `None` so the publisher omits the self-entry —
-            // peers learn about us only through whichever connection
-            // we initiated, and our `reachable = false` advertisement
-            // is carried by the publisher's `self_reachable` flag.
-            let advertise_addr = if inbound_disabled {
-                None
-            } else {
-                Some(self_listen_addr)
-            };
-            let handles = GossipOverlay::spawn(SpawnArgs {
+            // The custom gossip overlay was removed (milestone #6 / #840);
+            // libp2p is the only overlay backend now.
+            let _ = (
+                p2p_cmd_tx,
                 self_id,
-                self_listen_addr: advertise_addr,
-                self_reachable: !inbound_disabled,
-                event_rx: handle.event_rx,
-                sink,
-                dialer,
+                self_listen_addr,
+                inbound_disabled,
+                dialer_ctx,
                 clock,
-                config: cfg,
-            });
-
-            // Boot-time bootstrap ingestion. Each `add_bootstrap`
-            // call triggers a TOFU dial via the Dialer plumbed into
-            // `GossipDiscovery`.
-            for addr in &overlay_cfg.bootstrap_addrs {
-                handles.discovery.add_bootstrap(*addr);
-            }
-
-            info!(
-                "overlay: gossip (outbound_target={}, inbound_max={}, total_max={}, \
-                 bootstrap_addrs={})",
-                overlay_cfg.outbound_target,
-                overlay_cfg.inbound_max,
-                overlay_cfg.total_max,
-                overlay_cfg.bootstrap_addrs.len()
+                private_peers,
+                persistent_peers,
             );
-
-            let broadcaster: Arc<dyn Broadcaster> = Arc::new(handles.broadcaster);
-            let discovery: Arc<dyn overlay_traits::Discovery> = handles.discovery;
-            Ok(OverlayWiring {
-                broadcaster,
-                discovery,
-                event_rx: handles.event_rx,
-                overlay_shutdown: Some(handles.shutdown),
-                overlay_joins: vec![
-                    handles.overlay_join,
-                    handles.publisher_join,
-                    handles.maintenance_join,
-                ],
-                gossip_sink_overflows,
-                peer_outbound_overflows,
-            })
+            anyhow::bail!("the gossip overlay has been removed; set [overlay] mode = \"libp2p\"")
         }
         OverlayMode::Libp2p => {
             // The libp2p backend (#840) owns its own Swarm/transport and does

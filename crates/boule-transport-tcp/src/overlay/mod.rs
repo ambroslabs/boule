@@ -36,9 +36,10 @@
 //!
 //! # Implementations
 //!
-//! - [`crate::overlay::gossip`] — the partial-mesh gossip overlay (issue
-//!   #137). The production overlay, and the only one wired into
-//!   `node::run`.
+//! The legacy partial-mesh gossip overlay (issue #137) was removed in the
+//! libp2p migration (milestone #6 / #840); libp2p is the production overlay.
+//! What remains here are the trait re-exports + the in-memory test doubles:
+//!
 //! - `memory` — in-memory [`crate::overlay::Broadcaster`] /
 //!   [`crate::overlay::Discovery`] **test fakes**
 //!   ([`crate::overlay::MemoryBroadcaster`] /
@@ -50,8 +51,6 @@
 //!
 //! - NAT traversal.
 //! - Dynamic membership / validator-set changes.
-
-pub mod gossip;
 
 // `MemoryBroadcaster`/`MemoryDiscovery` moved to `boule-core` (test doubles,
 // transport-agnostic); re-exported here for back-compat.

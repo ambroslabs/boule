@@ -55,7 +55,6 @@
 //! [`cut_link`]: SimCluster::cut_link
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -83,12 +82,6 @@ use boule_core::transport::overlay::{
     Broadcaster, Discovery, DiscoveryEvent, MemoryBroadcaster, MemoryDiscovery, ProtocolEvent,
     ProtocolOutbound,
 };
-use boule_transport_tcp::overlay::gossip::maintenance::{Dialer, MeshMaintenanceConfig};
-use boule_transport_tcp::overlay::gossip::overlay::{
-    GossipOverlay, GossipOverlayConfig, GossipOverlayHandles, SpawnArgs,
-};
-use boule_transport_tcp::overlay::gossip::peer_list_task::{OverlayUnicast, PeerListGossipConfig};
-use boule_transport_tcp::overlay::gossip::sink::OverlaySink;
 use bytes::Bytes;
 use rand::Rng;
 use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
@@ -215,28 +208,8 @@ impl SimMessage {
 /// payloads the `BareRouting` harness injects — in which case the
 /// selective-drop predicate is not consulted and the frame is delivered.
 fn decode_sim_message(payload: &[u8], framing: PayloadFraming) -> Option<SimMessage> {
-    let wire_bytes: &[u8] = match framing {
-        PayloadFraming::Mesh => payload,
-        PayloadFraming::GossipOverlay => {
-            // Unwrap the gossip `Forward` envelope to reach the inner
-            // consensus frame, mirroring `VoteObserver::observe_outbound`.
-            // Decode straight from the borrowed inner `Bytes`.
-            match postcard::from_bytes::<boule_transport_tcp::overlay::gossip::wire::OverlayFrame>(
-                payload,
-            ) {
-                Ok(boule_transport_tcp::overlay::gossip::wire::OverlayFrame::Forward {
-                    payload: inner,
-                    ..
-                }) => {
-                    return postcard::from_bytes::<boule_consensus::wire::WireMessage>(&inner)
-                        .ok()
-                        .map(|w| SimMessage::from_wire(&w));
-                }
-                _ => return None,
-            }
-        }
-    };
-    postcard::from_bytes::<boule_consensus::wire::WireMessage>(wire_bytes)
+    let PayloadFraming::Mesh = framing;
+    postcard::from_bytes::<boule_consensus::wire::WireMessage>(payload)
         .ok()
         .map(|w| SimMessage::from_wire(&w))
 }
@@ -333,15 +306,10 @@ struct SelectiveControls {
 ///
 /// `Mesh` route tasks (the `spawn` / `spawn_with_*` family) write
 /// postcard-encoded [`boule_consensus::wire::WireMessage`] bytes
-/// straight onto the per-node send channel. `GossipOverlay` route tasks
-/// (the `spawn_gossip` family) instead write postcard-encoded
-/// [`boule_transport_tcp::overlay::gossip::wire::OverlayFrame`] bytes whose
-/// `Forward.payload` carries the inner `WireMessage` — the observer
-/// unwraps that one extra layer before decoding.
+/// straight onto the per-node send channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PayloadFraming {
     Mesh,
-    GossipOverlay,
 }
 
 /// A safety-core vote-uniqueness violation observed by [`VoteObserver`].
@@ -355,9 +323,7 @@ enum PayloadFraming {
 pub struct VoteViolation {
     /// Stable identity of the replica whose safety core emitted both
     /// votes. Resolved from the [`boule_core::crypto::signed::Signed::signer`]
-    /// field on the observed vote envelope, so the attribution survives
-    /// gossip-mode forwarding (the originator's signer travels with the
-    /// payload).
+    /// field on the observed vote envelope.
     pub replica: NodeId,
     /// View at which the conflict was observed.
     pub view: View,
@@ -447,38 +413,9 @@ impl VoteObserver {
     /// variants (proposals, new-views, block requests, ...) are
     /// expected on the same channel and intentionally ignored.
     fn observe_outbound(&self, payload: &[u8], framing: PayloadFraming) {
-        let wire_bytes: &[u8] = match framing {
-            PayloadFraming::Mesh => payload,
-            PayloadFraming::GossipOverlay => {
-                match postcard::from_bytes::<boule_transport_tcp::overlay::gossip::wire::OverlayFrame>(
-                    payload,
-                ) {
-                    Ok(boule_transport_tcp::overlay::gossip::wire::OverlayFrame::Forward {
-                        payload: inner,
-                        ..
-                    }) => {
-                        // Re-decode from the unwrapped inner payload.
-                        // `Bytes` doesn't `as_ref` to `&[u8]` in a way
-                        // that survives the match, so reborrow via a
-                        // local. Avoid `into_inner` to keep zero-copy
-                        // semantics in the common case.
-                        if let Ok(boule_consensus::wire::WireMessage::Vote(signed, _)) =
-                            postcard::from_bytes::<boule_consensus::wire::WireMessage>(&inner)
-                        {
-                            self.record(
-                                signed.signer,
-                                signed.payload.view,
-                                signed.payload.block_hash,
-                            );
-                        }
-                        return;
-                    }
-                    _ => return,
-                }
-            }
-        };
+        let PayloadFraming::Mesh = framing;
         if let Ok(boule_consensus::wire::WireMessage::Vote(signed, _)) =
-            postcard::from_bytes::<boule_consensus::wire::WireMessage>(wire_bytes)
+            postcard::from_bytes::<boule_consensus::wire::WireMessage>(payload)
         {
             self.record(
                 signed.signer,
@@ -497,25 +434,9 @@ impl VoteObserver {
     /// recorded so the test can affirm a full node *does* still relay /
     /// serve those.
     fn observe_emitter_outbound(&self, emitter: NodeId, payload: &[u8], framing: PayloadFraming) {
-        // Unwrap the gossip overlay frame to the inner wire bytes, mirroring
-        // `observe_outbound`. Mesh framing is the wire bytes directly.
-        let wire_bytes: std::borrow::Cow<'_, [u8]> = match framing {
-            PayloadFraming::Mesh => std::borrow::Cow::Borrowed(payload),
-            PayloadFraming::GossipOverlay => {
-                match postcard::from_bytes::<boule_transport_tcp::overlay::gossip::wire::OverlayFrame>(
-                    payload,
-                ) {
-                    Ok(boule_transport_tcp::overlay::gossip::wire::OverlayFrame::Forward {
-                        payload: inner,
-                        ..
-                    }) => std::borrow::Cow::Owned(inner.to_vec()),
-                    _ => return,
-                }
-            }
-        };
-        let Ok(msg) =
-            postcard::from_bytes::<boule_consensus::wire::WireMessage>(wire_bytes.as_ref())
-        else {
+        // Mesh framing is the wire bytes directly.
+        let PayloadFraming::Mesh = framing;
+        let Ok(msg) = postcard::from_bytes::<boule_consensus::wire::WireMessage>(payload) else {
             return;
         };
         use boule_consensus::wire::WireMessage as W;
@@ -723,15 +644,10 @@ pub struct SimCluster {
     commit_cache: Vec<Vec<Block>>,
     /// Shutdown senders; `None` after `kill_node` has been called for that slot.
     shutdown_txs: Vec<Option<oneshot::Sender<()>>>,
-    /// Per-orchestrator shutdown senders (gossip-mode clusters only).
-    /// Held for the lifetime of the cluster so the orchestrator's
-    /// `select!` shutdown arm stays pending; dropped together on
-    /// [`SimCluster::drop`]. Empty for mesh-mode clusters.
-    overlay_shutdowns: Vec<oneshot::Sender<()>>,
     /// Per-node signers, captured so [`SimCluster::restart_all_with_recover`]
     /// can re-spawn the cluster with the same identities. In the same
     /// `node_ids` order. `None` for clusters that don't support
-    /// restart (e.g. the gossip-mode cluster).
+    /// restart.
     signers: Option<Vec<Arc<dyn Signer>>>,
     /// Per-node hot-rotation signers (#312), in `node_ids` order. A test
     /// injects a key rotation mid-run via [`SimCluster::register_rotation`],
@@ -761,8 +677,8 @@ pub struct SimCluster {
     /// Per-replica vote-uniqueness observer (issue #422 / audit
     /// finding 14-3). Wired into every per-node route task so each
     /// safety core's outbound `ConsensusMsg::Vote` frames are recorded
-    /// and diffed against prior votes at the same view. Default-on
-    /// across mesh and gossip-mode clusters; teardown via
+    /// and diffed against prior votes at the same view. Default-on;
+    /// teardown via
     /// [`Self::assert_no_replica_double_voted`] runs from `Drop` so
     /// every existing sim test picks up the assertion automatically.
     pub vote_observer: Arc<VoteObserver>,
@@ -1565,7 +1481,6 @@ impl SimCluster {
             crash_slots,
             commit_cache,
             shutdown_txs,
-            overlay_shutdowns: Vec::new(),
             signers: Some(signers_for_restart),
             rotatable_signers: rotatable_signers_captured,
             storages: Some(storages_for_restart),
@@ -1586,8 +1501,7 @@ impl SimCluster {
     }
 
     /// Borrow node `idx`'s consensus signer. Returns `None` if the
-    /// cluster was spawned without restart-capable signers (i.e. the
-    /// gossip-mode harness, which doesn't capture them). Used by sim
+    /// cluster was spawned without restart-capable signers. Used by sim
     /// tests that need to construct signed payloads under a node's
     /// current identity — e.g. the validator-key-rotation tx (#260),
     /// where the rotation envelope's `sig_old` must come from the
@@ -1776,7 +1690,7 @@ impl SimCluster {
 
     /// Per-node durable storage handle, in the same `node_ids` order as
     /// [`Self::signer`]. Returns `None` for clusters that don't capture
-    /// per-node storages (the gossip-mode harness). The same `Arc` is
+    /// per-node storages. The same `Arc` is
     /// handed to `ConsensusNode::recover` across
     /// [`SimCluster::restart_node_with_recover`], so reading the bytes
     /// returned here corresponds to the on-disk shape a process restart
@@ -2255,14 +2169,12 @@ impl SimCluster {
     /// # Panics
     ///
     /// Panics if the cluster doesn't carry the per-node state required
-    /// to restart (currently only the mesh-mode constructors do —
-    /// see [`SimCluster::spawn`]). Gossip-mode clusters
-    /// ([`SimCluster::spawn_gossip`]) cannot be restarted today.
+    /// to restart (see [`SimCluster::spawn`]).
     pub async fn restart_all_with_recover(&mut self) {
         let signers = self
             .signers
             .clone()
-            .expect("restart_all_with_recover requires a mesh-mode SimCluster");
+            .expect("restart_all_with_recover requires captured signers");
         let storages = self
             .storages
             .clone()
@@ -2464,7 +2376,7 @@ impl SimCluster {
     /// # Panics
     ///
     /// Panics if `idx` is out of range or if the cluster was spawned
-    /// without per-node crash slots (gossip-mode clusters).
+    /// without per-node crash slots.
     pub fn arm_crashpoint(&self, idx: usize, name: &'static str) -> Option<&'static str> {
         assert!(
             idx < self.crash_slots.len(),
@@ -2494,12 +2406,12 @@ impl SimCluster {
     /// # Panics
     ///
     /// Panics if `idx` is out of range or if the cluster was spawned
-    /// without captured storages (gossip-mode harness).
+    /// without captured storages.
     pub fn peek_storage(&self, idx: usize) -> Arc<dyn Storage> {
         let storages = self
             .storages
             .as_ref()
-            .expect("peek_storage requires a mesh-mode SimCluster");
+            .expect("peek_storage requires captured storages");
         Arc::clone(&storages[idx])
     }
 
@@ -2537,14 +2449,13 @@ impl SimCluster {
     ///
     /// # Panics
     ///
-    /// Panics if the cluster was not spawned via a mesh-mode
-    /// constructor (gossip-mode clusters don't capture per-node
-    /// `(signer, storage, wal)` triples).
+    /// Panics if the cluster was spawned without capturing per-node
+    /// `(signer, storage, wal)` triples.
     pub async fn restart_node_with_recover(&mut self, idx: usize) -> anyhow::Result<()> {
         let signers = self
             .signers
             .as_ref()
-            .expect("restart_node_with_recover requires a mesh-mode SimCluster");
+            .expect("restart_node_with_recover requires captured signers");
         let storages = self
             .storages
             .as_ref()
@@ -3021,14 +2932,12 @@ async fn deliver_one(
     }
 }
 
-// ── Gossip-overlay sim mode (issue #137) ─────────────────────────────────────
-
 /// Build adjacency lists for an undirected K-regular circulant ring on
 /// `n` vertices.
 ///
 /// Each vertex `i` is connected to `i ± 1, i ± 2, …, i ± k/2` (mod
-/// `n`). For the gossip-overlay sim this is a cheap way to get a
-/// connected K-regular graph without rolling a random regular graph.
+/// `n`). A cheap way to get a connected K-regular graph without rolling
+/// a random regular graph.
 ///
 /// # Panics
 ///
@@ -3049,413 +2958,6 @@ pub fn circulant_neighbors(n: usize, k: usize) -> Vec<Vec<usize>> {
         }
     }
     out
-}
-
-/// Synthetic socket address used as the gossip overlay's
-/// `self_listen_addr` for sim-cluster node `idx`. The publisher
-/// embeds it in self-advertised peer-list entries; receivers merge
-/// it into their `PeerTable` (they never actually dial these
-/// addresses in the sim — the topology is fixed at construction).
-fn sim_addr_for(idx: usize) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 7000_u16.saturating_add(idx as u16)))
-}
-
-/// Per-frame loss configuration installed by [`SimCluster::set_frame_loss`].
-struct LossConfig {
-    /// Probability in `[0.0, 1.0]` that any given delivery is dropped.
-    rate: f64,
-}
-
-/// `Dialer` impl that records calls but never opens a connection.
-///
-/// In the sim, the partial-mesh topology is fixed at construction
-/// (every node receives `PeerConnected` events for its topological
-/// neighbours and only those). The maintenance loop's dial requests
-/// — driven by entries the peer-list gossip eventually populates in
-/// `PeerTable` — would otherwise try to expand the mesh; the no-op
-/// dialer keeps the topology stable and lets us assert the partial
-/// mesh's behaviour deterministically.
-struct SimNoopDialer;
-
-impl Dialer for SimNoopDialer {
-    fn dial(&self, _addr: SocketAddr, _expected: Option<NodeId>) {}
-}
-
-/// `OverlayUnicast` wrapper that drops a fraction of outbound frames
-/// before forwarding to the inner sink. The underlying RNG is seeded
-/// per-instance for deterministic replay.
-///
-/// Used by [`SimCluster::set_frame_loss`] to model the random-loss
-/// liveness scenario from the issue #137 acceptance criteria.
-struct LossySink {
-    inner: Arc<dyn OverlayUnicast>,
-    rng: Mutex<ChaCha20Rng>,
-    rate: f64,
-}
-
-impl LossySink {
-    fn new(inner: Arc<dyn OverlayUnicast>, rate: f64, seed: u64) -> Self {
-        Self {
-            inner,
-            rng: Mutex::new(ChaCha20Rng::seed_from_u64(seed)),
-            rate,
-        }
-    }
-}
-
-impl OverlayUnicast for LossySink {
-    fn send_to(&self, target: NodeId, payload: Bytes) {
-        let drop = {
-            let mut rng = self.rng.lock();
-            rng.random::<f64>() < self.rate
-        };
-        if drop {
-            return;
-        }
-        self.inner.send_to(target, payload);
-    }
-}
-
-impl SimCluster {
-    /// Spawn `n` honest nodes wired together with a per-node
-    /// [`GossipOverlay`] so consensus traffic flows through
-    /// `OverlayFrame::Forward` framing instead of the legacy mesh.
-    /// The topology is a `target_degree`-regular circulant ring (each
-    /// node has exactly `target_degree` direct neighbours); the
-    /// orchestrator's `direct` set is seeded by dispatching
-    /// [`ProtocolEvent::PeerConnected`] to each neighbour at boot,
-    /// matching how the production `PeerCommand::RegisterProtocol`
-    /// path would feed real handshake events.
-    ///
-    /// The maintenance dialer is a no-op
-    /// ([`SimNoopDialer`]), so the topology stays exactly as
-    /// constructed — peer-list gossip still propagates self-entries,
-    /// but no new direct connections are formed in the sim.
-    ///
-    /// `frame_loss_rate` is applied via a [`LossySink`] wrapper around
-    /// each node's [`OverlaySink`]; pass `0.0` to disable loss.
-    /// `loss_seed` seeds the ChaCha RNG that decides per-frame drops.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n < 4`, if `target_degree` is odd, or if
-    /// `target_degree >= n`.
-    pub async fn spawn_gossip(
-        n: usize,
-        timeout_base: Duration,
-        target_degree: usize,
-        frame_loss_rate: f64,
-        loss_seed: u64,
-    ) -> Self {
-        assert!(n >= 4, "BFT requires at least 4 nodes (3f+1 with f=1)");
-        let topology = circulant_neighbors(n, target_degree);
-
-        let signers: Vec<NodeSigner> = (0..n).map(|_| fresh_signer()).collect();
-        let validator_ids_unsorted: Vec<boule_consensus::validator_set::ValidatorId> = signers
-            .iter()
-            .map(|s| boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(s.node_id()))
-            .collect();
-        let vs = ValidatorSet::new(validator_ids_unsorted);
-        let genesis = Block::genesis([0u8; 32], [0; 32]);
-
-        let mut signer_map: HashMap<NodeId, Arc<dyn Signer>> = HashMap::new();
-        for s in signers {
-            signer_map.insert(s.node_id(), Arc::new(s) as Arc<dyn Signer>);
-        }
-
-        let partitioned: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
-        let link_cuts: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
-        let partition_blocks: Arc<Mutex<HashSet<LinkCut>>> = Arc::new(Mutex::new(HashSet::new()));
-        let dead_nodes: Arc<Mutex<HashSet<NodeId>>> = Arc::new(Mutex::new(HashSet::new()));
-        let controls = SelectiveControls::default();
-
-        // Per-replica vote-uniqueness observer (issue #422). Same
-        // default-on observer the mesh constructors install; the
-        // route task unwraps the gossip-overlay framing before
-        // looking for an inner `WireMessage::Vote`.
-        let vote_observer: Arc<VoteObserver> = Arc::new(VoteObserver::default());
-
-        // Per-node raw event channels — sim's route tasks deliver
-        // `ProtocolEvent`s to the orchestrator's input here.
-        let mut event_txs: HashMap<NodeId, mpsc::Sender<ProtocolEvent>> = HashMap::new();
-        let mut event_rxs: Vec<(NodeId, mpsc::Receiver<ProtocolEvent>)> = Vec::new();
-        for v in vs.iter() {
-            let nid = v.into_node_id();
-            let (tx, rx) = mpsc::channel(1024);
-            event_txs.insert(nid, tx);
-            event_rxs.push((nid, rx));
-        }
-        let event_txs = Arc::new(RwLock::new(event_txs));
-
-        // Resolve sorted-index ordering so we can map NodeId → topology
-        // index. ValidatorSet sorts ascending; circulant_neighbors uses
-        // those indices directly.
-        let node_ids: Vec<NodeId> = vs.iter().map(|v| v.into_node_id()).collect();
-
-        let mut commit_rxs: Vec<mpsc::Receiver<Block>> = Vec::new();
-        let mut commit_overflow_counters: Vec<Arc<AtomicU64>> = Vec::new();
-        let mut shutdown_txs: Vec<Option<oneshot::Sender<()>>> = Vec::new();
-        let mut mempools_captured_gossip: Vec<Arc<dyn Mempool>> = Vec::new();
-        let mut equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
-        let mut proposal_equivocations_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
-        let mut state_divergence_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
-        let mut proposal_command_rejection_counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n);
-        // Hold the overlay shutdown senders for the lifetime of the
-        // SimCluster — dropping them eagerly wakes the orchestrator's
-        // `_ = &mut self.shutdown` select arm and tears the run loop
-        // down before the test even starts. We leak them via the
-        // returned cluster so the orchestrators stay alive; on
-        // `SimCluster::drop` they're released and the orchestrators
-        // exit through their normal shutdown path.
-        let mut overlay_shutdowns: Vec<oneshot::Sender<()>> = Vec::with_capacity(n);
-
-        let clock: Arc<dyn Clock> = Arc::new(TokioClock::new());
-
-        // Phase A: spawn orchestrators only. We delay `ConsensusNode::run`
-        // until the topology has been seeded (otherwise the view-1
-        // leader broadcasts to an empty `direct` set on first boot).
-        struct PendingNode {
-            nid: NodeId,
-            broadcaster: Arc<dyn Broadcaster>,
-            discovery: Arc<dyn Discovery>,
-            consensus_event_rx: mpsc::Receiver<ProtocolEvent>,
-            signer: Arc<dyn Signer>,
-            node: ConsensusNode,
-        }
-        let mut pending: Vec<PendingNode> = Vec::with_capacity(n);
-
-        for (idx, (nid, raw_event_rx)) in event_rxs.into_iter().enumerate() {
-            let signer = signer_map[&nid].clone();
-            let config = NodeConfigForConsensus {
-                validator_set: vs.clone(),
-                genesis: genesis.clone(),
-                propose_limit: 16,
-                timeout_base,
-                timeout_max: Duration::from_secs(30),
-                limits: CacheLimits::unbounded_for_tests(),
-                snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
-                min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-                signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
-                block_retention_window: 0,
-                min_block_interval: Duration::ZERO,
-                weak_subjectivity_checkpoint: None,
-                operator_keys: Vec::new(),
-                max_endpoint_list_length: 8,
-            };
-            let sm: Arc<Mutex<Box<dyn StateMachine>>> =
-                Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
-            let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(256));
-            mempools_captured_gossip.push(Arc::clone(&mempool));
-            let storage = Arc::new(MemoryStorage::new());
-            let wal = Arc::new(MemoryWal::new());
-
-            let (commit_tx, commit_rx) = mpsc::channel::<Block>(SIM_COMMIT_CHANNEL_CAP);
-            commit_rxs.push(commit_rx);
-            let notifier = MpscCommitNotifier::new(commit_tx);
-            commit_overflow_counters.push(notifier.overflow_counter());
-            let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
-
-            let node = ConsensusNode::new(nid, config, sm, mempool, storage, wal)
-                .with_commit_notifier(commit_notifier);
-            equivocations_counters.push(node.equivocations_counter());
-            proposal_equivocations_counters.push(node.proposal_equivocations_counter());
-            state_divergence_counters.push(node.state_divergence_counter());
-            proposal_command_rejection_counters.push(node.proposal_command_rejections_counter());
-
-            // Per-node outbound channel: orchestrator's OverlaySink writes
-            // here; the route task reads on the other side.
-            let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
-
-            // Wrap in `LossySink` if frame-loss is enabled. The inner
-            // `OverlaySink` is what touches the per-node send channel;
-            // the wrapper short-circuits a fraction of frames before
-            // they reach it.
-            let base_sink: Arc<dyn OverlayUnicast> = Arc::new(OverlaySink::new(send_tx));
-            let sink: Arc<dyn OverlayUnicast> = if frame_loss_rate > 0.0 {
-                let per_node_seed = loss_seed.wrapping_mul(31).wrapping_add(idx as u64);
-                Arc::new(LossySink::new(base_sink, frame_loss_rate, per_node_seed))
-            } else {
-                base_sink
-            };
-
-            // Tighter knobs than production defaults so sim convergence
-            // is fast in paused-time runs.
-            let overlay_cfg = GossipOverlayConfig {
-                peer_list: PeerListGossipConfig {
-                    interval: Duration::from_millis(50),
-                    fanout: target_degree,
-                    max_entries: None,
-                    private: std::collections::HashSet::new(),
-                },
-                maintenance: MeshMaintenanceConfig {
-                    interval: Duration::from_secs(1),
-                    outbound_target: target_degree,
-                    persistent: std::collections::HashSet::new(),
-                },
-                dedup_capacity: 4096,
-                dedup_ttl: Duration::from_secs(60),
-                peer_table_capacity: 256,
-                cmd_channel_depth: 256,
-                event_channel_depth: 1024,
-                rng_seed: idx as u64,
-            };
-
-            let GossipOverlayHandles {
-                broadcaster,
-                discovery,
-                event_rx: consensus_event_rx,
-                shutdown: overlay_shutdown,
-                ..
-            } = GossipOverlay::spawn(SpawnArgs {
-                self_id: nid,
-                self_listen_addr: Some(sim_addr_for(idx)),
-                self_reachable: true,
-                event_rx: raw_event_rx,
-                sink,
-                dialer: Arc::new(SimNoopDialer),
-                clock: Arc::clone(&clock),
-                config: overlay_cfg,
-            });
-            // Hold the overlay shutdown sender; dropping it now
-            // would wake `_ = &mut self.shutdown` in the orchestrator
-            // and tear it down before the topology is seeded. Stored
-            // in `overlay_shutdowns`; dropped on `SimCluster::drop`.
-            overlay_shutdowns.push(overlay_shutdown);
-
-            let broadcaster: Arc<dyn Broadcaster> = Arc::new(broadcaster);
-            let discovery: Arc<dyn Discovery> = discovery;
-
-            spawn_route_task(
-                nid,
-                send_rx,
-                Arc::clone(&event_txs),
-                Arc::clone(&partitioned),
-                Arc::clone(&link_cuts),
-                Arc::clone(&partition_blocks),
-                Arc::clone(&dead_nodes),
-                None,
-                Arc::clone(&vote_observer),
-                PayloadFraming::GossipOverlay,
-                controls.clone(),
-            );
-
-            pending.push(PendingNode {
-                nid,
-                broadcaster,
-                discovery,
-                consensus_event_rx,
-                signer,
-                node,
-            });
-        }
-
-        // Phase B: seed the partial-mesh topology by dispatching
-        // `ProtocolEvent::PeerConnected` for each (node, neighbour)
-        // pair listed in `topology`. This populates each
-        // orchestrator's `direct` set; outbound traffic from consensus
-        // (started in phase C below) naturally flows along these
-        // edges.
-        for (i, neighbours) in topology.iter().enumerate() {
-            let nid_i = node_ids[i];
-            let event_tx_i = event_txs.read()[&nid_i].clone();
-            for &j in neighbours {
-                let nid_j = node_ids[j];
-                if event_tx_i
-                    .try_send(ProtocolEvent::PeerConnected {
-                        node_id: nid_j,
-                        addr: sim_addr_for(j),
-                    })
-                    .is_err()
-                {
-                    panic!("sim_gossip: PeerConnected dispatch failed for {i} → {j}");
-                }
-            }
-        }
-
-        // Yield enough to give every orchestrator's run loop a
-        // chance to pull all PeerConnected events out of its
-        // raw `event_rx` and into the `direct` set. Without this
-        // the view-1 leader spawned in phase C would broadcast to
-        // an empty direct set on its first boot tick.
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
-
-        // Phase C: spawn consensus.run for each node. The view-1
-        // leader's first broadcast now has a populated direct set.
-        for pn in pending {
-            let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            shutdown_txs.push(Some(shutdown_tx));
-            let PendingNode {
-                broadcaster,
-                discovery,
-                consensus_event_rx,
-                signer,
-                node,
-                ..
-            } = pn;
-            tokio::spawn(async move {
-                let _ = node
-                    .run(
-                        broadcaster,
-                        discovery,
-                        consensus_event_rx,
-                        signer,
-                        shutdown_rx,
-                    )
-                    .await;
-            });
-        }
-
-        let commit_cache: Vec<Vec<Block>> = (0..n).map(|_| Vec::new()).collect();
-
-        // Slow-node bridge (#497) is mesh-only; gossip-mode clusters
-        // pass through the GossipOverlay before reaching consensus,
-        // and inserting a bridge there is out of scope for #497. Seed
-        // a delay map of zeros keyed by NodeId so the field is
-        // populated; calls to `set_slow_node` against a gossip-mode
-        // cluster will mutate the atomic but no bridge is reading it.
-        let mut slow_node_delays_us: HashMap<NodeId, Arc<AtomicU64>> = HashMap::new();
-        for nid in &node_ids {
-            slow_node_delays_us.insert(*nid, Arc::new(AtomicU64::new(0)));
-        }
-
-        SimCluster {
-            commit_rxs,
-            commit_overflow_counters,
-            node_ids,
-            partitioned,
-            link_cuts,
-            partition_blocks,
-            dead_nodes,
-            event_txs,
-            // Crashpoint injection is mesh-cluster only — the gossip
-            // overlay clusters don't run inside `CRASH_SLOT.scope(...)`.
-            crash_slots: Vec::new(),
-            commit_cache,
-            shutdown_txs,
-            overlay_shutdowns,
-            // Restart-from-disk is mesh-cluster only for now; the
-            // gossip overlay's orchestrator wiring isn't trivially
-            // re-spawnable.
-            signers: None,
-            // This spawn path doesn't capture hot-rotation signers.
-            rotatable_signers: Vec::new(),
-            storages: None,
-            wals: None,
-            mempools: mempools_captured_gossip,
-            validator_set: vs,
-            genesis,
-            timeout_base,
-            vote_observer,
-            equivocations_counters,
-            proposal_equivocations_counters,
-            state_divergence_counters,
-            proposal_command_rejection_counters,
-            slow_node_delays_us: Arc::new(slow_node_delays_us),
-            controls,
-        }
-    }
 }
 
 /// Produce a fresh [`NodeSigner`] from a newly-generated Ed25519 key pair.
@@ -6893,282 +6395,7 @@ mod tests {
         assert_no_conflicts(&committed);
     }
 
-    // ── G-series: gossip-overlay scenarios (issue #137 stack 8) ──────────────
-
-    /// Smallest viable gossip-overlay sim test. 4 nodes, K=2 ring, no
-    /// loss. If this fails the larger 25-node convergence is doomed —
-    /// useful as an isolation step when debugging scale issues.
-    #[tokio::test]
-    async fn gossip_4_node_basic_cluster_commits() {
-        tokio::time::pause();
-        let mut cluster = SimCluster::spawn_gossip(
-            4,
-            Duration::from_millis(50),
-            /* target_degree */ 2,
-            /* loss_rate     */ 0.0,
-            /* loss_seed     */ 0,
-        )
-        .await;
-        let committed = cluster
-            .advance_and_yield_until(Duration::from_secs(5), |c| {
-                c.peek_commit_heights().iter().all(|&h| h > 0)
-            })
-            .await;
-        assert!(
-            committed,
-            "4-node K=2 gossip cluster did not commit: heights = {:?}",
-            cluster.peek_commit_heights()
-        );
-    }
-
-    /// Issue #137 acceptance criterion: a 25-node cluster running the
-    /// partial-mesh gossip overlay with `target_degree = 8` reaches
-    /// steady-state consensus commits. Validates the orchestrator
-    /// scales to validator-set size and that consensus traffic flows
-    /// correctly through `OverlayFrame::Forward` framing + dedup +
-    /// re-fanout.
-    #[tokio::test]
-    async fn gossip_25_node_cluster_commits_at_steady_state() {
-        tokio::time::pause();
-        const N: usize = 25;
-        const K: usize = 8;
-        let mut cluster = SimCluster::spawn_gossip(
-            N,
-            Duration::from_millis(50),
-            K,
-            /* frame_loss_rate */ 0.0,
-            /* loss_seed       */ 0,
-        )
-        .await;
-
-        // Generous budget — first commit must land within 5 s of
-        // virtual time. In practice it lands in well under 1 s; the
-        // wider cap absorbs the extra channel overhead at N=25 vs
-        // the existing 4-node tests.
-        const COMMIT_CAP: Duration = Duration::from_secs(5);
-        let everyone_commits = cluster
-            .advance_and_yield_until(COMMIT_CAP, |c| {
-                c.peek_commit_heights().iter().all(|&h| h > 0)
-            })
-            .await;
-        assert!(
-            everyone_commits,
-            "every node must commit at least one block under gossip overlay; heights: {:?}",
-            cluster.peek_commit_heights()
-        );
-
-        let committed = cluster.drain_commits();
-        assert_no_conflicts(&committed);
-    }
-
-    /// Issue #137 acceptance criterion: liveness holds under random
-    /// gossip-layer message loss. Drops 20% of overlay sink writes
-    /// (split roughly evenly across `Forward` and `PeerList` frames
-    /// — the wrapper drops indiscriminately) and asserts every node
-    /// still commits within the budget. With consensus's pacemaker
-    /// timeouts a few hundred milliseconds of view duration absorb
-    /// occasional message loss.
-    #[tokio::test]
-    async fn gossip_25_node_cluster_preserves_liveness_under_random_loss() {
-        tokio::time::pause();
-        const N: usize = 25;
-        const K: usize = 8;
-        let mut cluster = SimCluster::spawn_gossip(
-            N,
-            Duration::from_millis(50),
-            K,
-            /* frame_loss_rate */ 0.20,
-            /* loss_seed       */ 17,
-        )
-        .await;
-
-        // Wider cap than the no-loss test: ChaCha-driven 20% drop
-        // forces multi-round vote/proposal retries, so first
-        // cluster-wide commit takes longer in virtual time.
-        const COMMIT_CAP: Duration = Duration::from_secs(15);
-        let everyone_commits = cluster
-            .advance_and_yield_until(COMMIT_CAP, |c| {
-                c.peek_commit_heights().iter().all(|&h| h > 0)
-            })
-            .await;
-        assert!(
-            everyone_commits,
-            "liveness must hold under 20% frame loss; heights: {:?}",
-            cluster.peek_commit_heights()
-        );
-
-        let committed = cluster.drain_commits();
-        assert_no_conflicts(&committed);
-    }
-
-    /// Issue #137 acceptance criterion: partition-and-heal preserves
-    /// liveness. Splits 25 nodes into [13, 12] (neither half holds a
-    /// `2f+1 = 17` quorum, so neither commits during the partition),
-    /// holds for several views, heals, and asserts both halves catch
-    /// up to fresh post-heal commits.
-    #[tokio::test]
-    async fn gossip_25_node_cluster_partition_and_heal_resumes_commits() {
-        tokio::time::pause();
-        const N: usize = 25;
-        const K: usize = 8;
-        let mut cluster = SimCluster::spawn_gossip(
-            N,
-            Duration::from_millis(50),
-            K,
-            /* frame_loss_rate */ 0.0,
-            /* loss_seed       */ 0,
-        )
-        .await;
-
-        // Phase 1: warm up — all 25 nodes commit at least one block
-        // before we partition.
-        const WARM_CAP: Duration = Duration::from_secs(5);
-        let warmed = cluster
-            .advance_and_yield_until(WARM_CAP, |c| c.peek_commit_heights().iter().all(|&h| h > 0))
-            .await;
-        assert!(
-            warmed,
-            "warm-up phase failed: heights = {:?}",
-            cluster.peek_commit_heights()
-        );
-        let heights_pre = cluster.peek_commit_heights();
-
-        // Phase 2: split [0..13] from [13..25]. Each half is below
-        // the 2f+1 = 17 quorum so neither side can advance.
-        let group_a: Vec<usize> = (0..13).collect();
-        cluster.partition_into_two(&group_a);
-
-        // Hold the partition for a few views — long enough that any
-        // mid-flight quorum opportunities are flushed.
-        cluster.advance_and_yield(Duration::from_millis(500)).await;
-
-        // Phase 3: heal and require every node to advance past its
-        // pre-partition commit height. We don't care which post-heal
-        // height each node lands on; only that it's strictly past
-        // `heights_pre` (proves consensus resumed after the heal).
-        cluster.heal_partition();
-        const HEAL_CAP: Duration = Duration::from_secs(10);
-        let resumed = cluster
-            .advance_and_yield_until(HEAL_CAP, |c| {
-                let h = c.peek_commit_heights();
-                (0..N).all(|i| h[i] > heights_pre[i])
-            })
-            .await;
-        assert!(
-            resumed,
-            "every node must advance after heal; pre = {:?}, post = {:?}",
-            heights_pre,
-            cluster.peek_commit_heights()
-        );
-
-        let committed = cluster.drain_commits();
-        assert_no_conflicts(&committed);
-    }
-
-    /// Issue #178 regression. A node isolated from the cluster while
-    /// it's running on a sparse-mesh gossip overlay (`target_degree`
-    /// well below `n - 1`) loses sync — the live cluster commits
-    /// several blocks past the isolated node's high water mark while
-    /// it is partitioned. After healing, the previously-isolated node
-    /// must catch up via block-sync rather than wedging at its old
-    /// height.
-    ///
-    /// This is the in-sim analogue of a rotating-failure scenario: a
-    /// partitioned node mirrors the
-    /// "behind the cluster" state of a freshly-restarted node, since
-    /// in both cases the lagger sees fresh proposals whose parents
-    /// it has never processed.
-    ///
-    /// The non-zero `frame_loss_rate` is the key knob that exercises
-    /// the issue #178 fix (re-emit `Action::RequestBlock` for still-
-    /// parked proposals on every `PacemakerAdvance`). Without lossy
-    /// frames the sim's first probe always succeeds and the retry
-    /// branch is never reached; with 25% loss a non-trivial fraction
-    /// of `BlockRequest`s and `BlockResponse`s drop, so liveness
-    /// depends on the safety core re-emitting requests for proposals
-    /// whose parent never arrived. Matches the real-world symptom:
-    /// the gossip-fallback unicast had no built-in retry, so a single
-    /// dropped probe wedged the lagger.
-    #[tokio::test]
-    async fn gossip_sparse_mesh_isolated_node_catches_up_via_block_sync() {
-        tokio::time::pause();
-        const N: usize = 7;
-        const K: usize = 4; // sparse-mesh ring (well below `N - 1 = 6`).
-        let mut cluster = SimCluster::spawn_gossip(
-            N,
-            Duration::from_millis(50),
-            K,
-            /* frame_loss_rate */ 0.25,
-            /* loss_seed       */ 0xD7B2,
-        )
-        .await;
-
-        // Phase 1 — warm-up. Every node commits at least one block so
-        // each has a non-trivial `pending_blocks` cache and a recovered
-        // `high_qc` to extend off of.
-        const WARM_CAP: Duration = Duration::from_secs(5);
-        let warmed = cluster
-            .advance_and_yield_until(WARM_CAP, |c| c.peek_commit_heights().iter().all(|&h| h > 0))
-            .await;
-        assert!(
-            warmed,
-            "warm-up failed: heights = {:?}",
-            cluster.peek_commit_heights()
-        );
-
-        // Phase 2 — partition node 0. The remaining 6 nodes still hold
-        // the n=7 quorum (5 of 7), so they continue committing blocks
-        // while node 0 sits silent. We hold the partition long enough
-        // for the live cluster to advance well past node 0's
-        // pre-partition height so the post-heal catch-up actually
-        // exercises the block-sync path (rather than just resuming
-        // off the same pending_blocks).
-        cluster.partition_node(0);
-        let height_before_partition = cluster.peek_commit_heights()[0];
-        const PARTITION_HOLD: Duration = Duration::from_secs(2);
-        cluster
-            .advance_and_yield_until(PARTITION_HOLD, |c| {
-                let h = c.peek_commit_heights();
-                // Wait until *some* live node has gained ≥ 5 commits
-                // past the partition point. The exact gap doesn't
-                // matter; the goal is that node 0 is provably behind.
-                (1..N).any(|i| h[i] >= height_before_partition + 5)
-            })
-            .await;
-
-        // Snapshot heights mid-partition. Node 0 must not have moved.
-        let heights_mid = cluster.peek_commit_heights();
-        assert_eq!(
-            heights_mid[0], height_before_partition,
-            "isolated node 0 must not advance while partitioned: heights = {heights_mid:?}",
-        );
-        assert!(
-            (1..N).any(|i| heights_mid[i] > height_before_partition),
-            "live cluster must keep committing while node 0 is partitioned: heights = {heights_mid:?}",
-        );
-
-        // Phase 3 — heal. Node 0 reconnects and must catch up via
-        // block-sync (its `pending_blocks` is missing every proposal
-        // committed during the partition, so each fresh proposal
-        // arriving at node 0 will park and emit `RequestBlock`).
-        cluster.heal_node(0);
-        const HEAL_CAP: Duration = Duration::from_secs(15);
-        let caught_up = cluster
-            .advance_and_yield_until(HEAL_CAP, |c| c.peek_commit_heights()[0] > heights_mid[0])
-            .await;
-        assert!(
-            caught_up,
-            "previously-isolated node 0 must catch up via block-sync after heal; \
-             heights = {:?}",
-            cluster.peek_commit_heights()
-        );
-
-        let committed = cluster.drain_commits();
-        assert_no_conflicts(&committed);
-    }
-
-    /// `circulant_neighbors` produces a connected K-regular graph for
-    /// the parameters the gossip-overlay sim uses.
+    /// `circulant_neighbors` produces a connected K-regular graph.
     #[test]
     fn circulant_neighbors_is_k_regular_and_symmetric() {
         let n = 25usize;

@@ -398,7 +398,7 @@ pub struct ConsensusNode {
     /// (#308) / out-of-process Application (#225) wiring.
     commit_notifier: Option<Arc<dyn CommitNotifier>>,
     /// Shared overflow counter from
-    /// [`boule_transport_tcp::overlay::gossip::sink::OverlaySink`] when the node
+    /// `OverlaySink` (removed) when the node
     /// is wired to a gossip-mode overlay (issue #163 / #486). When
     /// `Some`, [`ConsensusNode::build_status`] reads its current value
     /// and surfaces it under
@@ -1029,7 +1029,7 @@ impl ConsensusNode {
     }
 
     /// Wire the gossip-mode overlay's
-    /// [`boule_transport_tcp::overlay::gossip::sink::OverlaySink`] overflow
+    /// `OverlaySink` (removed) overflow
     /// counter into this node so
     /// [`boule_consensus::status::BackpressureStatus::gossip_sink_overflow_total`]
     /// reflects the running drop count. Pass the `Arc<AtomicU64>`
