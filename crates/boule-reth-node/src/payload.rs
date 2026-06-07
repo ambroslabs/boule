@@ -71,6 +71,11 @@ where
             // verbatim for blocks that carry NO registry payload, so a plain
             // boule block looks like a stock Ethereum block.
             default_extra_data: ctx.payload_builder_config().extra_data(),
+            // The operator's `--builder.gaslimit` target. `EthereumBuilderConfig`
+            // otherwise defaults `desired_gas_limit` to 30M, so without this the
+            // block gas limit ramps toward 30M regardless of the flag (it is read
+            // from node config here, exactly like `extra_data` above).
+            builder_gas_limit: ctx.payload_builder_config().gas_limit(),
         })
     }
 }
@@ -85,6 +90,8 @@ pub struct BoulePayloadBuilder<Pool, Client, Evm> {
     pool: Pool,
     evm_config: Evm,
     default_extra_data: alloy_primitives::Bytes,
+    /// Operator `--builder.gaslimit` target, or `None` to keep reth's default.
+    builder_gas_limit: Option<u64>,
 }
 
 impl<Pool, Client, Evm> PayloadBuilder for BoulePayloadBuilder<Pool, Client, Evm>
@@ -114,15 +121,16 @@ where
             payload_id,
         } = config;
 
-        let extra_data = self.extra_data_for(&attributes);
+        let builder_config = self.builder_config(&attributes);
 
         // Strip our custom field and run the stock builder, but with the per-call
-        // extra_data carrying the registry payload into the sealed header.
+        // extra_data carrying the registry payload into the sealed header, and the
+        // operator's configured gas limit (else reth ramps the limit toward 30M).
         default_ethereum_payload(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
-            EthereumBuilderConfig::new().with_extra_data(extra_data),
+            builder_config,
             BuildArguments {
                 cached_reads,
                 execution_cache,
@@ -148,7 +156,7 @@ where
             attributes,
             payload_id,
         } = config;
-        let extra_data = self.extra_data_for(&attributes);
+        let builder_config = self.builder_config(&attributes);
 
         let args = BuildArguments::new(
             Default::default(),
@@ -167,7 +175,7 @@ where
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
-            EthereumBuilderConfig::new().with_extra_data(extra_data),
+            builder_config,
             args,
             |attrs| self.pool.best_transactions_with_attributes(attrs),
         )?
@@ -185,6 +193,16 @@ impl<Pool, Client, Evm> BoulePayloadBuilder<Pool, Client, Evm> {
             self.default_extra_data.clone()
         } else {
             registry
+        }
+    }
+
+    /// The per-build [`EthereumBuilderConfig`]: carries the registry `extra_data`
+    /// and honors the operator's `--builder.gaslimit` (else reth's 30M default).
+    fn builder_config(&self, attributes: &BoulePayloadAttributes) -> EthereumBuilderConfig {
+        let cfg = EthereumBuilderConfig::new().with_extra_data(self.extra_data_for(attributes));
+        match self.builder_gas_limit {
+            Some(gl) => cfg.with_gas_limit(gl),
+            None => cfg,
         }
     }
 }
