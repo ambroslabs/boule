@@ -34,6 +34,21 @@ pub const CONSENSUS_TOPIC: &str = "/boule/consensus/1.0.0";
 /// Addressed point-to-point protocol for block-sync / `send_to` traffic.
 pub const BLOCK_SYNC_PROTOCOL: &str = "/boule/blocksync/1.0.0";
 
+/// Maximum gossipsub message size (#862).
+///
+/// gossipsub's default `max_transmit_size` is **64 KiB**, but a consensus
+/// `Proposal` carries the full EVM execution payload (every tx, JSON-hex
+/// encoded) inline, so a busy block easily exceeds 64 KiB. Past that limit
+/// `gossipsub.publish` returns `MessageTooLarge` and the proposal is dropped —
+/// the leader can't propagate full blocks, the EL falls behind, and throughput
+/// collapses (~3x lower than the legacy overlay; root cause of #862). The
+/// legacy custom overlay framed consensus messages up to its 1 MiB
+/// `DEFAULT_MAX_FRAME_LEN`; match that ceiling with headroom (a 30M-gas block
+/// of simple transfers is ~0.36 MiB JSON-hex; leave room for fuller/contract
+/// blocks and QC overhead). The block-sync (request-response/cbor) path already
+/// defaults to a 1 MiB cap, so only gossipsub needs raising.
+pub const MAX_TRANSMIT_SIZE: usize = 4 * 1024 * 1024;
+
 /// The block-sync behaviour type: request = opaque consensus payload bytes,
 /// response = empty ack. Consensus does its own request/response correlation
 /// via two independent `send_to`s, so this protocol only needs to *deliver*
@@ -116,6 +131,8 @@ impl Behaviour {
         // unsigned `originator` field.
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .validation_mode(ValidationMode::Strict)
+            // Don't silently drop full-block Proposals — see MAX_TRANSMIT_SIZE (#862).
+            .max_transmit_size(MAX_TRANSMIT_SIZE)
             .build()
             .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
         let mut gossipsub = gossipsub::Behaviour::new(
