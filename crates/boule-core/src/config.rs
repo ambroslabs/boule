@@ -2447,7 +2447,7 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 
 [overlay]
-mode = "gossip"
+mode = "libp2p"
 bootstrap_addrs = ["10.0.0.1:7000", "[::1]:7000"]
 "#,
         );
