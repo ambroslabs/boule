@@ -9,10 +9,21 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        # GitHub's release-asset CDN intermittently 504s; retry so a
-        # transient gateway error doesn't fail the whole job.
-        sudo curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
-          -o /usr/local/bin/solc \
-          https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux
+        # solc is fetched from two independent CDNs so a sustained outage on
+        # one (GitHub's release-asset CDN intermittently 504s for minutes at a
+        # time, which the per-request --retry can't ride out) doesn't break
+        # every job. Both serve the identical 0.8.24+commit.e11b9ed9 binary.
+        urls=(
+          "https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux"
+          "https://binaries.soliditylang.org/linux-amd64/solc-linux-amd64-v0.8.24+commit.e11b9ed9"
+        )
+        for url in "${urls[@]}"; do
+          echo "Fetching solc from $url"
+          if sudo curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+            -o /usr/local/bin/solc "$url"; then
+            break
+          fi
+          echo "::warning::solc download failed from $url; trying next mirror"
+        done
         sudo chmod +x /usr/local/bin/solc
         solc --version
