@@ -9,7 +9,10 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        sudo curl -fsSL -o /usr/local/bin/solc \
+        # GitHub's release-asset CDN intermittently 504s; retry so a
+        # transient gateway error doesn't fail the whole job.
+        sudo curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+          -o /usr/local/bin/solc \
           https://github.com/ethereum/solidity/releases/download/v0.8.24/solc-static-linux
         sudo chmod +x /usr/local/bin/solc
         solc --version
