@@ -10,6 +10,10 @@ ignore = [
     # with no runtime surface. No maintained drop-in replacement is wired
     # through the alloy stack yet, so accept it until alloy drops it.
     "RUSTSEC-2024-0436",
+    # `proc-macro-error2` (transitive build-time proc-macro) is flagged
+    # unmaintained, not vulnerable — no runtime surface. Accept until the
+    # upstream that pulls it switches off it.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
