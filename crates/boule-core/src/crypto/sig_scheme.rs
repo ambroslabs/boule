@@ -267,18 +267,15 @@ impl std::error::Error for AggregateVerifyError {}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignatureSchemeChoice {
-    /// One raw Ed25519 signature per signer plus a [`SignerBitmap`];
-    /// `O(n)` verifies, wire size grows with the quorum.
-    /// See [`Ed25519Collected`].
-    #[default]
+    /// One raw Ed25519 signature per signer plus a [`SignerBitmap`].
+    /// No longer selectable — the config layer rejects it; BLS is the
+    /// only supported scheme. See [`Ed25519Collected`].
     Ed25519Collected,
     /// BLS12-381 signature aggregation: each QC carries one ~96-byte
     /// aggregate G2 point. `O(1)` pairing-check verification, constant
-    /// QC wire size in `n`. See [`BlsAggregated`].
-    ///
-    /// Keygen, signing, aggregation and verification are wired up;
-    /// proof-of-possession at validator registration arrives in #291,
-    /// and the integration with the HotStuff voting path is in #293.
+    /// QC wire size in `n`. The only supported scheme. See
+    /// [`BlsAggregated`].
+    #[default]
     BlsAggregated,
 }
 

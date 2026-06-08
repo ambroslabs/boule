@@ -54,9 +54,22 @@ use boule_consensus::hotstuff::qc::{QuorumCertificate, TimeoutVote, Vote};
 use boule_consensus::hotstuff::{NewView, Proposal};
 use boule_consensus::replication::block::{Block, BlockHash};
 use boule_consensus::wire::WireMessage;
+use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPartialSig};
 use boule_core::crypto::signed::{ChainId, Signed};
 use boule_core::identity::NodeId;
 use boule_core::transport::overlay::ProtocolOutbound;
+
+// ── BLS partial helper ───────────────────────────────────────────────────────
+
+/// Mint a real-encoding BLS partial signature. The forged QCs these
+/// adversaries craft are rejected on *content* (insufficient signers,
+/// stale/fresher view, sentinel block hash), not on partial encoding —
+/// but `add_bls_partial` panics on malformed G2 bytes, so the placeholder
+/// it folds in must be a genuinely-encoded point.
+fn dummy_bls_partial() -> BlsPartialSig {
+    let (sk, _pk) = BlsAggregated::keygen(&[0u8; 32]).expect("BLS keygen");
+    BlsAggregated::sign_partial(&sk, b"x").expect("BLS sign_partial")
+}
 
 // ── Wire helpers ─────────────────────────────────────────────────────────────
 
@@ -270,8 +283,8 @@ impl ForgedQcAdversary {
 
     fn forged_qc(validators_len: usize) -> QuorumCertificate {
         let mut qc = QuorumCertificate::new(0, [0xFE; 32], validators_len);
-        // Insufficient signers: one set bit, one zero signature.
-        qc.add_signature(0, [0u8; 64]);
+        // Insufficient signers: a single folded partial, well below quorum.
+        qc.add_bls_partial(0, dummy_bls_partial());
         qc
     }
 }
@@ -391,7 +404,11 @@ impl ForgedPiggybackAdversary {
         let mut qc = QuorumCertificate::new(u64::MAX - 1, [0xDE; 32], validators_len);
         let quorum = boule_consensus::hotstuff::qc::quorum_size(validators_len);
         for idx in 0..quorum {
-            qc.add_signature(idx, [0u8; 64]);
+            // Real-encoding partials over an unrelated message: enough set
+            // bits to clear the structural quorum gate (`is_well_formed`),
+            // but the aggregate does not verify against any honest QC
+            // message — exactly the forgery the #321 verifier must drop.
+            qc.add_bls_partial(idx, dummy_bls_partial());
         }
         qc
     }
@@ -659,16 +676,26 @@ impl Adversary for TwinValidatorAdversary {
                     view: signed_a.payload.view,
                     block_hash: block_hash_b,
                 };
-                let signed_b = Signed::sign(vote_b, ctx.signer.as_ref(), &ctx.chain_id)
+                let signed_b = Signed::sign(vote_b.clone(), ctx.signer.as_ref(), &ctx.chain_id)
                     .expect("twin vote re-signing must not fail (own signer is healthy)");
-                // Carry the original Vote's BLS partial slot through —
-                // on Ed25519 chains it is `None`; on BLS chains the
-                // dispatch-layer ingress check rejects the forged twin
-                // because the partial does not sign over the mutated
-                // block_hash. The Ed25519 envelope still verifies, the
-                // dedupe map still fires, so the test invariant holds
-                // on either chain scheme.
-                let payload_b = encode(&WireMessage::Vote(signed_b, bls_partial));
+                // Re-sign the BLS partial over the *mutated* pre-image so
+                // the forgery survives the ingress BLS-partial gate and
+                // reaches the recipient-side equivocation detector. On a
+                // BLS cluster `ctx.bls_signer` is `Some`; we sign the same
+                // `(view, block_hash)` pre-image the verifier reconstructs
+                // (`preimage::<Vote>`). On an Ed25519 cluster there is no
+                // BLS signer and we carry the original `None` partial slot
+                // through — the Ed25519 envelope alone drives the dedupe.
+                let bls_partial_b = match ctx.bls_signer.as_ref() {
+                    Some(bls) => {
+                        let bytes =
+                            boule_core::crypto::signed::preimage::<Vote>(&vote_b, &ctx.chain_id)
+                                .expect("twin vote BLS pre-image must encode");
+                        Some(bls.sign_partial(&bytes))
+                    }
+                    None => bls_partial,
+                };
+                let payload_b = encode(&WireMessage::Vote(signed_b, bls_partial_b));
                 vec![outbound, ProtocolOutbound::Broadcast(payload_b)]
             }
             (TwinKind::Proposal, WireMessage::Proposal(signed_a)) => {

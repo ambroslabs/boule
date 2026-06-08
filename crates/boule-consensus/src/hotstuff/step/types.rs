@@ -44,46 +44,45 @@ pub enum Event {
     PacemakerAdvance(View),
 }
 
-/// Verified vote payload, typed by the chain's signature scheme.
-///
-/// Ed25519 chains carry no BLS partial; `bls_aggregated` chains carry a
-/// partial already validated by the ingress verifier
-/// (`crate::dispatch::verify_bls_partial_if_required`) against the
-/// signer's per-historical-view BLS pubkey. The core matches on the
-/// variant and folds the bytes without re-checking; "BLS chain + missing
-/// partial" is unrepresentable.
+/// Verified vote payload: a signed envelope plus the BLS partial the
+/// ingress verifier (`crate::dispatch::verify_bls_partial_if_required`)
+/// already validated against the signer's per-historical-view BLS pubkey.
+/// The core folds the partial into the QC bucket via
+/// [`QuorumCertificate::add_bls_partial`] without re-checking.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VoteVariant {
-    /// Ed25519 chain vote: signed envelope only, no BLS partial.
-    Ed25519(crate::dispatch::Verified<Signed<Vote>>),
-    /// BLS-aggregated chain vote: signed envelope plus the BLS partial,
-    /// folded into the QC bucket via
-    /// [`QuorumCertificate::add_bls_partial`].
-    Bls {
-        signed: crate::dispatch::Verified<Signed<Vote>>,
-        partial: BlsPartialSig,
-    },
+pub struct VoteVariant {
+    signed: crate::dispatch::Verified<Signed<Vote>>,
+    partial: BlsPartialSig,
 }
 
 impl VoteVariant {
-    /// Borrow the inner [`crate::dispatch::Verified`] envelope shared by both variants.
+    /// Borrow the inner [`crate::dispatch::Verified`] envelope.
     pub fn verified(&self) -> &crate::dispatch::Verified<Signed<Vote>> {
-        match self {
-            VoteVariant::Ed25519(verified) => verified,
-            VoteVariant::Bls { signed, .. } => signed,
-        }
+        &self.signed
     }
 
-    /// Constructor from an already-computed optional partial: `Some` →
-    /// [`VoteVariant::Bls`], `None` → [`VoteVariant::Ed25519`].
+    /// Construct from the verifier's optional partial. The partial is
+    /// always present after `verify_bls_partial_if_required` (BLS is the
+    /// only scheme), so `None` indicates a verifier bug.
     pub fn from_optional_partial(
         signed: crate::dispatch::Verified<Signed<Vote>>,
         bls_partial: Option<BlsPartialSig>,
     ) -> Self {
-        match bls_partial {
-            Some(partial) => VoteVariant::Bls { signed, partial },
-            None => VoteVariant::Ed25519(signed),
+        Self {
+            signed,
+            partial: bls_partial
+                .expect("BLS vote must carry a partial after verify_bls_partial_if_required"),
         }
+    }
+
+    /// Construct directly from a verified envelope and its BLS partial.
+    pub fn new(signed: crate::dispatch::Verified<Signed<Vote>>, partial: BlsPartialSig) -> Self {
+        Self { signed, partial }
+    }
+
+    /// Consume into the verified envelope and its BLS partial.
+    pub fn into_parts(self) -> (crate::dispatch::Verified<Signed<Vote>>, BlsPartialSig) {
+        (self.signed, self.partial)
     }
 }
 

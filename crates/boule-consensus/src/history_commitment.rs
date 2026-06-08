@@ -491,11 +491,14 @@ fn feed_section(hasher: &mut Sha256, bytes: &[u8]) {
 /// silently dropped — the production code logs them and drops, and the
 /// rebuild path needs to drop in the same places to produce an
 /// identical history.
+#[allow(clippy::too_many_arguments)] // mirrors the four-history rebuild
+// surface; bundling into a struct would obscure the call sites.
 pub fn apply_reconfig_commands_to_set_history(
     block: &Block,
     set_history: &mut ValidatorSetHistory,
     key_history: &mut ValidatorKeyHistory,
     mut operator_key_history: Option<&mut OperatorKeyHistory>,
+    mut bls_key_history: Option<&mut BlsKeyHistory>,
     scheme: SignatureSchemeChoice,
     min_v_eff_delay: View,
     chain_id: &ChainId,
@@ -576,6 +579,22 @@ pub fn apply_reconfig_commands_to_set_history(
                 let v_id = crate::validator_set::ValidatorId::from_genesis_pubkey(entry.node_id);
                 if new_members.contains(&v_id) && !op_hist.contains(&v_id) {
                     let _ = op_hist.register(&v_id, cmd.v_eff, operator_pubkey);
+                }
+            }
+        }
+
+        // BLS chains: register each newly-seated validator's genesis BLS key
+        // (from its verified PoP) at `v_eff` — the rebuild analogue of the
+        // live registration in
+        // `boule_node::consensus_node::ConsensusNode::apply_committed_reconfigs`.
+        if let Some(bls_hist) = bls_key_history.as_deref_mut() {
+            for entry in &cmd.adds {
+                let Some(bls_pop) = &entry.bls_pop else {
+                    continue;
+                };
+                let v_id = crate::validator_set::ValidatorId::from_genesis_pubkey(entry.node_id);
+                if new_members.contains(&v_id) && !bls_hist.contains(&entry.node_id) {
+                    let _ = bls_hist.register(entry.node_id, cmd.v_eff, bls_pop.pubkey);
                 }
             }
         }
@@ -790,6 +809,7 @@ pub fn compute_post_block_commitment(
         &mut set,
         &mut key,
         operator.as_mut(),
+        bls.as_mut(),
         scheme,
         min_v_eff_delay,
         chain_id,

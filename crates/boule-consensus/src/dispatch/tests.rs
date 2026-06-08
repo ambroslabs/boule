@@ -31,6 +31,36 @@ fn sample_qc() -> QuorumCertificate {
     QuorumCertificate::new(0, genesis().hash(), 4)
 }
 
+/// Test helper: a structurally valid (but not cryptographically
+/// meaningful) BLS partial signature. Folding it into a QC keeps the
+/// bitmap and aggregate consistent so `is_well_formed` passes; the
+/// tests that use it run under the `Skip` policy (or only check
+/// well-formedness), so the partial is never aggregate-verified.
+fn dummy_bls_partial(seed: u8) -> boule_core::crypto::sig_scheme::BlsPartialSig {
+    let mut ikm = [0u8; 32];
+    ikm.fill(seed);
+    let (sk, _) = boule_core::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
+    boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(&sk, b"dummy").unwrap()
+}
+
+/// Build a BLS QC at `view`/`block_hash` over a `validator_set_len`-wide
+/// bitmap, with the first `num_signers` slots folded in as structurally
+/// valid partials. Replaces the old Ed25519 `add_signature` fixtures —
+/// every call site here runs under `Skip` or only inspects bitmap
+/// well-formedness, so the partials need not verify.
+fn bls_qc_with_signers(
+    view: impl Into<View>,
+    block_hash: BlockHash,
+    validator_set_len: usize,
+    num_signers: usize,
+) -> QuorumCertificate {
+    let mut qc = QuorumCertificate::new(view, block_hash, validator_set_len);
+    for i in 0..num_signers {
+        qc.add_bls_partial(i, dummy_bls_partial(0x10 ^ i as u8));
+    }
+    qc
+}
+
 fn make_vs_with_signers(signers: &[&NodeSigner]) -> ValidatorSet {
     let ids: Vec<crate::validator_set::ValidatorId> = signers
         .iter()
@@ -114,8 +144,7 @@ fn ingress_proposal_emits_on_qc_at_justify_view() {
     let vs = make_vs_with_signers(&[&signer]);
 
     // Proposal at view 6 with a justify QC at view 5.
-    let mut justify = QuorumCertificate::new(5, [0xAB; 32], 1);
-    justify.add_signature(0, [0x11; 64]);
+    let justify = bls_qc_with_signers(5, [0xAB; 32], 1, 1);
     let parent = genesis();
     let header = crate::replication::block::BlockHeader {
         parent_hash: parent.hash(),
@@ -203,7 +232,7 @@ fn ingress_vote_happy_path() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress_with_genesis_set(signer.node_id(), &bytes, &vs).unwrap();
@@ -221,8 +250,7 @@ fn ingress_new_view_emits_pacemaker_on_qc() {
     let signer = fresh_signer();
     let vs = make_vs_with_signers(&[&signer]);
 
-    let mut high_qc = QuorumCertificate::new(7, [0xCD; 32], 1);
-    high_qc.add_signature(0, [0x11; 64]);
+    let high_qc = bls_qc_with_signers(7, [0xCD; 32], 1, 1);
     let nv = NewView { high_qc };
     let signed = Signed::sign(nv, &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::NewView(signed);
@@ -495,11 +523,12 @@ fn egress_broadcast_proposal_is_verifiable() {
 // ── Snapshot wire protocol (#228) ─────────────────────────────────────
 
 fn sample_quorum_qc(vs_len: usize, block_hash: [u8; 32]) -> QuorumCertificate {
-    let mut qc = QuorumCertificate::new(0, block_hash, vs_len);
-    for i in 0..crate::hotstuff::qc::quorum_size(vs_len) {
-        qc.add_signature(i, [0u8; 64]);
-    }
-    qc
+    bls_qc_with_signers(
+        0,
+        block_hash,
+        vs_len,
+        crate::hotstuff::qc::quorum_size(vs_len),
+    )
 }
 
 fn sample_manifest_for_dispatch() -> SnapshotManifest {
@@ -762,7 +791,7 @@ fn vote_at_v_eff_verifies_against_post_boundary_set() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &new_signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     // Succeeds against the history that contains the boundary.
@@ -797,7 +826,7 @@ fn vote_at_v_eff_rejected_without_boundary() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &new_signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -835,7 +864,7 @@ fn vote_before_boundary_verifies_against_pre_boundary_set() {
         block_hash: [0xCD; 32],
     };
     let signed = Signed::sign(vote, &old_signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress(
@@ -929,10 +958,7 @@ fn new_view_with_pre_boundary_high_qc_under_old_set_accepted() {
     let key_history = key_history_for(&history);
 
     // high_qc minted at view v_eff - 1 against the *old* set.
-    let mut high_qc = QuorumCertificate::new(v_eff - 1, [0xAB; 32], old_set.len());
-    for i in 0..old_set.len() {
-        high_qc.add_signature(i, [0xCC; 64]);
-    }
+    let high_qc = bls_qc_with_signers(v_eff - 1, [0xAB; 32], old_set.len(), old_set.len());
     assert!(high_qc.is_well_formed(&old_set));
 
     let nv = NewView { high_qc };
@@ -980,10 +1006,7 @@ fn new_view_with_high_qc_minted_against_new_set_rejected_at_pre_boundary_view() 
     // high_qc minted against the *new* (larger) set, but claimed at
     // a pre-boundary view. The bitmap length will be `new_set.len()`,
     // which doesn't match `set_at(v_eff - 1) = old_set`.
-    let mut high_qc = QuorumCertificate::new(v_eff - 1, [0xAB; 32], new_set.len());
-    for i in 0..new_set.len() {
-        high_qc.add_signature(i, [0xDD; 64]);
-    }
+    let high_qc = bls_qc_with_signers(v_eff - 1, [0xAB; 32], new_set.len(), new_set.len());
     assert!(high_qc.is_well_formed(&new_set));
     assert!(!high_qc.is_well_formed(&old_set));
 
@@ -1019,8 +1042,7 @@ fn new_view_under_genesis_only_history_round_trips() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_for(&history);
 
-    let mut high_qc = QuorumCertificate::new(7, [0xCD; 32], vs.len());
-    high_qc.add_signature(0, [0x11; 64]);
+    let high_qc = bls_qc_with_signers(7, [0xCD; 32], vs.len(), 1);
     let nv = NewView { high_qc };
     let signed = Signed::sign(nv, &signer, &ChainId::TEST).unwrap();
     let wire = WireMessage::NewView(signed);
@@ -1109,7 +1131,7 @@ fn vote_after_rotation_signed_with_new_key_accepted() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &new, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress(
@@ -1176,7 +1198,7 @@ fn spanning_vote_pre_rotation_view_signed_with_old_key_accepted() {
         block_hash: [0xCD; 32],
     };
     let signed = Signed::sign(vote, &old, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress(
@@ -1211,7 +1233,7 @@ fn vote_after_rotation_signed_with_stale_old_key_rejected() {
         block_hash: [0xEF; 32],
     };
     let signed = Signed::sign(vote, &old, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -1246,7 +1268,7 @@ fn vote_before_rotation_signed_with_future_new_key_rejected() {
         block_hash: [0x12; 32],
     };
     let signed = Signed::sign(vote, &new, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -1280,7 +1302,7 @@ fn vote_signed_by_unrelated_key_rejected() {
         block_hash: [0x77; 32],
     };
     let signed = Signed::sign(vote, &attacker, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -1385,8 +1407,7 @@ fn new_view_after_rotation_signed_with_new_key_accepted() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_with_rotation(&vs, old.node_id(), new.node_id(), 100);
 
-    let mut high_qc = QuorumCertificate::new(100, [0xCD; 32], vs.len());
-    high_qc.add_signature(0, [0x11; 64]);
+    let high_qc = bls_qc_with_signers(100, [0xCD; 32], vs.len(), 1);
     let nv = NewView { high_qc };
     let signed = Signed::sign(nv, &new, &ChainId::TEST).unwrap();
     let wire = WireMessage::NewView(signed);
@@ -1430,7 +1451,7 @@ fn vote_from_removed_validator_after_v_eff_rejected() {
         block_hash: [0xAB; 32],
     };
     let signed = Signed::sign(vote, &removed, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let err = ingress(
@@ -1450,7 +1471,7 @@ fn vote_from_removed_validator_after_v_eff_rejected() {
         block_hash: [0xCD; 32],
     };
     let signed = Signed::sign(vote, &removed, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, None);
+    let wire = WireMessage::Vote(signed, Some(dummy_bls_partial(0)));
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let dispatches = ingress(
@@ -1674,9 +1695,8 @@ fn ingress_with_verify_rejects_tampered_bls_qc_inside_proposal() {
     let leader = &signers[0];
 
     // Tamper the aggregate inside the QC.
-    if let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut qc.signatures {
-        agg[0] ^= 0xFF;
-    }
+    let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut qc.signatures;
+    agg[0] ^= 0xFF;
 
     let block = Block {
         header: crate::replication::block::BlockHeader {
@@ -1732,9 +1752,8 @@ fn ingress_with_verify_rejects_tampered_bls_qc_inside_newview() {
     let (signers, vs, mut high_qc, bls_history) = build_real_bls_qc(view, block_hash);
     let messenger = &signers[1];
 
-    if let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut high_qc.signatures {
-        agg[3] ^= 0xAA;
-    }
+    let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut high_qc.signatures;
+    agg[3] ^= 0xAA;
 
     let nv = NewView { high_qc };
     let signed = Signed::sign(nv, messenger, &ChainId::TEST).unwrap();
@@ -1840,9 +1859,8 @@ fn ingress_with_verify_drops_tampered_bls_qc_inside_timeout_vote_piggyback() {
     // Tamper one byte of the aggregate. The bitmap and signature
     // count remain consistent, so this slips past `is_well_formed`
     // and only fails at `verify_aggregate_bls`.
-    if let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut qc.signatures {
-        agg[0] ^= 0xFF;
-    }
+    let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut qc.signatures;
+    agg[0] ^= 0xFF;
 
     let tv = TimeoutVote {
         view: qc_view + 3,

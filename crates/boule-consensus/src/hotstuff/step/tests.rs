@@ -91,9 +91,8 @@ pub(crate) fn bls_partial(
         .expect("BLS partial signing must not fail")
 }
 
-/// Build a BLS-flavored [`VoteVariant`] carrying a real partial from
-/// `sender` — the BLS analog of wrapping [`signed_vote`] in
-/// [`VoteVariant::Ed25519`]. Use this everywhere a scheme-agnostic
+/// Build a [`VoteVariant`] carrying a real BLS partial from `sender`,
+/// wrapping [`signed_vote`]. Use this everywhere a scheme-agnostic
 /// safety/liveness test needs to feed a vote into the core.
 pub(crate) fn bls_vote(
     view: impl Into<View>,
@@ -101,10 +100,10 @@ pub(crate) fn bls_vote(
     sender: NodeId,
 ) -> VoteVariant {
     let view = view.into();
-    VoteVariant::Bls {
-        signed: crate::dispatch::Verified::unchecked(signed_vote(view, block_hash, sender)),
-        partial: bls_partial(view, block_hash, sender),
-    }
+    VoteVariant::new(
+        crate::dispatch::Verified::unchecked(signed_vote(view, block_hash, sender)),
+        bls_partial(view, block_hash, sender),
+    )
 }
 
 /// Wrap an already-built [`Signed<Vote>`] in a BLS [`VoteVariant`],
@@ -116,10 +115,7 @@ pub(crate) fn bls_vote_from_signed(signed: Signed<Vote>) -> VoteVariant {
         signed.payload.block_hash,
         signed.signer,
     );
-    VoteVariant::Bls {
-        signed: crate::dispatch::Verified::unchecked(signed),
-        partial,
-    }
+    VoteVariant::new(crate::dispatch::Verified::unchecked(signed), partial)
 }
 
 /// As [`bls_vote_from_signed`] but stamping `stable_id` as the
@@ -135,10 +131,10 @@ pub(crate) fn bls_vote_from_signed_with_signer(
         signed.payload.block_hash,
         signed.signer,
     );
-    VoteVariant::Bls {
-        signed: crate::dispatch::Verified::unchecked_with_signer(signed, stable_id),
+    VoteVariant::new(
+        crate::dispatch::Verified::unchecked_with_signer(signed, stable_id),
         partial,
-    }
+    )
 }
 
 /// Build a [`Signed<NewView>`] from `sender` carrying `high_qc`.
@@ -1229,10 +1225,10 @@ fn bls_quorum_emits_high_qc_with_real_aggregate_that_verifies() {
             signer: *signer_id,
             sig: [signer_id[0]; 64],
         };
-        step_actions = core.step(Event::VoteReceived(VoteVariant::Bls {
-            signed: crate::dispatch::Verified::unchecked(signed),
+        step_actions = core.step(Event::VoteReceived(VoteVariant::new(
+            crate::dispatch::Verified::unchecked(signed),
             partial,
-        }));
+        )));
     }
 
     // Quorum-emit branch: Persist(HighQc(_)) + Broadcast(Proposal(_))
@@ -1611,7 +1607,7 @@ fn post_quorum_votes_do_not_rebroadcast() {
         "late vote from new signer must not re-broadcast: {step_late_new:?}",
     );
 
-    // Duplicate vote from an existing signer — `add_signature` is
+    // Duplicate vote from an existing signer — `add_bls_partial` is
     // a no-op on the set-bit; dispatch also early-returns.
     let step_dup = core.step(Event::VoteReceived(bls_vote(3, block_v3_hash, nid(2))));
     assert!(
@@ -1884,7 +1880,7 @@ fn second_vote_at_same_view_for_different_block_emits_equivocation_evidence() {
 
 /// A duplicate of the same `(signer, view, block_hash)` is
 /// idempotent: no equivocation emitted, the bucket's signer-count
-/// is unchanged (the underlying `add_signature` ignores set bits).
+/// is unchanged (the underlying `add_bls_partial` ignores set bits).
 #[test]
 fn duplicate_vote_for_same_block_does_not_emit_equivocation_evidence() {
     let mut core = make_core(1);

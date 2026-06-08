@@ -299,29 +299,16 @@ mod tests {
         boule_core::identity::node_id_to_base58(&signer.node_id())
     }
 
-    fn write_ed25519_chain_config(
-        config_path: &Path,
-        current_key_path: &Path,
-        validator_b58: &str,
-    ) {
-        let text = format!(
-            "[node]\n\
-             listen_addr = \"127.0.0.1:7000\"\n\n\
-             [node.identity]\n\
-             backend = \"file\"\n\
-             path = \"{key}\"\n\n\
-             [node.validator_identity]\n\
-             backend = \"file\"\n\
-             path = \"{key}\"\n\n\
-             [api]\n\
-             listen_addr = \"127.0.0.1:8000\"\n\n\
-             [consensus]\n\
-             validators = [\"{val}\"]\n\
-             signature_scheme = \"ed25519_collected\"\n",
-            key = current_key_path.display(),
-            val = validator_b58,
-        );
-        std::fs::write(config_path, text).unwrap();
+    /// Mint a fresh BLS validator pubkey and return `(pubkey_hex, pop_hex)`
+    /// suitable for a `[[consensus.validators_bls]]` table entry. The PoP is a
+    /// 96-byte placeholder: the rotation tool under test never verifies the
+    /// genesis PoP (it derives and verifies its own), only the pubkey feeds the
+    /// chain_id, so a bogus PoP is sufficient for these scheme-agnostic tests.
+    fn bls_validator_entry(seed: u8) -> (String, String) {
+        let mut ikm = [0u8; 32];
+        ikm[0] = seed;
+        let (_sk, pk) = BlsAggregated::keygen(&ikm).unwrap();
+        (hex::encode(pk), hex::encode([0u8; 96]))
     }
 
     fn write_bls_chain_config(
@@ -375,8 +362,9 @@ mod tests {
         let validator_b58 = mint_validator_key(&validator_key);
         let operator_key = dir.path().join("operator.key");
         let operator_b58 = mint_validator_key(&operator_key);
+        let (bls_pk_hex, bls_pop_hex) = bls_validator_entry(0x11);
 
-        // Config declares the operator key for the validator.
+        // Config declares the operator key for the validator (BLS chain).
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
@@ -390,18 +378,25 @@ mod tests {
                  listen_addr = \"127.0.0.1:8000\"\n\n\
                  [consensus]\n\
                  validators = [\"{val}\"]\n\
-                 signature_scheme = \"ed25519_collected\"\n\n\
+                 signature_scheme = \"bls_aggregated\"\n\n\
+                 [[consensus.validators_bls]]\n\
+                 node_id = \"{val}\"\n\
+                 bls_pubkey = \"{pk}\"\n\
+                 bls_pop = \"{pop}\"\n\n\
                  [[consensus.validators_operator_keys]]\n\
                  node_id = \"{val}\"\n\
                  operator_pubkey = \"{op}\"\n",
                 vk = validator_key.display(),
                 val = validator_b58,
+                pk = bls_pk_hex,
+                pop = bls_pop_hex,
                 op = operator_b58,
             ),
         )
         .unwrap();
 
         let new_key = dir.path().join("new.key");
+        let new_bls = dir.path().join("new-bls.key");
         let req = OperatorRecoveryRequest {
             config_path: Some(config_path.clone()),
             validator: Some(validator_b58.clone()),
@@ -411,13 +406,14 @@ mod tests {
             new_key_backend: Some("file".into()),
             new_key_path: Some(new_key.clone()),
             new_key_passphrase_env: None,
-            new_bls_key_backend: None,
-            new_bls_key_path: None,
+            new_bls_key_backend: Some("file".into()),
+            new_bls_key_path: Some(new_bls.clone()),
             v_eff: Some(500),
         };
         let outcome = build_operator_recovery_envelope(&req).expect("recovery must succeed");
-        assert!(!outcome.bls_chain);
+        assert!(outcome.bls_chain);
         assert!(new_key.exists(), "new signing key must be minted");
+        assert!(new_bls.exists(), "new BLS key must be minted");
 
         let new_id =
             boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
@@ -460,11 +456,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let validator_key = dir.path().join("validator.key");
         let validator_b58 = mint_validator_key(&validator_key);
+        let (bls_pk_hex, bls_pop_hex) = bls_validator_entry(0x22);
         let config_path = dir.path().join("config.toml");
-        write_ed25519_chain_config(&config_path, &validator_key, &validator_b58);
+        write_bls_chain_config(
+            &config_path,
+            &validator_key,
+            &validator_b58,
+            &bls_pk_hex,
+            &bls_pop_hex,
+        );
 
         let missing_operator = dir.path().join("nope-operator.key");
         let new_key = dir.path().join("new.key");
+        let new_bls = dir.path().join("new-bls.key");
         let req = OperatorRecoveryRequest {
             config_path: Some(config_path),
             validator: Some(validator_b58),
@@ -474,8 +478,8 @@ mod tests {
             new_key_backend: Some("file".into()),
             new_key_path: Some(new_key.clone()),
             new_key_passphrase_env: None,
-            new_bls_key_backend: None,
-            new_bls_key_path: None,
+            new_bls_key_backend: Some("file".into()),
+            new_bls_key_path: Some(new_bls),
             v_eff: Some(500),
         };
         let err = build_operator_recovery_envelope(&req).unwrap_err();
@@ -502,6 +506,7 @@ mod tests {
         let validator_b58 = mint_validator_key(&validator_key);
         let old_operator = dir.path().join("old-operator.key");
         let old_op_b58 = mint_validator_key(&old_operator);
+        let (bls_pk_hex, bls_pop_hex) = bls_validator_entry(0x33);
 
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -516,12 +521,18 @@ mod tests {
                  listen_addr = \"127.0.0.1:8000\"\n\n\
                  [consensus]\n\
                  validators = [\"{val}\"]\n\
-                 signature_scheme = \"ed25519_collected\"\n\n\
+                 signature_scheme = \"bls_aggregated\"\n\n\
+                 [[consensus.validators_bls]]\n\
+                 node_id = \"{val}\"\n\
+                 bls_pubkey = \"{pk}\"\n\
+                 bls_pop = \"{pop}\"\n\n\
                  [[consensus.validators_operator_keys]]\n\
                  node_id = \"{val}\"\n\
                  operator_pubkey = \"{op}\"\n",
                 vk = validator_key.display(),
                 val = validator_b58,
+                pk = bls_pk_hex,
+                pop = bls_pop_hex,
                 op = old_op_b58,
             ),
         )
@@ -585,8 +596,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let validator_key = dir.path().join("validator.key");
         let validator_b58 = mint_validator_key(&validator_key);
+        let (bls_pk_hex, bls_pop_hex) = bls_validator_entry(0x44);
         let config_path = dir.path().join("config.toml");
-        write_ed25519_chain_config(&config_path, &validator_key, &validator_b58);
+        write_bls_chain_config(
+            &config_path,
+            &validator_key,
+            &validator_b58,
+            &bls_pk_hex,
+            &bls_pop_hex,
+        );
 
         let missing_old = dir.path().join("nope-old.key");
         let new_op = dir.path().join("new-operator.key");
@@ -609,78 +627,6 @@ mod tests {
     }
 
     #[test]
-    fn rotation_propose_ed25519_chain_builds_verifiable_envelope() {
-        // End-to-end: real config + existing validator key on disk → minted
-        // new key → signed envelope that verifies under the validator's
-        // current pubkey and the chain's chain_id.
-        use boule_core::crypto::signed::{NodeSigner, Signer as _};
-
-        let dir = TempDir::new().unwrap();
-        let current_key = dir.path().join("current.key");
-        let validator_b58 = mint_validator_key(&current_key);
-        let config_path = dir.path().join("config.toml");
-        write_ed25519_chain_config(&config_path, &current_key, &validator_b58);
-
-        let new_key = dir.path().join("new.key");
-        assert!(!new_key.exists(), "new key must not pre-exist");
-        let args = RotationProposeRequest {
-            config_path: Some(config_path.clone()),
-            new_key_backend: Some("file".into()),
-            new_key_path: Some(new_key.clone()),
-            new_key_passphrase_env: None,
-            new_bls_key_backend: None,
-            new_bls_key_path: None,
-            v_eff: Some(500),
-        };
-        let outcome = build_rotation_envelope(&args).expect("rotation propose must succeed");
-
-        assert!(
-            new_key.exists(),
-            "new key file must be created by load_or_init"
-        );
-        assert!(!outcome.bls_chain);
-        assert!(outcome.envelope.payload.new_bls_pubkey.is_none());
-        assert!(outcome.envelope.payload.new_bls_pop.is_none());
-        assert_eq!(outcome.envelope.payload.v_eff.0, 500);
-
-        let current_id =
-            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
-                path: current_key.clone(),
-                allow_insecure_perms: false,
-            })
-            .unwrap()
-            .try_load()
-            .unwrap()
-            .unwrap();
-        let current_signer = NodeSigner::from_identity(&current_id).unwrap();
-        let new_id =
-            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
-                path: new_key.clone(),
-                allow_insecure_perms: false,
-            })
-            .unwrap()
-            .try_load()
-            .unwrap()
-            .unwrap();
-        let new_signer = NodeSigner::from_identity(&new_id).unwrap();
-        assert_eq!(outcome.envelope.payload.validator, current_signer.node_id());
-        assert_eq!(outcome.envelope.payload.new_pubkey, new_signer.node_id());
-
-        let cfg = boule_core::config::load(&config_path).unwrap();
-        let chain_id =
-            boule_consensus::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
-        outcome
-            .envelope
-            .verify(&current_signer.node_id(), &chain_id)
-            .expect("envelope must verify");
-
-        let bytes = outcome.envelope.encode_command();
-        assert!(
-            boule_consensus::validator_rotation::DualSignedRotation::is_rotation_payload(&bytes,),
-        );
-    }
-
-    #[test]
     fn rotation_propose_idempotent_when_new_key_already_exists() {
         // Re-running with a pre-minted `new_key_path` must reload it (not
         // overwrite) and produce a payload pointing at the same pubkey.
@@ -689,17 +635,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let current_key = dir.path().join("current.key");
         let validator_b58 = mint_validator_key(&current_key);
+        let (bls_pk_hex, bls_pop_hex) = bls_validator_entry(0x55);
         let config_path = dir.path().join("config.toml");
-        write_ed25519_chain_config(&config_path, &current_key, &validator_b58);
+        write_bls_chain_config(
+            &config_path,
+            &current_key,
+            &validator_b58,
+            &bls_pk_hex,
+            &bls_pop_hex,
+        );
 
         let new_key = dir.path().join("new.key");
+        let new_bls = dir.path().join("new-bls.key");
         let args = RotationProposeRequest {
             config_path: Some(config_path.clone()),
             new_key_backend: Some("file".into()),
             new_key_path: Some(new_key.clone()),
             new_key_passphrase_env: None,
-            new_bls_key_backend: None,
-            new_bls_key_path: None,
+            new_bls_key_backend: Some("file".into()),
+            new_bls_key_path: Some(new_bls.clone()),
             v_eff: Some(500),
         };
         let first = build_rotation_envelope(&args).unwrap();
@@ -717,34 +671,6 @@ mod tests {
         let new_signer = NodeSigner::from_identity(&new_id).unwrap();
         assert_eq!(first.envelope.payload.new_pubkey, new_signer.node_id());
         assert_eq!(second.envelope.payload.new_pubkey, new_signer.node_id());
-    }
-
-    #[test]
-    fn rotation_propose_rejects_bls_flags_on_ed25519_chain() {
-        let dir = TempDir::new().unwrap();
-        let current_key = dir.path().join("current.key");
-        let validator_b58 = mint_validator_key(&current_key);
-        let config_path = dir.path().join("config.toml");
-        write_ed25519_chain_config(&config_path, &current_key, &validator_b58);
-
-        let new_key = dir.path().join("new.key");
-        let new_bls = dir.path().join("new-bls.key");
-        let args = RotationProposeRequest {
-            config_path: Some(config_path.clone()),
-            new_key_backend: Some("file".into()),
-            new_key_path: Some(new_key.clone()),
-            new_key_passphrase_env: None,
-            new_bls_key_backend: Some("file".into()),
-            new_bls_key_path: Some(new_bls.clone()),
-            v_eff: Some(500),
-        };
-        let err = build_rotation_envelope(&args).unwrap_err();
-        assert!(
-            err.to_string().contains("ed25519_collected"),
-            "unexpected error: {err}",
-        );
-        // Ed25519 path must reject BLS flags before touching disk.
-        assert!(!new_bls.exists());
     }
 
     #[test]

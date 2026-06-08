@@ -16,7 +16,6 @@ use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
 use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
 use boule_core::crypto::signed::ChainId;
-use boule_core::identity::NodeId;
 
 use super::super::{IngressError, QcVerification};
 use super::domain::vote_preimage;
@@ -35,7 +34,7 @@ use super::domain::vote_preimage;
 pub(in crate::dispatch) fn verify_qc_if_requested(
     qc: &QuorumCertificate,
     history: &ValidatorSetHistory,
-    key_history: &ValidatorKeyHistory,
+    _key_history: &ValidatorKeyHistory,
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
@@ -95,39 +94,14 @@ pub(in crate::dispatch) fn verify_qc_if_requested(
     })?;
 
     match scheme {
+        // Ed25519-collected consensus signatures are no longer supported;
+        // reject any QC claiming that scheme (no such chain can be
+        // configured — see `ConsensusConfig::resolve_genesis_bls_keys`).
         SignatureSchemeChoice::Ed25519Collected => {
-            if !qc.is_ed25519() {
-                return Err(IngressError::InvalidQcAggregate {
-                    view: qc.view,
-                    scheme: scheme.name(),
-                });
-            }
-            // The verifier needs one Ed25519 pubkey per validator slot
-            // at qc.view — the same pubkey under which a vote at that
-            // view would have been signed. Resolve through the
-            // per-historical-view key history so post-rotation lookups
-            // pick up the right key.
-            //
-            // The `unwrap_or` falls back to the stable id's bytes when
-            // a validator has no recorded key at the QC's view — this
-            // is the same convention as before #328 (the stable id is
-            // the validator's genesis pubkey, so using its bytes as a
-            // pubkey here matches the pre-rotation case). The
-            // verifier itself works at the `NodeId` byte layer.
-            let pubkeys: Vec<NodeId> = vs
-                .iter()
-                .map(|stable_id| {
-                    key_history
-                        .key_at(stable_id, qc.view)
-                        .map(NodeId::from)
-                        .unwrap_or_else(|| stable_id.into_node_id())
-                })
-                .collect();
-            qc.verify_aggregate(&preimage_bytes, &pubkeys)
-                .map_err(|_| IngressError::InvalidQcAggregate {
-                    view: qc.view,
-                    scheme: scheme.name(),
-                })?;
+            return Err(IngressError::InvalidQcAggregate {
+                view: qc.view,
+                scheme: scheme.name(),
+            });
         }
         SignatureSchemeChoice::BlsAggregated => {
             if !qc.is_bls() {

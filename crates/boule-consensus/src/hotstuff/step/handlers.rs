@@ -192,19 +192,9 @@ impl HotStuffCore {
     pub(super) fn on_vote_received(&mut self, variant: VoteVariant) -> Vec<Action> {
         // `voter_id` is the stable `ValidatorId` ingress resolved via
         // `ValidatorKeyHistory::validator_for` and stamped on the
-        // envelope. `bls_partial` is `Some` iff the variant is `Bls`; the
-        // type makes "BLS chain + missing partial" unrepresentable.
-        let (signed, voter_id, bls_partial): (Signed<Vote>, _, Option<BlsPartialSig>) =
-            match variant {
-                VoteVariant::Ed25519(verified) => {
-                    let (signed, voter_id) = verified.into_parts();
-                    (signed, voter_id, None)
-                }
-                VoteVariant::Bls { signed, partial } => {
-                    let (signed, voter_id) = signed.into_parts();
-                    (signed, voter_id, Some(partial))
-                }
-            };
+        // envelope. The BLS partial was validated by ingress.
+        let (verified, partial) = variant.into_parts();
+        let (signed, voter_id) = verified.into_parts();
         let vote = &signed.payload;
         let next_view = vote.view + 1;
 
@@ -246,9 +236,9 @@ impl HotStuffCore {
         }
 
         // Accumulate into the bucket for this `(view, block_hash)`.
-        // `add_signature` / `add_bls_partial` are idempotent on set bits.
-        // The bucket is sized to the set authoritative at `vote.view` so
-        // the bitmap and quorum threshold match later QC verification.
+        // `add_bls_partial` is idempotent on set bits. The bucket is sized
+        // to the set authoritative at `vote.view` so the bitmap and quorum
+        // threshold match later QC verification.
         let key = (vote.view, vote.block_hash);
         let vs_at_vote_set = vs_at_vote.for_view(vote.view);
         let validator_set_len = vs_at_vote_set.len();
@@ -257,20 +247,11 @@ impl HotStuffCore {
         if !self.vote_bucket.contains_key(&key) {
             self.evict_vote_buckets_to_fit_one();
         }
-        let qc = self
-            .vote_bucket
-            .entry(key)
-            .or_insert_with(|| match bls_partial {
-                None => QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len),
-                Some(_) => {
-                    QuorumCertificate::new_bls(vote.view, vote.block_hash, validator_set_len)
-                }
-            });
+        let qc = self.vote_bucket.entry(key).or_insert_with(|| {
+            QuorumCertificate::new(vote.view, vote.block_hash, validator_set_len)
+        });
         let had_quorum = qc.has_quorum(vs_at_vote_set);
-        match bls_partial {
-            None => qc.add_signature(voter_idx, signed.sig),
-            Some(partial) => qc.add_bls_partial(voter_idx, partial),
-        }
+        qc.add_bls_partial(voter_idx, partial);
         let has_quorum_now = qc.has_quorum(vs_at_vote_set);
 
         // Fire only on the sub-quorum to quorum transition. Late votes

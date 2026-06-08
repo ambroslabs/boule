@@ -1081,12 +1081,25 @@ mod tests {
         }
     }
 
-    /// Build a quorum-bearing QC over `block_hash` for the given
+    /// A deterministic BLS partial signature for validator slot `seed`,
+    /// signed over an arbitrary message. The snapshot path never re-runs
+    /// the QC pairing check, so the message contents don't matter — we
+    /// only need real partials so the folded aggregate is well-formed
+    /// under [`QuorumCertificate::is_well_formed`].
+    fn bls_partial(seed: u8) -> boule_core::crypto::sig_scheme::BlsPartialSig {
+        use boule_core::crypto::sig_scheme::BlsAggregated;
+        let mut ikm = [0u8; 32];
+        ikm.fill(seed);
+        let (sk, _) = BlsAggregated::keygen(&ikm).unwrap();
+        BlsAggregated::sign_partial(&sk, b"snapshot-test").unwrap()
+    }
+
+    /// Build a quorum-bearing BLS QC over `block_hash` for the given
     /// validator-set length.
     fn quorum_qc_over(vs_len: usize, block_hash: BlockHash) -> QuorumCertificate {
         let mut qc = QuorumCertificate::new(View::ZERO, block_hash, vs_len);
         for i in 0..quorum_size(vs_len) {
-            qc.add_signature(i, [0u8; 64]);
+            qc.add_bls_partial(i, bls_partial(i as u8));
         }
         qc
     }
@@ -1361,7 +1374,7 @@ mod tests {
         let mut qc = QuorumCertificate::new(0, block_hash, vs.len());
         // Quorum for n=4 is 2f+1 with f=1 → 3.
         for i in 0..crate::hotstuff::qc::quorum_size(vs.len()) {
-            qc.add_signature(i, [0u8; 64]);
+            qc.add_bls_partial(i, bls_partial(i as u8));
         }
         qc
     }
@@ -1573,7 +1586,7 @@ mod tests {
         // Strip down to a single signer so the QC no longer has
         // quorum (n=4, f=1 → quorum=3).
         let mut weak_qc = QuorumCertificate::new(0, m.block_hash, vs.len());
-        weak_qc.add_signature(0, [0u8; 64]);
+        weak_qc.add_bls_partial(0, bls_partial(0));
         m.commit_qc = weak_qc;
         let err = m.verify(&vs).unwrap_err();
         assert!(matches!(
