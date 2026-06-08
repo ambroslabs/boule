@@ -58,7 +58,7 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::View;
-use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
+use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey};
 use boule_core::crypto::signed::{ChainId, SignedMessage, Signer, preimage};
 use boule_core::identity::NodeId;
 
@@ -103,13 +103,12 @@ pub const V_EFF_MIN_DELAY: View = View::new(2);
 /// shape is unchanged). `new_pubkey` is the consensus key the validator
 /// proposes to sign under starting at view `v_eff`.
 ///
-/// On `bls_aggregated` chains every rotation must atomically swap both
-/// halves of the validator's identity: `new_bls_pubkey` carries the new
-/// BLS12-381 G1 pubkey and `new_bls_pop` is its proof-of-possession
-/// (matching the `add-validator` reconfig contract from #291). On
-/// `ed25519_collected` chains both fields must be absent. Splitting the
-/// two halves into independent rotations would let the histories
-/// disagree at a single view (#358 out-of-scope item).
+/// Every rotation must atomically swap both halves of the validator's
+/// identity: `new_bls_pubkey` carries the new BLS12-381 G1 pubkey and
+/// `new_bls_pop` is its proof-of-possession (matching the
+/// `add-validator` reconfig contract from #291). Splitting the two
+/// halves into independent rotations would let the histories disagree at
+/// a single view (#358 out-of-scope item).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorKeyRotation {
     pub validator: NodeId,
@@ -163,13 +162,11 @@ pub enum RotationStructuralError {
         v_eff: View,
     },
     NewKeyEqualsValidator,
-    /// On a `bls_aggregated` chain a rotation must carry both
-    /// `new_bls_pubkey` and `new_bls_pop`; on `ed25519_collected` it
-    /// must carry neither (#358). Splitting the two halves into
-    /// independent rotations would leave the Ed25519 and BLS
-    /// histories transiently disagreeing at a single view.
+    /// A rotation must carry both `new_bls_pubkey` and `new_bls_pop`
+    /// (#358). Splitting the two halves into independent rotations
+    /// would leave the Ed25519 and BLS histories transiently
+    /// disagreeing at a single view.
     BlsFieldsInconsistentWithScheme {
-        scheme: SignatureSchemeChoice,
         bls_pubkey_present: bool,
         bls_pop_present: bool,
     },
@@ -199,14 +196,13 @@ impl std::fmt::Display for RotationStructuralError {
                 )
             }
             Self::BlsFieldsInconsistentWithScheme {
-                scheme,
                 bls_pubkey_present,
                 bls_pop_present,
             } => write!(
                 f,
-                "rotation BLS fields inconsistent with chain scheme {scheme}: \
+                "rotation BLS fields inconsistent: \
                  new_bls_pubkey={bls_pubkey_present}, new_bls_pop={bls_pop_present}; \
-                 BLS chains require both, Ed25519 chains require neither",
+                 a rotation requires both",
             ),
             Self::BlsPopVerificationFailed => f.write_str(
                 "rotation new_bls_pop does not verify under new_bls_pubkey \
@@ -249,44 +245,26 @@ impl ValidatorKeyRotation {
         Ok(())
     }
 
-    /// Check that the BLS half of this rotation matches the chain's
-    /// signature scheme, and (on BLS chains) that `new_bls_pop`
-    /// verifies under `new_bls_pubkey` and `chain_id` (#358, #410).
+    /// Check that this rotation carries the required BLS fields and that
+    /// `new_bls_pop` verifies under `new_bls_pubkey` and `chain_id`
+    /// (#358, #410).
     ///
-    /// Separate from [`Self::validate_structural`] because the chain
-    /// scheme isn't part of the rotation payload — it's a property of
-    /// the chain the rotation is being applied to. Callers thread the
-    /// scheme in from `NodeConfigForConsensus.signature_scheme` (or
-    /// `ConsensusNode.signature_scheme` post-construction) and the
-    /// chain_id from `ConsensusNode.chain_id`.
+    /// Separate from [`Self::validate_structural`] because the chain_id
+    /// isn't part of the rotation payload — it's a property of the chain
+    /// the rotation is being applied to. Callers thread the chain_id in
+    /// from `ConsensusNode.chain_id`.
     pub fn validate_scheme_consistency(
         &self,
-        scheme: SignatureSchemeChoice,
         chain_id: &ChainId,
     ) -> Result<(), RotationStructuralError> {
-        match scheme {
-            SignatureSchemeChoice::Ed25519Collected => {
-                if self.new_bls_pubkey.is_some() || self.new_bls_pop.is_some() {
-                    return Err(RotationStructuralError::BlsFieldsInconsistentWithScheme {
-                        scheme,
-                        bls_pubkey_present: self.new_bls_pubkey.is_some(),
-                        bls_pop_present: self.new_bls_pop.is_some(),
-                    });
-                }
-                Ok(())
-            }
-            SignatureSchemeChoice::BlsAggregated => {
-                let (Some(pk), Some(pop)) = (&self.new_bls_pubkey, &self.new_bls_pop) else {
-                    return Err(RotationStructuralError::BlsFieldsInconsistentWithScheme {
-                        scheme,
-                        bls_pubkey_present: self.new_bls_pubkey.is_some(),
-                        bls_pop_present: self.new_bls_pop.is_some(),
-                    });
-                };
-                BlsAggregated::verify_pop(pop, pk, chain_id)
-                    .map_err(|_| RotationStructuralError::BlsPopVerificationFailed)
-            }
-        }
+        let (Some(pk), Some(pop)) = (&self.new_bls_pubkey, &self.new_bls_pop) else {
+            return Err(RotationStructuralError::BlsFieldsInconsistentWithScheme {
+                bls_pubkey_present: self.new_bls_pubkey.is_some(),
+                bls_pop_present: self.new_bls_pop.is_some(),
+            });
+        };
+        BlsAggregated::verify_pop(pop, pk, chain_id)
+            .map_err(|_| RotationStructuralError::BlsPopVerificationFailed)
     }
 }
 
@@ -839,8 +817,8 @@ pub struct RotationProposeRequest {
 #[derive(Debug)]
 pub struct RotationProposeOutcome {
     pub envelope: DualSignedRotation,
-    /// True iff the chain's `signature_scheme` is `bls_aggregated` and the
-    /// rotation therefore carries a BLS pubkey + PoP.
+    /// Always `true`: every rotation carries a BLS pubkey + PoP. Retained
+    /// for the CLI's diagnostic output.
     pub bls_chain: bool,
 }
 
@@ -905,33 +883,19 @@ pub fn build_rotation_envelope(
     let cons = config.consensus.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "--config {} has no [consensus] section; rotation requires the \
-             chain's signature_scheme + chain_id to bundle a chain-bound payload",
+             chain's chain_id to bundle a chain-bound payload",
             config_path.display(),
         )
     })?;
     let chain_id = crate::genesis::derive_chain_id(cons)?;
 
-    // Reject scheme/flag mismatches *before* minting any new keys so a
+    // Reject a missing BLS flag *before* minting any new keys so a
     // misconfigured invocation leaves no half-provisioned files behind.
-    match cons.signature_scheme {
-        SignatureSchemeChoice::BlsAggregated => {
-            if req.new_bls_key_backend.is_none() {
-                anyhow::bail!(
-                    "[consensus].signature_scheme = \"bls_aggregated\" but no \
-                     --new-bls-key-backend was supplied; BLS chains rotate both halves \
-                     atomically (#358)",
-                );
-            }
-        }
-        SignatureSchemeChoice::Ed25519Collected => {
-            if req.new_bls_key_backend.is_some() || req.new_bls_key_path.is_some() {
-                anyhow::bail!(
-                    "[consensus].signature_scheme = \"ed25519_collected\" but a \
-                     --new-bls-key-* flag was supplied; Ed25519 chains have no use for \
-                     BLS keys (remove the flag)",
-                );
-            }
-        }
+    if req.new_bls_key_backend.is_none() {
+        anyhow::bail!(
+            "no --new-bls-key-backend was supplied; rotations carry both the Ed25519 \
+             and BLS halves atomically (#358)",
+        );
     }
 
     // Resolve the *current* validator signer, mirroring `start`'s
@@ -980,10 +944,9 @@ pub fn build_rotation_envelope(
     };
     let new_signer = NodeSigner::from_identity(&new_identity)?;
 
-    // BLS half. Scheme/flag-presence consistency was already enforced
-    // up front; this block only runs the actual provisioning on BLS chains.
-    let bls_chain = matches!(cons.signature_scheme, SignatureSchemeChoice::BlsAggregated);
-    let (new_bls_pubkey, new_bls_pop) = if bls_chain {
+    // BLS half. Flag presence was already enforced up front; this block
+    // runs the actual provisioning.
+    let (new_bls_pubkey, new_bls_pop) = {
         let backend = req
             .new_bls_key_backend
             .as_deref()
@@ -999,8 +962,6 @@ pub fn build_rotation_envelope(
         let pop = BlsAggregated::sign_pop(&bls_id.secret, &chain_id)
             .map_err(|e| anyhow::anyhow!("signing BLS PoP: {e:?}"))?;
         (Some(bls_id.public), Some(pop))
-    } else {
-        (None, None)
     };
 
     let payload = ValidatorKeyRotation {
@@ -1019,13 +980,13 @@ pub fn build_rotation_envelope(
         );
     }
     payload
-        .validate_scheme_consistency(cons.signature_scheme, &chain_id)
+        .validate_scheme_consistency(&chain_id)
         .map_err(|e| anyhow::anyhow!("rotation payload failed scheme-consistency check: {e}"))?;
 
     let envelope = DualSignedRotation::sign(payload, &current_signer, &new_signer, &chain_id)?;
     Ok(RotationProposeOutcome {
         envelope,
-        bls_chain,
+        bls_chain: true,
     })
 }
 
@@ -1107,33 +1068,19 @@ pub fn build_operator_recovery_envelope(
     let cons = config.consensus.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "--config {} has no [consensus] section; recovery requires the chain's \
-             signature_scheme + chain_id to bundle a chain-bound payload",
+             chain_id to bundle a chain-bound payload",
             config_path.display(),
         )
     })?;
     let chain_id = crate::genesis::derive_chain_id(cons)?;
 
-    // Same scheme/flag-presence checks as `build_rotation_envelope`, before
+    // Same BLS-flag-presence check as `build_rotation_envelope`, before
     // touching disk.
-    match cons.signature_scheme {
-        SignatureSchemeChoice::BlsAggregated => {
-            if req.new_bls_key_backend.is_none() {
-                anyhow::bail!(
-                    "[consensus].signature_scheme = \"bls_aggregated\" but no \
-                     --new-bls-key-backend was supplied; BLS chains rotate both halves \
-                     atomically (#358)",
-                );
-            }
-        }
-        SignatureSchemeChoice::Ed25519Collected => {
-            if req.new_bls_key_backend.is_some() || req.new_bls_key_path.is_some() {
-                anyhow::bail!(
-                    "[consensus].signature_scheme = \"ed25519_collected\" but a \
-                     --new-bls-key-* flag was supplied; Ed25519 chains have no use for \
-                     BLS keys (remove the flag)",
-                );
-            }
-        }
+    if req.new_bls_key_backend.is_none() {
+        anyhow::bail!(
+            "no --new-bls-key-backend was supplied; rotations carry both the Ed25519 \
+             and BLS halves atomically (#358)",
+        );
     }
 
     // Load the operator key — it must already exist (cold-storage authority
@@ -1176,8 +1123,7 @@ pub fn build_operator_recovery_envelope(
     let new_signer = NodeSigner::from_identity(&new_identity)?;
 
     // BLS half (same as rotation).
-    let bls_chain = matches!(cons.signature_scheme, SignatureSchemeChoice::BlsAggregated);
-    let (new_bls_pubkey, new_bls_pop) = if bls_chain {
+    let (new_bls_pubkey, new_bls_pop) = {
         let backend = req
             .new_bls_key_backend
             .as_deref()
@@ -1192,8 +1138,6 @@ pub fn build_operator_recovery_envelope(
         let pop = BlsAggregated::sign_pop(&bls_id.secret, &chain_id)
             .map_err(|e| anyhow::anyhow!("signing BLS PoP: {e:?}"))?;
         (Some(bls_id.public), Some(pop))
-    } else {
-        (None, None)
     };
 
     let payload = ValidatorKeyRotation {
@@ -1210,13 +1154,13 @@ pub fn build_operator_recovery_envelope(
         );
     }
     payload
-        .validate_scheme_consistency(cons.signature_scheme, &chain_id)
+        .validate_scheme_consistency(&chain_id)
         .map_err(|e| anyhow::anyhow!("recovery payload failed scheme-consistency check: {e}"))?;
 
     let envelope = OperatorSignedRotation::sign(payload, &operator_signer, &new_signer, &chain_id)?;
     Ok(OperatorRecoveryOutcome {
         envelope,
-        bls_chain,
+        bls_chain: true,
     })
 }
 
@@ -1857,22 +1801,16 @@ mod tests {
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk);
         p.new_bls_pop = Some(pop);
-        assert_eq!(
-            p.validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST),
-            Ok(())
-        );
+        assert_eq!(p.validate_scheme_consistency(&ChainId::TEST), Ok(()));
     }
 
     #[test]
     fn validate_scheme_consistency_bls_chain_rejects_missing_bls_pubkey() {
         let p = sample_payload();
-        let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST)
-            .unwrap_err();
+        let err = p.validate_scheme_consistency(&ChainId::TEST).unwrap_err();
         assert!(matches!(
             err,
             RotationStructuralError::BlsFieldsInconsistentWithScheme {
-                scheme: SignatureSchemeChoice::BlsAggregated,
                 bls_pubkey_present: false,
                 ..
             }
@@ -1884,13 +1822,10 @@ mod tests {
         let (_sk, pk) = bls_keypair(0xB1);
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk);
-        let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST)
-            .unwrap_err();
+        let err = p.validate_scheme_consistency(&ChainId::TEST).unwrap_err();
         assert!(matches!(
             err,
             RotationStructuralError::BlsFieldsInconsistentWithScheme {
-                scheme: SignatureSchemeChoice::BlsAggregated,
                 bls_pubkey_present: true,
                 bls_pop_present: false,
             }
@@ -1910,9 +1845,7 @@ mod tests {
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk_b);
         p.new_bls_pop = Some(pop_under_a);
-        let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST)
-            .unwrap_err();
+        let err = p.validate_scheme_consistency(&ChainId::TEST).unwrap_err();
         assert!(matches!(
             err,
             RotationStructuralError::BlsPopVerificationFailed
@@ -1927,9 +1860,7 @@ mod tests {
         let mut p = sample_payload();
         p.new_bls_pubkey = Some(pk);
         p.new_bls_pop = Some(pop);
-        let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &ChainId::TEST)
-            .unwrap_err();
+        let err = p.validate_scheme_consistency(&ChainId::TEST).unwrap_err();
         assert!(matches!(
             err,
             RotationStructuralError::BlsPopVerificationFailed
@@ -1951,13 +1882,10 @@ mod tests {
         p.new_bls_pop = Some(pop_on_a);
 
         // Sanity: under the originating chain, the PoP verifies.
-        assert_eq!(
-            p.validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &chain_a),
-            Ok(())
-        );
+        assert_eq!(p.validate_scheme_consistency(&chain_a), Ok(()));
         // Cross-chain replay is rejected.
         assert!(matches!(
-            p.validate_scheme_consistency(SignatureSchemeChoice::BlsAggregated, &chain_b),
+            p.validate_scheme_consistency(&chain_b),
             Err(RotationStructuralError::BlsPopVerificationFailed)
         ));
     }
@@ -2250,7 +2178,6 @@ mod tests {
         use crate::history_commitment::{RotationCancelError, apply_rotation_cancel_command};
         use crate::validator_key_history::ValidatorKeyHistory;
         use crate::validator_set::ValidatorId;
-        use boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated;
 
         let current = fresh_signer();
         let new = fresh_signer();
@@ -2286,15 +2213,8 @@ mod tests {
         .encode_command();
 
         // Apply at commit view 75 (before v_eff 100) → cancelled + restored.
-        let applied = apply_rotation_cancel_command(
-            &mut kh,
-            None,
-            &cmd,
-            &ChainId::TEST,
-            BlsAggregated,
-            View(75),
-        )
-        .unwrap();
+        let applied =
+            apply_rotation_cancel_command(&mut kh, None, &cmd, &ChainId::TEST, View(75)).unwrap();
         assert!(applied);
         assert_eq!(
             kh.to_persisted(),
@@ -2304,14 +2224,7 @@ mod tests {
 
         // Re-applying the same cancel (no longer pending) is a clean error.
         assert!(matches!(
-            apply_rotation_cancel_command(
-                &mut kh,
-                None,
-                &cmd,
-                &ChainId::TEST,
-                BlsAggregated,
-                View(75)
-            ),
+            apply_rotation_cancel_command(&mut kh, None, &cmd, &ChainId::TEST, View(75)),
             Err(RotationCancelError::NoPendingRotation),
         ));
     }
@@ -2323,7 +2236,6 @@ mod tests {
         use crate::history_commitment::{RotationCancelError, apply_rotation_cancel_command};
         use crate::validator_key_history::ValidatorKeyHistory;
         use crate::validator_set::ValidatorId;
-        use boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated;
 
         let current = fresh_signer();
         let new = fresh_signer();
@@ -2359,14 +2271,7 @@ mod tests {
         .encode_command();
 
         assert!(matches!(
-            apply_rotation_cancel_command(
-                &mut kh,
-                None,
-                &cmd,
-                &ChainId::TEST,
-                BlsAggregated,
-                View(75)
-            ),
+            apply_rotation_cancel_command(&mut kh, None, &cmd, &ChainId::TEST, View(75)),
             Err(RotationCancelError::Verify(_)),
         ));
         assert_eq!(

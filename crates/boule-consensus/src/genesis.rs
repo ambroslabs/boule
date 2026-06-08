@@ -57,7 +57,6 @@ pub fn derive_chain_id(
         .context("decoding genesis operator-key table")?;
     Ok(derive_chain_id_from_parts(
         &ids,
-        cfg.signature_scheme,
         &bls_pubkeys,
         &operator_keys,
         seed,
@@ -78,7 +77,6 @@ pub fn derive_chain_id(
 /// [`ChainId`]: boule_core::crypto::signed::ChainId
 pub fn derive_chain_id_from_parts(
     validator_node_ids: &[NodeId],
-    signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
     genesis_operator_keys: &[(NodeId, NodeId)],
     genesis_seed: [u8; 32],
@@ -91,7 +89,6 @@ pub fn derive_chain_id_from_parts(
     let validator_set = ValidatorSet::new(validator_ids);
     let commitment = compute_genesis_validator_history_commitment(
         &validator_set,
-        signature_scheme,
         genesis_bls,
         genesis_operator_keys,
     );
@@ -119,12 +116,8 @@ pub fn build_genesis(
         seed = bytes;
     }
     let operator_keys = cfg.resolve_genesis_operator_keys()?;
-    let commitment = compute_genesis_validator_history_commitment(
-        validator_set,
-        cfg.signature_scheme,
-        genesis_bls,
-        &operator_keys,
-    );
+    let commitment =
+        compute_genesis_validator_history_commitment(validator_set, genesis_bls, &operator_keys);
     Ok(Block::genesis(seed, commitment))
 }
 
@@ -134,7 +127,6 @@ pub fn build_genesis(
 /// so both produce byte-identical hashes from the same inputs.
 fn compute_genesis_validator_history_commitment(
     validator_set: &ValidatorSet,
-    scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
     genesis_operator_keys: &[(NodeId, NodeId)],
 ) -> [u8; 32] {
@@ -142,12 +134,9 @@ fn compute_genesis_validator_history_commitment(
         crate::validator_history::ValidatorSetHistory::from_genesis(validator_set.clone());
     let key_hist =
         crate::validator_key_history::ValidatorKeyHistory::new(validator_set.iter().copied());
-    let bls_hist = match scheme {
-        boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => Some(
-            crate::bls_key_history::BlsKeyHistory::with_genesis(genesis_bls.iter().copied()),
-        ),
-        boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => None,
-    };
+    let bls_hist = Some(crate::bls_key_history::BlsKeyHistory::with_genesis(
+        genesis_bls.iter().copied(),
+    ));
     // #549: v2 folds the operator-key history. `None` when the chain declared
     // no operator keys, so an operator-keyless chain hashes (and so derives a
     // chain_id) distinctly from one with an empty operator history.

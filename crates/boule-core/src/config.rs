@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::cli::OutputFormat;
-use crate::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey, SignatureSchemeChoice};
+use crate::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey};
 use crate::crypto::signed::ChainId;
 use crate::identity::KeyProvider;
 use crate::identity::encrypted_file::EncryptedFileKeyProvider;
@@ -58,11 +58,10 @@ pub struct NodeConfig {
     /// enabled. Both slots accept any of the same backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validator_identity: Option<IdentityConfig>,
-    /// BLS validator-signing identity backend. Required when the chain's
-    /// `signature_scheme = "bls_aggregated"` (#288); rejected when the
-    /// chain is `ed25519_collected` so a misconfigured node refuses to
-    /// start rather than booting in an inconsistent state. Today only a
-    /// `file` backend is supported. See [`BlsIdentityConfig`].
+    /// BLS validator-signing identity backend. Required for a validator
+    /// (#288); a misconfigured node refuses to start rather than booting
+    /// in an inconsistent state. Today only a `file` backend is
+    /// supported. See [`BlsIdentityConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bls_validator_identity: Option<BlsIdentityConfig>,
     /// Deprecated alias for `[node.identity] backend = "file" path = ...`.
@@ -403,23 +402,11 @@ pub struct ConsensusConfig {
     /// enforces the bound.
     #[serde(default = "default_snapshot_chunk_size_bytes")]
     pub snapshot_chunk_size_bytes: u32,
-    /// Signature scheme used by this chain's QCs. Selected at genesis
-    /// and **fixed** for the lifetime of the chain — switching requires
-    /// a coordinated restart from new genesis. Defaults to
-    /// `"ed25519_collected"`. Unknown values are rejected at parse time
-    /// so an operator who fat-fingers the field learns at startup
-    /// rather than mid-cluster. See [`SignatureSchemeChoice`].
-    #[serde(default)]
-    pub signature_scheme: SignatureSchemeChoice,
     /// Per-validator BLS pubkey + proof-of-possession declarations.
     ///
-    /// Required when `signature_scheme = "bls_aggregated"`: every
-    /// validator listed in `validators` must appear here exactly once
-    /// with a hex-encoded BLS pubkey and PoP, both verified at startup.
-    /// Forbidden when `signature_scheme = "ed25519_collected"`: an
-    /// Ed25519 chain has no use for BLS keys, and silently accepting
-    /// them would mask a misconfigured genesis. See
-    /// [`ConsensusConfig::resolve_genesis_bls_keys`].
+    /// Required: every validator listed in `validators` must appear here
+    /// exactly once with a hex-encoded BLS pubkey and PoP, both verified
+    /// at startup. See [`ConsensusConfig::resolve_genesis_bls_keys`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validators_bls: Vec<ValidatorBlsEntry>,
     /// Per-validator **operator-key** declarations (#549).
@@ -512,9 +499,8 @@ pub struct ValidatorOperatorKeyEntry {
 
 impl ConsensusConfig {
     /// Parse and structurally validate the `validators_bls` table
-    /// against `signature_scheme` and `validators`. Returns the
-    /// ordered list of `(node_id, bls_pubkey, bls_pop)` triples ready
-    /// for two consumers:
+    /// against `validators`. Returns the ordered list of
+    /// `(node_id, bls_pubkey, bls_pop)` triples ready for two consumers:
     ///
     /// 1. A `(NodeId, BlsPublicKey)` projection seeds the genesis
     ///    `boule_consensus::bls_key_history::BlsKeyHistory` and
@@ -524,104 +510,87 @@ impl ConsensusConfig {
     ///    (and therefore the chain_id) is known, since the PoP
     ///    pre-image binds to chain_id (#410).
     ///
-    /// Errors:
-    /// - On a BLS chain: `validators_bls` missing, mismatched length,
-    ///   duplicate or unknown `node_id`s, or malformed hex. PoP
-    ///   cryptographic verification is deferred to
-    ///   [`Self::verify_genesis_bls_pops`] because the chain_id isn't
-    ///   known until the genesis block is built from this triple.
-    /// - On an Ed25519 chain: any `validators_bls` entry present at all.
+    /// Errors: `validators_bls` missing, mismatched length, duplicate or
+    /// unknown `node_id`s, or malformed hex. PoP cryptographic
+    /// verification is deferred to [`Self::verify_genesis_bls_pops`]
+    /// because the chain_id isn't known until the genesis block is built
+    /// from this triple.
     ///
-    /// On a BLS chain, the returned `Vec` is the per-validator BLS
-    /// timeline at view 0 plus the operator-supplied PoPs. On an
-    /// Ed25519 chain, returns an empty `Vec`.
+    /// The returned `Vec` is the per-validator BLS timeline at view 0
+    /// plus the operator-supplied PoPs.
     pub fn resolve_genesis_bls_keys(&self) -> anyhow::Result<Vec<(NodeId, BlsPublicKey, BlsPop)>> {
-        match self.signature_scheme {
-            SignatureSchemeChoice::Ed25519Collected => anyhow::bail!(
-                "signature_scheme = \"ed25519_collected\" is no longer supported; \
-                 BLS is the only consensus signature scheme. Set \
-                 signature_scheme = \"bls_aggregated\" and provide a validators_bls table."
-            ),
-            SignatureSchemeChoice::BlsAggregated => {
-                if self.validators_bls.is_empty() {
-                    anyhow::bail!(
-                        "consensus.validators_bls is required when signature_scheme = \
-                         \"bls_aggregated\" but the table is empty or missing. \
-                         Each entry in `validators` must declare a matching `node_id`, \
-                         `bls_pubkey`, and `bls_pop`."
-                    );
-                }
-                if self.validators_bls.len() != self.validators.len() {
-                    anyhow::bail!(
-                        "consensus.validators_bls has {} entries but consensus.validators has {} \
-                         — each validator must declare exactly one BLS entry.",
-                        self.validators_bls.len(),
-                        self.validators.len(),
-                    );
-                }
-                // Resolve each validator NodeId once so we can detect
-                // duplicates and unknown NodeIds in a single pass.
-                let mut declared: std::collections::BTreeSet<NodeId> =
-                    std::collections::BTreeSet::new();
-                for (idx, raw) in self.validators.iter().enumerate() {
-                    let nid = base58_to_node_id(raw).map_err(|e| {
-                        anyhow::anyhow!(
-                            "consensus.validators[{idx}] {raw:?} is not valid base58 NodeId: {e}",
-                        )
-                    })?;
-                    if !declared.insert(nid) {
-                        anyhow::bail!(
-                            "consensus.validators[{idx}] {raw:?} is a duplicate; \
-                             every validator must appear exactly once.",
-                        );
-                    }
-                }
-
-                let mut out = Vec::with_capacity(self.validators_bls.len());
-                let mut seen: std::collections::BTreeSet<NodeId> =
-                    std::collections::BTreeSet::new();
-                for (idx, entry) in self.validators_bls.iter().enumerate() {
-                    let nid = base58_to_node_id(&entry.node_id).map_err(|e| {
-                        anyhow::anyhow!(
-                            "consensus.validators_bls[{idx}].node_id {:?} is not valid base58 \
-                             NodeId: {e}",
-                            entry.node_id,
-                        )
-                    })?;
-                    if !declared.contains(&nid) {
-                        anyhow::bail!(
-                            "consensus.validators_bls[{idx}].node_id {:?} is not in \
-                             consensus.validators — every BLS entry must reference a declared \
-                             validator.",
-                            entry.node_id,
-                        );
-                    }
-                    if !seen.insert(nid) {
-                        anyhow::bail!(
-                            "consensus.validators_bls[{idx}].node_id {:?} appears more than \
-                             once; declare each validator's BLS pubkey exactly once.",
-                            entry.node_id,
-                        );
-                    }
-                    let pubkey: BlsPublicKey = decode_hex_array(&entry.bls_pubkey).map_err(|e| {
-                        anyhow::anyhow!(
-                            "consensus.validators_bls[{idx}].bls_pubkey is not 48-byte hex: {e}",
-                        )
-                    })?;
-                    let sig_bytes: [u8; 96] = decode_hex_array(&entry.bls_pop).map_err(|e| {
-                        anyhow::anyhow!(
-                            "consensus.validators_bls[{idx}].bls_pop is not 96-byte hex: {e}",
-                        )
-                    })?;
-                    let pop = BlsPop {
-                        pubkey,
-                        sig: sig_bytes,
-                    };
-                    out.push((nid, pubkey, pop));
-                }
-                Ok(out)
+        if self.validators_bls.is_empty() {
+            anyhow::bail!(
+                "consensus.validators_bls is required but the table is empty or missing. \
+                 Each entry in `validators` must declare a matching `node_id`, \
+                 `bls_pubkey`, and `bls_pop`."
+            );
+        }
+        if self.validators_bls.len() != self.validators.len() {
+            anyhow::bail!(
+                "consensus.validators_bls has {} entries but consensus.validators has {} \
+                 — each validator must declare exactly one BLS entry.",
+                self.validators_bls.len(),
+                self.validators.len(),
+            );
+        }
+        // Resolve each validator NodeId once so we can detect
+        // duplicates and unknown NodeIds in a single pass.
+        let mut declared: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        for (idx, raw) in self.validators.iter().enumerate() {
+            let nid = base58_to_node_id(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "consensus.validators[{idx}] {raw:?} is not valid base58 NodeId: {e}",
+                )
+            })?;
+            if !declared.insert(nid) {
+                anyhow::bail!(
+                    "consensus.validators[{idx}] {raw:?} is a duplicate; \
+                     every validator must appear exactly once.",
+                );
             }
         }
+
+        let mut out = Vec::with_capacity(self.validators_bls.len());
+        let mut seen: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+        for (idx, entry) in self.validators_bls.iter().enumerate() {
+            let nid = base58_to_node_id(&entry.node_id).map_err(|e| {
+                anyhow::anyhow!(
+                    "consensus.validators_bls[{idx}].node_id {:?} is not valid base58 \
+                     NodeId: {e}",
+                    entry.node_id,
+                )
+            })?;
+            if !declared.contains(&nid) {
+                anyhow::bail!(
+                    "consensus.validators_bls[{idx}].node_id {:?} is not in \
+                     consensus.validators — every BLS entry must reference a declared \
+                     validator.",
+                    entry.node_id,
+                );
+            }
+            if !seen.insert(nid) {
+                anyhow::bail!(
+                    "consensus.validators_bls[{idx}].node_id {:?} appears more than \
+                     once; declare each validator's BLS pubkey exactly once.",
+                    entry.node_id,
+                );
+            }
+            let pubkey: BlsPublicKey = decode_hex_array(&entry.bls_pubkey).map_err(|e| {
+                anyhow::anyhow!(
+                    "consensus.validators_bls[{idx}].bls_pubkey is not 48-byte hex: {e}",
+                )
+            })?;
+            let sig_bytes: [u8; 96] = decode_hex_array(&entry.bls_pop).map_err(|e| {
+                anyhow::anyhow!("consensus.validators_bls[{idx}].bls_pop is not 96-byte hex: {e}",)
+            })?;
+            let pop = BlsPop {
+                pubkey,
+                sig: sig_bytes,
+            };
+            out.push((nid, pubkey, pop));
+        }
+        Ok(out)
     }
 
     /// Parse and structurally validate the `validators_operator_keys` table
@@ -2048,52 +2017,6 @@ validators = ["a"]
             crate::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
         );
         assert_eq!(cons.mempool_capacity, 1024);
-        // BLS is the only consensus signature scheme and the default.
-        assert_eq!(cons.signature_scheme, SignatureSchemeChoice::BlsAggregated,);
-    }
-
-    #[test]
-    fn consensus_signature_scheme_explicit_ed25519_collected_parses() {
-        let c = parse(
-            r#"
-[node]
-listen_addr = "127.0.0.1:7000"
-
-[api]
-listen_addr = "127.0.0.1:8080"
-
-[consensus]
-validators = ["a"]
-signature_scheme = "ed25519_collected"
-"#,
-        );
-        let cons = c.consensus.expect("consensus section");
-        assert_eq!(
-            cons.signature_scheme,
-            SignatureSchemeChoice::Ed25519Collected,
-        );
-    }
-
-    #[test]
-    fn consensus_signature_scheme_unknown_value_fails_to_parse() {
-        // Catch operator typos at startup, not on the first QC.
-        let s = r#"
-[node]
-listen_addr = "127.0.0.1:7000"
-
-[api]
-listen_addr = "127.0.0.1:8080"
-
-[consensus]
-validators = ["a"]
-signature_scheme = "ed25519_aggregated"
-"#;
-        let err = toml::from_str::<Config>(s).expect_err("unknown scheme must not parse");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("signature_scheme") || msg.contains("ed25519_aggregated"),
-            "error must point at the offending field/value, got: {msg}",
-        );
     }
 
     #[test]
@@ -2939,8 +2862,7 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 
 [consensus]
-{validators}signature_scheme = "bls_aggregated"
-
+{validators}
 {bls_table}"#,
             validators = render_validators(&v),
             bls_table = render_bls_table(&v),
@@ -3075,8 +2997,7 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 
 [consensus]
-{validators}signature_scheme = "bls_aggregated"
-
+{validators}
 {bls_table}"#,
             validators = render_validators(&v),
             bls_table = render_bls_table(&v),
@@ -3105,8 +3026,7 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 
 [consensus]
-{validators}signature_scheme = "bls_aggregated"
-"#,
+{validators}"#,
             validators = render_validators(&v),
         );
         let cons = parse(&s).consensus.expect("consensus");
@@ -3115,29 +3035,6 @@ listen_addr = "127.0.0.1:8080"
             err.to_string().contains("validators_bls is required"),
             "got: {err}",
         );
-    }
-
-    #[test]
-    fn ed25519_chain_with_validators_bls_is_rejected() {
-        let v = (1..=4u8).map(make_bls_validator).collect::<Vec<_>>();
-        let s = format!(
-            r#"
-[node]
-listen_addr = "127.0.0.1:7000"
-
-[api]
-listen_addr = "127.0.0.1:8080"
-
-[consensus]
-{validators}signature_scheme = "ed25519_collected"
-
-{bls_table}"#,
-            validators = render_validators(&v),
-            bls_table = render_bls_table(&v),
-        );
-        let cons = parse(&s).consensus.expect("consensus");
-        let err = cons.resolve_genesis_bls_keys().unwrap_err();
-        assert!(err.to_string().contains("ed25519_collected"), "got: {err}",);
     }
 
     #[test]
@@ -3158,8 +3055,7 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 
 [consensus]
-{validators}signature_scheme = "bls_aggregated"
-
+{validators}
 {bls_table}"#,
             validators = render_validators(&v),
             bls_table = render_bls_table(&v),
@@ -3194,8 +3090,7 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 
 [consensus]
-{validators}signature_scheme = "bls_aggregated"
-
+{validators}
 {bls_table}"#,
             validators = render_validators(&v),
             bls_table = render_bls_table(&bls_v),
@@ -3224,8 +3119,7 @@ listen_addr = "127.0.0.1:7000"
 listen_addr = "127.0.0.1:8080"
 
 [consensus]
-{validators}signature_scheme = "bls_aggregated"
-
+{validators}
 {bls_table}"#,
             validators = render_validators(&v),
             bls_table = render_bls_table(&short),

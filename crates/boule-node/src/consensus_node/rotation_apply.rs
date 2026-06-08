@@ -93,15 +93,11 @@ impl ConsensusNode {
                 continue;
             }
 
-            // Scheme-consistency check (#358): on BLS chains the
-            // rotation must atomically rotate both keys (with a
-            // verified PoP for the new BLS pubkey); on Ed25519 chains
-            // the BLS fields must be absent. Splitting the two halves
-            // would leave the histories transiently disagreeing.
-            if let Err(e) = envelope
-                .payload
-                .validate_scheme_consistency(self.signature_scheme, &self.chain_id)
-            {
+            // Scheme-consistency check (#358): the rotation must
+            // atomically rotate both keys (with a verified PoP for the
+            // new BLS pubkey). Splitting the two halves would leave the
+            // histories transiently disagreeing.
+            if let Err(e) = envelope.payload.validate_scheme_consistency(&self.chain_id) {
                 tracing::warn!(
                     target: TRACE_TARGET,
                     height = block.header.height.0,
@@ -148,8 +144,6 @@ impl ConsensusNode {
             // monotone-`v_eff` invariant — same failure mode the
             // Ed25519 path already covers, but in the parallel BLS
             // history. Log + roll back if it does.
-            if self.signature_scheme
-                == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated
             {
                 let new_bls_pk = envelope.payload.new_bls_pubkey.expect(
                     "BLS chain rotation passed scheme consistency must carry new_bls_pubkey",
@@ -213,7 +207,6 @@ impl ConsensusNode {
                 self.bls_key_history.as_mut(),
                 cmd_bytes,
                 &self.chain_id,
-                self.signature_scheme,
                 block_view,
             ) {
                 Ok(false) => {} // not a cancel payload
@@ -249,7 +242,6 @@ impl ConsensusNode {
                 &self.operator_key_history,
                 cmd_bytes,
                 &self.chain_id,
-                self.signature_scheme,
                 block_view,
             ) {
                 Ok(false) => {} // not an operator-rotation payload
@@ -387,7 +379,6 @@ impl ConsensusNode {
                 rebuilt_bls.as_mut(),
                 Some(&mut rebuilt_operator),
                 &self.chain_id,
-                self.signature_scheme,
             );
             debug_assert_eq!(
                 rebuilt_keys.to_persisted(),

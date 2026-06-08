@@ -330,8 +330,7 @@ mod tests {
              [api]\n\
              listen_addr = \"127.0.0.1:8000\"\n\n\
              [consensus]\n\
-             validators = [\"{val}\"]\n\
-             signature_scheme = \"bls_aggregated\"\n\n\
+             validators = [\"{val}\"]\n\n\
              [[consensus.validators_bls]]\n\
              node_id = \"{val}\"\n\
              bls_pubkey = \"{pk}\"\n\
@@ -377,8 +376,7 @@ mod tests {
                  [api]\n\
                  listen_addr = \"127.0.0.1:8000\"\n\n\
                  [consensus]\n\
-                 validators = [\"{val}\"]\n\
-                 signature_scheme = \"bls_aggregated\"\n\n\
+                 validators = [\"{val}\"]\n\n\
                  [[consensus.validators_bls]]\n\
                  node_id = \"{val}\"\n\
                  bls_pubkey = \"{pk}\"\n\
@@ -520,8 +518,7 @@ mod tests {
                  [api]\n\
                  listen_addr = \"127.0.0.1:8000\"\n\n\
                  [consensus]\n\
-                 validators = [\"{val}\"]\n\
-                 signature_scheme = \"bls_aggregated\"\n\n\
+                 validators = [\"{val}\"]\n\n\
                  [[consensus.validators_bls]]\n\
                  node_id = \"{val}\"\n\
                  bls_pubkey = \"{pk}\"\n\
@@ -739,10 +736,7 @@ mod tests {
         outcome
             .envelope
             .payload
-            .validate_scheme_consistency(
-                boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
-                &chain_id,
-            )
+            .validate_scheme_consistency(&chain_id)
             .expect("must pass scheme-consistency under the BLS scheme");
 
         let current_id =

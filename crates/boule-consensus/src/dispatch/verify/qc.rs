@@ -14,7 +14,7 @@ use crate::View;
 use crate::hotstuff::qc::QuorumCertificate;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
-use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
+use boule_core::crypto::sig_scheme::{BlsAggregated, SignatureScheme};
 use boule_core::crypto::signed::ChainId;
 
 use super::super::{IngressError, QcVerification};
@@ -26,11 +26,10 @@ use super::domain::vote_preimage;
 /// signature-free, and rejecting it here would refuse to bootstrap.
 ///
 /// On `Skip`, returns `Ok(())` without inspecting the QC. On `Verify`,
-/// the QC's scheme must match `scheme`; the per-historical-view
-/// validator pubkeys are resolved at `qc.view` via `key_history`
-/// (Ed25519) or `bls_key_history` (BLS); the corresponding
-/// `verify_aggregate` / `verify_aggregate_bls` is called against the
-/// canonical Vote pre-image `(qc.view, qc.block_hash)`.
+/// the QC must carry a BLS aggregate; the per-historical-view validator
+/// pubkeys are resolved at `qc.view` via `bls_key_history` and
+/// `verify_aggregate_bls` is called against the canonical Vote pre-image
+/// `(qc.view, qc.block_hash)`.
 pub(in crate::dispatch) fn verify_qc_if_requested(
     qc: &QuorumCertificate,
     history: &ValidatorSetHistory,
@@ -38,16 +37,15 @@ pub(in crate::dispatch) fn verify_qc_if_requested(
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<(), IngressError> {
-    let (scheme, bls_key_history, genesis_hash) = match qc_verification {
+    let (bls_key_history, genesis_hash) = match qc_verification {
         #[cfg(any(test, feature = "testing"))]
         QcVerification::Skip => return Ok(()),
         QcVerification::Verify {
-            scheme,
             bls_key_history,
             operator_key_history: _,
             min_v_eff_delay: _,
             genesis_hash,
-        } => (scheme, bls_key_history, genesis_hash),
+        } => (bls_key_history, genesis_hash),
     };
 
     // Audit finding 7-4 (issue #418): a view-0 QC is the genesis
@@ -61,7 +59,7 @@ pub(in crate::dispatch) fn verify_qc_if_requested(
     if qc.view == View::ZERO && qc.block_hash != *genesis_hash {
         return Err(IngressError::InvalidQcAggregate {
             view: View::ZERO,
-            scheme: scheme.name(),
+            scheme: BlsAggregated::NAME,
         });
     }
 
@@ -89,44 +87,32 @@ pub(in crate::dispatch) fn verify_qc_if_requested(
     let preimage_bytes = vote_preimage(qc.view, qc.block_hash, chain_id).map_err(|_| {
         IngressError::InvalidQcAggregate {
             view: qc.view,
-            scheme: scheme.name(),
+            scheme: BlsAggregated::NAME,
         }
     })?;
 
-    match scheme {
-        // Ed25519-collected consensus signatures are no longer supported;
-        // reject any QC claiming that scheme (no such chain can be
-        // configured — see `ConsensusConfig::resolve_genesis_bls_keys`).
-        SignatureSchemeChoice::Ed25519Collected => {
-            return Err(IngressError::InvalidQcAggregate {
-                view: qc.view,
-                scheme: scheme.name(),
-            });
-        }
-        SignatureSchemeChoice::BlsAggregated => {
-            if !qc.is_bls() {
-                return Err(IngressError::InvalidQcAggregate {
-                    view: qc.view,
-                    scheme: scheme.name(),
-                });
-            }
-            let bls_history = bls_key_history.ok_or(IngressError::InvalidQcAggregate {
-                view: qc.view,
-                scheme: scheme.name(),
-            })?;
-            let pubkeys = bls_history.pubkeys_for_set(vs, qc.view).map_err(|_| {
-                IngressError::InvalidQcAggregate {
-                    view: qc.view,
-                    scheme: scheme.name(),
-                }
-            })?;
-            qc.verify_aggregate_bls(&preimage_bytes, &pubkeys)
-                .map_err(|_| IngressError::InvalidQcAggregate {
-                    view: qc.view,
-                    scheme: scheme.name(),
-                })?;
-        }
+    if !qc.is_bls() {
+        return Err(IngressError::InvalidQcAggregate {
+            view: qc.view,
+            scheme: BlsAggregated::NAME,
+        });
     }
+    let bls_history = bls_key_history.ok_or(IngressError::InvalidQcAggregate {
+        view: qc.view,
+        scheme: BlsAggregated::NAME,
+    })?;
+    let pubkeys =
+        bls_history
+            .pubkeys_for_set(vs, qc.view)
+            .map_err(|_| IngressError::InvalidQcAggregate {
+                view: qc.view,
+                scheme: BlsAggregated::NAME,
+            })?;
+    qc.verify_aggregate_bls(&preimage_bytes, &pubkeys)
+        .map_err(|_| IngressError::InvalidQcAggregate {
+            view: qc.view,
+            scheme: BlsAggregated::NAME,
+        })?;
     Ok(())
 }
 

@@ -548,15 +548,6 @@ struct SpawnExtras {
     /// Per-node adversary hooks (issue #132). Indexed by sorted node
     /// order; `None` slots run the honest protocol unchanged.
     adversaries: Option<Vec<Option<Arc<dyn Adversary>>>>,
-    /// Chain-level signature scheme override (#354 step 2). When
-    /// `Some(BlsAggregated)`, [`SimCluster::spawn_inner`] generates a
-    /// BLS keypair per validator, seeds each node's
-    /// [`boule_consensus::bls_key_history::BlsKeyHistory`] from
-    /// genesis, and plumbs the corresponding
-    /// [`boule_core::crypto::bls_key::BlsPartialSignerImpl`] onto each
-    /// node so leaders can produce real BLS partials on Vote frames.
-    /// `None` keeps the default Ed25519 cluster shape.
-    signature_scheme: Option<boule_core::crypto::sig_scheme::SignatureSchemeChoice>,
     /// Per-validator voting weights, indexed in *sorted* validator
     /// order (`spawn_inner` sorts the freshly-generated `NodeSigner`s
     /// by `NodeId` before assigning weights — the slot at index `i`
@@ -937,9 +928,6 @@ impl SimCluster {
             SpawnExtras {
                 rate_limits: None,
                 adversaries: None,
-                signature_scheme: Some(
-                    boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
-                ),
                 weights: None,
                 slow_disk_delays: None,
                 slow_node_delays: None,
@@ -978,7 +966,6 @@ impl SimCluster {
             SpawnExtras {
                 rate_limits: None,
                 adversaries: Some(adversaries),
-                signature_scheme: None,
                 weights: None,
                 slow_disk_delays: None,
                 slow_node_delays: None,
@@ -1093,7 +1080,6 @@ impl SimCluster {
             SpawnExtras {
                 rate_limits: Some(rate_limits),
                 adversaries: None,
-                signature_scheme: None,
                 weights: None,
                 slow_disk_delays: None,
                 slow_node_delays: None,
@@ -1114,13 +1100,11 @@ impl SimCluster {
         let SpawnExtras {
             rate_limits,
             adversaries,
-            signature_scheme,
             weights,
             slow_disk_delays,
             slow_node_delays,
             state_machines,
         } = extras;
-        let scheme = signature_scheme.unwrap_or_default();
         if let Some(adv) = adversaries.as_ref() {
             assert_eq!(adv.len(), n, "adversary slots must equal n");
         }
@@ -1175,7 +1159,7 @@ impl SimCluster {
         let (bls_pubkeys, bls_secret_for): (
             HashMap<NodeId, boule_core::crypto::sig_scheme::BlsPublicKey>,
             HashMap<NodeId, boule_core::crypto::sig_scheme::BlsSecretKey>,
-        ) = if scheme == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
+        ) = {
             let mut pubs = HashMap::new();
             let mut secs = HashMap::new();
             for (i, validator_id) in vs.iter().enumerate() {
@@ -1197,8 +1181,6 @@ impl SimCluster {
                 secs.insert(nid, sk);
             }
             (pubs, secs)
-        } else {
-            (HashMap::new(), HashMap::new())
         };
 
         // Shared partition set: routing tasks check this before forwarding.
@@ -1316,7 +1298,6 @@ impl SimCluster {
                 limits: CacheLimits::unbounded_for_tests(),
                 snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-                signature_scheme: scheme,
                 block_retention_window: 0,
                 min_block_interval: Duration::ZERO,
                 weak_subjectivity_checkpoint: None,
@@ -1372,7 +1353,7 @@ impl SimCluster {
             // (2) its own `BlsPartialSignerImpl` so the dispatch-layer
             //     vote signer can produce real BLS partials on Vote
             //     frames the leader emits or loops back through #118.
-            if scheme == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated {
+            {
                 let bls_history = boule_consensus::bls_key_history::BlsKeyHistory::with_genesis(
                     bls_pubkeys.iter().map(|(id, pk)| (*id, *pk)),
                 );
@@ -1407,8 +1388,6 @@ impl SimCluster {
                         >,
                 > = rotatable_bls;
                 node = node.with_bls_signer(bls_signer);
-            } else {
-                rotatable_bls_signers_captured.push(None);
             }
 
             // Optional rate-limiter (issue #134). The sim has no real
@@ -1455,9 +1434,7 @@ impl SimCluster {
                                 boule_core::crypto::sig_scheme::BlsAggregated,
                             >,
                     >,
-                > = if scheme
-                    == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated
-                {
+                > = {
                     let identity = boule_core::crypto::bls_key::BlsValidatorIdentity {
                         secret: zeroize::Zeroizing::new(bls_secret_for[&nid]),
                         public: bls_pubkeys[&nid],
@@ -1465,8 +1442,6 @@ impl SimCluster {
                     Some(Arc::new(
                         boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity),
                     ))
-                } else {
-                    None
                 };
                 let ctx = AdversaryCtx {
                     my_id: nid,
@@ -1573,16 +1548,10 @@ impl SimCluster {
             rotatable_bls_signers: rotatable_bls_signers_captured,
             storages: Some(storages_for_restart),
             wals: Some(wals_for_restart),
-            bls_keys: if scheme
-                == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated
-            {
-                Some(BlsClusterKeys {
-                    pubkeys: bls_pubkeys,
-                    secrets: bls_secret_for,
-                })
-            } else {
-                None
-            },
+            bls_keys: Some(BlsClusterKeys {
+                pubkeys: bls_pubkeys,
+                secrets: bls_secret_for,
+            }),
             mempools: mempools_captured,
             validator_set: vs,
             genesis,
@@ -1641,7 +1610,6 @@ impl SimCluster {
             limits: CacheLimits::unbounded_for_tests(),
             snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-            signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
             block_retention_window: 0,
             min_block_interval: Duration::ZERO,
             weak_subjectivity_checkpoint: None,
@@ -2418,7 +2386,6 @@ impl SimCluster {
                 limits: CacheLimits::unbounded_for_tests(),
                 snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
                 min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-                signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
                 block_retention_window: 0,
                 min_block_interval: Duration::ZERO,
                 weak_subjectivity_checkpoint: None,
@@ -2689,7 +2656,6 @@ impl SimCluster {
             limits: CacheLimits::unbounded_for_tests(),
             snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-            signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
             block_retention_window: 0,
             min_block_interval: Duration::ZERO,
             weak_subjectivity_checkpoint: None,

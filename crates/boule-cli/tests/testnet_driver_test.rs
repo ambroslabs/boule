@@ -41,7 +41,6 @@ async fn driver_lifecycle_4_nodes() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -136,7 +135,6 @@ async fn submitted_tx_is_committed() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -233,7 +231,6 @@ async fn submitted_stake_command_changes_the_validator_set() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -369,7 +366,6 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -504,7 +500,6 @@ async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -592,7 +587,6 @@ async fn new_cluster_canonicalizes_relative_workdir() {
         binary: bin,
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster with relative workdir");

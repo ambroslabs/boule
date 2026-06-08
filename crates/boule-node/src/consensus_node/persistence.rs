@@ -888,7 +888,6 @@ impl ConsensusNode {
                 &mut rebuilt_key,
                 Some(&mut rebuilt_operator),
                 rebuilt_bls.as_mut(),
-                self.signature_scheme,
                 self.min_v_eff_delay,
                 &self.chain_id,
             );
@@ -899,7 +898,6 @@ impl ConsensusNode {
                 rebuilt_bls.as_mut(),
                 Some(&mut rebuilt_operator),
                 &self.chain_id,
-                self.signature_scheme,
             );
             let claimed = block.header.validator_history_commitment;
             // #549: v2 folds the operator-key history, rebuilt incrementally

@@ -1204,8 +1204,7 @@ fn bls_quorum_emits_high_qc_with_real_aggregate_that_verifies() {
     let block_v3_hash = block_v3.hash();
 
     let state = HotStuffState::new(validators_set.clone(), Block::genesis([0; 32], [0; 32]));
-    let mut core = HotStuffCore::new(nid(1), state)
-        .with_signature_scheme(SignatureSchemeChoice::BlsAggregated);
+    let mut core = HotStuffCore::new(nid(1), state);
     core.state.insert_pending(block_v3.clone());
 
     // Build one BLS partial per voter at indices 1, 2, 3
@@ -3802,11 +3801,6 @@ mod property {
         /// Byzantine. Honest validator indices are `0..n_honest`
         /// where `n_honest = validators.len() - byzantine_count`.
         pub byzantine_count: usize,
-        /// Chain-level signature scheme this set runs under
-        /// (#354 step 3). Drives whether `event_from_msg`
-        /// produces a BLS partial alongside each Vote and which
-        /// genesis-QC shape `kickoff_proposal` uses.
-        pub signature_scheme: SignatureSchemeChoice,
         /// Per-validator BLS keypair. Length matches
         /// `validators.len()`. Indexed parallel to validator order
         /// (sorted ascending), so `bls_keys[i]` belongs to
@@ -3838,7 +3832,6 @@ mod property {
                 byzantine_count < n_total,
                 "byzantine_count must be strictly less than n_total",
             );
-            let scheme = SignatureSchemeChoice::BlsAggregated;
             let n_honest = n_total - byzantine_count;
             let validators = validator_set(n_total);
             let genesis = Block::genesis([0; 32], [0; 32]);
@@ -3846,7 +3839,7 @@ mod property {
                 .map(|i| {
                     let nid = validators.get(i).unwrap().into_node_id();
                     let state = HotStuffState::new(validators.clone(), genesis.clone());
-                    HotStuffCore::new(nid, state).with_signature_scheme(scheme)
+                    HotStuffCore::new(nid, state)
                 })
                 .collect();
             let inboxes = (0..n_honest).map(|_| VecDeque::new()).collect();
@@ -3872,25 +3865,19 @@ mod property {
                 validators,
                 genesis,
                 byzantine_count,
-                signature_scheme: scheme,
                 bls_keys,
             }
         }
 
         /// Sign a BLS partial over the canonical Vote pre-image
-        /// using validator `signer_idx`'s BLS key. Returns `None`
-        /// on Ed25519 chains (where the optional partial field
-        /// rides as `None`). Panics on BLS chains if `signer_idx`
-        /// is out of range — the caller should index validators
-        /// directly.
+        /// using validator `signer_idx`'s BLS key. Panics if
+        /// `signer_idx` is out of range — the caller should index
+        /// validators directly.
         pub fn bls_partial_for_vote(
             &self,
             signer_idx: usize,
             vote: &Vote,
         ) -> Option<boule_core::crypto::sig_scheme::BlsPartialSig> {
-            if self.signature_scheme != SignatureSchemeChoice::BlsAggregated {
-                return None;
-            }
             let preimg = boule_core::crypto::signed::preimage::<Vote>(
                 vote,
                 &boule_core::crypto::signed::ChainId::TEST,

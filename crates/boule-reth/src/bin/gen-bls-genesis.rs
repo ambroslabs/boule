@@ -26,7 +26,7 @@
 
 use boule_consensus::genesis::derive_chain_id_from_parts;
 use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
-use boule_core::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
+use boule_core::crypto::sig_scheme::BlsAggregated;
 use boule_core::identity::base58_to_node_id;
 
 fn parse_seed(seed_hex: &str) -> anyhow::Result<[u8; 32]> {
@@ -66,8 +66,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         // Joint chain_id over the WHOLE validator set (set-order independent).
-        let chain_id =
-            derive_chain_id_from_parts(&ids, SignatureSchemeChoice::BlsAggregated, &bls, &[], seed);
+        let chain_id = derive_chain_id_from_parts(&ids, &bls, &[], seed);
 
         for (i, (node_id, secret)) in secrets.iter().enumerate() {
             let pop = BlsAggregated::sign_pop(secret, &chain_id)
@@ -101,14 +100,8 @@ fn main() -> anyhow::Result<()> {
         .load_or_init()?;
 
     // chain_id from the exact genesis parts the node will commit to: this sole
-    // validator, the BLS scheme, its BLS pubkey, no operator keys, the reth seed.
-    let chain_id = derive_chain_id_from_parts(
-        &[node_id],
-        SignatureSchemeChoice::BlsAggregated,
-        &[(node_id, identity.public)],
-        &[],
-        seed,
-    );
+    // validator, its BLS pubkey, no operator keys, the reth seed.
+    let chain_id = derive_chain_id_from_parts(&[node_id], &[(node_id, identity.public)], &[], seed);
     let pop = BlsAggregated::sign_pop(&identity.secret, &chain_id)
         .map_err(|e| anyhow::anyhow!("signing chain-bound BLS PoP: {e:?}"))?;
 

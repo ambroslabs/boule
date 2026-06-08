@@ -256,8 +256,6 @@ mod tests {
 
     use boule_consensus::replication::impls::InMemoryMempool;
     use boule_consensus::replication::mempool::Mempool;
-    use boule_consensus::validator_rotation::DualSignedRotation;
-    use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
     use boule_core::crypto::signed::ChainId;
     use boule_core::identity::NodeIdentity;
     use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
@@ -275,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_with_key_spec_mints_key_and_schedules_rotation() {
+    fn rotate_with_key_spec_mints_key_then_errors_on_bls_chain() {
         let genesis = fresh_signer();
         let view = Arc::new(AtomicU64::new(5));
         let signer = Arc::new(RotatableSigner::new(
@@ -286,7 +284,6 @@ mod tests {
         let handle = RotationHandle::new(
             genesis.node_id(),
             ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
             Arc::clone(&view),
             Arc::clone(&mempool),
             Arc::clone(&signer),
@@ -296,33 +293,14 @@ mod tests {
         let new_key = dir.path().join("new.key");
         assert!(!new_key.exists());
 
-        let receipt = rotate_with_key_spec(&handle, "file", Some(new_key.clone()), None, Some(60))
-            .expect("rotate must succeed");
-
-        assert!(new_key.exists(), "the new key file must be minted");
-        assert_eq!(receipt.v_eff, 60);
-        assert_eq!(receipt.validator, genesis.node_id());
-
-        // The minted key is the one the node now schedules + signs the tx
-        // under. Reload it to confirm the reported pubkey + verify the tx.
-        let minted =
-            boule_core::config::build_provider(&boule_core::config::IdentityConfig::File {
-                path: new_key.clone(),
-                allow_insecure_perms: false,
-            })
-            .unwrap()
-            .try_load()
-            .unwrap()
-            .unwrap();
-        let minted_signer = NodeSigner::from_identity(&minted).unwrap();
-        assert_eq!(receipt.new_pubkey, minted_signer.node_id());
-
-        let proposed = mempool.propose(16);
-        assert_eq!(proposed.len(), 1);
-        let env = DualSignedRotation::decode_command(&proposed[0]).unwrap();
-        env.verify(&genesis.node_id(), &ChainId::TEST)
-            .expect("admitted rotation tx must verify");
-        assert_eq!(env.payload.new_pubkey, minted_signer.node_id());
+        // The key spec is resolved (and the file minted) before the handle
+        // rejects the rotation: hot rotation is unsupported on a BLS chain.
+        let err = rotate_with_key_spec(&handle, "file", Some(new_key.clone()), None, Some(60))
+            .expect_err("hot rotation is unsupported on a BLS chain");
+        assert!(err.to_string().contains("BLS"), "{err}");
+        assert!(new_key.exists(), "the new key file is still minted");
+        // Nothing was admitted on the rejected path.
+        assert_eq!(mempool.len(), 0);
     }
 
     #[test]
@@ -334,14 +312,7 @@ mod tests {
             Arc::clone(&view),
         ));
         let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(64));
-        let handle = RotationHandle::new(
-            genesis.node_id(),
-            ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
-            view,
-            mempool,
-            signer,
-        );
+        let handle = RotationHandle::new(genesis.node_id(), ChainId::TEST, view, mempool, signer);
         // `env` can't mint a fresh key — must be rejected before any rotation.
         let err = rotate_with_key_spec(&handle, "env", None, None, Some(60)).unwrap_err();
         assert!(!err.to_string().is_empty());
@@ -380,7 +351,6 @@ mod tests {
         let handle = Arc::new(RotationHandle::new(
             genesis.node_id(),
             ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
             view,
             Arc::clone(&mempool),
             signer,

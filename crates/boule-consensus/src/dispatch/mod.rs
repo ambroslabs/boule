@@ -51,7 +51,6 @@ use crate::replication::block::{Block, BlockHash};
 use crate::replication::snapshot::SnapshotManifest;
 use crate::validator_set::ValidatorId;
 use crate::{Height, View};
-use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
 use boule_core::crypto::signed::Signed;
 use boule_core::identity::NodeId;
 
@@ -513,16 +512,14 @@ impl<T> Verified<Signed<T>> {
 ///
 /// The historical name reflects QC verification, but the variant
 /// carries every chain-level parameter needed for both checks:
-/// `scheme`, `bls_key_history`, `min_v_eff_delay`, and `genesis_hash`
-/// are all read by the proposal-receive validator alongside the QC
-/// verifier.
+/// `bls_key_history`, `min_v_eff_delay`, and `genesis_hash` are all read
+/// by the proposal-receive validator alongside the QC verifier.
 pub enum QcVerification<'a> {
     #[cfg(any(test, feature = "testing"))]
     Skip,
     Verify {
-        scheme: SignatureSchemeChoice,
-        /// Required on BLS chains; ignored on Ed25519 chains. Used by
-        /// both the QC aggregate verifier and the proposal-receive
+        /// The chain's per-validator BLS key history. Used by both the
+        /// QC aggregate verifier and the proposal-receive
         /// history-commitment verifier (#325 PR C).
         bls_key_history: Option<&'a crate::bls_key_history::BlsKeyHistory>,
         /// Operator-key history (#549), used by the proposal-receive

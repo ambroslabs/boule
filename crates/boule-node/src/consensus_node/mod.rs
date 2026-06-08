@@ -69,9 +69,11 @@ use boule_consensus::block_sync_retry_timer::{
 };
 use boule_consensus::dispatch::{self, Outbound};
 use boule_consensus::endpoint_registry::EndpointRegistry;
+#[cfg(test)]
+use boule_consensus::hotstuff::genesis_qc;
 use boule_consensus::hotstuff::qc::{ConsensusMsg, VerifiedQc, genesis_qc_bls};
 use boule_consensus::hotstuff::step::{HotStuffCore, StateUpdate};
-use boule_consensus::hotstuff::{HotStuffState, QuorumCertificate, genesis_qc};
+use boule_consensus::hotstuff::{HotStuffState, QuorumCertificate};
 use boule_consensus::limits::CacheEvictionCounters;
 use boule_consensus::liveness_tracker::LivenessTracker;
 use boule_consensus::node_role::NodeRole;
@@ -370,11 +372,6 @@ pub struct ConsensusNode {
                 >,
         >,
     >,
-    /// Chain-level signature scheme (#288). Fixed for the lifetime of
-    /// the chain; consulted at ingress time to dispatch QC aggregate
-    /// verification through the right `verify_aggregate` /
-    /// `verify_aggregate_bls` arm.
-    pub signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     /// Configured view-timer behaviour; consulted by the timer helper
     /// in Phase D when arming/re-arming the view timer.
     pub timeout_policy: Arc<ExponentialBackoff>,
@@ -841,20 +838,10 @@ impl ConsensusNode {
         // get a different tag, so a Vote/Proposal/NewView signed on one
         // chain cannot be replayed on another.
         let chain_id = ChainId::from_genesis_hash(config.genesis.hash());
-        // Pick the genesis QC shape that matches the chain's signature
-        // scheme. The Ed25519 path's all-zero placeholder sigs would
-        // panic if folded into a BLS aggregate (see #338's
-        // well-formedness invariant); the BLS variant returns an
-        // empty-bitmap, empty-aggregate QC that the dispatch verifier
-        // accepts via its `signer_count == 0` genesis-skip path.
-        let boot_qc = match config.signature_scheme {
-            boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected => {
-                genesis_qc(&config.genesis, &config.validator_set)
-            }
-            boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated => {
-                genesis_qc_bls(&config.genesis, validator_set_len)
-            }
-        };
+        // The BLS genesis QC is an empty-bitmap, empty-aggregate QC that
+        // the dispatch verifier accepts via its `signer_count == 0`
+        // genesis-skip path (see #338's well-formedness invariant).
+        let boot_qc = genesis_qc_bls(&config.genesis, validator_set_len);
         let mut hs_state = HotStuffState::new(config.validator_set.clone(), config.genesis);
         // Seed the cluster-agreed genesis QC so the view-1 leader can
         // build a proposal on first boot without waiting for a QC-forming
@@ -868,8 +855,7 @@ impl ConsensusNode {
         hs_state.high_qc = Some(VerifiedQc::unchecked(boot_qc));
         let eviction_counters = CacheEvictionCounters::default();
         let core =
-            HotStuffCore::with_limits(self_id, hs_state, config.limits, eviction_counters.clone())
-                .with_signature_scheme(config.signature_scheme);
+            HotStuffCore::with_limits(self_id, hs_state, config.limits, eviction_counters.clone());
 
         let validator_history = ValidatorSetHistory::from_genesis(config.validator_set.clone());
         let validator_key_history = ValidatorKeyHistory::new(config.validator_set.iter().copied());
@@ -896,7 +882,6 @@ impl ConsensusNode {
             operator_key_history,
             bls_key_history: None,
             bls_signer: None,
-            signature_scheme: config.signature_scheme,
             timeout_policy,
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
@@ -1056,7 +1041,7 @@ impl ConsensusNode {
     ///
     /// [`ConsensusNode::new`] and [`ConsensusNode::recover`] already seed
     /// the safety-core state with the canonical genesis QC derived from
-    /// `(genesis, validator_set_len)` via [`genesis_qc`]; this helper is
+    /// `(genesis, validator_set_len)` via `genesis_qc_bls`; this helper is
     /// kept for tests and harnesses that need to inject a hand-built QC
     /// (e.g. to start from a mid-chain state).
     pub fn with_genesis_qc(mut self, qc: QuorumCertificate) -> Self {
@@ -1276,7 +1261,6 @@ impl ConsensusNode {
         let eviction_counters = CacheEvictionCounters::default();
         let mut core =
             HotStuffCore::with_limits(self_id, hs_state, config.limits, eviction_counters.clone())
-                .with_signature_scheme(config.signature_scheme)
                 .with_proposed_in_view(proposed_in_view);
 
         // #254: replay each post-genesis boundary into the safety
@@ -1418,7 +1402,6 @@ impl ConsensusNode {
             operator_key_history,
             bls_key_history: None,
             bls_signer: None,
-            signature_scheme: config.signature_scheme,
             timeout_policy,
             timeout_buckets: HashMap::new(),
             timeout_buckets_capacity: config.limits.timeout_buckets_capacity,
@@ -2002,7 +1985,6 @@ impl ConsensusNode {
                             // reject view-0 QCs over an attacker-chosen block
                             // hash (#418, audit finding 7-4).
                             let qc_verification = dispatch::QcVerification::Verify {
-                                scheme: self.signature_scheme,
                                 bls_key_history: self.bls_key_history.as_ref(),
                                 operator_key_history: Some(&self.operator_key_history),
                                 min_v_eff_delay: self.min_v_eff_delay,
@@ -5621,7 +5603,6 @@ mod tests {
                 node.bls_key_history.as_ref(),
                 Some(&node.operator_key_history),
                 &node.chain_id,
-                node.signature_scheme,
                 node.min_v_eff_delay,
             );
 
@@ -7805,7 +7786,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&joiner_storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(joiner_signer.node_id()));
         let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
         let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
@@ -8622,7 +8604,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&joiner_storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(joiner_signer.node_id()));
         let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
         let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
@@ -8978,7 +8961,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(self_signer.node_id()));
 
         let high_qc_view_before = node.pacemaker.high_qc_view();
         let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
@@ -9044,7 +9028,7 @@ mod tests {
     #[tokio::test]
     async fn forged_piggyback_on_timeout_vote_does_not_taint_bucket_best_high_qc() {
         use boule_consensus::bls_key_history::BlsKeyHistory;
-        use boule_core::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
+        use boule_core::crypto::sig_scheme::BlsAggregated;
 
         // n = 4 → quorum = 3, f + 1 = 2.
         let self_signer = fresh_signer();
@@ -9077,8 +9061,7 @@ mod tests {
             .map(|(i, v)| (v.into_node_id(), bls_keypair(0xB0 + i as u8).1))
             .collect();
         let bls_history = BlsKeyHistory::with_genesis(genesis_bls.iter().copied());
-        let mut cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
-        cfg.signature_scheme = SignatureSchemeChoice::BlsAggregated;
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
         let mut node = ConsensusNode::new(
             self_signer.node_id(),
             cfg,
@@ -9131,7 +9114,6 @@ mod tests {
         // Run through the production verify path — this is the same
         // policy the live event loop wires (node.rs apply_dispatch).
         let qc_verification = boule_consensus::dispatch::QcVerification::Verify {
-            scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
             bls_key_history: Some(&bls_history),
             operator_key_history: Some(&node.operator_key_history),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
@@ -10016,7 +9998,6 @@ mod tests {
                 node.bls_key_history.as_ref(),
                 Some(&node.operator_key_history),
                 &node.chain_id,
-                node.signature_scheme,
                 node.min_v_eff_delay,
             );
         let justify = boule_consensus::hotstuff::qc::genesis_qc(&parent, &vs);
@@ -10026,7 +10007,6 @@ mod tests {
         let wire = WireMessage::Proposal(signed_proposal);
         let payload = postcard::to_stdvec(&wire).expect("encode wire");
         let qc_verification = boule_consensus::dispatch::QcVerification::Verify {
-            scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
             bls_key_history: None,
             operator_key_history: Some(&node.operator_key_history),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
@@ -10258,7 +10238,6 @@ mod tests {
                 node.bls_key_history.as_ref(),
                 Some(&node.operator_key_history),
                 &node.chain_id,
-                node.signature_scheme,
                 node.min_v_eff_delay,
             );
 
@@ -10986,7 +10965,6 @@ mod tests {
                 node.bls_key_history.as_ref(),
                 Some(&node.operator_key_history),
                 &node.chain_id,
-                node.signature_scheme,
                 node.min_v_eff_delay,
             );
     }
@@ -11443,7 +11421,7 @@ mod tests {
     #[test]
     fn verify_persisted_history_consistency_bls_happy_path() {
         use boule_consensus::bls_key_history::BlsKeyHistory;
-        use boule_core::crypto::sig_scheme::{BlsPublicKey, SignatureSchemeChoice};
+        use boule_core::crypto::sig_scheme::BlsPublicKey;
 
         // Synthesize 4 BLS pubkeys (deterministic, since the test
         // only exercises the bookkeeping path; PoP verification is
@@ -11473,8 +11451,7 @@ mod tests {
         );
         let g = Block::genesis([0u8; 32], commitment);
 
-        let mut cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
-        cfg.signature_scheme = SignatureSchemeChoice::BlsAggregated;
+        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), g.clone());
 
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 

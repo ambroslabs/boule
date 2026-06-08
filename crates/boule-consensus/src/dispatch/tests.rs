@@ -1584,7 +1584,6 @@ fn ingress_with_verify_accepts_real_bls_qc_inside_proposal() {
             Some(&bls_history),
             None,
             &ChainId::TEST,
-            SignatureSchemeChoice::BlsAggregated,
             crate::reconfig::MIN_V_EFF_DELAY,
         );
     let proposal = Proposal { block, justify: qc };
@@ -1593,7 +1592,6 @@ fn ingress_with_verify_accepts_real_bls_qc_inside_proposal() {
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -1658,7 +1656,6 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -1721,7 +1718,6 @@ fn ingress_with_verify_rejects_tampered_bls_qc_inside_proposal() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -1763,7 +1759,6 @@ fn ingress_with_verify_rejects_tampered_bls_qc_inside_newview() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -1812,7 +1807,6 @@ fn ingress_with_verify_accepts_real_bls_qc_inside_timeout_vote_piggyback() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -1873,7 +1867,6 @@ fn ingress_with_verify_drops_tampered_bls_qc_inside_timeout_vote_piggyback() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -1945,7 +1938,6 @@ fn ingress_with_verify_drops_malformed_high_qc_in_timeout_vote_piggyback() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -1993,7 +1985,6 @@ fn ingress_with_verify_emits_high_qc_trusted_for_timeout_vote_with_no_piggyback(
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2039,7 +2030,6 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
             None,
             None,
             &ChainId::TEST,
-            SignatureSchemeChoice::BlsAggregated,
             crate::reconfig::MIN_V_EFF_DELAY,
         );
     let proposal = Proposal {
@@ -2053,7 +2043,6 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2107,7 +2096,6 @@ fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2186,7 +2174,6 @@ fn ingress_vote_on_bls_chain_accepts_valid_bls_partial() {
     let key_history = key_history_from_set(&vs);
     let bls_history = BlsKeyHistory::with_genesis([(signer.node_id(), bls_pk)]);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2226,7 +2213,6 @@ fn ingress_vote_on_bls_chain_rejects_missing_bls_partial() {
     let key_history = key_history_from_set(&vs);
     let bls_history = BlsKeyHistory::with_genesis([(signer.node_id(), bls_pk)]);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2266,7 +2252,6 @@ fn ingress_vote_on_bls_chain_rejects_tampered_bls_partial() {
     let key_history = key_history_from_set(&vs);
     let bls_history = BlsKeyHistory::with_genesis([(signer.node_id(), bls_pk)]);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2316,7 +2301,6 @@ fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
     // pk_a must reject.
     let bls_history = BlsKeyHistory::with_genesis([(signer.node_id(), bls_pk_a)]);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2356,7 +2340,6 @@ fn ingress_vote_on_bls_chain_rejects_when_bls_history_absent() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
