@@ -7786,7 +7786,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&joiner_storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(joiner_signer.node_id()));
         let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
         let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
@@ -8603,7 +8604,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&joiner_storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(joiner_signer.node_id()));
         let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
         let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
@@ -8959,7 +8961,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(self_signer.node_id()));
 
         let high_qc_view_before = node.pacemaker.high_qc_view();
         let signer_arc: Arc<dyn Signer> = Arc::new(self_signer);
