@@ -115,6 +115,107 @@ impl Signer for RotatableSigner {
     }
 }
 
+/// One scheduled BLS partial signer: at and after view `v_eff`, fold
+/// partials with `signer`.
+struct BlsKeyAt {
+    v_eff: u64,
+    signer: Arc<
+        dyn boule_core::crypto::signed::PartialSigner<boule_core::crypto::sig_scheme::BlsAggregated>,
+    >,
+}
+
+/// BLS analogue of [`RotatableSigner`] (#358 hot-swap): a view-aware
+/// [`PartialSigner`](boule_core::crypto::signed::PartialSigner) that swaps the
+/// BLS partial-signing key at a rotation's effective view, without a restart.
+///
+/// On a BLS-only chain a dual key rotation rotates both the Ed25519 *and* the
+/// BLS half. The Ed25519 half hot-swaps through [`RotatableSigner`]; this is
+/// the BLS sibling, sharing the same `current_view` atomic so both halves flip
+/// together at `v_eff`. Without it, a rotated validator that keeps leading
+/// post-boundary would fold partials under its *old* BLS key, which the
+/// dispatch-layer QC verifier (resolving the new BLS pubkey from history)
+/// rejects.
+pub struct RotatableBlsSigner {
+    current_view: Arc<AtomicU64>,
+    entries: RwLock<Vec<BlsKeyAt>>,
+}
+
+impl RotatableBlsSigner {
+    /// A BLS partial signer active from view 0 with `genesis`, reading
+    /// `current_view` (shared with the pacemaker / [`RotatableSigner`]) to
+    /// decide which key is live.
+    pub fn new(
+        genesis: Arc<
+            dyn boule_core::crypto::signed::PartialSigner<
+                    boule_core::crypto::sig_scheme::BlsAggregated,
+                >,
+        >,
+        current_view: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            current_view,
+            entries: RwLock::new(vec![BlsKeyAt {
+                v_eff: 0,
+                signer: genesis,
+            }]),
+        }
+    }
+
+    /// Schedule `new_signer` to become active at and after `v_eff`. Returns
+    /// `false` (and ignores the request) on a non-monotonic `v_eff`, matching
+    /// [`RotatableSigner::register_rotation`].
+    pub fn register_rotation(
+        &self,
+        v_eff: u64,
+        new_signer: Arc<
+            dyn boule_core::crypto::signed::PartialSigner<
+                    boule_core::crypto::sig_scheme::BlsAggregated,
+                >,
+        >,
+    ) -> bool {
+        let mut entries = self.entries.write();
+        let last_v_eff = entries
+            .last()
+            .expect("entries always has the genesis entry")
+            .v_eff;
+        if v_eff <= last_v_eff {
+            return false;
+        }
+        entries.push(BlsKeyAt {
+            v_eff,
+            signer: new_signer,
+        });
+        true
+    }
+
+    fn active(
+        &self,
+    ) -> Arc<
+        dyn boule_core::crypto::signed::PartialSigner<boule_core::crypto::sig_scheme::BlsAggregated>,
+    > {
+        let view = self.current_view.load(Ordering::Relaxed);
+        let entries = self.entries.read();
+        entries
+            .iter()
+            .rev()
+            .find(|k| k.v_eff <= view)
+            .map(|k| Arc::clone(&k.signer))
+            .unwrap_or_else(|| Arc::clone(&entries[0].signer))
+    }
+}
+
+impl boule_core::crypto::signed::PartialSigner<boule_core::crypto::sig_scheme::BlsAggregated>
+    for RotatableBlsSigner
+{
+    fn pubkey(&self) -> boule_core::crypto::sig_scheme::BlsPublicKey {
+        self.active().pubkey()
+    }
+
+    fn sign_partial(&self, msg: &[u8]) -> boule_core::crypto::sig_scheme::BlsPartialSig {
+        self.active().sign_partial(msg)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

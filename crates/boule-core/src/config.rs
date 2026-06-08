@@ -537,17 +537,11 @@ impl ConsensusConfig {
     /// Ed25519 chain, returns an empty `Vec`.
     pub fn resolve_genesis_bls_keys(&self) -> anyhow::Result<Vec<(NodeId, BlsPublicKey, BlsPop)>> {
         match self.signature_scheme {
-            SignatureSchemeChoice::Ed25519Collected => {
-                if !self.validators_bls.is_empty() {
-                    anyhow::bail!(
-                        "consensus.validators_bls is set but signature_scheme = \
-                         \"ed25519_collected\" — Ed25519 chains have no use for BLS keys. \
-                         Remove the validators_bls table or switch to \
-                         signature_scheme = \"bls_aggregated\"."
-                    );
-                }
-                Ok(Vec::new())
-            }
+            SignatureSchemeChoice::Ed25519Collected => anyhow::bail!(
+                "signature_scheme = \"ed25519_collected\" is no longer supported; \
+                 BLS is the only consensus signature scheme. Set \
+                 signature_scheme = \"bls_aggregated\" and provide a validators_bls table."
+            ),
             SignatureSchemeChoice::BlsAggregated => {
                 if self.validators_bls.is_empty() {
                     anyhow::bail!(
@@ -2054,11 +2048,8 @@ validators = ["a"]
             crate::config::DEFAULT_BLOCK_SYNC_MAX_ATTEMPTS,
         );
         assert_eq!(cons.mempool_capacity, 1024);
-        // Default scheme: collected Ed25519. BLS lands at #289.
-        assert_eq!(
-            cons.signature_scheme,
-            SignatureSchemeChoice::Ed25519Collected,
-        );
+        // BLS is the only consensus signature scheme and the default.
+        assert_eq!(cons.signature_scheme, SignatureSchemeChoice::BlsAggregated,);
     }
 
     #[test]

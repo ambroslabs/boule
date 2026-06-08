@@ -434,6 +434,84 @@ struct ConsensusNodeSpec {
     key_path: String,
     p2p_addr: String,
     node_id: String,
+    /// Path to this node's minted BLS validator-signing key. The node
+    /// loads it via `[node.bls_validator_identity]` to produce vote
+    /// partials.
+    bls_key_path: String,
+}
+
+/// One `[[consensus.validators_bls]]` genesis row: base58 NodeId,
+/// hex-encoded 48-byte BLS pubkey, hex-encoded 96-byte chain-bound PoP.
+/// Mirrors the testnet driver's `BlsGenesisEntry`
+/// (`boule-node/src/testnet/lifecycle.rs`).
+#[derive(Clone)]
+struct BlsGenesisEntry {
+    node_id: String,
+    bls_pubkey_hex: String,
+    bls_pop_hex: String,
+}
+
+/// Mint a BLS keypair per validator, derive the deployment chain_id
+/// from the genesis parts, and sign a chain-bound PoP per validator —
+/// the exact recipe `mint_bls_keys_if_needed`
+/// (`boule-node/src/testnet/lifecycle.rs`) uses. `specs` carries each
+/// node's base58 node_id (collected in phase 1); the minted BLS key
+/// path is written back into each spec so the per-node config can
+/// reference it under `[node.bls_validator_identity]`.
+///
+/// BLS is the only consensus scheme now, so the cluster always needs a
+/// valid `[consensus.validators_bls]` table to boot.
+fn mint_bls_genesis(
+    specs: &mut [ConsensusNodeSpec],
+    key_dirs: &[tempfile::TempDir],
+) -> Vec<BlsGenesisEntry> {
+    use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
+    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
+    use boule_core::identity::{NodeId, base58_to_node_id};
+
+    // Pass 1: provision each validator's BLS key file and collect
+    // (node_id, secret, pubkey). PoPs are deferred until the chain_id
+    // is known.
+    let mut node_id_bytes: Vec<NodeId> = Vec::with_capacity(specs.len());
+    let mut pubkeys: Vec<(NodeId, BlsPublicKey)> = Vec::with_capacity(specs.len());
+    let mut secrets = Vec::with_capacity(specs.len());
+    for (spec, dir) in specs.iter_mut().zip(key_dirs) {
+        let bls_path = dir.path().join("bls.key");
+        let identity = BlsKeyFile::new(bls_path.clone())
+            .load_or_init()
+            .expect("minting BLS validator key");
+        let nid = base58_to_node_id(&spec.node_id).expect("valid base58 node_id");
+        node_id_bytes.push(nid);
+        pubkeys.push((nid, identity.public));
+        secrets.push(identity.secret);
+        spec.bls_key_path = bls_path.to_str().unwrap().to_owned();
+    }
+
+    // Pass 2: derive the deployment chain_id from the genesis parts
+    // (validators + BLS pubkeys, no operator keys, default all-zeros
+    // seed — matching a config that omits `genesis_seed_hex`), then
+    // mint a chain-bound PoP per validator (#410).
+    let chain_id = boule_consensus::genesis::derive_chain_id_from_parts(
+        &node_id_bytes,
+        SignatureSchemeChoice::BlsAggregated,
+        &pubkeys,
+        &[],
+        [0u8; 32],
+    );
+
+    specs
+        .iter()
+        .zip(pubkeys.iter())
+        .zip(secrets.iter())
+        .map(|((spec, (_, pubkey)), secret)| {
+            let pop = BlsAggregated::sign_pop(secret, &chain_id).expect("signing BLS PoP");
+            BlsGenesisEntry {
+                node_id: spec.node_id.clone(),
+                bls_pubkey_hex: hex::encode(pubkey),
+                bls_pop_hex: hex::encode(pop.sig),
+            }
+        })
+        .collect()
 }
 
 /// Spawn a 4-node HotStuff cluster with `[consensus]` configured on
@@ -455,8 +533,15 @@ async fn start_consensus_cluster(n: usize) -> (Vec<NodeGuard>, Vec<tempfile::Tem
             key_path: key_path.clone(),
             p2p_addr: info.p2p_addr,
             node_id: info.node_id,
+            bls_key_path: String::new(),
         });
     }
+
+    // Phase 1b: mint the BLS genesis table now that every validator's
+    // base58 node_id is known. BLS is the only consensus scheme, so the
+    // cluster cannot boot without a valid `[consensus.validators_bls]`
+    // table + per-node BLS signing key.
+    let bls_genesis = mint_bls_genesis(&mut specs, &key_dirs);
 
     // Phase 2: relaunch with full peer list + [consensus] section.
     let validators_toml = specs
@@ -482,6 +567,8 @@ async fn start_consensus_cluster(n: usize) -> (Vec<NodeGuard>, Vec<tempfile::Tem
                 &spec.p2p_addr,
                 &peer_descs,
                 &validators_toml,
+                &spec.bls_key_path,
+                &bls_genesis,
             )
             .await,
         );
@@ -508,6 +595,8 @@ async fn spawn_consensus_node(
     fixed_p2p_addr: &str,
     peers: &[PeerDesc<'_>],
     validators_toml: &str,
+    bls_key_path: &str,
+    bls_genesis: &[BlsGenesisEntry],
 ) -> NodeGuard {
     let addr_file = NamedTempFile::new().unwrap();
     let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
@@ -520,15 +609,32 @@ async fn spawn_consensus_node(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // BLS genesis (#360): BLS is the only consensus scheme, so every
+    // node needs the `[[consensus.validators_bls]]` table the genesis
+    // validator set requires plus its own `[node.bls_validator_identity]`
+    // key file to produce vote partials. Mirrors `write_final_config`
+    // in `boule-node/src/testnet/lifecycle.rs`.
+    let mut validators_bls_toml = String::new();
+    for e in bls_genesis {
+        validators_bls_toml.push_str(&format!(
+            "\n[[consensus.validators_bls]]\nnode_id    = \"{nid}\"\nbls_pubkey = \"{pk}\"\nbls_pop    = \"{pop}\"\n",
+            nid = e.node_id,
+            pk = e.bls_pubkey_hex,
+            pop = e.bls_pop_hex,
+        ));
+    }
+
     // Use short timeouts + in-memory storage so the test commits
     // blocks within a few hundred ms. Without this a stock config
     // (timeout_base_ms = 200) still works, but shorter base keeps the
     // test tight.
     let config = format!(
         "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [node.bls_validator_identity]\nbackend = \"file\"\npath = \"{bls_key_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [overlay]\nmode = \"libp2p\"\nbootstrap_addrs = [{bootstrap_toml}]\n\n\
-        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
+        [consensus]\nsignature_scheme = \"bls_aggregated\"\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n\
+        {validators_bls_toml}"
     );
     let mut config_file = NamedTempFile::new().unwrap();
     config_file.write_all(config.as_bytes()).unwrap();
@@ -683,6 +789,8 @@ async fn spawn_consensus_node_libp2p(
     fixed_p2p_addr: &str,
     bootstrap_addrs: &[String],
     validators_toml: &str,
+    bls_key_path: &str,
+    bls_genesis: &[BlsGenesisEntry],
 ) -> NodeGuard {
     let addr_file = NamedTempFile::new().unwrap();
     let addr_file_path = addr_file.path().to_str().unwrap().to_owned();
@@ -698,11 +806,26 @@ async fn spawn_consensus_node_libp2p(
         format!("[{inner}]")
     };
 
+    // BLS genesis table + per-node signing key — required since BLS is
+    // the only consensus scheme (mirrors `write_final_config` in the
+    // testnet driver).
+    let mut validators_bls_toml = String::new();
+    for e in bls_genesis {
+        validators_bls_toml.push_str(&format!(
+            "\n[[consensus.validators_bls]]\nnode_id    = \"{nid}\"\nbls_pubkey = \"{pk}\"\nbls_pop    = \"{pop}\"\n",
+            nid = e.node_id,
+            pk = e.bls_pubkey_hex,
+            pop = e.bls_pop_hex,
+        ));
+    }
+
     let config = format!(
         "[node]\nlisten_addr = \"{fixed_p2p_addr}\"\nkey_file = \"{key_path}\"\naddr_file = \"{addr_file_path}\"\n\n\
+        [node.bls_validator_identity]\nbackend = \"file\"\npath = \"{bls_key_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [overlay]\nmode = \"libp2p\"\nbootstrap_addrs = {bootstrap_toml}\n\n\
-        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n"
+        [consensus]\nsignature_scheme = \"bls_aggregated\"\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n\
+        {validators_bls_toml}"
     );
     let mut config_file = NamedTempFile::new().unwrap();
     config_file.write_all(config.as_bytes()).unwrap();
@@ -765,8 +888,12 @@ async fn start_libp2p_consensus_cluster(n: usize) -> (Vec<NodeGuard>, Vec<tempfi
             key_path: key_path.clone(),
             p2p_addr: info.p2p_addr,
             node_id: info.node_id,
+            bls_key_path: String::new(),
         });
     }
+
+    // Mint the BLS genesis table (the only consensus scheme requires it).
+    let bls_genesis = mint_bls_genesis(&mut specs, &key_dirs);
 
     let validators_toml = specs
         .iter()
@@ -789,6 +916,8 @@ async fn start_libp2p_consensus_cluster(n: usize) -> (Vec<NodeGuard>, Vec<tempfi
                 &spec.p2p_addr,
                 &bootstrap,
                 &validators_toml,
+                &spec.bls_key_path,
+                &bls_genesis,
             )
             .await,
         );

@@ -10,7 +10,8 @@ use boule_consensus::replication::block::Block;
 use boule_consensus::validator_set::ValidatorSet;
 
 use super::{
-    ConsensusNode, STORAGE_KEY_OPERATOR_KEY_HISTORY, STORAGE_KEY_VALIDATOR_HISTORY, TRACE_TARGET,
+    ConsensusNode, STORAGE_KEY_BLS_KEY_HISTORY, STORAGE_KEY_OPERATOR_KEY_HISTORY,
+    STORAGE_KEY_VALIDATOR_HISTORY, TRACE_TARGET,
 };
 
 impl ConsensusNode {
@@ -48,6 +49,10 @@ impl ConsensusNode {
         // — the operator-key history persists under its own key (and, unlike
         // signing keys, is NOT re-derivable from the set, so it must be saved).
         let mut operator_history_changed = false;
+        // On a BLS chain, a reconfig add registers the new validator's
+        // genesis BLS key (from its verified PoP); track that so the BLS
+        // history is re-persisted, like the operator history.
+        let mut bls_history_changed = false;
         // #546: track endpoint-registry GC (a removed validator's entries
         // dropped) so we re-persist the registry once if anything changed.
         let mut endpoint_registry_changed = false;
@@ -235,6 +240,30 @@ impl ConsensusNode {
                 }
             }
 
+            // BLS chains: register each newly-seated validator's genesis BLS
+            // pubkey (carried in its already-verified PoP) at `v_eff`, so the
+            // QC verifier can resolve its key once it joins the committee.
+            // Mirrors `apply_reconfig_commands_to_set_history` so the live
+            // history matches the commitment/recovery rebuild.
+            if let Some(bls_history) = self.bls_key_history.as_mut() {
+                for entry in &cmd.adds {
+                    let Some(bls_pop) = &entry.bls_pop else {
+                        continue;
+                    };
+                    let v_id = boule_consensus::validator_set::ValidatorId::from_genesis_pubkey(
+                        entry.node_id,
+                    );
+                    if new_set.contains(&v_id)
+                        && !bls_history.contains(&entry.node_id)
+                        && bls_history
+                            .register(entry.node_id, cmd.v_eff, bls_pop.pubkey)
+                            .is_ok()
+                    {
+                        bls_history_changed = true;
+                    }
+                }
+            }
+
             // #547: seed the initial endpoint list of newly-seated
             // validators (authenticated by the inbound-consent signature
             // when an operator key is present, #548). Best-effort: a list
@@ -299,6 +328,29 @@ impl ConsensusNode {
                     error = %e,
                     "operator_key_history_encode_failed",
                 ),
+            }
+        }
+
+        // Persist the BLS key history if a reconfig add registered a BLS key
+        // (it cannot be rebuilt from the set alone once mutated).
+        if bls_history_changed {
+            if let Some(bls) = self.bls_key_history.as_ref() {
+                match postcard::to_stdvec(&bls.to_persisted()) {
+                    Ok(bytes) => {
+                        if let Err(e) = self.storage.put(STORAGE_KEY_BLS_KEY_HISTORY, &bytes) {
+                            tracing::error!(
+                                target: TRACE_TARGET,
+                                error = %e,
+                                "bls_key_history_persist_failed",
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        target: TRACE_TARGET,
+                        error = %e,
+                        "bls_key_history_encode_failed",
+                    ),
+                }
             }
         }
 
@@ -370,6 +422,9 @@ impl ConsensusNode {
                 &mut rebuilt,
                 &mut throwaway_key,
                 Some(&mut rebuilt_operator),
+                // BLS parity is asserted separately at recover; this
+                // debug check only compares the set history.
+                None,
                 self.signature_scheme,
                 self.min_v_eff_delay,
                 &self.chain_id,

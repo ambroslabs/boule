@@ -55,6 +55,7 @@ use boule_consensus::replication::block::{Block, BlockHash, BlockHeader};
 use boule_consensus::validator_set::ValidatorSet;
 use boule_consensus::wire::WireMessage;
 use boule_consensus::{Height, View};
+use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPartialSig, SignatureScheme};
 use boule_core::crypto::signed::{ChainId, NodeSigner, Signed, Signer};
 use boule_core::identity::NodeId;
 use boule_core::identity::NodeIdentity;
@@ -62,6 +63,15 @@ use boule_core::identity::NodeIdentity;
 // ── Shared signer pool ──────────────────────────────────────────────
 
 const N_VALIDATORS: usize = 4;
+
+/// Mint a real-encoding BLS partial signature. The fuzz/sim paths run
+/// under Skip-style verification so the partial need not cryptographically
+/// verify against any particular message, but `add_bls_partial` panics on
+/// malformed G2 bytes — so this produces a genuinely-encoded point.
+fn dummy_bls_partial() -> BlsPartialSig {
+    let (sk, _pk) = BlsAggregated::keygen(&[0u8; 32]).expect("BLS keygen");
+    BlsAggregated::sign_partial(&sk, b"x").expect("BLS sign_partial")
+}
 
 /// Cap on generated view/height values. Picked low enough that
 /// `header.view + 1` arithmetic in the safety core stays away from
@@ -129,20 +139,23 @@ fn arb_signer_bitmap() -> impl Strategy<Value = SignerBitmap> {
 // ── Generators for the wire payload types ───────────────────────────
 
 fn arb_qc() -> impl Strategy<Value = QuorumCertificate> {
-    (
-        0u64..MAX_VIEW,
-        any::<[u8; 32]>(),
-        arb_signer_bitmap(),
-        prop::collection::vec(any::<[u8; 64]>(), 0..16),
-    )
-        .prop_map(|(view, block_hash, signers, signatures)| {
+    (0u64..MAX_VIEW, any::<[u8; 32]>(), arb_signer_bitmap()).prop_map(
+        |(view, block_hash, signers)| {
+            // Deliberately-malformed adversarial QC: the `signers` bitmap
+            // is fuzzed independently of the (empty) BLS aggregate, so
+            // `signers.count()` and the aggregate's signer set are free to
+            // disagree — exactly the structural inconsistency this fuzzer
+            // feeds past decode into ingress / the safety core.
             QuorumCertificate::from_raw_parts(
                 View(view),
                 block_hash,
                 signers,
-                boule_consensus::hotstuff::qc::QcSignatures::Ed25519Collected(signatures),
+                boule_consensus::hotstuff::qc::QcSignatures::BlsAggregated(
+                    BlsAggregated::empty_aggregate(),
+                ),
             )
-        })
+        },
+    )
 }
 
 fn arb_block(genesis_hash: BlockHash) -> impl Strategy<Value = Block> {
@@ -225,7 +238,13 @@ fn arb_signed_wire_bytes_and_signer() -> impl Strategy<Value = (Vec<u8>, NodeId)
         (arb_signer_idx(), arb_vote()).prop_map(|(idx, v)| {
             let signer = &signer_pool()[idx];
             let signed = Signed::sign(v, signer, &ChainId::TEST).expect("sign Vote");
-            let bytes = postcard::to_stdvec(&WireMessage::Vote(signed, None))
+            // The chain is BLS-only: a Vote frame must carry a BLS
+            // partial or ingress trips the `VoteVariant` typestate
+            // (`from_optional_partial` panics on `None`). Ingress runs
+            // under `QcVerification::Skip` here, so the partial isn't
+            // cryptographically checked — but it must be genuinely
+            // G2-encoded, which `dummy_bls_partial` guarantees.
+            let bytes = postcard::to_stdvec(&WireMessage::Vote(signed, Some(dummy_bls_partial())))
                 .expect("encode WireMessage::Vote");
             (bytes, signer.node_id())
         }),
@@ -481,7 +500,7 @@ impl ReplicaSet {
     fn synth_qc(&self, view: View, block_hash: BlockHash) -> QuorumCertificate {
         let mut qc = QuorumCertificate::new(view, block_hash, self.validators.len());
         for i in 0..self.validators.len() {
-            qc.add_signature(i, [i as u8 + 1; 64]);
+            qc.add_bls_partial(i, dummy_bls_partial());
         }
         qc
     }
@@ -498,12 +517,13 @@ fn event_from_msg(source: NodeId, msg: ConsensusMsg) -> Event {
             }))
         }
         ConsensusMsg::Vote(payload) => {
-            Event::VoteReceived(boule_consensus::hotstuff::step::VoteVariant::Ed25519(
+            Event::VoteReceived(boule_consensus::hotstuff::step::VoteVariant::new(
                 boule_consensus::dispatch::Verified::unchecked(Signed {
                     payload,
                     signer: source,
                     sig,
                 }),
+                dummy_bls_partial(),
             ))
         }
         ConsensusMsg::NewView(payload) => {
@@ -676,10 +696,10 @@ fn malformed_signed_proposal(p: MalformedProposalInputs) -> Signed<Proposal> {
         commands: Vec::new(),
     };
     let mut justify = QuorumCertificate::new(p.justify_view, p.justify_block_hash, p.n_validators);
-    // Mint a full set of placeholder signatures so `has_quorum` is
+    // Mint a full set of placeholder partials so `has_quorum` is
     // satisfied — the safety core treats this as legitimate.
     for i in 0..p.n_validators {
-        justify.add_signature(i, [i as u8 + 1; 64]);
+        justify.add_bls_partial(i, dummy_bls_partial());
     }
     Signed {
         payload: Proposal { block, justify },
@@ -744,7 +764,7 @@ proptest! {
                         signer: sender,
                         sig: [0u8; 64],
                     };
-                    replicas.inject(target, Event::VoteReceived(boule_consensus::hotstuff::step::VoteVariant::Ed25519(boule_consensus::dispatch::Verified::unchecked(signed))));
+                    replicas.inject(target, Event::VoteReceived(boule_consensus::hotstuff::step::VoteVariant::new(boule_consensus::dispatch::Verified::unchecked(signed), dummy_bls_partial())));
                 }
                 FuzzStep::InjectBytesNewView { target, sender_idx, qc_view, qc_block_hash } => {
                     let sender = replicas.validators.get(sender_idx).unwrap().into_node_id();
@@ -752,7 +772,7 @@ proptest! {
                         qc_view, qc_block_hash, n_validators,
                     );
                     for i in 0..n_validators {
-                        high_qc.add_signature(i, [i as u8 + 1; 64]);
+                        high_qc.add_bls_partial(i, dummy_bls_partial());
                     }
                     let signed = Signed {
                         payload: NewView { high_qc },
@@ -880,12 +900,13 @@ proptest! {
                 CacheStep::Vote { signer_idx, view, block_hash } => {
                     let signer = validators.get(signer_idx).unwrap().into_node_id();
                     Event::VoteReceived(
-                        boule_consensus::hotstuff::step::VoteVariant::Ed25519(
+                        boule_consensus::hotstuff::step::VoteVariant::new(
                             boule_consensus::dispatch::Verified::unchecked(Signed {
                                 payload: Vote { view, block_hash },
                                 signer,
                                 sig: [0u8; 64],
                             }),
+                            dummy_bls_partial(),
                         ),
                     )
                 }
@@ -910,7 +931,7 @@ proptest! {
                     let block = Block { header, commands: Vec::new() };
                     let mut justify = QuorumCertificate::new(View::ZERO, [0; 32], validators.len());
                     for i in 0..validators.len() {
-                        justify.add_signature(i, [i as u8 + 1; 64]);
+                        justify.add_bls_partial(i, dummy_bls_partial());
                     }
                     Event::ProposalReceived(boule_consensus::dispatch::Verified::unchecked(Signed {
                         payload: Proposal { block, justify },
@@ -935,7 +956,7 @@ proptest! {
                     let block = Block { header, commands: Vec::new() };
                     let mut justify = QuorumCertificate::new(View::ZERO, genesis.hash(), validators.len());
                     for i in 0..validators.len() {
-                        justify.add_signature(i, [i as u8 + 1; 64]);
+                        justify.add_bls_partial(i, dummy_bls_partial());
                     }
                     Event::ProposalReceived(boule_consensus::dispatch::Verified::unchecked(Signed {
                         payload: Proposal { block, justify },

@@ -2219,9 +2219,71 @@ mod tests {
         Arc::new(Mutex::new(Box::new(CounterStateMachine::new())))
     }
 
+    /// Deterministic per-node BLS keypair (IKM = the node id) so test
+    /// nodes can sign vote partials that verify against a shared genesis
+    /// BLS history.
+    fn bls_keypair_for(
+        node_id: NodeId,
+    ) -> (
+        boule_core::crypto::sig_scheme::BlsSecretKey,
+        boule_core::crypto::sig_scheme::BlsPublicKey,
+    ) {
+        boule_core::crypto::sig_scheme::BlsAggregated::keygen(&node_id).unwrap()
+    }
+
+    /// Genesis BLS history covering every validator in `vs`.
+    fn bls_history_for(vs: &ValidatorSet) -> boule_consensus::bls_key_history::BlsKeyHistory {
+        boule_consensus::bls_key_history::BlsKeyHistory::with_genesis(
+            vs.iter()
+                .map(|v| (v.into_node_id(), bls_keypair_for(v.into_node_id()).1)),
+        )
+    }
+
+    /// A real BLS partial-signer for `node_id`, matching `bls_history_for`.
+    fn bls_signer_for(
+        node_id: NodeId,
+    ) -> Arc<
+        dyn boule_core::crypto::signed::PartialSigner<boule_core::crypto::sig_scheme::BlsAggregated>,
+    > {
+        let (sk, pk) = bls_keypair_for(node_id);
+        Arc::new(
+            boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(
+                boule_core::crypto::bls_key::BlsValidatorIdentity {
+                    secret: zeroize::Zeroizing::new(sk),
+                    public: pk,
+                },
+            ),
+        )
+    }
+
+    /// The chain id a `make_node`/`test_config` node derives (from the
+    /// shared test `genesis()`), for minting chain-bound BLS PoPs.
+    fn test_chain_id() -> boule_core::crypto::signed::ChainId {
+        boule_core::crypto::signed::ChainId::from_genesis_hash(genesis().hash())
+    }
+
+    /// A valid chain-bound BLS proof-of-possession for `node_id`'s
+    /// deterministic test BLS key — required on every reconfig `add` on a
+    /// BLS chain.
+    fn test_bls_pop(node_id: NodeId) -> boule_core::crypto::sig_scheme::BlsPop {
+        bls_pop_for_chain(node_id, &test_chain_id())
+    }
+
+    /// A valid chain-bound BLS proof-of-possession for `node_id`'s
+    /// deterministic test BLS key, bound to an explicit `chain_id` — for
+    /// fixtures whose genesis (and thus chain id) differs from the shared
+    /// `genesis()` (e.g. `genesis_with_real_commitment`).
+    fn bls_pop_for_chain(
+        node_id: NodeId,
+        chain_id: &boule_core::crypto::signed::ChainId,
+    ) -> boule_core::crypto::sig_scheme::BlsPop {
+        let (sk, _pk) = bls_keypair_for(node_id);
+        boule_core::crypto::sig_scheme::BlsAggregated::sign_pop(&sk, chain_id).unwrap()
+    }
+
     fn make_node(self_id: NodeId) -> ConsensusNode {
         let vs = four_validators();
-        let cfg = test_config(vs);
+        let cfg = test_config(vs.clone());
         ConsensusNode::new(
             self_id,
             cfg,
@@ -2230,6 +2292,18 @@ mod tests {
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
         )
+        .with_bls_signer(bls_signer_for(self_id))
+    }
+
+    /// A well-formed (valid G2 encoding) but cryptographically arbitrary
+    /// BLS partial signature, used to populate QC fixtures that are only
+    /// exercised under structural / `Skip` paths. `add_bls_partial`
+    /// panics on malformed bytes, so the partial must come from a real
+    /// keygen+sign — but it need not verify against any particular set.
+    fn dummy_bls_partial(seed: u8) -> boule_core::crypto::sig_scheme::BlsPartialSig {
+        use boule_core::crypto::sig_scheme::BlsAggregated;
+        let (sk, _pk) = BlsAggregated::keygen(&[seed; 32]).unwrap();
+        BlsAggregated::sign_partial(&sk, b"dummy-bls-partial").unwrap()
     }
 
     // ── A4: smoke test ───────────────────────────────────────────────────────
@@ -3297,9 +3371,9 @@ mod tests {
 
     fn sample_full_qc() -> QuorumCertificate {
         let mut qc = QuorumCertificate::new(View(41), [0xCDu8; 32], 4);
-        qc.add_signature(0, [0x11u8; 64]);
-        qc.add_signature(2, [0x22u8; 64]);
-        qc.add_signature(3, [0x33u8; 64]);
+        qc.add_bls_partial(0, dummy_bls_partial(0));
+        qc.add_bls_partial(2, dummy_bls_partial(2));
+        qc.add_bls_partial(3, dummy_bls_partial(3));
         qc
     }
 
@@ -3635,9 +3709,9 @@ mod tests {
             block_hash: b_locked.hash(),
         };
         let mut qc = QuorumCertificate::new(19, b_high_qc.hash(), 4);
-        qc.add_signature(0, [0x11u8; 64]);
-        qc.add_signature(1, [0x22u8; 64]);
-        qc.add_signature(2, [0x33u8; 64]);
+        qc.add_bls_partial(0, dummy_bls_partial(0));
+        qc.add_bls_partial(1, dummy_bls_partial(1));
+        qc.add_bls_partial(2, dummy_bls_partial(2));
 
         // Session 1: seed the safety core's `pending_blocks` with both
         // uncommitted blocks (mirroring what `on_proposal_received`
@@ -3773,9 +3847,9 @@ mod tests {
             block_hash: b3.hash(),
         };
         let mut qc = QuorumCertificate::new(b4.header.view, b4.hash(), 4);
-        qc.add_signature(0, [0x11u8; 64]);
-        qc.add_signature(1, [0x22u8; 64]);
-        qc.add_signature(2, [0x33u8; 64]);
+        qc.add_bls_partial(0, dummy_bls_partial(0));
+        qc.add_bls_partial(1, dummy_bls_partial(1));
+        qc.add_bls_partial(2, dummy_bls_partial(2));
         storage
             .put(STORAGE_KEY_LOCKED, &encode_locked(&locked).unwrap())
             .unwrap();
@@ -3876,9 +3950,9 @@ mod tests {
             block_hash: b2.hash(),
         };
         let mut qc = QuorumCertificate::new(b3.header.view, b3.hash(), 4);
-        qc.add_signature(0, [0x11u8; 64]);
-        qc.add_signature(1, [0x22u8; 64]);
-        qc.add_signature(2, [0x33u8; 64]);
+        qc.add_bls_partial(0, dummy_bls_partial(0));
+        qc.add_bls_partial(1, dummy_bls_partial(1));
+        qc.add_bls_partial(2, dummy_bls_partial(2));
         storage
             .put(STORAGE_KEY_LOCKED, &encode_locked(&locked).unwrap())
             .unwrap();
@@ -4251,7 +4325,7 @@ mod tests {
         let mut entry = ValidatorEntry {
             node_id: added,
             addr: "127.0.0.1:9005".parse().unwrap(),
-            bls_pop: None,
+            bls_pop: Some(test_bls_pop(added)),
             operator_pubkey: Some(operator),
             weight: 1,
             consent_sig: None,
@@ -4298,7 +4372,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
-                bls_pop: None,
+                bls_pop: Some(test_bls_pop(nid(5))),
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
@@ -4347,7 +4421,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
-                bls_pop: None,
+                bls_pop: Some(test_bls_pop(nid(5))),
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
@@ -4540,7 +4614,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
-                bls_pop: None,
+                bls_pop: Some(test_bls_pop(nid(5))),
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
@@ -4554,7 +4628,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(6),
                 addr: "127.0.0.1:9006".parse().unwrap(),
-                bls_pop: None,
+                bls_pop: Some(test_bls_pop(nid(6))),
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
@@ -4625,13 +4699,14 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(nid(1)));
         let v_eff = MIN_V_EFF_DELAY + 5;
         let cmd = ReconfigCommand {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
-                bls_pop: None,
+                bls_pop: Some(test_bls_pop(nid(5))),
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
@@ -5093,7 +5168,10 @@ mod tests {
             )
             .unwrap();
             let verified = Verified::wrap_after_verify_with_signer(signed, eq_id);
-            Dispatch::Safety(SafetyEvent::VoteReceived(VoteVariant::Ed25519(verified)))
+            Dispatch::Safety(SafetyEvent::VoteReceived(VoteVariant::new(
+                verified,
+                dummy_bls_partial(0),
+            )))
         };
 
         let signer: Arc<dyn Signer> = Arc::new(fresh_signer());
@@ -5132,7 +5210,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(nid(2)));
         (node, equivocator, eq_id)
     }
 
@@ -5362,7 +5441,7 @@ mod tests {
         let mut entry = ValidatorEntry {
             node_id: added,
             addr: "127.0.0.1:9005".parse().unwrap(),
-            bls_pop: None,
+            bls_pop: Some(test_bls_pop(added)),
             weight: 1,
             operator_pubkey: Some(operator.node_id()),
             consent_sig: None,
@@ -5425,7 +5504,7 @@ mod tests {
         let new = fresh_signer();
         let v_id = ValidatorId::from_genesis_pubkey(validator.node_id());
         let vs = ValidatorSet::new(vec![v_id, vid(2), vid(3), vid(4)]);
-        let mut cfg = test_config(vs);
+        let mut cfg = test_config(vs.clone());
         cfg.operator_keys = vec![(validator.node_id(), operator.node_id())];
         let node = ConsensusNode::new(
             nid(2),
@@ -5434,7 +5513,12 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(nid(2)))
+        // BLS-only chain: the node carries a genesis BLS history so the
+        // BLS half of a signing-key rotation (and the rebuild's parity
+        // assert) can mirror onto the rotated validator's entry.
+        .with_bls_key_history(bls_history_for(&vs));
         (node, operator, new, v_id)
     }
 
@@ -5449,12 +5533,14 @@ mod tests {
         use boule_consensus::validator_set::Pubkey;
 
         let (mut node, operator, new, v_id) = node_with_operator_key();
+        // BLS-only chain: a signing-key rotation must atomically rotate the
+        // BLS key too, with a chain-bound PoP for the new BLS pubkey.
         let payload = ValidatorKeyRotation {
             validator: v_id.into_node_id(),
             new_pubkey: new.node_id(),
             v_eff: View(20),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
+            new_bls_pubkey: Some(bls_keypair_for(new.node_id()).1),
+            new_bls_pop: Some(test_bls_pop(new.node_id())),
         };
         let env = OperatorSignedRotation::sign(payload, &operator, &new, &node.chain_id).unwrap();
         let block = block_with_commands(1, 5, vec![env.encode_command()]);
@@ -5651,8 +5737,8 @@ mod tests {
 
         // A QC at view 7 signed by the validators at indices 0 and 2.
         let mut qc = QuorumCertificate::new(7u64, [0xCD; 32], vs.len());
-        qc.add_signature(0, [0u8; 64]);
-        qc.add_signature(2, [0u8; 64]);
+        qc.add_bls_partial(0, dummy_bls_partial(0));
+        qc.add_bls_partial(2, dummy_bls_partial(2));
 
         let ctx = node.build_app_context(&qc);
         // Proposer is this node.
@@ -6821,6 +6907,7 @@ mod tests {
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
         )
+        .with_bls_signer(bls_signer_for(self_id))
     }
 
     /// The retry timer stays armed while only the range tracker has
@@ -6903,7 +6990,7 @@ mod tests {
         };
         let mut qc = QuorumCertificate::new(View::ZERO, block.hash(), vs.len());
         for i in 0..boule_consensus::hotstuff::qc::quorum_size(vs.len()) {
-            qc.add_signature(i, [0u8; 64]);
+            qc.add_bls_partial(i, dummy_bls_partial(i as u8));
         }
         let manifest = SnapshotManifest::build_for_test_genesis_histories(
             block,
@@ -7419,7 +7506,7 @@ mod tests {
         };
         let mut commit_qc = QuorumCertificate::new(50, snapshot_block.hash(), vs.len());
         for i in 0..boule_consensus::hotstuff::qc::quorum_size(vs.len()) {
-            commit_qc.add_signature(i, [0u8; 64]);
+            commit_qc.add_bls_partial(i, dummy_bls_partial(i as u8));
         }
         let manifest =
             boule_consensus::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
@@ -7451,7 +7538,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&server_storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(server_node_id));
 
         // ── Build the fresh joiner ────────────────────────────────────
         let joiner_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
@@ -7470,7 +7558,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&joiner_storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(joiner_signer.node_id()));
 
         // Wrap in Arc *after* using the original `server_signer` to
         // sign the synthetic proposal below. `NodeSigner` is not
@@ -7773,7 +7862,7 @@ mod tests {
         };
         let mut tampered_qc = QuorumCertificate::new(50, tampered_block.hash(), bad_vs.len());
         for i in 0..boule_consensus::hotstuff::qc::quorum_size(bad_vs.len()) {
-            tampered_qc.add_signature(i, [0u8; 64]);
+            tampered_qc.add_bls_partial(i, dummy_bls_partial(i as u8));
         }
         let bad_manifest =
             boule_consensus::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
@@ -7942,7 +8031,7 @@ mod tests {
         };
         let mut commit_qc = QuorumCertificate::new(50, snapshot_block.hash(), vs.len());
         for i in 0..boule_consensus::hotstuff::qc::quorum_size(vs.len()) {
-            commit_qc.add_signature(i, [0u8; 64]);
+            commit_qc.add_bls_partial(i, dummy_bls_partial(i as u8));
         }
         let manifest = boule_consensus::replication::snapshot::SnapshotManifest::build(
             snapshot_block,
@@ -8124,7 +8213,7 @@ mod tests {
         };
         let mut commit_qc = QuorumCertificate::new(snapshot_view, snapshot_block.hash(), vs.len());
         for i in 0..boule_consensus::hotstuff::qc::quorum_size(vs.len()) {
-            commit_qc.add_signature(i, [0u8; 64]);
+            commit_qc.add_bls_partial(i, dummy_bls_partial(i as u8));
         }
         // `build_for_test_genesis_histories` rewrites
         // `block.header.validator_history_commitment` (and re-targets
@@ -8300,7 +8389,7 @@ mod tests {
         };
         let mut commit_qc = QuorumCertificate::new(50, snapshot_block.hash(), vs.len());
         for i in 0..boule_consensus::hotstuff::qc::quorum_size(vs.len()) {
-            commit_qc.add_signature(i, [0u8; 64]);
+            commit_qc.add_bls_partial(i, dummy_bls_partial(i as u8));
         }
         let manifest =
             boule_consensus::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
@@ -8325,7 +8414,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&joiner_storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(joiner_signer.node_id()));
         let joiner_signer_arc: Arc<dyn Signer> = Arc::new(joiner_signer);
         let (joiner_bc, mut joiner_outbound) = make_test_broadcaster();
         let (timer_tx, _timer_rx) = tokio::sync::mpsc::channel::<View>(4);
@@ -8509,7 +8599,7 @@ mod tests {
         };
         let mut commit_qc = QuorumCertificate::new(50, snapshot_block.hash(), vs.len());
         for i in 0..boule_consensus::hotstuff::qc::quorum_size(vs.len()) {
-            commit_qc.add_signature(i, [0u8; 64]);
+            commit_qc.add_bls_partial(i, dummy_bls_partial(i as u8));
         }
         let manifest =
             boule_consensus::replication::snapshot::SnapshotManifest::build_for_test_genesis_histories(
@@ -9151,7 +9241,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(self_signer.node_id()));
 
         // Advance our pacemaker well past the wedged peer's view.
         // Use OnQc(50) so current_view = 51 — comfortably ahead of the
@@ -9401,7 +9492,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(self_id));
         (node, vs)
     }
 
@@ -9668,7 +9760,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(self_id));
         (node, vs)
     }
 
@@ -9878,7 +9971,8 @@ mod tests {
         // This test drives a hand-crafted block with a placeholder
         // committed root through the vote path; disable the #599
         // divergence check so the expected vote is not suppressed.
-        .with_vote_divergence_check_disabled();
+        .with_vote_divergence_check_disabled()
+        .with_bls_signer(bls_signer_for(self_signer.node_id()));
         let signer: Arc<dyn Signer> = Arc::new(self_signer);
 
         let (inner_bc, _outbound_rx) = make_test_broadcaster();
@@ -10114,7 +10208,8 @@ mod tests {
         // This test drives a hand-crafted block with a placeholder
         // committed root through the vote path; disable the #599
         // divergence check so the expected vote is not suppressed.
-        .with_vote_divergence_check_disabled();
+        .with_vote_divergence_check_disabled()
+        .with_bls_signer(bls_signer_for(self_signer.node_id()));
         let signer: Arc<dyn Signer> = Arc::new(self_signer);
 
         let (inner_bc, _outbound_rx) = make_test_broadcaster();
@@ -10641,9 +10736,9 @@ mod tests {
         let parent = genesis();
         let block = make_committable_block(&parent, 5, 5);
         let mut qc = QuorumCertificate::new(5, block.hash(), 4);
-        qc.add_signature(0, [0u8; 64]);
-        qc.add_signature(1, [0u8; 64]);
-        qc.add_signature(2, [0u8; 64]);
+        qc.add_bls_partial(0, dummy_bls_partial(0));
+        qc.add_bls_partial(1, dummy_bls_partial(1));
+        qc.add_bls_partial(2, dummy_bls_partial(2));
         node.persist_updates(&[StateUpdate::HighQc(qc.clone())])
             .unwrap();
 
@@ -10686,9 +10781,9 @@ mod tests {
         let parent = genesis();
         let block = make_committable_block(&parent, 1, 1);
         let mut qc = QuorumCertificate::new(1, block.hash(), 4);
-        qc.add_signature(0, [0u8; 64]);
-        qc.add_signature(1, [0u8; 64]);
-        qc.add_signature(2, [0u8; 64]);
+        qc.add_bls_partial(0, dummy_bls_partial(0));
+        qc.add_bls_partial(1, dummy_bls_partial(1));
+        qc.add_bls_partial(2, dummy_bls_partial(2));
         node.persist_updates(&[StateUpdate::HighQc(qc)]).unwrap();
         node.apply_commit(block);
 
@@ -10718,9 +10813,9 @@ mod tests {
         let parent = genesis();
         let block = make_committable_block(&parent, 3, 3); // not a multiple of 5
         let mut qc = QuorumCertificate::new(3, block.hash(), 4);
-        qc.add_signature(0, [0u8; 64]);
-        qc.add_signature(1, [0u8; 64]);
-        qc.add_signature(2, [0u8; 64]);
+        qc.add_bls_partial(0, dummy_bls_partial(0));
+        qc.add_bls_partial(1, dummy_bls_partial(1));
+        qc.add_bls_partial(2, dummy_bls_partial(2));
         node.persist_updates(&[StateUpdate::HighQc(qc)]).unwrap();
         node.apply_commit(block);
 
@@ -10792,9 +10887,9 @@ mod tests {
             };
             let block = make_committable_block(&parent, height, height);
             let mut qc = QuorumCertificate::new(View(height), block.hash(), 4);
-            qc.add_signature(0, [0u8; 64]);
-            qc.add_signature(1, [0u8; 64]);
-            qc.add_signature(2, [0u8; 64]);
+            qc.add_bls_partial(0, dummy_bls_partial(0));
+            qc.add_bls_partial(1, dummy_bls_partial(1));
+            qc.add_bls_partial(2, dummy_bls_partial(2));
             node.persist_updates(&[StateUpdate::HighQc(qc)]).unwrap();
             node.apply_commit(block);
         }
@@ -10835,9 +10930,9 @@ mod tests {
             };
             let block = make_committable_block(&parent, height, height);
             let mut qc = QuorumCertificate::new(View(height), block.hash(), 4);
-            qc.add_signature(0, [0u8; 64]);
-            qc.add_signature(1, [0u8; 64]);
-            qc.add_signature(2, [0u8; 64]);
+            qc.add_bls_partial(0, dummy_bls_partial(0));
+            qc.add_bls_partial(1, dummy_bls_partial(1));
+            qc.add_bls_partial(2, dummy_bls_partial(2));
             node.persist_updates(&[StateUpdate::HighQc(qc)]).unwrap();
             node.apply_commit(block);
         }
@@ -10943,7 +11038,8 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(nid(1)));
         // Block 1 carries a reconfig. Stamp the post-block commitment
         // (#325 PR C) so the recovery walk's apply-then-hash check
         // matches.
@@ -10952,7 +11048,10 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
-                bls_pop: None,
+                // The PoP must bind to THIS node's chain id, which derives
+                // from `g` (genesis_with_real_commitment), not the shared
+                // `genesis()` that `test_bls_pop` uses.
+                bls_pop: Some(bls_pop_for_chain(nid(5), &node.chain_id)),
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
@@ -11118,13 +11217,15 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::clone(&storage),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_signer(bls_signer_for(nid(1)));
         let v_eff = MIN_V_EFF_DELAY + 5;
         let cmd = ReconfigCommand {
             adds: vec![ValidatorEntry {
                 node_id: nid(5),
                 addr: "127.0.0.1:9005".parse().unwrap(),
-                bls_pop: None,
+                // Chain-bound PoP — `g`'s chain id, not the shared `genesis()`.
+                bls_pop: Some(bls_pop_for_chain(nid(5), &node.chain_id)),
                 operator_pubkey: None,
                 weight: 1,
                 consent_sig: None,
@@ -11495,6 +11596,7 @@ mod tests {
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
         )
+        .with_bls_signer(bls_signer_for(self_id))
     }
 
     #[test]

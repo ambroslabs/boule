@@ -735,9 +735,18 @@ mod tests {
     }
 
     fn quorum_qc(vs_len: usize, block_hash: BlockHash) -> QuorumCertificate {
+        use boule_core::crypto::sig_scheme::BlsAggregated;
         let mut qc = QuorumCertificate::new(0, block_hash, vs_len);
+        // Real BLS partials over an arbitrary message: the snapshot path
+        // never re-runs the QC pairing check, so the message contents
+        // don't matter — we only need the folded aggregate to be
+        // well-formed under `QuorumCertificate::is_well_formed`.
         for i in 0..quorum_size(vs_len) {
-            qc.add_signature(i, [0u8; 64]);
+            let mut ikm = [0u8; 32];
+            ikm.fill(i as u8);
+            let (sk, _) = BlsAggregated::keygen(&ikm).unwrap();
+            let partial = BlsAggregated::sign_partial(&sk, b"snapshot-test").unwrap();
+            qc.add_bls_partial(i, partial);
         }
         qc
     }

@@ -503,6 +503,19 @@ pub struct AdversaryCtx {
     /// under any other tag fails envelope verification at ingress and
     /// never reaches the safety core.
     pub chain_id: boule_core::crypto::signed::ChainId,
+    /// The adversary's own BLS partial signer on a BLS-scheme cluster,
+    /// `None` on Ed25519 clusters. A twin-vote / forged-vote adversary
+    /// that mutates a Vote's `block_hash` must re-sign a *fresh* BLS
+    /// partial over the new `(view, block_hash)` pre-image, or honest
+    /// receivers reject the forgery at the ingress BLS-partial gate
+    /// before the equivocation detector ever sees it.
+    pub bls_signer: Option<
+        Arc<
+            dyn boule_core::crypto::signed::PartialSigner<
+                    boule_core::crypto::sig_scheme::BlsAggregated,
+                >,
+        >,
+    >,
 }
 
 /// Hook installed on a single node's routing task that lets a Byzantine
@@ -583,6 +596,20 @@ struct SpawnExtras {
 /// `tokio::time::pause()` + `advance()` or with `yield_now()` loops.
 ///
 /// Dropping the cluster sends shutdown to all still-running nodes.
+///
+/// Captured genesis BLS keys for a BLS-scheme cluster, retained so
+/// [`SimCluster::restart_all_with_recover`] can re-wire each recovered
+/// node's `BlsPartialSignerImpl` and `BlsKeyHistory` (production keeps
+/// these on disk / in the operator keystore; the sim mints them
+/// deterministically at spawn).
+#[derive(Clone)]
+struct BlsClusterKeys {
+    /// Shared genesis pubkey table (same on every node).
+    pubkeys: HashMap<NodeId, boule_core::crypto::sig_scheme::BlsPublicKey>,
+    /// Per-node secret keys, keyed by `NodeId`.
+    secrets: HashMap<NodeId, boule_core::crypto::sig_scheme::BlsSecretKey>,
+}
+
 pub struct SimCluster {
     /// Per-node commit receivers, in ascending [`NodeId`] (sorted) order.
     /// Bounded at [`SIM_COMMIT_CHANNEL_CAP`]; if a test fails to drain in
@@ -654,6 +681,11 @@ pub struct SimCluster {
     /// which reaches the node's running signer so it swaps keys at `v_eff`.
     /// Empty for spawn paths that don't capture them.
     rotatable_signers: Vec<Arc<crate::rotatable_signer::RotatableSigner>>,
+    /// Per-node hot-rotation BLS partial signers (#358), in `node_ids`
+    /// order. `None` per slot on Ed25519 clusters (or any spawn path
+    /// that doesn't wire BLS). A test injects a BLS-half key rotation
+    /// mid-run via [`SimCluster::register_bls_rotation`].
+    rotatable_bls_signers: Vec<Option<Arc<crate::rotatable_signer::RotatableBlsSigner>>>,
     /// Per-node durable storage handles, captured so
     /// [`SimCluster::restart_all_with_recover`] can resume against the
     /// same on-disk state. Same order as [`Self::signers`].
@@ -661,6 +693,13 @@ pub struct SimCluster {
     /// Per-node WAL handles, captured for the same reason as
     /// [`Self::storages`].
     wals: Option<Vec<Arc<dyn Wal>>>,
+    /// Genesis BLS keypairs, captured on BLS-scheme clusters so
+    /// [`SimCluster::restart_all_with_recover`] can re-wire each
+    /// recovered node's `BlsPartialSignerImpl` + `BlsKeyHistory`. Empty
+    /// on Ed25519 clusters (the recover path then attaches no BLS
+    /// signer, matching the pre-restart wiring). The shared genesis
+    /// pubkey table is the same on every node.
+    bls_keys: Option<BlsClusterKeys>,
     /// Per-node mempool handles. Same order as `node_ids`. Tests can
     /// insert raw command bytes here to drive a leader's next proposal
     /// — used by the reconfig sim tests (#255) to inject a tagged
@@ -1241,6 +1280,12 @@ impl SimCluster {
         // rotation mid-run via `SimCluster::register_rotation`.
         let mut rotatable_signers_captured: Vec<Arc<crate::rotatable_signer::RotatableSigner>> =
             Vec::new();
+        // #358: per-node hot-rotation BLS partial signers (BLS clusters
+        // only), so a test can flip the BLS half at a rotation's `v_eff`
+        // alongside the Ed25519 half via `SimCluster::register_bls_rotation`.
+        let mut rotatable_bls_signers_captured: Vec<
+            Option<Arc<crate::rotatable_signer::RotatableBlsSigner>>,
+        > = Vec::new();
         let mut storages_for_restart: Vec<Arc<dyn Storage>> = Vec::new();
         let mut wals_for_restart: Vec<Arc<dyn Wal>> = Vec::new();
         let mut mempools_captured: Vec<Arc<dyn Mempool>> = Vec::new();
@@ -1338,14 +1383,32 @@ impl SimCluster {
                     secret: zeroize::Zeroizing::new(sk),
                     public: pk,
                 };
-                let bls_signer: Arc<
+                let genesis_bls_signer: Arc<
                     dyn boule_core::crypto::signed::PartialSigner<
                             boule_core::crypto::sig_scheme::BlsAggregated,
                         >,
                 > = Arc::new(
                     boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity),
                 );
+                // #358 hot-swap: sign through a RotatableBlsSigner sharing
+                // the node's current-view handle (the same one the Ed25519
+                // RotatableSigner below uses), so `register_bls_rotation`
+                // can flip the BLS half at a rotation's `v_eff` with no
+                // restart. With no rotation registered it folds with the
+                // genesis BLS key, unchanged.
+                let rotatable_bls = Arc::new(crate::rotatable_signer::RotatableBlsSigner::new(
+                    genesis_bls_signer,
+                    node.signing_view_handle(),
+                ));
+                rotatable_bls_signers_captured.push(Some(Arc::clone(&rotatable_bls)));
+                let bls_signer: Arc<
+                    dyn boule_core::crypto::signed::PartialSigner<
+                            boule_core::crypto::sig_scheme::BlsAggregated,
+                        >,
+                > = rotatable_bls;
                 node = node.with_bls_signer(bls_signer);
+            } else {
+                rotatable_bls_signers_captured.push(None);
             }
 
             // Optional rate-limiter (issue #134). The sim has no real
@@ -1382,6 +1445,29 @@ impl SimCluster {
             let discovery: Arc<dyn Discovery> = MemoryDiscovery::spawn(disco_src_rx);
 
             let route_adv = adversary_for_node.map(|adv| {
+                // On a BLS cluster, hand the adversary its own BLS
+                // partial signer so a forged Vote that mutates
+                // `block_hash` can carry a partial that verifies over the
+                // new pre-image (else the ingress BLS gate rejects it).
+                let adv_bls_signer: Option<
+                    Arc<
+                        dyn boule_core::crypto::signed::PartialSigner<
+                                boule_core::crypto::sig_scheme::BlsAggregated,
+                            >,
+                    >,
+                > = if scheme
+                    == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated
+                {
+                    let identity = boule_core::crypto::bls_key::BlsValidatorIdentity {
+                        secret: zeroize::Zeroizing::new(bls_secret_for[&nid]),
+                        public: bls_pubkeys[&nid],
+                    };
+                    Some(Arc::new(
+                        boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity),
+                    ))
+                } else {
+                    None
+                };
                 let ctx = AdversaryCtx {
                     my_id: nid,
                     validators: Arc::clone(&node_ids_arc),
@@ -1390,6 +1476,7 @@ impl SimCluster {
                     chain_id: boule_core::crypto::signed::ChainId::from_genesis_hash(
                         genesis.hash(),
                     ),
+                    bls_signer: adv_bls_signer,
                 };
                 (adv, ctx)
             });
@@ -1483,8 +1570,19 @@ impl SimCluster {
             shutdown_txs,
             signers: Some(signers_for_restart),
             rotatable_signers: rotatable_signers_captured,
+            rotatable_bls_signers: rotatable_bls_signers_captured,
             storages: Some(storages_for_restart),
             wals: Some(wals_for_restart),
+            bls_keys: if scheme
+                == boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated
+            {
+                Some(BlsClusterKeys {
+                    pubkeys: bls_pubkeys,
+                    secrets: bls_secret_for,
+                })
+            } else {
+                None
+            },
             mempools: mempools_captured,
             validator_set: vs,
             genesis,
@@ -1562,7 +1660,7 @@ impl SimCluster {
         let commit_overflow = notifier.overflow_counter();
         let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
 
-        let node = ConsensusNode::new(
+        let mut node = ConsensusNode::new(
             nid,
             config,
             sm,
@@ -1571,6 +1669,37 @@ impl SimCluster {
             Arc::clone(&wal),
         )
         .with_commit_notifier(commit_notifier);
+
+        // BLS-only chain: a tail-spawned node boots from the genesis
+        // committee config, so — like the `spawn_inner` and restart paths —
+        // it needs the genesis `BlsKeyHistory` to verify the committee's BLS
+        // QCs while it block-syncs. (Without it the dispatch-layer QC
+        // verifier can't resolve per-view BLS pubkeys and every synced block
+        // is rejected, so the node never leaves height 0.) It also gets a
+        // fresh BLS partial signer so that, if a reconfig later seats it, its
+        // self-vote carries a real partial; the cluster keeps quorum without
+        // it regardless (4-of-5 weighted), so its BLS pubkey need not be
+        // registered in peers' histories for the chain to progress.
+        if let Some(bls_keys) = self.bls_keys.as_ref() {
+            let bls_history = boule_consensus::bls_key_history::BlsKeyHistory::with_genesis(
+                bls_keys.pubkeys.iter().map(|(id, pk)| (*id, *pk)),
+            );
+            node = node.with_bls_key_history(bls_history);
+            let (sk, pk) = boule_core::crypto::sig_scheme::BlsAggregated::keygen(&nid)
+                .expect("fresh BLS keygen for a tail-spawned node");
+            let identity = boule_core::crypto::bls_key::BlsValidatorIdentity {
+                secret: zeroize::Zeroizing::new(sk),
+                public: pk,
+            };
+            let bls_signer: Arc<
+                dyn boule_core::crypto::signed::PartialSigner<
+                        boule_core::crypto::sig_scheme::BlsAggregated,
+                    >,
+            > = Arc::new(
+                boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity),
+            );
+            node = node.with_bls_signer(bls_signer);
+        }
 
         // Capture the counters before the node moves into its task.
         self.equivocations_counters
@@ -1645,6 +1774,10 @@ impl SimCluster {
         self.crash_slots.push(crash_slot);
         self.mempools.push(Arc::clone(&mempool));
         self.rotatable_signers.push(rotatable);
+        // Tail-spawned validators are Ed25519-only (no BLS wiring per
+        // this helper's contract); push `None` to keep the BLS rotation
+        // vector index-aligned with `node_ids`.
+        self.rotatable_bls_signers.push(None);
         if let Some(s) = self.signers.as_mut() {
             s.push(Arc::clone(&signer));
         }
@@ -1686,6 +1819,31 @@ impl SimCluster {
     /// not strictly past the node's latest scheduled rotation.
     pub fn register_rotation(&self, idx: usize, v_eff: u64, new_signer: Arc<dyn Signer>) -> bool {
         self.rotatable_signers[idx].register_rotation(v_eff, new_signer)
+    }
+
+    /// BLS sibling of [`Self::register_rotation`] (#358): inject the BLS
+    /// half of a committed dual-key rotation into node `idx`'s running
+    /// BLS partial signer, so at and after `v_eff` it folds partials
+    /// with `new_bls_signer` — no restart. On a BLS-only chain a rotated
+    /// validator must hot-swap *both* halves to keep voting/leading past
+    /// the boundary; pair this with `register_rotation` for the Ed25519
+    /// half. Returns `false` if `v_eff` is non-monotonic, and panics if
+    /// node `idx` has no BLS signer (Ed25519 cluster or a tail-spawned
+    /// validator).
+    pub fn register_bls_rotation(
+        &self,
+        idx: usize,
+        v_eff: u64,
+        new_bls_signer: Arc<
+            dyn boule_core::crypto::signed::PartialSigner<
+                    boule_core::crypto::sig_scheme::BlsAggregated,
+                >,
+        >,
+    ) -> bool {
+        self.rotatable_bls_signers[idx]
+            .as_ref()
+            .expect("register_bls_rotation requires a BLS-wired node")
+            .register_rotation(v_eff, new_bls_signer)
     }
 
     /// Per-node durable storage handle, in the same `node_ids` order as
@@ -2180,6 +2338,11 @@ impl SimCluster {
             .wals
             .clone()
             .expect("restart_all_with_recover requires captured WALs");
+        // On BLS clusters the recovered node must re-attach its BLS
+        // partial signer + key history, exactly as `spawn_inner` wired
+        // them — otherwise the loopback self-vote on a BLS chain folds a
+        // missing partial and panics in `VoteVariant::from_optional_partial`.
+        let bls_keys = self.bls_keys.clone();
         let n = self.node_ids.len();
         assert_eq!(signers.len(), n);
         assert_eq!(storages.len(), n);
@@ -2278,9 +2441,35 @@ impl SimCluster {
             new_commit_overflow_counters.push(notifier.overflow_counter());
             let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
 
-            let node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)
+            let mut node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)
                 .expect("recover must succeed against the same storage that just persisted")
                 .with_commit_notifier(commit_notifier);
+
+            // Re-wire BLS plumbing on BLS clusters (mirror of the
+            // `spawn_inner` wiring): the genesis `BlsKeyHistory` so the
+            // dispatch-layer QC verifier resolves per-view BLS pubkeys,
+            // and this node's `BlsPartialSignerImpl` so its loopback
+            // self-vote carries a real BLS partial (#354 step 2 / #118).
+            if let Some(bls_keys) = bls_keys.as_ref() {
+                let bls_history = boule_consensus::bls_key_history::BlsKeyHistory::with_genesis(
+                    bls_keys.pubkeys.iter().map(|(id, pk)| (*id, *pk)),
+                );
+                node = node.with_bls_key_history(bls_history);
+                let sk = bls_keys.secrets[&nid];
+                let pk = bls_keys.pubkeys[&nid];
+                let identity = boule_core::crypto::bls_key::BlsValidatorIdentity {
+                    secret: zeroize::Zeroizing::new(sk),
+                    public: pk,
+                };
+                let bls_signer: Arc<
+                    dyn boule_core::crypto::signed::PartialSigner<
+                            boule_core::crypto::sig_scheme::BlsAggregated,
+                        >,
+                > = Arc::new(
+                    boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity),
+                );
+                node = node.with_bls_signer(bls_signer);
+            }
 
             let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
             let broadcaster: Arc<dyn Broadcaster> = Arc::new(MemoryBroadcaster::new(send_tx));
@@ -2523,8 +2712,33 @@ impl SimCluster {
         self.commit_overflow_counters[idx] = notifier.overflow_counter();
         let commit_notifier: Arc<dyn CommitNotifier> = Arc::new(notifier);
 
-        let node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)?
+        let mut node = ConsensusNode::recover(nid, config, sm, mempool, storage, wal)?
             .with_commit_notifier(commit_notifier);
+
+        // Re-wire BLS plumbing on BLS clusters (mirror of the
+        // `spawn_inner` wiring): without the partial signer the reborn
+        // node's loopback self-vote folds a missing partial and panics
+        // in `VoteVariant::from_optional_partial` (#354 step 2 / #118).
+        if let Some(bls_keys) = self.bls_keys.as_ref() {
+            let bls_history = boule_consensus::bls_key_history::BlsKeyHistory::with_genesis(
+                bls_keys.pubkeys.iter().map(|(id, pk)| (*id, *pk)),
+            );
+            node = node.with_bls_key_history(bls_history);
+            let sk = bls_keys.secrets[&nid];
+            let pk = bls_keys.pubkeys[&nid];
+            let identity = boule_core::crypto::bls_key::BlsValidatorIdentity {
+                secret: zeroize::Zeroizing::new(sk),
+                public: pk,
+            };
+            let bls_signer: Arc<
+                dyn boule_core::crypto::signed::PartialSigner<
+                        boule_core::crypto::sig_scheme::BlsAggregated,
+                    >,
+            > = Arc::new(
+                boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(identity),
+            );
+            node = node.with_bls_signer(bls_signer);
+        }
 
         let (send_tx, send_rx) = mpsc::channel::<ProtocolOutbound>(1024);
         let broadcaster: Arc<dyn Broadcaster> = Arc::new(MemoryBroadcaster::new(send_tx));
@@ -6889,13 +7103,22 @@ mod tests {
         let joiner_idx = cluster.node_ids.len() - 1;
 
         // Add the joiner at a future v_eff. No operator key → no inbound
-        // consent required (#548).
+        // consent required (#548). BLS-only chain: the add must carry a
+        // chain-bound PoP for the joiner's BLS key (the same `keygen(&nid)`
+        // key `spawn_validator_into` wired onto the joiner).
         let v_eff: View = View(60);
+        let chain_id =
+            boule_core::crypto::signed::ChainId::from_genesis_hash(cluster.genesis.hash());
+        let (joiner_bls_sk, _joiner_bls_pk) =
+            boule_core::crypto::sig_scheme::BlsAggregated::keygen(&joiner).unwrap();
+        let joiner_bls_pop =
+            boule_core::crypto::sig_scheme::BlsAggregated::sign_pop(&joiner_bls_sk, &chain_id)
+                .unwrap();
         let cmd = ReconfigCommand {
             adds: vec![ValidatorEntry {
                 node_id: joiner,
                 addr: "127.0.0.1:9100".parse().unwrap(),
-                bls_pop: None,
+                bls_pop: Some(joiner_bls_pop),
                 weight: 1,
                 operator_pubkey: None,
                 consent_sig: None,
@@ -7105,6 +7328,30 @@ mod tests {
         let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
         let new_pubkey = new_signer.node_id();
 
+        // The rotation envelope's `sig_old`/`sig_new` (and, on a BLS
+        // chain, the PoP) are verified at commit under each replica's own
+        // `chain_id`, which the cluster derives from the genesis hash
+        // (NOT `ChainId::TEST`). Signing under the wrong chain_id makes
+        // the rotation fail verification at apply, so it never lands in
+        // the key history and the boundary swap is moot.
+        let chain_id = ChainId::from_genesis_hash(cluster.genesis.hash());
+
+        // The chain is BLS-only, so the rotation must rotate the BLS half
+        // too: mint a real new BLS keypair + a PoP over it under the
+        // cluster's `chain_id`, or `validate_scheme_consistency` drops
+        // the rotation. The validator's running BLS signer is hot-swapped
+        // to this key at `v_eff` (below), mirroring the Ed25519 swap, so
+        // its post-boundary partials fold under the new BLS pubkey the
+        // verifier now resolves from history.
+        let mut bls_ikm = [0u8; 32];
+        bls_ikm[0] = 0x6B; // deterministic across re-runs
+        bls_ikm[1] = rotated_idx as u8;
+        let (new_bls_sk, new_bls_pk) =
+            boule_core::crypto::sig_scheme::BlsAggregated::keygen(&bls_ikm).unwrap();
+        let new_bls_pop =
+            boule_core::crypto::sig_scheme::BlsAggregated::sign_pop(&new_bls_sk, &chain_id)
+                .unwrap();
+
         // v_eff sits comfortably ahead of where the warm-up landed and
         // ahead of any leader-of-view turn the rotated validator might
         // serve right after commit, so the cross-boundary window is
@@ -7114,15 +7361,9 @@ mod tests {
             validator: rotated_validator,
             new_pubkey,
             v_eff,
-            new_bls_pubkey: None,
-            new_bls_pop: None,
+            new_bls_pubkey: Some(new_bls_pk),
+            new_bls_pop: Some(new_bls_pop),
         };
-        // The rotation envelope's `sig_old`/`sig_new` are verified at commit
-        // under each replica's own `chain_id`, which the cluster derives from
-        // the genesis hash (NOT `ChainId::TEST`). Signing under the wrong
-        // chain_id makes the rotation fail signature verification at apply,
-        // so it never lands in the key history and the boundary swap is moot.
-        let chain_id = ChainId::from_genesis_hash(cluster.genesis.hash());
         let envelope = DualSignedRotation::sign(payload, &*current_signer, &*new_signer, &chain_id)
             .expect("constructing rotation envelope must succeed");
         let cmd_bytes = envelope.encode_command();
@@ -7141,6 +7382,29 @@ mod tests {
         assert!(
             cluster.register_rotation(rotated_idx, v_eff.0, Arc::clone(&new_signer)),
             "registering the hot rotation must succeed",
+        );
+
+        // #358: hot-swap the BLS half too. On a BLS-only chain the
+        // rotated validator's post-boundary votes must fold under the
+        // NEW BLS key (which the verifier resolves from the rotated
+        // history); without this swap the partials still come from the
+        // genesis BLS key and every quorum the rotated slot touches is
+        // rejected, so it could never lead + commit past `v_eff`.
+        let new_bls_signer: Arc<
+            dyn boule_core::crypto::signed::PartialSigner<
+                    boule_core::crypto::sig_scheme::BlsAggregated,
+                >,
+        > = Arc::new(
+            boule_core::crypto::bls_key::BlsPartialSignerImpl::from_identity(
+                boule_core::crypto::bls_key::BlsValidatorIdentity {
+                    secret: zeroize::Zeroizing::new(new_bls_sk),
+                    public: new_bls_pk,
+                },
+            ),
+        );
+        assert!(
+            cluster.register_bls_rotation(rotated_idx, v_eff.0, new_bls_signer),
+            "registering the hot BLS rotation must succeed",
         );
 
         // Drive the cluster comfortably past v_eff — far enough that the
@@ -7617,6 +7881,20 @@ mod tests {
         let new_signer = Arc::new(fresh_signer()) as Arc<dyn Signer>;
         let new_pubkey = new_signer.node_id();
 
+        // The chain is BLS-only, so a rotation must rotate the BLS half
+        // too: mint a real new BLS keypair and a PoP over it under the
+        // cluster's real `chain_id` (the same one `apply_committed_rotations`
+        // verifies against), or `validate_scheme_consistency` drops the
+        // rotation and it never lands in the key history.
+        let mut bls_ikm = [0u8; 32];
+        bls_ikm[0] = 0x5A; // deterministic across re-runs
+        bls_ikm[1] = rotated_idx as u8;
+        let (new_bls_sk, new_bls_pk) =
+            boule_core::crypto::sig_scheme::BlsAggregated::keygen(&bls_ikm).unwrap();
+        let new_bls_pop =
+            boule_core::crypto::sig_scheme::BlsAggregated::sign_pop(&new_bls_sk, &chain_id)
+                .unwrap();
+
         // `v_eff = 30` keeps the test budget tight: after the rotation
         // takes effect the rotated validator's signer is not swapped,
         // so 1-of-4 round-robin views (the rotated validator's leader
@@ -7631,8 +7909,8 @@ mod tests {
             validator: rotated_validator,
             new_pubkey,
             v_eff,
-            new_bls_pubkey: None,
-            new_bls_pop: None,
+            new_bls_pubkey: Some(new_bls_pk),
+            new_bls_pop: Some(new_bls_pop),
         };
         let envelope = DualSignedRotation::sign(payload, &*old_signer, &*new_signer, &chain_id)
             .expect("constructing rotation envelope must succeed");
@@ -7681,13 +7959,26 @@ mod tests {
         // Build a synthetic Vote bytes-bag for the four cases. The
         // `block_hash` is opaque to verification (signature bytes only,
         // no view-time block lookup at ingress), so any constant works.
+        //
+        // The chain is BLS-only, and these cases drive `ingress_wire`
+        // (which verifies under `QcVerification::Skip` — the BLS partial
+        // is not checked, but a Vote frame must still *carry* one so the
+        // `VoteVariant` typestate holds). A throwaway BLS partial over a
+        // throwaway key satisfies that; the cases assert on Ed25519
+        // signer resolution, which is independent of the partial.
+        let dummy_bls_partial = {
+            let (sk, _pk) =
+                boule_core::crypto::sig_scheme::BlsAggregated::keygen(&[0x11u8; 32]).unwrap();
+            boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(&sk, b"spanning-vote-dummy")
+                .expect("dummy BLS partial")
+        };
         let make_vote_msg = |view: View, signer: &dyn Signer| -> WireMessage {
             let vote = Vote {
                 view,
                 block_hash: [0xAB; 32],
             };
             let signed = Signed::sign(vote, signer, &chain_id).expect("sign vote");
-            WireMessage::Vote(signed, None)
+            WireMessage::Vote(signed, Some(dummy_bls_partial))
         };
 
         let rotated_validator_id = ValidatorId::from_genesis_pubkey(rotated_validator);

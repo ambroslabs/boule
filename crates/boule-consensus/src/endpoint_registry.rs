@@ -698,6 +698,20 @@ mod tests {
             .node_id();
         let validator_b58 = boule_core::identity::node_id_to_base58(&validator);
 
+        // BLS chain: mint the validator's genesis BLS key and a
+        // chain-bound PoP for the validators_bls table.
+        let (bls_sk, bls_pk) =
+            boule_core::crypto::sig_scheme::BlsAggregated::keygen(&[0x22u8; 32]).unwrap();
+        let chain_id = crate::genesis::derive_chain_id_from_parts(
+            &[validator],
+            boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
+            &[(validator, bls_pk)],
+            &[],
+            [0u8; 32],
+        );
+        let bls_pop =
+            boule_core::crypto::sig_scheme::BlsAggregated::sign_pop(&bls_sk, &chain_id).unwrap();
+
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
@@ -711,9 +725,15 @@ mod tests {
                  listen_addr = \"127.0.0.1:8000\"\n\n\
                  [consensus]\n\
                  validators = [\"{val}\"]\n\
-                 signature_scheme = \"ed25519_collected\"\n",
+                 signature_scheme = \"bls_aggregated\"\n\n\
+                 [[consensus.validators_bls]]\n\
+                 node_id = \"{val}\"\n\
+                 bls_pubkey = \"{pk}\"\n\
+                 bls_pop = \"{pop}\"\n",
                 key = key_path.display(),
                 val = validator_b58,
+                pk = hex::encode(bls_pk),
+                pop = hex::encode(bls_pop.sig),
             ),
         )
         .unwrap();
