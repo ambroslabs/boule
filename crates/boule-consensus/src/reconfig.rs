@@ -303,7 +303,7 @@ impl ReconfigCommand {
     ///
     /// Test-only shim around [`Self::validate_against_with_delay_and_scheme`]
     /// — production callers thread in the chain's real scheme and
-    /// chain_id rather than relying on the Ed25519 + [`ChainId::TEST`]
+    /// chain_id rather than relying on the BLS + [`ChainId::TEST`]
     /// defaults this wrapper hardcodes.
     #[cfg(test)]
     pub fn validate_against(
@@ -321,7 +321,7 @@ impl ReconfigCommand {
     /// validator time to state-sync" window than the consensus floor.
     ///
     /// This shim is `cfg(test)` because it assumes
-    /// [`SignatureSchemeChoice::Ed25519Collected`] and uses
+    /// [`SignatureSchemeChoice::BlsAggregated`] and uses
     /// [`ChainId::TEST`], both of which are inappropriate for
     /// production. Production callers go through
     /// [`Self::validate_against_with_delay_and_scheme`] with the
@@ -333,13 +333,11 @@ impl ReconfigCommand {
         current_view: impl Into<View>,
         min_v_eff_delay: View,
     ) -> anyhow::Result<Vec<(NodeId, u64)>> {
-        // Ed25519 chains never read the chain_id arg (PoPs are absent),
-        // so the test sentinel is safe here.
         self.validate_against_with_delay_and_scheme(
             current_set,
             current_view.into(),
             min_v_eff_delay,
-            SignatureSchemeChoice::Ed25519Collected,
+            SignatureSchemeChoice::BlsAggregated,
             &ChainId::TEST,
         )
     }
@@ -962,6 +960,17 @@ mod tests {
         assert!(BlsAggregated::verify_pop(&derived, &id.public, &other).is_err());
     }
 
+    /// A valid `ChainId::TEST`-bound BLS proof-of-possession for `nid(b)`.
+    /// Seeded off `b` so distinct validators get distinct keys, matching
+    /// [`entry_with_valid_pop`]. Every `adds` entry the BLS-scheme test shims
+    /// validate must carry one (#334), so the generic entry builders embed it.
+    fn valid_pop(b: u8) -> BlsPop {
+        let mut ikm = [0u8; 32];
+        ikm.fill(b);
+        let (sk, _pk) = BlsAggregated::keygen(&ikm).unwrap();
+        BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap()
+    }
+
     fn entry(b: u8, port: u16) -> ValidatorEntry {
         entry_with_weight(b, port, 1)
     }
@@ -970,7 +979,7 @@ mod tests {
         ValidatorEntry {
             node_id: nid(b),
             addr: addr(port),
-            bls_pop: None,
+            bls_pop: Some(valid_pop(b)),
             weight,
             operator_pubkey: None,
             consent_sig: None,
@@ -1000,7 +1009,7 @@ mod tests {
         let mut entry = ValidatorEntry {
             node_id: nid(b),
             addr: addr(port),
-            bls_pop: None,
+            bls_pop: Some(valid_pop(b)),
             weight: 1,
             operator_pubkey: Some(operator.node_id()),
             consent_sig: None,
@@ -1034,7 +1043,7 @@ mod tests {
             adds: vec![ValidatorEntry {
                 node_id: nid(10),
                 addr: addr(7010),
-                bls_pop: None,
+                bls_pop: Some(valid_pop(10)),
                 weight: 1,
                 operator_pubkey: Some(operator.node_id()),
                 consent_sig: None,
@@ -1345,13 +1354,14 @@ mod tests {
     }
 
     /// #548: end-to-end consent-sign — mint an operator key on disk, write a
-    /// minimal Ed25519 chain config, and produce a consent signature for an
+    /// minimal BLS chain config, and produce a consent signature for an
     /// add. The signature verifies against an entry built from the same
     /// terms under the chain's derived chain_id, and the reported operator
     /// pubkey matches the key on disk.
     #[test]
     fn build_add_consent_signature_round_trips_and_verifies() {
         use crate::reconfig_consent::ReconfigAddConsent;
+        use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider as _};
         use boule_core::crypto::signed::{NodeSigner, Signer as _};
 
         let dir = TempDir::new().unwrap();
@@ -1368,23 +1378,52 @@ mod tests {
             .unwrap()
             .node_id();
 
-        // Minimal Ed25519 chain config — consent-sign needs only [consensus]
-        // for the chain_id; the added validator need not be in the set.
+        // Minimal BLS chain config — consent-sign needs only [consensus]
+        // for the chain_id; the added validator need not be in the set. A
+        // BLS chain requires a validators_bls table whose PoP verifies
+        // under the derived chain_id, so mint a genesis BLS key for the
+        // lone validator (base58 "111…1" = all-zero node id) and a
+        // chain-bound PoP.
+        let gen_node = [0u8; 32];
+        let (gen_sk, gen_pk) =
+            boule_core::crypto::sig_scheme::BlsAggregated::keygen(&[0x11u8; 32]).unwrap();
+        let chain_id = crate::genesis::derive_chain_id_from_parts(
+            &[gen_node],
+            SignatureSchemeChoice::BlsAggregated,
+            &[(gen_node, gen_pk)],
+            &[],
+            [0u8; 32],
+        );
+        let gen_pop =
+            boule_core::crypto::sig_scheme::BlsAggregated::sign_pop(&gen_sk, &chain_id).unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
             &config_path,
-            "[node]\n\
-             listen_addr = \"127.0.0.1:7000\"\n\n\
-             [node.identity]\n\
-             backend = \"file\"\n\
-             path = \"/dev/null\"\n\n\
-             [api]\n\
-             listen_addr = \"127.0.0.1:8000\"\n\n\
-             [consensus]\n\
-             validators = [\"11111111111111111111111111111111\"]\n\
-             signature_scheme = \"ed25519_collected\"\n",
+            format!(
+                "[node]\n\
+                 listen_addr = \"127.0.0.1:7000\"\n\n\
+                 [node.identity]\n\
+                 backend = \"file\"\n\
+                 path = \"/dev/null\"\n\n\
+                 [api]\n\
+                 listen_addr = \"127.0.0.1:8000\"\n\n\
+                 [consensus]\n\
+                 validators = [\"11111111111111111111111111111111\"]\n\
+                 signature_scheme = \"bls_aggregated\"\n\n\
+                 [[consensus.validators_bls]]\n\
+                 node_id = \"11111111111111111111111111111111\"\n\
+                 bls_pubkey = \"{}\"\n\
+                 bls_pop = \"{}\"\n",
+                hex::encode(gen_pk),
+                hex::encode(gen_pop.sig),
+            ),
         )
         .unwrap();
+
+        // Mint the BLS key file; a BLS-chain add must carry a PoP (#334), so
+        // both the consent-sign and the payload build thread it through.
+        let bls_key = dir.path().join("bls.key");
+        BlsKeyFile::new(bls_key.clone()).load_or_init().unwrap();
 
         let node_id = nid(7);
         let addr: SocketAddr = "127.0.0.1:7007".parse().unwrap();
@@ -1395,7 +1434,7 @@ mod tests {
             weight: 3,
             v_eff: 60,
             bls_pop_file: None,
-            bls_key_file: None,
+            bls_key_file: Some(bls_key.clone()),
             operator_key_backend: Some("file".into()),
             operator_key_path: Some(operator_key.clone()),
             operator_key_passphrase_env: None,
@@ -1405,13 +1444,15 @@ mod tests {
             build_add_consent_signature(&req).expect("consent-sign must succeed");
         assert_eq!(reported_operator, operator_pubkey);
 
-        // The signature verifies for an add carrying identical terms.
+        // The signature verifies for an add carrying identical terms — including
+        // the same chain-bound PoP the consent-sign path derived.
         let cfg = boule_core::config::load(&config_path).unwrap();
         let chain_id = crate::genesis::derive_chain_id(cfg.consensus.as_ref().unwrap()).unwrap();
+        let bls_pop = derive_bls_pop_from_key_file(&bls_key, &chain_id).unwrap();
         let entry = ValidatorEntry {
             node_id,
             addr,
-            bls_pop: None,
+            bls_pop: Some(bls_pop),
             weight: 3,
             operator_pubkey: Some(operator_pubkey),
             consent_sig: Some(sig),
@@ -1428,7 +1469,7 @@ mod tests {
             View(60),
             3,
             None,
-            None,
+            Some(&bls_key),
             Some(operator_pubkey),
             Some(sig),
             vec![],
@@ -1442,7 +1483,7 @@ mod tests {
                 &floor_set(),
                 View(0),
                 MIN_V_EFF_DELAY,
-                SignatureSchemeChoice::Ed25519Collected,
+                SignatureSchemeChoice::BlsAggregated,
                 &chain_id,
             )
             .is_ok()
@@ -1466,7 +1507,7 @@ mod tests {
              listen_addr = \"127.0.0.1:8000\"\n\n\
              [consensus]\n\
              validators = [\"11111111111111111111111111111111\"]\n\
-             signature_scheme = \"ed25519_collected\"\n",
+             signature_scheme = \"bls_aggregated\"\n",
         )
         .unwrap();
         let req = ReconfigConsentSignRequest {
@@ -1482,6 +1523,8 @@ mod tests {
             operator_key_passphrase_env: None,
             initial_endpoints: vec![],
         };
+        // The operator key load happens before any scheme/PoP check, so a
+        // missing operator key errors out regardless of chain scheme.
         let err = build_add_consent_signature(&req).unwrap_err();
         assert!(err.to_string().contains("operator key"), "{err}");
     }
@@ -1651,28 +1694,23 @@ mod tests {
         assert!(err.to_string().contains("PoP"), "{err}");
     }
 
-    #[test]
-    fn add_without_pop_passes_validation_on_ed25519_chain() {
-        // Default validate_against uses Ed25519Collected. An add with
-        // `bls_pop: None` on an Ed25519 chain is the normal case.
-        let cur = floor_set();
-        let cmd = ReconfigCommand {
-            adds: vec![entry(5, 7005)],
-            removes: vec![],
-            changes: vec![],
-            v_eff: View(10),
-        };
-        cmd.validate_against(&cur, 0)
-            .expect("entries without PoP must validate on Ed25519 chains");
-    }
-
     // ---------- Scheme-driven PoP enforcement (#334) ----------
 
     #[test]
     fn bls_chain_rejects_add_without_pop() {
         let cur = floor_set();
+        // Explicitly PoP-less add — the generic `entry` builder now embeds a
+        // valid PoP, so build the entry inline to exercise the absence path.
         let cmd = ReconfigCommand {
-            adds: vec![entry(5, 7005)],
+            adds: vec![ValidatorEntry {
+                node_id: nid(5),
+                addr: addr(7005),
+                bls_pop: None,
+                weight: 1,
+                operator_pubkey: None,
+                consent_sig: None,
+                initial_endpoints: vec![],
+            }],
             removes: vec![],
             changes: vec![],
             v_eff: View(10),
@@ -1711,27 +1749,6 @@ mod tests {
             )
             .unwrap();
         assert!(next.iter().any(|(n, _)| *n == nid(5)));
-    }
-
-    #[test]
-    fn ed25519_chain_rejects_add_with_pop() {
-        let cur = floor_set();
-        let cmd = ReconfigCommand {
-            adds: vec![entry_with_valid_pop(5, 7005, &ChainId::TEST)],
-            removes: vec![],
-            changes: vec![],
-            v_eff: View(10),
-        };
-        let err = cmd
-            .validate_against_with_delay_and_scheme(
-                &cur,
-                0,
-                MIN_V_EFF_DELAY,
-                SignatureSchemeChoice::Ed25519Collected,
-                &ChainId::TEST,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("ed25519_collected"), "{err}",);
     }
 
     // ── #462: weighted reconfig payload ─────────────────────────────────

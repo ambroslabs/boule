@@ -787,10 +787,21 @@ mod tests {
         [0xBB; 32]
     }
 
+    /// Fold a real (but content-irrelevant) BLS partial into a BLS QC at
+    /// `idx`. Used by quorum/weight tests that only care about the
+    /// signer-bitmap tally, not the aggregate's cryptographic content —
+    /// but still need a non-sentinel aggregate so `is_well_formed`
+    /// holds.
+    fn add_dummy_bls_partial(qc: &mut QuorumCertificate, idx: usize) {
+        let (sk, _) = bls_keypair(idx as u8);
+        let partial = BlsAggregated::sign_partial(&sk, b"dummy").unwrap();
+        qc.add_bls_partial(idx, partial);
+    }
+
     #[test]
     fn qc_empty_has_no_quorum() {
         let vs = four_validators();
-        let qc = QuorumCertificate::new(View(5), sample_block_hash(), vs.len());
+        let qc = QuorumCertificate::new_bls(View(5), sample_block_hash(), vs.len());
         assert_eq!(qc.signer_count(), 0);
         assert!(!qc.has_quorum(&vs));
         assert!(qc.is_well_formed(&vs));
@@ -799,10 +810,10 @@ mod tests {
     #[test]
     fn qc_below_threshold_is_not_quorum() {
         let vs = four_validators();
-        let mut qc = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
+        let mut qc = QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len());
         // n=4 → quorum=3. Two signatures is not enough.
-        qc.add_signature(0, [1; 64]);
-        qc.add_signature(2, [2; 64]);
+        add_dummy_bls_partial(&mut qc, 0);
+        add_dummy_bls_partial(&mut qc, 2);
         assert_eq!(qc.signer_count(), 2);
         assert!(!qc.has_quorum(&vs));
     }
@@ -810,59 +821,27 @@ mod tests {
     #[test]
     fn qc_at_threshold_reaches_quorum() {
         let vs = four_validators();
-        let mut qc = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
-        qc.add_signature(0, [1; 64]);
-        qc.add_signature(1, [2; 64]);
-        qc.add_signature(3, [3; 64]);
+        let mut qc = QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len());
+        add_dummy_bls_partial(&mut qc, 0);
+        add_dummy_bls_partial(&mut qc, 1);
+        add_dummy_bls_partial(&mut qc, 3);
         assert_eq!(qc.signer_count(), 3);
         assert!(qc.has_quorum(&vs));
     }
 
     #[test]
-    fn qc_duplicate_signature_is_noop() {
-        let vs = four_validators();
-        let mut qc = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
-        qc.add_signature(2, [7; 64]);
-        qc.add_signature(2, [9; 64]); // duplicate — first write wins
-        assert_eq!(qc.signer_count(), 1);
-        let QcSignatures::Ed25519Collected(sigs) = &qc.signatures else {
-            panic!("expected Ed25519");
-        };
-        assert_eq!(sigs.len(), 1);
-        assert_eq!(sigs[0], [7; 64]);
-    }
-
-    #[test]
-    fn qc_signatures_stay_parallel_to_set_bits_regardless_of_insertion_order() {
-        let vs = four_validators();
-        let mut qc = QuorumCertificate::new(View(2), sample_block_hash(), vs.len());
-        // Insert out of order: 3, then 0, then 2.
-        qc.add_signature(3, [0x33; 64]);
-        qc.add_signature(0, [0x00; 64]);
-        qc.add_signature(2, [0x22; 64]);
-
-        // iter_signatures must yield them in validator-index order.
-        let collected: Vec<(usize, [u8; 64])> =
-            qc.iter_signatures().map(|(i, s)| (i, *s)).collect();
-        assert_eq!(
-            collected,
-            vec![(0, [0x00; 64]), (2, [0x22; 64]), (3, [0x33; 64])]
-        );
-    }
-
-    #[test]
     fn qc_is_well_formed_rejects_size_mismatch() {
         let vs = four_validators();
-        let qc_wrong_size = QuorumCertificate::new(View(1), sample_block_hash(), vs.len() + 1);
+        let qc_wrong_size = QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len() + 1);
         assert!(!qc_wrong_size.is_well_formed(&vs));
     }
 
     #[test]
     fn qc_postcard_roundtrip_stable() {
         let vs = four_validators();
-        let mut qc = QuorumCertificate::new(View(9), [0xAB; 32], vs.len());
-        qc.add_signature(0, [0x10; 64]);
-        qc.add_signature(3, [0x40; 64]);
+        let mut qc = QuorumCertificate::new_bls(View(9), [0xAB; 32], vs.len());
+        add_dummy_bls_partial(&mut qc, 0);
+        add_dummy_bls_partial(&mut qc, 3);
 
         let wire = postcard::to_stdvec(&qc).unwrap();
         let back: QuorumCertificate = postcard::from_bytes(&wire).unwrap();
@@ -876,10 +855,10 @@ mod tests {
     fn proposal_signs_and_verifies_under_its_domain() {
         let signer = fresh_signer();
         let vs = four_validators();
-        let mut justify = QuorumCertificate::new(View::ZERO, [0; 32], vs.len());
-        justify.add_signature(0, [0x01; 64]);
-        justify.add_signature(1, [0x02; 64]);
-        justify.add_signature(2, [0x03; 64]);
+        let mut justify = QuorumCertificate::new_bls(View::ZERO, [0; 32], vs.len());
+        add_dummy_bls_partial(&mut justify, 0);
+        add_dummy_bls_partial(&mut justify, 1);
+        add_dummy_bls_partial(&mut justify, 2);
         let proposal = Proposal {
             block: Block::genesis([0; 32], [0; 32]),
             justify,
@@ -913,8 +892,8 @@ mod tests {
     fn newview_signs_and_verifies_under_its_domain() {
         let signer = fresh_signer();
         let vs = four_validators();
-        let mut high_qc = QuorumCertificate::new(View(11), [0xCC; 32], vs.len());
-        high_qc.add_signature(1, [0xAA; 64]);
+        let mut high_qc = QuorumCertificate::new_bls(View(11), [0xCC; 32], vs.len());
+        add_dummy_bls_partial(&mut high_qc, 1);
         let nv = NewView { high_qc };
         let signed = Signed::sign(nv.clone(), &signer, &ChainId::TEST).unwrap();
         signed.verify(&signer.node_id(), &ChainId::TEST).unwrap();
@@ -944,7 +923,7 @@ mod tests {
         let forged: Signed<Proposal> = Signed {
             payload: Proposal {
                 block: Block::genesis([0; 32], [0; 32]),
-                justify: QuorumCertificate::new(vote.view, vote.block_hash, vs.len()),
+                justify: QuorumCertificate::new_bls(vote.view, vote.block_hash, vs.len()),
             },
             signer: signed_vote.signer,
             sig: signed_vote.sig,
@@ -955,8 +934,8 @@ mod tests {
     #[test]
     fn consensus_msg_enum_roundtrip() {
         let vs = four_validators();
-        let mut justify = QuorumCertificate::new(View::ZERO, [0; 32], vs.len());
-        justify.add_signature(0, [0xFE; 64]);
+        let mut justify = QuorumCertificate::new_bls(View::ZERO, [0; 32], vs.len());
+        add_dummy_bls_partial(&mut justify, 0);
         let msg = ConsensusMsg::Proposal(Proposal {
             block: Block::genesis([0; 32], [0; 32]),
             justify,
@@ -1179,20 +1158,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "called on a bls_aggregated QC")]
-    fn ed25519_helpers_panic_on_bls_qc() {
-        let mut qc = QuorumCertificate::new_bls(View::ZERO, [0; 32], 4);
-        qc.add_signature(0, [0; 64]); // wrong API
-    }
-
-    #[test]
-    #[should_panic(expected = "called on a ed25519_collected QC")]
-    fn bls_helpers_panic_on_ed25519_qc() {
-        let mut qc = QuorumCertificate::new(View::ZERO, [0; 32], 4);
-        qc.add_bls_partial(0, [0; 96]); // wrong API
-    }
-
-    #[test]
     fn bls_qc_is_well_formed_rejects_signers_with_empty_aggregate() {
         // A bitmap claiming signers but the aggregate still at the
         // empty-sentinel is structurally malformed. Catch it at
@@ -1224,9 +1189,7 @@ mod tests {
 
     #[test]
     fn qc_signatures_scheme_name_matches_variant() {
-        let qc_ed = QuorumCertificate::new(View::ZERO, [0; 32], 4);
         let qc_bls = QuorumCertificate::new_bls(View::ZERO, [0; 32], 4);
-        assert_eq!(qc_ed.signatures.scheme_name(), "ed25519_collected");
         assert_eq!(qc_bls.signatures.scheme_name(), "bls_aggregated");
     }
 
@@ -1298,17 +1261,17 @@ mod tests {
 
         // Heavy + one small: signer weight = 6 ≥ 6 ⇒ quorum.
         let mut qc_heavy_plus_small =
-            QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
-        qc_heavy_plus_small.add_signature(0, [0; 64]); // weight 5
-        qc_heavy_plus_small.add_signature(1, [0; 64]); // weight 1
+            QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len());
+        add_dummy_bls_partial(&mut qc_heavy_plus_small, 0); // weight 5
+        add_dummy_bls_partial(&mut qc_heavy_plus_small, 1); // weight 1
         assert_eq!(qc_heavy_plus_small.signer_weight(&vs), 6);
         assert!(qc_heavy_plus_small.has_quorum(&vs));
 
         // Three small validators: weight = 3 < 6 ⇒ no quorum.
-        let mut qc_three_small = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
-        qc_three_small.add_signature(1, [0; 64]);
-        qc_three_small.add_signature(2, [0; 64]);
-        qc_three_small.add_signature(3, [0; 64]);
+        let mut qc_three_small = QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len());
+        add_dummy_bls_partial(&mut qc_three_small, 1);
+        add_dummy_bls_partial(&mut qc_three_small, 2);
+        add_dummy_bls_partial(&mut qc_three_small, 3);
         assert_eq!(qc_three_small.signer_weight(&vs), 3);
         assert!(!qc_three_small.has_quorum(&vs));
     }
@@ -1324,19 +1287,19 @@ mod tests {
                 .unwrap();
         assert_eq!(vs.total_weight(), 9);
 
-        let mut qc_at = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
-        qc_at.add_signature(0, [0; 64]); // weight 3
-        qc_at.add_signature(1, [0; 64]); // weight 3 → 6 total
+        let mut qc_at = QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len());
+        add_dummy_bls_partial(&mut qc_at, 0); // weight 3
+        add_dummy_bls_partial(&mut qc_at, 1); // weight 3 → 6 total
         assert_eq!(qc_at.signer_weight(&vs), 6);
         assert!(
             !qc_at.has_quorum(&vs),
             "signer weight equal to 2/3 of total must NOT be quorum"
         );
 
-        let mut qc_above = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
-        qc_above.add_signature(0, [0; 64]);
-        qc_above.add_signature(1, [0; 64]);
-        qc_above.add_signature(2, [0; 64]);
+        let mut qc_above = QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len());
+        add_dummy_bls_partial(&mut qc_above, 0);
+        add_dummy_bls_partial(&mut qc_above, 1);
+        add_dummy_bls_partial(&mut qc_above, 2);
         assert_eq!(qc_above.signer_weight(&vs), 9);
         assert!(qc_above.has_quorum(&vs));
     }
@@ -1362,9 +1325,9 @@ mod tests {
         // Two of the three heavy validators: signer_weight = 2 *
         // u64::MAX. Threshold (in math): 3 * 2 * u64::MAX > 2 * (3 *
         // u64::MAX + 1) ⇔ 6 * u64::MAX > 6 * u64::MAX + 2 ⇔ false.
-        let mut qc_two_heavy = QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
-        qc_two_heavy.add_signature(0, [0; 64]);
-        qc_two_heavy.add_signature(1, [0; 64]);
+        let mut qc_two_heavy = QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len());
+        add_dummy_bls_partial(&mut qc_two_heavy, 0);
+        add_dummy_bls_partial(&mut qc_two_heavy, 1);
         assert_eq!(qc_two_heavy.signer_weight(&vs), (u64::MAX as u128) * 2);
         assert!(
             !qc_two_heavy.has_quorum(&vs),
@@ -1375,30 +1338,15 @@ mod tests {
         // 3 * (2*u64::MAX + 1) = 6*u64::MAX + 3, vs 2*total =
         // 6*u64::MAX + 2. 6*u64::MAX + 3 > 6*u64::MAX + 2 ⇒ quorum.
         let mut qc_two_heavy_plus_one =
-            QuorumCertificate::new(View(1), sample_block_hash(), vs.len());
-        qc_two_heavy_plus_one.add_signature(0, [0; 64]);
-        qc_two_heavy_plus_one.add_signature(1, [0; 64]);
-        qc_two_heavy_plus_one.add_signature(3, [0; 64]); // weight 1
+            QuorumCertificate::new_bls(View(1), sample_block_hash(), vs.len());
+        add_dummy_bls_partial(&mut qc_two_heavy_plus_one, 0);
+        add_dummy_bls_partial(&mut qc_two_heavy_plus_one, 1);
+        add_dummy_bls_partial(&mut qc_two_heavy_plus_one, 3); // weight 1
         assert_eq!(
             qc_two_heavy_plus_one.signer_weight(&vs),
             (u64::MAX as u128) * 2 + 1
         );
         assert!(qc_two_heavy_plus_one.has_quorum(&vs));
-    }
-
-    /// `genesis_qc`'s fill loop is byte-identical to the pre-#461
-    /// `0..quorum_size(n)` loop when every weight is 1. Spot-check for
-    /// n in {4, 7, 10}.
-    #[test]
-    fn genesis_qc_fill_collapses_to_quorum_size_at_weight_one() {
-        for n in [4usize, 7, 10] {
-            let vs = ValidatorSet::new((0..n as u8).map(|i| vid_for(i + 1)).collect::<Vec<_>>());
-            let g = Block::genesis([0; 32], [0; 32]);
-            let qc = genesis_qc(&g, &vs);
-            assert_eq!(qc.signer_count(), quorum_size(n));
-            assert!(qc.has_quorum(&vs), "n = {n}");
-            assert!(qc.is_well_formed(&vs));
-        }
     }
 
     /// Boundary u128 arithmetic in `quorum_weight_threshold` and
@@ -1428,27 +1376,6 @@ mod tests {
         assert_eq!(threshold, expected);
         // honesty threshold: total/3 + 1, also overflow-free.
         assert_eq!(honesty_weight_threshold(&vs), total / 3 + 1);
-    }
-
-    /// `genesis_qc` correctly fills enough bits even when a single
-    /// stake-heavy validator dominates. Weights `[5, 1, 1, 1]` →
-    /// quorum threshold = 6; the loop must add the heavy validator
-    /// (sorted index 0; weight 5) PLUS at least one small to cross.
-    #[test]
-    fn genesis_qc_fill_handles_nonuniform_weights() {
-        let vs = ValidatorSet::with_weights(vec![
-            (vid_for(1), 5),
-            (vid_for(2), 1),
-            (vid_for(3), 1),
-            (vid_for(4), 1),
-        ])
-        .unwrap();
-        let g = Block::genesis([0; 32], [0; 32]);
-        let qc = genesis_qc(&g, &vs);
-        assert!(qc.has_quorum(&vs));
-        // Heavy validator (5) plus one small (1) = 6 = threshold.
-        assert_eq!(qc.signer_weight(&vs), 6);
-        assert_eq!(qc.signer_count(), 2);
     }
 
     /// #469 gap 1 — pin the issue body's "weight change requires a
@@ -1484,10 +1411,10 @@ mod tests {
         // index 0; the heavy validator post-boundary is at sorted
         // index 0. The QC's bitmap covers indices 1, 2, 3 — the
         // three light validators — in BOTH sets.
-        let mut qc = QuorumCertificate::new(View(7), sample_block_hash(), pre.len());
-        qc.add_signature(1, [0; 64]);
-        qc.add_signature(2, [0; 64]);
-        qc.add_signature(3, [0; 64]);
+        let mut qc = QuorumCertificate::new_bls(View(7), sample_block_hash(), pre.len());
+        add_dummy_bls_partial(&mut qc, 1);
+        add_dummy_bls_partial(&mut qc, 2);
+        add_dummy_bls_partial(&mut qc, 3);
 
         // Pre-boundary: signer weight 2+2+2 = 6 > 2/3 of 8 (= 5.33)
         // ⇒ quorum.
@@ -1512,11 +1439,12 @@ mod tests {
         // Confirm the post-boundary "larger signer set" — adding the
         // heavy validator (sorted index 0; weight 4) lifts signer
         // weight to 10 ⇒ quorum.
-        let mut qc_with_heavy = QuorumCertificate::new(View(7), sample_block_hash(), post.len());
-        qc_with_heavy.add_signature(0, [0; 64]);
-        qc_with_heavy.add_signature(1, [0; 64]);
-        qc_with_heavy.add_signature(2, [0; 64]);
-        qc_with_heavy.add_signature(3, [0; 64]);
+        let mut qc_with_heavy =
+            QuorumCertificate::new_bls(View(7), sample_block_hash(), post.len());
+        add_dummy_bls_partial(&mut qc_with_heavy, 0);
+        add_dummy_bls_partial(&mut qc_with_heavy, 1);
+        add_dummy_bls_partial(&mut qc_with_heavy, 2);
+        add_dummy_bls_partial(&mut qc_with_heavy, 3);
         assert_eq!(qc_with_heavy.signer_weight(&post), 10);
         assert!(qc_with_heavy.has_quorum(&post));
     }
@@ -1550,10 +1478,10 @@ mod tests {
 
         // Build a pre-boundary QC at view 5: 3-of-4 light signers,
         // covering sorted indices 1, 2, 3.
-        let mut qc = QuorumCertificate::new(View(5), sample_block_hash(), pre.len());
-        qc.add_signature(1, [0; 64]);
-        qc.add_signature(2, [0; 64]);
-        qc.add_signature(3, [0; 64]);
+        let mut qc = QuorumCertificate::new_bls(View(5), sample_block_hash(), pre.len());
+        add_dummy_bls_partial(&mut qc, 1);
+        add_dummy_bls_partial(&mut qc, 2);
+        add_dummy_bls_partial(&mut qc, 3);
 
         // Historical verification: the historical-set lookup at
         // qc.view returns the pre-boundary set, and the QC is quorum
@@ -1572,14 +1500,14 @@ mod tests {
         // — without it, an honest replica would (incorrectly) reject
         // the archived QC.
         let post_set_at_v11 = history.set_at(View(11));
-        let mut qc_against_post = QuorumCertificate::new(
+        let mut qc_against_post = QuorumCertificate::new_bls(
             View(11), // synthetic view at which the post-boundary set is authoritative
             sample_block_hash(),
             post.len(),
         );
-        qc_against_post.add_signature(1, [0; 64]);
-        qc_against_post.add_signature(2, [0; 64]);
-        qc_against_post.add_signature(3, [0; 64]);
+        add_dummy_bls_partial(&mut qc_against_post, 1);
+        add_dummy_bls_partial(&mut qc_against_post, 2);
+        add_dummy_bls_partial(&mut qc_against_post, 3);
         assert_eq!(
             qc_against_post.signer_weight(post_set_at_v11.for_view(View(11))),
             3

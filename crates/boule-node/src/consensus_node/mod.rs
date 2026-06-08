@@ -8953,6 +8953,9 @@ mod tests {
     /// forged QC into every honest replica's `state.high_qc`.
     #[tokio::test]
     async fn forged_piggyback_on_timeout_vote_does_not_taint_bucket_best_high_qc() {
+        use boule_consensus::bls_key_history::BlsKeyHistory;
+        use boule_core::crypto::sig_scheme::{BlsAggregated, SignatureSchemeChoice};
+
         // n = 4 → quorum = 3, f + 1 = 2.
         let self_signer = fresh_signer();
         let byzantine = fresh_signer();
@@ -8969,7 +8972,23 @@ mod tests {
                 .map(boule_consensus::validator_set::ValidatorId::from_genesis_pubkey)
                 .collect(),
         );
-        let cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        // BLS chain: seed a genesis BLS key history matching the set so
+        // the dispatch verifier can resolve per-validator pubkeys for
+        // the piggyback's aggregate check.
+        let bls_keypair = |seed: u8| {
+            let mut ikm = [0u8; 32];
+            ikm.fill(seed);
+            BlsAggregated::keygen(&ikm).unwrap()
+        };
+        let genesis_bls: Vec<_> = vs
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, v)| (v.into_node_id(), bls_keypair(0xB0 + i as u8).1))
+            .collect();
+        let bls_history = BlsKeyHistory::with_genesis(genesis_bls.iter().copied());
+        let mut cfg = NodeConfigForConsensus::for_testing(vs.clone(), genesis());
+        cfg.signature_scheme = SignatureSchemeChoice::BlsAggregated;
         let mut node = ConsensusNode::new(
             self_signer.node_id(),
             cfg,
@@ -8977,21 +8996,28 @@ mod tests {
             Arc::new(InMemoryMempool::new(64)),
             Arc::new(MemoryStorage::new()),
             Arc::new(MemoryWal::new()),
-        );
+        )
+        .with_bls_key_history(bls_history.clone());
 
-        // Build a *well-formed* but cryptographically bogus QC at a
-        // very-fresh view. Quorum-many bits set, quorum-many zero
-        // signatures — passes is_well_formed, fails verify_aggregate.
+        // Build a *well-formed* but cryptographically bogus BLS QC at a
+        // very-fresh view. Quorum-many bits set, quorum-many real BLS
+        // partials — but signed under keys that do NOT match the genesis
+        // BLS pubkeys, so is_well_formed passes and verify_aggregate_bls
+        // fails.
         let bogus_view: View = View(u64::MAX - 1);
         let bogus_block_hash = [0xDE; 32];
-        let mut forged = boule_consensus::hotstuff::qc::QuorumCertificate::new(
+        let mut forged = boule_consensus::hotstuff::qc::QuorumCertificate::new_bls(
             bogus_view,
             bogus_block_hash,
             vs.len(),
         );
         let quorum = boule_consensus::hotstuff::qc::quorum_size(vs.len());
+        let forged_msg = b"forged-piggyback-not-the-real-vote-preimage";
         for idx in 0..quorum {
-            forged.add_signature(idx, [0u8; 64]);
+            // Sign with a stray key (seed 0xF0+) that is not in the
+            // genesis history, guaranteeing aggregate verification fails.
+            let (sk, _pk) = bls_keypair(0xF0 + idx as u8);
+            forged.add_bls_partial(idx, BlsAggregated::sign_partial(&sk, forged_msg).unwrap());
         }
 
         // The byzantine signs a real timeout vote at a future view
@@ -9015,8 +9041,8 @@ mod tests {
         // Run through the production verify path — this is the same
         // policy the live event loop wires (node.rs apply_dispatch).
         let qc_verification = boule_consensus::dispatch::QcVerification::Verify {
-            scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
-            bls_key_history: None,
+            scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
+            bls_key_history: Some(&bls_history),
             operator_key_history: Some(&node.operator_key_history),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
             genesis_hash: node.core.state().genesis_hash,
@@ -9906,7 +9932,7 @@ mod tests {
         let wire = WireMessage::Proposal(signed_proposal);
         let payload = postcard::to_stdvec(&wire).expect("encode wire");
         let qc_verification = boule_consensus::dispatch::QcVerification::Verify {
-            scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+            scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
             bls_key_history: None,
             operator_key_history: Some(&node.operator_key_history),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,

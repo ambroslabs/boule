@@ -1469,36 +1469,55 @@ fn vote_from_removed_validator_after_v_eff_rejected() {
 
 // ── ingress: QC aggregate verification (#332) ────────────────────────────
 
-/// Build a 4-validator setup, hand-fold real Vote signatures into a
-/// QC over `(view, block_hash)`, and return the bundle the
-/// verification tests below use.
-fn build_real_ed25519_qc(
+/// Build a 4-validator BLS setup, hand-fold real BLS Vote partials
+/// into an aggregate QC over `(view, block_hash)`, and return the
+/// bundle the verification tests below use. The returned
+/// [`BlsKeyHistory`] seeds each validator's genesis BLS pubkey so the
+/// dispatch verifier can resolve the aggregate.
+fn build_real_bls_qc(
     view: View,
     block_hash: BlockHash,
-) -> (Vec<NodeSigner>, ValidatorSet, QuorumCertificate) {
-    let signers: Vec<NodeSigner> = (0..4).map(|_| fresh_signer()).collect();
+) -> (
+    Vec<NodeSigner>,
+    ValidatorSet,
+    QuorumCertificate,
+    BlsKeyHistory,
+) {
+    let bls: Vec<(
+        NodeSigner,
+        boule_core::crypto::sig_scheme::BlsSecretKey,
+        boule_core::crypto::sig_scheme::BlsPublicKey,
+    )> = (0..4u8).map(|i| fresh_bls_signer(0x60 | i)).collect();
     let vs = ValidatorSet::new(
-        signers
-            .iter()
-            .map(|s| crate::validator_set::ValidatorId::from_genesis_pubkey(s.node_id()))
+        bls.iter()
+            .map(|(s, _, _)| crate::validator_set::ValidatorId::from_genesis_pubkey(s.node_id()))
             .collect(),
     );
+    let bls_history = BlsKeyHistory::with_genesis(bls.iter().map(|(s, _, pk)| (s.node_id(), *pk)));
 
+    // The dispatch QC verifier aggregate-checks against the canonical
+    // Vote envelope preimage — sign exactly those bytes with each
+    // validator's BLS secret.
     let vote = Vote { view, block_hash };
-    let mut qc = QuorumCertificate::new(view, block_hash, vs.len());
-    // Fold the first 3 validators' signatures (n=4 → quorum=3) in
+    let preimage_bytes =
+        boule_core::crypto::signed::preimage::<Vote>(&vote, &ChainId::TEST).unwrap();
+    let mut qc = QuorumCertificate::new_bls(view, block_hash, vs.len());
+    // Fold the first 3 validators' partials (n=4 → quorum=3) in
     // sorted-NodeId order to match the bitmap layout the verifier
     // assumes.
     for stable_id in vs.iter().take(quorum_size_for_n(vs.len())) {
-        let signer = signers
+        let (_, bls_sk, _) = bls
             .iter()
-            .find(|s| s.node_id() == stable_id.into_node_id())
+            .find(|(s, _, _)| s.node_id() == stable_id.into_node_id())
             .unwrap();
-        let signed = Signed::sign(vote.clone(), signer, &ChainId::TEST).unwrap();
+        let partial =
+            boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(bls_sk, &preimage_bytes)
+                .unwrap();
         let idx = vs.index_of(stable_id).unwrap();
-        qc.add_signature(idx, signed.sig);
+        qc.add_bls_partial(idx, partial);
     }
-    (signers, vs, qc)
+    let signers: Vec<NodeSigner> = bls.into_iter().map(|(s, _, _)| s).collect();
+    (signers, vs, qc, bls_history)
 }
 
 fn quorum_size_for_n(n: usize) -> usize {
@@ -1507,10 +1526,10 @@ fn quorum_size_for_n(n: usize) -> usize {
 }
 
 #[test]
-fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
+fn ingress_with_verify_accepts_real_bls_qc_inside_proposal() {
     let view: View = View(5);
     let block_hash = [0x55; 32];
-    let (signers, vs, qc) = build_real_ed25519_qc(view, block_hash);
+    let (signers, vs, qc, bls_history) = build_real_bls_qc(view, block_hash);
     let leader = &signers[0];
 
     let history = ValidatorSetHistory::from_genesis(vs.clone());
@@ -1541,10 +1560,10 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
             &block,
             &history,
             &key_history,
-            None,
+            Some(&bls_history),
             None,
             &ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
+            SignatureSchemeChoice::BlsAggregated,
             crate::reconfig::MIN_V_EFF_DELAY,
         );
     let proposal = Proposal { block, justify: qc };
@@ -1553,8 +1572,8 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
+        scheme: SignatureSchemeChoice::BlsAggregated,
+        bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
@@ -1567,7 +1586,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
         &qc_verify,
         &ChainId::TEST,
     )
-    .expect("real Ed25519 QC must verify under the genesis pubkeys");
+    .expect("real BLS QC must verify under the genesis pubkeys");
     assert_eq!(dispatches.len(), 3);
 }
 
@@ -1584,7 +1603,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_proposal() {
 fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_proposal() {
     let view: View = View(5);
     let block_hash = [0x55; 32];
-    let (signers, vs, qc) = build_real_ed25519_qc(view, block_hash);
+    let (signers, vs, qc, bls_history) = build_real_bls_qc(view, block_hash);
     let leader = &signers[0];
 
     let history = ValidatorSetHistory::from_genesis(vs.clone());
@@ -1618,8 +1637,8 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
+        scheme: SignatureSchemeChoice::BlsAggregated,
+        bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
@@ -1648,15 +1667,15 @@ fn ingress_with_verify_rejects_forged_validator_history_commitment_inside_propos
 }
 
 #[test]
-fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
+fn ingress_with_verify_rejects_tampered_bls_qc_inside_proposal() {
     let view: View = View(5);
     let block_hash = [0x55; 32];
-    let (signers, vs, mut qc) = build_real_ed25519_qc(view, block_hash);
+    let (signers, vs, mut qc, bls_history) = build_real_bls_qc(view, block_hash);
     let leader = &signers[0];
 
-    // Tamper the first signature inside the QC.
-    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) = &mut qc.signatures {
-        sigs[0][0] ^= 0xFF;
+    // Tamper the aggregate inside the QC.
+    if let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut qc.signatures {
+        agg[0] ^= 0xFF;
     }
 
     let block = Block {
@@ -1682,8 +1701,8 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
+        scheme: SignatureSchemeChoice::BlsAggregated,
+        bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
@@ -1701,20 +1720,20 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_proposal() {
         err,
         IngressError::InvalidQcAggregate {
             view: View(5),
-            scheme: "ed25519_collected"
+            scheme: "bls_aggregated"
         }
     ));
 }
 
 #[test]
-fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
+fn ingress_with_verify_rejects_tampered_bls_qc_inside_newview() {
     let view: View = View(7);
     let block_hash = [0x77; 32];
-    let (signers, vs, mut high_qc) = build_real_ed25519_qc(view, block_hash);
+    let (signers, vs, mut high_qc, bls_history) = build_real_bls_qc(view, block_hash);
     let messenger = &signers[1];
 
-    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) = &mut high_qc.signatures {
-        sigs[1][3] ^= 0xAA;
+    if let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut high_qc.signatures {
+        agg[3] ^= 0xAA;
     }
 
     let nv = NewView { high_qc };
@@ -1725,8 +1744,8 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
+        scheme: SignatureSchemeChoice::BlsAggregated,
+        bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
@@ -1744,7 +1763,7 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
         err,
         IngressError::InvalidQcAggregate {
             view: View(7),
-            scheme: "ed25519_collected"
+            scheme: "bls_aggregated"
         }
     ));
 }
@@ -1754,10 +1773,10 @@ fn ingress_with_verify_rejects_tampered_ed25519_qc_inside_newview() {
 /// vote and ingress flags it as trusted so `on_timeout_vote` will
 /// fold it into the bucket's `best_high_qc`.
 #[test]
-fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
+fn ingress_with_verify_accepts_real_bls_qc_inside_timeout_vote_piggyback() {
     let qc_view: View = View(4);
     let block_hash = [0x44; 32];
-    let (signers, vs, qc) = build_real_ed25519_qc(qc_view, block_hash);
+    let (signers, vs, qc, bls_history) = build_real_bls_qc(qc_view, block_hash);
     let voter = &signers[0];
 
     // Timeout vote at a *later* view than its piggybacked QC — the
@@ -1774,8 +1793,8 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
+        scheme: SignatureSchemeChoice::BlsAggregated,
+        bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
@@ -1788,7 +1807,7 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
         &qc_verify,
         &ChainId::TEST,
     )
-    .expect("real Ed25519 piggyback must verify under the genesis pubkeys");
+    .expect("real BLS piggyback must verify under the genesis pubkeys");
     assert_eq!(dispatches.len(), 1);
     assert!(
         matches!(
@@ -1812,17 +1831,17 @@ fn ingress_with_verify_accepts_real_ed25519_qc_inside_timeout_vote_piggyback() {
 /// `bucket.best_high_qc` — closing the TC self-NewView loopback
 /// laundering vector.
 #[test]
-fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback() {
+fn ingress_with_verify_drops_tampered_bls_qc_inside_timeout_vote_piggyback() {
     let qc_view: View = View(4);
     let block_hash = [0x44; 32];
-    let (signers, vs, mut qc) = build_real_ed25519_qc(qc_view, block_hash);
+    let (signers, vs, mut qc, bls_history) = build_real_bls_qc(qc_view, block_hash);
     let voter = &signers[0];
 
-    // Tamper one byte of the first signature in the aggregate. The
-    // bitmap and signature count remain consistent, so this slips
-    // past `is_well_formed` and only fails at `verify_aggregate`.
-    if let crate::hotstuff::qc::QcSignatures::Ed25519Collected(sigs) = &mut qc.signatures {
-        sigs[0][0] ^= 0xFF;
+    // Tamper one byte of the aggregate. The bitmap and signature
+    // count remain consistent, so this slips past `is_well_formed`
+    // and only fails at `verify_aggregate_bls`.
+    if let crate::hotstuff::qc::QcSignatures::BlsAggregated(agg) = &mut qc.signatures {
+        agg[0] ^= 0xFF;
     }
 
     let tv = TimeoutVote {
@@ -1836,8 +1855,8 @@ fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback()
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
+        scheme: SignatureSchemeChoice::BlsAggregated,
+        bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
@@ -1879,14 +1898,20 @@ fn ingress_with_verify_drops_tampered_ed25519_qc_inside_timeout_vote_piggyback()
 fn ingress_with_verify_drops_malformed_high_qc_in_timeout_vote_piggyback() {
     let qc_view: View = View(4);
     let block_hash = [0x44; 32];
-    let (signers, vs, qc) = build_real_ed25519_qc(qc_view, block_hash);
+    let (signers, vs, qc, bls_history) = build_real_bls_qc(qc_view, block_hash);
     let voter = &signers[0];
 
     // Construct a wrongly-sized QC for the same view — the bitmap
     // is 1 bit wide rather than `vs.len()` (= 4) bits. Real-set
     // ingress will see a bitmap-set-mismatch on `is_well_formed`.
-    let mut malformed = QuorumCertificate::new(qc_view, block_hash, 1);
-    malformed.add_signature(0, [0u8; 64]);
+    let mut malformed = QuorumCertificate::new_bls(qc_view, block_hash, 1);
+    let mut ikm = [0u8; 32];
+    ikm[0] = 0xF1;
+    let (mal_sk, _) = boule_core::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
+    malformed.add_bls_partial(
+        0,
+        boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(&mal_sk, b"x").unwrap(),
+    );
     // Sanity: the aggregate from the real QC also exists, but we
     // don't reuse its sigs — the verifier never gets that far.
     drop(qc);
@@ -1902,8 +1927,8 @@ fn ingress_with_verify_drops_malformed_high_qc_in_timeout_vote_piggyback() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
+        scheme: SignatureSchemeChoice::BlsAggregated,
+        bls_key_history: Some(&bls_history),
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
         genesis_hash: genesis().hash(),
@@ -1950,7 +1975,7 @@ fn ingress_with_verify_emits_high_qc_trusted_for_timeout_vote_with_no_piggyback(
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
+        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -1996,7 +2021,7 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
             None,
             None,
             &ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
+            SignatureSchemeChoice::BlsAggregated,
             crate::reconfig::MIN_V_EFF_DELAY,
         );
     let proposal = Proposal {
@@ -2010,7 +2035,7 @@ fn ingress_with_verify_accepts_genesis_empty_qc_inside_proposal() {
     let history = ValidatorSetHistory::from_genesis(vs.clone());
     let key_history = key_history_from_set(&vs);
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
+        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2053,7 +2078,7 @@ fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
         genesis().hash(),
         "test fixture is meaningful only when the forged hash is not the real genesis",
     );
-    let forged_justify = QuorumCertificate::new(0, forged_block_hash, vs.len());
+    let forged_justify = QuorumCertificate::new_bls(0, forged_block_hash, vs.len());
 
     let proposal = Proposal {
         block: genesis(),
@@ -2064,7 +2089,7 @@ fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
     let bytes = postcard::to_stdvec(&wire).unwrap();
 
     let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
+        scheme: SignatureSchemeChoice::BlsAggregated,
         bls_key_history: None,
         operator_key_history: None,
         min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
@@ -2084,81 +2109,11 @@ fn ingress_with_verify_rejects_view_zero_qc_over_non_genesis_block_hash() {
             err,
             IngressError::InvalidQcAggregate {
                 view: View::ZERO,
-                scheme: "ed25519_collected",
+                scheme: "bls_aggregated",
             }
         ),
         "expected InvalidQcAggregate at view 0, got {err:?}",
     );
-}
-
-#[test]
-fn ingress_with_verify_rejects_bls_qc_on_ed25519_chain() {
-    // A QC carrying the BLS variant arriving on an Ed25519 chain is
-    // a structural mismatch — reject before pairing-check.
-    let view: View = View(3);
-    let block_hash = [0x33; 32];
-    let signer = fresh_signer();
-    let vs = make_vs_with_signers(&[&signer]);
-    // Build a real-shaped BLS QC so it survives is_well_formed:
-    // sign with a real BLS key and fold the partial in normally.
-    // The dispatch-layer scheme mismatch (Ed25519 chain receiving
-    // a BLS QC) is what we're exercising, not bytes-level forgery.
-    let mut ikm = [0u8; 32];
-    ikm[0] = 0xAB;
-    let (sk, _pk) = boule_core::crypto::sig_scheme::BlsAggregated::keygen(&ikm).unwrap();
-    let real_partial =
-        boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(&sk, b"x").unwrap();
-    let mut bls_qc = QuorumCertificate::new_bls(view, block_hash, vs.len());
-    bls_qc.add_bls_partial(0, real_partial);
-
-    let block = Block {
-        header: crate::replication::block::BlockHeader {
-            parent_hash: block_hash,
-            height: Height(1),
-            view: view + 1,
-            proposer: signer.node_id(),
-            state_commitment: [0; 32],
-            commands_commitment: [0; 32],
-            validator_history_commitment: [0; 32],
-            committed_height: Height::ZERO,
-            committed_state_root: [0; 32],
-            timestamp: 0,
-        },
-        commands: vec![],
-    };
-    let proposal = Proposal {
-        block,
-        justify: bls_qc,
-    };
-    let signed = Signed::sign(proposal, &signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Proposal(signed);
-    let bytes = postcard::to_stdvec(&wire).unwrap();
-
-    let history = ValidatorSetHistory::from_genesis(vs.clone());
-    let key_history = key_history_from_set(&vs);
-    let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
-        operator_key_history: None,
-        min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
-        genesis_hash: genesis().hash(),
-    };
-    let err = ingress_with_qc_verification(
-        signer.node_id(),
-        &bytes,
-        &history,
-        &key_history,
-        &qc_verify,
-        &ChainId::TEST,
-    )
-    .expect_err("BLS QC on Ed25519 chain must be rejected");
-    assert!(matches!(
-        err,
-        IngressError::InvalidQcAggregate {
-            scheme: "ed25519_collected",
-            ..
-        }
-    ));
 }
 
 // ── ingress: BLS partial on Vote (#354 step 1) ───────────────────────────
@@ -2366,48 +2321,6 @@ fn ingress_vote_on_bls_chain_rejects_partial_signed_by_wrong_key() {
 }
 
 #[test]
-fn ingress_vote_on_ed25519_chain_ignores_bls_partial_field() {
-    // On an Ed25519 chain, the optional BLS partial is metadata —
-    // present or absent, valid or junk, ingress accepts the vote.
-    // (The QC verifier only consults the inner Ed25519 sig.)
-    let signer = fresh_signer();
-    let vs = make_vs_with_signers(&[&signer]);
-    let view: View = View(9);
-    let block_hash = [0xEE; 32];
-
-    // Ship a junk BLS partial alongside the vote — it must be ignored.
-    let vote = Vote { view, block_hash };
-    let signed = Signed::sign(vote, &signer, &ChainId::TEST).unwrap();
-    let wire = WireMessage::Vote(signed, Some([0xFFu8; 96]));
-    let bytes = postcard::to_stdvec(&wire).unwrap();
-
-    let history = ValidatorSetHistory::from_genesis(vs.clone());
-    let key_history = key_history_from_set(&vs);
-    let qc_verify = QcVerification::Verify {
-        scheme: SignatureSchemeChoice::Ed25519Collected,
-        bls_key_history: None,
-        operator_key_history: None,
-        min_v_eff_delay: crate::reconfig::MIN_V_EFF_DELAY,
-        genesis_hash: genesis().hash(),
-    };
-
-    let dispatches = ingress_with_qc_verification(
-        signer.node_id(),
-        &bytes,
-        &history,
-        &key_history,
-        &qc_verify,
-        &ChainId::TEST,
-    )
-    .expect("Ed25519 chain must ignore the optional BLS partial field");
-    assert_eq!(dispatches.len(), 1);
-    assert!(matches!(
-        dispatches[0],
-        Dispatch::Safety(SafetyEvent::VoteReceived(_))
-    ));
-}
-
-#[test]
 fn ingress_vote_on_bls_chain_rejects_when_bls_history_absent() {
     // Defense-in-depth: a BLS chain misconfigured to ship
     // `QcVerification::Verify` without a `bls_key_history` must not
@@ -2478,8 +2391,15 @@ fn ingress_with_skip_lets_invalid_aggregate_through() {
     // it without us noticing.
     let signer = fresh_signer();
     let vs = make_vs_with_signers(&[&signer]);
-    let mut bogus_qc = QuorumCertificate::new(0, sample_qc().block_hash, vs.len());
-    bogus_qc.add_signature(0, [0xCC; 64]); // not a real Ed25519 sig
+    let mut bogus_qc = QuorumCertificate::new_bls(0, sample_qc().block_hash, vs.len());
+    // A well-formed BLS partial from an unrelated key over an unrelated
+    // message: valid G2 encoding (so construction doesn't panic) but it
+    // verifies against nothing — the "invalid aggregate" Skip must pass.
+    let (_, stray_sk, _) = fresh_bls_signer(0xEE);
+    let partial =
+        boule_core::crypto::sig_scheme::BlsAggregated::sign_partial(&stray_sk, b"unrelated")
+            .unwrap();
+    bogus_qc.add_bls_partial(0, partial);
     let proposal = Proposal {
         block: genesis(),
         justify: bogus_qc,

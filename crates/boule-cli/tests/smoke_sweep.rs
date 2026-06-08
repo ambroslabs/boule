@@ -481,7 +481,7 @@ async fn run_rotating(
         group,
         nodes,
         seed,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {
@@ -510,7 +510,7 @@ async fn run_disconnect(
         group,
         7,
         seed,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {
@@ -536,7 +536,7 @@ async fn run_kill_restart(root: &Path, binary: &Path, group: &str, seed: u64) ->
         group,
         4,
         seed,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {
@@ -599,7 +599,7 @@ async fn run_gossip_steady(root: &Path, binary: &Path, group: &str, seed: u64) -
         group,
         7,
         seed,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {
@@ -757,7 +757,7 @@ async fn run_footgun(root: &Path, binary: &Path, group: &str) -> TrialResult {
         group,
         7,
         7,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {
@@ -801,7 +801,7 @@ async fn run_gated(root: &Path, binary: &Path, group: &str) -> TrialResult {
         group,
         7,
         7,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {
@@ -845,7 +845,7 @@ async fn run_restart_disk(root: &Path, binary: &Path, group: &str, seed: u64) ->
         group,
         4,
         seed,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {
@@ -882,7 +882,7 @@ async fn run_seqkill(root: &Path, binary: &Path, group: &str, seed: u64) -> Tria
         group,
         4,
         seed,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {
@@ -925,7 +925,7 @@ async fn run_partition(root: &Path, binary: &Path, group: &str, seed: u64) -> Tr
         group,
         7,
         seed,
-        SignatureSchemeChoice::Ed25519Collected,
+        SignatureSchemeChoice::BlsAggregated,
     )
     .await
     {

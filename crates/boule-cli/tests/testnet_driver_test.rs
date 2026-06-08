@@ -41,7 +41,7 @@ async fn driver_lifecycle_4_nodes() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -136,7 +136,7 @@ async fn submitted_tx_is_committed() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -233,7 +233,7 @@ async fn submitted_stake_command_changes_the_validator_set() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -342,9 +342,9 @@ async fn submitted_stake_command_changes_the_validator_set() {
 
 /// Reconfig hardening (#668): app-driven removal of a *middle* validator on
 /// the multi-process testnet. Removing a non-last validator re-indexes the
-/// Ed25519-collected QC signer bitmap for every validator sorted after it,
-/// so QCs under the post-boundary 4-set must still verify — i.e. the
-/// cluster must keep committing. (`submitted_stake_command_changes_the_validator_set`
+/// QC signer bitmap for every validator sorted after it, so QCs under the
+/// post-boundary 4-set must still verify — i.e. the cluster must keep
+/// committing. (`submitted_stake_command_changes_the_validator_set`
 /// removes the highest-sorted validator, the trivial bitmap case.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
@@ -369,7 +369,7 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -504,7 +504,7 @@ async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
         binary: bin.clone(),
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster");
@@ -592,7 +592,7 @@ async fn new_cluster_canonicalizes_relative_workdir() {
         binary: bin,
         timeout_base_ms: 200,
         timeout_max_ms: 1_500,
-        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected,
+        signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
     })
     .await
     .expect("new_cluster with relative workdir");
