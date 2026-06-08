@@ -930,6 +930,7 @@ mod tests {
     // ── apply_operator_rotation_command (#549) ─────────────────────────
 
     use crate::validator_rotation::{OperatorSignedRotation, ValidatorKeyRotation};
+    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, BlsSecretKey};
     use boule_core::crypto::signed::{ChainId, NodeSigner, Signer};
 
     fn fresh_signer() -> NodeSigner {
@@ -943,42 +944,60 @@ mod tests {
         NodeSigner::from_identity(&id).unwrap()
     }
 
-    /// One validator (its genesis pubkey = stable id) with an operator key,
-    /// plus signers for a recovery rotation to `new`.
+    fn bls_keypair(seed: u8) -> (BlsSecretKey, BlsPublicKey) {
+        let mut ikm = [0u8; 32];
+        ikm[0] = seed;
+        BlsAggregated::keygen(&ikm).expect("test BLS keygen")
+    }
+
+    /// One validator (its genesis pubkey = stable id) with an operator key and a
+    /// genesis BLS key, plus signers for a recovery rotation to `new`. The
+    /// returned `(BlsSecretKey, BlsPublicKey)` is the *new* BLS half the recovery
+    /// rotation swaps to (a BLS chain rotates both halves atomically, #358).
     fn operator_recovery_fixture() -> (
         ValidatorKeyHistory,
+        BlsKeyHistory,
         OperatorKeyHistory,
         crate::validator_set::ValidatorId,
         NodeSigner, // operator
         NodeSigner, // new signing key
+        BlsSecretKey,
+        BlsPublicKey,
     ) {
         let validator = fresh_signer();
         let operator = fresh_signer();
         let new = fresh_signer();
         let v_id = crate::validator_set::ValidatorId::from_genesis_pubkey(validator.node_id());
         let keys = ValidatorKeyHistory::new(vec![v_id]);
+        let (_gen_sk, gen_bls_pk) = bls_keypair(0x01);
+        let bls = BlsKeyHistory::with_genesis([(v_id.into_node_id(), gen_bls_pk)]);
         let ops = OperatorKeyHistory::with_genesis([(v_id, operator.node_id())]);
-        (keys, ops, v_id, operator, new)
+        let (new_bls_sk, new_bls_pk) = bls_keypair(0x02);
+        (keys, bls, ops, v_id, operator, new, new_bls_sk, new_bls_pk)
     }
 
     fn recovery_payload(
         v_id: &crate::validator_set::ValidatorId,
         new: &NodeSigner,
+        new_bls_sk: &BlsSecretKey,
+        new_bls_pk: BlsPublicKey,
     ) -> ValidatorKeyRotation {
+        let pop = BlsAggregated::sign_pop(new_bls_sk, &ChainId::TEST).unwrap();
         ValidatorKeyRotation {
             validator: v_id.into_node_id(),
             new_pubkey: new.node_id(),
             v_eff: View(10),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
+            new_bls_pubkey: Some(new_bls_pk),
+            new_bls_pop: Some(pop),
         }
     }
 
     #[test]
     fn operator_rotation_applies_with_a_valid_operator_signature() {
-        let (mut keys, ops, v_id, operator, new) = operator_recovery_fixture();
+        let (mut keys, mut bls, ops, v_id, operator, new, new_bls_sk, new_bls_pk) =
+            operator_recovery_fixture();
         let env = OperatorSignedRotation::sign(
-            recovery_payload(&v_id, &new),
+            recovery_payload(&v_id, &new, &new_bls_sk, new_bls_pk),
             &operator,
             &new,
             &ChainId::TEST,
@@ -986,11 +1005,11 @@ mod tests {
         .unwrap();
         let applied = apply_operator_rotation_command(
             &mut keys,
-            None,
+            Some(&mut bls),
             &ops,
             &env.encode_command(),
             &ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
+            SignatureSchemeChoice::BlsAggregated,
             View(5),
         )
         .unwrap();
@@ -1004,15 +1023,18 @@ mod tests {
             keys.key_at(&v_id, View(9)),
             Some(Pubkey::from_node_id(v_id.into_node_id())),
         );
+        // The BLS half was mirrored atomically at the same v_eff.
+        assert_eq!(bls.key_at(&v_id.into_node_id(), 10), Some(new_bls_pk));
     }
 
     #[test]
     fn operator_rotation_rejects_a_signature_from_the_wrong_operator_key() {
-        let (mut keys, ops, v_id, _operator, new) = operator_recovery_fixture();
+        let (mut keys, mut bls, ops, v_id, _operator, new, new_bls_sk, new_bls_pk) =
+            operator_recovery_fixture();
         // Signed by an attacker key, not the validator's real operator key.
         let attacker = fresh_signer();
         let env = OperatorSignedRotation::sign(
-            recovery_payload(&v_id, &new),
+            recovery_payload(&v_id, &new, &new_bls_sk, new_bls_pk),
             &attacker,
             &new,
             &ChainId::TEST,
@@ -1020,11 +1042,11 @@ mod tests {
         .unwrap();
         let r = apply_operator_rotation_command(
             &mut keys,
-            None,
+            Some(&mut bls),
             &ops,
             &env.encode_command(),
             &ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
+            SignatureSchemeChoice::BlsAggregated,
             View(5),
         );
         assert!(matches!(r, Err(OperatorRotationError::Verify(_))));
@@ -1037,10 +1059,11 @@ mod tests {
 
     #[test]
     fn operator_rotation_rejects_when_the_validator_has_no_operator_key() {
-        let (mut keys, _ops, v_id, operator, new) = operator_recovery_fixture();
+        let (mut keys, mut bls, _ops, v_id, operator, new, new_bls_sk, new_bls_pk) =
+            operator_recovery_fixture();
         let empty_ops = OperatorKeyHistory::new();
         let env = OperatorSignedRotation::sign(
-            recovery_payload(&v_id, &new),
+            recovery_payload(&v_id, &new, &new_bls_sk, new_bls_pk),
             &operator,
             &new,
             &ChainId::TEST,
@@ -1048,11 +1071,11 @@ mod tests {
         .unwrap();
         let r = apply_operator_rotation_command(
             &mut keys,
-            None,
+            Some(&mut bls),
             &empty_ops,
             &env.encode_command(),
             &ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
+            SignatureSchemeChoice::BlsAggregated,
             View(5),
         );
         assert!(matches!(r, Err(OperatorRotationError::NoOperatorKey)));
@@ -1060,15 +1083,16 @@ mod tests {
 
     #[test]
     fn apply_operator_rotation_command_ignores_non_operator_payloads() {
-        let (mut keys, ops, _v_id, _operator, _new) = operator_recovery_fixture();
+        let (mut keys, mut bls, ops, _v_id, _operator, _new, _new_bls_sk, _new_bls_pk) =
+            operator_recovery_fixture();
         // A garbage / non-operator-rotation command is a clean Ok(false).
         let applied = apply_operator_rotation_command(
             &mut keys,
-            None,
+            Some(&mut bls),
             &ops,
             b"not an operator rotation",
             &ChainId::TEST,
-            SignatureSchemeChoice::Ed25519Collected,
+            SignatureSchemeChoice::BlsAggregated,
             View(5),
         )
         .unwrap();

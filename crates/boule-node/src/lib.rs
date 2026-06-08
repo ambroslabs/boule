@@ -1239,27 +1239,6 @@ mod tests {
     }
 
     #[test]
-    fn ed25519_chain_with_no_bls_config_returns_none() {
-        let cfg = cons_cfg(SignatureSchemeChoice::Ed25519Collected);
-        let storage = empty_storage();
-        let res = reconcile_bls_identity(&cfg, None, &nid(1), &[], storage.as_ref()).unwrap();
-        assert!(res.is_none());
-    }
-
-    #[test]
-    fn ed25519_chain_with_bls_config_is_rejected() {
-        let cfg = cons_cfg(SignatureSchemeChoice::Ed25519Collected);
-        let bls_cfg = BlsIdentityConfig::File {
-            path: PathBuf::from("/tmp/unused.key"),
-            allow_insecure_perms: false,
-        };
-        let storage = empty_storage();
-        let err = reconcile_bls_identity(&cfg, Some(&bls_cfg), &nid(1), &[], storage.as_ref())
-            .unwrap_err();
-        assert!(err.to_string().contains("ed25519_collected"), "{err}");
-    }
-
-    #[test]
     fn bls_chain_with_no_bls_config_is_rejected() {
         let cfg = cons_cfg(SignatureSchemeChoice::BlsAggregated);
         let storage = empty_storage();

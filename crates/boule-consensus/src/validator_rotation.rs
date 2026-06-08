@@ -1851,52 +1851,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_scheme_consistency_ed25519_chain_accepts_no_bls_fields() {
-        let p = sample_payload();
-        assert_eq!(
-            p.validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected, &ChainId::TEST),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn validate_scheme_consistency_ed25519_chain_rejects_bls_pubkey_present() {
-        let (_sk, pk) = bls_keypair(0xA0);
-        let mut p = sample_payload();
-        p.new_bls_pubkey = Some(pk);
-        let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected, &ChainId::TEST)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            RotationStructuralError::BlsFieldsInconsistentWithScheme {
-                scheme: SignatureSchemeChoice::Ed25519Collected,
-                bls_pubkey_present: true,
-                bls_pop_present: false,
-            }
-        ));
-    }
-
-    #[test]
-    fn validate_scheme_consistency_ed25519_chain_rejects_bls_pop_present() {
-        let (sk, _pk) = bls_keypair(0xA1);
-        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
-        let mut p = sample_payload();
-        p.new_bls_pop = Some(pop);
-        let err = p
-            .validate_scheme_consistency(SignatureSchemeChoice::Ed25519Collected, &ChainId::TEST)
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            RotationStructuralError::BlsFieldsInconsistentWithScheme {
-                bls_pubkey_present: false,
-                bls_pop_present: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn validate_scheme_consistency_bls_chain_accepts_valid_pop() {
         let (sk, pk) = bls_keypair(0xB0);
         let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
@@ -2296,7 +2250,7 @@ mod tests {
         use crate::history_commitment::{RotationCancelError, apply_rotation_cancel_command};
         use crate::validator_key_history::ValidatorKeyHistory;
         use crate::validator_set::ValidatorId;
-        use boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected;
+        use boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated;
 
         let current = fresh_signer();
         let new = fresh_signer();
@@ -2337,7 +2291,7 @@ mod tests {
             None,
             &cmd,
             &ChainId::TEST,
-            Ed25519Collected,
+            BlsAggregated,
             View(75),
         )
         .unwrap();
@@ -2355,7 +2309,7 @@ mod tests {
                 None,
                 &cmd,
                 &ChainId::TEST,
-                Ed25519Collected,
+                BlsAggregated,
                 View(75)
             ),
             Err(RotationCancelError::NoPendingRotation),
@@ -2369,7 +2323,7 @@ mod tests {
         use crate::history_commitment::{RotationCancelError, apply_rotation_cancel_command};
         use crate::validator_key_history::ValidatorKeyHistory;
         use crate::validator_set::ValidatorId;
-        use boule_core::crypto::sig_scheme::SignatureSchemeChoice::Ed25519Collected;
+        use boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated;
 
         let current = fresh_signer();
         let new = fresh_signer();
@@ -2410,7 +2364,7 @@ mod tests {
                 None,
                 &cmd,
                 &ChainId::TEST,
-                Ed25519Collected,
+                BlsAggregated,
                 View(75)
             ),
             Err(RotationCancelError::Verify(_)),
