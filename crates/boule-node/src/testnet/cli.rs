@@ -65,10 +65,9 @@ fn print_usage() {
     println!("  new    --nodes N [--seed-extra K] [--target-degree T]");
     println!("         [--seed S] [--workdir DIR] [--boule-bin PATH]");
     println!("         [--timeout-base-ms MS] [--timeout-max-ms MS]");
-    println!("         [--signature-scheme ed25519_collected|bls_aggregated]");
     println!("           Generate a workdir + per-node configs and mint identities.");
-    println!("           On BLS chains, also mints a BLS keypair per node, computes");
-    println!("           PoPs, and writes the [consensus.validators_bls] genesis table.");
+    println!("           Also mints a BLS keypair per node, computes PoPs, and writes");
+    println!("           the [consensus.validators_bls] genesis table.");
     println!();
     println!("  up [<node>] [--workdir DIR] [--boule-bin PATH]");
     println!("           Spawn every node (or just <node>) listed in state.json.");
@@ -191,7 +190,6 @@ fn resolve_boule_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 // ── `new` ───────────────────────────────────────────────────────────────────
 
 async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
-    use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
     let (workdir, rest) = parse_workdir(args)?;
     let (boule_bin, rest) = parse_boule_bin(&rest)?;
     let mut nodes: Option<usize> = None;
@@ -200,7 +198,6 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
     let mut seed: u64 = 0;
     let mut timeout_base_ms: u64 = DEFAULT_TIMEOUT_BASE_MS;
     let mut timeout_max_ms: u64 = DEFAULT_TIMEOUT_MAX_MS;
-    let mut signature_scheme = SignatureSchemeChoice::Ed25519Collected;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -215,17 +212,6 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
             }
             "--timeout-max-ms" => {
                 timeout_max_ms = pop_value(&rest, &mut i, "--timeout-max-ms")?.parse()?
-            }
-            "--signature-scheme" => {
-                let val = pop_value(&rest, &mut i, "--signature-scheme")?;
-                signature_scheme = match val {
-                    "ed25519_collected" => SignatureSchemeChoice::Ed25519Collected,
-                    "bls_aggregated" => SignatureSchemeChoice::BlsAggregated,
-                    other => anyhow::bail!(
-                        "unknown --signature-scheme {other:?}; expected \
-                         \"ed25519_collected\" or \"bls_aggregated\"",
-                    ),
-                };
             }
             other => anyhow::bail!("unknown `new` flag: {other}"),
         }
@@ -256,12 +242,11 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
         binary,
         timeout_base_ms,
         timeout_max_ms,
-        signature_scheme,
     })
     .await?;
     println!(
         "wrote {} nodes to {} (seed={seed}, seed_extra={seed_extra}, \
-         target_degree={target_degree}, signature_scheme={signature_scheme})",
+         target_degree={target_degree})",
         state.nodes.len(),
         workdir.display()
     );

@@ -46,7 +46,6 @@ use crate::replication::block::Block;
 use crate::validator_history::ValidatorSetHistory;
 use crate::validator_key_history::ValidatorKeyHistory;
 use crate::validator_set::{Pubkey, ValidatorSet};
-use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
 use boule_core::crypto::signed::ChainId;
 
 /// Why a committed rotation-cancel (#317) did not apply. The block stays
@@ -97,7 +96,6 @@ pub fn apply_rotation_cancel_command(
     bls_key_history: Option<&mut BlsKeyHistory>,
     cmd_bytes: &[u8],
     chain_id: &ChainId,
-    scheme: SignatureSchemeChoice,
     commit_view: View,
 ) -> Result<bool, RotationCancelError> {
     use crate::validator_rotation::DualSignedRotationCancel;
@@ -131,13 +129,10 @@ pub fn apply_rotation_cancel_command(
     key_history
         .cancel_pending_rotation(&validator_pk, cancelling_v_eff, commit_view)
         .map_err(RotationCancelError::History)?;
-    // Mirror into the BLS history on BLS chains (best-effort, like the rotation
-    // apply: a BLS mismatch after the Ed25519 cancel is not rolled back).
-    if scheme == SignatureSchemeChoice::BlsAggregated {
-        if let Some(bls) = bls_key_history {
-            let _ =
-                bls.cancel_pending_rotation(stable.into_node_id(), cancelling_v_eff, commit_view);
-        }
+    // Mirror into the BLS history (best-effort, like the rotation apply: a BLS
+    // mismatch after the Ed25519 cancel is not rolled back).
+    if let Some(bls) = bls_key_history {
+        let _ = bls.cancel_pending_rotation(stable.into_node_id(), cancelling_v_eff, commit_view);
     }
     Ok(true)
 }
@@ -204,7 +199,6 @@ pub fn apply_operator_rotation_command(
     operator_key_history: &OperatorKeyHistory,
     cmd_bytes: &[u8],
     chain_id: &ChainId,
-    scheme: SignatureSchemeChoice,
     commit_view: View,
 ) -> Result<bool, OperatorRotationError> {
     use crate::validator_rotation::OperatorSignedRotation;
@@ -234,7 +228,7 @@ pub fn apply_operator_rotation_command(
         .map_err(OperatorRotationError::Verify)?;
 
     env.payload
-        .validate_scheme_consistency(scheme, chain_id)
+        .validate_scheme_consistency(chain_id)
         .map_err(OperatorRotationError::Scheme)?;
 
     key_history
@@ -244,10 +238,8 @@ pub fn apply_operator_rotation_command(
     // BLS chains rotate both keys atomically (#358), mirroring the dual-signed
     // path: best-effort, a BLS mismatch after the Ed25519 apply is not rolled
     // back (the Ed25519 mutation already happened).
-    if scheme == SignatureSchemeChoice::BlsAggregated {
-        if let (Some(bls), Some(new_bls_pk)) = (bls_key_history, env.payload.new_bls_pubkey) {
-            let _ = bls.apply_rotation(stable.into_node_id(), env.payload.v_eff, new_bls_pk);
-        }
+    if let (Some(bls), Some(new_bls_pk)) = (bls_key_history, env.payload.new_bls_pubkey) {
+        let _ = bls.apply_rotation(stable.into_node_id(), env.payload.v_eff, new_bls_pk);
     }
     Ok(true)
 }
@@ -499,7 +491,6 @@ pub fn apply_reconfig_commands_to_set_history(
     key_history: &mut ValidatorKeyHistory,
     mut operator_key_history: Option<&mut OperatorKeyHistory>,
     mut bls_key_history: Option<&mut BlsKeyHistory>,
-    scheme: SignatureSchemeChoice,
     min_v_eff_delay: View,
     chain_id: &ChainId,
 ) {
@@ -517,11 +508,10 @@ pub fn apply_reconfig_commands_to_set_history(
 
         // Validate against the set authoritative at the block's view.
         let current_set_at = set_history.set_at(block_view);
-        let next_members = match cmd.validate_against_with_delay_and_scheme(
+        let next_members = match cmd.validate_against_with_delay_and_chain(
             current_set_at.for_view(block_view),
             block_view,
             min_v_eff_delay,
-            scheme,
             chain_id,
         ) {
             Ok(m) => m,
@@ -621,7 +611,6 @@ pub fn apply_rotation_commands_to_histories(
     mut bls_key_history: Option<&mut BlsKeyHistory>,
     operator_key_history: Option<&mut OperatorKeyHistory>,
     chain_id: &ChainId,
-    scheme: SignatureSchemeChoice,
 ) {
     use crate::validator_rotation::DualSignedRotation;
 
@@ -647,7 +636,7 @@ pub fn apply_rotation_commands_to_histories(
 
         if envelope
             .payload
-            .validate_scheme_consistency(scheme, chain_id)
+            .validate_scheme_consistency(chain_id)
             .is_err()
         {
             continue;
@@ -665,43 +654,40 @@ pub fn apply_rotation_commands_to_histories(
             continue;
         }
 
-        if scheme == SignatureSchemeChoice::BlsAggregated {
-            let new_bls_pk = match envelope.payload.new_bls_pubkey {
-                Some(pk) => pk,
-                None => {
-                    // Should have been caught by validate_scheme_consistency
-                    // above on a BLS chain, but mirror the production
-                    // code's expect-style guard with a soft drop here:
-                    // if we got this far, the production code panicked,
-                    // so the persisted history could not have included
-                    // this rotation either.
-                    continue;
-                }
-            };
-            let bls_history = match bls_key_history.as_deref_mut() {
-                Some(h) => h,
-                None => {
-                    // Same reasoning: the production code would have
-                    // panicked, so this rotation never landed in the
-                    // persisted history. Drop on the rebuild path.
-                    continue;
-                }
-            };
-            let stable_id = match stable_id {
-                Some(id) => id,
-                None => continue,
-            };
-            // Production logs and continues (does not roll back) on
-            // BLS-history apply failure after the Ed25519 history
-            // already mutated. We do the same — the Ed25519 mutation
-            // already happened, leaving the rebuild in the same shape
-            // the production code left it in.
-            let _ = bls_history.apply_rotation(
-                stable_id.into_node_id(),
-                envelope.payload.v_eff,
-                new_bls_pk,
-            );
-        }
+        let new_bls_pk = match envelope.payload.new_bls_pubkey {
+            Some(pk) => pk,
+            None => {
+                // Should have been caught by validate_scheme_consistency
+                // above, but mirror the production code's expect-style
+                // guard with a soft drop here: if we got this far, the
+                // production code panicked, so the persisted history could
+                // not have included this rotation either.
+                continue;
+            }
+        };
+        let bls_history = match bls_key_history.as_deref_mut() {
+            Some(h) => h,
+            None => {
+                // Same reasoning: the production code would have
+                // panicked, so this rotation never landed in the
+                // persisted history. Drop on the rebuild path.
+                continue;
+            }
+        };
+        let stable_id = match stable_id {
+            Some(id) => id,
+            None => continue,
+        };
+        // Production logs and continues (does not roll back) on
+        // BLS-history apply failure after the Ed25519 history
+        // already mutated. We do the same — the Ed25519 mutation
+        // already happened, leaving the rebuild in the same shape
+        // the production code left it in.
+        let _ = bls_history.apply_rotation(
+            stable_id.into_node_id(),
+            envelope.payload.v_eff,
+            new_bls_pk,
+        );
     }
 
     // #317: process any rotation-cancel commands after the rotations. A cancel
@@ -714,7 +700,6 @@ pub fn apply_rotation_commands_to_histories(
             bls_key_history.as_deref_mut(),
             cmd_bytes,
             chain_id,
-            scheme,
             block_view,
         );
     }
@@ -734,7 +719,6 @@ pub fn apply_rotation_commands_to_histories(
                 op,
                 cmd_bytes,
                 chain_id,
-                scheme,
                 block_view,
             );
         }
@@ -785,7 +769,7 @@ pub fn apply_rotation_commands_to_histories(
 /// follower-side verification is sound regardless of the relative
 /// commit positions of leader and follower.
 #[allow(clippy::too_many_arguments)] // the post-block commitment is a pure
-// function of all four histories + chain/scheme/delay; bundling them into a
+// function of all four histories + chain/delay; bundling them into a
 // struct would obscure the call sites more than it clarifies.
 pub fn compute_post_block_commitment(
     block: &Block,
@@ -794,7 +778,6 @@ pub fn compute_post_block_commitment(
     bls_key_history: Option<&BlsKeyHistory>,
     operator_key_history: Option<&OperatorKeyHistory>,
     chain_id: &ChainId,
-    scheme: SignatureSchemeChoice,
     min_v_eff_delay: View,
 ) -> [u8; 32] {
     let mut set = set_history.clone();
@@ -810,7 +793,6 @@ pub fn compute_post_block_commitment(
         &mut key,
         operator.as_mut(),
         bls.as_mut(),
-        scheme,
         min_v_eff_delay,
         chain_id,
     );
@@ -821,7 +803,6 @@ pub fn compute_post_block_commitment(
         bls.as_mut(),
         operator.as_mut(),
         chain_id,
-        scheme,
     );
     validator_history_commitment_v2(&set, &key, bls.as_ref(), operator.as_ref())
 }
@@ -1029,7 +1010,6 @@ mod tests {
             &ops,
             &env.encode_command(),
             &ChainId::TEST,
-            SignatureSchemeChoice::BlsAggregated,
             View(5),
         )
         .unwrap();
@@ -1066,7 +1046,6 @@ mod tests {
             &ops,
             &env.encode_command(),
             &ChainId::TEST,
-            SignatureSchemeChoice::BlsAggregated,
             View(5),
         );
         assert!(matches!(r, Err(OperatorRotationError::Verify(_))));
@@ -1095,7 +1074,6 @@ mod tests {
             &empty_ops,
             &env.encode_command(),
             &ChainId::TEST,
-            SignatureSchemeChoice::BlsAggregated,
             View(5),
         );
         assert!(matches!(r, Err(OperatorRotationError::NoOperatorKey)));
@@ -1112,7 +1090,6 @@ mod tests {
             &ops,
             b"not an operator rotation",
             &ChainId::TEST,
-            SignatureSchemeChoice::BlsAggregated,
             View(5),
         )
         .unwrap();

@@ -81,11 +81,10 @@ impl ConsensusNode {
             // so all replicas accept or reject identically.
             let block_view = block.header.view;
             let current_set_at = self.validator_history.set_at(block_view);
-            let next_members = match cmd.validate_against_with_delay_and_scheme(
+            let next_members = match cmd.validate_against_with_delay_and_chain(
                 current_set_at.for_view(block_view),
                 block_view,
                 self.min_v_eff_delay,
-                self.signature_scheme,
                 &self.chain_id,
             ) {
                 Ok(m) => m,
@@ -139,7 +138,7 @@ impl ConsensusNode {
             let new_set = match ValidatorSet::with_weights(next_entries) {
                 Ok(s) => s,
                 Err(e) => {
-                    // validate_against_with_delay_and_scheme already
+                    // validate_against_with_delay_and_chain already
                     // rejects weight 0; this path is unreachable in
                     // practice. If it fires, drop the reconfig — the
                     // post-#460 ValidatorSet invariant is load-bearing
@@ -425,7 +424,6 @@ impl ConsensusNode {
                 // BLS parity is asserted separately at recover; this
                 // debug check only compares the set history.
                 None,
-                self.signature_scheme,
                 self.min_v_eff_delay,
                 &self.chain_id,
             );

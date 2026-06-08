@@ -97,15 +97,12 @@ impl Signer for NodeSigner {
 ///   (votes/proposals/new-views) using the validator's long-term Ed25519
 ///   network identity. Always returns `[u8; 64]`.
 /// * [`PartialSigner<S>`] signs the **vote pre-image** that the leader
-///   will fold into a QC aggregate. The shape of the partial is dictated
-///   by the chain's scheme: `[u8; 64]` under
-///   [`Ed25519Collected`](crate::crypto::sig_scheme::Ed25519Collected)
-///   (a re-export of the envelope sig), `[u8; 96]` under
-///   [`BlsAggregated`](crate::crypto::sig_scheme::BlsAggregated).
+///   will fold into a QC aggregate. The partial is a `[u8; 96]` BLS
+///   point under [`BlsAggregated`](crate::crypto::sig_scheme::BlsAggregated).
 ///
 /// Keeping the two traits separate lets the network identity stay
-/// Ed25519-only forever (TLS handshake, peer-id) while the QC scheme
-/// is swappable per chain at genesis (#287, #288).
+/// Ed25519-only forever (TLS handshake, peer-id) while the QC scheme is
+/// the chain's BLS aggregation scheme (#287, #288).
 pub trait PartialSigner<S: SignatureScheme>: Send + Sync {
     /// The validator's public key under the chain's scheme. Used at
     /// `BlsKeyHistory::register` time and for client-side

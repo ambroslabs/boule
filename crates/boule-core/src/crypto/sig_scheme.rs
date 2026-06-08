@@ -1,49 +1,22 @@
-//! Pluggable signature schemes for HotStuff QC aggregation.
+//! BLS signature aggregation for HotStuff QC aggregation.
 //!
-//! HotStuff's quorum certificates carry a quorum of validator signatures
-//! over a `(view, block_hash)` pair. There are two production-relevant
-//! ways to encode that quorum on the wire:
+//! A quorum certificate carries a quorum of validator signatures over a
+//! `(view, block_hash)` pair. [`BlsAggregated`] encodes that quorum as a
+//! single ~96-byte BLS12-381 G2 point plus a [`SignerBitmap`];
+//! verification is one pairing check and the QC wire size is constant in
+//! the quorum count.
 //!
-//! - [`Ed25519Collected`]: one raw 64-byte Ed25519 signature per signer
-//!   plus a [`SignerBitmap`]. Verification is `O(n)` `ring::ED25519`
-//!   verifies. QC wire size scales with the quorum count.
-//! - [`BlsAggregated`]: a single ~96-byte BLS12-381 G2 point aggregating
-//!   every partial. Verification is one pairing check. QC wire size is
-//!   constant in `n`.
-//!
-//! Both schemes are implemented at the trait level. `QuorumCertificate`
-//! itself currently carries an Ed25519-shaped `signatures: Vec<[u8; 64]>`
-//! field; widening it to dispatch on either scheme (tagged enum or
-//! generic) lands when the BLS path is wired through the voting layer
-//! in #293.
-//!
-//! # Chain-level scheme selection
-//!
-//! The signature scheme is fixed at genesis (see #288). Within a chain
-//! every validator uses the same scheme, every QC carries one form of
-//! aggregate, and switching schemes requires a coordinated chain restart
-//! from new genesis. Mixed-scheme chains are out of scope.
-//!
-//! # Trait shape
-//!
-//! [`SignatureScheme`] is intentionally narrow: it covers the operations
-//! the QC layer needs to *aggregate* and *verify* a quorum of partials.
-//! Per-validator partial *signing* still goes through the existing
-//! [`Signer`](crate::crypto::signed::Signer) trait — that's enough today
-//! because the only scheme is Ed25519, whose partial signature is the
-//! same 64 bytes the [`Signer`](crate::crypto::signed::Signer) returns.
-//! When BLS lands the signing surface grows to return a scheme-shaped
-//! partial; the design note for that work is in #293.
+//! [`SignatureScheme`] is the narrow trait the QC layer uses to
+//! *aggregate* and *verify* a quorum of partials; per-validator partial
+//! *signing* goes through [`PartialSigner`](crate::crypto::signed::PartialSigner).
 //!
 //! [`SignerBitmap`]: crate::crypto::sig_scheme::SignerBitmap
 
 use std::fmt::{self, Debug};
 
-use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::signed::ChainId;
-use crate::identity::NodeId;
 
 /// Compact signer set, indexed over a validator set's sorted order.
 ///
@@ -152,25 +125,20 @@ impl SignerBitmap {
 /// QC-shaped aggregate and how that aggregate is verified against the
 /// pubkeys of the signers selected by a [`SignerBitmap`].
 pub trait SignatureScheme: 'static {
-    /// Single-signer partial signature. For [`Ed25519Collected`] this is
-    /// the same `[u8; 64]` returned by
-    /// [`Signer::sign`](crate::crypto::signed::Signer::sign).
+    /// Single-signer partial signature (for [`BlsAggregated`], a 96-byte
+    /// compressed G2 point).
     ///
     /// `Serialize`/`Deserialize` are intentionally not required at the
     /// trait level — serialization is the QC's concern, and the QC type
-    /// applies its own field-level `#[serde(with = ...)]` so types like
-    /// `[u8; 64]` (which serde does not auto-derive past `N=32`) work
-    /// unchanged.
+    /// applies its own field-level `#[serde(with = ...)]`.
     type PartialSig: Clone + Debug + Eq + Send + Sync;
 
-    /// Aggregate of partials, as carried inside a QC. For
-    /// [`Ed25519Collected`] this is a parallel-on-set-bits
-    /// `Vec<PartialSig>`; for BLS it will be a single point.
+    /// Aggregate of partials, as carried inside a QC (for
+    /// [`BlsAggregated`], a single G2 point).
     type Aggregate: Clone + Debug + Eq + Send + Sync;
 
-    /// Validator public key as registered in the validator set. For
-    /// [`Ed25519Collected`] this is the same [`NodeId`] the network
-    /// identity uses.
+    /// Validator public key as registered in the validator set (for
+    /// [`BlsAggregated`], a 48-byte compressed G1 point).
     type PublicKey: Clone + Debug + Eq + Send + Sync;
 
     /// Stable scheme name. Surfaces in the genesis config (#288) and in
@@ -252,114 +220,6 @@ impl fmt::Display for AggregateVerifyError {
 }
 
 impl std::error::Error for AggregateVerifyError {}
-
-/// Chain-level choice of signature scheme, selected at genesis (#288).
-///
-/// Within a single chain every validator uses the same scheme and every
-/// QC carries one form of aggregate. Switching schemes requires a
-/// coordinated chain restart from new genesis (mixed-scheme chains are
-/// out of scope, see #143).
-///
-/// Stored in `[consensus]` TOML as
-/// `signature_scheme = "ed25519_collected"` (and, once #289 lands,
-/// `"bls_aggregated"`). Unknown values fail to parse — callers should
-/// surface that as a startup error.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SignatureSchemeChoice {
-    /// One raw Ed25519 signature per signer plus a [`SignerBitmap`].
-    /// No longer selectable — the config layer rejects it; BLS is the
-    /// only supported scheme. See [`Ed25519Collected`].
-    Ed25519Collected,
-    /// BLS12-381 signature aggregation: each QC carries one ~96-byte
-    /// aggregate G2 point. `O(1)` pairing-check verification, constant
-    /// QC wire size in `n`. The only supported scheme. See
-    /// [`BlsAggregated`].
-    #[default]
-    BlsAggregated,
-}
-
-impl SignatureSchemeChoice {
-    /// Stable name used on the wire and in error messages.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Ed25519Collected => Ed25519Collected::NAME,
-            Self::BlsAggregated => BlsAggregated::NAME,
-        }
-    }
-}
-
-impl fmt::Display for SignatureSchemeChoice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.name())
-    }
-}
-
-/// Collected-Ed25519 scheme: each QC carries one 64-byte signature per
-/// signer in a `Vec<[u8; 64]>` parallel to the [`SignerBitmap`].
-///
-/// This is the scheme HotStuff's reference implementation describes as
-/// "Basic HotStuff" — safe and live, but with `O(n)` per-QC verification
-/// cost. It is the production default until BLS lands (#143).
-pub struct Ed25519Collected;
-
-impl SignatureScheme for Ed25519Collected {
-    type PartialSig = [u8; 64];
-    type Aggregate = Vec<[u8; 64]>;
-    type PublicKey = NodeId;
-
-    const NAME: &'static str = "ed25519_collected";
-
-    fn empty_aggregate() -> Self::Aggregate {
-        Vec::new()
-    }
-
-    fn add_partial(
-        agg: &mut Self::Aggregate,
-        signers_before: &SignerBitmap,
-        validator_idx: usize,
-        partial: Self::PartialSig,
-    ) {
-        if signers_before.get(validator_idx) {
-            return;
-        }
-        let insert_at = signers_before
-            .iter_set()
-            .take_while(|&i| i < validator_idx)
-            .count();
-        agg.insert(insert_at, partial);
-    }
-
-    fn aggregate_count(agg: &Self::Aggregate) -> usize {
-        agg.len()
-    }
-
-    fn verify_aggregate(
-        agg: &Self::Aggregate,
-        signers: &SignerBitmap,
-        message: &[u8],
-        pubkeys: &[Self::PublicKey],
-    ) -> Result<(), AggregateVerifyError> {
-        if signers.len() != pubkeys.len() {
-            return Err(AggregateVerifyError::LengthMismatch {
-                bitmap_len: signers.len(),
-                pubkeys_len: pubkeys.len(),
-            });
-        }
-        if agg.len() != signers.count() {
-            return Err(AggregateVerifyError::Malformed {
-                reason: "aggregate sig count disagrees with bitmap set-bit count",
-            });
-        }
-        for (idx, sig) in signers.iter_set().zip(agg.iter()) {
-            let pk = &pubkeys[idx];
-            UnparsedPublicKey::new(&ED25519, pk as &[u8])
-                .verify(message, sig)
-                .map_err(|_| AggregateVerifyError::InvalidAggregate)?;
-        }
-        Ok(())
-    }
-}
 
 /// BLS12-381 signature aggregation scheme: each QC carries a single
 /// ~96-byte aggregate G2 point. Verification is one pairing check.
@@ -937,22 +797,6 @@ mod tests {
     #[test]
     fn bls_aggregated_name_is_bls_aggregated() {
         assert_eq!(BlsAggregated::NAME, "bls_aggregated");
-        assert_eq!(
-            SignatureSchemeChoice::BlsAggregated.name(),
-            "bls_aggregated",
-        );
-    }
-
-    #[test]
-    fn bls_scheme_choice_round_trips_through_toml() {
-        // Genesis-config field uses snake_case; both variants round trip.
-        let raw = "scheme = \"bls_aggregated\"\n";
-        #[derive(serde::Deserialize)]
-        struct Wrap {
-            scheme: SignatureSchemeChoice,
-        }
-        let parsed: Wrap = toml::from_str(raw).unwrap();
-        assert_eq!(parsed.scheme, SignatureSchemeChoice::BlsAggregated);
     }
 
     #[test]
@@ -1148,8 +992,7 @@ mod tests {
     fn bls_aggregate_resolution_constant_size_independent_of_n() {
         // Sanity: the aggregate carried inside a QC is always 96 bytes
         // regardless of the quorum size. This is the load-bearing
-        // property the BLS path is supposed to deliver vs.
-        // Ed25519Collected's `64 * (2f+1)` growth.
+        // property the BLS aggregate delivers: O(1) size regardless of n.
         let large_n = 50;
         let signers_all: Vec<(BlsSecretKey, BlsPublicKey)> =
             (0..large_n).map(|i| bls_signer(i as u8)).collect();

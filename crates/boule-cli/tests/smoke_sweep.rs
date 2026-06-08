@@ -26,7 +26,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
 use boule_node::testnet::scenario::{Scenario, ScenarioMeta, Step};
 use boule_node::testnet::topology::TopologySpec;
 use boule_node::testnet::workdir::State;
@@ -344,7 +343,6 @@ async fn bringup(
     group: &str,
     nodes: usize,
     seed: u64,
-    scheme: SignatureSchemeChoice,
 ) -> anyhow::Result<(PathBuf, State)> {
     let workdir = root.join(group);
     let _ = std::fs::remove_dir_all(&workdir);
@@ -360,7 +358,6 @@ async fn bringup(
         binary: binary.to_path_buf(),
         timeout_base_ms: 200,
         timeout_max_ms: 2_000,
-        signature_scheme: scheme,
     })
     .await?;
     lifecycle::up_all(&workdir, binary, &state).await?;
@@ -475,16 +472,7 @@ async fn run_rotating(
     f: usize,
     seed: u64,
 ) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        nodes,
-        seed,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, nodes, seed).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(seed), format!("bringup: {e}")),
     };
@@ -504,16 +492,7 @@ async fn run_disconnect(
     window: u64,
     seed: u64,
 ) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        7,
-        seed,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 7, seed).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(seed), format!("bringup: {e}")),
     };
@@ -530,16 +509,7 @@ async fn run_disconnect(
 }
 
 async fn run_kill_restart(root: &Path, binary: &Path, group: &str, seed: u64) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        4,
-        seed,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 4, seed).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(seed), format!("bringup: {e}")),
     };
@@ -593,16 +563,7 @@ async fn run_kill_restart(root: &Path, binary: &Path, group: &str, seed: u64) ->
 }
 
 async fn run_gossip_steady(root: &Path, binary: &Path, group: &str, seed: u64) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        7,
-        seed,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 7, seed).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(seed), format!("bringup: {e}")),
     };
@@ -710,16 +671,7 @@ async fn run_path_probe(root: &Path, binary: &Path, group: &str) -> TrialResult 
 }
 
 async fn run_bls(root: &Path, binary: &Path, group: &str, seed: u64) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        4,
-        seed,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 4, seed).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(seed), format!("bringup: {e}")),
     };
@@ -751,16 +703,7 @@ async fn run_bls(root: &Path, binary: &Path, group: &str, seed: u64) -> TrialRes
 }
 
 async fn run_footgun(root: &Path, binary: &Path, group: &str) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        7,
-        7,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 7, 7).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(7), format!("bringup: {e}")),
     };
@@ -795,16 +738,7 @@ async fn run_footgun(root: &Path, binary: &Path, group: &str) -> TrialResult {
 }
 
 async fn run_gated(root: &Path, binary: &Path, group: &str) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        7,
-        7,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 7, 7).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(7), format!("bringup: {e}")),
     };
@@ -839,16 +773,7 @@ async fn run_gated(root: &Path, binary: &Path, group: &str) -> TrialResult {
 }
 
 async fn run_restart_disk(root: &Path, binary: &Path, group: &str, seed: u64) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        4,
-        seed,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 4, seed).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(seed), format!("bringup: {e}")),
     };
@@ -876,16 +801,7 @@ async fn run_restart_disk(root: &Path, binary: &Path, group: &str, seed: u64) ->
 }
 
 async fn run_seqkill(root: &Path, binary: &Path, group: &str, seed: u64) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        4,
-        seed,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 4, seed).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(seed), format!("bringup: {e}")),
     };
@@ -919,16 +835,7 @@ async fn run_seqkill(root: &Path, binary: &Path, group: &str, seed: u64) -> Tria
 }
 
 async fn run_partition(root: &Path, binary: &Path, group: &str, seed: u64) -> TrialResult {
-    let (workdir, state) = match bringup(
-        root,
-        binary,
-        group,
-        7,
-        seed,
-        SignatureSchemeChoice::BlsAggregated,
-    )
-    .await
-    {
+    let (workdir, state) = match bringup(root, binary, group, 7, seed).await {
         Ok(x) => x,
         Err(e) => return TrialResult::fail(group, Some(seed), format!("bringup: {e}")),
     };

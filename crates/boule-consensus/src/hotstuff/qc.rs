@@ -541,18 +541,12 @@ pub fn genesis_qc(genesis: &Block, vs: &ValidatorSet) -> QuorumCertificate {
 /// over the genesis block: an empty signer bitmap and the
 /// `BLS_EMPTY_AGGREGATE_SENTINEL` aggregate.
 ///
-/// **The bitmap is left empty intentionally.** The `Ed25519Collected`
-/// genesis QC fills its bitmap with `quorum_size` placeholder
-/// signatures because the verifier's well-formedness invariant
-/// requires `signatures.len() == signers.count()`. The BLS variant
-/// does not need this because its well-formedness check (#338) is the
-/// dual `(empty bitmap) ↔ (empty-aggregate sentinel)` invariant — and
-/// the dispatch-layer QC verifier (#345/#353) treats `signer_count == 0`
-/// as the genesis-skip condition in addition to `view == 0`. Mirroring
-/// the Ed25519 placeholder fill here would set bits without folding
-/// any real partials, leaving the aggregate at the empty sentinel and
-/// failing the `(non-empty bitmap) ↔ (non-sentinel aggregate)` half of
-/// the well-formedness check.
+/// **The bitmap is left empty intentionally.** BLS well-formedness is the
+/// dual `(empty bitmap) ↔ (empty-aggregate sentinel)` invariant, and the
+/// dispatch-layer QC verifier treats `signer_count == 0` as a genesis-skip
+/// condition alongside `view == 0`. Setting bits without folding real
+/// partials would leave the aggregate at the sentinel and fail the
+/// `(non-empty bitmap) ↔ (non-sentinel aggregate)` half.
 ///
 /// Every honest replica on a `bls_aggregated` chain derives the same
 /// QC from the shared `(genesis, validator_set_len)` pair, so the

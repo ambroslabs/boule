@@ -1065,7 +1065,6 @@ impl ConsensusNode {
                                 self.bls_key_history.as_ref(),
                                 Some(&self.operator_key_history),
                                 &self.chain_id,
-                                self.signature_scheme,
                                 self.min_v_eff_delay,
                             );
                     }

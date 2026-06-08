@@ -29,7 +29,7 @@ use super::qc::{ConsensusMsg, NewView, Proposal, QuorumCertificate, VerifiedQc, 
 use super::safety_rules::{safe_to_vote, should_update_high_qc, three_chain_commit};
 use super::state::{HotStuffState, Locked};
 use crate::validator_set::{ValidatorId, ValidatorSet};
-use boule_core::crypto::sig_scheme::{BlsPartialSig, SignatureSchemeChoice};
+use boule_core::crypto::sig_scheme::BlsPartialSig;
 
 /// Tracing target shared with the integration layer so safety-core
 /// eviction logs flow through the same `RUST_LOG` filter.
@@ -124,11 +124,6 @@ pub struct HotStuffCore {
     /// snapshot. Cloned into the integration layer so the timeout-bucket
     /// handler shares a single counter handle.
     eviction_counters: CacheEvictionCounters,
-    /// Chain-level signature scheme. Vote folding (Ed25519 vs. BLS) is
-    /// driven by the dispatched [`VoteVariant`], not this field; it is
-    /// retained for the [`Self::with_signature_scheme`] setter and future
-    /// scheme-aware read sites. Defaults to `Ed25519Collected`.
-    signature_scheme: SignatureSchemeChoice,
 }
 
 /// Per-parent-hash retry accounting for `RequestBlock`. See
@@ -191,15 +186,7 @@ impl HotStuffCore {
             proposed_in_view: View::ZERO,
             limits,
             eviction_counters,
-            signature_scheme: SignatureSchemeChoice::Ed25519Collected,
         }
-    }
-
-    /// Set the chain's signature scheme. Called once at boot by the
-    /// integration layer. Defaults to `Ed25519Collected`.
-    pub fn with_signature_scheme(mut self, scheme: SignatureSchemeChoice) -> Self {
-        self.signature_scheme = scheme;
-        self
     }
 
     /// Restore the durably-persisted `proposed_in_view` value. The

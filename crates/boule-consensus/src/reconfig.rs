@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::View;
 use crate::endpoint_registry::EndpointEntry;
 use crate::validator_set::{ValidatorId, ValidatorSet};
-use boule_core::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop, SignatureSchemeChoice};
+use boule_core::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPop};
 use boule_core::crypto::signed::ChainId;
 use boule_core::identity::NodeId;
 
@@ -70,13 +70,11 @@ pub const MIN_V_EFF_DELAY: View = View::new(4);
 ///
 /// `node_id` is the node's Ed25519 network identity (the pubkey *is* the
 /// node id); `addr` is
-/// the routable socket peers should use to reach this validator. On BLS
-/// chains (#143 / #289) `bls_pop` carries the new validator's BLS
-/// pubkey paired with a proof-of-possession signature over that pubkey;
-/// on Ed25519 chains the field is `None`. The reconfig validator (this
-/// module) verifies the PoP whenever it is present, regardless of the
-/// chain's scheme — scheme-driven enforcement (PoP *required* on BLS
-/// chains) lands together with the rest of the BLS integration in #293.
+/// the routable socket peers should use to reach this validator.
+/// `bls_pop` carries the new validator's BLS pubkey paired with a
+/// proof-of-possession signature over that pubkey; it is required on
+/// every `adds` entry (#293) and verified by the reconfig validator
+/// (this module) at validation time.
 ///
 /// `weight` is the validator's voting weight when seated (#462). Must
 /// be `>= 1`; weight 0 is rejected at validation time, mirroring the
@@ -123,7 +121,7 @@ pub struct ValidatorEntry {
     /// operator key must prove that operator consented to being seated on
     /// these exact terms, so a leader cannot conscript an honest operator's
     /// identity or alter the terms they agreed to.
-    /// [`ReconfigCommand::validate_against_with_delay_and_scheme`] rejects an
+    /// [`ReconfigCommand::validate_against_with_delay_and_chain`] rejects an
     /// add with an `operator_pubkey` but a missing or invalid `consent_sig`. Adds
     /// with no `operator_pubkey` carry `None` and stay unauthenticated (the
     /// existing-committee-approval half of #548 is gossip-dependent and out
@@ -181,7 +179,7 @@ mod serde_optional_sig {
 /// value to `weight` at and after `v_eff`" without altering membership
 /// (#462). Composes with `adds` / `removes` in the same
 /// [`ReconfigCommand`] under the disjointness rules in
-/// [`ReconfigCommand::validate_against_with_delay_and_scheme`].
+/// [`ReconfigCommand::validate_against_with_delay_and_chain`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WeightChange {
     pub node_id: NodeId,
@@ -192,7 +190,7 @@ pub struct WeightChange {
 ///
 /// `adds`, `removes`, and `changes` describe the diff against the
 /// active set. `v_eff` is the view at which the resulting set becomes
-/// authoritative. See [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_scheme`] for the exact
+/// authoritative. See [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_chain`] for the exact
 /// pre-commit checks.
 ///
 /// **Wire-format note (#462):** `ValidatorEntry` gains a `weight`
@@ -301,10 +299,10 @@ impl ReconfigCommand {
     /// - Every weight (in `adds` and `changes`) is `>= 1`.
     /// - Resulting set size `>= MIN_VALIDATOR_FLOOR`.
     ///
-    /// Test-only shim around [`Self::validate_against_with_delay_and_scheme`]
-    /// — production callers thread in the chain's real scheme and
-    /// chain_id rather than relying on the BLS + [`ChainId::TEST`]
-    /// defaults this wrapper hardcodes.
+    /// Test-only shim around [`Self::validate_against_with_delay_and_chain`]
+    /// — production callers thread in the chain's real chain_id rather
+    /// than relying on the [`ChainId::TEST`] default this wrapper
+    /// hardcodes.
     #[cfg(test)]
     pub fn validate_against(
         &self,
@@ -314,18 +312,16 @@ impl ReconfigCommand {
         self.validate_against_with_delay(current_set, current_view.into(), MIN_V_EFF_DELAY)
     }
 
-    /// Same as [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_scheme`] but uses an operator-supplied
+    /// Same as [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_chain`] but uses an operator-supplied
     /// minimum delay floor, which must be at least [`MIN_V_EFF_DELAY`].
     /// Wired through [`crate::wire::NodeConfigForConsensus::min_v_eff_delay`]
     /// (#272) so deployments can require a longer "give the new
     /// validator time to state-sync" window than the consensus floor.
     ///
-    /// This shim is `cfg(test)` because it assumes
-    /// [`SignatureSchemeChoice::BlsAggregated`] and uses
-    /// [`ChainId::TEST`], both of which are inappropriate for
-    /// production. Production callers go through
-    /// [`Self::validate_against_with_delay_and_scheme`] with the
-    /// chain's real scheme + chain_id.
+    /// This shim is `cfg(test)` because it uses [`ChainId::TEST`], which
+    /// is inappropriate for production. Production callers go through
+    /// [`Self::validate_against_with_delay_and_chain`] with the chain's
+    /// real chain_id.
     #[cfg(test)]
     pub fn validate_against_with_delay(
         &self,
@@ -333,34 +329,26 @@ impl ReconfigCommand {
         current_view: impl Into<View>,
         min_v_eff_delay: View,
     ) -> anyhow::Result<Vec<(NodeId, u64)>> {
-        self.validate_against_with_delay_and_scheme(
+        self.validate_against_with_delay_and_chain(
             current_set,
             current_view.into(),
             min_v_eff_delay,
-            SignatureSchemeChoice::BlsAggregated,
             &ChainId::TEST,
         )
     }
 
-    /// Scheme-aware variant of [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_scheme`].
-    /// Adds two checks driven by the chain's signature scheme (#334):
-    ///
-    /// - BLS chain: every `adds` entry must carry a `bls_pop` whose
-    ///   pre-image binds to `chain_id` (#410). Without the PoP, a
-    ///   Byzantine proposer could seat a validator with no verifiable
-    ///   BLS pubkey and stall every QC the new committee tries to
-    ///   form; without the chain_id binding, an attacker could
-    ///   cross-replay a PoP minted on another deployment.
-    /// - Ed25519 chain: no `adds` entry may carry a `bls_pop`. A BLS
-    ///   PoP on an Ed25519 chain has no semantic meaning; accepting it
-    ///   would mask a misconfigured operator who copied a BLS-chain
-    ///   payload onto an Ed25519 chain.
-    pub fn validate_against_with_delay_and_scheme(
+    /// Chain-aware variant of [`crate::reconfig::ReconfigCommand::validate_against_with_delay_and_chain`].
+    /// Adds the BLS proof-of-possession check (#334): every `adds` entry
+    /// must carry a `bls_pop` whose pre-image binds to `chain_id` (#410).
+    /// Without the PoP, a Byzantine proposer could seat a validator with
+    /// no verifiable BLS pubkey and stall every QC the new committee
+    /// tries to form; without the chain_id binding, an attacker could
+    /// cross-replay a PoP minted on another deployment.
+    pub fn validate_against_with_delay_and_chain(
         &self,
         current_set: &ValidatorSet,
         current_view: impl Into<View>,
         min_v_eff_delay: View,
-        scheme: SignatureSchemeChoice,
         chain_id: &ChainId,
     ) -> anyhow::Result<Vec<(NodeId, u64)>> {
         let current_view = current_view.into();
@@ -472,22 +460,14 @@ impl ReconfigCommand {
             }
         }
 
-        // Verify any embedded BLS proof-of-possession AND enforce the
-        // scheme-driven presence rule.
-        //
-        // Cryptographic check: every entry that carries a `bls_pop` is
-        // verified here so a malformed PoP is rejected pre-commit
-        // regardless of scheme.
-        //
-        // Presence check: on BLS chains, every `adds` entry MUST carry
-        // a PoP — otherwise the new validator would be seated with no
-        // verifiable BLS pubkey and the next QC would stall. On
-        // Ed25519 chains, no `adds` entry may carry one — a BLS PoP
-        // has no semantic meaning there, and silently accepting it
-        // would mask a misconfigured operator.
+        // Verify the embedded BLS proof-of-possession AND enforce its
+        // presence. Every `adds` entry MUST carry a PoP — otherwise the
+        // new validator would be seated with no verifiable BLS pubkey and
+        // the next QC would stall — and the PoP is verified here so a
+        // malformed one is rejected pre-commit.
         for entry in &self.adds {
-            match (&entry.bls_pop, scheme) {
-                (Some(pop), _) => {
+            match &entry.bls_pop {
+                Some(pop) => {
                     BlsAggregated::verify_pop(pop, &pop.pubkey, chain_id).map_err(|e| match e {
                         BlsKeyError::PopPubkeyMismatch => anyhow::anyhow!(
                             "BLS PoP for validator {} has mismatched embedded pubkey",
@@ -498,23 +478,14 @@ impl ReconfigCommand {
                             hex::encode(entry.node_id),
                         ),
                     })?;
-                    if matches!(scheme, SignatureSchemeChoice::Ed25519Collected) {
-                        anyhow::bail!(
-                            "validator {} carries a BLS PoP but the chain's signature_scheme = \
-                             \"ed25519_collected\" — Ed25519 chains have no use for BLS keys.",
-                            hex::encode(entry.node_id),
-                        );
-                    }
                 }
-                (None, SignatureSchemeChoice::BlsAggregated) => {
+                None => {
                     anyhow::bail!(
-                        "validator {} has no bls_pop but the chain's signature_scheme = \
-                         \"bls_aggregated\" — every BLS-chain `adds` entry must declare a \
+                        "validator {} has no bls_pop — every `adds` entry must declare a \
                          proof-of-possession.",
                         hex::encode(entry.node_id),
                     );
                 }
-                (None, SignatureSchemeChoice::Ed25519Collected) => {}
             }
         }
 
@@ -637,10 +608,10 @@ pub fn derive_bls_pop_from_key_file(path: &Path, chain_id: &ChainId) -> anyhow::
 }
 
 /// Build the encoded `add-validator` reconfig payload. When `config` is
-/// supplied, cross-checks the chain's `signature_scheme` against BLS-flag
-/// presence (#334), derives the chain_id for PoP binding (#410), and
-/// locally verifies any resolved PoP. `bls_pop_file` and `bls_key_file`
-/// are mutually exclusive. Backs `reconfig add-validator`.
+/// supplied, requires a BLS flag (#334), derives the chain_id for PoP
+/// binding (#410), and locally verifies the resolved PoP. `bls_pop_file`
+/// and `bls_key_file` are mutually exclusive. Backs `reconfig
+/// add-validator`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_add_validator_payload(
     config: Option<&boule_core::config::Config>,
@@ -674,7 +645,7 @@ pub fn build_add_validator_payload(
     Ok(cmd.encode())
 }
 
-/// Resolve a single add [`ValidatorEntry`] from CLI inputs: scheme
+/// Resolve a single add [`ValidatorEntry`] from CLI inputs: BLS-flag
 /// cross-checks (#334), BLS proof-of-possession resolution + chain-bound
 /// verification (#410), and the chain_id (when `--config` is supplied).
 ///
@@ -712,27 +683,16 @@ fn resolve_add_entry(
     // used by the local PoP verify and threaded into the fresh-mint path.
     let cfg_chain_id: Option<ChainId> = if let Some(cfg) = config {
         let cons = cfg.consensus.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("--config has no [consensus] section — cannot infer scheme or chain_id")
+            anyhow::anyhow!("--config has no [consensus] section — cannot infer chain_id")
         })?;
-        // Scheme cross-check (#334): refuse to build a payload that would
-        // be rejected at commit time by scheme-driven enforcement.
-        match (cons.signature_scheme, bls_pop_file, bls_key_file) {
-            (SignatureSchemeChoice::BlsAggregated, None, None) => {
-                anyhow::bail!(
-                    "--config declares signature_scheme = \"bls_aggregated\" but no \
-                     --bls-pop-file or --bls-key-file was supplied. Every BLS-chain `adds` \
-                     entry must carry a proof-of-possession.",
-                );
-            }
-            (SignatureSchemeChoice::Ed25519Collected, Some(_), _)
-            | (SignatureSchemeChoice::Ed25519Collected, _, Some(_)) => {
-                anyhow::bail!(
-                    "--config declares signature_scheme = \"ed25519_collected\" but a \
-                     --bls-pop-file or --bls-key-file was supplied. Ed25519 chains have no \
-                     use for BLS keys; remove the BLS flag.",
-                );
-            }
-            _ => {}
+        // BLS flag cross-check (#334): refuse to build a payload that
+        // would be rejected at commit time. Every `adds` entry must carry
+        // a proof-of-possession.
+        if bls_pop_file.is_none() && bls_key_file.is_none() {
+            anyhow::bail!(
+                "no --bls-pop-file or --bls-key-file was supplied. Every `adds` entry must \
+                 carry a proof-of-possession.",
+            );
         }
         Some(crate::genesis::derive_chain_id(cons)?)
     } else {
@@ -740,7 +700,7 @@ fn resolve_add_entry(
     };
 
     // Resolve the BLS proof-of-possession from whichever flag was passed
-    // (or none, for an Ed25519 chain).
+    // (or none, when no --config was supplied for the out-of-band path).
     let bls_pop = if let Some(path) = bls_pop_file {
         Some(read_bls_pop_file(path)?)
     } else if let Some(path) = bls_key_file {
@@ -1389,7 +1349,6 @@ mod tests {
             boule_core::crypto::sig_scheme::BlsAggregated::keygen(&[0x11u8; 32]).unwrap();
         let chain_id = crate::genesis::derive_chain_id_from_parts(
             &[gen_node],
-            SignatureSchemeChoice::BlsAggregated,
             &[(gen_node, gen_pk)],
             &[],
             [0u8; 32],
@@ -1408,8 +1367,7 @@ mod tests {
                  [api]\n\
                  listen_addr = \"127.0.0.1:8000\"\n\n\
                  [consensus]\n\
-                 validators = [\"11111111111111111111111111111111\"]\n\
-                 signature_scheme = \"bls_aggregated\"\n\n\
+                 validators = [\"11111111111111111111111111111111\"]\n\n\
                  [[consensus.validators_bls]]\n\
                  node_id = \"11111111111111111111111111111111\"\n\
                  bls_pubkey = \"{}\"\n\
@@ -1479,11 +1437,10 @@ mod tests {
         // Validate under the *same* chain_id the consent was signed for
         // (NOT the ChainId::TEST shim — the consent is chain-bound).
         assert!(
-            cmd.validate_against_with_delay_and_scheme(
+            cmd.validate_against_with_delay_and_chain(
                 &floor_set(),
                 View(0),
                 MIN_V_EFF_DELAY,
-                SignatureSchemeChoice::BlsAggregated,
                 &chain_id,
             )
             .is_ok()
@@ -1506,8 +1463,7 @@ mod tests {
              [api]\n\
              listen_addr = \"127.0.0.1:8000\"\n\n\
              [consensus]\n\
-             validators = [\"11111111111111111111111111111111\"]\n\
-             signature_scheme = \"bls_aggregated\"\n",
+             validators = [\"11111111111111111111111111111111\"]\n",
         )
         .unwrap();
         let req = ReconfigConsentSignRequest {
@@ -1599,13 +1555,7 @@ mod tests {
         cmd: &ReconfigCommand,
         cur: &ValidatorSet,
     ) -> anyhow::Result<Vec<(NodeId, u64)>> {
-        cmd.validate_against_with_delay_and_scheme(
-            cur,
-            View::ZERO,
-            MIN_V_EFF_DELAY,
-            SignatureSchemeChoice::BlsAggregated,
-            &ChainId::TEST,
-        )
+        cmd.validate_against_with_delay_and_chain(cur, View::ZERO, MIN_V_EFF_DELAY, &ChainId::TEST)
     }
 
     #[test]
@@ -1673,23 +1623,11 @@ mod tests {
             v_eff: View(10),
         };
         // Sanity: under the originating chain, the add is accepted.
-        cmd.validate_against_with_delay_and_scheme(
-            &cur,
-            0,
-            MIN_V_EFF_DELAY,
-            SignatureSchemeChoice::BlsAggregated,
-            &chain_a,
-        )
-        .expect("PoP minted on chain A must validate on chain A");
+        cmd.validate_against_with_delay_and_chain(&cur, 0, MIN_V_EFF_DELAY, &chain_a)
+            .expect("PoP minted on chain A must validate on chain A");
         // Cross-chain replay: rejected.
         let err = cmd
-            .validate_against_with_delay_and_scheme(
-                &cur,
-                0,
-                MIN_V_EFF_DELAY,
-                SignatureSchemeChoice::BlsAggregated,
-                &chain_b,
-            )
+            .validate_against_with_delay_and_chain(&cur, 0, MIN_V_EFF_DELAY, &chain_b)
             .unwrap_err();
         assert!(err.to_string().contains("PoP"), "{err}");
     }
@@ -1716,18 +1654,9 @@ mod tests {
             v_eff: View(10),
         };
         let err = cmd
-            .validate_against_with_delay_and_scheme(
-                &cur,
-                0,
-                MIN_V_EFF_DELAY,
-                SignatureSchemeChoice::BlsAggregated,
-                &ChainId::TEST,
-            )
+            .validate_against_with_delay_and_chain(&cur, 0, MIN_V_EFF_DELAY, &ChainId::TEST)
             .unwrap_err();
-        assert!(
-            err.to_string().contains("bls_aggregated") && err.to_string().contains("no bls_pop"),
-            "{err}",
-        );
+        assert!(err.to_string().contains("no bls_pop"), "{err}");
     }
 
     #[test]
@@ -1740,13 +1669,7 @@ mod tests {
             v_eff: View(10),
         };
         let next = cmd
-            .validate_against_with_delay_and_scheme(
-                &cur,
-                0,
-                MIN_V_EFF_DELAY,
-                SignatureSchemeChoice::BlsAggregated,
-                &ChainId::TEST,
-            )
+            .validate_against_with_delay_and_chain(&cur, 0, MIN_V_EFF_DELAY, &ChainId::TEST)
             .unwrap();
         assert!(next.iter().any(|(n, _)| *n == nid(5)));
     }

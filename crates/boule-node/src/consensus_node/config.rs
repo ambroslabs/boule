@@ -48,14 +48,6 @@ pub struct NodeConfigForConsensus {
     /// the constant.
     pub min_v_eff_delay: View,
 
-    /// Chain-level signature scheme selected at genesis (#288). Fixed
-    /// for the lifetime of the chain — switching requires a
-    /// coordinated chain restart from new genesis. Today only
-    /// `Ed25519Collected` is implemented; the BLS variant lands in #289
-    /// and the "node built for the wrong scheme" mismatch check lands
-    /// in #292.
-    pub signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
-
     /// Number of committed blocks to retain in the durable block store
     /// (`consensus/block/<hash>`) below `last_committed`. Older
     /// committed blocks are deleted in the same atomic batch as each
@@ -113,7 +105,6 @@ impl NodeConfigForConsensus {
             // policy. The default keeps the snapshot store untouched.
             snapshot_policy: boule_consensus::replication::snapshot::SnapshotPolicy::disabled(),
             min_v_eff_delay: boule_consensus::reconfig::MIN_V_EFF_DELAY,
-            signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice::default(),
             // Tests build short chains — keep everything by default so
             // an integration test that walks the committed chain by
             // hand never trips over a pruned block. Tests that exercise

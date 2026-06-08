@@ -704,7 +704,6 @@ mod tests {
             boule_core::crypto::sig_scheme::BlsAggregated::keygen(&[0x22u8; 32]).unwrap();
         let chain_id = crate::genesis::derive_chain_id_from_parts(
             &[validator],
-            boule_core::crypto::sig_scheme::SignatureSchemeChoice::BlsAggregated,
             &[(validator, bls_pk)],
             &[],
             [0u8; 32],
@@ -724,8 +723,7 @@ mod tests {
                  [api]\n\
                  listen_addr = \"127.0.0.1:8000\"\n\n\
                  [consensus]\n\
-                 validators = [\"{val}\"]\n\
-                 signature_scheme = \"bls_aggregated\"\n\n\
+                 validators = [\"{val}\"]\n\n\
                  [[consensus.validators_bls]]\n\
                  node_id = \"{val}\"\n\
                  bls_pubkey = \"{pk}\"\n\

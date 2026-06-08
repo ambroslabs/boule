@@ -466,7 +466,7 @@ fn mint_bls_genesis(
     key_dirs: &[tempfile::TempDir],
 ) -> Vec<BlsGenesisEntry> {
     use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
-    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
+    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey};
     use boule_core::identity::{NodeId, base58_to_node_id};
 
     // Pass 1: provision each validator's BLS key file and collect
@@ -493,7 +493,6 @@ fn mint_bls_genesis(
     // mint a chain-bound PoP per validator (#410).
     let chain_id = boule_consensus::genesis::derive_chain_id_from_parts(
         &node_id_bytes,
-        SignatureSchemeChoice::BlsAggregated,
         &pubkeys,
         &[],
         [0u8; 32],
@@ -633,7 +632,7 @@ async fn spawn_consensus_node(
         [node.bls_validator_identity]\nbackend = \"file\"\npath = \"{bls_key_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [overlay]\nmode = \"libp2p\"\nbootstrap_addrs = [{bootstrap_toml}]\n\n\
-        [consensus]\nsignature_scheme = \"bls_aggregated\"\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n\
+        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n\
         {validators_bls_toml}"
     );
     let mut config_file = NamedTempFile::new().unwrap();
@@ -824,7 +823,7 @@ async fn spawn_consensus_node_libp2p(
         [node.bls_validator_identity]\nbackend = \"file\"\npath = \"{bls_key_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [overlay]\nmode = \"libp2p\"\nbootstrap_addrs = {bootstrap_toml}\n\n\
-        [consensus]\nsignature_scheme = \"bls_aggregated\"\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n\
+        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n\
         {validators_bls_toml}"
     );
     let mut config_file = NamedTempFile::new().unwrap();

@@ -38,12 +38,6 @@ pub struct NewArgs {
     /// well under a second.
     pub timeout_base_ms: u64,
     pub timeout_max_ms: u64,
-    /// Chain-level signature scheme (#360). On
-    /// `SignatureSchemeChoice::BlsAggregated` the cluster setup mints
-    /// a BLS keypair per node, computes per-validator PoPs, and writes
-    /// a `[consensus.validators_bls]` genesis table + a
-    /// `[node.bls_validator_identity]` reference per node config.
-    pub signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
 }
 
 /// `testnet new`: lay out the workdir, generate the topology, mint
@@ -57,7 +51,6 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
         binary,
         timeout_base_ms,
         timeout_max_ms,
-        signature_scheme,
     } = args;
 
     spec.validate()?;
@@ -136,7 +129,7 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
     // validator's pubkey. The single-pass version that lived here
     // before chain_id binding produced PoPs that would replay across
     // any deployment sharing those BLS keys.
-    let bls_genesis = mint_bls_keys_if_needed(signature_scheme, &mut nodes)?;
+    let bls_genesis = mint_bls_keys(&mut nodes)?;
 
     // Phase 2b: write the final per-node config with the full
     // [consensus] section + sparse [[peers]] block. On BLS chains the
@@ -153,7 +146,6 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
             spec.target_degree,
             timeout_base_ms,
             timeout_max_ms,
-            signature_scheme,
             bls_genesis.as_deref(),
         )?;
     }
@@ -194,7 +186,7 @@ fn node_layout(workdir: &Path, index: usize, bootstrap_peers: Vec<usize>) -> Nod
     }
 }
 
-/// One genesis-table entry built by [`mint_bls_keys_if_needed`].
+/// One genesis-table entry built by [`mint_bls_keys`].
 /// Mirrors the `[consensus.validators_bls]` row shape — base58 NodeId,
 /// hex-encoded 48-byte BLS pubkey, hex-encoded 96-byte PoP signature
 /// over that pubkey.
@@ -204,13 +196,13 @@ struct BlsGenesisEntry {
     bls_pop_hex: String,
 }
 
-/// On `bls_aggregated` chains: per-node, generate a fresh BLS keypair
-/// and persist it to `<node_dir>/bls.key` via the same `BlsKeyFile`
-/// provider production uses. Returns the ordered genesis table — one
-/// entry per validator, in the same order as `nodes` (which is sorted
-/// by index, matching the `[consensus] validators` ordering written to
-/// every node's config). On Ed25519 chains: returns `None` and skips
-/// all work.
+/// Per-node, generate a fresh BLS keypair and persist it to
+/// `<node_dir>/bls.key` via the same `BlsKeyFile` provider production
+/// uses. Returns the ordered genesis table — one entry per validator, in
+/// the same order as `nodes` (which is sorted by index, matching the
+/// `[consensus] validators` ordering written to every node's config).
+/// The `Option` is always `Some` (it threads into the config writer's
+/// optional BLS-table argument).
 ///
 /// Mutates each node's `NodeLayout::bls_key_path` so the final-config
 /// writer can reference the on-disk path under
@@ -221,16 +213,10 @@ struct BlsGenesisEntry {
 /// over (validators, BLS pubkeys, default genesis seed). Without that
 /// binding a PoP minted here would replay across any deployment that
 /// happened to reuse the same validator BLS key.
-fn mint_bls_keys_if_needed(
-    scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
-    nodes: &mut [NodeLayout],
-) -> anyhow::Result<Option<Vec<BlsGenesisEntry>>> {
+fn mint_bls_keys(nodes: &mut [NodeLayout]) -> anyhow::Result<Option<Vec<BlsGenesisEntry>>> {
     use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
-    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey, SignatureSchemeChoice};
+    use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey};
     use boule_core::identity::base58_to_node_id;
-    if scheme == SignatureSchemeChoice::Ed25519Collected {
-        return Ok(None);
-    }
 
     // Pass 1: provision each validator's BLS key file on disk and
     // collect (NodeId, secret, pubkey). PoPs are deferred until the
@@ -288,7 +274,6 @@ fn mint_bls_keys_if_needed(
     // the field.
     let chain_id = boule_consensus::genesis::derive_chain_id_from_parts(
         &validator_ids,
-        scheme,
         &bls_pubkeys,
         // The testnet driver declares no operator keys (#549).
         &[],
@@ -341,10 +326,8 @@ fn write_final_config(
     _target_degree: usize,
     timeout_base_ms: u64,
     timeout_max_ms: u64,
-    signature_scheme: boule_core::crypto::sig_scheme::SignatureSchemeChoice,
     bls_genesis: Option<&[BlsGenesisEntry]>,
 ) -> anyhow::Result<()> {
-    use boule_core::crypto::sig_scheme::SignatureSchemeChoice;
     use std::fmt::Write as _;
     let p2p = n
         .p2p_addr
@@ -367,25 +350,17 @@ fn write_final_config(
     }
     let bootstrap_toml = bootstrap_list.join(", ");
 
-    // BLS genesis table (#360): on `bls_aggregated` chains, emit the
-    // `[consensus] signature_scheme` field, the
-    // `[[consensus.validators_bls]]` rows that the genesis validator
-    // set requires (`ConsensusConfig::resolve_genesis_bls_keys`), and
-    // a `[node.bls_validator_identity]` block pointing at this node's
-    // on-disk BLS key file. Ed25519 chains skip all three.
+    // BLS genesis table (#360): emit the `[[consensus.validators_bls]]`
+    // rows that the genesis validator set requires
+    // (`ConsensusConfig::resolve_genesis_bls_keys`), and a
+    // `[node.bls_validator_identity]` block pointing at this node's
+    // on-disk BLS key file.
     let mut bls_consensus_toml = String::new();
     let mut bls_node_identity_toml = String::new();
-    if signature_scheme == SignatureSchemeChoice::BlsAggregated {
+    {
         let entries = bls_genesis.ok_or_else(|| {
-            anyhow::anyhow!(
-                "bls_aggregated chain reached write_final_config without a BLS genesis table",
-            )
+            anyhow::anyhow!("reached write_final_config without a BLS genesis table")
         })?;
-        write!(
-            bls_consensus_toml,
-            "\nsignature_scheme = \"bls_aggregated\"\n",
-        )
-        .unwrap();
         for e in entries {
             write!(
                 bls_consensus_toml,
@@ -398,7 +373,7 @@ fn write_final_config(
         }
         let bls_path = n.bls_key_path.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "bls_aggregated chain but {} has no bls_key_path; mint phase did not run",
+                "{} has no bls_key_path; mint phase did not run",
                 n.display_name(),
             )
         })?;
