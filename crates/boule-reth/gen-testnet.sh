@@ -27,12 +27,12 @@
 #             — a faucet account (#806) is just another entry here.
 #   STAKING_OWNER  the address allowed to call Staking.withdraw (#821 — unbonding
 #                  removes a validator, a trusted-owner action) (default: dev EOA)
-#   GENESIS_STATE_ROOT  pin the genesis EVM state root instead of booting reth
-#                       to read it (skips needing a live reth at generate time).
+#   GENESIS_STATE_ROOT  pin the genesis EVM state root instead of booting the EL
+#                       to read it (skips the throwaway EL boot at generate time).
 #
-# Requires: cargo (builds boule + the gen-* helpers), and — unless
-# GENESIS_STATE_ROOT is set — reth + jq + curl + openssl to read the genesis
-# state root once (the consensus↔EL genesis seed).
+# Requires: cargo (builds boule + the custom EL + the gen-* helpers), and —
+# unless GENESIS_STATE_ROOT is set — jq + curl + openssl to read the genesis
+# state root once (the consensus↔EL genesis seed) from a throwaway custom EL.
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -140,17 +140,16 @@ for p in $PREFUND; do PREFUND_ARGS+=(--prefund "$p"); done
 echo "   wrote $GEN"
 
 # ── 5. genesis EVM state root = the consensus↔EL genesis seed ──
-# Either pinned via env, or read once from a throwaway reth booted on the genesis.
+# Either pinned via env, or read once from a throwaway custom EL booted on the genesis.
 if [ -n "${GENESIS_STATE_ROOT:-}" ]; then
   SEED="${GENESIS_STATE_ROOT#0x}"
   echo "── using pinned genesis state root: $SEED ──"
 else
-  command -v reth >/dev/null || { echo "FATAL: reth not on PATH and GENESIS_STATE_ROOT unset"; exit 2; }
   [ -x "$EL_BIN" ] || { echo "── building boule-reth-node (heavy) to read the genesis root ──"
     : "${BINDGEN_EXTRA_CLANG_ARGS:=-I/usr/lib/gcc/x86_64-linux-gnu/15/include}"
     export BINDGEN_EXTRA_CLANG_ARGS
     (cd "$NODE_DIR" && cargo build --jobs 3) || { echo "FATAL: EL build failed"; exit 2; }; }
-  echo "── reading genesis EVM state root from a throwaway reth ──"
+  echo "── reading genesis EVM state root from a throwaway custom EL ──"
   TMPRETH="$OUTDIR/.seed-reth"; rm -rf "$TMPRETH"; mkdir -p "$TMPRETH"
   openssl rand -hex 32 > "$TMPRETH/jwt.hex"
   "$EL_BIN" node --chain "$GEN" --datadir "$TMPRETH" \

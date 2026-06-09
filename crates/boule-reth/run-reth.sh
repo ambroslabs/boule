@@ -1,31 +1,19 @@
 #!/usr/bin/env bash
-# Start an execution layer for a boule chain: custom Prague-at-genesis
+# Start the execution layer for a boule chain: custom Prague-at-genesis
 # chainspec, Engine API on :8551 (JWT), public eth RPC on :8545, no internal
 # block production (boule drives it via the Engine API).
 #
-# Two backends, selected by EL=:
-#   EL=custom (default) — the A1 custom node `boule-reth-node` (#777/#781), which
-#                         applies recordKey/recordWeight/recordSettled as system
-#                         calls from the per-block `registryPayload` attribute
-#                         (EL-applied writes; no tx). Built from the standalone
-#                         `crates/boule-reth-node` workspace. The boule node sends
-#                         the custom `registryPayload` build attribute — see
-#                         RethEngine::build_block (#781). This is the SOLE
-#                         registry write path since A1 Phase 3 (#783) retired the
-#                         proposer-signed transaction write path, so the custom EL
-#                         is the default backend.
-#   EL=stock            — stock `reth` v2.2.0+ on PATH. Drives EVM execution, but
-#                         being unmodified it does NOT apply the registry system
-#                         calls — so on a stock EL the Registry (keyAt/weightOf/
-#                         settledView) stays at its genesis seed. Use only for a
-#                         plain EVM smoke test, not the validator-registry path.
+# The EL is the A1 custom node `boule-reth-node` (#777/#781), which applies
+# recordKey/recordWeight/recordSettled as system calls from the per-block
+# `registryPayload` attribute (EL-applied writes; no tx). Built from the
+# standalone `crates/boule-reth-node` workspace. The boule node sends the custom
+# `registryPayload` build attribute — see RethEngine::build_block (#781). This is
+# the SOLE registry write path since A1 Phase 3 (#783) retired the proposer-signed
+# transaction write path; an unmodified upstream reth would ignore the attribute
+# and never mirror the registry, so the custom EL is the only supported backend.
 #
-# Requires reth v2.2.0+ on PATH (v2.2.0 activates Prague — validated; also the
-# binary the custom EL is pinned to). Generates jwt.hex and genesis.json on first
-# run.
+# Generates jwt.hex and genesis.json on first run.
 set -euo pipefail
-
-EL="${EL:-custom}"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 DATADIR="${DATADIR:-/tmp/reth-boule-data}"
@@ -57,20 +45,15 @@ echo "seeding genesis Registry with $N dev validator weights -> $SEEDED"
 # Fresh datadir each run keeps the spike reproducible (genesis at height 0).
 rm -rf "$DATADIR"
 
-# Pick the EL binary. The custom node is built from its own (excluded) workspace;
-# the stock backend is whatever `reth` is on PATH.
-if [ "$EL" = "custom" ]; then
-  NODE_DIR="$DIR/../boule-reth-node"
-  echo "EL=custom: building + running boule-reth-node (the A1 custom EL)"
-  # reth's mdbx-sys runs bindgen via libclang with no resource-dir headers on a
-  # fresh box; this is the documented host workaround (Cargo.toml / Phase-0).
-  : "${BINDGEN_EXTRA_CLANG_ARGS:=-I/usr/lib/gcc/x86_64-linux-gnu/15/include}"
-  export BINDGEN_EXTRA_CLANG_ARGS
-  (cd "$NODE_DIR" && cargo build --jobs 3 >/dev/null)
-  EL_BIN="$NODE_DIR/target/debug/boule-reth-node"
-else
-  EL_BIN="$(command -v reth)"
-fi
+# Build the custom EL from its own (excluded) workspace.
+NODE_DIR="$DIR/../boule-reth-node"
+echo "building + running boule-reth-node (the A1 custom EL)"
+# reth's mdbx-sys runs bindgen via libclang with no resource-dir headers on a
+# fresh box; this is the documented host workaround (Cargo.toml / Phase-0).
+: "${BINDGEN_EXTRA_CLANG_ARGS:=-I/usr/lib/gcc/x86_64-linux-gnu/15/include}"
+export BINDGEN_EXTRA_CLANG_ARGS
+(cd "$NODE_DIR" && cargo build --jobs 3 >/dev/null)
+EL_BIN="$NODE_DIR/target/debug/boule-reth-node"
 
 exec "$EL_BIN" node \
   --chain "$SEEDED" \
