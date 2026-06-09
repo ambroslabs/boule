@@ -13,7 +13,7 @@ use clap::{Args, Subcommand};
 use boule_core::identity::{base58_to_node_id, node_id_to_base58};
 
 #[derive(Subcommand)]
-pub(crate) enum GenesisCmd {
+pub enum GenesisCmd {
     /// Emit a reth genesis JSON with the `Registry` predeploy seeded with a
     /// deterministic dev validator set (weights `1..=N`), so a fresh chain has
     /// a working weighted-quorum surface from block zero.
@@ -25,7 +25,7 @@ pub(crate) enum GenesisCmd {
 }
 
 #[derive(Args)]
-pub(crate) struct DevArgs {
+pub struct DevArgs {
     /// Number of dev validators to seed (weights are `1..=N`).
     #[arg(long, default_value_t = 4)]
     validators: usize,
@@ -35,7 +35,7 @@ pub(crate) struct DevArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct BlsPopArgs {
+pub struct BlsPopArgs {
     /// The chain's 32-byte genesis seed as hex (the reth EL genesis state
     /// root); `0x` prefix optional.
     #[arg(long)]

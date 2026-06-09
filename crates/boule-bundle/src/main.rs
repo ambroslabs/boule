@@ -1,12 +1,19 @@
-//! `boule` — the single-binary bundled node (milestone #7, #886).
+//! `boule` — the single, unified user-facing binary (milestone #7, #897).
 //!
-//! `boule node -c <config> --chain <genesis.json> --datadir <dir>` boots the
-//! custom reth EL (`BouleNode`) **in-process** and runs boule consensus against
-//! it in the same process — no second process, no HTTP Engine API, no JWT.
+//! This is the ONE `boule` binary in the repo. It links the reth SDK (via
+//! `boule-reth-node` / `reth-ethereum`) and hosts EVERY subcommand:
 //!
-//! This binary links the reth SDK (via `boule-reth-node` / `reth-ethereum`); it
-//! lives in the reth-side workspace so `boule-cli` (the standalone two-process
-//! `boule start` / `init` / `rotation` CLI) stays reth-SDK-free.
+//! - `boule node` — boots the custom reth EL (`BouleNode`) **in-process** and
+//!   runs boule consensus against it in the same process (no second process, no
+//!   HTTP Engine API, no JWT). Implemented here.
+//! - every reth-free subcommand (`init`/`start`/`key`/`config`/`snapshot`/
+//!   `reconfig`/`rotation`/`endpoint`) plus the reth-gated `genesis`/`faucet`/
+//!   `rpc-proxy`: reused verbatim from the `boule-cli` library's [`cli::Command`]
+//!   tree (the single source of truth), flattened in alongside `node`.
+//!
+//! `boule-cli` stays a reth-SDK-free LIBRARY so the root workspace can build /
+//! test / clippy those subcommands without ever compiling the reth dep tree.
+//! Only this crate (in the reth-side workspace) links reth.
 
 mod runtime;
 mod transport;
@@ -16,8 +23,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
+use boule_cli::cli;
 use boule_core::config;
 
 use crate::runtime::{BundleRethConfig, RethPorts, run_bundled};
@@ -25,7 +32,9 @@ use crate::runtime::{BundleRethConfig, RethPorts, run_bundled};
 #[derive(Parser)]
 #[command(
     name = "boule",
-    about = "Single-binary boule node: consensus + the custom reth EL in one process"
+    version,
+    about = "Single-binary boule node: consensus + the custom reth EL in one process, \
+             plus the full provisioning/ops CLI"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,6 +45,11 @@ struct Cli {
 enum Command {
     /// Boot reth in-process + consensus in one process (the canonical run command).
     Node(NodeArgs),
+    /// Every reth-free + reth-gated provisioning/ops subcommand, reused from the
+    /// `boule-cli` library (init/start/key/config/snapshot/reconfig/rotation/
+    /// endpoint/genesis/faucet/rpc-proxy).
+    #[command(flatten)]
+    Cli(cli::Command),
 }
 
 #[derive(Parser)]
@@ -49,7 +63,7 @@ struct NodeArgs {
     /// Permit a key file with group/other-readable permissions.
     #[arg(long = "allow-insecure-key-perms")]
     allow_insecure_perms: bool,
-    /// Path to the seeded genesis JSON (the `gen-genesis` output / build.rs
+    /// Path to the seeded genesis JSON (the `boule genesis dev` output / build.rs
     /// `genesis.json` seeded with validator weights). Parsed into reth's
     /// chainspec.
     #[arg(long = "chain")]
@@ -76,9 +90,7 @@ struct NodeArgs {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .init();
+    boule_cli::init_tracing();
 
     let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -88,6 +100,7 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(async {
         match cli.command {
             Command::Node(args) => handle_node(args).await,
+            Command::Cli(cmd) => cli::dispatch_command(cmd).await,
         }
     })
 }
@@ -107,7 +120,7 @@ async fn handle_node(args: NodeArgs) -> anyhow::Result<()> {
     let provider = config::build_provider(&identity_cfg)?;
     let network_identity = provider.try_load()?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no node key found via the `{}` backend. Run `boule-cli init --config {}` first \
+            "no node key found via the `{}` backend. Run `boule init --config {}` first \
              (or provision the key out-of-band for read-only backends).",
             identity_cfg.backend_name(),
             config_path.display(),
@@ -121,7 +134,7 @@ async fn handle_node(args: NodeArgs) -> anyhow::Result<()> {
         let val_provider = config::build_provider(&val_cfg)?;
         let val_id = val_provider.try_load()?.ok_or_else(|| {
             anyhow::anyhow!(
-                "no validator key found via the `{}` backend. Run `boule-cli init --config {}` \
+                "no validator key found via the `{}` backend. Run `boule init --config {}` \
                  first.",
                 val_cfg.backend_name(),
                 config_path.display(),

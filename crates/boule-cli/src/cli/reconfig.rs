@@ -27,7 +27,7 @@ fn parse_endpoint(s: &str) -> anyhow::Result<EndpointEntry> {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum ReconfigCmd {
+pub enum ReconfigCmd {
     /// Add a validator to the committee at view `v_eff`.
     AddValidator(ReconfigAddArgs),
     /// Remove a validator from the committee at view `v_eff`.
@@ -42,7 +42,7 @@ pub(crate) enum ReconfigCmd {
 }
 
 #[derive(Args)]
-pub(crate) struct ReconfigAddArgs {
+pub struct ReconfigAddArgs {
     /// New validator NodeId (base58).
     #[arg(long)]
     pubkey: String,
@@ -83,7 +83,7 @@ pub(crate) struct ReconfigAddArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct ReconfigConsentSignArgs {
+pub struct ReconfigConsentSignArgs {
     /// NodeId (base58) of the validator being admitted — the same `--pubkey`
     /// the add will carry.
     #[arg(long)]
@@ -125,7 +125,7 @@ pub(crate) struct ReconfigConsentSignArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct ReconfigRemoveArgs {
+pub struct ReconfigRemoveArgs {
     /// Validator NodeId to remove (base58).
     #[arg(long)]
     pubkey: String,
@@ -135,7 +135,7 @@ pub(crate) struct ReconfigRemoveArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct ReconfigChangeWeightArgs {
+pub struct ReconfigChangeWeightArgs {
     /// Validator NodeId to reweight (base58).
     #[arg(long)]
     pubkey: String,

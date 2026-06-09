@@ -17,7 +17,7 @@ use clap::Args;
 use boule_node::eth_public::{FaucetOptions, serve_faucet};
 
 #[derive(Args)]
-pub(crate) struct FaucetArgs {
+pub struct FaucetArgs {
     /// Bind address (env: FAUCET_LISTEN_ADDR).
     #[arg(long, env = "FAUCET_LISTEN_ADDR", default_value = "0.0.0.0:8546")]
     listen: SocketAddr,

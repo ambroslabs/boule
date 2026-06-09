@@ -12,7 +12,7 @@ use boule_core::identity::node_id_to_base58;
 use super::shared::resolve_config_path;
 
 #[derive(Args)]
-pub(crate) struct InitArgs {
+pub struct InitArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,

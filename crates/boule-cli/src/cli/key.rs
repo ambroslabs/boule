@@ -9,14 +9,14 @@ use boule_core::config;
 use super::shared::resolve_config_path;
 
 #[derive(Subcommand)]
-pub(crate) enum KeyCmd {
+pub enum KeyCmd {
     /// Migrate the node key between identity backends. Reads the current
     /// `[node.identity]` from the config and provisions the destination.
     Migrate(MigrateArgs),
 }
 
 #[derive(Args)]
-pub(crate) struct MigrateArgs {
+pub struct MigrateArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,

@@ -18,7 +18,7 @@ use clap::Args;
 use boule_node::eth_public::{RpcProxyOptions, serve_rpc_proxy};
 
 #[derive(Args)]
-pub(crate) struct RpcProxyArgs {
+pub struct RpcProxyArgs {
     /// Bind address (env: ETH_RPC_PROXY_LISTEN_ADDR).
     #[arg(
         long,

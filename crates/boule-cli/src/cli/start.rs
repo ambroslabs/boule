@@ -11,7 +11,7 @@ use boule_node as node;
 use super::shared::{is_production, resolve_config_path};
 
 #[derive(Args)]
-pub(crate) struct StartArgs {
+pub struct StartArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,

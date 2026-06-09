@@ -28,47 +28,61 @@ with reth's persisted finalized head, so a node restarted against an
 already-advanced reth resumes with the correct lagged `committed_state_root`
 (no fresh datadir required).
 
+> **Single-binary, reth in-process.** As of milestone #7 there is ONE `boule`
+> binary (built by `boule-bundle`, reth-linked) that runs consensus **and** the
+> custom reth EL in the **same process** — no second process, no `run-reth.sh`,
+> no HTTP Engine API, no JWT. `boule node` is the canonical run command; this
+> demo uses it. The standalone `boule start` + separate-reth path still exists
+> for advanced/HTTP setups but is no longer the default.
+
 ## 0. Prerequisites
 
 - `solc` (the predeploy genesis is compiled from source by `boule-reth`'s
-  `build.rs`), plus `openssl`, `curl`, `jq`, and `foundry` (`cast`). The custom
-  execution layer (`boule-reth-node`) is built from source by `run-reth.sh` — no
-  `reth` binary on `PATH` is needed.
-- Build the node binary **with the reth feature**:
+  `build.rs`), plus `curl` and `foundry` (`cast`) for the EVM transfer demo. The
+  custom execution layer is linked into the `boule` binary — no separate `reth`
+  binary on `PATH` is needed.
+- Build the unified `boule` binary (links reth in-process):
   ```
-  cargo build -p boule-cli --features reth
+  export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/15/include"
+  cargo build -p boule-bundle --jobs 3   # heavy reth build (~6min first time)
   ```
-  This produces the `boule` binary; the standard build (no feature) omits
-  the reth backend entirely.
+  The binary is at `crates/boule-bundle/target/debug/boule` and exposes every
+  subcommand (`boule --help`): `node`, `init`, `start`, `genesis`, `faucet`,
+  `rpc-proxy`, `key`, `config`, `snapshot`, `reconfig`, `rotation`, `endpoint`.
 
-## 1. Start the execution layer (terminal 1, leave running)
-
-```
-crates/boule-reth/run-reth.sh
-```
-
-Engine API on `:8551` (JWT generated at `crates/boule-reth/jwt.hex` on
-first run), eth RPC on `:8545`, no internal mining. The datadir is
-recreated each run so genesis is always at height 0.
-
-## 2. Read reth's genesis state root
+## 1. Generate a seeded reth genesis
 
 ```
-cast rpc --rpc-url http://127.0.0.1:8545 eth_getBlockByNumber 0x0 false | jq -r .stateRoot
+boule genesis dev --validators 1 --out ./genesis.json
 ```
 
-Copy that value (without the `0x`) into `genesis_seed_hex` below. The node
-verifies the bridge at startup: if `genesis_seed_hex` does not equal reth's
-genesis state root it refuses to start and prints the exact value to set.
+Emits a reth genesis JSON with the `Registry` predeploy seeded with a dev
+validator set, so the chain has a working weighted-quorum surface from block 0.
 
-## 3. Init the node key + get the NodeId (terminal 2)
+## 2. Init the node key + get the NodeId
 
 ```
-cargo run -p boule-cli --features reth -- init --config ./boule-reth.toml
+boule init --config ./boule-reth.toml
 ```
 
 Mints `./boule/node.key` and prints the node's base58 NodeId. Put that into
 `[consensus] validators` below.
+
+## 3. Discover reth's genesis state root + mint the BLS PoP
+
+`boule node` verifies a bridge at startup: the consensus `genesis_seed_hex`
+must equal reth's genesis state root, or it bails and prints the exact value to
+set. Run it once with an all-zero seed to read the root, then mint the
+chain-bound BLS proof-of-possession for that seed:
+
+```
+boule genesis bls-pop --genesis-seed <RETH-GENESIS-STATE-ROOT> \
+  --validator <YOUR-NODE-ID>:./boule/bls.key
+```
+
+This prints the `bls_pubkey` / `bls_pop` for the `[[consensus.validators_bls]]`
+row below. (The CI smoke test `crates/boule-bundle/tests/bundle_smoke.rs`
+automates this whole flow.)
 
 ## 4. Config — `boule-reth.toml`
 
@@ -80,12 +94,17 @@ listen_addr = "127.0.0.1:7000"
 backend = "file"
 path    = "./boule/node.key"
 
+[node.bls_validator_identity]
+backend = "file"
+path    = "./boule/bls.key"
+
 [api]
 listen_addr = "127.0.0.1:8000"
 
 [consensus]
-validators       = ["<YOUR-NODE-ID-FROM-STEP-3>"]
-genesis_seed_hex = "<RETH-GENESIS-STATE-ROOT-FROM-STEP-2 without 0x>"
+validators       = ["<YOUR-NODE-ID-FROM-STEP-2>"]
+signature_scheme = "bls_aggregated"
+genesis_seed_hex = "<RETH-GENESIS-STATE-ROOT-FROM-STEP-3 without 0x>"
 storage_dir      = "./boule/consensus"
 timeout_base_ms  = 500
 timeout_max_ms   = 5000
@@ -94,12 +113,14 @@ timeout_max_ms   = 5000
 # MetaMask-friendly block time.
 min_block_interval_ms = 1000
 
+[[consensus.validators_bls]]
+node_id    = "<YOUR-NODE-ID-FROM-STEP-2>"
+bls_pubkey = "<bls_pubkey FROM STEP 3>"
+bls_pop    = "<bls_pop FROM STEP 3>"
+
 [consensus.application]
-backend         = "reth"
-engine_url      = "http://127.0.0.1:8551"
-eth_url         = "http://127.0.0.1:8545"
-jwt_secret_path = "crates/boule-reth/jwt.hex"
-fee_recipient   = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+backend       = "reth-inprocess"
+fee_recipient = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 ```
 
 ### Multi-validator: peer the reths
@@ -118,7 +139,8 @@ reth_peers  = [
 ```
 
 At startup the node connects its local reth to each peer via `admin_addPeer`
-(so `run-reth.sh` enables the `admin` RPC namespace). Get a reth's enode with
+(the in-process reth enables the `admin` RPC namespace by default — see
+`boule node --http.api`). Get a reth's enode with
 `cast rpc --rpc-url <its eth_url> admin_nodeInfo | jq -r .enode` (or
 `admin_nodeInfo` over JSON-RPC). Peering the validator reths is what makes:
 
@@ -130,15 +152,18 @@ At startup the node connects its local reth to each peer via `admin_addPeer`
 Peering is best-effort: an unreachable peer is logged and skipped (reth keeps
 retrying), so node startup never blocks on it.
 
-## 5. Run the validator
+## 5. Run the validator (ONE process: consensus + reth in-process)
 
 ```
-cargo run -p boule-cli --features reth -- start --config ./boule-reth.toml
+boule node -c ./boule-reth.toml --chain ./genesis.json --datadir ./boule/reth \
+  --http.port 8545 --authrpc.port 8551
 ```
 
-It bridges genesis (consensus `genesis_seed_hex` must equal reth's genesis
-state root — it bails with the right value otherwise), then begins
-proposing: each block asks reth to build a payload and commits it.
+This boots the custom reth EL in-process and runs consensus against it over an
+in-process transport. It bridges genesis (consensus `genesis_seed_hex` must
+equal reth's genesis state root — it bails with the right value otherwise),
+then begins proposing: each block asks reth to build a payload and commits it.
+The public eth JSON-RPC is on `:8545`.
 
 ## 6. Send an EVM transfer and watch it land
 

@@ -22,13 +22,16 @@ mod start;
 /// A peer-to-peer runtime hosting a HotStuff-style BFT consensus node.
 #[derive(Parser)]
 #[command(name = "boule", version, about, long_about = None)]
-pub(crate) struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
+/// The reth-free `boule` subcommand tree. The unified `boule` binary
+/// (`boule-bundle`) flattens this into its own command enum alongside `node`,
+/// so every subcommand here is reachable from the single binary.
 #[derive(Subcommand)]
-enum Command {
+pub enum Command {
     /// Bootstrap a node: write a starter config if missing, provision the
     /// node key, ensure storage_dir exists, and print the resulting NodeId.
     Init(init::InitArgs),
@@ -63,8 +66,16 @@ enum Command {
     RpcProxy(rpc_proxy::RpcProxyArgs),
 }
 
-pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
-    match cli.command {
+/// Parse-and-run entry point for a standalone `boule` invocation.
+pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    dispatch_command(cli.command).await
+}
+
+/// Dispatch a single [`Command`]. Exposed so the unified `boule` binary
+/// (`boule-bundle`) can flatten this enum into its own top-level command and
+/// route the reth-free subcommands through here.
+pub async fn dispatch_command(command: Command) -> anyhow::Result<()> {
+    match command {
         Command::Init(a) => init::handle(a),
         Command::Start(a) => start::handle(a).await,
         Command::Key(key::KeyCmd::Migrate(a)) => key::handle_migrate(a),

@@ -37,9 +37,18 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "Single-binary boule node: HotStuff consensus + the custom reth execution layer (BouleNode) in one process, reth in-process over its auth-server IPC client (no HTTP Engine API, no JWT). Milestone #7."
 
+# The single user-facing `boule` binary (milestone #7 north star).
 [[bin]]
 name = "boule"
 path = "src/main.rs"
+
+# The `testnet` driver binary, mirrored here from `boule-cli` so the relocated
+# CLI integration tests can spawn it via `CARGO_BIN_EXE_testnet`. It is a thin
+# shell over the reth-free `boule_node::testnet` library (same source as
+# `boule-cli`'s testnet bin).
+[[bin]]
+name = "testnet"
+path = "src/bin/testnet.rs"
 
 [dependencies]
 # The custom reth EL node (BouleNode) — same standalone workspace, path dep.
@@ -54,6 +63,11 @@ boule-node = { path = "../boule-node", features = ["reth"] }
 # boule-reth provides the `EngineTransport` seam + `RethApplication` + predeploy
 # decoders; this crate implements the in-process transport against it.
 boule-reth = { path = "../boule-reth" }
+# boule-cli: the reth-free `boule` command tree (init/start/key/config/snapshot/
+# reconfig/rotation/endpoint + reth-gated genesis/faucet/rpc-proxy). The unified
+# binary flattens its `cli::Command` enum alongside `node`. Built WITH `reth` so
+# every subcommand (incl. genesis/faucet/rpc-proxy) is present.
+boule-cli = { path = "../boule-cli", features = ["reth"] }
 
 # reth as a LIBRARY (no fork): pinned to the v2.2.0 tag, matching boule-reth-node
 # and the local reth binary. Features: `node`/`node-api`/`evm`/`cli` (same as
@@ -80,4 +94,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+# The relocated `boule-cli` integration tests (#897): they spawn the unified
+# `boule` binary (`CARGO_BIN_EXE_boule`) and the `testnet` driver
+# (`CARGO_BIN_EXE_testnet`), and drive the reth-free `boule_node::testnet`
+# library + `boule_consensus`/`boule_core` helpers directly.
+boule-core = { path = "../boule-core" }
+boule-consensus = { path = "../boule-consensus" }
+boule-node = { path = "../boule-node", features = ["reth"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
