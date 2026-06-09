@@ -247,7 +247,11 @@ jobs:
       # `#[ignore]`d (it runs in smoke.yml); the fast structural checks run here.
       - if: needs.changes.outputs.bundle == 'true'
         name: Relocated CLI integration tests
-        run: cargo test --locked --test integration_test --test testnet_driver_test --test smoke_sweep
+        # `--test-threads=1`: these spawn full multi-node clusters; running them
+        # in parallel oversubscribes CI cores and starves timing-sensitive
+        # mesh-formation (e.g. test_libp2p_overlay_3_node_smoke) past its budget.
+        # The original heavy shard serialized them too — keep that here.
+        run: cargo test --locked --test integration_test --test testnet_driver_test --test smoke_sweep -- --test-threads=1
 
       # (b) The single-process `boule node` smoke: reth in-process committing
       # blocks (the folded-in former smoke.sh). `#[ignore]`d, run explicitly.

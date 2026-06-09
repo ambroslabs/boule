@@ -938,10 +938,10 @@ async fn test_libp2p_overlay_3_node_smoke() {
     // the gossipsub mesh forms and the cluster commits). libp2p mesh-formation
     // latency is sensitive to CI core contention, so this is generous — it
     // bounds the pathological-slow case, not the expected duration.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(60);
     'outer: loop {
         if Instant::now() > deadline {
-            panic!("libp2p-overlay cluster did not commit within 30s");
+            panic!("libp2p-overlay cluster did not commit within 60s");
         }
         for g in &guards {
             let resp = client.get(g.admin_url("/consensus/status")).send().await;
