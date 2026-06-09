@@ -1,0 +1,83 @@
+# boule-bundle — the single-binary boule node: consensus + the custom reth EL
+# (`BouleNode`) in ONE process, with reth running IN-PROCESS (no HTTP Engine
+# API, no JWT). Milestone #7 (#884/#885/#886).
+#
+# This crate links BOTH the reth SDK (`reth-ethereum`, same git tag/features as
+# `boule-reth-node`) AND the boule-side crates (`boule-node`, `boule-reth`,
+# `boule-consensus`, `boule-core`) plus `boule-reth-node` (for `BouleNode`). The
+# dependency direction is one-way (reth-side → boule-side); the boule-side crates
+# never see the reth SDK.
+#
+# It is a member of the reth-side workspace rooted at `crates/boule-reth-node`
+# (NOT boule's root workspace), so the heavy reth dependency tree never enters
+# boule's main build / Cargo.lock / CI. The bundle is therefore NOT compiled or
+# tested in CI — it is verified locally (a real single-validator smoke test). See
+# the PR body.
+#
+# Build prerequisites on a fresh box (reth's mdbx-sys runs bindgen via libclang
+# with no resource-dir headers):
+#   export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/15/include"
+#   cargo build --jobs 3   # a reth-SDK binary is ~6min + a huge dep tree
+
+# Its OWN standalone workspace (like `boule-reth-node`), excluded from boule's
+# root workspace so the heavy reth tree stays out of boule's main build / CI. It
+# path-depends on `boule-reth-node` (a sibling, in its own separate workspace);
+# a path dep across workspaces is fine — only workspace *membership* requires the
+# member to be below the root.
+[workspace]
+resolver = "2"
+members = ["."]
+
+[package]
+name = "boule-bundle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Single-binary boule node: HotStuff consensus + the custom reth execution layer (BouleNode) in one process, reth in-process over its auth-server IPC client (no HTTP Engine API, no JWT). Milestone #7."
+
+[[bin]]
+name = "boule"
+path = "src/main.rs"
+
+[dependencies]
+# The custom reth EL node (BouleNode) — same standalone workspace, path dep.
+boule-reth-node = { path = "../boule-reth-node" }
+
+# boule-side crates (path deps; one-way dep, they never see the reth SDK).
+boule-core = { path = "../boule-core" }
+boule-consensus = { path = "../boule-consensus" }
+# boule-node provides the `run_with_application` injection seam + identity/config
+# plumbing; build it WITH the `reth` feature so the eth-public services compile.
+boule-node = { path = "../boule-node", features = ["reth"] }
+# boule-reth provides the `EngineTransport` seam + `RethApplication` + predeploy
+# decoders; this crate implements the in-process transport against it.
+boule-reth = { path = "../boule-reth" }
+
+# reth as a LIBRARY (no fork): pinned to the v2.2.0 tag, matching boule-reth-node
+# and the local reth binary. Features: `node`/`node-api`/`evm`/`cli` (same as
+# boule-reth-node, for NodeBuilder + ChainSpec parsing), plus `tasks`/`provider`
+# for the in-process launch (Runtime/TaskExecutor + init_db).
+reth-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0", features = [
+    "node",
+    "node-api",
+    "evm",
+    "cli",
+    "tasks",
+    "provider",
+] }
+
+# jsonrpsee: the in-process clients for the auth-server (engine_*) IPC endpoint
+# and the eth HTTP endpoint both implement `ClientT`. Match reth's pin (0.26).
+jsonrpsee = { version = "0.26", features = ["async-client", "http-client", "client-core"] }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

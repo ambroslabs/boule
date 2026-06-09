@@ -36,6 +36,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{info, warn};
 
 use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
+use boule_consensus::replication::application::Application;
 use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
 use boule_consensus::replication::mempool::Mempool;
 use boule_consensus::replication::state_machine::StateMachine;
@@ -52,6 +53,62 @@ use boule_core::storage::{DiskStorage, DiskWal, MemoryStorage, MemoryWal, Storag
 use boule_core::transport::overlay as overlay_traits;
 use boule_core::transport::overlay::{Broadcaster, Discovery};
 
+/// The inputs a [`ApplicationFactory`] receives to build the injected execution
+/// backend. The shared [`Mempool`] is the crux: the in-process reth
+/// [`Application`] must pull system (reconfig) txs from the *same* mempool the
+/// `ConsensusNode` draws proposals from, and that mempool is created inside
+/// `start_consensus` — so it cannot be a pre-built `Arc<dyn Application>`.
+pub struct ApplicationContext {
+    /// This node's id (the consensus signing identity).
+    pub self_id: NodeId,
+    /// The consensus genesis block's `state_commitment`; the reth backend must
+    /// bridge this against reth's genesis state root (fails closed on mismatch).
+    pub genesis_state_commitment: [u8; 32],
+    /// The genesis validator stake set (`(node_id_bytes, weight)`), seeding the
+    /// CL-native stake ledger.
+    pub genesis_stake: Vec<([u8; 32], u64)>,
+    /// boule's mempool, shared with the `ConsensusNode`. The injected
+    /// application MUST use this instance.
+    pub mempool: Arc<dyn Mempool>,
+}
+
+/// A boxed `'static` future, used by [`ApplicationFactory`] / the external
+/// shutdown signal.
+pub type BoxFutureUnit = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>;
+
+/// Builds the injected execution backend from an [`ApplicationContext`]. Used by
+/// the bundled single-process runtime (`boule-bundle`, #885) to construct the
+/// in-process reth [`Application`] against the shared mempool created inside
+/// `start_consensus`.
+pub type ApplicationFactory = Box<
+    dyn FnOnce(
+            ApplicationContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<Arc<dyn Application>>> + Send>,
+        > + Send,
+>;
+
+/// Optional injected execution backend + external shutdown signal, used by the
+/// bundled single-process runtime (`boule-bundle`, #885) to drive consensus
+/// against a reth node launched *in the same process*.
+///
+/// - `factory` — builds the [`Application`] from the shared mempool (see
+///   [`ApplicationContext`]), replacing the config-driven
+///   `[consensus.application]` backend selection. When `Some`, the standalone
+///   HTTP `reth_application` path is skipped. When `None`, the node selects its
+///   backend from config (the standalone two-process path).
+/// - `shutdown` — an external shutdown future raced against `ctrl_c`. The bundle
+///   passes reth's `node_exit_future` here so that if reth exits first, consensus
+///   and the overlay are torn down *before* the bundle drops the reth node. When
+///   `None`, only `ctrl_c` triggers shutdown.
+#[derive(Default)]
+pub struct ApplicationOverride {
+    /// Factory that builds the application to inject (skips config selection).
+    pub factory: Option<ApplicationFactory>,
+    /// External shutdown future raced against `ctrl_c` (e.g. reth's exit future).
+    pub shutdown: Option<BoxFutureUnit>,
+}
+
 /// Run a node from a fully-resolved configuration plus the network and
 /// (optional) validator identities. When `validator_identity` is `None`,
 /// the network identity is reused for consensus signing — the historical
@@ -62,6 +119,29 @@ pub async fn run(
     network_identity: NodeIdentity,
     validator_identity: Option<NodeIdentity>,
 ) -> anyhow::Result<()> {
+    run_with_application(
+        config,
+        network_identity,
+        validator_identity,
+        ApplicationOverride::default(),
+    )
+    .await
+}
+
+/// Like [`run`], but accepts an [`ApplicationOverride`] so a caller (the
+/// `boule-bundle` single-process runtime, #885) can inject a pre-built
+/// in-process reth [`Application`] and an external shutdown future. This is the
+/// shared body; [`run`] is the standalone two-process entry point (no override).
+pub async fn run_with_application(
+    config: Config,
+    network_identity: NodeIdentity,
+    validator_identity: Option<NodeIdentity>,
+    app_override: ApplicationOverride,
+) -> anyhow::Result<()> {
+    let ApplicationOverride {
+        factory: injected_factory,
+        shutdown: external_shutdown,
+    } = app_override;
     let network_node_id = network_identity.node_id()?;
 
     // Reject configurations that would self-dial: a static [[peers]]
@@ -193,6 +273,16 @@ pub async fn run(
         addr
     };
 
+    // An injected application factory (the bundled runtime) is meaningless
+    // without consensus — fail closed rather than silently dropping the
+    // already-launched reth backend.
+    if injected_factory.is_some() && config.consensus.is_none() {
+        anyhow::bail!(
+            "an in-process execution backend was injected (bundled runtime) but the config has \
+             no [consensus] section; the bundled node must run consensus"
+        );
+    }
+
     // Optionally start consensus. When the [consensus] section is
     // present, the protocol is registered, the ConsensusNode is
     // constructed (with disk storage if configured, otherwise in-memory)
@@ -224,6 +314,7 @@ pub async fn run(
                 persistent_peers,
                 libp2p_keypair,
                 libp2p_limits,
+                injected_factory,
             )
             .await?,
         )
@@ -335,8 +426,23 @@ pub async fn run(
         std::fs::write(path, content.to_string())?;
     }
 
-    tokio::signal::ctrl_c().await?;
-    info!("shutting down...");
+    // Block until a shutdown trigger fires: ctrl-c, or — for the bundled
+    // single-process runtime (#885) — reth's `node_exit_future`, whichever
+    // comes first. When reth exits first the bundle relies on consensus +
+    // overlay being torn down here (via the oneshots below) *before* it drops
+    // the reth node, so in-flight commit/build RPCs are not cut.
+    match external_shutdown {
+        Some(exit) => {
+            tokio::select! {
+                r = tokio::signal::ctrl_c() => { r?; info!("ctrl-c received, shutting down..."); }
+                () = exit => { info!("reth node exited, shutting down consensus..."); }
+            }
+        }
+        None => {
+            tokio::signal::ctrl_c().await?;
+            info!("shutting down...");
+        }
+    }
 
     let (consensus_join, overlay_joins) = match consensus_runtime {
         Some(rc) => {
@@ -444,7 +550,17 @@ async fn reth_application(
         fee_recipient,
         build_wait_ms,
         reth_peers,
-    } = cfg;
+    } = cfg
+    else {
+        // `RethInProcess` (the bundled single-process mode, #886) is launched by
+        // the `boule node` bundle binary, which injects an in-process
+        // application and never reaches this standalone two-process builder.
+        anyhow::bail!(
+            "[consensus.application] backend = \"reth-inprocess\" selects the bundled \
+             single-process node; run it with `boule node -c <config>` (the bundle binary), \
+             not `boule start`. For the standalone two-process mode set backend = \"reth\"."
+        );
+    };
     // Connect the local reth to the other validators' reths (best-effort) so
     // tx-pool gossip and EL self-sync work across the cluster.
     boule_reth::peer_reths(eth_url, reth_peers).await?;
@@ -535,6 +651,7 @@ async fn start_consensus(
     persistent_peers: std::collections::HashSet<NodeId>,
     libp2p_keypair: Option<boule_transport_libp2p::identity::Keypair>,
     libp2p_limits: boule_transport_libp2p::swarm::Limits,
+    injected_factory: Option<ApplicationFactory>,
 ) -> anyhow::Result<RunningConsensus> {
     let validator_set = build_validator_set(cons_cfg, self_id)?;
     // #803: surface the participation role at boot so an operator (and the
@@ -734,8 +851,28 @@ async fn start_consensus(
     // infrastructure only, reachable solely via the hidden
     // `allow_counter_state_machine` dev affordance (used by the `testnet`
     // driver, rewritten in #888).
-    match cons_cfg.application.as_ref() {
-        Some(reth_cfg) => {
+    match (injected_factory, cons_cfg.application.as_ref()) {
+        // The bundled single-process runtime (#885) injects a factory that
+        // builds the in-process reth `Application` against the shared mempool
+        // created above; use it and skip the config-driven (standalone HTTP)
+        // backend selection. The factory performs the genesis-root bridge +
+        // frontier recovery in-process.
+        (Some(factory), _) => {
+            info!(
+                target: "boule::node",
+                "building injected in-process execution backend (bundled runtime)",
+            );
+            let app = factory(ApplicationContext {
+                self_id: *self_id,
+                genesis_state_commitment,
+                genesis_stake,
+                mempool: Arc::clone(&mempool),
+            })
+            .await
+            .context("building injected in-process execution backend")?;
+            node = node.with_application(app);
+        }
+        (None, Some(reth_cfg)) => {
             let app = reth_application(
                 reth_cfg,
                 *self_id,
@@ -746,7 +883,7 @@ async fn start_consensus(
             .await?;
             node = node.with_application(app);
         }
-        None if cons_cfg.allow_counter_state_machine => {
+        (None, None) if cons_cfg.allow_counter_state_machine => {
             // Dev/test path only: keep the constructor-wired counter SM.
             warn!(
                 target: "boule::node",
@@ -755,7 +892,7 @@ async fn start_consensus(
                  production backend — configure [consensus.application] backend = \"reth\".",
             );
         }
-        None => {
+        (None, None) => {
             anyhow::bail!(
                 "[consensus] is configured but no execution backend is set: a node must declare \
                  [consensus.application] with backend = \"reth\". reth is the only supported \
@@ -1387,5 +1524,65 @@ mod tests {
         // It carries the genesis history so it can verify QCs from the committee.
         assert_eq!(bootstrap.history.len(), 2);
         assert_eq!(bootstrap.history.key_at(&nid(1), 0), Some([0x11; 48]));
+    }
+
+    /// The injection seam (#885): an [`ApplicationFactory`] receives the shared
+    /// mempool created inside `start_consensus` (via [`ApplicationContext`]) and
+    /// builds an [`Application`] against *that* instance — the property the
+    /// bundled in-process reth backend relies on (it pulls reconfig system txs
+    /// from the same pool the `ConsensusNode` proposes from). This exercises the
+    /// factory plumbing end to end without booting a node, so the public seam has
+    /// an in-CI consumer (no `#[allow(dead_code)]`).
+    #[tokio::test]
+    async fn application_factory_builds_against_the_injected_context() {
+        use crate::consensus_node::MempoolBlockBuilder;
+        use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
+        use boule_consensus::replication::stake_source::BondedStakeLedger;
+        use parking_lot::Mutex as PlMutex;
+        use std::sync::atomic::AtomicU64;
+
+        // A factory that records it ran and returns an app built from the
+        // context-provided mempool (the bundle's reth factory has the same shape).
+        let factory: ApplicationFactory = Box::new(|ctx: ApplicationContext| {
+            Box::pin(async move {
+                let sm: Arc<PlMutex<Box<dyn StateMachine>>> =
+                    Arc::new(PlMutex::new(Box::new(CounterStateMachine::new())));
+                let stake: Box<dyn boule_consensus::replication::stake_source::StakeSource> =
+                    Box::new(BondedStakeLedger::seeded_from(ctx.genesis_stake.clone()));
+                let app: Arc<dyn Application> = Arc::new(MempoolBlockBuilder::new(
+                    ctx.self_id,
+                    Arc::clone(&ctx.mempool),
+                    sm,
+                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(AtomicU64::new(0)),
+                    64,
+                    stake,
+                ));
+                Ok(app)
+            })
+        });
+
+        let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(8));
+        // A sentinel command inserted into the *context* mempool must be visible
+        // to the application the factory builds — proving they share the instance.
+        mempool
+            .insert(bytes::Bytes::from_static(b"sentinel-cmd"))
+            .unwrap();
+
+        let ctx = ApplicationContext {
+            self_id: nid(1),
+            genesis_state_commitment: [0u8; 32],
+            genesis_stake: vec![([1u8; 32], 5)],
+            mempool: Arc::clone(&mempool),
+        };
+        let app = factory(ctx).await.expect("factory builds the application");
+        // The app holds the same mempool: dropping our handle and the app's
+        // shared Arc, the strong count reflects both references.
+        assert!(
+            Arc::strong_count(&mempool) >= 2,
+            "the built application shares the injected mempool instance",
+        );
+        // Sanity: the application is usable (object-safe Arc<dyn Application>).
+        let _: &dyn Application = app.as_ref();
     }
 }
