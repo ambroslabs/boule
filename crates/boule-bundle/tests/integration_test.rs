@@ -174,10 +174,10 @@ async fn spawn_node(peers: &[PeerDesc<'_>]) -> NodeGuard {
             panic!("node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
-        if !content.is_empty() {
-            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
-                break addrs;
-            }
+        if !content.is_empty()
+            && let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content)
+        {
+            break addrs;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -226,12 +226,11 @@ async fn wait_for_peer_count(node: &NodeGuard, expected: usize, timeout: Duratio
                 node.api_port, expected
             );
         }
-        if let Ok(resp) = client.get(node.admin_url("/peers")).send().await {
-            if let Ok(peers) = resp.json::<Value>().await {
-                if peers.as_array().map(|a| a.len()).unwrap_or(0) >= expected {
-                    return;
-                }
-            }
+        if let Ok(resp) = client.get(node.admin_url("/peers")).send().await
+            && let Ok(peers) = resp.json::<Value>().await
+            && peers.as_array().map(|a| a.len()).unwrap_or(0) >= expected
+        {
+            return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -276,13 +275,13 @@ async fn launch_once_for_discovery(key_path: &str) -> DiscoveryInfo {
             panic!("discovery node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
-        if !content.is_empty() {
-            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
-                break DiscoveryInfo {
-                    p2p_addr: addrs.p2p_addr,
-                    node_id: addrs.node_id,
-                };
-            }
+        if !content.is_empty()
+            && let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content)
+        {
+            break DiscoveryInfo {
+                p2p_addr: addrs.p2p_addr,
+                node_id: addrs.node_id,
+            };
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -372,10 +371,10 @@ async fn spawn_node_fixed_port(
             panic!("phase-2 node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
-        if !content.is_empty() {
-            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
-                break addrs;
-            }
+        if !content.is_empty()
+            && let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content)
+        {
+            break addrs;
         }
         // Reap-and-retry on an early exit (the EADDRINUSE bind race).
         // `try_wait` reaps the process when it reports `Some`.
@@ -656,10 +655,10 @@ async fn spawn_consensus_node(
             panic!("consensus node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
-        if !content.is_empty() {
-            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
-                break addrs;
-            }
+        if !content.is_empty()
+            && let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content)
+        {
+            break addrs;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -845,10 +844,10 @@ async fn spawn_consensus_node_libp2p(
             panic!("libp2p-overlay node did not write addr_file within 30s");
         }
         let content = std::fs::read_to_string(&addr_file_path).unwrap_or_default();
-        if !content.is_empty() {
-            if let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content) {
-                break addrs;
-            }
+        if !content.is_empty()
+            && let Ok(addrs) = serde_json::from_str::<NodeAddrs>(&content)
+        {
+            break addrs;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };

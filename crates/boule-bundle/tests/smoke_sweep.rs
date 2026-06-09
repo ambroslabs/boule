@@ -17,7 +17,7 @@
 //!
 //! Run locally:
 //! ```sh
-//! SMOKE_TIER=full cargo test -p boule-cli --test smoke_sweep -- --ignored --nocapture
+//! SMOKE_TIER=full cargo test -p boule-bundle --test smoke_sweep -- --ignored --nocapture
 //! ```
 //! `SMOKE_TIER` is one of `quick|standard|extended|full` (default
 //! `full`). The `boule` node binary is located via `CARGO_BIN_EXE_boule`.
@@ -378,15 +378,13 @@ async fn dump_diagnostics(state: &State) {
         let name = n.display_name();
         let alive = lifecycle::pid_alive(n).is_some();
         let mut line = format!("    {name}: {}", if alive { "up" } else { "down" });
-        if let Some(api) = n.admin_addr {
-            if let Ok(Some(s)) = admin::maybe_consensus_status(api).await {
-                line += &format!(
-                    " height={} role={} gossip_sink_overflow={}",
-                    s.last_committed_height.0,
-                    s.self_role,
-                    s.backpressure.gossip_sink_overflow_total
-                );
-            }
+        if let Some(api) = n.admin_addr
+            && let Ok(Some(s)) = admin::maybe_consensus_status(api).await
+        {
+            line += &format!(
+                " height={} role={} gossip_sink_overflow={}",
+                s.last_committed_height.0, s.self_role, s.backpressure.gossip_sink_overflow_total
+            );
         }
         eprintln!("{line}");
     }
@@ -414,10 +412,10 @@ async fn backpressure_growth(state: &State) -> Result<(), String> {
     async fn sample(state: &State) -> BTreeMap<String, u64> {
         let mut m = BTreeMap::new();
         for n in &state.nodes {
-            if let Some(api) = n.admin_addr {
-                if let Ok(Some(s)) = admin::maybe_consensus_status(api).await {
-                    m.insert(n.display_name(), s.backpressure.gossip_sink_overflow_total);
-                }
+            if let Some(api) = n.admin_addr
+                && let Ok(Some(s)) = admin::maybe_consensus_status(api).await
+            {
+                m.insert(n.display_name(), s.backpressure.gossip_sink_overflow_total);
             }
         }
         m
@@ -427,10 +425,10 @@ async fn backpressure_growth(state: &State) -> Result<(), String> {
     let second = sample(state).await;
     let mut grew = Vec::new();
     for (node, &v1) in &first {
-        if let Some(&v2) = second.get(node) {
-            if v2 > v1 {
-                grew.push(format!("{node}:{v1}->{v2}"));
-            }
+        if let Some(&v2) = second.get(node)
+            && v2 > v1
+        {
+            grew.push(format!("{node}:{v1}->{v2}"));
         }
     }
     if grew.is_empty() {
@@ -913,15 +911,15 @@ async fn survivors_partitioned(state: &State) -> bool {
     for n in &survivors {
         let me = n.display_name();
         adj.entry(me.clone()).or_default();
-        if let Some(api) = n.admin_addr {
-            if let Ok(Some(peers)) = admin::maybe_peers(api).await {
-                for pid in peers {
-                    if let Some(pname) = id2name.get(&pid) {
-                        if names.contains(pname) {
-                            adj.entry(me.clone()).or_default().insert(pname.clone());
-                            adj.entry(pname.clone()).or_default().insert(me.clone());
-                        }
-                    }
+        if let Some(api) = n.admin_addr
+            && let Ok(Some(peers)) = admin::maybe_peers(api).await
+        {
+            for pid in peers {
+                if let Some(pname) = id2name.get(&pid)
+                    && names.contains(pname)
+                {
+                    adj.entry(me.clone()).or_default().insert(pname.clone());
+                    adj.entry(pname.clone()).or_default().insert(me.clone());
                 }
             }
         }
