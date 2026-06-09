@@ -15,8 +15,8 @@
 //!   OUT  output path (default: stdout).
 //! ```
 //!
-//! `run-reth.sh` / `testnet.sh` invoke this so the reth chain they boot already
-//! has seated weights.
+//! `run-reth.sh` invokes this so the reth chain it boots already has seated
+//! weights.
 
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);

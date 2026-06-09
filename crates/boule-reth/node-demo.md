@@ -30,7 +30,10 @@ already-advanced reth resumes with the correct lagged `committed_state_root`
 
 ## 0. Prerequisites
 
-- `reth` v2.2.0 on `PATH`, plus `openssl` and `foundry` (`cast`).
+- `solc` (the predeploy genesis is compiled from source by `boule-reth`'s
+  `build.rs`), plus `openssl`, `curl`, `jq`, and `foundry` (`cast`). The custom
+  execution layer (`boule-reth-node`) is built from source by `run-reth.sh` — no
+  `reth` binary on `PATH` is needed.
 - Build the node binary **with the reth feature**:
   ```
   cargo build -p boule-cli --features reth
@@ -38,7 +41,7 @@ already-advanced reth resumes with the correct lagged `committed_state_root`
   This produces the `boule` binary; the standard build (no feature) omits
   the reth backend entirely.
 
-## 1. Start reth (terminal 1, leave running)
+## 1. Start the execution layer (terminal 1, leave running)
 
 ```
 crates/boule-reth/run-reth.sh
@@ -215,34 +218,12 @@ Operator-supplied trust parameters:
 Liveness assumptions: at least one honest reth peer serving state, and a pivot
 recent enough that non-archive peers still retain its state.
 
-## 8. Multi-validator testnet (`testnet.sh`)
+## 8. Multi-validator testnet
 
-`testnet.sh` brings up a whole reth-backed cluster on one host and asserts the
-properties §1–7 only gesture at — that **N independent reths** execute the same
-ordered payloads to the **same** state across leader rotations. It launches `N`
-boule validators, each driving its own reth (distinct datadirs/ports from this
-`genesis.json`), peers the reths (§4), runs past several rotations, then checks:
-
-1. **liveness** — the chain passes `2N` committed blocks, so the round-robin
-   leader schedule has had every validator lead;
-2. **agreement** — all `N` reths report a byte-identical EVM state root at a deep
-   committed height;
-3. **tx landing** — a tx sent to *one* node's reth is mined, in the same block,
-   on *all* reths;
-4. **no divergence** — no node ever logged `consensus_state_divergence_detected`.
-
-Prereqs on `PATH`: `reth`, `cast` (foundry), `openssl`, `jq`, `curl`, plus a
-boule binary built with the reth feature. From the repo root:
-
-```
-cargo build --release -p boule-cli --features reth
-./crates/boule-reth/testnet.sh            # 4 validators (default)
-N=7 ./crates/boule-reth/testnet.sh        # or any N
-```
-
-It prints a `✓`/`✗` per assertion and exits non-zero if any fail, so it doubles
-as a smoke test for the reth backend. It needs `reth`/`cast`, so it is an
-operator/local harness rather than a CI gate (like `run-reth.sh`).
+To bring up a whole reth-backed cluster — `N` boule validators, each driving its
+own custom EL, peered so the EVM tx-pool gossips — use the deployment-artifact
+generator `gen-testnet.sh` (it emits per-node configs + run tooling and is the
+maintained multi-node path). See [`../../docs/join-testnet.md`](../../docs/join-testnet.md).
 
 ## Re-capturing the test fixtures
 
