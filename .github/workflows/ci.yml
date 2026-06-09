@@ -110,7 +110,7 @@ jobs:
       matrix:
         shard: [heavy, default]
     env:
-      HEAVY_FILTER: 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + binary(testnet_driver_test) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
+      HEAVY_FILTER: 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
     steps:
       - uses: actions/checkout@v4
       - if: needs.changes.outputs.rust == 'true'

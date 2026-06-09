@@ -12,11 +12,14 @@
 #
 #   1. CPU-bound tests (25-node sims, BLS pairing/PoP) that would slow each
 #      other down by contending for cores.
-#   2. Multi-node libp2p cluster integration tests (the `testnet_driver_test`
-#      binary plus the `test_libp2p_overlay_3_node_smoke` /
+#   2. Multi-node libp2p cluster integration tests (the
+#      `test_libp2p_overlay_3_node_smoke` /
 #      `test_consensus_status_endpoint_reports_live_progress` smoke tests).
 #      These are not CPU-bound, but they stand up real nodes over loopback
 #      sockets and must form a gossipsub mesh and commit within a budget.
+#      (The `testnet_driver_test` cluster binary moved to the reth-linked
+#      `boule-bundle` workspace in #897, so it is no longer in this workspace's
+#      filter — its own workspace runs it serially.)
 #      Under the default shard's `--test-threads=$(nproc)` they get starved
 #      during the mesh-formation window and flake (compounded by #855: the
 #      overlay does not re-dial bootstrap peers, so a startup dial race never
@@ -48,5 +51,5 @@
 heavy-compute = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + binary(testnet_driver_test) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
+filter = 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
 test-group = 'heavy-compute'
