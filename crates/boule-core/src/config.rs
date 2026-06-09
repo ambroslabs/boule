@@ -266,16 +266,20 @@ impl AdminApiConfig {
 }
 
 /// `[consensus.application]` — which execution backend processes the
-/// blocks consensus orders. Absent means the built-in counter state
-/// machine. `backend = "reth"` drives an external reth execution layer
-/// over the Engine API (one block = one EVM payload); it requires the
-/// node binary to be built with the `reth` cargo feature, otherwise
-/// startup fails with a clear error.
+/// blocks consensus orders. `backend = "reth"` drives an external reth
+/// execution layer over the Engine API (one block = one EVM payload); it
+/// requires the node binary to be built with the `reth` cargo feature,
+/// otherwise startup fails with a clear error.
+///
+/// reth is the only supported production backend (#881/#883). The in-process
+/// counter state machine survives only as deterministic-sim / test
+/// infrastructure and is no longer reachable through this config: a
+/// validating node with no `[consensus.application]` is a startup error
+/// unless the hidden dev affordance
+/// [`ConsensusConfig::allow_counter_state_machine`] is set.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(tag = "backend", rename_all = "kebab-case")]
 pub enum ApplicationConfig {
-    /// The built-in in-process counter state machine (the default).
-    Counter,
     /// An external reth EL driven over the Engine API.
     Reth {
         /// Authenticated Engine API endpoint (reth `--authrpc`, e.g.
@@ -305,6 +309,12 @@ pub enum ApplicationConfig {
 
 fn default_reth_build_wait_ms() -> u64 {
     200
+}
+
+/// `serde(skip_serializing_if)` predicate for `bool` fields that default to
+/// `false` and should be omitted from serialized config when unset.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// HotStuff consensus configuration. Opt-in via the top-level
@@ -344,10 +354,21 @@ pub struct ConsensusConfig {
     /// genesis-anchored, today's behaviour. See `[consensus.weak_subjectivity_checkpoint]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weak_subjectivity_checkpoint: Option<WeakSubjectivityCheckpoint>,
-    /// Execution backend (`[consensus.application]`). Absent = the
-    /// built-in counter state machine. See [`ApplicationConfig`].
+    /// Execution backend (`[consensus.application]`). reth is the only
+    /// supported production backend (#881/#883). Absent on a validating node
+    /// is a startup error unless [`Self::allow_counter_state_machine`] is set.
+    /// See [`ApplicationConfig`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application: Option<ApplicationConfig>,
+    /// Hidden dev/test affordance (#883): permit a node to run the built-in
+    /// counter state machine instead of a reth execution layer. This exists
+    /// only for the local `testnet` driver (rewritten in #888) and ad-hoc
+    /// experiments — a production node MUST configure a reth
+    /// `[consensus.application]`. When `false` (the default) a validating node
+    /// with no reth application refuses to start. Undocumented in operator
+    /// docs on purpose; do not rely on it in production.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_counter_state_machine: bool,
     /// Maximum commands the leader pulls from the mempool per proposal.
     #[serde(default = "default_propose_limit")]
     pub propose_limit: usize,
@@ -2848,6 +2869,42 @@ listen_addr = "127.0.0.1:8080"
             .map(|e| format!("\"{}\"", e.nid_b58))
             .collect();
         format!("validators = [{}]\n", names.join(", "))
+    }
+
+    #[test]
+    fn allow_counter_state_machine_defaults_false_and_round_trips() {
+        // #883: a `[consensus]` block with no application defaults the hidden
+        // dev affordance to `false`, and round-trips when explicitly set.
+        let base = r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["11111111111111111111111111111111"]
+"#;
+        let cons = parse(base).consensus.expect("consensus");
+        assert!(
+            !cons.allow_counter_state_machine,
+            "must default to false (production fails closed without a reth backend)",
+        );
+        // Omitting it from a clean default must not serialize the key back.
+        let re = toml::to_string(&cons).expect("serialize");
+        assert!(
+            !re.contains("allow_counter_state_machine"),
+            "false must be skipped on serialize; got:\n{re}",
+        );
+
+        let with_flag = format!("{base}allow_counter_state_machine = true\n");
+        let cons = parse(&with_flag).consensus.expect("consensus");
+        assert!(cons.allow_counter_state_machine, "explicit true must parse");
+        let re = toml::to_string(&cons).expect("serialize");
+        assert!(
+            re.contains("allow_counter_state_machine = true"),
+            "true must round-trip; got:\n{re}",
+        );
     }
 
     #[test]
