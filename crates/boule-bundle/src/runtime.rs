@@ -45,6 +45,10 @@ use crate::transport::InProcessTransport;
 /// on one host (the smoke test / a local cluster).
 #[derive(Debug, Clone)]
 pub struct RethPorts {
+    /// Address the public `eth_*` HTTP RPC server binds. Defaults to loopback
+    /// (`127.0.0.1`); `boule node --dev` sets `0.0.0.0` so a published Docker
+    /// port (`-p 8545:8545`) reaches it.
+    pub http_addr: std::net::IpAddr,
     /// Public `eth_*` HTTP RPC port (`--http.port`).
     pub http_port: u16,
     /// Authenticated Engine API port (`--authrpc.port`). The bundle talks to the
@@ -59,6 +63,7 @@ pub struct RethPorts {
 impl Default for RethPorts {
     fn default() -> Self {
         Self {
+            http_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             http_port: 8545,
             auth_port: 8551,
             p2p_port: 0,
@@ -109,7 +114,7 @@ fn build_node_config(cfg: &BundleRethConfig) -> Result<NodeConfig<ChainSpec>> {
         .with_http()
         .with_http_api(http_api)
         .with_auth_ipc();
-    node_config.rpc.http_addr = std::net::Ipv4Addr::LOCALHOST.into();
+    node_config.rpc.http_addr = cfg.ports.http_addr;
     node_config.rpc.http_port = cfg.ports.http_port;
     node_config.rpc.auth_addr = std::net::Ipv4Addr::LOCALHOST.into();
     node_config.rpc.auth_port = cfg.ports.auth_port;
@@ -168,38 +173,31 @@ async fn fetch_finalized_head_in_process(
     Ok(Some((height, root)))
 }
 
+/// Build the boule [`Config`] (plus the network + optional validator identity)
+/// for a bundled run, given reth's genesis state root.
+///
+/// reth's genesis state root is only known after reth launches in-process, so
+/// config that depends on it (the consensus `genesis_seed_hex`, and — for
+/// `--dev` — a freshly minted chain-bound BLS PoP) is built through this
+/// callback *after* [`run_bundled`] has the root. The standard `boule node`
+/// path ignores the root and returns the operator's pre-loaded config (after a
+/// fail-closed bridge check); the `--dev` path mints its whole single-validator
+/// config *from* the root, so it matches by construction.
+pub type ConfigProvider = Box<
+    dyn FnOnce([u8; 32]) -> Result<(Config, NodeIdentity, Option<NodeIdentity>)> + Send + 'static,
+>;
+
 /// Run the bundled single-process node (#885): launch `BouleNode` in-process,
 /// then drive boule consensus against it. Blocks until ctrl-c or reth exits.
-pub async fn run_bundled(
-    config: Config,
-    network_identity: NodeIdentity,
-    validator_identity: Option<NodeIdentity>,
+///
+/// The standard `boule node` entry [`run_bundled`] wraps this with a provider
+/// that returns the operator's pre-loaded config after the genesis bridge check;
+/// `boule node --dev` ([`crate::dev::run_dev`]) passes a provider that mints a
+/// whole single-validator config from reth's genesis root.
+pub async fn run_bundled_with(
     reth_cfg: BundleRethConfig,
+    config_provider: ConfigProvider,
 ) -> Result<()> {
-    // Pull the in-process application parameters from the dedicated config
-    // variant (`reth-inprocess`); the standalone `reth` variant carries HTTP/JWT
-    // fields that are meaningless here.
-    let (fee_recipient, build_wait_ms) = match config
-        .consensus
-        .as_ref()
-        .and_then(|c| c.application.as_ref())
-    {
-        Some(ApplicationConfig::RethInProcess {
-            fee_recipient,
-            build_wait_ms,
-        }) => (fee_recipient.clone(), *build_wait_ms),
-        Some(ApplicationConfig::Reth { .. }) => anyhow::bail!(
-            "[consensus.application] backend = \"reth\" selects the standalone two-process node; \
-             run it with `boule start`. The bundled `boule node` requires backend = \
-             \"reth-inprocess\"."
-        ),
-        None => anyhow::bail!(
-            "the bundled `boule node` requires [consensus.application] backend = \
-             \"reth-inprocess\""
-        ),
-    };
-
-    // === Launch reth (BouleNode) in-process ===
     let node_config = build_node_config(&reth_cfg)?;
     let data_dir = node_config.datadir();
     let db_path = data_dir.db();
@@ -257,41 +255,44 @@ pub async fn run_bundled(
 
     let transport = InProcessTransport::new(engine_client, eth_client);
 
-    // === Genesis-root bridge (fail closed) ===
     let (reth_genesis_hash, reth_genesis_root) = fetch_genesis_in_process(&transport).await?;
-    let genesis_state_commitment = config
+    // Read the finalized head once, in-process, for frontier recovery on restart.
+    let finalized = fetch_finalized_head_in_process(&transport).await?;
+
+    // === Resolve the config now that the genesis root is known ===
+    // The standard path returns the operator's pre-loaded config (after a
+    // fail-closed bridge check inside `run_bundled`); `--dev` mints a whole
+    // single-validator config from the root here.
+    let (config, network_identity, validator_identity) = config_provider(reth_genesis_root)?;
+
+    // Pull the in-process application parameters from the dedicated config
+    // variant (`reth-inprocess`); the standalone `reth` variant carries HTTP/JWT
+    // fields that are meaningless here.
+    let (fee_recipient, build_wait_ms) = match config
         .consensus
         .as_ref()
-        .map(|c| {
-            // The consensus genesis `state_commitment` derives from
-            // `genesis_seed_hex`; decode it the same way consensus does. When
-            // absent it is all-zeros (which will mismatch reth and fail closed,
-            // exactly as intended).
-            c.genesis_seed_hex
-                .as_deref()
-                .map(decode_seed_hex)
-                .transpose()
-        })
-        .transpose()?
-        .flatten()
-        .unwrap_or([0u8; 32]);
-    if reth_genesis_root != genesis_state_commitment {
-        anyhow::bail!(
-            "consensus genesis state_commitment {} does not match reth's genesis state root {}; \
-             set [consensus] genesis_seed_hex = \"{}\"",
-            hex::encode(genesis_state_commitment),
-            hex::encode(reth_genesis_root),
-            hex::encode(reth_genesis_root),
-        );
-    }
+        .and_then(|c| c.application.as_ref())
+    {
+        Some(ApplicationConfig::RethInProcess {
+            fee_recipient,
+            build_wait_ms,
+        }) => (fee_recipient.clone(), *build_wait_ms),
+        Some(ApplicationConfig::Reth { .. }) => anyhow::bail!(
+            "[consensus.application] backend = \"reth\" selects the standalone two-process node; \
+             run it with `boule start`. The bundled `boule node` requires backend = \
+             \"reth-inprocess\"."
+        ),
+        None => anyhow::bail!(
+            "the bundled `boule node` requires [consensus.application] backend = \
+             \"reth-inprocess\""
+        ),
+    };
+
     info!(
         target: "boule::bundle",
         genesis_root = %hex::encode(reth_genesis_root),
         "in-process reth genesis bridged to consensus genesis",
     );
-
-    // Read the finalized head once, in-process, for frontier recovery on restart.
-    let finalized = fetch_finalized_head_in_process(&transport).await?;
 
     // === Inject the RethApplication factory + race reth's exit future ===
     // The transport is moved into the factory; the genesis / finalized-head reads
@@ -339,6 +340,47 @@ pub async fn run_bundled(
     drop(full);
     drop(node_handle.node);
     result
+}
+
+/// Run the bundled single-process node (#885): the operator path. Loads the
+/// genesis root from reth in-process and enforces the fail-closed bridge check
+/// against the consensus `genesis_seed_hex` before running.
+pub async fn run_bundled(
+    config: Config,
+    network_identity: NodeIdentity,
+    validator_identity: Option<NodeIdentity>,
+    reth_cfg: BundleRethConfig,
+) -> Result<()> {
+    let provider: ConfigProvider = Box::new(move |reth_genesis_root: [u8; 32]| {
+        // === Genesis-root bridge (fail closed) ===
+        let genesis_state_commitment = config
+            .consensus
+            .as_ref()
+            .map(|c| {
+                // The consensus genesis `state_commitment` derives from
+                // `genesis_seed_hex`; decode it the same way consensus does. When
+                // absent it is all-zeros (which will mismatch reth and fail
+                // closed, exactly as intended).
+                c.genesis_seed_hex
+                    .as_deref()
+                    .map(decode_seed_hex)
+                    .transpose()
+            })
+            .transpose()?
+            .flatten()
+            .unwrap_or([0u8; 32]);
+        if reth_genesis_root != genesis_state_commitment {
+            anyhow::bail!(
+                "consensus genesis state_commitment {} does not match reth's genesis state root \
+                 {}; set [consensus] genesis_seed_hex = \"{}\"",
+                hex::encode(genesis_state_commitment),
+                hex::encode(reth_genesis_root),
+                hex::encode(reth_genesis_root),
+            );
+        }
+        Ok((config, network_identity, validator_identity))
+    });
+    run_bundled_with(reth_cfg, provider).await
 }
 
 /// Construct `RethApplication` (unchanged) against the shared consensus mempool,

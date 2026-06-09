@@ -1,0 +1,16 @@
+# Keep heavy/irrelevant artifacts out of the Docker build context.
+# The docker/Dockerfile builds from the repo root (the bundle path-depends on its
+# sibling crates), so the whole tree is the context — exclude what the build does
+# not need.
+
+# Build outputs (each workspace's target/, incl. the standalone reth-side ones).
+target/
+**/target/
+
+# Generated genesis bytecode (build.rs regenerates it from the .sol sources).
+crates/boule-reth/genesis.json
+
+# VCS + CI + local tooling (not needed to compile the binary).
+.git/
+.github/
+.claude/

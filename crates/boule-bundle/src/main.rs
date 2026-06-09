@@ -15,6 +15,7 @@
 //! test / clippy those subcommands without ever compiling the reth dep tree.
 //! Only this crate (in the reth-side workspace) links reth.
 
+mod dev;
 mod runtime;
 mod transport;
 
@@ -54,7 +55,15 @@ enum Command {
 
 #[derive(Parser)]
 struct NodeArgs {
-    /// Config file path (default: platform-specific location).
+    /// Zero-config dev mode: bootstrap a single-validator chain in-process
+    /// (mint keys, build a seeded genesis, launch reth, mint the chain-bound
+    /// BLS PoP at reth's genesis root, and run consensus) — no `--chain`, no
+    /// `--config`, no shell. State lives under `--datadir` (a temp dir by
+    /// default). For local development only.
+    #[arg(long)]
+    dev: bool,
+    /// Config file path (default: platform-specific location). Ignored with
+    /// `--dev` (the dev chain mints its own config).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
     /// Fail closed on insecure defaults (also set by BOULE_ENV=production).
@@ -65,12 +74,13 @@ struct NodeArgs {
     allow_insecure_perms: bool,
     /// Path to the seeded genesis JSON (the `boule genesis dev` output / build.rs
     /// `genesis.json` seeded with validator weights). Parsed into reth's
-    /// chainspec.
-    #[arg(long = "chain")]
-    chain: PathBuf,
-    /// reth data directory (mdbx + static files).
+    /// chainspec. Required unless `--dev` (which generates one).
+    #[arg(long = "chain", required_unless_present = "dev")]
+    chain: Option<PathBuf>,
+    /// reth data directory (mdbx + static files). With `--dev`, defaults to a
+    /// temp dir wiped on exit.
     #[arg(long = "datadir")]
-    datadir: PathBuf,
+    datadir: Option<PathBuf>,
     /// Public eth `eth_*` HTTP RPC port.
     #[arg(long = "http.port", default_value_t = 8545)]
     http_port: u16,
@@ -106,8 +116,29 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// `boule node`: mirrors `boule-cli`'s `start::handle` (config load + identity
-/// resolution), then launches the bundled reth-in-process runtime.
+/// resolution), then launches the bundled reth-in-process runtime. With `--dev`,
+/// delegates to the zero-config single-validator dev bootstrap instead.
 async fn handle_node(args: NodeArgs) -> anyhow::Result<()> {
+    if args.dev {
+        return dev::run_dev(dev::DevArgs {
+            datadir: args.datadir,
+            http_port: args.http_port,
+            auth_port: args.auth_port,
+            p2p_port: args.p2p_port,
+            http_api: args.http_api,
+            fee_recipient: dev::DEV_FEE_RECIPIENT.to_string(),
+        })
+        .await;
+    }
+
+    // `--chain`/`--datadir` are required without `--dev` (enforced by clap for
+    // `--chain`; `--datadir` is required here so the non-dev path always has an
+    // explicit state directory).
+    let chain = args.chain.context("--chain is required without --dev")?;
+    let datadir = args
+        .datadir
+        .context("--datadir is required without --dev")?;
+
     let config_path = crate::resolve_config_path(args.config_path)?;
     let config = config::load(&config_path)?;
     info!("loaded config from {}", config_path.display());
@@ -147,17 +178,19 @@ async fn handle_node(args: NodeArgs) -> anyhow::Result<()> {
 
     // The reth chainspec is read from the genesis file (a path); pass it through
     // verbatim — `EthereumChainSpecParser` accepts a path or JSON string.
-    let chain_json = std::fs::read_to_string(&args.chain)
-        .with_context(|| format!("reading chainspec genesis {}", args.chain.display()))?;
+    let chain_json = std::fs::read_to_string(&chain)
+        .with_context(|| format!("reading chainspec genesis {}", chain.display()))?;
 
     let reth_cfg = BundleRethConfig {
         chain_json,
-        datadir: args.datadir,
+        datadir,
         ports: RethPorts {
+            // Operator path keeps the historical loopback bind (default).
             http_port: args.http_port,
             auth_port: args.auth_port,
             p2p_port: args.p2p_port,
             auth_ipc_path: args.auth_ipc_path,
+            ..RethPorts::default()
         },
         http_api: args.http_api,
     };
