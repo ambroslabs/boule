@@ -305,6 +305,22 @@ pub enum ApplicationConfig {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reth_peers: Vec<String>,
     },
+    /// reth embedded **in the same process** as consensus (the bundled
+    /// single-binary node, #884/#885/#886). The boule↔EL hop is an in-process
+    /// Engine API call (reth's auth-server IPC client) — no HTTP, no JWT — so
+    /// `engine_url` / `eth_url` / `jwt_secret_path` are not configured here; the
+    /// bundle (`boule node`) owns reth's datadir, chainspec, and ports. Selected
+    /// by `backend = "reth-inprocess"`. Honored only by the bundle binary; the
+    /// standalone `boule start` rejects it (it cannot launch reth in-process).
+    #[serde(rename = "reth-inprocess")]
+    RethInProcess {
+        /// EVM `suggestedFeeRecipient` for built payloads.
+        fee_recipient: String,
+        /// Pause between `forkchoiceUpdatedV3(attrs)` and `getPayloadV3` so
+        /// reth's async build can pull pool transactions in.
+        #[serde(default = "default_reth_build_wait_ms")]
+        build_wait_ms: u64,
+    },
 }
 
 fn default_reth_build_wait_ms() -> u64 {
@@ -2904,6 +2920,66 @@ validators = ["11111111111111111111111111111111"]
         assert!(
             re.contains("allow_counter_state_machine = true"),
             "true must round-trip; got:\n{re}",
+        );
+    }
+
+    #[test]
+    fn reth_inprocess_backend_parses_without_http_jwt_fields() {
+        // #886: the bundled single-process backend selects `reth-inprocess` and
+        // must NOT require the standalone two-process HTTP/JWT fields
+        // (engine_url / eth_url / jwt_secret_path).
+        let s = r#"
+[node]
+listen_addr = "127.0.0.1:7000"
+
+[api]
+listen_addr = "127.0.0.1:8080"
+
+[consensus]
+validators = ["11111111111111111111111111111111"]
+
+[consensus.application]
+backend = "reth-inprocess"
+fee_recipient = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+"#;
+        let cons = parse(s).consensus.expect("consensus");
+        match cons.application.expect("application") {
+            ApplicationConfig::RethInProcess {
+                fee_recipient,
+                build_wait_ms,
+            } => {
+                assert_eq!(fee_recipient, "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+                assert_eq!(build_wait_ms, default_reth_build_wait_ms());
+            }
+            other => panic!("expected RethInProcess, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn application_backend_tag_round_trips() {
+        // The serde `tag = "backend"` discriminant must serialize back to the
+        // kebab-case names so `boule node` vs `boule start` stay unambiguous.
+        let reth = ApplicationConfig::Reth {
+            engine_url: "http://127.0.0.1:8551".into(),
+            eth_url: "http://127.0.0.1:8545".into(),
+            jwt_secret_path: PathBuf::from("/tmp/jwt.hex"),
+            fee_recipient: "0x00".into(),
+            build_wait_ms: 200,
+            reth_peers: vec![],
+        };
+        assert!(
+            toml::to_string(&reth)
+                .unwrap()
+                .contains("backend = \"reth\"")
+        );
+        let inproc = ApplicationConfig::RethInProcess {
+            fee_recipient: "0x00".into(),
+            build_wait_ms: 200,
+        };
+        assert!(
+            toml::to_string(&inproc)
+                .unwrap()
+                .contains("backend = \"reth-inprocess\"")
         );
     }
 
