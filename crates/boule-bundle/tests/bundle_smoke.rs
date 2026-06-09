@@ -256,14 +256,14 @@ fn single_validator_commits_blocks() {
     let mut passed = false;
     while Instant::now() < deadline {
         // Bail out early if the node died.
-        if let Some(child) = guard.0.as_mut() {
-            if let Ok(Some(status)) = child.try_wait() {
-                let tail = std::fs::read_to_string(&log).unwrap_or_default();
-                panic!(
-                    "`boule node` exited early ({status:?}); log tail:\n{}",
-                    tail.lines().rev().take(60).collect::<Vec<_>>().join("\n")
-                );
-            }
+        if let Some(child) = guard.0.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            let tail = std::fs::read_to_string(&log).unwrap_or_default();
+            panic!(
+                "`boule node` exited early ({status:?}); log tail:\n{}",
+                tail.lines().rev().take(60).collect::<Vec<_>>().join("\n")
+            );
         }
         if let Some(n) = eth_block_number(&http) {
             last = n;
