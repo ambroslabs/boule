@@ -25,6 +25,10 @@
 //! [`BondedStakeLedger`]:
 //!   boule_consensus::replication::stake_source::BondedStakeLedger
 
+use std::path::PathBuf;
+
+use boule_consensus::genesis::derive_chain_id_from_parts;
+use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
 use boule_core::crypto::sig_scheme::{BlsAggregated, BlsKeyError, BlsPublicKey};
 use boule_core::identity::NodeId;
 use serde_json::Value;
@@ -336,6 +340,71 @@ pub fn dev_genesis_validators(n: usize) -> Vec<GenesisValidator> {
 pub fn build_dev_genesis(n: usize) -> Value {
     build_seeded_genesis(dev_genesis_validators(n))
         .expect("dev validators have valid BLS keys and a Registry predeploy")
+}
+
+/// One validator's chain-bound BLS genesis row: its `NodeId`, BLS public key,
+/// and the proof-of-possession signed over the chain's `chain_id` (#410 PoP).
+/// Feeds a `[[consensus.validators_bls]]` genesis entry.
+#[derive(Debug, Clone)]
+pub struct BlsPopRow {
+    /// The validator's boule [`NodeId`] (32 bytes).
+    pub node_id: NodeId,
+    /// The validator's BLS public key.
+    pub pubkey: BlsPublicKey,
+    /// The PoP signature bytes (over the chain's `chain_id`).
+    pub pop_sig: Vec<u8>,
+}
+
+/// Mint (or load) the BLS keys at `key_paths` and emit each validator's
+/// chain-bound PoP for a chain whose genesis seed is `genesis_seed` (#410).
+///
+/// The `chain_id` (PoP pre-image) is derived over the **whole** validator set
+/// — set-order independent, exactly as `[consensus.validators]` parsing does —
+/// so a 2-of-N BLS quorum's PoPs all verify on every node. Input order is
+/// preserved in the returned rows. A single-validator deployment is just the
+/// `n == 1` case.
+///
+/// Dev/e2e callers tolerate group/world-readable perms on the freshly created
+/// key files (`allow_insecure_perms = true`); a production deployment should
+/// pass `false`.
+///
+/// This is the reusable primitive behind the CLI's `boule genesis bls-pop`
+/// subcommand; it reproduces the testnet driver's mint/derive/sign sequence
+/// against an explicit reth genesis seed.
+pub fn mint_genesis_bls_pops(
+    validators: &[(NodeId, PathBuf)],
+    genesis_seed: [u8; 32],
+    allow_insecure_perms: bool,
+) -> anyhow::Result<Vec<BlsPopRow>> {
+    anyhow::ensure!(!validators.is_empty(), "at least one validator is required");
+
+    // Load every validator's BLS key first (input order preserved).
+    let mut ids = Vec::with_capacity(validators.len());
+    let mut bls = Vec::with_capacity(validators.len());
+    let mut secrets = Vec::with_capacity(validators.len());
+    for (node_id, path) in validators {
+        let identity = BlsKeyFile::new(path.clone())
+            .with_allow_insecure_perms(allow_insecure_perms)
+            .load_or_init()?;
+        ids.push(*node_id);
+        bls.push((*node_id, identity.public));
+        secrets.push(identity.secret);
+    }
+
+    // Joint chain_id over the WHOLE validator set (set-order independent).
+    let chain_id = derive_chain_id_from_parts(&ids, &bls, &[], genesis_seed);
+
+    let mut rows = Vec::with_capacity(validators.len());
+    for (i, secret) in secrets.iter().enumerate() {
+        let pop = BlsAggregated::sign_pop(secret, &chain_id)
+            .map_err(|e| anyhow::anyhow!("signing chain-bound BLS PoP: {e:?}"))?;
+        rows.push(BlsPopRow {
+            node_id: ids[i],
+            pubkey: bls[i].1,
+            pop_sig: pop.sig.to_vec(),
+        });
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]

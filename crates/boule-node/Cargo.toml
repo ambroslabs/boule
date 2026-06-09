@@ -12,19 +12,6 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# Public eth-facing services for full nodes (#806). Both are reth/EVM-specific
-# (they sign + relay EVM JSON-RPC), so they only build with the `reth` feature;
-# in the default build they are skipped rather than failing to compile.
-[[bin]]
-name = "faucet"
-path = "src/bin/faucet.rs"
-required-features = ["reth"]
-
-[[bin]]
-name = "eth-rpc-proxy"
-path = "src/bin/eth-rpc-proxy.rs"
-required-features = ["reth"]
-
 [features]
 # Build the reth execution-layer backend (`[consensus.application] backend
 # = "reth"`). Pulls in `boule-reth`; off by default so the standard build

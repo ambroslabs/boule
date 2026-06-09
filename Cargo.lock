@@ -1202,6 +1202,7 @@ dependencies = [
  "boule-consensus",
  "boule-core",
  "boule-node",
+ "boule-reth",
  "bytes",
  "clap",
  "futures-util",
