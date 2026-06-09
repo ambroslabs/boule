@@ -1,0 +1,7 @@
+# Keep the docker build context (repo root) lean — cargo rebuilds inside the
+# image, so local build outputs and VCS metadata are noise. See docker/Dockerfile.
+.git
+target
+crates/boule-reth-node/target
+fuzz/target
+**/*.log
