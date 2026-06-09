@@ -422,6 +422,7 @@ fn write_final_config(
          storage_dir      = \"{storage}\"\n\
          timeout_base_ms  = {timeout_base_ms}\n\
          timeout_max_ms   = {timeout_max_ms}\n\
+         allow_counter_state_machine = true\n\
          {bls_consensus_toml}",
         addr = n.addr_path.display(),
         key = n.key_path.display(),

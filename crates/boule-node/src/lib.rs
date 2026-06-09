@@ -444,10 +444,7 @@ async fn reth_application(
         fee_recipient,
         build_wait_ms,
         reth_peers,
-    } = cfg
-    else {
-        unreachable!("reth_application called for a non-reth backend");
-    };
+    } = cfg;
     // Connect the local reth to the other validators' reths (best-effort) so
     // tx-pool gossip and EL self-sync work across the cluster.
     boule_reth::peer_reths(eth_url, reth_peers).await?;
@@ -729,12 +726,15 @@ async fn start_consensus(
         }
     }
 
-    // Select the execution backend (`[consensus.application]`). Absent or
-    // `counter` keeps the in-process counter application the constructor
-    // wired; `reth` swaps in the Engine-API-backed application after
-    // bridging the consensus genesis to reth's.
+    // Select the execution backend (`[consensus.application]`). reth is the
+    // only supported production backend (#881/#883): a configured `reth`
+    // swaps in the Engine-API-backed application after bridging the consensus
+    // genesis to reth's. An absent application is a startup error — the
+    // in-process counter state machine the constructor wired is test/sim
+    // infrastructure only, reachable solely via the hidden
+    // `allow_counter_state_machine` dev affordance (used by the `testnet`
+    // driver, rewritten in #888).
     match cons_cfg.application.as_ref() {
-        None | Some(ApplicationConfig::Counter) => {}
         Some(reth_cfg) => {
             let app = reth_application(
                 reth_cfg,
@@ -745,6 +745,23 @@ async fn start_consensus(
             )
             .await?;
             node = node.with_application(app);
+        }
+        None if cons_cfg.allow_counter_state_machine => {
+            // Dev/test path only: keep the constructor-wired counter SM.
+            warn!(
+                target: "boule::node",
+                "[consensus] allow_counter_state_machine = true: running the built-in counter \
+                 state machine. This is test/dev infrastructure and is NOT a supported \
+                 production backend — configure [consensus.application] backend = \"reth\".",
+            );
+        }
+        None => {
+            anyhow::bail!(
+                "[consensus] is configured but no execution backend is set: a node must declare \
+                 [consensus.application] with backend = \"reth\". reth is the only supported \
+                 execution layer (#881/#883); the in-process counter state machine is no longer \
+                 a production backend.",
+            );
         }
     }
 
@@ -1124,6 +1141,7 @@ mod tests {
             genesis_seed_hex: None,
             weak_subjectivity_checkpoint: None,
             application: None,
+            allow_counter_state_machine: false,
             propose_limit: 64,
             mempool_capacity: 1024,
             max_endpoint_list_length: 8,
