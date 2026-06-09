@@ -245,9 +245,17 @@ jobs:
       # (a) The relocated CLI integration tests run against the unified binary
       # (`CARGO_BIN_EXE_boule`). `smoke_sweep`'s heavy cluster sweep is
       # `#[ignore]`d (it runs in smoke.yml); the fast structural checks run here.
+      #
+      # `--test-threads=1`: these binaries include multi-node libp2p cluster
+      # tests (the `testnet_driver_test` clusters + `test_libp2p_overlay_*` /
+      # `test_consensus_status_*` smokes) that stand up real nodes over loopback
+      # and must form a gossipsub mesh + commit within a budget. Under the
+      # runner's default parallelism they starve during mesh formation and flake
+      # ("cluster did not commit within 30s") — the same reason the root
+      # workspace routes them onto a serialized heavy shard. Run serially here.
       - if: needs.changes.outputs.bundle == 'true'
         name: Relocated CLI integration tests
-        run: cargo test --locked --test integration_test --test testnet_driver_test --test smoke_sweep
+        run: cargo test --locked --test integration_test --test testnet_driver_test --test smoke_sweep -- --test-threads=1
 
       # (b) The single-process `boule node` smoke: reth in-process committing
       # blocks (the folded-in former smoke.sh). `#[ignore]`d, run explicitly.
