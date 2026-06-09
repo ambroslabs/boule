@@ -18,6 +18,15 @@ categories.workspace = true
 # stays lean. A config that selects the reth backend without this feature
 # fails at startup with a clear error.
 reth = ["dep:boule-reth"]
+# Compiles the test/sim-only in-process counter execution backend — the
+# `CounterStateMachine` (via `boule-consensus/testing`), the `MempoolBlockBuilder`
+# default application, the `state_machine` constructor params, and the
+# `allow_counter_state_machine` dev affordance (#894). Off in production (reth is
+# the only supported backend, #883); enabled by downstream test builds — the
+# bundle's fast consensus-liveness integration tests — that need the lightweight
+# counter without booting reth. This crate's own tests get it for free via the
+# `test` cfg.
+testing = ["boule-consensus/testing"]
 
 [dependencies]
 boule-core          = { path = "../boule-core", version = "0.1.0" }

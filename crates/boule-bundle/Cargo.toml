@@ -58,8 +58,13 @@ boule-reth-node = { path = "../boule-reth-node" }
 boule-core = { path = "../boule-core" }
 boule-consensus = { path = "../boule-consensus" }
 # boule-node provides the `run_with_application` injection seam + identity/config
-# plumbing; build it WITH the `reth` feature so the eth-public services compile.
-boule-node = { path = "../boule-node", features = ["reth"] }
+# plumbing; build it WITH the `reth` feature so the eth-public services compile,
+# plus `testing` so the unified `boule` binary keeps the in-process counter
+# backend the fast consensus-liveness integration tests drive via
+# `allow_counter_state_machine` (the counter is otherwise gated out of a
+# production binary — #894; the canonical reth-only production build is the main
+# workspace's `boule-cli`).
+boule-node = { path = "../boule-node", features = ["reth", "testing"] }
 # boule-reth provides the `EngineTransport` seam + `RethApplication` + predeploy
 # decoders; this crate implements the in-process transport against it.
 boule-reth = { path = "../boule-reth" }
@@ -103,7 +108,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # library + `boule_consensus`/`boule_core` helpers directly.
 boule-core = { path = "../boule-core" }
 boule-consensus = { path = "../boule-consensus" }
-boule-node = { path = "../boule-node", features = ["reth"] }
+boule-node = { path = "../boule-node", features = ["reth", "testing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "rustls-tls-native-roots"] }

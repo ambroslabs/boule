@@ -30,6 +30,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 
+// Only the test/sim-only counter `state_machine` (#894) wraps state in a
+// `Mutex` at this layer; production seeds the placeholder application instead.
+#[cfg(any(test, feature = "testing"))]
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -37,8 +40,14 @@ use tracing::{info, warn};
 
 use crate::consensus_node::{ConsensusNode, NodeConfigForConsensus};
 use boule_consensus::replication::application::Application;
-use boule_consensus::replication::impls::{CounterStateMachine, InMemoryMempool};
+// The counter state machine is test/sim-only (#894): production orders reth,
+// not the in-process `StateMachine`. The constructor wires the placeholder app
+// in non-`testing` builds, so `run` only seeds a counter under the gate.
+#[cfg(any(test, feature = "testing"))]
+use boule_consensus::replication::impls::CounterStateMachine;
+use boule_consensus::replication::impls::InMemoryMempool;
 use boule_consensus::replication::mempool::Mempool;
+#[cfg(any(test, feature = "testing"))]
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_set::ValidatorSet;
@@ -775,6 +784,13 @@ async fn start_consensus(
         max_endpoint_list_length: cons_cfg.max_endpoint_list_length,
     };
 
+    // The in-process counter state machine is test/sim-only (#894). It is the
+    // lightweight backend reachable solely via the hidden
+    // `allow_counter_state_machine` dev affordance below (used by the testnet
+    // driver and the bundle's fast consensus-liveness tests); production orders
+    // reth, so the non-`testing` build constructs no counter at all and the
+    // constructor seeds an inert placeholder application.
+    #[cfg(any(test, feature = "testing"))]
     let state_machine: Arc<Mutex<Box<dyn StateMachine>>> =
         Arc::new(Mutex::new(Box::new(CounterStateMachine::new())));
     let mempool: Arc<dyn Mempool> = Arc::new(InMemoryMempool::new(cons_cfg.mempool_capacity));
@@ -821,6 +837,9 @@ async fn start_consensus(
     let mut node = ConsensusNode::recover(
         *self_id,
         node_cfg,
+        // Test/sim-only counter SM (#894); the parameter is gated out of the
+        // production constructor signature, so omit it there too.
+        #[cfg(any(test, feature = "testing"))]
         state_machine,
         Arc::clone(&mempool),
         storage,
@@ -883,8 +902,14 @@ async fn start_consensus(
             .await?;
             node = node.with_application(app);
         }
+        // Dev/test path only (#894): keep the constructor-wired counter SM. The
+        // counter is gated out of the production binary, so this affordance only
+        // exists in `testing`/test builds (the testnet driver + the bundle's
+        // fast consensus-liveness tests). In a production build the
+        // `allow_counter_state_machine` flag is inert and a node with no reth
+        // backend falls through to the error below.
+        #[cfg(any(test, feature = "testing"))]
         (None, None) if cons_cfg.allow_counter_state_machine => {
-            // Dev/test path only: keep the constructor-wired counter SM.
             warn!(
                 target: "boule::node",
                 "[consensus] allow_counter_state_machine = true: running the built-in counter \
