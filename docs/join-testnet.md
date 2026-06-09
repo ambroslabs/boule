@@ -34,12 +34,13 @@ To join, you need four things from the testnet operators (all public):
 ## 1. Prerequisites
 
 - `reth` v2.2.0 on `PATH` (the EL), plus `openssl`, `jq`, `curl`.
-- The two boule binaries, **built with the reth feature**:
+- The unified `boule` binary (reth linked in-process; built from the bundle's
+  standalone workspace):
   ```sh
-  cargo build -p boule-cli --features reth            # produces `boule`
-  cargo build -p boule-reth-node                      # produces the reth EL node
+  (cd crates/boule-bundle && cargo build)             # produces the single `boule` binary
   ```
-  Put both on `PATH` (or reference them by absolute path below).
+  Put it on `PATH` (or reference it by absolute path below). It hosts every
+  subcommand, including `node` (consensus + reth in-process).
 
 ## 2. Mint your node identity
 

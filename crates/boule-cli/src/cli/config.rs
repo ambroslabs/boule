@@ -10,7 +10,7 @@ use boule_core::config;
 use super::shared::{parse_output_format, resolve_config_path};
 
 #[derive(Args)]
-pub(crate) struct ConfigArgs {
+pub struct ConfigArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,

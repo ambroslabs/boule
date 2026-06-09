@@ -1,0 +1,5 @@
+# This crate is a standalone workspace embedding the reth SDK, whose MSRV (1.93)
+# is higher than boule's main workspace MSRV (1.85 in the repo-root clippy.toml).
+# Without this local file, clippy walks up to the root clippy.toml and warns that
+# its MSRV differs from this crate's Cargo.toml `rust-version`.
+msrv = "1.93.0"

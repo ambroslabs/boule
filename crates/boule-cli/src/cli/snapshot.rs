@@ -10,7 +10,7 @@ use boule_core::config;
 use super::shared::resolve_config_path;
 
 #[derive(Subcommand)]
-pub(crate) enum SnapshotCmd {
+pub enum SnapshotCmd {
     /// Dump a snapshot into a portable directory (manifest.bin + chunks).
     Export(SnapshotExportArgs),
     /// Load a directory produced by `snapshot export` into local storage.
@@ -18,7 +18,7 @@ pub(crate) enum SnapshotCmd {
 }
 
 #[derive(Args)]
-pub(crate) struct SnapshotExportArgs {
+pub struct SnapshotExportArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
@@ -31,7 +31,7 @@ pub(crate) struct SnapshotExportArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct SnapshotImportArgs {
+pub struct SnapshotImportArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,

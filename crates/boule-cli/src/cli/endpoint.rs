@@ -14,7 +14,7 @@ use boule_core::identity::{base58_to_node_id, node_id_to_base58};
 use super::shared::resolve_config_path;
 
 #[derive(Subcommand)]
-pub(crate) enum EndpointCmd {
+pub enum EndpointCmd {
     /// Replace the validator's published endpoint list.
     Set(EndpointEntriesArgs),
     /// Append entries to the validator's published list.
@@ -24,7 +24,7 @@ pub(crate) enum EndpointCmd {
 }
 
 #[derive(Args)]
-pub(crate) struct EndpointEntriesArgs {
+pub struct EndpointEntriesArgs {
     /// Config file path (default: platform-specific location). The
     /// validator's consensus key is loaded from it to sign the command.
     #[arg(short = 'c', long = "config")]
@@ -39,7 +39,7 @@ pub(crate) struct EndpointEntriesArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct EndpointRemoveArgs {
+pub struct EndpointRemoveArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,

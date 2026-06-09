@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Command-line interface and node binary for boule, a HotStuff-style BFT consensus layer."
+description = "The reth-free boule CLI command tree (library) for a HotStuff-style BFT consensus layer."
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/boule-cli"
@@ -12,17 +12,18 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-# The node binary. `boule-core` exposes its library as `boule`, so both the
-# binary and the testnet driver import it as `use boule_core::...`.
-[[bin]]
-name = "boule"
-path = "src/main.rs"
-
-# The `testnet` driver binary is auto-discovered from src/bin/testnet.rs.
+# This crate is a LIBRARY: it exposes the reth-free `boule` command tree
+# (`cli::Command` + `cli::dispatch`). The single user-facing `boule` binary is
+# produced by `boule-bundle` (reth-linked), which flattens this command tree
+# alongside its own `node` subcommand. There is exactly one `boule` binary in
+# the repo, and it is NOT here.
+#
+# The `testnet` driver binary is auto-discovered from src/bin/testnet.rs; it
+# stays here so the root-workspace integration tests can spawn it.
 
 [features]
-# Build the `boule` binary with the reth execution-layer backend
-# (`[consensus.application] backend = "reth"`). Passes through to
+# Build the reth-gated subcommands (`genesis`/`faucet`/`rpc-proxy`). Passes
+# through to
 # boule-node's `reth` feature and pulls in `boule-reth` for the reth-only
 # `genesis` / `faucet` / `rpc-proxy` subcommands; off by default so the
 # standard binary stays lean. See `../boule-reth/node-demo.md` for running a
@@ -44,11 +45,8 @@ clap               = { version = "4", features = ["derive", "env"] }
 reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde_json         = "1"
 
+# The CLI integration tests that used to live in `tests/` moved to
+# `boule-bundle` in #897, so they run against the unified `boule` binary. The
+# only remaining test-only dep is for the inline unit tests (e.g. rotation).
 [dev-dependencies]
-tokio              = { version = "1", features = ["full", "test-util"] }
-tempfile           = "3"
-reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
-serde              = { version = "1", features = ["derive"] }
-serde_json         = "1"
-libc               = "0.2"
-futures-util       = { version = "0.3", features = ["sink"] }
+tempfile = "3"

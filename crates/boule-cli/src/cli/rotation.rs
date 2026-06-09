@@ -14,7 +14,7 @@ use boule_core::identity::node_id_to_base58;
 use super::shared::resolve_config_path;
 
 #[derive(Subcommand)]
-pub(crate) enum RotationCmd {
+pub enum RotationCmd {
     /// Build a validator key-rotation payload, minting the new key(s).
     Propose(RotationProposeArgs),
     /// Build an operator-signed signing-key recovery payload (#549): rotate a
@@ -32,7 +32,7 @@ pub(crate) enum RotationCmd {
 }
 
 #[derive(Args)]
-pub(crate) struct HotRotateArgs {
+pub struct HotRotateArgs {
     /// Base URL of the running node's HTTP API (where `/admin/rotate-key`
     /// is served). Bind the API to a trusted interface — the endpoint is
     /// unauthenticated.
@@ -93,7 +93,7 @@ pub(crate) async fn handle_hot_rotate(args: HotRotateArgs) -> anyhow::Result<()>
 }
 
 #[derive(Args)]
-pub(crate) struct RotationProposeArgs {
+pub struct RotationProposeArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
@@ -145,7 +145,7 @@ pub(crate) fn handle_propose(args: RotationProposeArgs) -> anyhow::Result<()> {
 }
 
 #[derive(Args)]
-pub(crate) struct OperatorRecoveryArgs {
+pub struct OperatorRecoveryArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
@@ -214,7 +214,7 @@ pub(crate) fn handle_propose_operator_recovery(args: OperatorRecoveryArgs) -> an
 }
 
 #[derive(Args)]
-pub(crate) struct OperatorKeyRotationArgs {
+pub struct OperatorKeyRotationArgs {
     /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,

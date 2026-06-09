@@ -23,18 +23,26 @@ in the repo root pins the toolchain; `rustup` will pick it up automatically.
 # Build
 cargo build
 
+# The single user-facing `boule` binary is produced by `boule-bundle`
+# (reth-linked, its own standalone workspace). Build it and use it for the
+# commands below:
+#   (cd crates/boule-bundle && cargo build)   # heavy reth build; see node-demo.md
+#   boule=crates/boule-bundle/target/debug/boule
+
 # Bootstrap a single node (writes a starter config at the platform
 # default location if --config is omitted)
-cargo run --bin boule -- init --config config.toml
+"$boule" init --config config.toml
 
-# Run that node
-cargo run --bin boule -- start --config config.toml
+# Run that node (reth in-process)
+"$boule" node --config config.toml --chain genesis.json --datadir ./reth
 
 # Unit tests (includes the deterministic simulator)
 cargo test --lib
 
-# Integration tests (spawn real nodes in subprocesses; TLS + gossip end-to-end)
-cargo test --test integration_test
+# CLI integration tests (spawn real nodes in subprocesses; TLS + gossip
+# end-to-end) — they exercise the unified `boule` binary, so they live in the
+# reth-linked bundle workspace and run in CI's `bundle` lane:
+(cd crates/boule-bundle && cargo test --test integration_test)
 
 # Rendered API docs, including the crate-level overview
 cargo doc --document-private-items --open
@@ -69,7 +77,7 @@ binary.
 | `boule-consensus`     | HotStuff-style BFT: the safety core, pacemaker, message dispatch + wire format, block/mempool/snapshot replication and the state-machine seam, and validator-set rotation. |
 | `boule-transport-tcp` | TLS-authenticated transport, peer manager, dialer, RPC, and the gossip overlay (`Broadcaster` + `Discovery`). A node's Ed25519 public key is its overlay address.    |
 | `boule-node`          | The runtime that drives consensus over the transport, plus the `#[cfg(test)]` deterministic simulator and the local testnet driver.                                  |
-| `boule-cli`           | The `boule` binary, its subcommands, and the end-to-end integration tests.                                                                                           |
+| `boule-cli`           | The reth-free `boule` command-tree **library** (`init`/`start`/`key`/`config`/`snapshot`/`reconfig`/`rotation`/`endpoint`, plus reth-gated `genesis`/`faucet`/`rpc-proxy`) and the `testnet` driver bin. The unified `boule` binary lives in `boule-bundle`, which composes this tree + `node`. |
 
 Each crate's `lib.rs` carries its own module breakdown; `cargo doc` is the
 authoritative reference.
@@ -108,7 +116,7 @@ health.
 The node's long-term Ed25519 identity can be sourced from a file, an
 environment variable, an encrypted file, an OS keyring, or an external
 command; see the `[node.identity]` table and the `key migrate` subcommand
-(`cargo run --bin boule -- --help`).
+(`boule --help`).
 
 When `--config` is omitted, `boule` reads from the platform-specific
 default (`$XDG_CONFIG_HOME/boule/config.toml` on Linux, the standard

@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      bundle: ${{ steps.filter.outputs.bundle }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,6 +31,7 @@ jobs:
           set -euo pipefail
           if [[ "$EVENT_NAME" != "pull_request" ]]; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
+            echo "bundle=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed=$(git diff --name-only "$BASE_SHA"...HEAD)
@@ -39,6 +41,15 @@ jobs:
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+          # The unified `boule` binary (boule-bundle) links the reth SDK, so its
+          # lane is heavy (~6min reth build). Gate it tightly: only run when the
+          # bundle itself, the reth-side crates it composes, or the boule-side
+          # crates whose subcommands/runtime it hosts change (plus this workflow).
+          if echo "$changed" | grep -E '^(crates/boule-(bundle|reth-node|reth|cli|consensus|node|core|transport-libp2p)/|\.github/workflows/ci\.yml$)' >/dev/null; then
+            echo "bundle=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bundle=false" >> "$GITHUB_OUTPUT"
           fi
 
   fmt:
@@ -99,7 +110,7 @@ jobs:
       matrix:
         shard: [heavy, default]
     env:
-      HEAVY_FILTER: 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + binary(testnet_driver_test) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
+      HEAVY_FILTER: 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
     steps:
       - uses: actions/checkout@v4
       - if: needs.changes.outputs.rust == 'true'
@@ -149,3 +160,97 @@ jobs:
         uses: ./.github/actions/install-solc
       - if: needs.changes.outputs.rust == 'true'
         run: cargo doc --workspace --no-deps --document-private-items
+
+  # The single, unified `boule` binary (boule-bundle) links the reth SDK
+  # IN-PROCESS, so it lives in its own standalone workspace (excluded from the
+  # root workspace above — the root deliberately never compiles reth). This is
+  # therefore the ONLY CI lane that builds reth: it builds the bundle, runs the
+  # relocated CLI integration tests against the unified binary, and runs the
+  # single-process `boule node` smoke (reth in-process committing blocks).
+  #
+  # Heavy (~6min reth build + a huge dep tree), so it is path-gated to the
+  # bundle / reth / cli / consensus / node / core crates (see the `changes`
+  # job's `bundle` output) and relies on Swatinem caching across runs.
+  bundle:
+    name: Unified boule binary (reth in-process)
+    needs: changes
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Everything runs inside the bundle's standalone workspace (its own
+        # Cargo.toml / Cargo.lock, separate from the repo root).
+        working-directory: crates/boule-bundle
+    steps:
+      - uses: actions/checkout@v4
+
+      # MSRV is 1.93 (edition 2024); `stable` is well past that.
+      - if: needs.changes.outputs.bundle == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # solc compiles the predeploy genesis from source at build time
+      # (boule-reth's build.rs). Same pinned action the root lanes use.
+      - if: needs.changes.outputs.bundle == 'true'
+        uses: ./.github/actions/install-solc
+
+      # reth's mdbx-sys runs bindgen via libclang, which needs the C compiler's
+      # resource-dir headers (e.g. stdarg.h). Install clang + libclang and point
+      # bindgen at the installed gcc's include dir (gcc major derived at runtime).
+      - if: needs.changes.outputs.bundle == 'true'
+        name: Install clang/bindgen prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+          gcc_inc=$(ls -d /usr/lib/gcc/x86_64-linux-gnu/*/include | sort -V | tail -1)
+          echo "Using gcc include dir: $gcc_inc"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$gcc_inc" >> "$GITHUB_ENV"
+
+      # The reth tree is enormous; cache the registry/git sources and the build
+      # output, keyed on this workspace's own Cargo.lock. A flaky test shouldn't
+      # discard the expensive reth build cache.
+      - if: needs.changes.outputs.bundle == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/boule-bundle
+          prefix-key: bundle
+          cache-on-failure: true
+
+      - if: needs.changes.outputs.bundle == 'true'
+        name: Format
+        run: cargo fmt --all --check
+
+      - if: needs.changes.outputs.bundle == 'true'
+        name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Build the unified binary + the relocated test binaries.
+      - if: needs.changes.outputs.bundle == 'true'
+        name: Build the unified boule binary
+        run: cargo build --locked --bins
+
+      # Sanity: the single binary must expose EVERY subcommand (node + the full
+      # boule-cli command tree).
+      - if: needs.changes.outputs.bundle == 'true'
+        name: Subcommand surface
+        run: |
+          set -euo pipefail
+          help=$(cargo run --locked --bin boule -- --help)
+          echo "$help"
+          for sub in node init start genesis faucet rpc-proxy key config snapshot reconfig rotation endpoint; do
+            echo "$help" | grep -qw "$sub" || { echo "MISSING SUBCOMMAND: $sub"; exit 1; }
+          done
+
+      # (a) The relocated CLI integration tests run against the unified binary
+      # (`CARGO_BIN_EXE_boule`). `smoke_sweep`'s heavy cluster sweep is
+      # `#[ignore]`d (it runs in smoke.yml); the fast structural checks run here.
+      - if: needs.changes.outputs.bundle == 'true'
+        name: Relocated CLI integration tests
+        run: cargo test --locked --test integration_test --test testnet_driver_test --test smoke_sweep
+
+      # (b) The single-process `boule node` smoke: reth in-process committing
+      # blocks (the folded-in former smoke.sh). `#[ignore]`d, run explicitly.
+      - if: needs.changes.outputs.bundle == 'true'
+        name: Bundle single-process smoke (reth in-process commits blocks)
+        run: cargo test --locked --test bundle_smoke -- --ignored --nocapture

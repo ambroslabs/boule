@@ -97,11 +97,10 @@ fn build_node_config(cfg: &BundleRethConfig) -> Result<NodeConfig<ChainSpec>> {
         .parse()
         .map_err(|e| anyhow::anyhow!("parsing http.api module selection: {e}"))?;
 
-    let mut node_config = NodeConfig::new(chain)
-        .with_datadir_args(DatadirArgs {
-            datadir: MaybePlatformPath::from(cfg.datadir.clone()),
-            ..Default::default()
-        });
+    let mut node_config = NodeConfig::new(chain).with_datadir_args(DatadirArgs {
+        datadir: MaybePlatformPath::from(cfg.datadir.clone()),
+        ..Default::default()
+    });
 
     // Public eth RPC (for the boule eth-facing services + in-process genesis /
     // finalized-head reads). The standalone node serves the same surface.
@@ -135,9 +134,8 @@ async fn fetch_genesis_in_process(transport: &InProcessTransport) -> Result<(Str
         .as_str()
         .context("genesis block hash")?
         .to_string();
-    let root = boule_reth::root_from_hex(
-        block["stateRoot"].as_str().context("genesis stateRoot")?,
-    )?;
+    let root =
+        boule_reth::root_from_hex(block["stateRoot"].as_str().context("genesis stateRoot")?)?;
     Ok((hash, root))
 }
 
@@ -165,11 +163,8 @@ async fn fetch_finalized_head_in_process(
     if height == 0 {
         return Ok(None);
     }
-    let root = boule_reth::root_from_hex(
-        block["stateRoot"]
-            .as_str()
-            .context("finalized stateRoot")?,
-    )?;
+    let root =
+        boule_reth::root_from_hex(block["stateRoot"].as_str().context("finalized stateRoot")?)?;
     Ok(Some((height, root)))
 }
 
@@ -217,9 +212,9 @@ pub async fn run_bundled(
     // Reuse the ambient tokio runtime (the bundle's `#[tokio::main]`) as reth's
     // task executor — no second runtime. The returned `Runtime` IS reth's
     // `TaskExecutor`; its panic-monitor task is dropped on exit with the node.
-    let runtime: Runtime = RuntimeBuilder::new(
-        RuntimeConfig::default().with_tokio(TokioConfig::existing_handle(tokio::runtime::Handle::current())),
-    )
+    let runtime: Runtime = RuntimeBuilder::new(RuntimeConfig::default().with_tokio(
+        TokioConfig::existing_handle(tokio::runtime::Handle::current()),
+    ))
     .build()
     .map_err(|e| anyhow::anyhow!("building reth task runtime: {e}"))?;
 
@@ -243,14 +238,10 @@ pub async fn run_bundled(
     // opaque type, but the transport speaks raw JSON `Value`, so go to the
     // auth-server handle directly for the `ClientT` we can call `request` on.
     #[cfg(unix)]
-    let engine_client = full
-        .auth_server_handle()
-        .ipc_client()
-        .await
-        .context(
-            "reth auth-server IPC client unavailable; was auth IPC enabled \
+    let engine_client = full.auth_server_handle().ipc_client().await.context(
+        "reth auth-server IPC client unavailable; was auth IPC enabled \
              (RpcServerArgs::with_auth_ipc)?",
-        )?;
+    )?;
     #[cfg(not(unix))]
     let engine_client: jsonrpsee::async_client::Client = {
         anyhow::bail!(

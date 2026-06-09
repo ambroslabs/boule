@@ -6,7 +6,7 @@
 //! The template's `alloc` entries carry `"contract": "<Name>"` instead of
 //! `"code"`; this build script replaces each with the compiled `bin-runtime`.
 //! The output `genesis.json` is git-ignored — it is read by the genesis-pin
-//! unit tests (`include_str!`) and by `run-reth.sh` at runtime.
+//! unit tests (`include_str!`) and is the basis for `boule genesis dev`.
 //!
 //! solc is located via `$SOLC`, then `solc` on `PATH`, then the py-solc-x
 //! default (`~/.solcx/solc-v0.8.24`). CI installs the pinned solc 0.8.24.
@@ -99,7 +99,7 @@ fn main() {
     }
 
     // Write at the crate root (git-ignored) so `include_str!("../genesis.json")`
-    // and `run-reth.sh` find it. Only rewrite on change to avoid churn.
+    // finds it. Only rewrite on change to avoid churn.
     let genesis_path = crate_dir.join("genesis.json");
     let out = serde_json::to_string_pretty(&genesis).expect("serialize genesis") + "\n";
     let changed = std::fs::read_to_string(&genesis_path)
