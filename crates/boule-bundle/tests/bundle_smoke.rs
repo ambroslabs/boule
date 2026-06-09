@@ -286,6 +286,80 @@ fn single_validator_commits_blocks() {
     drop(guard);
 }
 
+/// `boule node --dev` (#892): one command, no provisioning — mint keys, build a
+/// seeded genesis, launch reth, mint the chain-bound PoP at the genesis root,
+/// and run consensus, all in-process. Asserts blocks COMMIT via `eth_blockNumber`.
+///
+/// This is the zero-config path a `docker run <img> node --dev` exercises. Uses
+/// distinct ports from `single_validator_commits_blocks` so the `--ignored` lane
+/// can run both without a port collision.
+#[test]
+#[ignore = "boots reth in-process; heavy, run via the CI lane with --ignored"]
+fn dev_mode_commits_blocks() {
+    let bin = boule_bin();
+    let work = tempfile::tempdir().expect("tempdir");
+    let datadir = work.path().join("datadir");
+
+    // Distinct ports from the other smoke (8545/8551) so both can run serially
+    // under `--ignored` without colliding.
+    let http_port: u16 = 8745;
+    let auth_port: u16 = 8751;
+
+    let log = work.path().join("dev.log");
+    let log_file = std::fs::File::create(&log).expect("create log");
+    let child = Command::new(&bin)
+        .args([
+            "node",
+            "--dev",
+            "--datadir",
+            datadir.to_str().unwrap(),
+            "--http.port",
+            &http_port.to_string(),
+            "--authrpc.port",
+            &auth_port.to_string(),
+        ])
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::from(log_file.try_clone().unwrap()))
+        .stderr(Stdio::from(log_file))
+        .spawn()
+        .expect("spawn `boule node --dev`");
+    let mut guard = NodeGuard(Some(child));
+
+    let http = format!("http://127.0.0.1:{http_port}");
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut last = 0u64;
+    let mut passed = false;
+    while Instant::now() < deadline {
+        if let Some(child) = guard.0.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            let tail = std::fs::read_to_string(&log).unwrap_or_default();
+            panic!(
+                "`boule node --dev` exited early ({status:?}); log tail:\n{}",
+                tail.lines().rev().take(60).collect::<Vec<_>>().join("\n")
+            );
+        }
+        if let Some(n) = eth_block_number(&http) {
+            last = n;
+            if n >= 5 {
+                passed = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    if !passed {
+        let tail = std::fs::read_to_string(&log).unwrap_or_default();
+        panic!(
+            "dev chain did not advance past several blocks (last={last}); log tail:\n{}",
+            tail.lines().rev().take(80).collect::<Vec<_>>().join("\n")
+        );
+    }
+    eprintln!("PASS — `boule node --dev` committed blocks; eth_blockNumber reached {last}");
+    drop(guard);
+}
+
 fn write_file(path: &Path, contents: &str) {
     let mut f = std::fs::File::create(path).unwrap_or_else(|e| panic!("create {path:?}: {e}"));
     f.write_all(contents.as_bytes())

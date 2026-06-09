@@ -257,4 +257,6 @@ jobs:
       # blocks (the folded-in former smoke.sh). `#[ignore]`d, run explicitly.
       - if: needs.changes.outputs.bundle == 'true'
         name: Bundle single-process smoke (reth in-process commits blocks)
-        run: cargo test --locked --test bundle_smoke -- --ignored --nocapture
+        # --test-threads=1: each smoke test boots its own in-process reth;
+        # running them concurrently makes two reth nodes clash. Serialize.
+        run: cargo test --locked --test bundle_smoke -- --ignored --nocapture --test-threads=1
