@@ -9,7 +9,7 @@
 //!
 //! - `wire` — [`WireMessage`] envelope and frame constants.
 //! - `config` — [`NodeConfigForConsensus`].
-//! - `block_builder` — [`MempoolBlockBuilder`] (the
+//! - `block_builder` — `MempoolBlockBuilder` (test/sim-only, feature-gated #894; the
 //!   [`BlockBuilder`](boule_consensus::hotstuff::step::BlockBuilder)
 //!   that pulls commands from the mempool and stamps `state_commitment`
 //!   by forking the committed SM; it also implements the async
@@ -86,7 +86,11 @@ use boule_consensus::rate_limit::MessageRateLimiter as RateLimiter;
 use boule_consensus::replication::application::{Application, ValidatorEffect, ValidatorUpdate};
 use boule_consensus::replication::block::BlockHash;
 use boule_consensus::replication::mempool::Mempool;
+// `BondedStakeLedger` + `StateMachine` are used only by the counter-backed
+// default block builder the constructors wire in test/sim builds (#894).
+#[cfg(any(test, feature = "testing"))]
 use boule_consensus::replication::stake_source::BondedStakeLedger;
+#[cfg(any(test, feature = "testing"))]
 use boule_consensus::replication::state_machine::StateMachine;
 use boule_consensus::status::ConsensusStatus;
 use boule_consensus::validator_history::ValidatorSetHistory;
@@ -104,6 +108,13 @@ use boule_core::transport::overlay::{Broadcaster, Discovery, DiscoveryEvent};
 mod action_interpreter;
 mod app_context;
 mod app_reconfig;
+// The in-process counter block builder is test/sim-only (#894): production
+// orders an external reth EL via `RethApplication`, which does not use the
+// `StateMachine`-backed `MempoolBlockBuilder`. Gate it behind `cfg(test)` for
+// this crate's own tests and the `testing` feature for downstream test builds
+// (the sim suite + the bundle's fast consensus-liveness tests) so it never
+// ships in a production binary.
+#[cfg(any(test, feature = "testing"))]
 mod block_builder;
 mod block_sync;
 mod commit;
@@ -118,7 +129,12 @@ mod rotation_apply;
 mod snapshot_io;
 mod status;
 mod timeout_bucket;
+// The production placeholder application (#894), wired by the constructors only
+// when the counter `MempoolBlockBuilder` default is gated out.
+#[cfg(not(any(test, feature = "testing")))]
+mod uninitialized_app;
 
+#[cfg(any(test, feature = "testing"))]
 pub use block_builder::MempoolBlockBuilder;
 pub use boule_consensus::wire::{
     BLOCK_RANGE_RESPONSE_MAX_BLOCKS, BlockRangeResponsePayload, BlockResponsePayload,
@@ -451,7 +467,7 @@ pub struct ConsensusNode {
     peer_heights: HashMap<NodeId, Height>,
     /// Height of the most recently committed block, updated in
     /// [`ConsensusNode::apply_commit`]. Zero before the first commit.
-    /// Wrapped in `Arc<AtomicU64>` so the [`MempoolBlockBuilder`] can
+    /// Wrapped in `Arc<AtomicU64>` so the `MempoolBlockBuilder` can
     /// read it from inside the safety core's `build_proposal_at_view`
     /// path to bound the uncommitted-ancestor walk (issue #375)
     /// without having to thread a borrow through the trait object.
@@ -460,7 +476,7 @@ pub struct ConsensusNode {
     /// layer — the safety core no longer holds the builder. The
     /// `BuildProposal` action handler `await`s [`Application::build_proposal`]
     /// to construct the leader's proposal. The counter node plugs in the
-    /// in-process [`MempoolBlockBuilder`]; a reth node will plug in an
+    /// in-process `MempoolBlockBuilder`; a reth node will plug in an
     /// execution layer that builds payloads over the Engine API.
     app: Arc<dyn Application>,
     /// Heap-resident work stack of self-addressed (loopback) dispatches — the
@@ -538,7 +554,7 @@ pub struct ConsensusNode {
     /// here (rather than looping it back immediately) is what terminates the
     /// per-round loopback chain so a single-validator chain settles (#614).
     stashed_proposal: Option<ConsensusMsg>,
-    /// Cumulative count of commands the local [`MempoolBlockBuilder`]
+    /// Cumulative count of commands the local `MempoolBlockBuilder`
     /// dropped because `StateMachine::apply` returned `Err` (issue
     /// #376). Surfaced under [`ConsensusStatus::dropped_commands`].
     /// Shared with the builder's own `Arc<AtomicU64>` so the two
@@ -781,7 +797,11 @@ impl ConsensusNode {
     pub fn new(
         self_id: NodeId,
         config: NodeConfigForConsensus,
-        state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
+        // The in-process counter state machine is test/sim-only (#894): only
+        // the gated `MempoolBlockBuilder` default application consumes it.
+        // Production seeds a placeholder application and installs the real reth
+        // backend via `with_application`, so the parameter is absent there.
+        #[cfg(any(test, feature = "testing"))] state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
         mempool: Arc<dyn Mempool>,
         storage: Arc<dyn Storage>,
         wal: Arc<dyn Wal>,
@@ -813,6 +833,10 @@ impl ConsensusNode {
 
         let last_committed_height = Arc::new(AtomicU64::new(0));
         let dropped_commands = Arc::new(AtomicU64::new(0));
+        // Default application (#894): the in-process counter block builder in
+        // test/sim builds; an inert placeholder in production, where reth is
+        // installed via `with_application` before the loop runs.
+        #[cfg(any(test, feature = "testing"))]
         let app: Arc<dyn Application> = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
@@ -829,6 +853,8 @@ impl ConsensusNode {
                     .map(|(id, w)| (*id.as_node_id(), w)),
             )),
         ));
+        #[cfg(not(any(test, feature = "testing")))]
+        let app: Arc<dyn Application> = Arc::new(uninitialized_app::UninitializedApplication);
 
         let validator_set_len = config.validator_set.len();
         // #324: bind the deployment's signing tag to its genesis block
@@ -1164,7 +1190,9 @@ impl ConsensusNode {
     pub fn recover(
         self_id: NodeId,
         config: NodeConfigForConsensus,
-        state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
+        // Test/sim-only counter state machine (#894); see `new`. Absent in
+        // production, which installs reth via `with_application`.
+        #[cfg(any(test, feature = "testing"))] state_machine: Arc<Mutex<Box<dyn StateMachine>>>,
         mempool: Arc<dyn Mempool>,
         storage: Arc<dyn Storage>,
         wal: Arc<dyn Wal>,
@@ -1229,6 +1257,10 @@ impl ConsensusNode {
 
         let last_committed_height = Arc::new(AtomicU64::new(last_committed.height.0));
         let dropped_commands = Arc::new(AtomicU64::new(0));
+        // Default application (#894): the counter block builder in test/sim
+        // builds; an inert placeholder in production (reth is installed via
+        // `with_application`).
+        #[cfg(any(test, feature = "testing"))]
         let app: Arc<dyn Application> = Arc::new(MempoolBlockBuilder::new(
             self_id,
             Arc::clone(&mempool),
@@ -1245,6 +1277,8 @@ impl ConsensusNode {
                     .map(|(id, w)| (*id.as_node_id(), w)),
             )),
         ));
+        #[cfg(not(any(test, feature = "testing")))]
+        let app: Arc<dyn Application> = Arc::new(uninitialized_app::UninitializedApplication);
         // #407: restore the leader-side `proposed_in_view` guard so a
         // crash between `Signed::sign` and the `Broadcast(Proposal)`
         // bytes leaving the host does not let this replica re-mint a

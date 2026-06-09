@@ -8,7 +8,8 @@
 //! The roadmap for this layer is issue #21 (milestone 5), broken into:
 //!
 //! - 5.A (#80): [`StateMachine`] trait and the reference
-//!   [`CounterStateMachine`] (this file and [`state_machine`] / [`impls`]).
+//!   `CounterStateMachine` (test/sim-only, feature-gated per #894; this file
+//!   and [`state_machine`] / [`impls`]).
 //! - 5.B (#81): a `Block` type with structural validation.
 //! - 5.C (#82): a `Mempool` trait and in-memory reference impl.
 //!
@@ -42,8 +43,13 @@ pub mod state_machine;
 pub use application::{Application, CommitResult, ValidatorUpdate};
 #[allow(unused_imports)]
 pub use block::{Block, BlockHash, BlockHeader, validate_structural};
+// `CounterStateMachine` is test/sim-only (#894) — re-export it only when its
+// defining module is compiled (this crate's tests or the `testing` feature).
+#[cfg(any(test, feature = "testing"))]
 #[allow(unused_imports)]
-pub use impls::{CounterStateMachine, InMemoryMempool};
+pub use impls::CounterStateMachine;
+#[allow(unused_imports)]
+pub use impls::InMemoryMempool;
 #[allow(unused_imports)]
 pub use mempool::Mempool;
 #[allow(unused_imports)]
