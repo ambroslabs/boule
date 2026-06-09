@@ -632,7 +632,7 @@ async fn spawn_consensus_node(
         [node.bls_validator_identity]\nbackend = \"file\"\npath = \"{bls_key_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [overlay]\nmode = \"libp2p\"\nbootstrap_addrs = [{bootstrap_toml}]\n\n\
-        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n\
+        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\nallow_counter_state_machine = true\n\
         {validators_bls_toml}"
     );
     let mut config_file = NamedTempFile::new().unwrap();
@@ -823,7 +823,7 @@ async fn spawn_consensus_node_libp2p(
         [node.bls_validator_identity]\nbackend = \"file\"\npath = \"{bls_key_path}\"\n\n\
         [api]\nlisten_addr = \"127.0.0.1:0\"\n[api.admin]\nlisten_addr = \"127.0.0.1:0\"\n\n\
         [overlay]\nmode = \"libp2p\"\nbootstrap_addrs = {bootstrap_toml}\n\n\
-        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\n\
+        [consensus]\nvalidators = [{validators_toml}]\npropose_limit = 64\ntimeout_base_ms = 200\ntimeout_max_ms = 2000\nallow_counter_state_machine = true\n\
         {validators_bls_toml}"
     );
     let mut config_file = NamedTempFile::new().unwrap();
