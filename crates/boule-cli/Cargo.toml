@@ -23,21 +23,24 @@ path = "src/main.rs"
 [features]
 # Build the `boule` binary with the reth execution-layer backend
 # (`[consensus.application] backend = "reth"`). Passes through to
-# boule-node's `reth` feature; off by default so the standard binary
-# stays lean. See `../boule-reth/node-demo.md` for running a chain.
-reth = ["boule-node/reth"]
+# boule-node's `reth` feature and pulls in `boule-reth` for the reth-only
+# `genesis` / `faucet` / `rpc-proxy` subcommands; off by default so the
+# standard binary stays lean. See `../boule-reth/node-demo.md` for running a
+# chain.
+reth = ["boule-node/reth", "dep:boule-reth"]
 
 [dependencies]
 boule-core          = { path = "../boule-core", version = "0.1.0" }
 boule-consensus     = { path = "../boule-consensus", version = "0.1.0" }
 boule-node          = { path = "../boule-node", version = "0.1.0" }
+boule-reth          = { path = "../boule-reth", version = "0.1.0", optional = true }
 tokio              = { version = "1", features = ["full"] }
 anyhow             = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 hex                = "0.4"
 bytes              = { version = "1", features = ["serde"] }
-clap               = { version = "4", features = ["derive"] }
+clap               = { version = "4", features = ["derive", "env"] }
 reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 serde_json         = "1"
 

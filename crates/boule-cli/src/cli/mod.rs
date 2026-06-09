@@ -5,10 +5,16 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod endpoint;
+#[cfg(feature = "reth")]
+mod faucet;
+#[cfg(feature = "reth")]
+mod genesis;
 mod init;
 mod key;
 mod reconfig;
 mod rotation;
+#[cfg(feature = "reth")]
+mod rpc_proxy;
 mod shared;
 mod snapshot;
 mod start;
@@ -45,6 +51,16 @@ enum Command {
     /// Build validator endpoint-advertisement payloads (printed as hex).
     #[command(subcommand)]
     Endpoint(endpoint::EndpointCmd),
+    /// Generate the reth EL genesis + chain-bound BLS proofs-of-possession.
+    #[cfg(feature = "reth")]
+    #[command(subcommand)]
+    Genesis(genesis::GenesisCmd),
+    /// Run the dev/testnet faucet service (reth EL).
+    #[cfg(feature = "reth")]
+    Faucet(faucet::FaucetArgs),
+    /// Run the public eth JSON-RPC proxy in front of a reth node.
+    #[cfg(feature = "reth")]
+    RpcProxy(rpc_proxy::RpcProxyArgs),
 }
 
 pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -76,5 +92,13 @@ pub(crate) async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Endpoint(endpoint::EndpointCmd::Set(a)) => endpoint::handle_set(a),
         Command::Endpoint(endpoint::EndpointCmd::Add(a)) => endpoint::handle_add(a),
         Command::Endpoint(endpoint::EndpointCmd::Remove(a)) => endpoint::handle_remove(a),
+        #[cfg(feature = "reth")]
+        Command::Genesis(genesis::GenesisCmd::Dev(a)) => genesis::handle_dev(a),
+        #[cfg(feature = "reth")]
+        Command::Genesis(genesis::GenesisCmd::BlsPop(a)) => genesis::handle_bls_pop(a),
+        #[cfg(feature = "reth")]
+        Command::Faucet(a) => faucet::handle(a).await,
+        #[cfg(feature = "reth")]
+        Command::RpcProxy(a) => rpc_proxy::handle(a).await,
     }
 }

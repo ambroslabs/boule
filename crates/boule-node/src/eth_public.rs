@@ -7,24 +7,26 @@
 //! [`boule_reth::rpc_proxy`]; this module only wraps it in axum routers and
 //! plugs the HTTP edge into the wall clock + client IP.
 //!
-//! These run as **standalone services** alongside a full node (see the
-//! `faucet` and `eth-rpc-proxy` bins), following the public/admin split of
-//! #807/#813: they are public-internet-facing, carry their own abuse
-//! protection, and never share a listener with the privileged admin surface.
+//! These run as **standalone services** alongside a full node — exposed as the
+//! `boule faucet` / `boule rpc-proxy` subcommands via [`serve_faucet`] /
+//! [`serve_rpc_proxy`] (#890) — following the public/admin split of #807/#813:
+//! they are public-internet-facing, carry their own abuse protection, and never
+//! share a listener with the privileged admin surface.
 //!
 //! # Client IP for rate limiting
 //!
 //! The limiter keys on the peer socket address from
 //! [`axum::extract::ConnectInfo`]. Behind a reverse proxy / load balancer the
 //! peer IP is the proxy's, so the operator should either run this as the edge
-//! or have the proxy enforce per-client limits too — documented in the bin
-//! help. We deliberately do **not** trust `X-Forwarded-For` (trivially spoofed
+//! or have the proxy enforce per-client limits too — documented in the
+//! subcommand help. We deliberately do **not** trust `X-Forwarded-For` (trivially spoofed
 //! when the service is directly reachable), which would defeat the per-IP cap.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use axum::Json;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::StatusCode;
@@ -33,6 +35,9 @@ use axum::routing::post;
 use axum::{Router, body::Bytes};
 use serde_json::{Value, json};
 use tracing::{info, warn};
+
+use boule_reth::faucet::FaucetConfig;
+use boule_reth::rpc_proxy::{ALLOWED_METHODS, PublicRpcConfig};
 
 /// Max accepted body for `POST /faucet`. The request is a single
 /// `{ "address": "0x…" }` object — a few dozen bytes — so a small fixed cap
@@ -215,6 +220,145 @@ fn single_request_id(payload: &Value) -> Value {
 
 fn jsonrpc_error(rej: Rejection, id: Value) -> Response {
     (StatusCode::OK, Json(rejection_to_jsonrpc(rej, id))).into_response()
+}
+
+// ─────────────────────────── service runners ───────────────────────────────
+//
+// `serve_faucet` / `serve_rpc_proxy` are the reusable entrypoints behind the
+// `boule faucet` / `boule rpc-proxy` subcommands. They own config assembly +
+// the listener + axum serve loop, taking only primitive options so the CLI (and
+// any other caller) stays free of the alloy signer types. Both run until the
+// process is terminated.
+
+/// Primitive options for the testnet faucet, mirroring the env knobs the old
+/// `faucet` bin read. `None` fields fall back to [`FaucetConfig`] defaults.
+#[derive(Debug, Clone)]
+pub struct FaucetOptions {
+    /// Bind address for the faucet HTTP listener.
+    pub listen: SocketAddr,
+    /// reth public RPC to submit drips through.
+    pub eth_url: String,
+    /// The faucet's funding key (`0x`-prefixed 32-byte hex); its address must
+    /// be prefunded in genesis.
+    pub private_key: String,
+    /// Amount per drip (wei).
+    pub drip_wei: Option<u128>,
+    /// Per-address cooldown (seconds).
+    pub address_cooldown_secs: Option<u64>,
+    /// Per-IP window (seconds).
+    pub ip_window_secs: Option<u64>,
+    /// Per-IP request cap within the window.
+    pub ip_max_per_window: Option<u32>,
+    /// EIP-1559 `max_fee_per_gas` (wei).
+    pub max_fee_per_gas: Option<u128>,
+    /// EIP-1559 `max_priority_fee_per_gas` (wei).
+    pub max_priority_fee_per_gas: Option<u128>,
+}
+
+/// Build a [`FaucetConfig`] then bind + serve the faucet (`POST /faucet`).
+/// Runs until the process is terminated.
+pub async fn serve_faucet(opts: FaucetOptions) -> anyhow::Result<()> {
+    let signer = opts
+        .private_key
+        .trim()
+        .parse()
+        .context("faucet private key is not a valid 0x-hex private key")?;
+    let mut cfg = FaucetConfig::new(opts.eth_url.clone(), signer);
+    if let Some(v) = opts.drip_wei {
+        cfg.drip_wei = v;
+    }
+    if let Some(v) = opts.address_cooldown_secs {
+        cfg.address_cooldown = std::time::Duration::from_secs(v);
+    }
+    if let Some(v) = opts.ip_window_secs {
+        cfg.ip_window = std::time::Duration::from_secs(v);
+    }
+    if let Some(v) = opts.ip_max_per_window {
+        cfg.ip_max_per_window = v;
+    }
+    if let Some(v) = opts.max_fee_per_gas {
+        cfg.max_fee_per_gas = v;
+    }
+    if let Some(v) = opts.max_priority_fee_per_gas {
+        cfg.max_priority_fee_per_gas = v;
+    }
+
+    let listen = opts.listen;
+    let eth_url = cfg.eth_url.clone();
+    let state = FaucetState::new(cfg);
+    info!(
+        target: "boule::faucet",
+        %listen, %eth_url,
+        faucet_address = %format!("0x{}", hex::encode(state.service.faucet_address())),
+        drip_wei = state.service.drip_wei(),
+        "faucet starting (ensure the faucet address is prefunded in genesis — #804)"
+    );
+
+    let app = faucet_router(state).into_make_service_with_connect_info::<SocketAddr>();
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .context("bind faucet listener")?;
+    info!(target: "boule::faucet", addr = %listener.local_addr()?, "faucet listening");
+    axum::serve(listener, app).await.context("faucet server")?;
+    Ok(())
+}
+
+/// Primitive options for the public eth JSON-RPC proxy, mirroring the env knobs
+/// the old `eth-rpc-proxy` bin read. `None` fields fall back to
+/// [`PublicRpcConfig`] defaults.
+#[derive(Debug, Clone)]
+pub struct RpcProxyOptions {
+    /// Bind address for the proxy HTTP listener.
+    pub listen: SocketAddr,
+    /// reth public RPC to forward the allow-listed surface to (keep loopback).
+    pub eth_url: String,
+    /// Max JSON-RPC batch length.
+    pub max_batch: Option<usize>,
+    /// Max request body (bytes).
+    pub max_body_bytes: Option<usize>,
+    /// Per-IP window (seconds).
+    pub ip_window_secs: Option<u64>,
+    /// Per-IP request cap within the window.
+    pub ip_max_per_window: Option<u32>,
+}
+
+/// Build a [`PublicRpcConfig`] then bind + serve the proxy (`POST /`). Runs
+/// until the process is terminated.
+pub async fn serve_rpc_proxy(opts: RpcProxyOptions) -> anyhow::Result<()> {
+    let mut cfg = PublicRpcConfig::new(opts.eth_url.clone());
+    if let Some(v) = opts.max_batch {
+        cfg.max_batch = v;
+    }
+    if let Some(v) = opts.max_body_bytes {
+        cfg.max_body_bytes = v;
+    }
+    if let Some(v) = opts.ip_window_secs {
+        cfg.ip_window = std::time::Duration::from_secs(v);
+    }
+    if let Some(v) = opts.ip_max_per_window {
+        cfg.ip_max_per_window = v;
+    }
+
+    let listen = opts.listen;
+    let backend = cfg.eth_url.clone();
+    info!(
+        target: "boule::ethrpc",
+        %listen, %backend,
+        max_batch = cfg.max_batch,
+        max_body_bytes = cfg.max_body_bytes,
+        allowed_methods = ALLOWED_METHODS.len(),
+        "public eth-RPC proxy starting (forwarding only the allow-listed surface)"
+    );
+    let state = PublicRpcState::new(cfg);
+    let app = rpc_proxy_router(state).into_make_service_with_connect_info::<SocketAddr>();
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .context("bind proxy listener")?;
+    info!(target: "boule::ethrpc", addr = %listener.local_addr()?, "eth-rpc-proxy listening");
+    axum::serve(listener, app)
+        .await
+        .context("eth-rpc-proxy server")?;
+    Ok(())
 }
 
 #[cfg(test)]

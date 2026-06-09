@@ -51,8 +51,9 @@ pub mod weight_proof;
 pub use application::RethApplication;
 pub use engine::{BuiltBlock, RethEngine, root_from_hex};
 pub use genesis::{
-    GenesisValidator, PrefundAlloc, build_deployment_genesis, build_dev_genesis,
-    build_seeded_genesis, dev_genesis_validators, seed_registry_genesis, seed_staking_owner,
+    BlsPopRow, GenesisValidator, PrefundAlloc, build_deployment_genesis, build_dev_genesis,
+    build_seeded_genesis, dev_genesis_validators, mint_genesis_bls_pops, seed_registry_genesis,
+    seed_staking_owner,
 };
 pub use transport::{
     EngineTransport, HttpTransport, fetch_finalized_head, fetch_genesis, peer_reths,
