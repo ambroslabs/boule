@@ -33,23 +33,22 @@ sha3       = "0.10"
 # alloy: build/sign EIP-1559 system txs and recover their sender (#732 write
 # path). `k256` enables sender recovery from a signature (used by the unit
 # tests and any future verification path).
-alloy-consensus    = { version = "2", features = ["k256"] }
-alloy-primitives   = "1"
-alloy-signer       = "2"
-alloy-signer-local = "2"
-alloy-eips         = "2"
+alloy-consensus    = { workspace = true }
+alloy-primitives   = { workspace = true }
+alloy-signer       = { workspace = true }
+alloy-signer-local = { workspace = true }
+alloy-eips         = { workspace = true }
 # ABI-encode the slashing/governance predeploy calls the `el-e2e-ops` helper
 # submits in the A1 Phase-5 e2e (#785).
-alloy-sol-types    = "1.5.6"
+alloy-sol-types    = { workspace = true }
 # #797 vote-time weight proof: build + verify a receipt-trie (MPT) inclusion
 # proof of the staking/slashing log a weight delta is derived from, against the
 # source block's `receiptsRoot`. `alloy-trie` is the vetted MPT verifier
 # (`proof::verify_proof`) + builder (`HashBuilder` + `ProofRetainer`);
-# `alloy-rlp` + `nybbles` give the receipt/key RLP + nibble path. All already in
-# the workspace lockfile via the EL's dependency tree.
-alloy-trie         = "0.9"
-alloy-rlp          = "0.3"
-nybbles            = "0.4"
+# `alloy-rlp` + `nybbles` give the receipt/key RLP + nibble path.
+alloy-trie         = { workspace = true }
+alloy-rlp          = { workspace = true }
+nybbles            = { workspace = true }
 
 [build-dependencies]
 # `build.rs` generates genesis.json from genesis.template.json + the compiled

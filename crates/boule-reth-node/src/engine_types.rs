@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use alloy_primitives::{B256, Bytes};
 use reth_ethereum::{
-    Block,
-    EthPrimitives,
-    TransactionSigned,
+    Block, EthPrimitives, TransactionSigned,
     chainspec::{ChainSpec, EthereumHardforks},
     node::{
         api::{
@@ -18,7 +16,6 @@ use reth_ethereum::{
     },
     primitives::{Block as _, Header, SealedBlock},
     provider::EthStorage,
-
     rpc::types::engine::{
         ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV2, ExecutionPayloadEnvelopeV3,
         ExecutionPayloadEnvelopeV4, ExecutionPayloadEnvelopeV5, ExecutionPayloadEnvelopeV6,
@@ -35,7 +32,6 @@ use crate::registry::RegistryPayload;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoulePayloadAttributes {
-
     #[serde(flatten)]
     pub inner: EthPayloadAttributes,
 
@@ -44,7 +40,6 @@ pub struct BoulePayloadAttributes {
 }
 
 impl BoulePayloadAttributes {
-
     pub fn registry_extra_data(&self) -> Bytes {
         let s = self.registry_payload.trim_start_matches("0x");
         if s.is_empty() {

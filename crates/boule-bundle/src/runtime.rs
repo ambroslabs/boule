@@ -24,7 +24,6 @@ use crate::transport::InProcessTransport;
 
 #[derive(Debug, Clone)]
 pub struct RethPorts {
-
     pub http_addr: std::net::IpAddr,
 
     pub http_port: u16,
@@ -49,7 +48,6 @@ impl Default for RethPorts {
 }
 
 pub struct BundleRethConfig {
-
     pub chain_json: String,
 
     pub datadir: PathBuf,
@@ -233,7 +231,6 @@ pub async fn run_bundled_with(
     });
 
     let exit: boule_node::BoxFutureUnit = Box::pin(async move {
-
         if let Err(e) = node_exit_future.await {
             tracing::error!(target: "boule::bundle", error = %e, "in-process reth node exited with error");
         }
@@ -265,12 +262,10 @@ pub async fn run_bundled(
     reth_cfg: BundleRethConfig,
 ) -> Result<()> {
     let provider: ConfigProvider = Box::new(move |reth_genesis_root: [u8; 32]| {
-
         let genesis_state_commitment = config
             .consensus
             .as_ref()
             .map(|c| {
-
                 c.genesis_seed_hex
                     .as_deref()
                     .map(decode_seed_hex)

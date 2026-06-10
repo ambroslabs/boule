@@ -1,13 +1,9 @@
-[workspace]
-resolver = "2"
-members = ["."]
-
 [package]
 name = "boule-bundle"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.93"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Single-binary boule node: HotStuff consensus + the custom reth execution layer (BouleNode) in one process, reth in-process over its auth-server IPC client (no HTTP Engine API, no JWT). Milestone #7."
 
@@ -16,21 +12,14 @@ name = "boule"
 path = "src/main.rs"
 
 [dependencies]
-boule-reth-node = { path = "../boule-reth-node" }
-boule-core = { path = "../boule-core" }
-boule-consensus = { path = "../boule-consensus" }
-boule-node = { path = "../boule-node", features = ["reth"] }
-boule-reth = { path = "../boule-reth" }
-boule-cli = { path = "../boule-cli", features = ["reth"] }
+boule-reth-node = { path = "../boule-reth-node", version = "0.1.0" }
+boule-core = { path = "../boule-core", version = "0.1.0" }
+boule-consensus = { path = "../boule-consensus", version = "0.1.0" }
+boule-node = { path = "../boule-node", version = "0.1.0", features = ["reth"] }
+boule-reth = { path = "../boule-reth", version = "0.1.0" }
+boule-cli = { path = "../boule-cli", version = "0.1.0", features = ["reth"] }
 
-reth-ethereum = { git = "https://github.com/paradigmxyz/reth.git", tag = "v2.2.0", features = [
-    "node",
-    "node-api",
-    "evm",
-    "cli",
-    "tasks",
-    "provider",
-] }
+reth-ethereum = { workspace = true, features = ["tasks", "provider"] }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

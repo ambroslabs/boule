@@ -65,7 +65,6 @@ impl BlockExecutorFactory for CustomEvmConfig {
         DB: StateDB,
         I: InspectorFor<Self, DB>,
     {
-
         let payload = RegistryPayload::decode(ctx.extra_data.as_ref());
         CustomBlockExecutor {
             payload,
@@ -131,7 +130,6 @@ impl ConfigureEngineEvm<ExecutionData> for CustomEvmConfig {
         &self,
         payload: &'a ExecutionData,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-
         self.inner.context_for_payload(payload)
     }
 
@@ -144,7 +142,6 @@ impl ConfigureEngineEvm<ExecutionData> for CustomEvmConfig {
 }
 
 pub struct CustomBlockExecutor<'a, Evm> {
-
     payload: Option<RegistryPayload>,
     inner: EthBlockExecutor<'a, Evm, &'a Arc<ChainSpec>, &'a RethReceiptBuilder>,
 }
@@ -159,7 +156,6 @@ where
     type Result = EthTxResult<E::HaltReason, TxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-
         if let Some(payload) = self.payload.take() {
             apply_registry_writes(&payload, self.inner.evm_mut())?;
         }

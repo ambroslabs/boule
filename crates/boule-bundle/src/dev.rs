@@ -10,7 +10,6 @@ use boule_core::identity::{KeyProvider, node_id_to_base58};
 use crate::runtime::{BundleRethConfig, ConfigProvider, RethPorts, run_bundled_with};
 
 pub struct DevArgs {
-
     pub datadir: Option<PathBuf>,
 
     pub http_port: u16,
@@ -27,7 +26,6 @@ pub struct DevArgs {
 pub const DEV_FEE_RECIPIENT: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 
 pub async fn run_dev(args: DevArgs) -> Result<()> {
-
     let (datadir, _tmp) = match args.datadir {
         Some(d) => (d, None),
         None => {
@@ -79,7 +77,6 @@ pub async fn run_dev(args: DevArgs) -> Result<()> {
         chain_json: genesis_json,
         datadir: datadir.join("reth"),
         ports: RethPorts {
-
             http_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             http_port: args.http_port,
             auth_port: args.auth_port,
@@ -133,7 +130,7 @@ fn build_dev_config(inputs: DevConfigInputs<'_>) -> Result<boule_core::config::C
     let rows = boule_reth::mint_genesis_bls_pops(
         &[(node_id, bls_key_path.to_path_buf())],
         genesis_root,
-         true,
+        true,
     )
     .context("minting dev chain-bound BLS PoP")?;
     let row = rows.first().context("expected one dev PoP row")?;

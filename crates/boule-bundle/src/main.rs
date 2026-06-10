@@ -27,7 +27,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-
     Node(NodeArgs),
 
     #[command(flatten)]
@@ -36,7 +35,6 @@ enum Command {
 
 #[derive(Parser)]
 struct NodeArgs {
-
     #[arg(long)]
     dev: bool,
 
@@ -148,7 +146,6 @@ async fn handle_node(args: NodeArgs) -> anyhow::Result<()> {
         chain_json,
         datadir,
         ports: RethPorts {
-
             http_port: args.http_port,
             auth_port: args.auth_port,
             p2p_port: args.p2p_port,

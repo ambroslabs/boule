@@ -6,14 +6,12 @@ use jsonrpsee::core::params::ArrayParams;
 use serde_json::Value;
 
 pub struct InProcessTransport {
-
     engine: jsonrpsee::async_client::Client,
 
     eth: jsonrpsee::http_client::HttpClient,
 }
 
 impl InProcessTransport {
-
     pub fn new(
         engine: jsonrpsee::async_client::Client,
         eth: jsonrpsee::http_client::HttpClient,
