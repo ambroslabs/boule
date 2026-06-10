@@ -8,16 +8,6 @@ members = [
     "crates/boule-cli",
     "crates/boule-reth",
 ]
-# `fuzz` is intentionally excluded: it hosts nightly-only `cargo-fuzz`
-# targets and must not be pulled into the stable workspace build.
-#
-# `crates/boule-reth-node` is its OWN standalone workspace (Option A custom EL,
-# #777), and `crates/boule-bundle` is a member of THAT workspace (the single-
-# binary boule+reth node, #885). Both are excluded here so their heavy
-# `reth-ethereum` SDK dependency tree (hundreds of crates) never enters boule's
-# main build / Cargo.lock / CI. Build them from `crates/boule-reth-node` with
-# `--jobs 3`; see that crate's Cargo.toml header.
-exclude = ["fuzz", "crates/boule-reth-node", "crates/boule-bundle"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,5 +17,5 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/ambroslabs/boule"
 homepage = "https://github.com/ambroslabs/boule"
 readme = "README.md"
-keywords = ["consensus", "bft", "hotstuff", "p2p", "distributed-systems"]
+keywords = ["blockchain", "consensus", "bft", "hotstuff"]
 categories = ["network-programming", "cryptography"]
