@@ -182,10 +182,9 @@ moves onto the EVM.
 
 These identifiers are mirrored as constants in `src/param.rs`; unit tests pin
 the address, topic, selectors, `AUTH_DOMAIN`, and the `Registry` weight/key-surface
-selectors to the genesis account's bytecode. The authenticated quorum is validated
-against a **live reth** by `test/param-auth.mjs` (valid signed approval counts,
-forged/wrong-key rejected, forged-quorum closed, non-seated rejected, ⅔ crossing
-emits once), which uses the `bls-sign` helper for signatures.
+selectors to the genesis account's bytecode. The authenticated quorum counts a
+valid signed approval, rejects forged/wrong-key signatures, closes a forged
+quorum, rejects a non-seated validator, and emits once on the ⅔ crossing.
 
 ### Reproducing the bytecode
 
@@ -225,9 +224,8 @@ authoritative for the validator set; see `docs/validator-registry-and-slashing.m
 | `historyLength(bytes32)` selector | `0x43905859` |
 
 Mirrored as constants in `src/registry.rs`; unit tests pin them to the generated
-bytecode. The contract's storage logic is validated against a **live reth** by
-the manual harness `test/registry.mjs` (see its header) — `recordKey`/`keyAt`
-exercised on a real EVM, since the genesis-pin Rust tests can't run the EVM.
+bytecode. The contract's `recordKey`/`keyAt` storage logic runs on a real EVM at
+the genesis registry address.
 
 ## `BlsVerify.sol` — in-EVM BLS signature verification (#732b)
 
@@ -239,8 +237,7 @@ precompiles plus SHA-256/MODEXP: `verify(pubkey, message, sig, -G1gen)` checks
 `expand_message_xmd` over SHA-256 → MODEXP-reduce → `2× MAP_FP2_TO_G2` →
 `G2ADD`) so it does not trust a caller-supplied curve point. Confirmed against
 boule's own blst (the in-Solidity `H` is byte-identical to blst's, and a real
-signature verifies while a tampered one is rejected) — see `test/blsverify.mjs`
-and `docs/validator-registry-and-slashing.md`.
+signature verifies while a tampered one is rejected).
 
 ## `Slashing.sol` — equivocation-slashing predeploy (#732b)
 
@@ -266,8 +263,7 @@ yields a pre-image that won't verify, so it cannot forge a slash.
 | `submitEquivocation(bytes32,bytes,uint64,bytes32,bytes,bytes32,bytes)` selector | `0xa39fe9c0` |
 
 Mirrored as constants in `src/slashing.rs`; unit tests pin them to the generated
-bytecode. The full verify + emit path is validated against a **live reth** by the
-manual harness `test/slashing.mjs` (see its header), with ground-truth
+bytecode. The full verify + emit path runs on a real EVM, with ground-truth
 equivocation vectors from boule's blst (`gen_slashing_vectors`).
 
 > [!NOTE]
@@ -333,14 +329,10 @@ signature-accumulation + bespoke tx-gossip approach.
 These identifiers are mirrored as constants in `src/governance.rs`; unit tests
 pin the address, topic, selectors, `AUTH_DOMAIN`, and the `Registry`
 weight/key-surface selectors to the genesis account's bytecode. The contract's
-authenticated approval-tally logic is validated against a **live reth** by the
-manual harness `test/governance.mjs` (see its header): a valid BLS-signed
-approval counts, a forged/wrong-key signature is rejected, naming a validator
-without its signature accrues no weight (forged-quorum closed), a non-seated
-caller reverts, and crossing the ⅔ weight threshold emits `Approved` exactly
-once. The harness shells out to the `bls-sign` helper
-(`cargo run -p boule-consensus --bin bls-sign`) for boule BLS signatures + EIP-2537
-pubkeys over the contract's `approveDigest`.
+authenticated approval-tally logic counts a valid BLS-signed approval, rejects a
+forged/wrong-key signature, accrues no weight when a validator is named without
+its signature (forged-quorum closed), reverts a non-seated caller, and emits
+`Approved` exactly once on crossing the ⅔ weight threshold.
 
 ### Reproducing the bytecode
 
