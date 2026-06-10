@@ -29,7 +29,10 @@ jobs:
   # three separate jobs each compiling reth and racing to write one cache.
   build:
     name: clippy + doc + test
-    runs-on: ubuntu-latest
+    # Blacksmith 4-vCPU runner: faster cold reth builds, and Swatinem/rust-cache
+    # transparently uses Blacksmith's colocated cache (no GitHub 10 GB limit,
+    # ~4x faster) with no action change. fmt/deny stay on free GitHub runners.
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
