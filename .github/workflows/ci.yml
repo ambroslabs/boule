@@ -8,9 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Set workflow-wide so the clippy/test/docs jobs hash to the same rust-cache
-  # environment key and can therefore share one cache (see the `shared-key`
-  # below). Harmless on the non-doc jobs.
+  # Applies to the `cargo doc` step in the build job below.
   RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
 
 jobs:
@@ -24,8 +22,13 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  clippy:
-    name: cargo clippy
+  # clippy + doc + test in ONE job sharing a single `target/`. The reth
+  # dependency tree compiles in two cargo modes — check (clippy/doc) and codegen
+  # (test). Running them in one job compiles reth twice total (clippy does the
+  # check build, which doc reuses; test does the one codegen build) instead of
+  # three separate jobs each compiling reth and racing to write one cache.
+  build:
+    name: clippy + doc + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,36 +37,20 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          # One cache shared by clippy/test/docs; only the test job writes it
-          # (its full `--all-targets` build is a superset of what clippy's
-          # check and docs' rustdoc need), and only on main.
-          shared-key: workspace
-          save-if: "false"
-      - uses: ./.github/actions/install-solc
-      - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo clippy -p boule-cli --features reth --all-targets -- -D warnings
-
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # The single writer of the shared cache; only persist from main so PR
-          # branches stay restore-only and don't each store a multi-GB copy
+          # One cache for the one compile job. Save only from main so PR
+          # branches stay restore-only and don't each persist a multi-GB copy
           # (keeps the repo under GitHub's 10 GB Actions-cache limit).
-          shared-key: workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/install-solc
       - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+      # check-mode compile of the whole tree + lints; doc reuses these artifacts.
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy -p boule-cli --features reth --all-targets -- -D warnings
+      - run: cargo doc --workspace --no-deps --document-private-items
+      # the one codegen build; also link-checks the reth-linked binaries.
       - run: cargo test --locked --all-targets
-      - name: Doctests
-        run: cargo test --locked --doc
+      - run: cargo test --locked --doc
 
   deny:
     name: cargo deny
@@ -71,19 +58,3 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
-
-  docs:
-    name: cargo doc
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: workspace
-          save-if: "false"
-      - uses: ./.github/actions/install-solc
-      - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-      - run: cargo doc --workspace --no-deps --document-private-items
-
