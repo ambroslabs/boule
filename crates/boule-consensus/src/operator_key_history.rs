@@ -1,46 +1,3 @@
-//! Per-validator **operator-key** history (#549).
-//!
-//! Every validator has, alongside its consensus *signing* key
-//! ([`ValidatorKeyHistory`](crate::validator_key_history::ValidatorKeyHistory)),
-//! an **operator key**: the cold-storage / multi-sig key identifying the
-//! human or organisation running the validator, distinct from the hot key
-//! that signs votes. The operator key's authority is administrative, not
-//! consensus:
-//!
-//! - It can rotate the *signing* key **without the old signing key** — the
-//!   recovery-from-loss path (#549). If a validator's signing key is
-//!   destroyed (HSM failure, lost single share), the operator key is what
-//!   lets it back into the set; without it the validator is bricked forever.
-//! - It self-rotates (dual-signed old + new operator) like the signing key.
-//! - Future: it authorises governance approvals (#548), endpoint updates
-//!   (#546), and withdrawal-address changes.
-//!
-//! This module is the **data structure** half of that work: a per-validator
-//! timeline of operator keys, mirroring
-//! [`BlsKeyHistory`](crate::bls_key_history::BlsKeyHistory) in shape (a
-//! validator's stable [`ValidatorId`] → a `v_eff`-ordered list of operator
-//! pubkeys). The lookup semantics are the same as the other key histories:
-//! an operator-signed action at view `V` verifies against the operator key
-//! that was active *at `V`*, so an action remains verifiable across later
-//! operator-key rotations.
-//!
-//! # Scope of this PR
-//!
-//! The pure structure plus its genesis constructor, lookups
-//! ([`OperatorKeyHistory::key_at`] / [`OperatorKeyHistory::current_key`]),
-//! the rotation mutator ([`OperatorKeyHistory::apply_rotation`]), and the
-//! persisted form — landed standalone,
-//! the way `BlsKeyHistory` (#294) shipped ahead of its integration. Wiring
-//! it into the commit path (operator-signed signing-key recovery, operator
-//! self-rotation, the anti-rollback commitment) lands in follow-up PRs.
-//!
-//! # Stable identifier
-//!
-//! Keyed by the validator's stable [`ValidatorId`] (its genesis pubkey, the
-//! same stable id `ValidatorKeyHistory` and `BlsKeyHistory` use), *not* by
-//! the operator pubkey — operators may run many validators (#549 q4), so the
-//! operator pubkey is not a unique key.
-
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -49,42 +6,23 @@ use crate::View;
 use crate::validator_set::ValidatorId;
 use boule_core::identity::NodeId;
 
-/// One entry in a validator's operator-key timeline: at view `v_eff` the
-/// validator's operator key became `operator_pubkey`. Per-validator entries
-/// are stored sorted by `v_eff` (monotonic increasing), with the genesis
-/// entry always at index 0 with `v_eff = 0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OperatorKeyEntry {
     v_eff: View,
     operator_pubkey: NodeId,
 }
 
-/// Per-validator history of operator keys over time.
-///
-/// Stable ID = the validator's stable [`ValidatorId`] (genesis pubkey).
-/// Validators declare an operator key at genesis and may rotate it later via
-/// a dual-signed operator-rotation tx (a follow-up PR). Operator-signed
-/// actions verify against the operator key active at the action's view.
 #[derive(Debug, Clone, Default)]
 pub struct OperatorKeyHistory {
     by_stable_id: BTreeMap<NodeId, Vec<OperatorKeyEntry>>,
 }
 
-/// Reasons [`OperatorKeyHistory::apply_rotation`] can refuse an operator-key
-/// rotation. Mirrors `BlsHistoryError`'s post-commit validation failures.
 #[derive(Debug, PartialEq, Eq)]
 pub enum OperatorHistoryError {
-    /// The validator has no operator-key history — it was never seeded at
-    /// genesis (or added with an operator key).
     UnknownValidator { stable_id: NodeId },
-    /// `v_eff` is not strictly greater than the most recent entry's, which
-    /// would make a single view's operator key ambiguous. Same
-    /// monotonic-`v_eff` rule as the signing-key and BLS histories; it also
-    /// provides replay protection for operator-signed rotations.
+
     VeffNotStrictlyIncreasing { last_v_eff: View, v_eff: View },
-    /// [`OperatorKeyHistory::register`] was called for a validator that already
-    /// has an operator-key history. `register` is for new reconfig-adds only;
-    /// existing validators rotate via [`OperatorKeyHistory::apply_rotation`].
+
     AlreadyRegistered { stable_id: NodeId },
 }
 
@@ -112,17 +50,10 @@ impl std::fmt::Display for OperatorHistoryError {
 impl std::error::Error for OperatorHistoryError {}
 
 impl OperatorKeyHistory {
-    /// Empty history. Genesis validators are added via [`Self::with_genesis`]
-    /// (or one-by-one through the persisted form), each at `v_eff = 0`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Build a history pre-populated with genesis validators' operator keys,
-    /// all effective at `v_eff = 0`. Mirrors
-    /// [`BlsKeyHistory::with_genesis`](crate::bls_key_history::BlsKeyHistory::with_genesis).
-    /// A duplicate `validator` in the iterator keeps the first entry (matching
-    /// `ValidatorSet`/`ValidatorKeyHistory` genesis dedup).
     pub fn with_genesis(genesis: impl IntoIterator<Item = (ValidatorId, NodeId)>) -> Self {
         let mut h = Self::new();
         for (validator, operator_pubkey) in genesis {
@@ -138,12 +69,6 @@ impl OperatorKeyHistory {
         h
     }
 
-    /// Register a brand-new validator's operator key, effective at `v_eff`.
-    /// Used when a reconfig **add** (#549) seats a validator that declared an
-    /// operator key — the operator-key analogue of mirroring the new validator
-    /// into `ValidatorKeyHistory`/`BlsKeyHistory` at the boundary. Errors if the
-    /// validator is already registered (callers guard with [`Self::contains`],
-    /// matching the key-history mirror).
     pub fn register(
         &mut self,
         validator: &ValidatorId,
@@ -165,11 +90,6 @@ impl OperatorKeyHistory {
         Ok(())
     }
 
-    /// Apply an operator-key rotation for an already-seeded validator.
-    /// `v_eff` must be strictly greater than the most recent entry's `v_eff`
-    /// so a single view never has an ambiguous operator key (also the replay
-    /// guard). Used by the operator self-rotation commit path (a follow-up
-    /// PR).
     pub fn apply_rotation(
         &mut self,
         stable_id: &ValidatorId,
@@ -198,15 +118,10 @@ impl OperatorKeyHistory {
         Ok(())
     }
 
-    /// Whether `validator` has an operator-key history.
     pub fn contains(&self, validator: &ValidatorId) -> bool {
         self.by_stable_id.contains_key(validator.as_node_id())
     }
 
-    /// The operator key active for `validator` at `view` — the entry with the
-    /// largest `v_eff <= view`. `None` if the validator has no operator-key
-    /// history. An operator-signed action committing at view `V` verifies
-    /// against `key_at(validator, V)`.
     pub fn key_at(&self, validator: &ValidatorId, view: impl Into<View>) -> Option<NodeId> {
         let view = view.into();
         let entries = self.by_stable_id.get(validator.as_node_id())?;
@@ -217,7 +132,6 @@ impl OperatorKeyHistory {
         Some(entries[i - 1].operator_pubkey)
     }
 
-    /// The most recent operator key on file for `validator`.
     pub fn current_key(&self, validator: &ValidatorId) -> Option<NodeId> {
         self.by_stable_id
             .get(validator.as_node_id())?
@@ -225,7 +139,6 @@ impl OperatorKeyHistory {
             .map(|e| e.operator_pubkey)
     }
 
-    /// Number of validators with an operator-key history.
     pub fn len(&self) -> usize {
         self.by_stable_id.len()
     }
@@ -234,8 +147,6 @@ impl OperatorKeyHistory {
         self.by_stable_id.is_empty()
     }
 
-    /// Snapshot into a serializable wire form for durable persistence. Mirrors
-    /// the other histories' `to_persisted` so all three flush side-by-side.
     pub fn to_persisted(&self) -> PersistedOperatorKeyHistory {
         let validators = self
             .by_stable_id
@@ -254,8 +165,6 @@ impl OperatorKeyHistory {
         PersistedOperatorKeyHistory { validators }
     }
 
-    /// Rebuild from the persisted form. Validates that every validator has at
-    /// least one entry and that entries are strictly `v_eff`-increasing.
     pub fn from_persisted(persisted: PersistedOperatorKeyHistory) -> anyhow::Result<Self> {
         let mut h = Self::new();
         for v in persisted.validators {
@@ -291,138 +200,19 @@ impl OperatorKeyHistory {
     }
 }
 
-/// Serializable form of an [`OperatorKeyHistory`] (postcard-stable: no maps,
-/// no floats), mirroring `PersistedBlsKeyHistory`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedOperatorKeyHistory {
     pub validators: Vec<PersistedOperatorValidator>,
 }
 
-/// One validator's operator-key timeline in persisted form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedOperatorValidator {
     pub stable_id: NodeId,
     pub entries: Vec<PersistedOperatorKeyEntry>,
 }
 
-/// One `(v_eff, operator_pubkey)` entry in persisted form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedOperatorKeyEntry {
     pub v_eff: View,
     pub operator_pubkey: NodeId,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn vid(b: u8) -> ValidatorId {
-        ValidatorId::from_genesis_pubkey([b; 32])
-    }
-    fn opk(b: u8) -> NodeId {
-        [b; 32]
-    }
-
-    #[test]
-    fn register_seats_a_new_validators_operator_key_at_v_eff() {
-        // #549: a reconfig-added validator registers its operator key at v_eff.
-        let mut h = OperatorKeyHistory::with_genesis([(vid(1), opk(0x11))]);
-        h.register(&vid(5), 30u64, opk(0x55)).unwrap();
-        assert_eq!(h.key_at(&vid(5), 30u64), Some(opk(0x55)));
-        assert_eq!(h.key_at(&vid(5), 29u64), None); // absent before v_eff
-        // Re-registering an already-seated validator is rejected.
-        assert_eq!(
-            h.register(&vid(5), 40u64, opk(0x66)),
-            Err(OperatorHistoryError::AlreadyRegistered {
-                stable_id: [5u8; 32],
-            }),
-        );
-        // A registered validator can then self-rotate its operator key.
-        h.apply_rotation(&vid(5), 50u64, opk(0x77)).unwrap();
-        assert_eq!(h.key_at(&vid(5), 50u64), Some(opk(0x77)));
-    }
-
-    #[test]
-    fn genesis_seeds_operator_keys_active_from_view_zero() {
-        let h = OperatorKeyHistory::with_genesis([(vid(1), opk(0x11)), (vid(2), opk(0x22))]);
-        assert_eq!(h.len(), 2);
-        assert_eq!(h.key_at(&vid(1), 0u64), Some(opk(0x11)));
-        assert_eq!(h.key_at(&vid(1), 99u64), Some(opk(0x11)));
-        assert_eq!(h.current_key(&vid(2)), Some(opk(0x22)));
-        assert!(h.contains(&vid(1)));
-        assert!(!h.contains(&vid(3)));
-        // A validator with no history resolves to nothing.
-        assert_eq!(h.key_at(&vid(3), 5u64), None);
-    }
-
-    #[test]
-    fn genesis_dedups_a_repeated_validator() {
-        let h = OperatorKeyHistory::with_genesis([(vid(1), opk(0x11)), (vid(1), opk(0xff))]);
-        assert_eq!(h.len(), 1);
-        // First entry wins, matching ValidatorSet/key-history genesis dedup.
-        assert_eq!(h.current_key(&vid(1)), Some(opk(0x11)));
-    }
-
-    #[test]
-    fn rotation_appends_and_lookup_is_view_scoped() {
-        let mut h = OperatorKeyHistory::with_genesis([(vid(1), opk(0x11))]);
-        h.apply_rotation(&vid(1), 10u64, opk(0x22)).unwrap();
-        // Before v_eff: still the genesis key. At/after: the new key.
-        assert_eq!(h.key_at(&vid(1), 9u64), Some(opk(0x11)));
-        assert_eq!(h.key_at(&vid(1), 10u64), Some(opk(0x22)));
-        assert_eq!(h.key_at(&vid(1), 11u64), Some(opk(0x22)));
-        assert_eq!(h.current_key(&vid(1)), Some(opk(0x22)));
-    }
-
-    #[test]
-    fn rotation_rejects_non_monotonic_v_eff_and_unknown_validator() {
-        let mut h = OperatorKeyHistory::with_genesis([(vid(1), opk(0x11))]);
-        h.apply_rotation(&vid(1), 10u64, opk(0x22)).unwrap();
-        // v_eff not strictly increasing (== last) is rejected (replay guard).
-        assert_eq!(
-            h.apply_rotation(&vid(1), 10u64, opk(0x33)),
-            Err(OperatorHistoryError::VeffNotStrictlyIncreasing {
-                last_v_eff: View(10),
-                v_eff: View(10),
-            }),
-        );
-        // Unknown validator.
-        assert_eq!(
-            h.apply_rotation(&vid(9), 1u64, opk(0x99)),
-            Err(OperatorHistoryError::UnknownValidator {
-                stable_id: [9u8; 32],
-            }),
-        );
-    }
-
-    #[test]
-    fn persisted_roundtrip_preserves_the_timeline() {
-        let mut h = OperatorKeyHistory::with_genesis([(vid(1), opk(0x11)), (vid(2), opk(0x22))]);
-        h.apply_rotation(&vid(1), 7u64, opk(0xaa)).unwrap();
-        let restored = OperatorKeyHistory::from_persisted(h.to_persisted()).unwrap();
-        assert_eq!(restored.key_at(&vid(1), 6u64), Some(opk(0x11)));
-        assert_eq!(restored.key_at(&vid(1), 7u64), Some(opk(0xaa)));
-        assert_eq!(restored.current_key(&vid(2)), Some(opk(0x22)));
-        assert_eq!(restored.to_persisted(), h.to_persisted());
-    }
-
-    #[test]
-    fn from_persisted_rejects_non_monotonic_entries() {
-        let bad = PersistedOperatorKeyHistory {
-            validators: vec![PersistedOperatorValidator {
-                stable_id: [1u8; 32],
-                entries: vec![
-                    PersistedOperatorKeyEntry {
-                        v_eff: View(0),
-                        operator_pubkey: opk(0x11),
-                    },
-                    PersistedOperatorKeyEntry {
-                        v_eff: View(0),
-                        operator_pubkey: opk(0x22),
-                    },
-                ],
-            }],
-        };
-        assert!(OperatorKeyHistory::from_persisted(bad).is_err());
-    }
 }

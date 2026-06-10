@@ -55,8 +55,3 @@ nybbles            = "0.4"
 # `build.rs` generates genesis.json from genesis.template.json + the compiled
 # contracts/*.sol; preserve_order keeps the template's key order in the output.
 serde_json = { version = "1", features = ["preserve_order"] }
-
-[dev-dependencies]
-# `net` + `rt-multi-thread` back the in-test mock reth used by the
-# concurrent-drip nonce test (#823).
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util"] }

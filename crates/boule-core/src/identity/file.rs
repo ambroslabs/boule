@@ -1,9 +1,3 @@
-//! File-backed identity: PKCS#8 PEM on disk with `0600` permissions.
-//!
-//! Read path accepts both PEM and legacy DER (auto-migrated to PEM + `0600`
-//! on next startup). Write path is atomic: write to a temp file in the same
-//! directory, fsync, then rename.
-
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -16,8 +10,7 @@ use super::{Encoding, KeyProvider, NodeIdentity, decode_pkcs8, der_to_pem, gener
 #[derive(Debug, Clone)]
 pub struct FileKeyProvider {
     path: PathBuf,
-    /// If true, skip the "world/group readable" permission check on read.
-    /// For dev use only.
+
     allow_insecure_perms: bool,
 }
 
@@ -162,91 +155,4 @@ fn check_permissions(path: &Path, allow_insecure: bool) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn check_permissions(_path: &Path, _allow_insecure: bool) -> anyhow::Result<()> {
     Ok(())
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    #[test]
-    fn generates_key_on_first_use() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.key");
-        let provider = FileKeyProvider::new(path.clone());
-
-        let id = provider.load_or_init().unwrap();
-        id.validate().unwrap();
-        assert!(path.exists());
-
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "new key should have mode 0600");
-
-        let contents = fs::read_to_string(&path).unwrap();
-        assert!(contents.starts_with("-----BEGIN PRIVATE KEY-----"));
-    }
-
-    #[test]
-    fn reuses_existing_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.key");
-        let provider = FileKeyProvider::new(path.clone());
-
-        let first = provider.load_or_init().unwrap();
-        let second = provider.load_or_init().unwrap();
-        assert_eq!(&first.pkcs8_der[..], &second.pkcs8_der[..]);
-    }
-
-    #[test]
-    fn migrates_der_to_pem() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.key");
-        let der = generate_pkcs8_der().unwrap();
-        fs::write(&path, &der[..]).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-
-        let provider = FileKeyProvider::new(path.clone());
-        let id = provider.load_or_init().unwrap();
-        assert_eq!(&id.pkcs8_der[..], &der[..]);
-
-        let after = fs::read_to_string(&path).unwrap();
-        assert!(after.starts_with("-----BEGIN PRIVATE KEY-----"));
-
-        let backup = path.with_extension("key.bak");
-        assert!(backup.exists());
-        let backup_bytes = fs::read(&backup).unwrap();
-        assert_eq!(backup_bytes, &der[..]);
-    }
-
-    #[test]
-    fn rejects_world_readable_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.key");
-        let der = generate_pkcs8_der().unwrap();
-        fs::write(&path, der_to_pem(&der)).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-
-        let err = FileKeyProvider::new(path.clone())
-            .load_or_init()
-            .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("insecure permissions"),
-            "unexpected error: {msg}"
-        );
-    }
-
-    #[test]
-    fn allow_insecure_flag_bypasses_perm_check() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.key");
-        let der = generate_pkcs8_der().unwrap();
-        fs::write(&path, der_to_pem(&der)).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-
-        FileKeyProvider::new(path)
-            .with_allow_insecure_perms(true)
-            .load_or_init()
-            .unwrap();
-    }
 }

@@ -1,19 +1,7 @@
-//! `testnet telemetry`: scrape interesting counters out of every
-//! node's log. Same anti-pattern as the §9b shell script (grep against
-//! tracing output), but immune to ANSI escapes because we count
-//! occurrences of the *event-name* substring rather than parse with
-//! `grep -oE`.
-//!
-//! The set of counters is intentionally small and curated. Operators
-//! who need richer data should subscribe to the `tracing` JSON output
-//! rather than scrape the log post-hoc.
-
 use std::collections::BTreeMap;
 
 use super::workdir::State;
 
-/// Counters tallied per node. Keys are stable — the CLI relies on
-/// them to render a tabular report.
 pub const COUNTERS: &[&str] = &[
     "consensus_resumed",
     "block_sync_request_emitted",
@@ -25,8 +13,6 @@ pub const COUNTERS: &[&str] = &[
 
 pub type NodeCounters = BTreeMap<String, usize>;
 
-/// Build a per-node counter table by scanning each log file for the
-/// counter names.
 pub fn collect(state: &State) -> anyhow::Result<BTreeMap<String, NodeCounters>> {
     let mut out: BTreeMap<String, NodeCounters> = BTreeMap::new();
     for n in &state.nodes {

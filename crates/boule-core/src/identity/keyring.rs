@@ -1,10 +1,3 @@
-//! OS keyring identity backend (macOS Keychain / Windows Credential Manager /
-//! Linux Secret Service).
-//!
-//! Stores PKCS#8 DER as a binary secret under (service, account). Gated by
-//! the `keyring-backend` cargo feature because the Linux backend needs a
-//! running D-Bus / Secret Service daemon at runtime.
-
 use anyhow::Context as _;
 use base64::Engine as _;
 use tracing::info;

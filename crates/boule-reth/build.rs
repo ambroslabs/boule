@@ -1,16 +1,3 @@
-//! Generates `genesis.json` from `genesis.template.json` by compiling each
-//! predeploy's `contracts/<Name>.sol` with solc — so the **source** (`.sol`) is
-//! the only thing committed, never the compiled bytecode (see AGENTS.md
-//! "Generated artifacts").
-//!
-//! The template's `alloc` entries carry `"contract": "<Name>"` instead of
-//! `"code"`; this build script replaces each with the compiled `bin-runtime`.
-//! The output `genesis.json` is git-ignored — it is read by the genesis-pin
-//! unit tests (`include_str!`) and is the basis for `boule genesis dev`.
-//!
-//! solc is located via `$SOLC`, then `solc` on `PATH`, then the py-solc-x
-//! default (`~/.solcx/solc-v0.8.24`). CI installs the pinned solc 0.8.24.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,7 +45,7 @@ fn compile_runtime(solc: &Path, contracts_dir: &Path, name: &str) -> String {
     let contracts = json["contracts"]
         .as_object()
         .expect("solc output has a `contracts` object");
-    // The key is "<path>:<Name>"; match the contract name.
+
     let suffix = format!(":{name}");
     let entry = contracts
         .iter()
@@ -98,8 +85,6 @@ fn main() {
         }
     }
 
-    // Write at the crate root (git-ignored) so `include_str!("../genesis.json")`
-    // finds it. Only rewrite on change to avoid churn.
     let genesis_path = crate_dir.join("genesis.json");
     let out = serde_json::to_string_pretty(&genesis).expect("serialize genesis") + "\n";
     let changed = std::fs::read_to_string(&genesis_path)

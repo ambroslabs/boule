@@ -1,10 +1,3 @@
-//! Status snapshot construction for the consensus integration layer.
-//!
-//! [`super::ConsensusNode::build_status`] composes a fresh
-//! [`ConsensusStatus`] from the safety-core, pacemaker, mempool, and
-//! peer-tracking state. Cheap enough to run at the end of every event-
-//! loop iteration.
-
 use std::sync::atomic::Ordering;
 
 use boule_consensus::hotstuff::qc::{quorum_size, quorum_weight_threshold};
@@ -20,17 +13,6 @@ use boule_core::identity::NodeId;
 
 use super::ConsensusNode;
 
-/// Compute the `self_role` string for a [`ConsensusStatus`]: either
-/// `"leader(view=N)"` when `self_id` is the proposer for `view`
-/// according to the installed leader selector, or `"replica"` otherwise.
-///
-/// Resolves the leader through [`Pacemaker::leader_for_view`] so the
-/// status string honors whichever selector is in effect (round-robin,
-/// weighted accumulator, or any future impl). When the selector is the
-/// production default [`boule_consensus::pacemaker::leader::WeightedAccumulatorSelector`]
-/// the role string tracks stake-weighted leadership exactly; under
-/// [`boule_consensus::pacemaker::leader::RoundRobinSelector`] it
-/// reduces to the previous `validators[view % len]` rule.
 pub(super) fn self_role_string(
     pacemaker: &Pacemaker,
     validator_set: &ValidatorSet,
@@ -49,13 +31,6 @@ pub(super) fn self_role_string(
 }
 
 impl ConsensusNode {
-    /// Build a fresh [`ConsensusStatus`] snapshot from the current
-    /// safety-core, pacemaker, mempool, and peer-tracking state.
-    ///
-    /// Cheap — shallow-copies a handful of fields, clones a small
-    /// handful of bounded-size vectors. Safe to call from the event
-    /// loop after each state-mutating tick without affecting
-    /// throughput.
     pub fn build_status(&self) -> ConsensusStatus {
         let current_view = self.pacemaker.current_view();
         let state = self.core.state();
@@ -95,9 +70,6 @@ impl ConsensusNode {
             .vote_buckets()
             .filter(|((view, _), _)| *view >= min_view && *view <= max_view)
             .map(|((view, block_hash), qc)| {
-                // Weight units (#473) against the set authoritative at the
-                // bucket's view — the same set the QC's bitmap was formed over,
-                // so `signer_weight` matches its bitmap length.
                 let set_at = self.validator_history.set_at(*view);
                 let vs = set_at.for_view(*view);
                 VoteBucketStatus {
@@ -110,8 +82,7 @@ impl ConsensusNode {
                 }
             })
             .collect();
-        // Stable ordering keeps the JSON shape deterministic across
-        // calls, which makes logs and diff-based debugging workable.
+
         vote_buckets.sort_by(|a, b| a.view.cmp(&b.view).then(a.block_hash.cmp(&b.block_hash)));
 
         let mut timeout_buckets: Vec<TimeoutBucketStatus> = self
@@ -125,7 +96,7 @@ impl ConsensusNode {
                     view: *view,
                     signers: bucket.signers.len(),
                     quorum,
-                    // The bucket already tracks signer weight (O(1) per insert).
+
                     signer_weight: bucket.signer_weight,
                     quorum_weight: quorum_weight_threshold(vs),
                 }
@@ -151,12 +122,6 @@ impl ConsensusNode {
             .collect();
         peers_connected.sort();
 
-        // Report the set authoritative at the current view, not the
-        // construction-time `self.validator_set` field — the latter is not
-        // advanced when a reconfig boundary takes effect, so it would show a
-        // stale committee after any membership change (governance or
-        // app-driven). `set_at(current_view)` reflects committed boundaries
-        // and is identical to genesis until one lands.
         let active_set = self.validator_history.set_at(current_view);
         let validator_set: Vec<String> = active_set
             .for_view(current_view)
@@ -164,8 +129,6 @@ impl ConsensusNode {
             .map(|v| boule_core::identity::node_id_to_base58(v.as_node_id()))
             .collect();
 
-        // by_stable_id is a BTreeMap, so iter() already yields
-        // validators in byte-lexicographic order — no extra sort needed.
         let validator_keys: Vec<ValidatorKeyStatus> = self
             .validator_key_history
             .iter()
@@ -238,7 +201,7 @@ impl ConsensusNode {
                     .map(|l| l.counters().outbound_drops_total())
                     .unwrap_or(0),
             },
-            // #540: surface the liveness detector's verdicts.
+
             delinquent_validators: self
                 .liveness_tracker
                 .delinquents()
@@ -246,7 +209,7 @@ impl ConsensusNode {
                 .map(|v| boule_core::identity::node_id_to_base58(v.as_node_id()))
                 .collect(),
             cluster_participation_permille: self.liveness_tracker.cluster_participation_permille(),
-            // #828: surface the persistently-behind-EL dead-proposer signal.
+
             el_behind: self.el_behind,
             el_behind_height_gap: self.el_behind_height_gap,
         }

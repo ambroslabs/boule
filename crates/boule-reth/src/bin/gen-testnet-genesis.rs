@@ -1,49 +1,8 @@
-//! Build a **deployment** reth `genesis.json` for a public testnet: seed the
-//! `Registry` predeploy with the deployment's *minted* validator set (keys +
-//! weights + `totalWeight` — the weighted-quorum surface from block zero), set
-//! a public EVM `chainId`, and prefund an operator-chosen list of EOAs.
-//!
-//! Unlike [`gen-genesis`](gen-genesis) (which seeds the deterministic dev
-//! validator set for harnesses), this binary takes the *real* validators the
-//! deployment minted — so it composes with `boule init` (node keys) and
-//! `gen-bls-genesis --multi` (chain-bound BLS keys + PoPs). The testnet
-//! generator (`gen-testnet.sh`) wires the three together.
-//!
-//! Usage:
-//! ```text
-//! gen-testnet-genesis \
-//!     --chain-id <U64> \
-//!     --staking-owner <0xADDR> \
-//!     --out <PATH> \
-//!     [--prefund <0xADDR>:<WEI> ...] \
-//!     --validator <NODE_ID_B58>:<BLS_PUBKEY_HEX>:<WEIGHT> ...
-//! ```
-//!
-//! - `--validator` repeats once per validator. `BLS_PUBKEY_HEX` is the
-//!   compressed-G1 BLS pubkey `gen-bls-genesis` prints (`bls_pubkey_<i>=…`).
-//!   `WEIGHT` is the validator's genesis stake (a positive integer) — the
-//!   Registry **must** seed non-zero weights or weighted quorum is inert.
-//! - `--prefund` repeats; `WEI` is decimal wei. A faucet account (#806) is just
-//!   another `--prefund` entry — this binary has no coupling to the faucet.
-//! - `--staking-owner` is the 20-byte EVM address allowed to call the `Staking`
-//!   predeploy's `withdraw` (#821): unbonding (which removes a validator) is a
-//!   trusted-owner action, not open self-service. **Required** — a deployment
-//!   that left it unset would have `owner == address(0)`, disabling `withdraw`
-//!   entirely (fails closed), but the operator must consciously choose the
-//!   address rather than silently ship a no-withdraw chain.
-//! - `--out` is the genesis path (default: stdout).
-//!
-//! The seeded storage is byte-identical to what a live reth answers for
-//! `weightOf` / `totalWeight` (pinned by the `genesis_seed_storage` tests in
-//! `registry.rs` against `eth_getStorageAt`).
-
 use boule_core::crypto::sig_scheme::BlsPublicKey;
 use boule_core::identity::base58_to_node_id;
 use boule_reth::{GenesisValidator, PrefundAlloc, build_deployment_genesis};
 
 fn parse_validator(spec: &str) -> anyhow::Result<GenesisValidator> {
-    // NODE_ID_B58:BLS_PUBKEY_HEX:WEIGHT — split from the right twice so a
-    // base58 id (no colons) stays intact.
     let parts: Vec<&str> = spec.splitn(3, ':').collect();
     anyhow::ensure!(
         parts.len() == 3,

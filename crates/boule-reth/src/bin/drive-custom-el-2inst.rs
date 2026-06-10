@@ -1,27 +1,3 @@
-//! A1 **Phase-5 two-instance determinism proof** (#793/#785): drive *two*
-//! independent custom-EL instances (A = proposer, B = verifier) over the real
-//! Engine API and prove they converge **byte-for-byte** on the canonical
-//! Registry (`0x…0b12`).
-//!
-//! For each block (a settled-only block, then a full key + weight + settled
-//! block whose `extra_data` exceeds the Ethereum 32-byte cap):
-//! 1. **A builds** it (`forkchoiceUpdatedV3(attrs)` → `getPayloadV4`) — the build
-//!    path, with the relaxed-cap `ConsensusBuilder`.
-//! 2. **B verifies** the *same* sealed payload (`newPayloadV4` + `fcU`) — the
-//!    verify path, with the relaxed-cap `convert_payload_to_block`. B never sees
-//!    the build attribute; it reconstructs the write set from the propagated
-//!    header `extra_data` alone (the EIP-4788 determinism model).
-//! 3. Assert **A and B agree on the block hash** (so their state roots, and thus
-//!    their `0x…0b12` storage, are identical) and that `keyAt` / `weightOf` /
-//!    `settledView` read back from `0x…0b12` match on *both* instances.
-//!
-//! Both instances must run the *same* genesis (canonical Registry at `0x…0b12`).
-//!
-//! ```text
-//! drive-custom-el-2inst <jwtA.hex> <jwtB.hex> [engineA] [ethA] [engineB] [ethB]
-//! ```
-//! Defaults: A on 8551/8545, B on 8561/8555.
-
 use anyhow::{Context, Result, bail};
 use boule_consensus::View;
 use boule_consensus::replication::application::ValidatorUpdate;
@@ -33,7 +9,6 @@ use boule_reth::{BuiltBlock, HttpTransport, RethEngine};
 use serde_json::json;
 use std::time::Duration;
 
-/// The canonical Registry predeploy address both instances read/write (#793).
 const REGISTRY_ADDR: &str = boule_reth::registry::REGISTRY_ADDRESS;
 
 const KEY_AT: [u8; 4] = [0x3a, 0x9e, 0x35, 0x8a];
@@ -58,7 +33,6 @@ async fn eth_call(t: &HttpTransport, calldata: Vec<u8>) -> Result<Vec<u8>> {
     hex::decode(hex.trim_start_matches("0x")).context("eth_call result not hex")
 }
 
-/// Read the three registry surfaces (keyAt, weightOf, settledView) at the head.
 async fn read_registry(
     t: &HttpTransport,
     validator: &NodeId,
@@ -115,7 +89,6 @@ async fn main() -> Result<()> {
     let ta = HttpTransport::new(engine_a, eth_a.clone(), secret_a, None);
     let tb = HttpTransport::new(engine_b, eth_b.clone(), secret_b, None);
 
-    // Both must boot the same genesis → identical genesis EVM block.
     let (gen_a, _) = boule_reth::fetch_genesis(&eth_a)
         .await
         .context("fetch genesis A (is instance A up?)")?;
@@ -131,7 +104,6 @@ async fn main() -> Result<()> {
     let ea = RethEngine::new(&ta, fee);
     let eb = RethEngine::new(&tb, fee);
 
-    // The full-payload write set we will read back on both instances.
     let validator: NodeId = [0x42; 32];
     let v_eff = View::new(15);
     let key128: [u8; 128] = std::array::from_fn(|i| (i as u8).wrapping_mul(3).wrapping_add(1));
@@ -139,12 +111,10 @@ async fn main() -> Result<()> {
     let weight = 4242u64;
     let settled_full = View::new(11);
 
-    // ── Block 1: settled-only (the common small block). A builds, B verifies. ──
     let p1 = RegistryPayload::new(vec![], &[], Some(View::new(9)));
     let b1 = build_on_a_verify_on_b(&ea, &eb, &gen_a, 1, &p1.to_attribute_hex()).await?;
     eprintln!("[block 1] settled-only: A and B agree on {}", b1.block_hash);
 
-    // ── Block 2: full payload (key + weight + settled), > 32-byte extra_data. ──
     let p2 = RegistryPayload::new(
         vec![RecordKey {
             validator,
@@ -164,7 +134,6 @@ async fn main() -> Result<()> {
         b2.block_hash
     );
 
-    // ── Both instances must read back the identical write set from 0x…0b12. ──
     let (ka, wa, sa) = read_registry(&ta, &validator, v_eff, &weight_validator).await?;
     let (kb, wb, sb) = read_registry(&tb, &validator, v_eff, &weight_validator).await?;
     check(ka == key128 && kb == key128, "keyAt == key128 on A and B")?;
@@ -189,9 +158,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// A builds block `n` on `parent` carrying `attr`; B verifies the *same* sealed
-/// payload via `newPayloadV4` (reconstructing the write set from `extra_data`
-/// alone). Asserts both commit VALID and agree on the block hash.
 async fn build_on_a_verify_on_b(
     ea: &RethEngine<'_>,
     eb: &RethEngine<'_>,
@@ -210,8 +176,6 @@ async fn build_on_a_verify_on_b(
     check(sa == ElStatus::Valid, "A committed VALID")?;
     check(ca == built.block_hash, "A head == built hash")?;
 
-    // B receives ONLY the sealed payload (no build attribute) and must reproduce
-    // the identical block — the verify path's relaxed-cap converter + executor.
     let (cb, sb) = eb
         .commit_block(&built.execution_payload)
         .await

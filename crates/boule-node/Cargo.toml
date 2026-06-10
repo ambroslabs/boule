@@ -18,15 +18,6 @@ categories.workspace = true
 # stays lean. A config that selects the reth backend without this feature
 # fails at startup with a clear error.
 reth = ["dep:boule-reth"]
-# Compiles the test/sim-only in-process counter execution backend — the
-# `CounterStateMachine` (via `boule-consensus/testing`), the `MempoolBlockBuilder`
-# default application, the `state_machine` constructor params, and the
-# `allow_counter_state_machine` dev affordance (#894). Off in production (reth is
-# the only supported backend, #883); enabled by downstream test builds — the
-# bundle's fast consensus-liveness integration tests — that need the lightweight
-# counter without booting reth. This crate's own tests get it for free via the
-# `test` cfg.
-testing = ["boule-consensus/testing"]
 
 [dependencies]
 boule-core          = { path = "../boule-core", version = "0.1.0" }
@@ -59,15 +50,3 @@ bs58                = "0.5"
 tempfile            = "3"
 toml                = "1"
 zeroize             = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
-# Enable the crash-injection seam in consensus for the crash-recovery sim.
-boule-consensus     = { path = "../boule-consensus", version = "0.1.0", features = ["crashpoints", "testing"] }
-boule-core          = { path = "../boule-core", version = "0.1.0", features = ["testing"] }
-tokio               = { version = "1", features = ["full", "test-util"] }
-proptest            = { version = "1", default-features = false, features = ["std", "bit-set"] }
-tempfile            = "3"
-rcgen               = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-# Drive axum routers in-process (`ServiceExt::oneshot`) for the API tests.
-tower               = { version = "0.5", features = ["util"] }
-http-body-util      = "0.1"

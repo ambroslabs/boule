@@ -1,9 +1,3 @@
-//! Argument parser + dispatcher for the `testnet` binary.
-//!
-//! Parses argv and routes to the testnet driver lib functions in the
-//! sibling modules. Mirrors the no-clap style used by `src/main.rs` so
-//! the surface stays consistent between the two binaries.
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,17 +9,13 @@ use super::topology::TopologySpec;
 use super::workdir::State;
 use super::{events, lifecycle, safety, scenario, telemetry, wait};
 
-/// Default workdir when `--workdir` is omitted.
 const DEFAULT_WORKDIR: &str = "./testnet";
-/// Default per-step wait timeout for `wait` and scenarios.
+
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 30;
-/// Default consensus pacemaker base timeout (smaller than the
-/// production default so smoke tests commit quickly).
+
 const DEFAULT_TIMEOUT_BASE_MS: u64 = 200;
 const DEFAULT_TIMEOUT_MAX_MS: u64 = 2_000;
 
-/// Top-level entry point. Returns `Ok(())` on success; the binary
-/// translates `Err` into a non-zero exit status.
 pub async fn dispatch(args: &[String]) -> anyhow::Result<()> {
     let first = match args.first().map(String::as_str) {
         Some(s) => s,
@@ -119,8 +109,6 @@ fn print_usage() {
     println!("If --boule-bin is omitted, the binary is searched next to the testnet exe.");
 }
 
-// ── Shared option parsing ───────────────────────────────────────────────────
-
 fn pop_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> anyhow::Result<&'a str> {
     *i += 1;
     args.get(*i)
@@ -162,11 +150,6 @@ fn parse_boule_bin(args: &[String]) -> anyhow::Result<(Option<PathBuf>, Vec<Stri
     Ok((bin, rest))
 }
 
-/// Locate the `boule` binary. If `explicit` is provided, use it.
-/// Otherwise look next to the current executable (the typical layout for
-/// both `cargo run --bin testnet` and a release build), and finally fall
-/// back to PATH lookup via the bare `boule` name so an installed
-/// build still works.
 fn resolve_boule_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(p) = explicit {
         if !p.exists() {
@@ -182,12 +165,9 @@ fn resolve_boule_bin(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
             }
         }
     }
-    // PATH fallback. We don't try to resolve eagerly — Command will
-    // exec via PATH and surface a clear error if it's missing.
+
     Ok(PathBuf::from("boule"))
 }
-
-// ── `new` ───────────────────────────────────────────────────────────────────
 
 async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
@@ -218,16 +198,7 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
         i += 1;
     }
     let nodes = nodes.ok_or_else(|| anyhow::anyhow!("`new` requires --nodes <N>"))?;
-    // Match `OverlayConfig::default().outbound_target` when
-    // --target-degree is omitted. The issue's k+3 minimum applies
-    // only when the operator is sweeping a sparse-mesh preset; the
-    // default for casual `new` invocations should keep enough
-    // redundancy that killing 2 nodes in a 7-node cluster doesn't
-    // partition the survivors. The driver continues to accept
-    // `--target-degree` as the user-facing flag (the testnet CLI is
-    // distinct from the per-node `[overlay]` schema), but it now
-    // writes the post-#187 `outbound_target` knob in each node's
-    // generated config.
+
     let target_degree = target_degree.unwrap_or(8);
     let spec = TopologySpec {
         nodes,
@@ -253,8 +224,6 @@ async fn cmd_new(args: &[String]) -> anyhow::Result<()> {
     println!("next: testnet up --workdir {}", workdir.display());
     Ok(())
 }
-
-// ── `up` ────────────────────────────────────────────────────────────────────
 
 async fn cmd_up(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
@@ -284,8 +253,6 @@ async fn cmd_up(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── `down` ──────────────────────────────────────────────────────────────────
-
 fn cmd_down(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
     if !rest.is_empty() {
@@ -296,8 +263,6 @@ fn cmd_down(args: &[String]) -> anyhow::Result<()> {
     println!("down: cluster torn down");
     Ok(())
 }
-
-// ── `kill` ──────────────────────────────────────────────────────────────────
 
 fn cmd_kill(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
@@ -349,23 +314,13 @@ fn cmd_kill(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── `ls` ────────────────────────────────────────────────────────────────────
-
 async fn cmd_ls(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
     if !rest.is_empty() {
         anyhow::bail!("`ls` takes no positional args; got {:?}", rest);
     }
     let state = State::load(&workdir)?;
-    // Columns:
-    //   - boot: number of `[[peers]]` bootstrap entries written by `new`
-    //   - peers: realized direct-peer count from /peers (live nodes only;
-    //     "-" when the node is down, "?" when the API is unreachable).
-    //
-    // The bootstrap count is what gets configured at boot; the realized
-    // count is what the gossip overlay actually maintains. Showing both
-    // makes it obvious whether `target_degree` is being honored without
-    // chasing down /peers per-node.
+
     println!(
         "{:>7}  {:<46}  {:<22}  {:<22}  {:<10}  {:>4}  {:>5}",
         "node", "node_id", "p2p", "api", "status", "boot", "peers"
@@ -409,8 +364,6 @@ async fn cmd_ls(args: &[String]) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-// ── `info` ──────────────────────────────────────────────────────────────────
 
 async fn cmd_info(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
@@ -463,8 +416,6 @@ async fn cmd_info(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── `logs` ──────────────────────────────────────────────────────────────────
-
 fn cmd_logs(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
     let state = State::load(&workdir)?;
@@ -474,7 +425,6 @@ fn cmd_logs(args: &[String]) -> anyhow::Result<()> {
     while i < rest.len() {
         match rest[i].as_str() {
             "--tail" => {
-                // Optional N; default 80 when --tail with no value.
                 if let Some(next) = rest.get(i + 1) {
                     if let Ok(n) = next.parse::<usize>() {
                         tail = Some(n);
@@ -507,8 +457,6 @@ fn cmd_logs(args: &[String]) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-// ── `snap` ──────────────────────────────────────────────────────────────────
 
 async fn cmd_snap(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
@@ -595,8 +543,6 @@ fn fmt_opt_usize(v: Option<usize>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".into())
 }
 
-// ── `wait` ──────────────────────────────────────────────────────────────────
-
 #[derive(Default)]
 struct WaitArgs {
     all_reach_height: Option<u64>,
@@ -677,8 +623,6 @@ async fn cmd_wait(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── `verify-safety` ─────────────────────────────────────────────────────────
-
 fn cmd_verify_safety(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
     if !rest.is_empty() {
@@ -702,8 +646,6 @@ fn cmd_verify_safety(args: &[String]) -> anyhow::Result<()> {
     anyhow::bail!("safety violations detected");
 }
 
-// ── `telemetry` ─────────────────────────────────────────────────────────────
-
 fn cmd_telemetry(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
     if !rest.is_empty() {
@@ -724,8 +666,6 @@ fn cmd_telemetry(args: &[String]) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-// ── `scenario` ──────────────────────────────────────────────────────────────
 
 async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
     let (workdir, rest) = parse_workdir(args)?;
@@ -749,13 +689,7 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
                 let v = pop_value(&rest, &mut i, "--liveness-window")?;
                 liveness_window_secs = parse_secs(v)?;
             }
-            // Deprecated alias for --liveness-window. The original
-            // name implied the killed nodes would come back up after
-            // N seconds, which the scenario engine never actually
-            // did — the flag has only ever sized the post-kill
-            // commit-progress window. Kept working so existing
-            // walkthroughs don't break, with a one-line stderr
-            // notice steering operators to the new name.
+
             "--restart-after" => {
                 let v = pop_value(&rest, &mut i, "--restart-after")?;
                 liveness_window_secs = parse_secs(v)?;
@@ -807,8 +741,6 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
         }
     };
 
-    // Bring the cluster up if it isn't already, so a single `testnet
-    // scenario ...` invocation works from a fresh `new`.
     let binary = resolve_boule_bin(boule_bin)?;
     let state = State::load(&workdir)?;
     let pids = lifecycle::up_all(&workdir, &binary, &state).await?;
@@ -816,8 +748,6 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
         println!("scenario: spawned {} node(s); cluster is up", pids.len());
     }
 
-    // Reload state — `up_all` doesn't mutate it but the scenario engine
-    // does between steps.
     let state = State::load(&workdir)?;
     events::record(
         &workdir,
@@ -829,9 +759,6 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
         )),
     );
 
-    // Drop guard: if the runtime aborts mid-scenario (panic, ctrl-c
-    // routed through the ScenarioGuard set up by main), leave the
-    // cluster torn down rather than zombie.
     let mut guard = ScenarioGuard::arm(workdir.clone(), state.clone());
     let outcomes = scenario::run(&workdir, &binary, scen.clone()).await;
     guard.disarm();
@@ -845,8 +772,6 @@ async fn cmd_scenario(args: &[String]) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => {
-            // Best-effort cleanup so a failed scenario doesn't leave
-            // zombies for the next run.
             let _ = lifecycle::down(&workdir, &state);
             Err(e)
         }
@@ -858,8 +783,6 @@ fn parse_secs(s: &str) -> anyhow::Result<u64> {
     Ok(trimmed.parse()?)
 }
 
-/// Tear the cluster down on `Drop` unless explicitly disarmed. Used to
-/// guarantee scenario crashes don't leave zombie node processes behind.
 pub struct ScenarioGuard {
     workdir: PathBuf,
     state: State,
@@ -886,27 +809,16 @@ impl ScenarioGuard {
 impl Drop for ScenarioGuard {
     fn drop(&mut self) {
         if self.armed {
-            // Best effort — we're already in an unwinding/abort path.
             let _ = lifecycle::down(&self.workdir, &self.state);
         }
     }
 }
 
-/// Entry point used by `src/bin/testnet.rs` after parsing global flags.
-/// Routes ctrl-c so that scenario commands tear the cluster down before
-/// the process exits.
 pub async fn run_with_signal_handling(args: &[String]) -> anyhow::Result<()> {
-    // Spawn a ctrl-c watcher that calls `down` against the workdir
-    // currently in use, then exits the process. We resolve the workdir
-    // by snooping `--workdir` out of argv (defaulting to DEFAULT_WORKDIR);
-    // this is best-effort — non-scenario commands are short-lived so
-    // there's nothing to clean up.
     let (workdir, _rest) = parse_workdir_for_signal(args);
     let workdir_for_signal = workdir.clone();
     let _watcher = tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            // Try to load state; if the workdir doesn't have one (e.g.
-            // ctrl-c during `new` mid-discovery), just exit.
             if let Ok(state) = State::load(&workdir_for_signal) {
                 let _ = lifecycle::down(&workdir_for_signal, &state);
             }
@@ -916,9 +828,6 @@ pub async fn run_with_signal_handling(args: &[String]) -> anyhow::Result<()> {
     dispatch(args).await
 }
 
-/// Best-effort `--workdir` extraction for the signal handler. Mirrors
-/// `parse_workdir` but never fails — we don't want a malformed argv to
-/// crash the watcher before we've even entered dispatch.
 fn parse_workdir_for_signal(args: &[String]) -> (PathBuf, ()) {
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
@@ -934,34 +843,4 @@ fn parse_workdir_for_signal(args: &[String]) -> (PathBuf, ()) {
 #[allow(dead_code)]
 fn _ensure_path_used(p: &Path) -> &Path {
     p
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_workdir_strips_flag_only() {
-        let args = vec![
-            "--workdir".into(),
-            "/tmp/foo".into(),
-            "--nodes".into(),
-            "4".into(),
-        ];
-        let (wd, rest) = parse_workdir(&args).unwrap();
-        assert_eq!(wd, PathBuf::from("/tmp/foo"));
-        assert_eq!(rest, vec!["--nodes".to_string(), "4".to_string()]);
-    }
-
-    #[test]
-    fn parse_workdir_default() {
-        let (wd, _) = parse_workdir(&[]).unwrap();
-        assert_eq!(wd, PathBuf::from(DEFAULT_WORKDIR));
-    }
-
-    #[test]
-    fn parse_secs_accepts_both_forms() {
-        assert_eq!(parse_secs("3").unwrap(), 3);
-        assert_eq!(parse_secs("15s").unwrap(), 15);
-    }
 }

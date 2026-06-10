@@ -1,9 +1,3 @@
-//! Entry point for the boule custom reth EL node (Option A, #777).
-//!
-//! Same CLI surface as stock reth, but launches [`BouleNode`] — the
-//! `NodeBuilder`-composed node that applies boule's registry writes as system
-//! calls. See [`boule_reth_node`] for the pipeline.
-
 use boule_reth_node::node::BouleNode;
 use reth_ethereum::cli::interface::Cli;
 

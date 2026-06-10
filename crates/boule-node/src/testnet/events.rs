@@ -1,9 +1,3 @@
-//! Append-only events log written under `<workdir>/events.jsonl`.
-//!
-//! Every action the driver takes (spawn, kill, snapshot, scenario step)
-//! lands here as one JSON record per line, timestamped with the
-//! wall-clock UTC. Enables post-mortem analysis after a scenario fails.
-
 use std::io::Write as _;
 use std::path::Path;
 
@@ -22,9 +16,6 @@ pub struct Event {
     pub detail: Option<String>,
 }
 
-/// Append a single event record. Failures are logged but do not bubble
-/// up — the events log is a debugging aid and never the source of
-/// truth for the driver's behaviour.
 pub fn record(workdir: &Path, kind: &str, node: Option<&str>, detail: Option<&str>) {
     let path = workdir.join(EVENTS_FILE);
     let evt = Event {

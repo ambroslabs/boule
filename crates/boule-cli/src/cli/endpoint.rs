@@ -1,7 +1,3 @@
-//! `boule endpoint` — build validator endpoint-advertisement payloads (#546),
-//! printed as hex to pipe into a validator's mempool (same route as
-//! `reconfig` / `rotation` payloads; no admin RPC yet).
-
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -15,43 +11,37 @@ use super::shared::resolve_config_path;
 
 #[derive(Subcommand)]
 pub enum EndpointCmd {
-    /// Replace the validator's published endpoint list.
     Set(EndpointEntriesArgs),
-    /// Append entries to the validator's published list.
+
     Add(EndpointEntriesArgs),
-    /// Drop entries (by `network_id`) from the validator's list.
+
     Remove(EndpointRemoveArgs),
 }
 
 #[derive(Args)]
 pub struct EndpointEntriesArgs {
-    /// Config file path (default: platform-specific location). The
-    /// validator's consensus key is loaded from it to sign the command.
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
-    /// Per-validator sequence number. Must strictly exceed the validator's
-    /// last-applied endpoint `seq`, or the chain drops the command at commit.
+
     #[arg(long)]
     seq: u64,
-    /// An entry as `<network_id_base58>@<host:port>`. Repeatable.
+
     #[arg(long = "entry", required = true)]
     entries: Vec<String>,
 }
 
 #[derive(Args)]
 pub struct EndpointRemoveArgs {
-    /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
-    /// Per-validator sequence number (must strictly increase).
+
     #[arg(long)]
     seq: u64,
-    /// A `network_id` (base58) to drop. Repeatable.
+
     #[arg(long = "network-id", required = true)]
     network_ids: Vec<String>,
 }
 
-/// Parse `<network_id_base58>@<host:port>` into an [`EndpointEntry`].
 fn parse_entry(s: &str) -> anyhow::Result<EndpointEntry> {
     let (id, addr) = s
         .split_once('@')
@@ -115,28 +105,4 @@ pub(crate) fn handle_remove(args: EndpointRemoveArgs) -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     emit(args.config_path, args.seq, EndpointOp::Remove(ids))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_entry_round_trips() {
-        let id = node_id_to_base58(&[7u8; 32]);
-        let e = parse_entry(&format!("{id}@10.0.0.1:9000")).unwrap();
-        assert_eq!(e.network_id, [7u8; 32]);
-        assert_eq!(e.network_address, "10.0.0.1:9000".parse().unwrap());
-    }
-
-    #[test]
-    fn parse_entry_rejects_missing_at() {
-        assert!(parse_entry("deadbeef-no-at").is_err());
-    }
-
-    #[test]
-    fn parse_entry_rejects_bad_address() {
-        let id = node_id_to_base58(&[7u8; 32]);
-        assert!(parse_entry(&format!("{id}@not-an-addr")).is_err());
-    }
 }

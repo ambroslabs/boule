@@ -1,14 +1,3 @@
-//! Genesis-block construction and [`ChainId`] derivation.
-//!
-//! These compute a deployment's genesis block and chain ID from a
-//! [`ConsensusConfig`] (or the raw parts), pulling in the genesis-time
-//! validator-set / key / BLS-key histories. They live in `consensus`
-//! rather than in the node runtime so CLI tooling (`reconfig`,
-//! `rotation`) and the `testnet` driver can derive a chain ID without
-//! booting a node.
-//!
-//! [`ChainId`]: boule_core::crypto::signed::ChainId
-
 use anyhow::Context as _;
 
 use crate::replication::block::Block;
@@ -16,18 +5,6 @@ use crate::validator_set::ValidatorSet;
 use boule_core::config::ConsensusConfig;
 use boule_core::identity::{NodeId, base58_to_node_id};
 
-/// Derive the deployment's [`ChainId`] from a [`ConsensusConfig`]
-/// without booting a full consensus node. Used by CLI tooling
-/// (`reconfig add-validator` etc.) that needs to mint or verify
-/// chain-bound BLS proofs-of-possession (#410) before the node is
-/// actually running.
-///
-/// Performs only the structural validation of `validators_bls`
-/// (decoding hex, length match, no duplicates) — the cryptographic
-/// PoP check is exactly what the caller is preparing to perform, so
-/// it would be redundant here.
-///
-/// [`ChainId`]: boule_core::crypto::signed::ChainId
 pub fn derive_chain_id(
     cfg: &ConsensusConfig,
 ) -> anyhow::Result<boule_core::crypto::signed::ChainId> {
@@ -63,18 +40,6 @@ pub fn derive_chain_id(
     ))
 }
 
-/// Lower-level [`ChainId`] derivation that takes only the inputs the
-/// genesis-block construction needs, without going through a fully-
-/// populated [`ConsensusConfig`]. Used by the `testnet` driver
-/// (which mints validator BLS keys before any config has been written
-/// and needs the chain_id to mint chain-bound PoPs, #410).
-///
-/// `validator_node_ids` is the cluster's validator pubkeys in their
-/// genesis order — the function sorts them through [`ValidatorSet`]
-/// the same way `[consensus.validators]` parsing does, so the input
-/// order doesn't matter as long as it's the same set on every node.
-///
-/// [`ChainId`]: boule_core::crypto::signed::ChainId
 pub fn derive_chain_id_from_parts(
     validator_node_ids: &[NodeId],
     genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
@@ -96,14 +61,6 @@ pub fn derive_chain_id_from_parts(
     boule_core::crypto::signed::ChainId::from_genesis_hash(genesis.hash())
 }
 
-/// Build the genesis block from the optional `genesis_seed_hex` config
-/// field. Defaults to all-zeros when unset.
-///
-/// `validator_history_commitment` is computed from the genesis-time
-/// validator-set / key / BLS-key / operator-key histories so a recovering
-/// node can cross-check its persisted history blobs against the chain's claim
-/// (#325 PR B). The quad is the canonical input to
-/// [`crate::history_commitment::validator_history_commitment_v2`] (#549).
 pub fn build_genesis(
     cfg: &ConsensusConfig,
     validator_set: &ValidatorSet,
@@ -121,10 +78,6 @@ pub fn build_genesis(
     Ok(Block::genesis(seed, commitment))
 }
 
-/// Compute the canonical genesis-time `validator_history_commitment`
-/// (#325 PR B). Shared between [`build_genesis`] and the recovery
-/// path's "what should the genesis block's commitment be?" derivation
-/// so both produce byte-identical hashes from the same inputs.
 fn compute_genesis_validator_history_commitment(
     validator_set: &ValidatorSet,
     genesis_bls: &[(NodeId, boule_core::crypto::sig_scheme::BlsPublicKey)],
@@ -137,9 +90,7 @@ fn compute_genesis_validator_history_commitment(
     let bls_hist = Some(crate::bls_key_history::BlsKeyHistory::with_genesis(
         genesis_bls.iter().copied(),
     ));
-    // #549: v2 folds the operator-key history. `None` when the chain declared
-    // no operator keys, so an operator-keyless chain hashes (and so derives a
-    // chain_id) distinctly from one with an empty operator history.
+
     let operator_hist = if genesis_operator_keys.is_empty() {
         None
     } else {

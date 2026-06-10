@@ -1,15 +1,3 @@
-//! Commit-time application of validator endpoint-advertisement system txs
-//! (#546).
-//!
-//! See [`super::ConsensusNode::apply_committed_endpoints`] for the
-//! validation discipline. The [`EndpointRegistry`] this maintains is a
-//! discovery hint (which `(network_id, address)` pairs reach a validator),
-//! not safety-critical state — so, unlike the validator/key histories, it
-//! is **not** folded into the #325 anti-rollback commitment. It is
-//! persisted after each applying commit and reloaded at recovery (never
-//! re-derived against the chain), which is what lets it survive block
-//! pruning.
-
 use boule_consensus::endpoint_registry::{EndpointRegistry, SignedEndpointCommand};
 use boule_consensus::replication::block::Block;
 use boule_consensus::validator_set::{Pubkey, ValidatorId};
@@ -18,20 +6,6 @@ use boule_core::storage::Storage;
 use super::{ConsensusNode, STORAGE_KEY_ENDPOINT_REGISTRY, TRACE_TARGET};
 
 impl ConsensusNode {
-    /// Scan `block.commands` for tagged [`SignedEndpointCommand`] payloads
-    /// (#546) and apply each one that is well-formed, signed by the
-    /// publishing validator's active key, and accepted by the registry
-    /// (monotone `seq`, cap, no-dup invariant).
-    ///
-    /// Each command is independently re-verified: the signature must verify
-    /// under the key the validator was signing with at this block's view
-    /// (resolved from the key history), and the validator must be a current
-    /// member. Malformed / mis-signed / non-member / registry-rejected
-    /// commands are logged and dropped — the block stays committed since the
-    /// safety core is independent of payload validity.
-    ///
-    /// Called from the commit path after reconfigs and rotations, so the key
-    /// history + membership reflect any change committed in the same block.
     pub(super) fn apply_committed_endpoints(&mut self, block: &Block) {
         let block_view = block.header.view;
         let mut applied_any = false;
@@ -54,10 +28,6 @@ impl ConsensusNode {
                 }
             };
 
-            // The publishing validator's stable id. It must be a current
-            // member, and the command must be signed by the key active for
-            // it at this view (the same trusted-source discipline as a
-            // rotation's `sig_old`).
             let vid = ValidatorId::from_genesis_pubkey(signed.payload.validator);
             if self
                 .validator_history
@@ -126,10 +96,6 @@ impl ConsensusNode {
         }
     }
 
-    /// Persist the endpoint registry. Logged-and-dropped on error (the
-    /// in-memory registry stays authoritative for this session; the next
-    /// applying commit re-attempts the flush). `pub(super)` so the reconfig
-    /// apply path can re-persist after GC'ing a removed validator's entries.
     pub(super) fn persist_endpoint_registry(&self) {
         match postcard::to_stdvec(&self.endpoint_registry) {
             Ok(bytes) => {
@@ -151,10 +117,6 @@ impl ConsensusNode {
         }
     }
 
-    /// Load the endpoint registry from storage at recovery, applying the
-    /// deployment's current `max_endpoint_list_length`. Absent key → empty;
-    /// a malformed blob → empty + error log (a corrupt discovery-hint blob
-    /// must not refuse the node a boot).
     pub(super) fn load_endpoint_registry(
         storage: &dyn Storage,
         max_endpoint_list_length: usize,
@@ -181,9 +143,7 @@ impl ConsensusNode {
                 EndpointRegistry::new(max_endpoint_list_length)
             }
         };
-        // The persisted blob carries whatever cap was in force when it was
-        // written; re-apply the deployment's current cap so a config change
-        // governs subsequent applies.
+
         registry.set_max_len(max_endpoint_list_length);
         registry
     }
