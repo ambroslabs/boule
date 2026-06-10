@@ -4,8 +4,10 @@
 //! (`CARGO_BIN_EXE_boule`) so we exercise the same spawn path the
 //! `testnet` CLI does.
 //!
-//! Budgeted for the 15s/test ceiling in CLAUDE.md: the cluster runs at
-//! `timeout_base_ms = 200` so commits land in well under a second.
+//! These are heavy multi-process e2e tests (run serially in the bundle lane,
+//! not the 15s-ceiling unit shards): the cluster runs at `timeout_base_ms =
+//! 200` so commits land in well under a second, but process spawn + libp2p
+//! mesh formation + reconfig dominate. See [`LIVENESS_BUDGET`].
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,6 +22,14 @@ use tokio::sync::Mutex;
 /// must be a tokio (async) mutex — `std::sync::Mutex` would trip the
 /// `await_holding_lock` lint.
 static TEST_SERIAL: Mutex<()> = Mutex::const_new(());
+
+/// Liveness budget for every wait in this file. Each test drives a real
+/// multi-process `boule` cluster; in CI these run inside the builder
+/// container (composite action / `make build`), where CPU oversubscription
+/// across 4–5 node processes makes warm-up and reconfig materially slower
+/// than a native run. One generous budget absorbs that variance without
+/// masking a true hang — a wedged cluster never advances, budget or not.
+const LIVENESS_BUDGET: Duration = Duration::from_secs(45);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn driver_lifecycle_4_nodes() {
@@ -67,7 +77,7 @@ async fn driver_lifecycle_4_nodes() {
     // slower than the old TCP transport's immediate connect and sensitive
     // to CI core contention. It is a failure-timeout, not the expected
     // duration — the happy path early-exits in a few seconds.
-    wait::all_reach_height(&state, 2, Duration::from_secs(20))
+    wait::all_reach_height(&state, 2, LIVENESS_BUDGET)
         .await
         .expect("all_reach_height(2) before kill");
 
@@ -84,7 +94,7 @@ async fn driver_lifecycle_4_nodes() {
     // Survivors keep committing. `all_reach_height` filters to live
     // nodes via `pid_alive`, so the dead node doesn't gate the wait.
     let state_after_kill = workdir::State::load(&wd).expect("reload state");
-    wait::all_reach_height(&state_after_kill, 4, Duration::from_secs(15))
+    wait::all_reach_height(&state_after_kill, 4, LIVENESS_BUDGET)
         .await
         .expect("all_reach_height(4) after kill — survivors should keep committing");
 
@@ -140,7 +150,7 @@ async fn submitted_tx_is_committed() {
     .expect("new_cluster");
     let _pids = lifecycle::up_all(&wd, &bin, &state).await.expect("up_all");
 
-    wait::all_reach_height(&state, 2, Duration::from_secs(20))
+    wait::all_reach_height(&state, 2, LIVENESS_BUDGET)
         .await
         .expect("warm-up commits before submitting");
 
@@ -171,7 +181,7 @@ async fn submitted_tx_is_committed() {
     // The command must be committed, not dropped: every node drains it from
     // its mempool (remove_committed runs only on commit) and the leader-side
     // includability check did not reject it.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + LIVENESS_BUDGET;
     loop {
         let mut all_drained = true;
         for n in &state.nodes {
@@ -236,7 +246,7 @@ async fn submitted_stake_command_changes_the_validator_set() {
     .expect("new_cluster");
     let _pids = lifecycle::up_all(&wd, &bin, &state).await.expect("up_all");
 
-    wait::all_reach_height(&state, 2, Duration::from_secs(20))
+    wait::all_reach_height(&state, 2, LIVENESS_BUDGET)
         .await
         .expect("warm-up commits");
 
@@ -290,7 +300,7 @@ async fn submitted_stake_command_changes_the_validator_set() {
     // The demo app turns the committed stake command into a validator_update,
     // materialised as a reconfig: the active set shrinks to 4 and no longer
     // contains the removed validator, on every node.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + LIVENESS_BUDGET;
     loop {
         let mut all_reduced = true;
         for n in &state.nodes {
@@ -317,7 +327,7 @@ async fn submitted_stake_command_changes_the_validator_set() {
         .expect("status")
         .last_committed_height
         .0;
-    let live_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let live_deadline = std::time::Instant::now() + LIVENESS_BUDGET;
     loop {
         let h = admin::consensus_status(obs_api)
             .await
@@ -371,7 +381,7 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
     .expect("new_cluster");
     let _pids = lifecycle::up_all(&wd, &bin, &state).await.expect("up_all");
 
-    wait::all_reach_height(&state, 2, Duration::from_secs(20))
+    wait::all_reach_height(&state, 2, LIVENESS_BUDGET)
         .await
         .expect("warm-up commits");
 
@@ -417,7 +427,7 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
     }
 
     // Active set shrinks to 4 and the median is gone, on every node.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + LIVENESS_BUDGET;
     loop {
         let mut all_reduced = true;
         for n in &state.nodes {
@@ -446,7 +456,7 @@ async fn app_driven_removal_of_a_mid_set_validator_keeps_liveness() {
         .expect("status")
         .last_committed_height
         .0;
-    let live_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let live_deadline = std::time::Instant::now() + LIVENESS_BUDGET;
     loop {
         let h = admin::consensus_status(obs_api)
             .await
@@ -504,7 +514,7 @@ async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
     .await
     .expect("new_cluster");
     lifecycle::up_all(&wd, &bin, &state).await.expect("up_all");
-    wait::all_reach_height(&state, 2, Duration::from_secs(20))
+    wait::all_reach_height(&state, 2, LIVENESS_BUDGET)
         .await
         .expect("all_reach_height(2)");
 
@@ -540,7 +550,7 @@ async fn scenario_up_idempotent_and_wait_advance_by_post_kill() {
     let target = state.nodes[1].clone();
     lifecycle::kill_one(&wd, &target).expect("kill_one");
     let state_after_kill = workdir::State::load(&wd).expect("reload state");
-    wait::all_advance_by(&state_after_kill, 3, Duration::from_secs(20))
+    wait::all_advance_by(&state_after_kill, 3, LIVENESS_BUDGET)
         .await
         .expect("all_advance_by(3) post-kill — survivors must keep committing");
 

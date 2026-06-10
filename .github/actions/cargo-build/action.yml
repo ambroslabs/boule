@@ -76,4 +76,4 @@ runs:
           -v "$ch":/cache/cargo \
           -w "/work/${{ inputs.working-directory }}" \
           "${{ inputs.image }}" \
-          bash -c 'eval "$CMD"; rc=$?; sccache --show-stats 2>/dev/null || true; exit $rc'
+          bash -c 'bash -c "$CMD"; rc=$?; sccache --show-stats 2>/dev/null || true; exit $rc'
