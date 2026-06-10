@@ -43,15 +43,68 @@ jobs:
             echo "rust=false" >> "$GITHUB_OUTPUT"
           fi
           # The unified `boule` binary (boule-bundle) links the reth SDK, so its
-          # lane is heavy (~6min reth build). Gate it tightly: only run when the
-          # bundle itself, the reth-side crates it composes, or the boule-side
-          # crates whose subcommands/runtime it hosts change (plus this workflow).
+          # lane is heavy. Gate it tightly: only run when the bundle itself, the
+          # reth-side crates it composes, or the boule-side crates whose
+          # subcommands/runtime it hosts change (plus this workflow).
           if echo "$changed" | grep -E '^(crates/boule-(bundle|reth-node|reth|cli|consensus|node|core|transport-libp2p)/|\.github/workflows/ci\.yml$)' >/dev/null; then
             echo "bundle=true" >> "$GITHUB_OUTPUT"
           else
             echo "bundle=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # Ensure the toolchain image (rust + clang + solc + sccache + nextest) exists
+  # in GHCR for THIS commit's builder inputs, then hand its content-addressed ref
+  # to every compiling job (which `needs:` this job, so the image is guaranteed
+  # published before they run). Build+push only when missing — when the toolchain
+  # is unchanged this is a ~2-second manifest check. The hash tag is pushed even
+  # on PRs (immutable; a PR can't clobber `:latest`), so a toolchain-changing PR
+  # gets its own image.
+  builder:
+    name: Builder image
+    needs: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          tag=$(echo "${{ hashFiles('docker/Dockerfile.builder', 'rust-toolchain.toml') }}" | cut -c1-16)
+          echo "image=ghcr.io/${{ github.repository_owner }}/boule-builder:$tag" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - id: exists
+        run: |
+          if docker manifest inspect "${{ steps.meta.outputs.image }}" >/dev/null 2>&1; then
+            echo "builder image already published: ${{ steps.meta.outputs.image }}"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "builder image missing — building + pushing"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.exists.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.builder
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # On main, move :latest to the current toolchain so local `make build`
+      # (which pulls :latest) tracks it.
+      - if: github.ref == 'refs/heads/main'
+        run: docker buildx imagetools create -t "ghcr.io/${{ github.repository_owner }}/boule-builder:latest" "${{ steps.meta.outputs.image }}"
+
+  # fmt and deny don't compile (rustfmt / cargo-deny read source + metadata), so
+  # they stay native — no builder image, no sccache needed.
   fmt:
     name: Format
     needs: changes
@@ -65,73 +118,6 @@ jobs:
       - if: needs.changes.outputs.rust == 'true'
         run: cargo fmt --all -- --check
 
-  clippy:
-    name: Clippy
-    needs: changes
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - if: needs.changes.outputs.rust == 'true'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - if: needs.changes.outputs.rust == 'true'
-        uses: Swatinem/rust-cache@v2
-      - if: needs.changes.outputs.rust == 'true'
-        uses: ./.github/actions/install-solc
-      - if: needs.changes.outputs.rust == 'true'
-        run: cargo clippy --all-targets -- -D warnings
-      # Optional cargo features are off by default, so the line above never
-      # compiles the feature-gated code. Lint the `reth` backend explicitly
-      # so it can't silently rot (as the workspace-excluded fuzz crate did).
-      # `-p boule-cli --features reth` is the user-facing build path and
-      # transitively compiles boule-node's gated code too.
-      - if: needs.changes.outputs.rust == 'true'
-        run: cargo clippy -p boule-cli --features reth --all-targets -- -D warnings
-
-  test:
-    # Two shards on separate runners to isolate tests that must not share a
-    # core from the rest of the suite. The `heavy` shard runs serially
-    # (`--test-threads=1`): compute-heavy tests (sims, BLS) plus the
-    # multi-node libp2p cluster integration tests, whose mesh-formation
-    # liveness is starved under the default shard's full parallelism. The
-    # `default` shard runs everything else at the runner's natural
-    # parallelism (no oversubscription).
-    #
-    # `HEAVY_FILTER` is the canonical filter expression that selects the
-    # heavy cohort. KEEP IN SYNC with `.config/nextest.toml`'s
-    # `[[profile.default.overrides]].filter` — see the comment in that file
-    # for the convention.
-    name: Test (${{ matrix.shard }})
-    needs: changes
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [heavy, default]
-    env:
-      HEAVY_FILTER: 'test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
-    steps:
-      - uses: actions/checkout@v4
-      - if: needs.changes.outputs.rust == 'true'
-        uses: dtolnay/rust-toolchain@stable
-      - if: needs.changes.outputs.rust == 'true'
-        uses: Swatinem/rust-cache@v2
-      - if: needs.changes.outputs.rust == 'true'
-        uses: ./.github/actions/install-solc
-      - if: needs.changes.outputs.rust == 'true'
-        name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
-      - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'heavy'
-        name: Heavy shard (serialized — compute-bound + multi-node clusters)
-        run: cargo nextest run --locked --all-targets -E "$HEAVY_FILTER" --test-threads=1
-      - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'default'
-        name: Default shard (everything else, parallel)
-        run: cargo nextest run --locked --all-targets -E "not ($HEAVY_FILTER)" --test-threads=$(nproc)
-      - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'default'
-        name: Doctests
-        run: cargo test --locked --doc -- --test-threads=$(nproc)
-
   deny:
     name: Deny (licenses + advisories)
     needs: changes
@@ -141,122 +127,121 @@ jobs:
       - if: needs.changes.outputs.rust == 'true'
         uses: EmbarkStudios/cargo-deny-action@v2
 
+  clippy:
+    name: Clippy
+    needs: [changes, builder]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - if: needs.changes.outputs.rust == 'true'
+        uses: ./.github/actions/cargo-build
+        with:
+          # The plain lint never compiles the feature-gated code; lint the `reth`
+          # backend explicitly too so it can't silently rot.
+          run: |
+            set -e
+            cargo clippy --all-targets -- -D warnings
+            cargo clippy -p boule-cli --features reth --all-targets -- -D warnings
+          image: ${{ needs.builder.outputs.image }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
+          cache-key: root
+
+  test:
+    # Two shards on separate runners. The `heavy` shard runs serially
+    # (`--test-threads=1`): compute-heavy tests (sims, BLS) + the multi-node
+    # libp2p cluster integration tests, whose mesh-formation liveness is starved
+    # under full parallelism. The `default` shard runs everything else at the
+    # runner's natural parallelism. Keep HEAVY_FILTER in sync with
+    # `.config/nextest.toml`'s `[[profile.default.overrides]].filter`.
+    name: Test (${{ matrix.shard }})
+    needs: [changes, builder]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [heavy, default]
+    steps:
+      - uses: actions/checkout@v4
+      - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'heavy'
+        name: Heavy shard (serialized — compute-bound + multi-node clusters)
+        uses: ./.github/actions/cargo-build
+        with:
+          run: |
+            HEAVY_FILTER='test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
+            cargo nextest run --locked --all-targets -E "$HEAVY_FILTER" --test-threads=1
+          image: ${{ needs.builder.outputs.image }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
+          cache-key: root
+      - if: needs.changes.outputs.rust == 'true' && matrix.shard == 'default'
+        name: Default shard (everything else) + doctests
+        uses: ./.github/actions/cargo-build
+        with:
+          run: |
+            set -e
+            HEAVY_FILTER='test(/^consensus::sim::tests::gossip_25_node_/) + test(/^crypto::bls_key::tests::/) + test(/^crypto::sig_scheme::tests::bls_/) + test(test_libp2p_overlay_3_node_smoke) + test(test_consensus_status_endpoint_reports_live_progress)'
+            cargo nextest run --locked --all-targets -E "not ($HEAVY_FILTER)" --test-threads="$(nproc)"
+            cargo test --locked --doc -- --test-threads="$(nproc)"
+          image: ${{ needs.builder.outputs.image }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
+          cache-key: root
+
   docs:
     name: Docs (intra-doc links)
-    needs: changes
+    needs: [changes, builder]
     runs-on: ubuntu-latest
-    # Fail on broken intra-doc links so doc references can't silently rot
-    # when items move between modules/crates (e.g. a refactor). Scoped to
-    # the broken-links lint; `private_intra_doc_links` stays a warning.
+    # Fail on broken intra-doc links so doc references can't silently rot.
     env:
       RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
     steps:
       - uses: actions/checkout@v4
       - if: needs.changes.outputs.rust == 'true'
-        uses: dtolnay/rust-toolchain@stable
-      - if: needs.changes.outputs.rust == 'true'
-        uses: Swatinem/rust-cache@v2
-      - if: needs.changes.outputs.rust == 'true'
-        uses: ./.github/actions/install-solc
-      - if: needs.changes.outputs.rust == 'true'
-        run: cargo doc --workspace --no-deps --document-private-items
+        uses: ./.github/actions/cargo-build
+        with:
+          run: cargo doc --workspace --no-deps --document-private-items
+          image: ${{ needs.builder.outputs.image }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
+          cache-key: root
 
   # The single, unified `boule` binary (boule-bundle) links the reth SDK
-  # IN-PROCESS, so it lives in its own standalone workspace (excluded from the
-  # root workspace above — the root deliberately never compiles reth). This is
-  # therefore the ONLY CI lane that builds reth: it builds the bundle, runs the
-  # relocated CLI integration tests against the unified binary, and runs the
-  # single-process `boule node` smoke (reth in-process committing blocks).
-  #
-  # Heavy (~6min reth build + a huge dep tree), so it is path-gated to the
-  # bundle / reth / cli / consensus / node / core crates (see the `changes`
-  # job's `bundle` output) and relies on Swatinem caching across runs.
+  # IN-PROCESS in its own standalone workspace — the only lane that builds reth.
+  # It builds the binary, checks the subcommand surface, runs the relocated CLI
+  # integration tests, and runs the single-process `boule node` smoke. Heavy, so
+  # path-gated to the bundle/reth/cli/consensus/node/core crates, and the reth
+  # build is reused across runs via sccache→Spaces (inside the builder image).
   bundle:
     name: Unified boule binary (reth in-process)
-    needs: changes
+    needs: [changes, builder]
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        # Everything runs inside the bundle's standalone workspace (its own
-        # Cargo.toml / Cargo.lock, separate from the repo root).
-        working-directory: crates/boule-bundle
     steps:
       - uses: actions/checkout@v4
-
-      # MSRV is 1.93 (edition 2024); `stable` is well past that.
       - if: needs.changes.outputs.bundle == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/cargo-build
         with:
-          components: rustfmt, clippy
-
-      # solc compiles the predeploy genesis from source at build time
-      # (boule-reth's build.rs). Same pinned action the root lanes use.
-      - if: needs.changes.outputs.bundle == 'true'
-        uses: ./.github/actions/install-solc
-
-      # reth's mdbx-sys runs bindgen via libclang, which needs the C compiler's
-      # resource-dir headers (e.g. stdarg.h). Install clang + libclang and point
-      # bindgen at the installed gcc's include dir (gcc major derived at runtime).
-      - if: needs.changes.outputs.bundle == 'true'
-        name: Install clang/bindgen prerequisites
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y clang libclang-dev
-          gcc_inc=$(ls -d /usr/lib/gcc/x86_64-linux-gnu/*/include | sort -V | tail -1)
-          echo "Using gcc include dir: $gcc_inc"
-          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$gcc_inc" >> "$GITHUB_ENV"
-
-      # The reth tree is enormous; cache the registry/git sources and the build
-      # output, keyed on this workspace's own Cargo.lock. A flaky test shouldn't
-      # discard the expensive reth build cache.
-      - if: needs.changes.outputs.bundle == 'true'
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/boule-bundle
-          prefix-key: bundle
-          cache-on-failure: true
-
-      - if: needs.changes.outputs.bundle == 'true'
-        name: Format
-        run: cargo fmt --all --check
-
-      - if: needs.changes.outputs.bundle == 'true'
-        name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      # Build the unified binary + the relocated test binaries.
-      - if: needs.changes.outputs.bundle == 'true'
-        name: Build the unified boule binary
-        run: cargo build --locked --bins
-
-      # Sanity: the single binary must expose EVERY subcommand (node + the full
-      # boule-cli command tree).
-      - if: needs.changes.outputs.bundle == 'true'
-        name: Subcommand surface
-        run: |
-          set -euo pipefail
-          help=$(cargo run --locked --bin boule -- --help)
-          echo "$help"
-          for sub in node init start genesis faucet rpc-proxy key config snapshot reconfig rotation endpoint; do
-            echo "$help" | grep -qw "$sub" || { echo "MISSING SUBCOMMAND: $sub"; exit 1; }
-          done
-
-      # (a) The relocated CLI integration tests run against the unified binary
-      # (`CARGO_BIN_EXE_boule`). `smoke_sweep`'s heavy cluster sweep is
-      # `#[ignore]`d (it runs in smoke.yml); the fast structural checks run here.
-      - if: needs.changes.outputs.bundle == 'true'
-        name: Relocated CLI integration tests
-        # `--test-threads=1`: these spawn full multi-node clusters; running them
-        # in parallel oversubscribes CI cores and starves timing-sensitive
-        # mesh-formation (e.g. test_libp2p_overlay_3_node_smoke) past its budget.
-        # The original heavy shard serialized them too — keep that here.
-        run: cargo test --locked --test integration_test --test testnet_driver_test --test smoke_sweep -- --test-threads=1
-
-      # (b) The single-process `boule node` smoke: reth in-process committing
-      # blocks (the folded-in former smoke.sh). `#[ignore]`d, run explicitly.
-      - if: needs.changes.outputs.bundle == 'true'
-        name: Bundle single-process smoke (reth in-process commits blocks)
-        # --test-threads=1: each smoke test boots its own in-process reth;
-        # running them concurrently makes two reth nodes clash. Serialize.
-        run: cargo test --locked --test bundle_smoke -- --ignored --nocapture --test-threads=1
+          working-directory: crates/boule-bundle
+          cache-key: bundle
+          image: ${{ needs.builder.outputs.image }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+          aws-access-key-id: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
+          # --test-threads=1 on the cluster/smoke tests: each spawns its own
+          # in-process reth; parallel runs clash + starve mesh-formation budgets.
+          run: |
+            set -e
+            cargo fmt --all --check
+            cargo clippy --locked --all-targets -- -D warnings
+            cargo build --locked --bins
+            help=$(cargo run --locked --bin boule -- --help)
+            echo "$help"
+            for sub in node init start genesis faucet rpc-proxy key config snapshot reconfig rotation endpoint; do
+              echo "$help" | grep -qw "$sub" || { echo "MISSING SUBCOMMAND: $sub"; exit 1; }
+            done
+            cargo test --locked --test integration_test --test testnet_driver_test --test smoke_sweep -- --test-threads=1
+            cargo test --locked --test bundle_smoke -- --ignored --nocapture --test-threads=1

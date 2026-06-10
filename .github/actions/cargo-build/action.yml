@@ -1,0 +1,79 @@
+name: cargo-build
+description: >
+  Run a build/test command inside the boule-builder image, with sccache (shared
+  DO Spaces cache) and a cached cargo registry. Compiled artifacts land back on
+  the host workspace (host-owned). No BuildKit cache-mounts; secrets are only env
+  on `docker run`, never in any image layer.
+
+inputs:
+  run:
+    description: 'shell command to run in the builder container (e.g. "cargo clippy --all-targets -- -D warnings")'
+    required: true
+  image:
+    description: 'builder image ref (pass needs.builder.outputs.image)'
+    required: true
+  registry-token:
+    description: 'token for the GHCR pull (pass secrets.GITHUB_TOKEN)'
+    required: true
+  working-directory:
+    description: 'directory (relative to repo root) to run in; the bundle uses its own workspace'
+    default: '.'
+  aws-access-key-id:
+    description: 'DO Spaces access key for sccache (empty → sccache falls back to a local-disk cache)'
+    default: ''
+  aws-secret-access-key:
+    default: ''
+  cache-key:
+    description: 'suffix to separate the cargo-registry cache per workspace'
+    default: 'default'
+
+runs:
+  using: composite
+  steps:
+    - name: Pull builder image
+      shell: bash
+      run: |
+        echo "${{ inputs.registry-token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        docker pull "${{ inputs.image }}"
+
+    # The cargo registry (downloaded crate sources) is a small, bounded host
+    # directory — easy to cache. Compiled output is cached by sccache→Spaces, not
+    # here, so this stays well under the 10 GB Actions-cache budget.
+    - name: Restore cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/cargo-home-${{ inputs.cache-key }}
+        key: cargo-home-${{ inputs.cache-key }}-${{ hashFiles(format('{0}/**/Cargo.lock', inputs.working-directory)) }}
+        restore-keys: |
+          cargo-home-${{ inputs.cache-key }}-
+
+    - name: run
+      shell: bash
+      env:
+        # The command is passed by env (not interpolated into the run-script) so
+        # arbitrary quoting in `run` can't break out. AWS creds come from inputs.
+        CMD: ${{ inputs.run }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws-access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws-secret-access-key }}
+      run: |
+        ch="${{ runner.temp }}/cargo-home-${{ inputs.cache-key }}"
+        mkdir -p "$ch"
+        # --user maps to the runner so bind-mounted host files stay host-owned.
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -e HOME=/tmp \
+          -e CARGO_HOME=/cache/cargo \
+          -e CARGO_INCREMENTAL=0 \
+          -e RUSTC_WRAPPER=sccache \
+          -e SCCACHE_BUCKET=boule-sccache \
+          -e SCCACHE_ENDPOINT=https://nyc3.digitaloceanspaces.com \
+          -e SCCACHE_REGION=auto \
+          -e AWS_ACCESS_KEY_ID \
+          -e AWS_SECRET_ACCESS_KEY \
+          -e RUSTDOCFLAGS \
+          -e CMD \
+          -v "$GITHUB_WORKSPACE":/work \
+          -v "$ch":/cache/cargo \
+          -w "/work/${{ inputs.working-directory }}" \
+          "${{ inputs.image }}" \
+          bash -c 'eval "$CMD"; rc=$?; sccache --show-stats 2>/dev/null || true; exit $rc'
