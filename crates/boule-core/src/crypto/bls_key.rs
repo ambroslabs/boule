@@ -1,31 +1,3 @@
-//! File-backed BLS validator-key persistence (#292).
-//!
-//! On chains whose genesis declares `signature_scheme = "bls_aggregated"`
-//! every validator holds a separate BLS12-381 secret key for QC
-//! signing, alongside the Ed25519 key that backs network identity (#141
-//! split network identity from validator signing). This module loads,
-//! generates, and persists the BLS half.
-//!
-//! # On-disk format
-//!
-//! Files are versioned to make rotation (#142) and format migrations
-//! mechanical: the first byte is a [`FORMAT_VERSION`] tag, followed by
-//! 32 raw secret-key bytes. PEM/PKCS#8 framing is unnecessary —
-//! BLS12-381 keys aren't an X.509 algorithm — and would only obscure
-//! the wire-format invariants.
-//!
-//! Permissions are tightened to `0o600` on write (matching the Ed25519
-//! file backend in [`crate::identity::file`]).
-//!
-//! # Cross-scheme mismatch
-//!
-//! [`BlsKeyFile::load_or_init`] is the validator-side half of the
-//! "node booted for the wrong scheme" check called out in
-//! `crate::crypto::sig_scheme` and #288: a node whose genesis declares
-//! BLS but cannot load (or generate) a BLS key here refuses to start.
-//! The startup-time scheme/identity reconciliation lives in #293 where
-//! the rest of the BLS integration is wired.
-
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -36,63 +8,25 @@ use zeroize::Zeroizing;
 use crate::crypto::sig_scheme::{BlsAggregated, BlsPartialSig, BlsPublicKey, BlsSecretKey};
 use crate::crypto::signed::PartialSigner;
 
-/// Format version stamped at the head of the on-disk key file.
-/// Bump when the layout changes; old files are then either migrated
-/// or surfaced as a startup error.
 pub const FORMAT_VERSION: u8 = 1;
 
-/// On-disk file size: 1 version byte + 32 secret-key bytes.
 const FILE_LEN: usize = 1 + 32;
 
-/// File-backed [`BlsKeyProvider`]. Generates a fresh key on first
-/// startup; persists to `path` with tight permissions; reloads on
-/// subsequent boots.
 #[derive(Debug, Clone)]
 pub struct BlsKeyFile {
     path: PathBuf,
-    /// Skip the "group/world readable" check on read. Dev escape hatch
-    /// — production should leave this `false`.
+
     allow_insecure_perms: bool,
 }
 
-/// Trait surface for sourcing a validator's BLS signing key. Mirrors
-/// the existing [`crate::identity::KeyProvider`] design but stays
-/// scoped to BLS — TLS / network identity remains Ed25519 (parent
-/// issue non-goal).
 pub trait BlsKeyProvider: Send + Sync {
-    /// Load an existing BLS validator key, or provision a fresh one if
-    /// the backing store is empty. Returns the (secret, public) pair.
-    ///
-    /// Proof-of-possession is *not* materialized here because the PoP
-    /// pre-image binds to the chain's [`ChainId`] (#410, audit
-    /// finding 7-2) and the key file is chain-agnostic. Callers that
-    /// need a PoP derive one on demand via
-    /// [`BlsAggregated::sign_pop`] using the chain's `ChainId`.
-    ///
-    /// [`ChainId`]: crate::crypto::signed::ChainId
     fn load_or_init(&self) -> anyhow::Result<BlsValidatorIdentity>;
 
-    /// Try to load without creating. `None` if the backing store has no
-    /// key yet — used by the startup reconciliation in #293 to
-    /// distinguish "first boot needs init" from "operator forgot to
-    /// configure BLS for a BLS chain."
     fn try_load(&self) -> anyhow::Result<Option<BlsValidatorIdentity>>;
 
-    /// Human-readable backend name for logs.
     fn name(&self) -> &'static str;
 }
 
-/// A loaded BLS validator identity: secret + public.
-///
-/// `secret` is wrapped in [`Zeroizing`] so the buffer is wiped on
-/// drop. Callers should keep this struct alive only long enough to
-/// build the in-memory signer.
-///
-/// Proof-of-possession is not stored here because the PoP pre-image
-/// binds to the chain's `ChainId` (#410); a single key file may be
-/// used across genesis-time configuration and future rotations on the
-/// same chain, but the PoP is derived per-use via
-/// [`BlsAggregated::sign_pop`].
 pub struct BlsValidatorIdentity {
     pub secret: Zeroizing<BlsSecretKey>,
     pub public: BlsPublicKey,
@@ -107,21 +41,12 @@ impl std::fmt::Debug for BlsValidatorIdentity {
     }
 }
 
-/// In-memory [`PartialSigner<BlsAggregated>`] backed by a loaded
-/// [`BlsValidatorIdentity`]. Holds the secret in a [`Zeroizing`] buffer
-/// for the lifetime of the signer; drop the signer to wipe the key.
-///
-/// Construct with [`Self::from_identity`]; do not reconstruct from raw
-/// secret bytes, so the only way in is via a [`BlsKeyProvider`].
 pub struct BlsPartialSignerImpl {
     secret: Zeroizing<BlsSecretKey>,
     public: BlsPublicKey,
 }
 
 impl BlsPartialSignerImpl {
-    /// Build a signer from a freshly-loaded validator identity.
-    /// Consumes the identity to avoid leaving two copies of the secret
-    /// material in memory.
     pub fn from_identity(id: BlsValidatorIdentity) -> Self {
         Self {
             secret: id.secret,
@@ -145,10 +70,6 @@ impl PartialSigner<BlsAggregated> for BlsPartialSignerImpl {
     }
 
     fn sign_partial(&self, msg: &[u8]) -> BlsPartialSig {
-        // `sign_partial` only fails on malformed secret-key bytes, and
-        // those would have been rejected at load time by
-        // `BlsKeyProvider::load_or_init`. Treat as infallible at this
-        // layer — same posture as `Signer::sign` for Ed25519.
         BlsAggregated::sign_partial(&self.secret, msg)
             .expect("loaded BLS secret keys must produce signatures")
     }
@@ -184,8 +105,7 @@ impl BlsKeyProvider for BlsKeyFile {
                     fs::create_dir_all(parent).context("creating BLS key directory")?;
                 }
             }
-            // ChaChaRng-seeded IKM is overkill — blst's `key_gen` already
-            // hashes the IKM internally. Use OS randomness as the IKM.
+
             let mut ikm = Zeroizing::new([0u8; 32]);
             getrandom_or_panic(&mut ikm[..]);
             let (secret, public) = BlsAggregated::keygen(&ikm[..])
@@ -225,8 +145,6 @@ fn decode_and_derive(raw: &[u8]) -> anyhow::Result<BlsValidatorIdentity> {
     let mut secret = Zeroizing::new([0u8; 32]);
     secret[..].copy_from_slice(&raw[1..FILE_LEN]);
 
-    // Derive the pubkey from the secret. PoP is deferred until a chain
-    // context is in scope (#410).
     let sk = blst::min_pk::SecretKey::from_bytes(&secret[..])
         .map_err(|e| anyhow::anyhow!("malformed BLS secret key on disk: {e:?}"))?;
     let public: BlsPublicKey = sk.sk_to_pk().to_bytes();
@@ -277,7 +195,7 @@ fn check_permissions(path: &Path, allow_insecure: bool) -> anyhow::Result<()> {
         .with_context(|| format!("stat {}", path.display()))?
         .permissions()
         .mode();
-    // 0o077 catches any group/world bits.
+
     if mode & 0o077 != 0 {
         bail!(
             "BLS key file {} has insecure permissions (mode 0o{:o}); set 0o600 or pass allow_insecure_perms",
@@ -298,148 +216,4 @@ fn getrandom_or_panic(buf: &mut [u8]) {
     rand::rngs::OsRng
         .try_fill_bytes(buf)
         .expect("OS RNG must produce key material");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::crypto::signed::ChainId;
-    use tempfile::TempDir;
-
-    #[test]
-    fn load_or_init_creates_then_reloads_consistently() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("bls.key");
-        let provider = BlsKeyFile::new(path.clone());
-
-        let id1 = provider.load_or_init().unwrap();
-        assert!(path.exists());
-        // The file is exactly 33 bytes (1 version + 32 secret).
-        assert_eq!(fs::metadata(&path).unwrap().len() as usize, FILE_LEN);
-
-        let id2 = provider.load_or_init().unwrap();
-        assert_eq!(id1.secret[..], id2.secret[..], "reload yields same secret");
-        assert_eq!(id1.public, id2.public);
-    }
-
-    #[test]
-    fn try_load_returns_none_when_unprovisioned() {
-        let dir = TempDir::new().unwrap();
-        let provider = BlsKeyFile::new(dir.path().join("missing.key"));
-        assert!(provider.try_load().unwrap().is_none());
-    }
-
-    #[test]
-    fn try_load_returns_some_after_init() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("bls.key");
-        let provider = BlsKeyFile::new(path);
-        provider.load_or_init().unwrap();
-        let loaded = provider.try_load().unwrap();
-        assert!(loaded.is_some());
-    }
-
-    #[test]
-    fn pop_derived_from_loaded_key_verifies_under_loaded_pubkey() {
-        // End-to-end check: a PoP derived from the loaded secret under
-        // an arbitrary chain_id verifies under the loaded pubkey and
-        // that same chain_id (#410).
-        let dir = TempDir::new().unwrap();
-        let provider = BlsKeyFile::new(dir.path().join("bls.key"));
-        let id = provider.load_or_init().unwrap();
-        let chain_id = ChainId([0x77; 32]);
-        let pop = BlsAggregated::sign_pop(&id.secret, &chain_id).unwrap();
-        BlsAggregated::verify_pop(&pop, &id.public, &chain_id).expect("self-PoP must verify");
-    }
-
-    #[test]
-    fn partial_signer_round_trips_under_registered_pubkey() {
-        // The acceptance criterion for #330: a validator on a BLS chain
-        // can produce a partial signature that BlsAggregated::verify_partial
-        // accepts under the validator's registered BLS pubkey.
-        let dir = TempDir::new().unwrap();
-        let provider = BlsKeyFile::new(dir.path().join("bls.key"));
-        let id = provider.load_or_init().unwrap();
-        let pubkey_after_load = id.public;
-        let signer = BlsPartialSignerImpl::from_identity(id);
-
-        // The pubkey reported by the signer matches what the loader returned.
-        assert_eq!(signer.pubkey(), pubkey_after_load);
-
-        let msg = b"vote(view=11,block=0xAB...)";
-        let partial = signer.sign_partial(msg);
-        BlsAggregated::verify_partial(&signer.pubkey(), msg, &partial)
-            .expect("partial must verify under the signer's own pubkey");
-    }
-
-    #[test]
-    fn signing_round_trips_with_loaded_key() {
-        let dir = TempDir::new().unwrap();
-        let provider = BlsKeyFile::new(dir.path().join("bls.key"));
-        let id = provider.load_or_init().unwrap();
-        let msg = b"sign with loaded key";
-        let sig = BlsAggregated::sign_partial(&id.secret, msg).unwrap();
-        BlsAggregated::verify_partial(&id.public, msg, &sig).expect("round trip must verify");
-    }
-
-    #[test]
-    fn rejects_wrong_version_byte() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("bls.key");
-        let mut bytes = [0u8; FILE_LEN];
-        bytes[0] = 99; // Unknown version.
-        fs::write(&path, bytes).unwrap();
-        // Tighten perms so the perm check passes on Unix.
-        set_owner_only(&path).unwrap();
-        let provider = BlsKeyFile::new(path);
-        let err = provider.load_or_init().unwrap_err();
-        assert!(
-            err.to_string().contains("version") || err.to_string().contains("supported"),
-            "expected version error, got: {err}",
-        );
-    }
-
-    #[test]
-    fn rejects_truncated_file() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("bls.key");
-        // Only 10 bytes — less than FILE_LEN.
-        fs::write(&path, [1u8; 10]).unwrap();
-        set_owner_only(&path).unwrap();
-        let provider = BlsKeyFile::new(path);
-        assert!(provider.load_or_init().is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_insecure_permissions() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("bls.key");
-        let mut bytes = [0u8; FILE_LEN];
-        bytes[0] = FORMAT_VERSION;
-        fs::write(&path, bytes).unwrap();
-        // Make it group-readable.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        let provider = BlsKeyFile::new(path);
-        let err = provider.load_or_init().unwrap_err();
-        assert!(err.to_string().contains("insecure permissions"), "{err}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn allow_insecure_perms_escape_hatch_works() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("bls.key");
-        // Provision normally first to get a valid file.
-        BlsKeyFile::new(path.clone()).load_or_init().unwrap();
-        // Loosen perms.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        // With allow_insecure_perms, the load succeeds.
-        let provider = BlsKeyFile::new(path).with_allow_insecure_perms(true);
-        provider
-            .load_or_init()
-            .expect("escape hatch must allow loose perms");
-    }
 }

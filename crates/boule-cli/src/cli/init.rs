@@ -1,5 +1,3 @@
-//! `boule init` — bootstrap a node.
-
 use std::path::PathBuf;
 
 use clap::Args;
@@ -13,7 +11,6 @@ use super::shared::resolve_config_path;
 
 #[derive(Args)]
 pub struct InitArgs {
-    /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
 }
@@ -31,15 +28,12 @@ pub(crate) fn handle(args: InitArgs) -> anyhow::Result<()> {
     let config = config::load(&config_path)?;
     info!("loaded config from {}", config_path.display());
 
-    // `init` runs interactively to bootstrap, so production semantics are off.
     let identity_cfg = config::resolve_and_validate_identity(&config.node, false, false)?;
     println!("network identity backend: {}", identity_cfg.backend_name());
 
     let provider = config::build_provider(&identity_cfg)?;
     provision_or_report(&*provider, identity_cfg.backend_name(), "network")?;
 
-    // Cross-validate `[[peers]]` against the local NodeId now so a self-id is
-    // caught at `init` rather than only surfacing at `start`.
     if let Some(net_id) = provider.try_load()? {
         config.validate(&net_id.node_id()?)?;
     }
@@ -50,8 +44,6 @@ pub(crate) fn handle(args: InitArgs) -> anyhow::Result<()> {
         provision_or_report(&*val_provider, val_cfg.backend_name(), "validator")?;
     }
 
-    // Create storage_dir during `init` so operators learn it's writable
-    // before going live, rather than lazily on first `start`.
     if let Some(cons) = config.consensus.as_ref() {
         if let Some(dir) = cons.storage_dir.as_ref() {
             std::fs::create_dir_all(dir).map_err(|e| {
@@ -70,10 +62,6 @@ pub(crate) fn handle(args: InitArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bootstrap a single key slot: report idempotently if a key already
-/// exists, otherwise mint one for backends that can self-provision and
-/// print an externally-managed notice for the rest. `slot` distinguishes
-/// `network` vs `validator` in the printed messages.
 fn provision_or_report(
     provider: &dyn KeyProvider,
     backend_name: &str,

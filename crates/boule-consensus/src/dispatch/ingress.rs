@@ -1,13 +1,3 @@
-//! Per-[`WireMessage`] ingress routing.
-//!
-//! [`ingress_wire_with_qc_verification`] dispatches to one
-//! `ingress_<variant>` function per [`WireMessage`] variant rather
-//! than nesting verifier calls inside a single match. The split makes
-//! the call sites in `boule_node`'s event loop testable
-//! in isolation — each variant function takes the already-decoded
-//! payload plus chain context and returns the [`Dispatch`] items
-//! that variant produces.
-
 use crate::hotstuff::NewView;
 use crate::hotstuff::qc::{TimeoutVote, Vote};
 use crate::hotstuff::{Proposal, step::Event as SafetyEvent};
@@ -27,62 +17,6 @@ use super::verify::proposal_history::verify_proposal_history_commitment_if_reque
 use super::verify::qc::{verify_high_qc_piggyback, verify_qc_if_requested};
 use super::{Dispatch, IngressError, QcVerification, Verified};
 
-/// Decode and verify a raw wire frame, producing zero or more [`Dispatch`]
-/// items.
-///
-/// `bytes` is the raw payload from [`crate::p2p::ProtocolEvent::Message`]
-/// (protocol tag and length prefix already stripped).
-///
-/// `history` is the per-view validator-set lookup. Each consensus message
-/// is verified against the set authoritative at that message's own view:
-/// proposals at `block.header.view`, votes and timeout votes at their
-/// `view` field, and NewView at `high_qc.view`. With history holding only
-/// the genesis boundary this matches the prior single-set behaviour
-/// exactly; once reconfiguration boundaries land via #253, signers get
-/// validated against the right set on either side of each boundary.
-///
-/// `key_history` is the per-validator signing-key lookup. The signer
-/// pubkey on the wire is bridged through [`ValidatorKeyHistory::validator_for`](crate::validator_key_history::ValidatorKeyHistory::validator_for)
-/// to the validator's stable identifier (the one that appears in the
-/// validator set), so a vote signed under a post-rotation key is still
-/// recognized as belonging to the same validator that was originally
-/// seated. Spanning votes — late votes for older views — verify against
-/// whichever key was active at *that* view, which is also looked up
-/// here. Without rotations applied, every validator's only entry is
-/// their genesis key, so this matches the prior behaviour exactly.
-///
-/// Returns [`Err(IngressError)`] if the frame can't be decoded or fails
-/// signature verification. The event loop should log and drop on error;
-/// the state machines are never touched.
-///
-/// Gated to `cfg(test)` (audit finding 10-4, issue #413): defaults to
-/// [`QcVerification::Skip`], which would silently disable embedded-QC
-/// aggregate verification if a production caller ever picked it up.
-/// Production wires [`ingress_with_qc_verification`] with
-/// [`QcVerification::Verify`] directly.
-#[cfg(any(test, feature = "testing"))]
-pub fn ingress(
-    from: NodeId,
-    bytes: &[u8],
-    history: &ValidatorSetHistory,
-    key_history: &ValidatorKeyHistory,
-    chain_id: &ChainId,
-) -> Result<Vec<Dispatch>, IngressError> {
-    ingress_with_qc_verification(
-        from,
-        bytes,
-        history,
-        key_history,
-        &QcVerification::Skip,
-        chain_id,
-    )
-}
-
-/// Decode + verify a wire frame, additionally checking embedded QC
-/// aggregates per `qc_verification`. Production callers pass
-/// [`QcVerification::Verify`] with the chain's scheme; tests that
-/// construct QCs with placeholder signatures pass the `cfg(test)`-only
-/// `QcVerification::Skip`.
 pub fn ingress_with_qc_verification(
     from: NodeId,
     bytes: &[u8],
@@ -95,31 +29,6 @@ pub fn ingress_with_qc_verification(
     ingress_wire_with_qc_verification(from, msg, history, key_history, qc_verification, chain_id)
 }
 
-/// Same as [`ingress`] but takes an already-decoded [`WireMessage`].
-///
-/// Exposed for unit tests that construct wire messages directly. Gated
-/// to `cfg(test)` for the same reason as [`ingress`] (audit finding
-/// 10-4, issue #413).
-#[cfg(any(test, feature = "testing"))]
-pub fn ingress_wire(
-    from: NodeId,
-    msg: WireMessage,
-    history: &ValidatorSetHistory,
-    key_history: &ValidatorKeyHistory,
-    chain_id: &ChainId,
-) -> Result<Vec<Dispatch>, IngressError> {
-    ingress_wire_with_qc_verification(
-        from,
-        msg,
-        history,
-        key_history,
-        &QcVerification::Skip,
-        chain_id,
-    )
-}
-
-/// QC-verifying counterpart to `ingress_wire`. See [`QcVerification`]
-/// for the scheme-aware verification policy.
 pub fn ingress_wire_with_qc_verification(
     from: NodeId,
     msg: WireMessage,
@@ -183,17 +92,6 @@ pub fn ingress_wire_with_qc_verification(
     }
 }
 
-/// Verify a `Signed<Proposal>` envelope and emit the safety-core
-/// `ProposalReceived` event plus the pacemaker `OnProposalReceived`
-/// liveness signal. Runs (in order) signer membership, envelope
-/// signature, the `Proposal.justify` QC aggregate, and the
-/// `validator_history_commitment` post-block check.
-///
-/// Also emits `OnQc(justify.view)` so a future-view proposal whose
-/// QC we never saw directly (packet loss raced the proposal) still
-/// advances the pacemaker — without it, `OnProposalReceived(v)` is
-/// dropped when `v != current_view` and the replica wedges until the
-/// timer fires (issue #436). Mirrors the NewView arm below.
 pub fn ingress_proposal(
     signed: Signed<Proposal>,
     history: &ValidatorSetHistory,
@@ -212,13 +110,7 @@ pub fn ingress_proposal(
         qc_verification,
         chain_id,
     )?;
-    // #325 PR C: verify the leader's stamped
-    // `validator_history_commitment` matches what we would compute
-    // over the proposed block's reconfig/rotation commands. Catches
-    // a Byzantine leader who proposes blocks with a forged
-    // commitment, before any honest replica votes on the block.
-    // PR B catches the same class of forgery at recovery time;
-    // PR C closes the window between propose and restart.
+
     verify_proposal_history_commitment_if_requested(
         &signed.payload.block,
         history,
@@ -235,8 +127,6 @@ pub fn ingress_proposal(
     ])
 }
 
-/// Verify a `Signed<Vote>` envelope (plus the optional BLS partial)
-/// and emit the safety-core `VoteReceived` event.
 pub fn ingress_vote(
     signed: Signed<Vote>,
     bls_partial: Option<boule_core::crypto::sig_scheme::BlsPartialSig>,
@@ -249,19 +139,12 @@ pub fn ingress_vote(
         verify_signer_at(signed.signer, signed.payload.view, history, key_history)?;
     verify_sig(&signed, chain_id)?;
     verify_bls_partial_if_required(&signed, bls_partial.as_ref(), qc_verification, chain_id)?;
-    // After `verify_bls_partial_if_required` succeeds, BLS chains
-    // have a `Some` partial and Ed25519 chains have a `None`. Encode
-    // that invariant in the `VoteVariant` enum (#372) so the safety
-    // core can dispatch on the type instead of a defensive runtime
-    // check.
+
     let verified = Verified::wrap_after_verify_with_signer(signed, signer_validator_id);
     let variant = crate::hotstuff::step::VoteVariant::from_optional_partial(verified, bls_partial);
     Ok(vec![Dispatch::Safety(SafetyEvent::VoteReceived(variant))])
 }
 
-/// Verify a `Signed<NewView>` envelope and emit the safety-core
-/// `NewViewReceived` event plus the pacemaker `OnQc` signal at the
-/// piggybacked `high_qc.view`.
 pub fn ingress_new_view(
     signed: Signed<NewView>,
     history: &ValidatorSetHistory,
@@ -269,23 +152,10 @@ pub fn ingress_new_view(
     qc_verification: &QcVerification<'_>,
     chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
-    // The wire envelope doesn't carry an explicit "current view"
-    // field — the closest signal we have is `high_qc.view`. The
-    // signer at the receiving boundary is whoever entered the
-    // *next* view armed with this high_qc, so we look up against
-    // the set at `high_qc.view`. The `high_qc` itself was minted
-    // at `high_qc.view` under the same set (#250) — so its
-    // bitmap shape, signature count, and quorum threshold must
-    // all match the historical set, not the current one.
     let high_qc_view = signed.payload.high_qc.view;
     let signer_validator_id = verify_signer_at(signed.signer, high_qc_view, history, key_history)?;
     verify_sig(&signed, chain_id)?;
-    // #250: well-formedness of the embedded high_qc against the
-    // set authoritative at `high_qc.view`. A NewView whose
-    // high_qc was constructed against a different set size
-    // (e.g. minted under the new set after a reconfig but
-    // claimed at a pre-boundary view) is rejected here before
-    // it can pollute the safety core's `state.high_qc`.
+
     let vs = history.set_at(high_qc_view);
     if !signed
         .payload
@@ -305,34 +175,10 @@ pub fn ingress_new_view(
         Dispatch::Safety(SafetyEvent::NewViewReceived(
             Verified::wrap_after_verify_with_signer(signed, signer_validator_id),
         )),
-        // Inform the pacemaker that we've seen a QC up to `high_qc_view`.
-        // It ignores stale events, so this is always safe to emit.
         Dispatch::Pacemaker(pacemaker::Event::OnQc(high_qc_view)),
     ])
 }
 
-/// Verify a `Signed<TimeoutVote>` envelope, soft-verify the optional
-/// `high_qc` piggyback, and emit the [`Dispatch::TimeoutVote`] frame.
-///
-/// The round-sync hint that closes the #218 wedge fires at the
-/// integration layer (`on_timeout_vote`), not here: it only kicks in
-/// once the local timeout bucket has accumulated `f + 1` distinct
-/// signers for the same view, ensuring at least one honest peer
-/// agrees. A single-signer hint at this layer would let a Byzantine
-/// `TimeoutSpammer` (see `sim_byzantine`) drag honest replicas'
-/// `current_view` arbitrarily forward by broadcasting
-/// `TimeoutVote(view = u64::MAX)`. The bucket-driven path keeps the
-/// trust gradient honest.
-///
-/// The piggybacked `high_qc` *is* checked here (audit finding 10-F3,
-/// issue #321): a Byzantine voter who attaches a forged fresher-view
-/// QC to an otherwise honest timeout vote would otherwise launder the
-/// QC through the bucket's `best_high_qc` and the TC self-NewView
-/// loopback straight into the safety core's `state.high_qc`. We
-/// verify the piggyback at ingress and surface the result as
-/// `high_qc_trusted` rather than rejecting the envelope: dropping the
-/// whole timeout vote on a bad piggyback would hand a Byzantine peer
-/// a way to suppress honest timeout signal by attaching garbage to it.
 pub fn ingress_timeout_vote(
     signed: Signed<TimeoutVote>,
     history: &ValidatorSetHistory,
@@ -355,39 +201,16 @@ pub fn ingress_timeout_vote(
     }])
 }
 
-/// Convert an inbound `BlockRequest` into a [`Dispatch::ServeBlock`]
-/// for the integration layer to satisfy.
 pub fn ingress_block_request(hash: BlockHash, from: NodeId) -> Vec<Dispatch> {
     vec![Dispatch::ServeBlock { hash, to: from }]
 }
 
-/// Convert an inbound signed `BlockResponse` into a
-/// [`Dispatch::ReceiveBlock`].
-///
-/// Verifies the responder's pubkey is known to `key_history` (i.e.
-/// resolves to a stable [`crate::validator_set::ValidatorId`]
-/// — past or present validator) and that the envelope signature is
-/// valid. Membership-at-current-view is intentionally not checked: the
-/// requester may be at a different view than the responder, and the
-/// signature's only job here is *attribution* so a wrong-hash answer is
-/// later slashable. Hash verification (`block.hash() == requested_hash`
-/// and `requested_hash` matches an outstanding `block_sync_inflight`
-/// entry) lives in the [`Dispatch::ReceiveBlock`] handler in
-/// `boule_node::consensus_node::action_interpreter::apply_dispatch` because the inflight
-/// tracker lives on the integration layer, not in ingress.
 pub fn ingress_block_response(
     signed: Signed<crate::wire::BlockResponsePayload>,
     from: NodeId,
     _key_history: &ValidatorKeyHistory,
     chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
-    // #858: any connected peer may serve a block — a caught-up *sentry*, not
-    // only a validator. The block is independently verified downstream
-    // (content-hash binding + the inflight gate in the `ReceiveBlock` handler,
-    // and the block's own QC in the safety core), so the responder need not be
-    // in the validator set. We still verify the envelope signature: for a
-    // validator it remains slashable evidence of a wrong-hash answer;
-    // a non-validator simply isn't slashable, but its block is still checked.
     verify_sig(&signed, chain_id)?;
     let crate::wire::BlockResponsePayload {
         requested_hash,
@@ -400,8 +223,6 @@ pub fn ingress_block_response(
     }])
 }
 
-/// Convert an inbound `BlockRangeRequest` into a
-/// [`Dispatch::ServeBlockRange`] (#514).
 pub fn ingress_block_range_request(
     from_height: crate::Height,
     to_height: crate::Height,
@@ -414,30 +235,12 @@ pub fn ingress_block_range_request(
     }]
 }
 
-/// Convert an inbound signed `BlockRangeResponse` into a
-/// [`Dispatch::ReceiveBlockRange`] (#514).
-///
-/// Verifies the responder's pubkey is known to `key_history` (i.e.
-/// resolves to a stable
-/// [`crate::validator_set::ValidatorId`]) and that the
-/// envelope signature is valid. Mirror of [`ingress_block_response`]
-/// — same trust model, with the additional invariant that responses
-/// must be inside the echoed `[from_height, to_height]` and in
-/// strictly ascending height order. The shape check happens here so
-/// a malformed response is rejected before it can pollute the
-/// requester's `pending_blocks` map. Validation against an
-/// outstanding range-inflight entry lives at the integration layer
-/// (#515 wires that gate).
 pub fn ingress_block_range_response(
     signed: Signed<crate::wire::BlockRangeResponsePayload>,
     from: NodeId,
     _key_history: &ValidatorKeyHistory,
     chain_id: &ChainId,
 ) -> Result<Vec<Dispatch>, IngressError> {
-    // #858: any connected peer may serve a block range — see
-    // `ingress_block_response`. The blocks are independently verified
-    // (in-range + ascending shape here, content-hash + QC downstream), so the
-    // responder need not be a validator.
     verify_sig(&signed, chain_id)?;
     let crate::wire::BlockRangeResponsePayload {
         from_height,
@@ -452,14 +255,10 @@ pub fn ingress_block_range_response(
     }])
 }
 
-/// Convert an inbound `SnapshotManifestRequest` into a
-/// [`Dispatch::ServeSnapshotManifest`].
 pub fn ingress_snapshot_manifest_request(height: Option<u64>, from: NodeId) -> Vec<Dispatch> {
     vec![Dispatch::ServeSnapshotManifest { height, to: from }]
 }
 
-/// Convert an inbound `SnapshotManifestResponse` into a
-/// [`Dispatch::ReceiveSnapshotManifest`].
 pub fn ingress_snapshot_manifest_response(
     manifest: Option<SnapshotManifest>,
     from: NodeId,
@@ -467,8 +266,6 @@ pub fn ingress_snapshot_manifest_response(
     vec![Dispatch::ReceiveSnapshotManifest { manifest, from }]
 }
 
-/// Convert an inbound `SnapshotChunkRequest` into a
-/// [`Dispatch::ServeSnapshotChunk`].
 pub fn ingress_snapshot_chunk_request(height: u64, chunk_idx: u32, from: NodeId) -> Vec<Dispatch> {
     vec![Dispatch::ServeSnapshotChunk {
         height: crate::Height(height),
@@ -477,8 +274,6 @@ pub fn ingress_snapshot_chunk_request(height: u64, chunk_idx: u32, from: NodeId)
     }]
 }
 
-/// Convert an inbound `SnapshotChunkResponse` into a
-/// [`Dispatch::ReceiveSnapshotChunk`].
 pub fn ingress_snapshot_chunk_response(
     height: u64,
     chunk_idx: u32,
@@ -493,12 +288,6 @@ pub fn ingress_snapshot_chunk_response(
     }]
 }
 
-/// Verify a gossiped [`EquivocationProof`](super::EquivocationProof)
-/// independently (#657b) and, if it is real evidence, emit
-/// [`Dispatch::ReceiveEquivocationEvidence`] carrying the equivocator's stable
-/// id. The proof is self-authenticating, so the relaying peer is not trusted —
-/// only the proof's own envelopes are. Bogus evidence is rejected here so it
-/// never reaches the mempool or a block.
 pub fn ingress_equivocation_evidence(
     proof: super::EquivocationProof,
     history: &ValidatorSetHistory,

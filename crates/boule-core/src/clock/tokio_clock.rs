@@ -1,13 +1,10 @@
-//! Production [`Clock`] implementation backed by tokio's runtime,
-//! [`chrono::Utc::now`], and [`std::time::Instant`].
-
 use std::time::{Duration, Instant};
 
 use super::{BoxFuture, Clock, ClockInterval};
 
 #[derive(Debug, Clone, Copy)]
 pub struct TokioClock {
-    #[allow(dead_code)] // Read through `now_monotonic`; see `Clock` trait.
+    #[allow(dead_code)]
     start: Instant,
 }
 

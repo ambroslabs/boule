@@ -1,5 +1,3 @@
-//! `boule start` — run the node.
-
 use std::path::PathBuf;
 
 use clap::Args;
@@ -12,13 +10,12 @@ use super::shared::{is_production, resolve_config_path};
 
 #[derive(Args)]
 pub struct StartArgs {
-    /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
-    /// Fail closed on insecure defaults (also set by BOULE_ENV=production).
+
     #[arg(long)]
     production: bool,
-    /// Permit a key file with group/other-readable permissions.
+
     #[arg(long = "allow-insecure-key-perms")]
     allow_insecure_perms: bool,
 }
@@ -44,9 +41,6 @@ pub(crate) async fn handle(args: StartArgs) -> anyhow::Result<()> {
         )
     })?;
 
-    // Optional separate validator (consensus signing) identity. If the
-    // table is present it must already hold a key — `start` never mints
-    // one (that's `init`'s job).
     let validator_identity = if let Some(val_cfg) = config::resolve_validator_identity(&config.node)
     {
         info!("validator identity backend: {}", val_cfg.backend_name());

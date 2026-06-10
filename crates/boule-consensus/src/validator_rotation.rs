@@ -1,55 +1,3 @@
-//! Validator consensus-key rotation transaction (issue #142).
-//!
-//! A validator that wants to swap its consensus signing key without leaving
-//! and rejoining the set submits a [`ValidatorKeyRotation`] payload wrapped
-//! in a [`DualSignedRotation`] envelope. The envelope carries two
-//! signatures over the same domain-separated pre-image:
-//!
-//! - `sig_old` — produced by the validator's *current* consensus key.
-//! - `sig_new` — produced by the proposed `new_pubkey`.
-//!
-//! Both must verify before the rotation can be accepted: that's the
-//! self-attestation property (#142, scope item 3) — proving the validator
-//! controls both keys. Without it, an attacker who compromises only the
-//! current key could rotate to a key only they hold, locking out the
-//! legitimate operator.
-//!
-//! # Scope of this module
-//!
-//! Type definition, postcard codec, structural well-formedness checks,
-//! dual-signature verification, and the tagged on-the-wire form used as
-//! a `Block.commands` payload. The commit-time application path lives
-//! in `consensus::node::ConsensusNode::apply_committed_rotations`
-//! (#260) and reads via [`DualSignedRotation::is_rotation_payload`] +
-//! [`DualSignedRotation::decode_command`].
-//!
-//! # Cancelling a pending rotation (#317)
-//!
-//! A rotation does not take effect at commit — it becomes active at a
-//! future `v_eff` (at least [`V_EFF_MIN_DELAY`] views out). That gap is
-//! a window in which an operator who mis-rotated (wrong key, premature
-//! announcement, suspected compromise of the *new* key before it goes
-//! live) can retract the rotation before any QC is ever signed under it.
-//! [`DualSignedRotationCancel`] (tagged [`ROTATION_CANCEL_TAG`]) is that
-//! retraction. Like the rotation itself it is dual-signed, proving control
-//! of both keys at cancel time:
-//!
-//! - `sig_old` — the validator's *current* (pre-rotation) consensus key,
-//!   i.e. the key active at the cancel's commit view.
-//! - `sig_new` — the *pending* rotation's `new_pubkey`.
-//!
-//! The pending new key is **not** carried in the cancel payload: it is
-//! recovered from the key history (the validator's most-recent entry),
-//! so a cancel can only target a rotation the chain already recorded.
-//! Only the *last* pending rotation is cancellable, and only while it is
-//! still in the future (`cancelling_v_eff > commit_view`); a rotation that
-//! has already taken effect cannot be undone this way (rotate again
-//! instead). Application removes the pending key-history entry, restoring
-//! the pre-rotation timeline — see
-//! [`crate::history_commitment::apply_rotation_cancel_command`], the
-//! helper shared by the live commit path and the recovery rebuild so both
-//! reproduce identical state.
-
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -62,68 +10,25 @@ use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPop, BlsPublicKey};
 use boule_core::crypto::signed::{ChainId, SignedMessage, Signer, preimage};
 use boule_core::identity::NodeId;
 
-/// Magic prefix that tags a `Block.commands` entry as a tagged
-/// [`DualSignedRotation`] payload. Mirrors the [`RECONFIG_TAG`] convention
-/// from [`crate::reconfig`]: a 6-byte prefix lets the
-/// commit-time scanner tell rotation txs apart from opaque application
-/// commands without attempting `postcard::from_bytes` on every slot.
-///
-/// [`RECONFIG_TAG`]: crate::reconfig::RECONFIG_TAG
 pub const ROTATION_TAG: &[u8; 6] = b"VKROT\0";
 
-/// Magic prefix tagging a `Block.commands` entry as a rotation-cancel payload
-/// ([`DualSignedRotationCancel`], #317) — retracting a committed-but-not-yet-
-/// effective rotation before its `v_eff`.
 pub const ROTATION_CANCEL_TAG: &[u8; 6] = b"VKCAN\0";
 
-/// Magic prefix tagging a `Block.commands` entry as an **operator-signed**
-/// signing-key rotation ([`OperatorSignedRotation`], #549) — the
-/// recovery-from-loss path, authorised by the validator's operator key
-/// instead of its old signing key.
 pub const OPERATOR_ROTATION_TAG: &[u8; 6] = b"VKOPR\0";
 
-/// Magic prefix tagging a `Block.commands` entry as an **operator-key
-/// self-rotation** ([`DualSignedOperatorRotation`], #549): a validator
-/// rotating its own operator key, dual-signed by the old and new operator
-/// keys (the operator-key analogue of [`DualSignedRotation`]).
 pub const OPERATOR_KEY_ROTATION_TAG: &[u8; 6] = b"OKROT\0";
 
-/// Minimum gap between the view in which a rotation is committed and its
-/// effective view, matching the convention established by validator-set
-/// reconfiguration (#140). Two views give the validator at least one full
-/// view to provision the new key on the signing path before it must
-/// produce votes/proposals under it.
 pub const V_EFF_MIN_DELAY: View = View::new(2);
 
-/// Payload of a validator-key rotation transaction.
-///
-/// `validator` identifies the validator whose key is changing (currently
-/// the validator's active consensus pubkey; once #140 introduces a stable
-/// validator address this field's interpretation tightens but the wire
-/// shape is unchanged). `new_pubkey` is the consensus key the validator
-/// proposes to sign under starting at view `v_eff`.
-///
-/// Every rotation must atomically swap both halves of the validator's
-/// identity: `new_bls_pubkey` carries the new BLS12-381 G1 pubkey and
-/// `new_bls_pop` is its proof-of-possession (matching the
-/// `add-validator` reconfig contract from #291). Splitting the two
-/// halves into independent rotations would let the histories disagree at
-/// a single view (#358 out-of-scope item).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorKeyRotation {
     pub validator: NodeId,
     pub new_pubkey: NodeId,
     pub v_eff: View,
-    /// New BLS pubkey (#358). Required on BLS chains, must be `None`
-    /// on Ed25519 chains; the consistency check is in
-    /// [`Self::validate_scheme_consistency`].
+
     #[serde(default, with = "serde_optional_bls_pubkey")]
     pub new_bls_pubkey: Option<BlsPublicKey>,
-    /// Proof-of-possession over `new_bls_pubkey` (#358). Required when
-    /// `new_bls_pubkey` is `Some`; must be `None` otherwise. Verified
-    /// by [`Self::validate_scheme_consistency`] under
-    /// [`BlsAggregated::verify_pop`] before the rotation can be
-    /// applied to [`crate::bls_key_history::BlsKeyHistory`].
+
     #[serde(default)]
     pub new_bls_pop: Option<BlsPop>,
 }
@@ -132,17 +37,6 @@ impl SignedMessage for ValidatorKeyRotation {
     const DOMAIN: &'static str = "boule.consensus.validator_rotation.v1";
 }
 
-/// A [`ValidatorKeyRotation`] envelope carrying both the old-key and
-/// new-key signatures over the canonical pre-image of the payload.
-///
-/// The "signer" of each signature is implicit: `sig_new` verifies under
-/// `payload.new_pubkey` (embedded in the payload itself), and `sig_old`
-/// verifies under whatever key the validator is currently using — looked
-/// up by the consumer against the active validator set, not carried on
-/// the envelope. That's deliberate: an attacker who rewrites a `signer`
-/// claim can already be defeated by [`boule_core::crypto::signed::Signed`],
-/// but for a self-attestation envelope the trusted answer to "who is the
-/// old signer?" comes from the validator set, not from the message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DualSignedRotation {
     pub payload: ValidatorKeyRotation,
@@ -152,9 +46,6 @@ pub struct DualSignedRotation {
     pub sig_new: [u8; 64],
 }
 
-/// Reasons a rotation can be rejected at the structural-validation stage,
-/// before any cryptographic check. These are cheap to evaluate and apply
-/// equally at admission time and at block-validation time.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RotationStructuralError {
     EffectiveViewTooSoon {
@@ -162,19 +53,12 @@ pub enum RotationStructuralError {
         v_eff: View,
     },
     NewKeyEqualsValidator,
-    /// A rotation must carry both `new_bls_pubkey` and `new_bls_pop`
-    /// (#358). Splitting the two halves into independent rotations
-    /// would leave the Ed25519 and BLS histories transiently
-    /// disagreeing at a single view.
+
     BlsFieldsInconsistentWithScheme {
         bls_pubkey_present: bool,
         bls_pop_present: bool,
     },
-    /// On a BLS chain, the proof-of-possession in `new_bls_pop` did
-    /// not verify under `new_bls_pubkey`. Catches a rotator who
-    /// supplies a BLS pubkey they don't actually hold the secret half
-    /// of — the same rogue-key-attack defense the registration path
-    /// runs (#291).
+
     BlsPopVerificationFailed,
 }
 
@@ -215,19 +99,6 @@ impl std::fmt::Display for RotationStructuralError {
 impl std::error::Error for RotationStructuralError {}
 
 impl ValidatorKeyRotation {
-    /// Validate fields that don't require any external state beyond the
-    /// current view. Specifically:
-    ///
-    /// - `v_eff` is at least `V_EFF_MIN_DELAY` views ahead of `current_view`,
-    ///   so the validator has time to provision the new key.
-    /// - `new_pubkey != validator`, rejecting trivially no-op rotations
-    ///   that would just churn the per-view key history.
-    ///
-    /// The `NodeId` shape (32 bytes) is enforced by postcard at decode
-    /// time; this method covers the rest. Cryptographic checks
-    /// (signature validity, `new_pubkey` being a valid Ed25519 point) are
-    /// out of scope for this layer — they happen in the verification
-    /// step that consumes a [`DualSignedRotation`].
     pub fn validate_structural(
         &self,
         current_view: impl Into<View>,
@@ -245,14 +116,6 @@ impl ValidatorKeyRotation {
         Ok(())
     }
 
-    /// Check that this rotation carries the required BLS fields and that
-    /// `new_bls_pop` verifies under `new_bls_pubkey` and `chain_id`
-    /// (#358, #410).
-    ///
-    /// Separate from [`Self::validate_structural`] because the chain_id
-    /// isn't part of the rotation payload — it's a property of the chain
-    /// the rotation is being applied to. Callers thread the chain_id in
-    /// from `ConsensusNode.chain_id`.
     pub fn validate_scheme_consistency(
         &self,
         chain_id: &ChainId,
@@ -268,32 +131,14 @@ impl ValidatorKeyRotation {
     }
 }
 
-/// Reasons a [`DualSignedRotation`] can fail cryptographic verification,
-/// after structural well-formedness has already been checked. These map
-/// 1:1 to the four rejection cases enumerated in the acceptance criteria
-/// for #258, so callers can log a precise reason without re-deriving it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RotationVerifyError {
-    /// `sig_old` does not verify under the validator's currently-active
-    /// consensus key. Covers the "signed only by the new key" case (the
-    /// envelope still has *some* bytes in `sig_old`, but they are not a
-    /// signature by the old key) and the "tampered old signature" case.
     InvalidOldSignature,
-    /// `sig_new` does not verify under `payload.new_pubkey`. Covers the
-    /// "signed only by the old key" case, the "tampered new signature"
-    /// case, and the "sig_new is a real signature but over different
-    /// bytes" case.
+
     InvalidNewSignature,
-    /// Re-serializing the payload to recover the canonical pre-image
-    /// failed. In practice this should never happen for the fixed-shape
-    /// payload used here, but surfacing it as a distinct variant keeps
-    /// the verifier from masking unexpected serialization regressions
-    /// behind a generic "invalid signature" verdict.
+
     Preimage(String),
-    /// `sig_operator` does not verify under the operator key active for the
-    /// validator at the rotation's commit view (#549). The operator-signed
-    /// recovery path's analogue of [`Self::InvalidOldSignature`]: the
-    /// authorising signature is the operator's, not the old signing key's.
+
     InvalidOperatorSignature,
 }
 
@@ -317,11 +162,6 @@ impl std::fmt::Display for RotationVerifyError {
 impl std::error::Error for RotationVerifyError {}
 
 impl DualSignedRotation {
-    /// Encode as a tagged byte sequence suitable for a
-    /// `Block.commands` slot: [`ROTATION_TAG`] || `postcard(self)`.
-    /// The tag prefix lets the commit-time scanner identify rotation
-    /// txs without attempting `postcard::from_bytes` on every command
-    /// in the block.
     pub fn encode_command(&self) -> Bytes {
         let body =
             postcard::to_stdvec(self).expect("postcard encoding of DualSignedRotation cannot fail");
@@ -331,19 +171,10 @@ impl DualSignedRotation {
         Bytes::from(out)
     }
 
-    /// True iff `bytes` carries the [`ROTATION_TAG`] prefix. Returns
-    /// false on near-miss prefixes (5-byte truncations, off-by-one) so
-    /// the commit-time scanner can short-circuit obvious non-rotations
-    /// before paying the postcard decode.
     pub fn is_rotation_payload(bytes: &[u8]) -> bool {
         bytes.starts_with(ROTATION_TAG)
     }
 
-    /// Decode a tagged rotation tx. Returns an error if the tag is
-    /// absent or the postcard body is malformed. The caller is
-    /// expected to follow this with [`Self::verify`] before applying
-    /// the rotation — `decode_command` does not do cryptographic
-    /// validation.
     pub fn decode_command(bytes: &[u8]) -> Result<Self> {
         let body = bytes
             .strip_prefix(ROTATION_TAG.as_slice())
@@ -351,17 +182,6 @@ impl DualSignedRotation {
         postcard::from_bytes(body).map_err(|e| anyhow::anyhow!("malformed DualSignedRotation: {e}"))
     }
 
-    /// Construct a dual-signed rotation envelope. The `current` signer
-    /// must hold the validator's currently-active consensus key; the
-    /// `new` signer must hold the key being rotated to (and its
-    /// `node_id()` must equal `payload.new_pubkey`, which the helper
-    /// asserts so callers can't accidentally produce an envelope whose
-    /// `sig_new` would never verify).
-    ///
-    /// Both signatures are over the same canonical pre-image as
-    /// [`boule_core::crypto::signed::Signed`] for `ValidatorKeyRotation` — the
-    /// shared helper guarantees the bytes signed match the bytes
-    /// [`Self::verify`] reconstructs.
     pub fn sign(
         payload: ValidatorKeyRotation,
         current: &dyn Signer,
@@ -384,20 +204,6 @@ impl DualSignedRotation {
         })
     }
 
-    /// Verify both signatures: `sig_old` under `current_pubkey` (the
-    /// validator's currently-active consensus key, looked up by the
-    /// caller against the live validator set), and `sig_new` under
-    /// `self.payload.new_pubkey`. Both must verify against `chain_id`.
-    ///
-    /// This is the cryptographic half of the self-attestation property
-    /// from #142: it proves the validator controls both keys at the
-    /// moment the rotation was signed, so a compromise of only the old
-    /// key cannot rotate to a key the legitimate operator does not hold.
-    /// `chain_id` (#324) scopes the rotation to the deployment so a
-    /// rotation signed for chain A cannot be replayed against chain B.
-    /// Structural validation ([`ValidatorKeyRotation::validate_structural`])
-    /// is independent — callers should run it first because it's
-    /// strictly cheaper.
     pub fn verify(
         &self,
         current_pubkey: &NodeId,
@@ -418,26 +224,6 @@ impl DualSignedRotation {
     }
 }
 
-/// An **operator-signed** signing-key rotation (#549) — the
-/// recovery-from-loss path. Carries the same [`ValidatorKeyRotation`] payload
-/// as [`DualSignedRotation`] (so the committed effect on
-/// [`ValidatorKeyHistory`](crate::validator_key_history::ValidatorKeyHistory)
-/// is identical), but the *authorising* signature is the validator's
-/// **operator key**, not its old signing key:
-///
-/// - `sig_operator` — by the operator key active for the validator at the
-///   rotation's commit view. This is what makes recovery possible: a
-///   validator whose signing key was destroyed has no old key to dual-sign
-///   with, but its cold-storage operator key can still authorise a swap to a
-///   fresh signing key.
-/// - `sig_new` — by `payload.new_pubkey`, the self-attestation that the
-///   operator controls the key it is rotating to (prevents fat-fingering a
-///   pubkey nobody holds, which would brick the validator a second time).
-///
-/// Replay protection is the same `v_eff` strict-monotonicity guard the
-/// dual-signed path relies on (a rotation can't be re-applied because
-/// `v_eff` must exceed the validator's latest key-history entry), so this
-/// needs no separate nonce. `chain_id` (#324) scopes it to the deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorSignedRotation {
     pub payload: ValidatorKeyRotation,
@@ -448,8 +234,6 @@ pub struct OperatorSignedRotation {
 }
 
 impl OperatorSignedRotation {
-    /// Encode as a tagged `Block.commands` slot: [`OPERATOR_ROTATION_TAG`] ||
-    /// `postcard(self)`.
     pub fn encode_command(&self) -> Bytes {
         let body = postcard::to_stdvec(self)
             .expect("postcard encoding of OperatorSignedRotation cannot fail");
@@ -459,13 +243,10 @@ impl OperatorSignedRotation {
         Bytes::from(out)
     }
 
-    /// True iff `bytes` carries the [`OPERATOR_ROTATION_TAG`] prefix.
     pub fn is_operator_rotation_payload(bytes: &[u8]) -> bool {
         bytes.starts_with(OPERATOR_ROTATION_TAG)
     }
 
-    /// Decode a tagged operator-signed rotation. Errors if the tag is absent
-    /// or the body is malformed. Follow with [`Self::verify`] before applying.
     pub fn decode_command(bytes: &[u8]) -> Result<Self> {
         let body = bytes
             .strip_prefix(OPERATOR_ROTATION_TAG.as_slice())
@@ -474,13 +255,6 @@ impl OperatorSignedRotation {
             .map_err(|e| anyhow::anyhow!("malformed OperatorSignedRotation: {e}"))
     }
 
-    /// Construct an operator-signed rotation envelope. `operator` must hold
-    /// the validator's active operator key; `new` must hold the key being
-    /// rotated to (its `node_id()` must equal `payload.new_pubkey`, asserted
-    /// so callers can't build an envelope whose `sig_new` would never verify).
-    /// Both signatures are over the same canonical pre-image as
-    /// [`DualSignedRotation::sign`], so the bytes signed match the bytes
-    /// [`Self::verify`] reconstructs.
     pub fn sign(
         payload: ValidatorKeyRotation,
         operator: &dyn Signer,
@@ -503,13 +277,6 @@ impl OperatorSignedRotation {
         })
     }
 
-    /// Verify both signatures: `sig_operator` under `operator_pubkey` (the
-    /// validator's operator key active at the rotation's commit view, looked
-    /// up by the caller against the operator-key history), and `sig_new`
-    /// under `self.payload.new_pubkey`. Both must verify against `chain_id`.
-    /// Structural validation
-    /// ([`ValidatorKeyRotation::validate_structural`]) is independent — run
-    /// it first, it's cheaper.
     pub fn verify(
         &self,
         operator_pubkey: &NodeId,
@@ -530,19 +297,12 @@ impl OperatorSignedRotation {
     }
 }
 
-/// An **operator-key self-rotation** payload (#549): a validator rotates its
-/// own operator key to `new_operator_pubkey`, effective at `v_eff`. The
-/// validator is named by its stable id (`validator`). This is the operator-key
-/// analogue of [`ValidatorKeyRotation`] — administrative, not consensus — and
-/// carries no BLS fields (operator keys are Ed25519 only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorKeyRotation {
-    /// The validator's stable id whose operator key is rotating.
     pub validator: NodeId,
-    /// The new operator pubkey, effective at `v_eff`.
+
     pub new_operator_pubkey: NodeId,
-    /// The view at which the new operator key takes effect. Must be strictly
-    /// greater than the validator's latest operator-key entry (replay guard).
+
     pub v_eff: View,
 }
 
@@ -550,31 +310,18 @@ impl SignedMessage for OperatorKeyRotation {
     const DOMAIN: &'static str = "boule.consensus.operator_key_rotation.v1";
 }
 
-/// An [`OperatorKeyRotation`] dual-signed by the old and new operator keys —
-/// the same self-attestation property as [`DualSignedRotation`], one level up:
-/// only an operator holding *both* the current operator key (authorising the
-/// change) and the new operator key (proving control of it) can rotate. A
-/// compromise of just one cannot move the operator key to a key the legitimate
-/// operator does not hold.
-///
-/// Note this is distinct from [`OperatorSignedRotation`], which rotates the
-/// *signing* key under operator authority; this rotates the *operator* key
-/// itself.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DualSignedOperatorRotation {
     pub payload: OperatorKeyRotation,
-    /// Signature by the validator's *current* operator key (looked up by the
-    /// consumer against the operator-key history, not carried on the envelope).
+
     #[serde(with = "serde_sig")]
     pub sig_old: [u8; 64],
-    /// Signature by `payload.new_operator_pubkey`.
+
     #[serde(with = "serde_sig")]
     pub sig_new: [u8; 64],
 }
 
 impl DualSignedOperatorRotation {
-    /// Encode as a tagged `Block.commands` slot: [`OPERATOR_KEY_ROTATION_TAG`]
-    /// || `postcard(self)`.
     pub fn encode_command(&self) -> Bytes {
         let body = postcard::to_stdvec(self)
             .expect("postcard encoding of DualSignedOperatorRotation cannot fail");
@@ -584,13 +331,10 @@ impl DualSignedOperatorRotation {
         Bytes::from(out)
     }
 
-    /// True iff `bytes` carries the [`OPERATOR_KEY_ROTATION_TAG`] prefix.
     pub fn is_operator_key_rotation_payload(bytes: &[u8]) -> bool {
         bytes.starts_with(OPERATOR_KEY_ROTATION_TAG)
     }
 
-    /// Decode a tagged operator-key rotation. Errors if the tag is absent or
-    /// the body is malformed. Follow with [`Self::verify`] before applying.
     pub fn decode_command(bytes: &[u8]) -> Result<Self> {
         let body = bytes
             .strip_prefix(OPERATOR_KEY_ROTATION_TAG.as_slice())
@@ -599,11 +343,6 @@ impl DualSignedOperatorRotation {
             .map_err(|e| anyhow::anyhow!("malformed DualSignedOperatorRotation: {e}"))
     }
 
-    /// Construct a dual-signed operator-key rotation envelope. `old` must hold
-    /// the validator's current operator key; `new` must hold the key being
-    /// rotated to (its `node_id()` must equal `payload.new_operator_pubkey`,
-    /// asserted so callers can't build an envelope whose `sig_new` would never
-    /// verify).
     pub fn sign(
         payload: OperatorKeyRotation,
         old: &dyn Signer,
@@ -626,10 +365,6 @@ impl DualSignedOperatorRotation {
         })
     }
 
-    /// Verify both signatures: `sig_old` under `current_operator_pubkey` (the
-    /// validator's operator key active at the rotation's commit view), and
-    /// `sig_new` under `self.payload.new_operator_pubkey`. Both must verify
-    /// against `chain_id`.
     pub fn verify(
         &self,
         current_operator_pubkey: &NodeId,
@@ -650,11 +385,6 @@ impl DualSignedOperatorRotation {
     }
 }
 
-/// The retraction payload for a committed-but-not-yet-effective rotation
-/// (#317): names the validator and the `v_eff` of the pending rotation being
-/// cancelled. The new pubkey is *not* carried — the consumer recovers it from
-/// the pending entry in [`crate::validator_key_history::ValidatorKeyHistory`],
-/// the same trusted source `sig_new` is checked against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorRotationCancel {
     pub validator: NodeId,
@@ -665,12 +395,6 @@ impl SignedMessage for ValidatorRotationCancel {
     const DOMAIN: &'static str = "boule.consensus.validator_rotation_cancel.v1";
 }
 
-/// A [`ValidatorRotationCancel`] carrying both the current-key and pending-new-
-/// key signatures over its canonical pre-image — the same self-attestation
-/// property as [`DualSignedRotation`]: only the operator who holds *both* keys
-/// (and therefore proposed the rotation) can retract it. A compromise of just
-/// the old key cannot cancel a rotation to a key the operator legitimately
-/// provisioned, and vice-versa.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DualSignedRotationCancel {
     pub payload: ValidatorRotationCancel,
@@ -681,8 +405,6 @@ pub struct DualSignedRotationCancel {
 }
 
 impl DualSignedRotationCancel {
-    /// Encode as a tagged byte sequence for a `Block.commands` slot:
-    /// [`ROTATION_CANCEL_TAG`] || `postcard(self)`.
     pub fn encode_command(&self) -> Bytes {
         let body = postcard::to_stdvec(self)
             .expect("postcard encoding of DualSignedRotationCancel cannot fail");
@@ -692,13 +414,10 @@ impl DualSignedRotationCancel {
         Bytes::from(out)
     }
 
-    /// True iff `bytes` carries the [`ROTATION_CANCEL_TAG`] prefix.
     pub fn is_cancel_payload(bytes: &[u8]) -> bool {
         bytes.starts_with(ROTATION_CANCEL_TAG)
     }
 
-    /// Decode a tagged rotation-cancel command. Errors if the tag is absent or
-    /// the body is malformed.
     pub fn decode_command(bytes: &[u8]) -> Result<Self> {
         let body = bytes
             .strip_prefix(ROTATION_CANCEL_TAG.as_slice())
@@ -707,8 +426,6 @@ impl DualSignedRotationCancel {
             .map_err(|e| anyhow::anyhow!("malformed DualSignedRotationCancel: {e}"))
     }
 
-    /// Sign a cancel with the validator's current key and the pending
-    /// rotation's new key (both over the same domain-separated pre-image).
     pub fn sign(
         payload: ValidatorRotationCancel,
         current: &dyn Signer,
@@ -725,11 +442,6 @@ impl DualSignedRotationCancel {
         })
     }
 
-    /// Verify both signatures: `sig_old` under `current_pubkey` (the
-    /// validator's currently-active consensus key at the cancel's commit view)
-    /// and `sig_new` under `pending_new_pubkey` (the key the pending rotation
-    /// would have installed, recovered from the key history). Reuses
-    /// [`RotationVerifyError`] — the failure modes are identical.
     pub fn verify(
         &self,
         current_pubkey: &NodeId,
@@ -751,10 +463,6 @@ impl DualSignedRotationCancel {
     }
 }
 
-/// Serde adapter for `Option<BlsPublicKey>` — a 48-byte fixed array that
-/// serde does not auto-derive past N=32. Mirrors the byte-sequence
-/// shape used by `Option<BlsPartialSig>` in
-/// [`crate::wire::WireMessage::Vote`] (#355).
 mod serde_optional_bls_pubkey {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
@@ -780,9 +488,6 @@ mod serde_optional_bls_pubkey {
     }
 }
 
-/// Mirror of `crypto::signed::serde_sig` for the two raw signatures held
-/// by [`DualSignedRotation`]. Kept private here so the envelope's wire
-/// format stays decoupled from the `Signed<T>` envelope's internals.
 mod serde_sig {
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
@@ -798,8 +503,6 @@ mod serde_sig {
     }
 }
 
-/// CLI inputs for `rotation propose`, populated by the binary's argument
-/// parser and consumed by [`build_rotation_envelope`].
 #[derive(Debug, Default)]
 pub struct RotationProposeRequest {
     pub config_path: Option<PathBuf>,
@@ -811,23 +514,13 @@ pub struct RotationProposeRequest {
     pub v_eff: Option<u64>,
 }
 
-/// Outcome of building a rotation envelope from CLI inputs. Captured as a
-/// struct so tests can assert on the resolved fields without re-doing the
-/// whole orchestration.
 #[derive(Debug)]
 pub struct RotationProposeOutcome {
     pub envelope: DualSignedRotation,
-    /// Always `true`: every rotation carries a BLS pubkey + PoP. Retained
-    /// for the CLI's diagnostic output.
+
     pub bls_chain: bool,
 }
 
-/// Translate the `--new-key-backend` + path/passphrase flags into an
-/// [`boule_core::config::IdentityConfig`]. Accepts only the path-bearing
-/// backends — `file` and `encrypted-file` — because they can
-/// self-provision a fresh key when the path doesn't yet exist (the common
-/// rotation path). Read-only backends (env, exec, keyring) need bespoke
-/// provisioning and should rotate against [`DualSignedRotation::sign`].
 pub fn build_new_identity_config_for_rotation(
     backend: &str,
     path: Option<PathBuf>,
@@ -856,12 +549,6 @@ pub fn build_new_identity_config_for_rotation(
     }
 }
 
-/// Orchestration core of `rotation propose` — resolves the current
-/// validator key from `req.config_path`'s config, mints (or reloads) the
-/// new Ed25519 key, mints (or reloads) the new BLS key on BLS chains,
-/// builds a chain-bound [`DualSignedRotation`], and returns it. Lives in
-/// the library so unit tests can drive the same flow without spawning a
-/// process.
 pub fn build_rotation_envelope(
     req: &RotationProposeRequest,
 ) -> anyhow::Result<RotationProposeOutcome> {
@@ -889,8 +576,6 @@ pub fn build_rotation_envelope(
     })?;
     let chain_id = crate::genesis::derive_chain_id(cons)?;
 
-    // Reject a missing BLS flag *before* minting any new keys so a
-    // misconfigured invocation leaves no half-provisioned files behind.
     if req.new_bls_key_backend.is_none() {
         anyhow::bail!(
             "no --new-bls-key-backend was supplied; rotations carry both the Ed25519 \
@@ -898,9 +583,6 @@ pub fn build_rotation_envelope(
         );
     }
 
-    // Resolve the *current* validator signer, mirroring `start`'s
-    // precedence: prefer `[node.validator_identity]`, else fall back to
-    // the network identity. The key must already exist on disk.
     let (current_id_cfg, current_slot) =
         match boule_core::config::resolve_validator_identity(&config.node) {
             Some(cfg) => (cfg, "validator"),
@@ -924,7 +606,6 @@ pub fn build_rotation_envelope(
     })?;
     let current_signer = NodeSigner::from_identity(&current_identity)?;
 
-    // Resolve / provision the *new* Ed25519 key.
     let new_id_cfg = build_new_identity_config_for_rotation(
         new_backend,
         req.new_key_path.clone(),
@@ -944,8 +625,6 @@ pub fn build_rotation_envelope(
     };
     let new_signer = NodeSigner::from_identity(&new_identity)?;
 
-    // BLS half. Flag presence was already enforced up front; this block
-    // runs the actual provisioning.
     let (new_bls_pubkey, new_bls_pop) = {
         let backend = req
             .new_bls_key_backend
@@ -972,7 +651,6 @@ pub fn build_rotation_envelope(
         new_bls_pop,
     };
 
-    // Surface a no-op rotation as a CLI-level error early.
     if payload.new_pubkey == payload.validator {
         anyhow::bail!(
             "new_pubkey equals current validator key; the --new-key-path is already \
@@ -990,23 +668,16 @@ pub fn build_rotation_envelope(
     })
 }
 
-/// CLI inputs for `rotation propose-operator-recovery` (#549), populated by
-/// the binary's argument parser and consumed by
-/// [`build_operator_recovery_envelope`].
 #[derive(Debug, Default)]
 pub struct OperatorRecoveryRequest {
     pub config_path: Option<PathBuf>,
-    /// Base58 stable id of the validator being recovered. Required because
-    /// the *signing* key is presumed lost, so it can't be loaded to identify
-    /// the validator; the operator supplies the (public, immutable) stable id.
+
     pub validator: Option<String>,
-    /// Backend + path for the **operator key** (must already exist — it is the
-    /// cold-storage authority key, not minted here).
+
     pub operator_key_backend: Option<String>,
     pub operator_key_path: Option<PathBuf>,
     pub operator_key_passphrase_env: Option<String>,
-    /// Backend + path for the fresh signing key to recover to (minted if
-    /// absent).
+
     pub new_key_backend: Option<String>,
     pub new_key_path: Option<PathBuf>,
     pub new_key_passphrase_env: Option<String>,
@@ -1015,21 +686,12 @@ pub struct OperatorRecoveryRequest {
     pub v_eff: Option<u64>,
 }
 
-/// Outcome of building an operator-signed recovery envelope.
 #[derive(Debug)]
 pub struct OperatorRecoveryOutcome {
     pub envelope: OperatorSignedRotation,
     pub bls_chain: bool,
 }
 
-/// Orchestration core of `rotation propose-operator-recovery` (#549) — the
-/// recovery-from-loss path. Resolves the validator's stable id from
-/// `req.validator`, loads the **operator key** (which authorises the rotation
-/// in place of the lost signing key), mints (or reloads) the new signing key
-/// (+ BLS key on BLS chains), and builds a chain-bound
-/// [`OperatorSignedRotation`]. Mirrors [`build_rotation_envelope`] but signs
-/// `sig_operator` with the operator key rather than `sig_old` with the (lost)
-/// current key.
 pub fn build_operator_recovery_envelope(
     req: &OperatorRecoveryRequest,
 ) -> anyhow::Result<OperatorRecoveryOutcome> {
@@ -1074,8 +736,6 @@ pub fn build_operator_recovery_envelope(
     })?;
     let chain_id = crate::genesis::derive_chain_id(cons)?;
 
-    // Same BLS-flag-presence check as `build_rotation_envelope`, before
-    // touching disk.
     if req.new_bls_key_backend.is_none() {
         anyhow::bail!(
             "no --new-bls-key-backend was supplied; rotations carry both the Ed25519 \
@@ -1083,9 +743,6 @@ pub fn build_operator_recovery_envelope(
         );
     }
 
-    // Load the operator key — it must already exist (cold-storage authority
-    // key, not minted here). Reuses the backend→config mapping but loads
-    // rather than provisions.
     let operator_cfg = build_new_identity_config_for_rotation(
         operator_backend,
         req.operator_key_path.clone(),
@@ -1102,7 +759,6 @@ pub fn build_operator_recovery_envelope(
         })?;
     let operator_signer = NodeSigner::from_identity(&operator_identity)?;
 
-    // Mint / reload the new signing key (the key being recovered to).
     let new_id_cfg = build_new_identity_config_for_rotation(
         new_backend,
         req.new_key_path.clone(),
@@ -1122,7 +778,6 @@ pub fn build_operator_recovery_envelope(
     };
     let new_signer = NodeSigner::from_identity(&new_identity)?;
 
-    // BLS half (same as rotation).
     let (new_bls_pubkey, new_bls_pop) = {
         let backend = req
             .new_bls_key_backend
@@ -1164,37 +819,27 @@ pub fn build_operator_recovery_envelope(
     })
 }
 
-/// CLI inputs for `rotation propose-operator-key-rotation` (#549), populated by
-/// the binary's argument parser and consumed by
-/// [`build_operator_key_rotation_envelope`].
 #[derive(Debug, Default)]
 pub struct OperatorKeyRotationRequest {
     pub config_path: Option<PathBuf>,
-    /// Base58 stable id of the validator whose operator key is rotating.
+
     pub validator: Option<String>,
-    /// Backend + path for the **current** operator key (must already exist).
+
     pub old_operator_key_backend: Option<String>,
     pub old_operator_key_path: Option<PathBuf>,
     pub old_operator_key_passphrase_env: Option<String>,
-    /// Backend + path for the **new** operator key (minted if absent).
+
     pub new_operator_key_backend: Option<String>,
     pub new_operator_key_path: Option<PathBuf>,
     pub new_operator_key_passphrase_env: Option<String>,
     pub v_eff: Option<u64>,
 }
 
-/// Outcome of building an operator-key self-rotation envelope.
 #[derive(Debug)]
 pub struct OperatorKeyRotationOutcome {
     pub envelope: DualSignedOperatorRotation,
 }
 
-/// Orchestration core of `rotation propose-operator-key-rotation` (#549) — a
-/// validator rotating its own operator key. Loads the **current** operator key
-/// (authorising, `sig_old`), mints (or reloads) the **new** operator key
-/// (`sig_new`), and builds a chain-bound [`DualSignedOperatorRotation`].
-/// Operator keys are Ed25519 only, so there is no signing-key or BLS half —
-/// this is simpler than [`build_operator_recovery_envelope`].
 pub fn build_operator_key_rotation_envelope(
     req: &OperatorKeyRotationRequest,
 ) -> anyhow::Result<OperatorKeyRotationOutcome> {
@@ -1237,7 +882,6 @@ pub fn build_operator_key_rotation_envelope(
     })?;
     let chain_id = crate::genesis::derive_chain_id(cons)?;
 
-    // Load the current operator key — must already exist (it authorises).
     let old_cfg = build_new_identity_config_for_rotation(
         old_backend,
         req.old_operator_key_path.clone(),
@@ -1254,7 +898,6 @@ pub fn build_operator_key_rotation_envelope(
         })?;
     let old_signer = NodeSigner::from_identity(&old_identity)?;
 
-    // Mint / reload the new operator key.
     let new_cfg = build_new_identity_config_for_rotation(
         new_backend,
         req.new_operator_key_path.clone(),
@@ -1288,996 +931,4 @@ pub fn build_operator_key_rotation_envelope(
     };
     let envelope = DualSignedOperatorRotation::sign(payload, &old_signer, &new_signer, &chain_id)?;
     Ok(OperatorKeyRotationOutcome { envelope })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use boule_core::crypto::signed::NodeSigner;
-    use boule_core::identity::NodeIdentity;
-    use rcgen::{KeyPair as RcgenKeyPair, PKCS_ED25519};
-    use zeroize::Zeroizing;
-
-    fn nid(b: u8) -> NodeId {
-        [b; 32]
-    }
-
-    fn fresh_signer() -> NodeSigner {
-        let kp = RcgenKeyPair::generate_for(&PKCS_ED25519).unwrap();
-        let id = NodeIdentity {
-            pkcs8_der: Zeroizing::new(kp.serialize_der()),
-        };
-        NodeSigner::from_identity(&id).unwrap()
-    }
-
-    fn sample_payload() -> ValidatorKeyRotation {
-        ValidatorKeyRotation {
-            validator: nid(1),
-            new_pubkey: nid(2),
-            v_eff: View(100),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        }
-    }
-
-    fn sample_envelope() -> DualSignedRotation {
-        DualSignedRotation {
-            payload: sample_payload(),
-            sig_old: [0xAA; 64],
-            sig_new: [0xBB; 64],
-        }
-    }
-
-    // ── tagged command codec (#260) ──────────────────────────────────────
-
-    #[test]
-    fn encode_decode_command_roundtrip() {
-        let env = sample_envelope();
-        let bytes = env.encode_command();
-        assert!(DualSignedRotation::is_rotation_payload(&bytes));
-        let back = DualSignedRotation::decode_command(&bytes).unwrap();
-        assert_eq!(back, env);
-    }
-
-    #[test]
-    fn is_rotation_payload_rejects_untagged_bytes() {
-        assert!(!DualSignedRotation::is_rotation_payload(b""));
-        assert!(!DualSignedRotation::is_rotation_payload(b"hello"));
-        // A near-miss (5 of 6 tag bytes) must not match.
-        assert!(!DualSignedRotation::is_rotation_payload(b"VKROT"));
-        // The reconfig tag must not be misinterpreted as a rotation.
-        assert!(!DualSignedRotation::is_rotation_payload(
-            crate::reconfig::RECONFIG_TAG
-        ));
-    }
-
-    #[test]
-    fn decode_command_errors_without_tag() {
-        let err = DualSignedRotation::decode_command(b"not a rotation").unwrap_err();
-        assert!(err.to_string().contains("missing rotation tag prefix"));
-    }
-
-    #[test]
-    fn decode_command_errors_on_truncated_body() {
-        let env = sample_envelope();
-        let bytes = env.encode_command();
-        let truncated = &bytes[..bytes.len() - 1];
-        assert!(DualSignedRotation::is_rotation_payload(truncated));
-        let err = DualSignedRotation::decode_command(truncated).unwrap_err();
-        assert!(err.to_string().contains("malformed DualSignedRotation"));
-    }
-
-    #[test]
-    fn rotation_tag_does_not_collide_with_reconfig_tag() {
-        // Both consume a `Block.commands` slot, so their first six bytes
-        // must disambiguate which payload type a slot holds.
-        assert_ne!(
-            ROTATION_TAG.as_slice(),
-            crate::reconfig::RECONFIG_TAG.as_slice()
-        );
-    }
-
-    #[test]
-    fn payload_round_trips_through_postcard() {
-        let p = sample_payload();
-        let bytes = postcard::to_stdvec(&p).unwrap();
-        let back: ValidatorKeyRotation = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(back, p);
-    }
-
-    #[test]
-    fn envelope_round_trips_through_postcard() {
-        let env = sample_envelope();
-        let bytes = postcard::to_stdvec(&env).unwrap();
-        let back: DualSignedRotation = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(back, env);
-    }
-
-    #[test]
-    fn envelope_rejects_short_signature_on_decode() {
-        // Hand-craft a postcard buffer where one of the signature byte
-        // sequences is the wrong length. The custom serde adapter must
-        // reject it, since a `[u8; 64]` decoded from a length-prefixed
-        // byte sequence has no other layer enforcing the length.
-        let env = sample_envelope();
-        let mut bytes = postcard::to_stdvec(&env).unwrap();
-
-        // Postcard encodes Vec<u8> as varint(len) || bytes. The payload
-        // (validator + new_pubkey + v_eff) is fixed-shape; immediately
-        // after it sits sig_old's varint length. For our V_EFF=100 the
-        // payload occupies 32+32+1 bytes (varint 100 = 1 byte).
-        let payload_len = 32 + 32 + 1;
-        // Bump sig_old's length byte from 64 to 63 and drop the last byte.
-        bytes[payload_len] = 63;
-        bytes.truncate(bytes.len() - 1);
-
-        let _ = postcard::from_bytes::<DualSignedRotation>(&bytes)
-            .expect_err("decode of malformed signature should fail");
-    }
-
-    #[test]
-    fn validate_structural_accepts_minimum_delay() {
-        let p = ValidatorKeyRotation {
-            validator: nid(1),
-            new_pubkey: nid(2),
-            v_eff: View(10) + V_EFF_MIN_DELAY,
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        assert!(p.validate_structural(10).is_ok());
-    }
-
-    #[test]
-    fn validate_structural_accepts_far_future() {
-        let p = ValidatorKeyRotation {
-            validator: nid(1),
-            new_pubkey: nid(2),
-            v_eff: View::MAX,
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        assert!(p.validate_structural(0).is_ok());
-    }
-
-    #[test]
-    fn validate_structural_rejects_one_view_ahead() {
-        let p = ValidatorKeyRotation {
-            validator: nid(1),
-            new_pubkey: nid(2),
-            v_eff: View(11),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        assert_eq!(
-            p.validate_structural(10),
-            Err(RotationStructuralError::EffectiveViewTooSoon {
-                current_view: View(10),
-                v_eff: View(11),
-            })
-        );
-    }
-
-    #[test]
-    fn validate_structural_rejects_same_view() {
-        let p = ValidatorKeyRotation {
-            validator: nid(1),
-            new_pubkey: nid(2),
-            v_eff: View(10),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        assert!(matches!(
-            p.validate_structural(10),
-            Err(RotationStructuralError::EffectiveViewTooSoon { .. })
-        ));
-    }
-
-    #[test]
-    fn validate_structural_rejects_past_v_eff() {
-        let p = ValidatorKeyRotation {
-            validator: nid(1),
-            new_pubkey: nid(2),
-            v_eff: View(5),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        assert!(matches!(
-            p.validate_structural(10),
-            Err(RotationStructuralError::EffectiveViewTooSoon { .. })
-        ));
-    }
-
-    #[test]
-    fn validate_structural_rejects_no_op_rotation() {
-        let p = ValidatorKeyRotation {
-            validator: nid(7),
-            new_pubkey: nid(7),
-            v_eff: View(1_000),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        assert_eq!(
-            p.validate_structural(0),
-            Err(RotationStructuralError::NewKeyEqualsValidator)
-        );
-    }
-
-    #[test]
-    fn validate_structural_does_not_overflow_at_view_max() {
-        // A current_view at the very top of the u64 range plus the min
-        // delay would overflow; saturating_add must keep us in a defined,
-        // monotonic regime so structural validation can't panic on
-        // adversarial inputs.
-        let p = ValidatorKeyRotation {
-            validator: nid(1),
-            new_pubkey: nid(2),
-            v_eff: View::MAX,
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        // Even at this extreme, v_eff == saturating_add result, so the
-        // check passes (>= holds).
-        assert!(p.validate_structural(u64::MAX).is_ok());
-    }
-
-    #[test]
-    fn payload_has_stable_domain_string() {
-        // The on-disk / on-wire signature pre-image embeds DOMAIN. Any
-        // change to this constant invalidates every signature ever
-        // produced under the old domain, so it's a wire-breaking change
-        // and must trip a deliberate test update.
-        assert_eq!(
-            ValidatorKeyRotation::DOMAIN,
-            "boule.consensus.validator_rotation.v1"
-        );
-    }
-
-    // ── verification ────────────────────────────────────────────────────────
-
-    /// Helper: build a real, valid `DualSignedRotation` where `current` is
-    /// the validator's currently-active key and `new` is the rotation
-    /// target. Returns the envelope plus the two signers' pubkeys, since
-    /// every rejection test wants to introspect at least one of them.
-    fn valid_envelope() -> (DualSignedRotation, NodeId, NodeId) {
-        let current = fresh_signer();
-        let new = fresh_signer();
-        let payload = ValidatorKeyRotation {
-            validator: current.node_id(),
-            new_pubkey: new.node_id(),
-            v_eff: View(100),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        let env = DualSignedRotation::sign(payload, &current, &new, &ChainId::TEST).unwrap();
-        (env, current.node_id(), new.node_id())
-    }
-
-    #[test]
-    fn verify_accepts_valid_dual_signed_rotation() {
-        let (env, current_pubkey, _) = valid_envelope();
-        env.verify(&current_pubkey, &ChainId::TEST).unwrap();
-    }
-
-    #[test]
-    fn verify_rejects_when_sig_old_is_zeroed() {
-        // Zeroed signature stands in for "missing" in a wire format that
-        // can't actually omit the field — postcard always serializes both.
-        let (mut env, current_pubkey, _) = valid_envelope();
-        env.sig_old = [0u8; 64];
-        assert_eq!(
-            env.verify(&current_pubkey, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOldSignature)
-        );
-    }
-
-    #[test]
-    fn verify_rejects_when_sig_new_is_zeroed() {
-        let (mut env, current_pubkey, _) = valid_envelope();
-        env.sig_new = [0u8; 64];
-        assert_eq!(
-            env.verify(&current_pubkey, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidNewSignature)
-        );
-    }
-
-    #[test]
-    fn verify_rejects_when_sig_old_is_signed_by_unrelated_key() {
-        // "Signed only by the new key" maps to: sig_old slot contains
-        // some valid Ed25519 signature, just not one produced by the
-        // validator's current key. Use a third unrelated signer so we're
-        // exercising the verification check, not the equality check.
-        let (env, current_pubkey, _) = valid_envelope();
-        let attacker = fresh_signer();
-        let bytes = preimage::<ValidatorKeyRotation>(&env.payload, &ChainId::TEST).unwrap();
-        let mut tampered = env;
-        tampered.sig_old = attacker.sign(&bytes);
-        assert_eq!(
-            tampered.verify(&current_pubkey, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOldSignature)
-        );
-    }
-
-    #[test]
-    fn verify_rejects_when_sig_new_is_signed_by_unrelated_key() {
-        // Mirror of the previous case: "signed only by the old key".
-        let (env, current_pubkey, _) = valid_envelope();
-        let attacker = fresh_signer();
-        let bytes = preimage::<ValidatorKeyRotation>(&env.payload, &ChainId::TEST).unwrap();
-        let mut tampered = env;
-        tampered.sig_new = attacker.sign(&bytes);
-        assert_eq!(
-            tampered.verify(&current_pubkey, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidNewSignature)
-        );
-    }
-
-    #[test]
-    fn verify_rejects_when_sig_new_covers_different_payload() {
-        // Both signatures must cover the same canonical encoding. If
-        // sig_new is a real signature by new_pubkey but over a *different*
-        // payload (different v_eff in this case), it must not verify
-        // against the envelope's payload.
-        let current = fresh_signer();
-        let new = fresh_signer();
-        let payload = ValidatorKeyRotation {
-            validator: current.node_id(),
-            new_pubkey: new.node_id(),
-            v_eff: View(100),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        let other_payload = ValidatorKeyRotation {
-            v_eff: View(999),
-            ..payload.clone()
-        };
-        let other_bytes = preimage::<ValidatorKeyRotation>(&other_payload, &ChainId::TEST).unwrap();
-        let bad_sig_new = new.sign(&other_bytes);
-        let bytes = preimage::<ValidatorKeyRotation>(&payload, &ChainId::TEST).unwrap();
-        let env = DualSignedRotation {
-            payload,
-            sig_old: current.sign(&bytes),
-            sig_new: bad_sig_new,
-        };
-        assert_eq!(
-            env.verify(&current.node_id(), &ChainId::TEST),
-            Err(RotationVerifyError::InvalidNewSignature)
-        );
-    }
-
-    #[test]
-    fn verify_rejects_when_caller_supplies_wrong_current_pubkey() {
-        // Even with a perfectly valid envelope, verifying against the
-        // wrong "current" key (e.g. the caller resolved a stale validator
-        // set) must fail — never succeed by silently treating the
-        // envelope's own claim as authoritative.
-        let (env, _, _) = valid_envelope();
-        let unrelated = fresh_signer();
-        assert_eq!(
-            env.verify(&unrelated.node_id(), &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOldSignature)
-        );
-    }
-
-    /// Cross-deployment replay rejection for rotation envelopes (#324):
-    /// a [`DualSignedRotation`] minted under chain_id A must not verify
-    /// against chain_id B even when both signatures are real and the
-    /// payload bytes are byte-identical. Without the chain_id mix-in
-    /// an attacker could capture a rotation tx from a testnet and
-    /// replay it against mainnet to roll the legitimate operator's
-    /// consensus key forward to whatever `new_pubkey` the testnet
-    /// rotation chose.
-    #[test]
-    fn verify_rejects_cross_chain_rotation_replay() {
-        let chain_a = ChainId([0xAA; 32]);
-        let chain_b = ChainId([0xBB; 32]);
-        let current = fresh_signer();
-        let new = fresh_signer();
-        let payload = ValidatorKeyRotation {
-            validator: current.node_id(),
-            new_pubkey: new.node_id(),
-            v_eff: View(100),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        let env = DualSignedRotation::sign(payload, &current, &new, &chain_a).unwrap();
-
-        // Verifying under chain A succeeds (sanity).
-        env.verify(&current.node_id(), &chain_a).unwrap();
-        // Verifying under chain B fails — the chain_id mix-in changed
-        // the bytes both signers signed under, so neither real
-        // signature reproduces against the chain-B pre-image. The
-        // verifier reports `sig_old` first because that's the fixed
-        // check order in `DualSignedRotation::verify`.
-        assert_eq!(
-            env.verify(&current.node_id(), &chain_b),
-            Err(RotationVerifyError::InvalidOldSignature),
-        );
-    }
-
-    #[test]
-    fn verify_rejects_when_payload_is_tampered_post_signing() {
-        // Bumping v_eff after both signatures are produced makes both
-        // signatures invalid (they cover the original v_eff). The
-        // verifier reports the *first* failure in fixed order — sig_old —
-        // which is enough to reject; we just want to confirm the bare
-        // payload cannot pass through unchecked.
-        let (mut env, current_pubkey, _) = valid_envelope();
-        env.payload.v_eff = View(env.payload.v_eff.0.wrapping_add(1));
-        assert!(matches!(
-            env.verify(&current_pubkey, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOldSignature)
-        ));
-    }
-
-    #[test]
-    fn verify_rejects_when_new_pubkey_field_is_swapped() {
-        // The verifier reads new_pubkey out of the payload to know what
-        // key to check sig_new against. Rewriting that field after
-        // signing must invalidate the sig (because either the pre-image
-        // changed too, breaking sig_old; or — more interesting — the new
-        // field doesn't match the actual signer of sig_new).
-        let (mut env, current_pubkey, _) = valid_envelope();
-        let attacker = fresh_signer();
-        env.payload.new_pubkey = attacker.node_id();
-        // sig_old was over the original new_pubkey, so it now fails first.
-        assert!(matches!(
-            env.verify(&current_pubkey, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOldSignature)
-        ));
-    }
-
-    #[test]
-    fn sign_rejects_mismatched_new_signer() {
-        // Constructor guard: caller passed a `new` signer whose pubkey
-        // doesn't match payload.new_pubkey. Producing the envelope would
-        // succeed but the resulting sig_new could never verify, so we
-        // fail loudly at sign time instead.
-        let current = fresh_signer();
-        let new = fresh_signer();
-        let wrong_new = fresh_signer();
-        let payload = ValidatorKeyRotation {
-            validator: current.node_id(),
-            new_pubkey: new.node_id(),
-            v_eff: View(100),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        let err =
-            DualSignedRotation::sign(payload, &current, &wrong_new, &ChainId::TEST).unwrap_err();
-        assert!(format!("{err}").contains("new signer's node_id does not match"));
-    }
-
-    #[test]
-    fn sign_envelope_round_trips_through_postcard_and_still_verifies() {
-        // End-to-end: real signatures survive the wire encoding both
-        // structurally and cryptographically.
-        let (env, current_pubkey, _) = valid_envelope();
-        let bytes = postcard::to_stdvec(&env).unwrap();
-        let back: DualSignedRotation = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(back, env);
-        back.verify(&current_pubkey, &ChainId::TEST).unwrap();
-    }
-
-    #[test]
-    fn payload_changes_alter_serialization() {
-        // Structural sanity: the three fields each contribute distinct
-        // bytes to the encoding, so a downstream signature scheme
-        // covering the postcard bytes will detect tampering with any
-        // single field.
-        let base = sample_payload();
-        let base_bytes = postcard::to_stdvec(&base).unwrap();
-
-        let mut a = base.clone();
-        a.validator[0] ^= 1;
-        assert_ne!(postcard::to_stdvec(&a).unwrap(), base_bytes);
-
-        let mut b = base.clone();
-        b.new_pubkey[0] ^= 1;
-        assert_ne!(postcard::to_stdvec(&b).unwrap(), base_bytes);
-
-        let mut c = base.clone();
-        c.v_eff = View(c.v_eff.0.wrapping_add(1));
-        assert_ne!(postcard::to_stdvec(&c).unwrap(), base_bytes);
-    }
-
-    // ── validate_scheme_consistency (#358) ───────────────────────────────
-
-    fn bls_keypair(
-        seed: u8,
-    ) -> (
-        boule_core::crypto::sig_scheme::BlsSecretKey,
-        boule_core::crypto::sig_scheme::BlsPublicKey,
-    ) {
-        let mut ikm = [0u8; 32];
-        ikm[0] = seed;
-        BlsAggregated::keygen(&ikm).expect("test BLS keygen")
-    }
-
-    #[test]
-    fn validate_scheme_consistency_bls_chain_accepts_valid_pop() {
-        let (sk, pk) = bls_keypair(0xB0);
-        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
-        let mut p = sample_payload();
-        p.new_bls_pubkey = Some(pk);
-        p.new_bls_pop = Some(pop);
-        assert_eq!(p.validate_scheme_consistency(&ChainId::TEST), Ok(()));
-    }
-
-    #[test]
-    fn validate_scheme_consistency_bls_chain_rejects_missing_bls_pubkey() {
-        let p = sample_payload();
-        let err = p.validate_scheme_consistency(&ChainId::TEST).unwrap_err();
-        assert!(matches!(
-            err,
-            RotationStructuralError::BlsFieldsInconsistentWithScheme {
-                bls_pubkey_present: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn validate_scheme_consistency_bls_chain_rejects_missing_pop() {
-        let (_sk, pk) = bls_keypair(0xB1);
-        let mut p = sample_payload();
-        p.new_bls_pubkey = Some(pk);
-        let err = p.validate_scheme_consistency(&ChainId::TEST).unwrap_err();
-        assert!(matches!(
-            err,
-            RotationStructuralError::BlsFieldsInconsistentWithScheme {
-                bls_pubkey_present: true,
-                bls_pop_present: false,
-            }
-        ));
-    }
-
-    #[test]
-    fn validate_scheme_consistency_bls_chain_rejects_pop_under_wrong_pubkey() {
-        // Rotator supplies a PoP signed by sk_a but claims a different
-        // BLS pubkey pk_b. Caught by `BlsAggregated::verify_pop`'s
-        // PopPubkeyMismatch check, surfaced here as
-        // `BlsPopVerificationFailed`. Same rogue-key-attack defense
-        // the registration path runs (#291).
-        let (sk_a, _pk_a) = bls_keypair(0xC0);
-        let (_sk_b, pk_b) = bls_keypair(0xC1);
-        let pop_under_a = BlsAggregated::sign_pop(&sk_a, &ChainId::TEST).unwrap();
-        let mut p = sample_payload();
-        p.new_bls_pubkey = Some(pk_b);
-        p.new_bls_pop = Some(pop_under_a);
-        let err = p.validate_scheme_consistency(&ChainId::TEST).unwrap_err();
-        assert!(matches!(
-            err,
-            RotationStructuralError::BlsPopVerificationFailed
-        ));
-    }
-
-    #[test]
-    fn validate_scheme_consistency_bls_chain_rejects_tampered_pop_signature() {
-        let (sk, pk) = bls_keypair(0xD0);
-        let mut pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
-        pop.sig[0] ^= 0xFF;
-        let mut p = sample_payload();
-        p.new_bls_pubkey = Some(pk);
-        p.new_bls_pop = Some(pop);
-        let err = p.validate_scheme_consistency(&ChainId::TEST).unwrap_err();
-        assert!(matches!(
-            err,
-            RotationStructuralError::BlsPopVerificationFailed
-        ));
-    }
-
-    /// #410: a rotation whose `new_bls_pop` was minted under chain A
-    /// must be rejected when the rotation is applied on chain B,
-    /// blocking cross-deployment PoP replay even when the rest of the
-    /// rotation is well-formed.
-    #[test]
-    fn validate_scheme_consistency_rejects_cross_chain_bls_pop_replay() {
-        let chain_a = ChainId([0xAA; 32]);
-        let chain_b = ChainId([0xBB; 32]);
-        let (sk, pk) = bls_keypair(0xD1);
-        let pop_on_a = BlsAggregated::sign_pop(&sk, &chain_a).unwrap();
-        let mut p = sample_payload();
-        p.new_bls_pubkey = Some(pk);
-        p.new_bls_pop = Some(pop_on_a);
-
-        // Sanity: under the originating chain, the PoP verifies.
-        assert_eq!(p.validate_scheme_consistency(&chain_a), Ok(()));
-        // Cross-chain replay is rejected.
-        assert!(matches!(
-            p.validate_scheme_consistency(&chain_b),
-            Err(RotationStructuralError::BlsPopVerificationFailed)
-        ));
-    }
-
-    #[test]
-    fn rotation_with_bls_fields_round_trips_through_postcard() {
-        // Wire-format sanity: the new optional BLS fields encode +
-        // decode via the `serde_optional_bls_pubkey` adapter and the
-        // existing `BlsPop` serde modules. Catches a layout regression
-        // in either path before the payload ever reaches a chain.
-        let (sk, pk) = bls_keypair(0xE0);
-        let pop = BlsAggregated::sign_pop(&sk, &ChainId::TEST).unwrap();
-        let mut p = sample_payload();
-        p.new_bls_pubkey = Some(pk);
-        p.new_bls_pop = Some(pop);
-        let bytes = postcard::to_stdvec(&p).unwrap();
-        let back: ValidatorKeyRotation = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(back, p);
-    }
-
-    // ── rotation cancel (#317) ────────────────────────────────────────────
-
-    /// A valid `DualSignedRotationCancel` signed by `current` (the validator's
-    /// active key) and `new` (the pending rotation's key).
-    fn valid_cancel() -> (DualSignedRotationCancel, NodeId, NodeId) {
-        let current = fresh_signer();
-        let new = fresh_signer();
-        let payload = ValidatorRotationCancel {
-            validator: current.node_id(),
-            cancelling_v_eff: View(100),
-        };
-        let c = DualSignedRotationCancel::sign(payload, &current, &new, &ChainId::TEST).unwrap();
-        (c, current.node_id(), new.node_id())
-    }
-
-    #[test]
-    fn cancel_verify_accepts_a_valid_dual_signed_cancel() {
-        let (c, current, new) = valid_cancel();
-        c.verify(&current, &new, &ChainId::TEST).unwrap();
-    }
-
-    #[test]
-    fn cancel_verify_rejects_when_sig_old_is_zeroed() {
-        let (mut c, current, new) = valid_cancel();
-        c.sig_old = [0u8; 64];
-        assert_eq!(
-            c.verify(&current, &new, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOldSignature),
-        );
-    }
-
-    #[test]
-    fn cancel_verify_rejects_when_sig_new_is_zeroed() {
-        let (mut c, current, new) = valid_cancel();
-        c.sig_new = [0u8; 64];
-        assert_eq!(
-            c.verify(&current, &new, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidNewSignature),
-        );
-    }
-
-    #[test]
-    fn cancel_verify_is_chain_scoped() {
-        let (c, current, new) = valid_cancel();
-        // A cancel signed for the test chain must not verify under another.
-        assert!(
-            c.verify(&current, &new, &ChainId::from_genesis_hash([9u8; 32]))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn cancel_encode_decode_roundtrips_and_tag_is_distinct() {
-        let (c, _, _) = valid_cancel();
-        let bytes = c.encode_command();
-        assert!(DualSignedRotationCancel::is_cancel_payload(&bytes));
-        // The cancel tag is not mistaken for a rotation payload, and vice-versa.
-        assert!(!DualSignedRotationCancel::is_cancel_payload(ROTATION_TAG));
-        assert!(!DualSignedRotation::is_rotation_payload(&bytes));
-        assert_eq!(DualSignedRotationCancel::decode_command(&bytes).unwrap(), c);
-    }
-
-    // ── Operator-signed rotation (#549) ────────────────────────────────
-
-    /// A valid `OperatorSignedRotation` plus `(operator_pubkey, new_pubkey)`.
-    /// The validator being recovered need not be the operator — the operator
-    /// key authorises the swap to `new`, which self-attests.
-    fn valid_operator_rotation() -> (OperatorSignedRotation, NodeId, NodeId) {
-        let operator = fresh_signer();
-        let new = fresh_signer();
-        let payload = ValidatorKeyRotation {
-            validator: nid(7),
-            new_pubkey: new.node_id(),
-            v_eff: View(100),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        let env = OperatorSignedRotation::sign(payload, &operator, &new, &ChainId::TEST).unwrap();
-        (env, operator.node_id(), new.node_id())
-    }
-
-    #[test]
-    fn operator_rotation_verify_accepts_operator_and_new_signatures() {
-        let (env, operator, _new) = valid_operator_rotation();
-        env.verify(&operator, &ChainId::TEST).unwrap();
-    }
-
-    #[test]
-    fn operator_rotation_verify_rejects_a_zeroed_operator_signature() {
-        let (mut env, operator, _new) = valid_operator_rotation();
-        env.sig_operator = [0u8; 64];
-        assert_eq!(
-            env.verify(&operator, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOperatorSignature),
-        );
-    }
-
-    #[test]
-    fn operator_rotation_verify_rejects_a_zeroed_new_signature() {
-        let (mut env, operator, _new) = valid_operator_rotation();
-        env.sig_new = [0u8; 64];
-        assert_eq!(
-            env.verify(&operator, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidNewSignature),
-        );
-    }
-
-    #[test]
-    fn operator_rotation_verify_rejects_a_different_operator_key() {
-        let (env, _operator, _new) = valid_operator_rotation();
-        // Verifying against the wrong operator pubkey fails (the authority
-        // check: only the validator's real operator key can recover it).
-        let stranger = fresh_signer().node_id();
-        assert_eq!(
-            env.verify(&stranger, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOperatorSignature),
-        );
-    }
-
-    #[test]
-    fn operator_rotation_verify_is_chain_scoped() {
-        let (env, operator, _new) = valid_operator_rotation();
-        assert!(
-            env.verify(&operator, &ChainId::from_genesis_hash([9u8; 32]))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn operator_rotation_sign_rejects_new_signer_pubkey_mismatch() {
-        let operator = fresh_signer();
-        let new = fresh_signer();
-        // payload.new_pubkey deliberately disagrees with the `new` signer.
-        let payload = ValidatorKeyRotation {
-            validator: nid(7),
-            new_pubkey: nid(0xff),
-            v_eff: View(100),
-            new_bls_pubkey: None,
-            new_bls_pop: None,
-        };
-        assert!(OperatorSignedRotation::sign(payload, &operator, &new, &ChainId::TEST).is_err());
-    }
-
-    #[test]
-    fn operator_rotation_encode_decode_roundtrips_and_tag_is_distinct() {
-        let (env, _, _) = valid_operator_rotation();
-        let bytes = env.encode_command();
-        assert!(OperatorSignedRotation::is_operator_rotation_payload(&bytes));
-        // Distinct from the dual-signed rotation and cancel tags.
-        assert!(!DualSignedRotation::is_rotation_payload(&bytes));
-        assert!(!DualSignedRotationCancel::is_cancel_payload(&bytes));
-        assert!(!OperatorSignedRotation::is_operator_rotation_payload(
-            ROTATION_TAG
-        ));
-        assert_eq!(OperatorSignedRotation::decode_command(&bytes).unwrap(), env);
-    }
-
-    // ── Operator-key self-rotation (#549) ──────────────────────────────
-
-    /// A valid `DualSignedOperatorRotation` plus `(old_operator, new_operator)`.
-    fn valid_operator_key_rotation() -> (DualSignedOperatorRotation, NodeId, NodeId) {
-        let old = fresh_signer();
-        let new = fresh_signer();
-        let payload = OperatorKeyRotation {
-            validator: nid(7),
-            new_operator_pubkey: new.node_id(),
-            v_eff: View(50),
-        };
-        let env = DualSignedOperatorRotation::sign(payload, &old, &new, &ChainId::TEST).unwrap();
-        (env, old.node_id(), new.node_id())
-    }
-
-    #[test]
-    fn operator_key_rotation_verify_accepts_old_and_new_signatures() {
-        let (env, old, _new) = valid_operator_key_rotation();
-        env.verify(&old, &ChainId::TEST).unwrap();
-    }
-
-    #[test]
-    fn operator_key_rotation_verify_rejects_zeroed_old_signature() {
-        let (mut env, old, _new) = valid_operator_key_rotation();
-        env.sig_old = [0u8; 64];
-        assert_eq!(
-            env.verify(&old, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOldSignature),
-        );
-    }
-
-    #[test]
-    fn operator_key_rotation_verify_rejects_zeroed_new_signature() {
-        let (mut env, old, _new) = valid_operator_key_rotation();
-        env.sig_new = [0u8; 64];
-        assert_eq!(
-            env.verify(&old, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidNewSignature),
-        );
-    }
-
-    #[test]
-    fn operator_key_rotation_verify_rejects_wrong_current_operator_key() {
-        let (env, _old, _new) = valid_operator_key_rotation();
-        let stranger = fresh_signer().node_id();
-        assert_eq!(
-            env.verify(&stranger, &ChainId::TEST),
-            Err(RotationVerifyError::InvalidOldSignature),
-        );
-    }
-
-    #[test]
-    fn operator_key_rotation_verify_is_chain_scoped() {
-        let (env, old, _new) = valid_operator_key_rotation();
-        assert!(
-            env.verify(&old, &ChainId::from_genesis_hash([9u8; 32]))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn operator_key_rotation_sign_rejects_new_signer_pubkey_mismatch() {
-        let old = fresh_signer();
-        let new = fresh_signer();
-        let payload = OperatorKeyRotation {
-            validator: nid(7),
-            new_operator_pubkey: nid(0xff), // disagrees with `new`
-            v_eff: View(50),
-        };
-        assert!(DualSignedOperatorRotation::sign(payload, &old, &new, &ChainId::TEST).is_err());
-    }
-
-    #[test]
-    fn operator_key_rotation_encode_decode_roundtrips_and_tag_is_distinct() {
-        let (env, _, _) = valid_operator_key_rotation();
-        let bytes = env.encode_command();
-        assert!(DualSignedOperatorRotation::is_operator_key_rotation_payload(&bytes));
-        // Distinct from every other system-tx tag.
-        assert!(!DualSignedRotation::is_rotation_payload(&bytes));
-        assert!(!DualSignedRotationCancel::is_cancel_payload(&bytes));
-        assert!(!OperatorSignedRotation::is_operator_rotation_payload(
-            &bytes
-        ));
-        assert!(
-            !DualSignedOperatorRotation::is_operator_key_rotation_payload(OPERATOR_ROTATION_TAG)
-        );
-        assert_eq!(
-            DualSignedOperatorRotation::decode_command(&bytes).unwrap(),
-            env
-        );
-    }
-
-    #[test]
-    fn operator_key_rotation_payload_has_stable_domain_string() {
-        assert_eq!(
-            OperatorKeyRotation::DOMAIN,
-            "boule.consensus.operator_key_rotation.v1"
-        );
-    }
-
-    #[test]
-    fn cancel_payload_has_stable_domain_string() {
-        assert_eq!(
-            ValidatorRotationCancel::DOMAIN,
-            "boule.consensus.validator_rotation_cancel.v1",
-        );
-    }
-
-    /// End-to-end through the shared commit-apply helper (#317): a real signed
-    /// cancel of a pending rotation restores the pre-rotation key history.
-    #[test]
-    fn apply_cancel_command_removes_a_pending_rotation_end_to_end() {
-        use crate::history_commitment::{RotationCancelError, apply_rotation_cancel_command};
-        use crate::validator_key_history::ValidatorKeyHistory;
-        use crate::validator_set::ValidatorId;
-
-        let current = fresh_signer();
-        let new = fresh_signer();
-        let mut kh = ValidatorKeyHistory::new([
-            ValidatorId::from_genesis_pubkey(current.node_id()),
-            ValidatorId::from_genesis_pubkey(fresh_signer().node_id()),
-        ]);
-        let pre = kh.to_persisted();
-
-        // Pending rotation current → new at v_eff 100, committed at view 50.
-        kh.apply_rotation(
-            &ValidatorKeyRotation {
-                validator: current.node_id(),
-                new_pubkey: new.node_id(),
-                v_eff: View(100),
-                new_bls_pubkey: None,
-                new_bls_pop: None,
-            },
-            View(50),
-        )
-        .unwrap();
-
-        let cmd = DualSignedRotationCancel::sign(
-            ValidatorRotationCancel {
-                validator: current.node_id(),
-                cancelling_v_eff: View(100),
-            },
-            &current,
-            &new,
-            &ChainId::TEST,
-        )
-        .unwrap()
-        .encode_command();
-
-        // Apply at commit view 75 (before v_eff 100) → cancelled + restored.
-        let applied =
-            apply_rotation_cancel_command(&mut kh, None, &cmd, &ChainId::TEST, View(75)).unwrap();
-        assert!(applied);
-        assert_eq!(
-            kh.to_persisted(),
-            pre,
-            "cancel restored the pre-rotation history"
-        );
-
-        // Re-applying the same cancel (no longer pending) is a clean error.
-        assert!(matches!(
-            apply_rotation_cancel_command(&mut kh, None, &cmd, &ChainId::TEST, View(75)),
-            Err(RotationCancelError::NoPendingRotation),
-        ));
-    }
-
-    /// A cancel whose `sig_new` was made by a key other than the pending
-    /// rotation's target is rejected, and the rotation is left pending.
-    #[test]
-    fn apply_cancel_command_rejects_a_forged_signature() {
-        use crate::history_commitment::{RotationCancelError, apply_rotation_cancel_command};
-        use crate::validator_key_history::ValidatorKeyHistory;
-        use crate::validator_set::ValidatorId;
-
-        let current = fresh_signer();
-        let new = fresh_signer();
-        let imposter = fresh_signer();
-        let mut kh = ValidatorKeyHistory::new([
-            ValidatorId::from_genesis_pubkey(current.node_id()),
-            ValidatorId::from_genesis_pubkey(fresh_signer().node_id()),
-        ]);
-        kh.apply_rotation(
-            &ValidatorKeyRotation {
-                validator: current.node_id(),
-                new_pubkey: new.node_id(),
-                v_eff: View(100),
-                new_bls_pubkey: None,
-                new_bls_pop: None,
-            },
-            View(50),
-        )
-        .unwrap();
-        let pending = kh.to_persisted();
-
-        // Sign with `current` + `imposter` instead of `new` → sig_new is wrong.
-        let cmd = DualSignedRotationCancel::sign(
-            ValidatorRotationCancel {
-                validator: current.node_id(),
-                cancelling_v_eff: View(100),
-            },
-            &current,
-            &imposter,
-            &ChainId::TEST,
-        )
-        .unwrap()
-        .encode_command();
-
-        assert!(matches!(
-            apply_rotation_cancel_command(&mut kh, None, &cmd, &ChainId::TEST, View(75)),
-            Err(RotationCancelError::Verify(_)),
-        ));
-        assert_eq!(
-            kh.to_persisted(),
-            pending,
-            "a forged cancel leaves the rotation pending",
-        );
-    }
 }

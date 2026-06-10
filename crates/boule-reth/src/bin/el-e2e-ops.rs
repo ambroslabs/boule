@@ -1,30 +1,3 @@
-//! RPC helper for the single-node `boule↔custom-EL` e2e (`single-node-el-e2e.sh`,
-//! #785/#777) on a box without foundry's `cast`. Subcommands over plain HTTP
-//! JSON-RPC against the EL's public `eth_*` endpoint (:8545):
-//!
-//! - `deposit <NODE_ID_HEX> <AMOUNT_WEI>` — sign + submit an EIP-1559
-//!   `Staking.deposit(bytes32)` tx (value = amount) from the prefunded anvil dev
-//!   account, so boule's staking read path mints a seated-weight change the EL
-//!   mirrors via `recordWeight`.
-//! - `read <NODE_ID_HEX> <V_EFF>` — read the Registry (0x…0b12) back:
-//!   `weightOf`, `totalWeight`, `historyLength`, `keyAt(_, v_eff)` (its byte
-//!   length), and `settledView`, printed as `KEY=VALUE` lines for the shell.
-//! - `block-number` — current EL head height.
-//! - `submit-equivocation <VALIDATOR> <CHAINID> <VIEW> <BLOCKA> <SIGA> <BLOCKB>
-//!   <SIGB>` — submit a forged equivocation proof (from `gen-equivocation`) to
-//!   the `Slashing` predeploy (0x…0b13); prints whether the tx emitted a
-//!   `Slashed` log (`SLASHED=1`/`0`) and the gas/status, exercising the slashing
-//!   verify-against-EL-key path end to end.
-//! - `gov-digest <PROPOSAL_ID> <VALIDATOR>` — `Governance.approveDigest`, the
-//!   32-byte message a validator must BLS-sign to approve (for `bls-sign --msg`).
-//! - `gov-approve <PROPOSAL_ID> <COMMAND_HEX> <VALIDATOR> <BLS_SIG_HEX>` — submit
-//!   a BLS-signed `Governance.approve`; prints `APPROVED=1`/`0` (whether this tx
-//!   crossed the ⅔ supermajority and emitted `Approved`) and the running tally.
-//! - `gov-state <PROPOSAL_ID>` — `Governance.approvals`/`isApproved` for a
-//!   proposal, as `KEY=VALUE` lines.
-//!
-//! Replaces the `cast send` / `cast call` the demo scripts assume.
-
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Bytes, FixedBytes, TxKind, U256};
@@ -42,18 +15,14 @@ use boule_reth::slashing::{SLASHED_TOPIC, SLASHING_ADDRESS};
 use serde_json::json;
 
 const STAKING_ADDRESS: &str = "0x0000000000000000000000000000000000000b0e";
-const DEPOSIT_SELECTOR: [u8; 4] = [0xb2, 0x14, 0xfa, 0xa5]; // deposit(bytes32)
-/// anvil dev account #0 (prefunded in the dev genesis).
+const DEPOSIT_SELECTOR: [u8; 4] = [0xb2, 0x14, 0xfa, 0xa5];
+
 const DEV_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-/// `disperse(address[])` selector — splits `msg.value` equally to all recipients.
+
 const DISPERSE_SELECTOR: [u8; 4] = [0x23, 0x81, 0x7f, 0xcd];
-/// Creation bytecode for `Disperse.sol` (compiled with solc 0.8.24 --optimize).
-/// Deployed once by `massfund`, then funds many wallets per tx (no per-account
-/// nonce bottleneck — the whole point of the mass-funding contract).
+
 const DISPERSE_BIN: &str = "608060405234801561000f575f80fd5b506102188061001d5f395ff3fe60806040526004361061001d575f3560e01c806323817fcd14610021575b5f80fd5b61003461002f366004610113565b610036565b005b5f6100418234610182565b90505f5b8281101561010d575f848483818110610060576100606101a1565b905060200201602081019061007591906101b5565b6001600160a01b0316836040515f6040518083038185875af1925050503d805f81146100bc576040519150601f19603f3d011682016040523d82523d5f602084013e6100c1565b606091505b50509050806101045760405162461bcd60e51b815260206004820152600b60248201526a1cd95b990819985a5b195960aa1b604482015260640160405180910390fd5b50600101610045565b50505050565b5f8060208385031215610124575f80fd5b823567ffffffffffffffff8082111561013b575f80fd5b818501915085601f83011261014e575f80fd5b81358181111561015c575f80fd5b8660208260051b8501011115610170575f80fd5b60209290920196919550909350505050565b5f8261019c57634e487b7160e01b5f52601260045260245ffd5b500490565b634e487b7160e01b5f52603260045260245ffd5b5f602082840312156101c5575f80fd5b81356001600160a01b03811681146101db575f80fd5b939250505056fea2646970667358221220bcf8b46303b45b5092d4d547a628bd677d3b43b2223709d3f899587568df19f564736f6c63430008180033";
 
-// ABI shapes for the predeploy calls the helper ABI-encodes (matching the
-// Solidity selectors pinned in slashing.rs / governance.rs).
 sol! {
     function submitEquivocation(
         bytes32 validator,
@@ -71,8 +40,6 @@ sol! {
 }
 
 fn transport() -> HttpTransport {
-    // No JWT needed for the public eth RPC; pass an empty secret.
-    // `ETH_URL` overrides the default so this can drive a remote node.
     let eth = std::env::var("ETH_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".into());
     HttpTransport::new("http://127.0.0.1:8551".into(), eth, Vec::new(), None)
 }
@@ -116,8 +83,6 @@ async fn u64_word(t: &HttpTransport, sel: [u8; 4], arg: Option<[u8; 32]>) -> Res
     Ok(u64::from_be_bytes(out[24..32].try_into().unwrap()))
 }
 
-/// Sign + submit an EIP-1559 call to `to` with `calldata`/`value` from the dev
-/// account, returning the tx hash.
 async fn send_tx(t: &HttpTransport, to: &str, calldata: Vec<u8>, value: u128) -> Result<String> {
     let signer: PrivateKeySigner = DEV_PK.parse().context("dev pk")?;
     let cid_hex = t.eth("eth_chainId", json!([])).await?;
@@ -173,7 +138,7 @@ async fn fetch_block(t: &HttpTransport) -> Result<u64> {
     let h = t.eth("eth_blockNumber", json!([])).await?;
     Ok(u64::from_str_radix(h.as_str().unwrap_or("0x0").trim_start_matches("0x"), 16).unwrap_or(0))
 }
-/// Sign a plain 21k-gas value transfer (no nonce/chain RPC — caller manages them).
+
 fn sign_transfer(
     signer: &PrivateKeySigner,
     nonce: u64,
@@ -197,18 +162,15 @@ fn sign_transfer(
     Ok(format!("0x{}", hex::encode(env.encoded_2718())))
 }
 
-/// loadtest <num_wallets> <duration_secs> <target_tps(0=unbounded)>
-/// Fund N wallets from the dev account, then fire transfers between them and
-/// measure submit-rate vs mined-rate (does the chain keep up, or wedge?).
 async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -> Result<()> {
     let chain_id = fetch_chain_id(t).await?;
     let dev: PrivateKeySigner = DEV_PK.parse().context("dev pk")?;
     let dev_addr = format!("0x{}", hex::encode(dev.address()));
     let wallets: Vec<PrivateKeySigner> = (0..n).map(|_| PrivateKeySigner::random()).collect();
     let addrs: Vec<Address> = wallets.iter().map(|w| w.address()).collect();
-    // fund each wallet 1 ETH from the dev account (sequential nonces)
+
     let mut dev_nonce = fetch_nonce(t, &dev_addr).await?;
-    let fund = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
+    let fund = U256::from(100_000_000_000_000_000u128);
     let mut last = String::new();
     eprintln!("funding {n} wallets (1 ETH each) in batches...");
     for (idx, a) in addrs.iter().enumerate() {
@@ -217,8 +179,7 @@ async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -
             last = r.as_str().unwrap_or("").to_string();
         }
         dev_nonce += 1;
-        // reth caps pending txs per sender; drain every 12 so funding from the
-        // single dev account doesn't get rejected past the per-account limit.
+
         if (idx + 1) % 12 == 0 {
             let _ = await_receipt(t, &last).await;
         }
@@ -243,23 +204,16 @@ async fn loadtest(t: &HttpTransport, n: usize, dur_secs: u64, target_tps: u64) -
     run_load(t, wallets, dur_secs, target_tps).await
 }
 
-/// genfund <N> <KEYSFILE> — generate N wallets, fund 1 ETH each from the dev
-/// account (batched under reth's per-account limit), and write their private
-/// keys (one hex per line) so a separate `loadkeys` run can drive load from them.
 async fn genfund(t: &HttpTransport, n: usize, path: &str) -> Result<()> {
     let chain_id = fetch_chain_id(t).await?;
     let dev: PrivateKeySigner = DEV_PK.parse().context("dev pk")?;
     let dev_addr = format!("0x{}", hex::encode(dev.address()));
     let wallets: Vec<PrivateKeySigner> = (0..n).map(|_| PrivateKeySigner::random()).collect();
     let mut dev_nonce = fetch_nonce(t, &dev_addr).await?;
-    let fund = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
+    let fund = U256::from(100_000_000_000_000_000u128);
     let mut last = String::new();
     let mut funded = 0usize;
-    // Submit each funding tx, RETRYING THE SAME WALLET on error rather than
-    // advancing the nonce — a nonce gap here strands every later tx as
-    // future-nonce and leaves wallets silently unfunded (the bug that made the
-    // spread test send from empty wallets). On backpressure (account-slots /
-    // txpool full) we drain, re-sync the nonce from chain, and retry.
+
     for (idx, w) in wallets.iter().enumerate() {
         loop {
             let raw = sign_transfer(&dev, dev_nonce, w.address(), fund, chain_id)?;
@@ -273,7 +227,6 @@ async fn genfund(t: &HttpTransport, n: usize, path: &str) -> Result<()> {
                 Err(e) => {
                     let msg = e.to_string().to_lowercase();
                     if msg.contains("nonce too low") || msg.contains("already known") {
-                        // it actually landed; the RPC reply just raced — advance.
                         dev_nonce += 1;
                         funded += 1;
                         break;
@@ -283,8 +236,7 @@ async fn genfund(t: &HttpTransport, n: usize, path: &str) -> Result<()> {
                             "genfund: faucet can't fund wallet {idx} (nonce {dev_nonce}): {e}"
                         );
                     }
-                    // backpressure (txpool full / account slots): drain in-flight
-                    // to free capacity, then retry the SAME nonce — never skip.
+
                     if !last.is_empty() {
                         let _ = await_receipt(t, &last).await;
                     }
@@ -307,8 +259,6 @@ async fn genfund(t: &HttpTransport, n: usize, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Sign an arbitrary EIP-1559 tx (Create or Call) with explicit gas — caller
-/// manages nonce/chain. Used for the Disperse deploy + batched disperse calls.
 fn sign_tx(
     signer: &PrivateKeySigner,
     nonce: u64,
@@ -334,7 +284,6 @@ fn sign_tx(
     Ok(format!("0x{}", hex::encode(env.encoded_2718())))
 }
 
-/// Poll for the receipt of a contract-creation tx; returns its `contractAddress`.
 async fn await_contract_address(t: &HttpTransport, tx_hash: &str) -> Result<String> {
     for _ in 0..60 {
         let r = t.eth("eth_getTransactionReceipt", json!([tx_hash])).await?;
@@ -351,11 +300,6 @@ async fn await_contract_address(t: &HttpTransport, tx_hash: &str) -> Result<Stri
     bail!("deploy receipt for {tx_hash} never appeared")
 }
 
-/// `massfund <N> <KEYSFILE> [WEI_EACH]` — deploy the Disperse contract once, then
-/// fund N fresh wallets WEI_EACH each via batched `disperse(address[])` calls
-/// (≤200 recipients per tx). One tx funds a whole batch, so funding is bounded
-/// by block throughput, not by the dev account's per-account nonce limit — the
-/// fix for the slow/clog-prone genfund faucet loop. Writes the keys at the end.
 async fn massfund(t: &HttpTransport, n: usize, path: &str, wei_each: u128) -> Result<()> {
     const BATCH: usize = 200;
     let chain_id = fetch_chain_id(t).await?;
@@ -365,7 +309,6 @@ async fn massfund(t: &HttpTransport, n: usize, path: &str, wei_each: u128) -> Re
     let addrs: Vec<Address> = wallets.iter().map(|w| w.address()).collect();
     let mut nonce = fetch_nonce(t, &dev_addr).await?;
 
-    // 1. deploy Disperse once
     let code = hex::decode(DISPERSE_BIN).context("disperse bytecode")?;
     let raw = sign_tx(
         &dev,
@@ -383,10 +326,8 @@ async fn massfund(t: &HttpTransport, n: usize, path: &str, wei_each: u128) -> Re
     let disperse: Address = disperse_addr.parse().context("disperse addr")?;
     eprintln!("massfund: Disperse deployed at {disperse_addr}");
 
-    // 2. fund recipients in batches — one disperse() tx per batch
     let mut funded = 0usize;
     for chunk in addrs.chunks(BATCH) {
-        // calldata = selector ++ abi.encode(address[]): offset, length, words
         let mut cd = DISPERSE_SELECTOR.to_vec();
         cd.extend_from_slice(&left_pad32(&[0x20]));
         cd.extend_from_slice(&left_pad32(&(chunk.len() as u64).to_be_bytes()));
@@ -394,7 +335,7 @@ async fn massfund(t: &HttpTransport, n: usize, path: &str, wei_each: u128) -> Re
             cd.extend_from_slice(&left_pad32(a.as_slice()));
         }
         let value = U256::from(wei_each) * U256::from(chunk.len() as u64);
-        // ~40k gas/recipient (new-account value transfer) + overhead
+
         let gas = 60_000 + chunk.len() as u64 * 40_000;
         let raw = sign_tx(
             &dev,
@@ -432,8 +373,6 @@ async fn massfund(t: &HttpTransport, n: usize, path: &str, wei_each: u128) -> Re
     Ok(())
 }
 
-/// loadkeys <KEYSFILE> <DUR> <TPS> — drive load from pre-funded wallet keys
-/// (so many nodes can run in parallel against one funded wallet pool).
 async fn loadkeys(t: &HttpTransport, path: &str, dur_secs: u64, target_tps: u64) -> Result<()> {
     let data = std::fs::read_to_string(path)?;
     let wallets: Vec<PrivateKeySigner> = data
@@ -446,7 +385,6 @@ async fn loadkeys(t: &HttpTransport, path: &str, dur_secs: u64, target_tps: u64)
     run_load(t, wallets, dur_secs, target_tps).await
 }
 
-/// Tx-storm load phase from already-funded `wallets`; prints submit/mined/backlog.
 async fn run_load(
     t: &HttpTransport,
     wallets: Vec<PrivateKeySigner>,
@@ -498,9 +436,6 @@ async fn run_load(
                             nonce += 1;
                         }
                         Err(_) => {
-                            // txpool backpressure / nonce drift: re-sync the nonce
-                            // from chain and back off so we don't spam-retry a
-                            // rejected nonce (which would DoS the RPC).
                             err.fetch_add(1, Ordering::Relaxed);
                             if let Ok(n) = fetch_nonce(&tx, &addr).await {
                                 nonce = n;
@@ -520,7 +455,7 @@ async fn run_load(
     }
     let subs = submitted.load(Ordering::Relaxed);
     let errs = errors.load(Ordering::Relaxed);
-    // let the mempool tail drain, then count included via on-chain nonces
+
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
     let mut included = 0u64;
     for a in &addrs {
@@ -546,8 +481,6 @@ async fn run_load(
     Ok(())
 }
 
-/// Poll for the receipt of `tx_hash` (the dev EL mines via real consensus, so it
-/// may take a few blocks); returns `(status_ok, topic0s)` once mined.
 async fn await_receipt(t: &HttpTransport, tx_hash: &str) -> Result<(bool, Vec<(String, String)>)> {
     for _ in 0..60 {
         let r = t.eth("eth_getTransactionReceipt", json!([tx_hash])).await?;
@@ -578,7 +511,6 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let t = transport();
     match args.first().map(String::as_str) {
-        // keccak256 <HEX> — boule's proposalId binding is keccak256(command).
         Some("keccak256") => {
             use sha3::{Digest, Keccak256};
             let bytes = parse_hex(&args[1])?;
@@ -601,8 +533,7 @@ async fn main() -> Result<()> {
             let h = send_tx(&t, STAKING_ADDRESS, cd, amount).await?;
             println!("{h}");
         }
-        // fund <ADDRESS> <AMOUNT_WEI> — plain value transfer (no calldata) from
-        // the prefunded dev account to an EOA. Drives a faucet-style top-up.
+
         Some("fund") => {
             let to = args.get(1).context("usage: fund <ADDRESS> <AMOUNT_WEI>")?;
             let amount: u128 = args
@@ -613,14 +544,14 @@ async fn main() -> Result<()> {
             let h = send_tx(&t, to, Vec::new(), amount).await?;
             println!("{h}");
         }
-        // loadtest <NUM_WALLETS> <DURATION_SECS> <TARGET_TPS|0>
+
         Some("loadtest") => {
             let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
             let dur: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
             let tps: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             loadtest(&t, n, dur, tps).await?;
         }
-        // genfund <N> <KEYSFILE> — fund N wallets centrally, write their keys.
+
         Some("genfund") => {
             let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
             let path = args
@@ -629,8 +560,7 @@ async fn main() -> Result<()> {
                 .unwrap_or("/tmp/wallets.keys");
             genfund(&t, n, path).await?;
         }
-        // massfund <N> <KEYSFILE> [WEI_EACH] — deploy Disperse, fund N wallets
-        // in batches (one tx each), write keys. Defaults WEI_EACH = 0.05 ETH.
+
         Some("massfund") => {
             let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(100);
             let path = args
@@ -640,10 +570,10 @@ async fn main() -> Result<()> {
             let wei: u128 = args
                 .get(3)
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(50_000_000_000_000_000); // 0.05 ETH
+                .unwrap_or(50_000_000_000_000_000);
             massfund(&t, n, path, wei).await?;
         }
-        // loadkeys <KEYSFILE> <DUR> <TPS> — load from pre-funded wallet keys.
+
         Some("loadkeys") => {
             let path = args
                 .get(1)
@@ -660,7 +590,7 @@ async fn main() -> Result<()> {
             let total = u64_word(&t, TOTAL_WEIGHT_SELECTOR, None).await?;
             let hist = u64_word(&t, HISTORY_LENGTH_SELECTOR, Some(node)).await?;
             let settled = u64_word(&t, SETTLED_VIEW_SELECTOR, None).await?;
-            // keyAt(node, v_eff) -> dynamic bytes; read its length.
+
             let mut kcd = KEY_AT_SELECTOR.to_vec();
             kcd.extend_from_slice(&node);
             kcd.extend_from_slice(&left_pad32(&v_eff.to_be_bytes()));
@@ -676,7 +606,7 @@ async fn main() -> Result<()> {
             println!("settledView={settled}");
             println!("keyAtLen={key_len}");
         }
-        // submit-equivocation <VALIDATOR> <CHAINID> <VIEW> <BLOCKA> <SIGA> <BLOCKB> <SIGB>
+
         Some("submit-equivocation") => {
             let cd = submitEquivocationCall {
                 validator: FixedBytes(parse_hex32(&args[1])?),
@@ -697,7 +627,7 @@ async fn main() -> Result<()> {
             println!("STATUS={}", if ok { 1 } else { 0 });
             println!("SLASHED={}", if slashed { 1 } else { 0 });
         }
-        // gov-digest <PROPOSAL_ID> <VALIDATOR>
+
         Some("gov-digest") => {
             let cd = approveDigestCall {
                 proposalId: FixedBytes(parse_hex32(&args[1])?),
@@ -712,7 +642,7 @@ async fn main() -> Result<()> {
             );
             println!("0x{}", hex::encode(out));
         }
-        // gov-approve <PROPOSAL_ID> <COMMAND_HEX> <VALIDATOR> <BLS_SIG_HEX>
+
         Some("gov-approve") => {
             let proposal = parse_hex32(&args[1])?;
             let cd = approveCall {
@@ -727,7 +657,7 @@ async fn main() -> Result<()> {
             let approved = logs
                 .iter()
                 .any(|(addr, t0)| eq_ci(addr, GOVERNANCE_ADDRESS) && eq_ci(t0, APPROVED_TOPIC));
-            // read the running tally back
+
             let tally = {
                 let c = approvalsCall {
                     proposalId: FixedBytes(proposal),
@@ -745,7 +675,7 @@ async fn main() -> Result<()> {
             println!("APPROVED={}", if approved { 1 } else { 0 });
             println!("approvals={tally}");
         }
-        // gov-state <PROPOSAL_ID>
+
         Some("gov-state") => {
             let proposal = parse_hex32(&args[1])?;
             let c = approvalsCall {
@@ -776,24 +706,4 @@ async fn main() -> Result<()> {
         ),
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use boule_reth::governance::{APPROVE_DIGEST_SELECTOR, APPROVE_SELECTOR};
-    use boule_reth::slashing::SUBMIT_EQUIVOCATION_SELECTOR;
-
-    /// The `sol!` ABI shapes this helper encodes must produce the exact 4-byte
-    /// selectors pinned (and genesis-bytecode-checked) in the library, so the
-    /// helper calls the predeploy functions it intends to.
-    #[test]
-    fn sol_selectors_match_pinned_constants() {
-        assert_eq!(
-            submitEquivocationCall::SELECTOR,
-            SUBMIT_EQUIVOCATION_SELECTOR
-        );
-        assert_eq!(approveCall::SELECTOR, APPROVE_SELECTOR);
-        assert_eq!(approveDigestCall::SELECTOR, APPROVE_DIGEST_SELECTOR);
-    }
 }

@@ -1,8 +1,3 @@
-//! `testnet` — driver binary for the parameterized testnet. The library half
-//! ([`boule_node::testnet`]) is also usable directly from integration
-//! tests; this binary is just the CLI shell that wires argv through to
-//! it. See `testnet --help`.
-
 use boule_node::testnet::cli;
 
 fn init_tracing() {

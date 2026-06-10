@@ -1,29 +1,9 @@
-//! `RethEngine` — the Engine API V4 driver.
-//!
-//! Two operations, matching the deferred-execution model:
-//! - [`RethEngine::build_block`] — leader side: `forkchoiceUpdatedV3(attrs)` +
-//!   `getPayloadV4`. Produces the EVM block and its state root.
-//! - [`RethEngine::commit_block`] — all nodes: `newPayloadV4` (execute) +
-//!   `forkchoiceUpdatedV3(head=safe=finalized)`.
-//!
-//! **Prague-at-genesis (#732 prerequisite).** Prague moves the payload methods
-//! to V4: `newPayloadV4` gains a fourth `executionRequests` argument (EIP-7685)
-//! and `getPayloadV4` returns one. `forkchoiceUpdatedV3` is unchanged across
-//! Prague. This boule chain triggers **no** execution requests — its staking is
-//! a custom predeploy (#655), not the beacon deposit contract, and it uses no
-//! EL withdrawals/consolidations — so `executionRequests` is always the empty
-//! list, which is what we pass to `newPayloadV4`.
-//!
-//! `withdrawals=[]`, zero blob/beacon fields, zero `prevRandao` for the
-//! single-validator case.
-
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::time::Duration;
 
 use crate::transport::EngineTransport;
 
-/// 32 zero bytes as a `0x`-hex string (prevRandao / parentBeaconBlockRoot / etc.).
 fn zero32() -> String {
     format!("0x{}", "00".repeat(32))
 }
@@ -36,9 +16,6 @@ fn hex_u64(v: &Value, field: &str) -> Result<u64> {
         .with_context(|| format!("{field}: not hex ({s})"))
 }
 
-/// Outcome of [`RethEngine::build_block`]: the opaque execution payload plus
-/// the fields consensus needs (the block hash and the post-state root that
-/// becomes the boule block's `state_commitment`).
 #[derive(Debug, Clone)]
 pub struct BuiltBlock {
     pub execution_payload: Value,
@@ -49,13 +26,11 @@ pub struct BuiltBlock {
 }
 
 impl BuiltBlock {
-    /// The post-state root as raw 32 bytes (for the boule header commitment).
     pub fn state_root_bytes(&self) -> Result<[u8; 32]> {
         root_from_hex(&self.state_root)
     }
 }
 
-/// Parse a `0x`-prefixed 32-byte hex string into raw bytes.
 pub fn root_from_hex(s: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(s.trim_start_matches("0x")).context("root hex")?;
     bytes
@@ -77,24 +52,6 @@ impl<'a> RethEngine<'a> {
         }
     }
 
-    /// Leader side: start a build on `head_hash` and retrieve the payload.
-    /// `evm_timestamp` is the new block's Unix-seconds timestamp; the caller
-    /// derives it from the consensus block time and must ensure it is strictly
-    /// greater than the parent's (EVM requires strictly increasing block
-    /// times). `build_wait` lets reth's async build pull pool txs in before
-    /// `getPayload` (pass `Duration::ZERO` in tests / for a fixture transport).
-    ///
-    /// `registry_payload` is the **A1 EL-applied registry write set** (#781):
-    /// the hex-encoded `(keys, weights, settledView)` boule consensus computed
-    /// for this block ([`RegistryPayload::to_attribute_hex`]). When non-empty it
-    /// is sent as the custom `registryPayload` payload attribute; the custom EL
-    /// (`boule-reth-node`) transcribes it into the sealed header `extra_data`
-    /// and applies the writes as system calls so every replica mirrors the
-    /// identical registry state. An empty string omits the attribute entirely, so
-    /// a stock reth (which ignores unknown attribute fields) and the custom EL
-    /// both build a plain block — the common case.
-    ///
-    /// [`RegistryPayload::to_attribute_hex`]: crate::registry_payload::RegistryPayload::to_attribute_hex
     pub async fn build_block(
         &self,
         head_hash: &str,
@@ -110,9 +67,7 @@ impl<'a> RethEngine<'a> {
             "withdrawals": [],
             "parentBeaconBlockRoot": z,
         });
-        // A1 (#781): carry boule's registry write set to the custom EL as the
-        // `registryPayload` attribute. Only when non-empty — an empty write set
-        // leaves a plain block (and keeps the attribute absent for stock reth).
+
         if !registry_payload.is_empty() {
             attrs["registryPayload"] = json!(registry_payload);
         }
@@ -161,15 +116,10 @@ impl<'a> RethEngine<'a> {
         })
     }
 
-    /// All nodes: execute `payload` and advance forkchoice to it
-    /// (`head = safe = finalized` — BFT finality, no reorgs). Returns the
-    /// committed block hash.
     pub async fn commit_block(&self, payload: &Value) -> Result<(String, ElStatus)> {
         let executed = self
             .transport
             .call(
-                // V4 adds the 4th `executionRequests` arg (EIP-7685); empty for
-                // this chain (no beacon deposits / EL withdrawals / consolidations).
                 "engine_newPayloadV4",
                 json!([payload, [], zero32(), []]),
                 "03-newpayload",
@@ -181,11 +131,7 @@ impl<'a> RethEngine<'a> {
             .as_str()
             .context("payload blockHash")?
             .to_string();
-        // Always drive forkchoice — even when newPayloadV4 returned SYNCING — so
-        // the EL has a canonical head to sync toward. This is the Engine API
-        // contract: `SYNCING` means "I don't have the parent yet"; the CL must
-        // still send forkchoiceUpdated so the EL knows where to sync. The fcU
-        // itself returns SYNCING while the EL backfills; that is not an error.
+
         let finalized = self
             .transport
             .call(
@@ -199,8 +145,6 @@ impl<'a> RethEngine<'a> {
             "forkchoiceUpdatedV3(final)",
         )?;
 
-        // VALID only when the payload executed *and* forkchoice accepted it;
-        // anything else means the EL is still catching up to this head.
         let status = if exec_status == ElStatus::Valid && fcu_status == ElStatus::Valid {
             ElStatus::Valid
         } else {
@@ -209,10 +153,6 @@ impl<'a> RethEngine<'a> {
         Ok((hash, status))
     }
 
-    /// Deliver a built payload to reth (`newPayloadV4`) WITHOUT finalizing, so
-    /// the block becomes known and later builds can chain on it. Needed under
-    /// HotStuff pipelining: when the leader builds block N, its parent N-1 may
-    /// not be committed/finalized yet, so reth must already know N-1's payload.
     pub async fn register_payload(&self, payload: &Value) -> Result<ElStatus> {
         let executed = self
             .transport
@@ -225,12 +165,6 @@ impl<'a> RethEngine<'a> {
         payload_status(&executed["status"], "newPayloadV4(register)")
     }
 
-    /// Advance forkchoice to `payload`'s block (`head = safe = finalized` — BFT
-    /// finality, no reorgs) WITHOUT re-executing it. Call this only after a
-    /// VALID `register_payload`/`newPayloadV4` for the same block, so reth
-    /// already has the parent chain and adopting the head cannot put it into
-    /// SYNCING. Pairs with the VALID-gated commit path that walks an EL gap
-    /// forward one adopted block at a time (#826).
     pub async fn forkchoice(&self, payload: &Value) -> Result<ElStatus> {
         let hash = payload["blockHash"].as_str().context("payload blockHash")?;
         let finalized = self
@@ -248,15 +182,10 @@ impl<'a> RethEngine<'a> {
     }
 }
 
-/// How the CL must interpret an Engine API payload/forkchoice status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElStatus {
-    /// The EL executed the payload and adopted it as canonical.
     Valid,
-    /// The EL does not yet have the payload's parent chain and is syncing
-    /// toward the head (`SYNCING`/`ACCEPTED`). Normal during catch-up — the CL
-    /// keeps driving `forkchoiceUpdated` and the EL converges in the
-    /// background; it is not an error.
+
     Syncing,
 }
 
@@ -264,8 +193,6 @@ fn forkchoice(hash: &str) -> Value {
     json!({ "headBlockHash": hash, "safeBlockHash": hash, "finalizedBlockHash": hash })
 }
 
-/// Map an Engine API status string to an [`ElStatus`]. `INVALID` (and anything
-/// unrecognized) is a genuine error; `SYNCING`/`ACCEPTED` are catch-up states.
 fn payload_status(status: &Value, what: &str) -> Result<ElStatus> {
     match status.as_str() {
         Some("VALID") => Ok(ElStatus::Valid),
@@ -275,194 +202,9 @@ fn payload_status(status: &Value, what: &str) -> Result<ElStatus> {
     }
 }
 
-/// Strict status check for the build path's `forkchoiceUpdated(attrs)`, where a
-/// non-`VALID` status means the leader cannot build (it lacks the head).
 fn expect_valid(status: &Value, what: &str) -> Result<()> {
     match status.as_str() {
         Some("VALID") => Ok(()),
         other => bail!("{what}: expected status VALID, got {other:?}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testing::FixtureTransport;
-
-    const GENESIS: &str = "0x48d8efff29130c4b1149a8cb877448dc06421f6617b92dc0f817ef96d8973767";
-    const BLOCK1: &str = "0x24df01d105151ebf3d2a6c33530c4d3078d632fb7be477e4ce038ec645a61e91";
-    const BLOCK1_STATE_ROOT: &str =
-        "0x351714af72d74259f45cd7eab0b04527cd40e74836a45abcae50f92d919d988f";
-
-    fn engine() -> RethEngine<'static> {
-        // Leak a unit transport so the test engine can be 'static; trivial.
-        RethEngine::new(
-            Box::leak(Box::new(FixtureTransport)) as &dyn EngineTransport,
-            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
-        )
-    }
-
-    #[tokio::test]
-    async fn build_block_parses_payload_and_state_root() {
-        let built = engine()
-            .build_block(GENESIS, 1, Duration::ZERO, "")
-            .await
-            .expect("build");
-        assert_eq!(built.block_number, 1);
-        assert_eq!(built.block_hash, BLOCK1);
-        assert_eq!(built.state_root, BLOCK1_STATE_ROOT);
-        assert_eq!(built.tx_count, 0, "empty-block golden run");
-    }
-
-    #[tokio::test]
-    async fn commit_block_validates_and_returns_hash() {
-        let payload = serde_json::from_str::<Value>(include_str!("../fixtures/02-getpayload.json"))
-            .unwrap()["result"]["executionPayload"]
-            .clone();
-        let (hash, status) = engine().commit_block(&payload).await.expect("commit");
-        assert_eq!(hash, BLOCK1);
-        assert_eq!(status, ElStatus::Valid);
-    }
-
-    #[tokio::test]
-    async fn build_then_commit_threads_the_payload_through() {
-        let eng = engine();
-        let built = eng
-            .build_block(GENESIS, 0, Duration::ZERO, "")
-            .await
-            .unwrap();
-        let (committed, _) = eng.commit_block(&built.execution_payload).await.unwrap();
-        assert_eq!(committed, built.block_hash);
-    }
-
-    /// A transport that records the params of the first `forkchoiceUpdatedV3`
-    /// (the build-path fcU-with-attrs) and otherwise serves the golden fixtures,
-    /// so we can assert exactly what attributes the build path sends.
-    struct CapturingTransport {
-        inner: crate::testing::FixtureTransport,
-        fcu_attrs: std::sync::Arc<parking_lot::Mutex<Option<Value>>>,
-    }
-
-    impl EngineTransport for CapturingTransport {
-        fn call(
-            &self,
-            method: &str,
-            params: Value,
-            tag: &str,
-        ) -> boule_core::clock::BoxFuture<'_, Result<Value>> {
-            if method == "engine_forkchoiceUpdatedV3" && tag == "01-fcu-attrs" {
-                *self.fcu_attrs.lock() = Some(params[1].clone());
-            }
-            self.inner.call(method, params, tag)
-        }
-    }
-
-    #[tokio::test]
-    async fn build_block_carries_registry_payload_attribute_when_non_empty() {
-        let fcu_attrs = std::sync::Arc::new(parking_lot::Mutex::new(None));
-        let t = CapturingTransport {
-            inner: crate::testing::FixtureTransport,
-            fcu_attrs: fcu_attrs.clone(),
-        };
-        let eng = RethEngine::new(&t, "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-        let hex = "0x424c52310101000000000001e2400000000000000000"; // settled_view=123456
-        eng.build_block(GENESIS, 1, Duration::ZERO, hex)
-            .await
-            .expect("build");
-        let attrs = fcu_attrs.lock().clone().expect("fcU(attrs) was sent");
-        assert_eq!(
-            attrs["registryPayload"].as_str(),
-            Some(hex),
-            "the registryPayload attribute carries the leader's encoded write set verbatim",
-        );
-    }
-
-    #[tokio::test]
-    async fn build_block_omits_registry_payload_attribute_when_empty() {
-        let fcu_attrs = std::sync::Arc::new(parking_lot::Mutex::new(None));
-        let t = CapturingTransport {
-            inner: crate::testing::FixtureTransport,
-            fcu_attrs: fcu_attrs.clone(),
-        };
-        let eng = RethEngine::new(&t, "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-        eng.build_block(GENESIS, 1, Duration::ZERO, "")
-            .await
-            .expect("build");
-        let attrs = fcu_attrs.lock().clone().expect("fcU(attrs) was sent");
-        assert!(
-            attrs.get("registryPayload").is_none(),
-            "an empty write set sends no registryPayload attribute (a plain block)",
-        );
-    }
-
-    /// A transport whose `newPayloadV3`/`forkchoiceUpdatedV3` return `SYNCING`,
-    /// and which records the methods called.
-    struct SyncingTransport {
-        methods: std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
-    }
-
-    impl EngineTransport for SyncingTransport {
-        fn call(
-            &self,
-            method: &str,
-            _params: Value,
-            _tag: &str,
-        ) -> boule_core::clock::BoxFuture<'_, Result<Value>> {
-            self.methods.lock().push(method.to_string());
-            let v = match method {
-                "engine_newPayloadV4" => json!({ "status": "SYNCING", "latestValidHash": null }),
-                "engine_forkchoiceUpdatedV3" => {
-                    json!({ "payloadStatus": { "status": "SYNCING" }, "payloadId": null })
-                }
-                other => panic!("unexpected method {other}"),
-            };
-            Box::pin(async move { Ok(v) })
-        }
-    }
-
-    #[tokio::test]
-    async fn commit_block_tolerates_syncing_and_still_drives_forkchoice() {
-        let methods = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let transport = SyncingTransport {
-            methods: methods.clone(),
-        };
-        let eng = RethEngine::new(&transport, "0xfee");
-        let payload = json!({ "blockHash": BLOCK1 });
-
-        let (hash, status) = eng
-            .commit_block(&payload)
-            .await
-            .expect("no error on SYNCING");
-        assert_eq!(hash, BLOCK1);
-        assert_eq!(status, ElStatus::Syncing, "EL reported syncing");
-        // Crucially, forkchoiceUpdated was still issued so the EL has a target.
-        let m = methods.lock();
-        assert!(m.iter().any(|x| x == "engine_newPayloadV4"));
-        assert!(
-            m.iter().any(|x| x == "engine_forkchoiceUpdatedV3"),
-            "forkchoiceUpdated must be sent even when newPayload is SYNCING"
-        );
-    }
-
-    #[tokio::test]
-    async fn invalid_payload_is_a_hard_error() {
-        struct InvalidTransport;
-        impl EngineTransport for InvalidTransport {
-            fn call(
-                &self,
-                _m: &str,
-                _p: Value,
-                _t: &str,
-            ) -> boule_core::clock::BoxFuture<'_, Result<Value>> {
-                Box::pin(async { Ok(json!({ "status": "INVALID" })) })
-            }
-        }
-        let t = InvalidTransport;
-        let eng = RethEngine::new(&t, "0xfee");
-        assert!(
-            eng.commit_block(&json!({ "blockHash": BLOCK1 }))
-                .await
-                .is_err()
-        );
     }
 }

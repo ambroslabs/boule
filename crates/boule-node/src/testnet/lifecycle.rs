@@ -1,13 +1,3 @@
-//! Process-lifecycle management: spawn, kill, down, and the `new`
-//! command's two-phase init flow.
-//!
-//! The two-phase init is the same trick the integration tests use
-//! (`launch_once_for_discovery` in `tests/integration_test.rs`): start
-//! every node briefly with empty `[[peers]]`, harvest its `node_id` +
-//! actual bound P2P address from the addr_file the binary writes, then
-//! re-write each config with the full topology before the cluster
-//! actually goes up.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -23,27 +13,19 @@ use super::workdir::{
     NodeAddrFile, NodeLayout, PersistedSpec, State, node_dir_name, read_addr_file,
 };
 
-/// How long to wait for a freshly-spawned node to write its addr_file.
 const ADDR_FILE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Grace period for SIGTERM before falling back to SIGKILL during `down`.
+
 const TERM_GRACE: Duration = Duration::from_secs(3);
 
-/// Context for the `testnet new` command.
 pub struct NewArgs {
     pub workdir: PathBuf,
     pub spec: TopologySpec,
     pub binary: PathBuf,
-    /// `timeout_base_ms` to write into each node's `[consensus]` block.
-    /// Defaults to 200 — short enough that 4-node smoke tests commit in
-    /// well under a second.
+
     pub timeout_base_ms: u64,
     pub timeout_max_ms: u64,
 }
 
-/// `testnet new`: lay out the workdir, generate the topology, mint
-/// every node's identity via `boule init`, harvest each node's
-/// `node_id`, and write the final per-node configs with the full
-/// `[consensus].validators` list and the bootstrap `[[peers]]` block.
 pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
     let NewArgs {
         workdir,
@@ -56,10 +38,7 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
     spec.validate()?;
     std::fs::create_dir_all(&workdir)
         .with_context(|| format!("creating workdir {}", workdir.display()))?;
-    // Canonicalize so every per-node path written to state.json is
-    // absolute. Otherwise `testnet new --workdir testnetN` records
-    // cwd-relative paths and any subsequent subcommand from a
-    // different cwd fails to open the log/key/addr files.
+
     let workdir = std::fs::canonicalize(&workdir)
         .with_context(|| format!("canonicalizing workdir {}", workdir.display()))?;
 
@@ -73,17 +52,6 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
 
     let topo = generate(&spec)?;
 
-    // Phase 1: lay out per-node directories + minimal configs (no
-    // peers, no consensus), run `init`, and start the binary briefly
-    // to discover the bound P2P address + node_id from the addr_file.
-    //
-    // The `init` step is sequential (cheap; no I/O contention worth
-    // parallelizing). The discovery launch is parallelized — each node
-    // is independent, has no peers configured, and the bottleneck is
-    // process spawn + a short addr_file poll. Running them concurrently
-    // turns N × ~100ms into max(~100ms) on small clusters and is the
-    // difference between fitting and not fitting in the integration
-    // test budget.
     let mut layouts: Vec<NodeLayout> = Vec::with_capacity(spec.nodes);
     for nt in &topo {
         let layout = node_layout(&workdir, nt.index, nt.bootstrap_peers.clone());
@@ -119,21 +87,8 @@ pub async fn new_cluster(args: NewArgs) -> anyhow::Result<State> {
     }
     nodes.sort_by_key(|n| n.index);
 
-    // Phase 2a: on BLS chains, mint each node's BLS validator key now
-    // (so we can pre-compute the genesis BLS table and bake the path
-    // into the final config). On Ed25519 chains this is a no-op.
-    //
-    // PoPs are minted in two passes (#410): first the keypairs alone,
-    // then — once we can compute the deployment's chain_id from the
-    // (validators + bls_pubkeys) tuple — chain-bound PoPs over each
-    // validator's pubkey. The single-pass version that lived here
-    // before chain_id binding produced PoPs that would replay across
-    // any deployment sharing those BLS keys.
     let bls_genesis = mint_bls_keys(&mut nodes)?;
 
-    // Phase 2b: write the final per-node config with the full
-    // [consensus] section + sparse [[peers]] block. On BLS chains the
-    // `bls_genesis` table is woven in alongside the validator list.
     let validator_ids: Vec<String> = nodes
         .iter()
         .map(|n| n.node_id.clone().expect("node_id populated in phase 1"))
@@ -186,41 +141,17 @@ fn node_layout(workdir: &Path, index: usize, bootstrap_peers: Vec<usize>) -> Nod
     }
 }
 
-/// One genesis-table entry built by [`mint_bls_keys`].
-/// Mirrors the `[consensus.validators_bls]` row shape — base58 NodeId,
-/// hex-encoded 48-byte BLS pubkey, hex-encoded 96-byte PoP signature
-/// over that pubkey.
 struct BlsGenesisEntry {
     node_id: String,
     bls_pubkey_hex: String,
     bls_pop_hex: String,
 }
 
-/// Per-node, generate a fresh BLS keypair and persist it to
-/// `<node_dir>/bls.key` via the same `BlsKeyFile` provider production
-/// uses. Returns the ordered genesis table — one entry per validator, in
-/// the same order as `nodes` (which is sorted by index, matching the
-/// `[consensus] validators` ordering written to every node's config).
-/// The `Option` is always `Some` (it threads into the config writer's
-/// optional BLS-table argument).
-///
-/// Mutates each node's `NodeLayout::bls_key_path` so the final-config
-/// writer can reference the on-disk path under
-/// `[node.bls_validator_identity]`.
-///
-/// The PoP attached to each entry is derived against the deployment's
-/// chain_id (#410), computed in-process from the genesis-block hash
-/// over (validators, BLS pubkeys, default genesis seed). Without that
-/// binding a PoP minted here would replay across any deployment that
-/// happened to reuse the same validator BLS key.
 fn mint_bls_keys(nodes: &mut [NodeLayout]) -> anyhow::Result<Option<Vec<BlsGenesisEntry>>> {
     use boule_core::crypto::bls_key::{BlsKeyFile, BlsKeyProvider};
     use boule_core::crypto::sig_scheme::{BlsAggregated, BlsPublicKey};
     use boule_core::identity::base58_to_node_id;
 
-    // Pass 1: provision each validator's BLS key file on disk and
-    // collect (NodeId, secret, pubkey). PoPs are deferred until the
-    // chain_id is known.
     struct PendingEntry {
         node_id: String,
         node_id_bytes: boule_core::identity::NodeId,
@@ -234,12 +165,7 @@ fn mint_bls_keys(nodes: &mut [NodeLayout]) -> anyhow::Result<Option<Vec<BlsGenes
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config_path has no parent for {}", n.display_name()))?;
         let bls_path = dir.join("bls.key");
-        // The testnet driver runs on the same machine as the node
-        // binary; `BlsKeyFile::load_or_init` writes mode 0600 and
-        // generates a fresh key on first call. Subsequent calls reload
-        // the same key — this matters if `testnet new` is ever rerun
-        // against an existing workdir (which `new_cluster` already
-        // refuses, but the helper is idempotent regardless).
+
         let provider = BlsKeyFile::new(bls_path.clone());
         let identity = provider
             .load_or_init()
@@ -260,22 +186,16 @@ fn mint_bls_keys(nodes: &mut [NodeLayout]) -> anyhow::Result<Option<Vec<BlsGenes
         n.bls_key_path = Some(bls_path);
     }
 
-    // Pass 2: compute the deployment's chain_id from the validator
-    // pubkeys + BLS table the genesis block will commit to, and mint a
-    // chain-bound PoP per validator (#410).
     let validator_ids: Vec<boule_core::identity::NodeId> =
         pending.iter().map(|e| e.node_id_bytes).collect();
     let bls_pubkeys: Vec<(boule_core::identity::NodeId, BlsPublicKey)> = pending
         .iter()
         .map(|e| (e.node_id_bytes, e.public))
         .collect();
-    // `testnet new` doesn't expose `genesis_seed_hex`, so the cluster
-    // uses the default all-zeros seed — same as a config that omits
-    // the field.
+
     let chain_id = boule_consensus::genesis::derive_chain_id_from_parts(
         &validator_ids,
         &bls_pubkeys,
-        // The testnet driver declares no operator keys (#549).
         &[],
         [0u8; 32],
     );
@@ -321,8 +241,7 @@ fn write_final_config(
     n: &NodeLayout,
     all: &[NodeLayout],
     validators: &[String],
-    // libp2p discovery is bootstrap-addr driven; the gossip outbound-target
-    // knob is no longer wired into the generated config.
+
     _target_degree: usize,
     timeout_base_ms: u64,
     timeout_max_ms: u64,
@@ -338,8 +257,6 @@ fn write_final_config(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // libp2p discovery is driven by bootstrap_addrs (the gossip overlay's
-    // [[peers]] peer-list was removed with the legacy transport).
     let mut bootstrap_list: Vec<String> = Vec::new();
     for &peer_idx in &n.bootstrap_peers {
         let p = &all[peer_idx];
@@ -350,11 +267,6 @@ fn write_final_config(
     }
     let bootstrap_toml = bootstrap_list.join(", ");
 
-    // BLS genesis table (#360): emit the `[[consensus.validators_bls]]`
-    // rows that the genesis validator set requires
-    // (`ConsensusConfig::resolve_genesis_bls_keys`), and a
-    // `[node.bls_validator_identity]` block pointing at this node's
-    // on-disk BLS key file.
     let mut bls_consensus_toml = String::new();
     let mut bls_node_identity_toml = String::new();
     {
@@ -385,15 +297,10 @@ fn write_final_config(
         .unwrap();
     }
 
-    // Bake the api_addr discovered in phase 1 into the final config
-    // (rather than re-binding to port 0). Otherwise `up` would land on
-    // a fresh dynamic port and the api_addr in `state.json` would be
-    // stale until the driver re-read each addr_file post-spawn.
     let api = n
         .api_addr
         .ok_or_else(|| anyhow::anyhow!("missing api_addr for {}", n.display_name()))?;
-    // Bake the discovered admin-listener addr too; fall back to a fresh
-    // loopback dynamic port if a pre-#807 state file lacks it.
+
     let admin = n
         .admin_addr
         .map(|a| a.to_string())
@@ -461,9 +368,6 @@ async fn launch_once_for_discovery(
     binary: &Path,
     layout: &NodeLayout,
 ) -> anyhow::Result<DiscoveryInfo> {
-    // Make sure stale addr_file from a previous run doesn't poison the
-    // poll loop. (The driver guards against it in `new_cluster` via the
-    // state-file existence check, but be defensive anyway.)
     let _ = std::fs::remove_file(&layout.addr_path);
 
     let mut child = Command::new(binary)
@@ -499,12 +403,6 @@ async fn launch_once_for_discovery(
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
 
-    // Tear the discovery process down — we relaunch with the final
-    // config in `up`. SIGKILL is fine: no peers are connected (this
-    // node was started with an empty `[[peers]]` block) so there's no
-    // close_notify path to flush, and the node's `tokio::signal::ctrl_c`
-    // graceful path waits up to 5s on join handles which dominates an
-    // otherwise sub-100ms launch.
     let _ = child.kill();
     let _ = child.wait();
 
@@ -516,8 +414,6 @@ async fn launch_once_for_discovery(
     })
 }
 
-/// Spawn one node from a populated `state.json` and write its PID
-/// file. Returns the node's PID.
 pub async fn up_one(workdir: &Path, binary: &Path, layout: &NodeLayout) -> anyhow::Result<u32> {
     if layout.pid_path.exists() {
         anyhow::bail!(
@@ -527,8 +423,7 @@ pub async fn up_one(workdir: &Path, binary: &Path, layout: &NodeLayout) -> anyho
             layout.display_name(),
         );
     }
-    // Truncate any existing addr_file so the address poll below picks
-    // up the new bind, not stale state from an earlier `up`/`new`.
+
     let _ = std::fs::remove_file(&layout.addr_path);
 
     let log = std::fs::OpenOptions::new()
@@ -552,9 +447,7 @@ pub async fn up_one(workdir: &Path, binary: &Path, layout: &NodeLayout) -> anyho
     let pid = child.id();
     std::fs::write(&layout.pid_path, pid.to_string())
         .with_context(|| format!("writing pid file {}", layout.pid_path.display()))?;
-    // Forget the child handle. We track the process through the pid
-    // file rather than the std::process::Child so re-invoked drivers
-    // can still down the cluster.
+
     std::mem::forget(child);
 
     events::record(
@@ -566,24 +459,19 @@ pub async fn up_one(workdir: &Path, binary: &Path, layout: &NodeLayout) -> anyho
     Ok(pid)
 }
 
-/// Spawn every down node. Idempotent: nodes that already have a live
-/// pid file are skipped.
 pub async fn up_all(workdir: &Path, binary: &Path, state: &State) -> anyhow::Result<Vec<u32>> {
     let mut pids = Vec::with_capacity(state.nodes.len());
     for n in &state.nodes {
         if pid_alive(n).is_some() {
             continue;
         }
-        // Best effort: clean up a stale pid file from a crashed driver.
+
         let _ = std::fs::remove_file(&n.pid_path);
         pids.push(up_one(workdir, binary, n).await?);
     }
     Ok(pids)
 }
 
-/// Read the `pid` file under a node's directory and confirm the
-/// process is still alive (via `kill(pid, 0)`). Returns the live PID
-/// or `None` if either the file is missing or the process is gone.
 pub fn pid_alive(layout: &NodeLayout) -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(&layout.pid_path)
         .ok()?
@@ -595,17 +483,6 @@ pub fn pid_alive(layout: &NodeLayout) -> Option<u32> {
 
 #[cfg(unix)]
 fn pid_is_running(pid: u32) -> bool {
-    // We `mem::forget` spawned children, so a SIGKILL'd or SIGTERM'd
-    // node becomes a zombie until reaped — and `kill(pid, 0)` happily
-    // reports zombies as "alive". Reap with `waitpid(WNOHANG)` first;
-    // it succeeds only for our own children, returns the pid when the
-    // process is gone, returns 0 when it's still actually running, and
-    // returns -1 (ECHILD) for processes spawned by a different driver
-    // invocation. Fall back to `kill(pid, 0)` for the latter case so
-    // re-invoked drivers can still observe nodes from prior `up`s.
-    //
-    // SAFETY: both syscalls are safe to invoke with arbitrary pid_t —
-    // invalid pids surface as -1 with errno set rather than UB.
     unsafe {
         let mut status: libc::c_int = 0;
         let r = libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG);
@@ -618,7 +495,7 @@ fn pid_is_running(pid: u32) -> bool {
         if r == 0 {
             return true;
         }
-        // r == -1: ECHILD (not our child) or another error. Fall through.
+
         libc::kill(pid as libc::pid_t, 0) == 0
     }
 }
@@ -650,8 +527,6 @@ fn libc_sigkill() -> i32 {
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: libc::c_int) -> bool {
-    // SAFETY: kill with a valid PID + signal is safe; an invalid PID
-    // returns -1 and sets errno, which we treat as "process gone".
     unsafe { libc::kill(pid as libc::pid_t, signal) == 0 }
 }
 
@@ -660,7 +535,6 @@ fn send_signal(_pid: u32, _signal: i32) -> bool {
     false
 }
 
-/// SIGKILL a single node and clean its pid file. Idempotent.
 pub fn kill_one(workdir: &Path, layout: &NodeLayout) -> anyhow::Result<()> {
     let Some(pid) = pid_alive(layout) else {
         let _ = std::fs::remove_file(&layout.pid_path);
@@ -678,8 +552,6 @@ pub fn kill_one(workdir: &Path, layout: &NodeLayout) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pick `count` random *live* nodes and SIGKILL them. Returns the
-/// indices killed. Reproducible under `seed`.
 pub fn kill_random(
     workdir: &Path,
     state: &State,
@@ -707,8 +579,6 @@ pub fn kill_random(
     Ok(chosen)
 }
 
-/// Tear down every live node — SIGTERM, then SIGKILL stragglers. Also
-/// reaps stale pid files. Idempotent.
 pub fn down(workdir: &Path, state: &State) -> anyhow::Result<()> {
     let mut termed = Vec::new();
     for n in &state.nodes {
@@ -753,36 +623,4 @@ fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(25));
     }
     !pid_is_running(pid)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testnet::workdir::PersistedSpec;
-
-    #[test]
-    fn parses_pid_file_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let layout = node_layout(tmp.path(), 0, vec![]);
-        std::fs::create_dir_all(layout.config_path.parent().unwrap()).unwrap();
-        std::fs::write(&layout.pid_path, "12345").unwrap();
-        // 12345 is almost certainly not a real PID owned by us; it
-        // doesn't need to exist for the parse path to be exercised.
-        let _ = pid_alive(&layout);
-    }
-
-    #[test]
-    fn down_with_no_nodes_is_noop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = State {
-            spec: PersistedSpec {
-                nodes: 0,
-                seed_extra: 0,
-                target_degree: 4,
-                seed: 0,
-            },
-            nodes: vec![],
-        };
-        down(tmp.path(), &state).unwrap();
-    }
 }

@@ -1,10 +1,3 @@
-//! HS256 JWT minting for the reth Engine API authrpc port.
-//!
-//! The Engine API requires `Authorization: Bearer <token>` where the token
-//! is an HS256 JWT carrying an `iat` (issued-at) claim within ±60s of the
-//! server clock, signed with the 32-byte shared secret reth was started with
-//! (`--authrpc.jwtsecret`).
-
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -15,7 +8,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Load the 32-byte hex JWT secret from reth's `--authrpc.jwtsecret` file.
 pub fn load_secret(path: &Path) -> Result<Vec<u8>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading jwt secret {}", path.display()))?;
@@ -23,7 +15,6 @@ pub fn load_secret(path: &Path) -> Result<Vec<u8>> {
     hex::decode(text).context("jwt secret is not valid hex")
 }
 
-/// Mint a fresh HS256 JWT. Call per-request so `iat` stays inside the window.
 pub fn mint(secret: &[u8]) -> Result<String> {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
     let iat = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();

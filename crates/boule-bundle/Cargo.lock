@@ -1840,8 +1840,6 @@ dependencies = [
  "eyre",
  "hex",
  "jsonrpsee",
- "libc",
- "reqwest 0.12.28",
  "reth-ethereum",
  "serde",
  "serde_json",

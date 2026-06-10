@@ -1,18 +1,3 @@
-//! The custom `ConfigureEvm` + `BlockExecutor` that applies boule's registry
-//! writes as **system calls** at the block boundary.
-//!
-//! Adapted from the Phase-0 spike (`~/code/reth-a1-spike/.../boule-a1-spike`)
-//! and reth's `examples/custom-beacon-withdrawals`. The Phase-0 spike applied a
-//! single `recordSettled`; this applies the full `(keys, weights, settledView)`
-//! decoded from `extra_data` (see [`crate::registry`]).
-//!
-//! The two traits that matter, both of which build the
-//! `EthBlockExecutionCtx` the executor reads `extra_data` from:
-//! - [`ConfigureEvm`] — the **build** path (`context_for_next_block`).
-//! - [`ConfigureEngineEvm`] — the **verify** path (`context_for_payload`, run on
-//!   `newPayloadV4`). Implementing only `ConfigureEvm` is the classic trap; the
-//!   verify path is where every non-proposing replica reproduces the write.
-
 use std::{fmt::Display, sync::Arc};
 
 use alloy_evm::{
@@ -45,8 +30,6 @@ use crate::registry::{
     record_settled_calldata, record_weight_calldata,
 };
 
-/// The custom EVM config: delegates everything to the stock Ethereum config
-/// except that it wraps each block executor to apply the registry writes.
 #[derive(Debug, Clone)]
 pub struct CustomEvmConfig {
     inner: EthEvmConfig,
@@ -82,9 +65,7 @@ impl BlockExecutorFactory for CustomEvmConfig {
         DB: StateDB,
         I: InspectorFor<Self, DB>,
     {
-        // Decode the registry payload from the SAME `extra_data` on both the
-        // build path (`context_for_next_block`) and the verify path
-        // (`context_for_payload`) — this is the determinism guarantee.
+
         let payload = RegistryPayload::decode(ctx.extra_data.as_ref());
         CustomBlockExecutor {
             payload,
@@ -150,8 +131,7 @@ impl ConfigureEngineEvm<ExecutionData> for CustomEvmConfig {
         &self,
         payload: &'a ExecutionData,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        // Sources `extra_data` straight from the SEALED block — the same bytes
-        // the build path wrote — so the executor decodes the identical payload.
+
         self.inner.context_for_payload(payload)
     }
 
@@ -163,10 +143,8 @@ impl ConfigureEngineEvm<ExecutionData> for CustomEvmConfig {
     }
 }
 
-/// The per-block executor: applies the registry writes pre-execution, then
-/// delegates the tx loop and finalization to the stock Ethereum executor.
 pub struct CustomBlockExecutor<'a, Evm> {
-    /// Registry writes decoded from `extra_data` (`None` for a non-boule block).
+
     payload: Option<RegistryPayload>,
     inner: EthBlockExecutor<'a, Evm, &'a Arc<ChainSpec>, &'a RethReceiptBuilder>,
 }
@@ -181,10 +159,7 @@ where
     type Result = EthTxResult<E::HaltReason, TxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        // Apply registry writes PRE-execution (the EIP-4788 slot): they are pure
-        // consensus-derived mirrors, independent of the block's transactions.
-        // Apply order is fixed (keys, then weights, then settled) and identical
-        // on every replica, so the resulting state is byte-identical.
+
         if let Some(payload) = self.payload.take() {
             apply_registry_writes(&payload, self.inner.evm_mut())?;
         }
@@ -223,10 +198,6 @@ where
     }
 }
 
-/// Apply the full registry write set as `SYSTEM`-caller system calls to the
-/// Registry predeploy: every `recordKey`, then every `recordWeight`, then
-/// `recordSettled` if present. Each is structurally identical to reth's
-/// EIP-4788/withdrawals system calls.
 pub fn apply_registry_writes(
     payload: &RegistryPayload,
     evm: &mut impl Evm<Error: Display, DB: DatabaseCommit>,
@@ -243,9 +214,6 @@ pub fn apply_registry_writes(
     Ok(())
 }
 
-/// Run one `SYSTEM_ADDRESS -> REGISTRY_ADDRESS` system call and commit its state
-/// delta, scrubbing the transient system-caller account so it does not perturb
-/// the state root (the same hygiene reth's withdrawals example performs).
 fn system_call(
     evm: &mut impl Evm<Error: Display, DB: DatabaseCommit>,
     calldata: Vec<u8>,

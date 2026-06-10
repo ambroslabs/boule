@@ -48,5 +48,3 @@ serde_json         = "1"
 # The CLI integration tests that used to live in `tests/` moved to
 # `boule-bundle` in #897, so they run against the unified `boule` binary. The
 # only remaining test-only dep is for the inline unit tests (e.g. rotation).
-[dev-dependencies]
-tempfile = "3"

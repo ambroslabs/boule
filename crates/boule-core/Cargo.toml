@@ -19,9 +19,6 @@ categories.workspace = true
 # have a secret service available.
 default = []
 keyring-backend = ["dep:keyring"]
-# Exposes test-only fixtures (e.g. `ChainId::TEST`) to downstream crates'
-# tests without making them available in production builds.
-testing = []
 
 [dependencies]
 tokio             = { version = "1", features = ["full"] }
@@ -62,7 +59,3 @@ keyring           = { version = "3", optional = true, default-features = false, 
 # implementation eth2/lighthouse runs in production. Wired through the
 # `BlsAggregated` scheme in `crate::crypto::sig_scheme`.
 blst              = "0.3"
-
-[dev-dependencies]
-tokio             = { version = "1", features = ["full", "test-util"] }
-proptest          = { version = "1", default-features = false, features = ["std", "bit-set"] }

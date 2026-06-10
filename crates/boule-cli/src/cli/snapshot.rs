@@ -1,5 +1,3 @@
-//! `boule snapshot` — export/import consensus snapshots.
-
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand};
@@ -11,31 +9,28 @@ use super::shared::resolve_config_path;
 
 #[derive(Subcommand)]
 pub enum SnapshotCmd {
-    /// Dump a snapshot into a portable directory (manifest.bin + chunks).
     Export(SnapshotExportArgs),
-    /// Load a directory produced by `snapshot export` into local storage.
+
     Import(SnapshotImportArgs),
 }
 
 #[derive(Args)]
 pub struct SnapshotExportArgs {
-    /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
-    /// Snapshot height to export (default: the latest).
+
     #[arg(long)]
     height: Option<u64>,
-    /// Output directory.
+
     #[arg(short = 'o', long)]
     out: PathBuf,
 }
 
 #[derive(Args)]
 pub struct SnapshotImportArgs {
-    /// Config file path (default: platform-specific location).
     #[arg(short = 'c', long = "config")]
     config_path: Option<PathBuf>,
-    /// Input directory, as produced by `snapshot export`.
+
     #[arg(short = 'i', long = "in")]
     in_dir: PathBuf,
 }

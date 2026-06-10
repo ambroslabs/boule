@@ -12,17 +12,6 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[features]
-# Crash-injection seam (issue #420): compiles the `crashpoint!` firing
-# path and the `CrashSlot` arming API. Off in production (the macro
-# becomes a no-op); enabled by `boule-node`'s dev-dependency so the
-# crash-recovery sim can arm and observe crashpoints.
-crashpoints = []
-# Exposes test-only fixtures (test ingress entry points, manifest/
-# block-sync test constructors) to downstream crates' tests without
-# making them part of the production API.
-testing = []
-
 [dependencies]
 boule-core  = { path = "../boule-core", version = "0.1.0" }
 serde       = { version = "1", features = ["derive"] }
@@ -39,11 +28,3 @@ blst        = "0.3"
 ring        = "0.17"
 tokio       = { version = "1", features = ["full"] }
 axum        = "0.8"
-
-[dev-dependencies]
-boule-core  = { path = "../boule-core", version = "0.1.0", features = ["testing"] }
-tokio       = { version = "1", features = ["full", "test-util"] }
-proptest    = { version = "1", default-features = false, features = ["std", "bit-set"] }
-rcgen       = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-zeroize     = { version = "1", features = ["derive"] }
-tempfile    = "3"

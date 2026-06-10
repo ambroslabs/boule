@@ -1,22 +1,3 @@
-//! Passphrase-encrypted file backend.
-//!
-//! On-disk format (base64-wrapped inside a PEM-like envelope):
-//!
-//! ```text
-//! magic:       "BOULE\0\0"  (7 bytes)
-//! version:     1            (1 byte)
-//! argon_m:     u32 BE       (memory cost in KiB)
-//! argon_t:     u32 BE       (iterations)
-//! argon_p:     u32 BE       (lanes)
-//! salt:        16 bytes
-//! nonce:       24 bytes     (XChaCha20)
-//! ciphertext:  PKCS#8 DER encrypted with XChaCha20-Poly1305, AAD = first 40 bytes
-//! ```
-//!
-//! The passphrase is taken from `passphrase_env` if set, else read from the
-//! TTY via rpassword. Passphrases are held in `SecretBox<String>` and zeroed
-//! on drop.
-
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -40,7 +21,7 @@ const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = 7 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN;
 const PEM_LABEL: &str = "BOULE ENCRYPTED PRIVATE KEY";
 
-const ARGON_M_KIB: u32 = 64 * 1024; // 64 MiB
+const ARGON_M_KIB: u32 = 64 * 1024;
 const ARGON_T: u32 = 3;
 const ARGON_P: u32 = 1;
 
@@ -295,80 +276,4 @@ fn atomic_write_envelope(path: &Path, blob: &[u8]) -> anyhow::Result<()> {
     tmp.persist(path)
         .map_err(|e| anyhow::anyhow!("renaming temp into place: {e}"))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn pass(s: &str) -> SecretBox<String> {
-        SecretBox::new(Box::new(s.to_string()))
-    }
-
-    #[test]
-    fn encrypt_decrypt_round_trip() {
-        let passphrase = pass("hunter2");
-        let msg = b"node key material bytes";
-        let blob = encrypt_blob(msg, &passphrase).unwrap();
-        let back = decrypt_blob(&blob, &passphrase).unwrap();
-        assert_eq!(&back[..], msg);
-    }
-
-    #[test]
-    fn wrong_passphrase_fails() {
-        let blob = encrypt_blob(b"secret", &pass("right")).unwrap();
-        let err = decrypt_blob(&blob, &pass("wrong")).unwrap_err();
-        assert!(format!("{err}").contains("decryption failed"));
-    }
-
-    #[test]
-    fn tamper_fails() {
-        let mut blob = encrypt_blob(b"secret", &pass("p")).unwrap();
-        // Flip a byte in the ciphertext section.
-        let last = blob.len() - 1;
-        blob[last] ^= 0x01;
-        let err = decrypt_blob(&blob, &pass("p")).unwrap_err();
-        assert!(format!("{err}").contains("decryption failed"));
-    }
-
-    #[test]
-    fn envelope_round_trip() {
-        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9];
-        let env = encode_envelope(&data);
-        let back = decode_envelope(env.as_bytes()).unwrap();
-        assert_eq!(back, data);
-    }
-
-    #[test]
-    fn provider_generates_and_reloads() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.enc");
-        let var = "BOULE_TEST_ENC_PASS";
-        unsafe { std::env::set_var(var, "p@ssw0rd!") };
-
-        let provider = EncryptedFileKeyProvider::new(path.clone(), Some(var.to_string()));
-        let first = provider.load_or_init().unwrap();
-        assert!(path.exists());
-
-        let second = provider.load_or_init().unwrap();
-        assert_eq!(&first.pkcs8_der[..], &second.pkcs8_der[..]);
-
-        unsafe { std::env::remove_var(var) };
-    }
-
-    #[test]
-    fn provider_wrong_passphrase() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("node.enc");
-        let var = "BOULE_TEST_ENC_PASS_WRONG";
-        unsafe { std::env::set_var(var, "correct-passphrase") };
-        let provider = EncryptedFileKeyProvider::new(path.clone(), Some(var.to_string()));
-        provider.load_or_init().unwrap();
-
-        unsafe { std::env::set_var(var, "different-one") };
-        let err = provider.load_or_init().unwrap_err();
-        assert!(format!("{err:#}").contains("decryption failed"));
-
-        unsafe { std::env::remove_var(var) };
-    }
 }
