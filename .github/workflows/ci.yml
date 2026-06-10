@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # CI checkouts are clean each run, so incremental compilation only bloats the
+  # cache — off is also the recommended setting alongside sccache.
+  CARGO_INCREMENTAL: 0
+  # Let sccache use the GitHub Actions cache backend in any job that opts in via
+  # RUSTC_WRAPPER=sccache. Inert in jobs that don't set the wrapper.
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   # Detect whether this change touches anything that affects build/test/lint
@@ -175,6 +181,12 @@ jobs:
     name: Unified boule binary (reth in-process)
     needs: changes
     runs-on: ubuntu-latest
+    env:
+      # This is the only job that compiles the reth SDK. Route compilation
+      # through sccache so reth's crates are cached per-crate (by their inputs)
+      # and survive Cargo.lock churn — a dependency tweak then recompiles only
+      # the changed crates instead of the whole reth tree.
+      RUSTC_WRAPPER: sccache
     defaults:
       run:
         # Everything runs inside the bundle's standalone workspace (its own
@@ -188,6 +200,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # Compiler cache (must be set up before any cargo invocation). Reuses
+      # reth's compiled crates across runs and branches keyed on each crate's
+      # inputs, backed by the GHA cache. This is what makes the reth build
+      # incremental instead of a ~15-min cold compile on every Cargo.lock change.
+      - if: needs.changes.outputs.bundle == 'true'
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # solc compiles the predeploy genesis from source at build time
       # (boule-reth's build.rs). Same pinned action the root lanes use.
@@ -207,15 +226,17 @@ jobs:
           echo "Using gcc include dir: $gcc_inc"
           echo "BINDGEN_EXTRA_CLANG_ARGS=-I$gcc_inc" >> "$GITHUB_ENV"
 
-      # The reth tree is enormous; cache the registry/git sources and the build
-      # output, keyed on this workspace's own Cargo.lock. A flaky test shouldn't
-      # discard the expensive reth build cache.
+      # Cache the cargo registry/git sources (keyed on this workspace's own
+      # Cargo.lock). The compiled output is cached by sccache above instead —
+      # caching the multi-GB reth target here too would blow GitHub's 10GB cache
+      # budget and evict the sccache entries, so `cache-targets: false`.
       - if: needs.changes.outputs.bundle == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/boule-bundle
           prefix-key: bundle
           cache-on-failure: true
+          cache-targets: false
 
       - if: needs.changes.outputs.bundle == 'true'
         name: Format
@@ -260,3 +281,9 @@ jobs:
         # --test-threads=1: each smoke test boots its own in-process reth;
         # running them concurrently makes two reth nodes clash. Serialize.
         run: cargo test --locked --test bundle_smoke -- --ignored --nocapture --test-threads=1
+
+      # Surface cache effectiveness (hit/miss/size) in the log — a cold run is
+      # ~all misses; subsequent runs on an unchanged reth tree should be ~all hits.
+      - if: needs.changes.outputs.bundle == 'true'
+        name: sccache stats
+        run: sccache --show-stats
