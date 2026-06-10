@@ -11,9 +11,6 @@ env:
   # CI checkouts are clean each run, so incremental compilation only bloats the
   # cache — off is also the recommended setting alongside sccache.
   CARGO_INCREMENTAL: 0
-  # Let sccache use the GitHub Actions cache backend in any job that opts in via
-  # RUSTC_WRAPPER=sccache. Inert in jobs that don't set the wrapper.
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   # Detect whether this change touches anything that affects build/test/lint
@@ -183,10 +180,16 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # This is the only job that compiles the reth SDK. Route compilation
-      # through sccache so reth's crates are cached per-crate (by their inputs)
-      # and survive Cargo.lock churn — a dependency tweak then recompiles only
-      # the changed crates instead of the whole reth tree.
+      # through sccache, backed by a shared DigitalOcean Spaces (S3) bucket, so
+      # reth's crates are cached per-crate (by their inputs) and reused across
+      # runs, branches, local dev, and Docker — surviving Cargo.lock churn (a
+      # dependency tweak recompiles only the changed crates, not the whole tree).
       RUSTC_WRAPPER: sccache
+      SCCACHE_BUCKET: boule-sccache
+      SCCACHE_ENDPOINT: https://nyc3.digitaloceanspaces.com
+      SCCACHE_REGION: auto
+      AWS_ACCESS_KEY_ID: ${{ secrets.SPACES_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.SPACES_SECRET_ACCESS_KEY }}
     defaults:
       run:
         # Everything runs inside the bundle's standalone workspace (its own
