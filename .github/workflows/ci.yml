@@ -30,6 +30,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/install-solc
+      - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy -p boule-cli --features reth --all-targets -- -D warnings
 
@@ -41,6 +43,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/install-solc
+      - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - run: cargo test --locked --all-targets
       - name: Doctests
         run: cargo test --locked --doc
@@ -62,5 +66,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: ./.github/actions/install-solc
+      - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
       - run: cargo doc --workspace --no-deps --document-private-items
 

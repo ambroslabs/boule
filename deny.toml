@@ -14,6 +14,17 @@ ignore = [
     # unmaintained, not vulnerable — no runtime surface. Accept until the
     # upstream that pulls it switches off it.
     "RUSTSEC-2026-0173",
+    # --- Surfaced by bringing the reth SDK into the deny scope (#workspace-merge) ---
+    # `bincode 1.3.3` (transitive via reth) is unmaintained, not vulnerable —
+    # upstream considers 1.3.3 a complete release. Accept until reth drops it.
+    "RUSTSEC-2025-0141",
+    # `hickory-proto` (transitive via reth's discv5 DNS discovery) — two DoS-only
+    # advisories: NSEC3 closest-encloser unbounded loop, and O(n²) name-compression
+    # CPU exhaustion. Reachable only through DNS-based peer discovery. Pinned to
+    # reth v2.2.0; the fix requires a reth bump. Accepted to unblock the merge —
+    # REVIEW before relying on DNS discovery in production.
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
 ]
 
 [licenses]
@@ -30,12 +41,29 @@ allow = [
     # `foldhash` (via alloy-primitives' hash maps) is Zlib — an OSI-approved,
     # FSF-free permissive license.
     "Zlib",
+    # Permissive / public-domain-equivalent licenses pulled in by the reth SDK
+    # dependency tree.
+    "0BSD",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    # MPL-2.0 is weak, file-level copyleft (no infection of our crates) — used by
+    # a few reth/alloy transitive deps.
+    "MPL-2.0",
 ]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# The reth SDK (boule-reth-node / boule-bundle EL crates) is a git dependency
+# pinned to a tag; allow git sources from the paradigmxyz org (reth) and sigp
+# (discv5, a reth transitive git dep).
+[sources.allow-org]
+github = ["paradigmxyz", "sigp"]
 
 [bans]
 multiple-versions = "warn"
+# reth is consumed as tag-pinned git deps (no semver), and the in-repo crates are
+# unpublished path deps — both legitimately versionless. Allow wildcards for
+# path/git sources; crates.io deps must still pin a version.
 wildcards = "deny"
+allow-wildcard-paths = true

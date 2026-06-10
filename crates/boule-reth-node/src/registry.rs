@@ -36,7 +36,6 @@ pub struct RegistryPayload {
 }
 
 impl RegistryPayload {
-
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty() && self.weights.is_empty() && self.settled_view.is_none()
     }

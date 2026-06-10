@@ -157,7 +157,6 @@ where
 }
 
 impl<Pool, Client, Evm> BoulePayloadBuilder<Pool, Client, Evm> {
-
     fn extra_data_for(&self, attributes: &BoulePayloadAttributes) -> alloy_primitives::Bytes {
         let registry = attributes.registry_extra_data();
         if registry.is_empty() {
