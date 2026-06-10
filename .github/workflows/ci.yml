@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Set workflow-wide so the clippy/test/docs jobs hash to the same rust-cache
+  # environment key and can therefore share one cache (see the `shared-key`
+  # below). Harmless on the non-doc jobs.
+  RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
 
 jobs:
   fmt:
@@ -29,6 +33,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # One cache shared by clippy/test/docs; only the test job writes it
+          # (its full `--all-targets` build is a superset of what clippy's
+          # check and docs' rustdoc need), and only on main.
+          shared-key: workspace
+          save-if: "false"
       - uses: ./.github/actions/install-solc
       - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
@@ -42,6 +52,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The single writer of the shared cache; only persist from main so PR
+          # branches stay restore-only and don't each store a multi-GB copy
+          # (keeps the repo under GitHub's 10 GB Actions-cache limit).
+          shared-key: workspace
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/install-solc
       - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
@@ -59,12 +75,13 @@ jobs:
   docs:
     name: cargo doc
     runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace
+          save-if: "false"
       - uses: ./.github/actions/install-solc
       - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
