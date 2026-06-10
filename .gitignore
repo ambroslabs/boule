@@ -1,21 +1,11 @@
-/target
+# rust build outputs
+target/
+**/target/
 
-# Generated key and certificate files
-*.pem
-*.key
-*.p8
+# reth build.rs generates this
+crates/boule-reth/genesis.json
 
-# Addr files written by test nodes
-*.addr
-
-# Local config overrides
-config.local.toml
+# developer tools
+.git/
+.github/
 .claude/
-
-# IDE
-.idea/
-.vscode/
-*.iml
-
-# macOS
-.DS_Store
