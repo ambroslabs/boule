@@ -11,7 +11,7 @@ env:
 
 jobs:
   fmt:
-    name: Format
+    name: cargo fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +21,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: cargo clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,7 +34,7 @@ jobs:
       - run: cargo clippy -p boule-cli --features reth --all-targets -- -D warnings
 
   test:
-    name: Test (${{ matrix.shard }})
+    name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,14 +46,14 @@ jobs:
         run: cargo test --locked --doc
 
   deny:
-    name: Deny (licenses + advisories)
+    name: cargo deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   docs:
-    name: Docs (intra-doc links)
+    name: cargo doc
     runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: -D rustdoc::broken_intra_doc_links
