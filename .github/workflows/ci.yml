@@ -38,12 +38,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # On Blacksmith this transparently uses the colocated cache (no GitHub
+      # 10 GB limit), so we let PRs save too (default save-if: true): a PR that
+      # changes deps reuses its own cache across re-pushes instead of cold-
+      # building reth each time. Caches are branch-scoped, so PRs never pollute
+      # main or each other.
       - uses: Swatinem/rust-cache@v2
-        with:
-          # One cache for the one compile job. Save only from main so PR
-          # branches stay restore-only and don't each persist a multi-GB copy
-          # (keeps the repo under GitHub's 10 GB Actions-cache limit).
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/install-solc
       - name: Install clang/libclang (reth mdbx/rocksdb bindgen)
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
